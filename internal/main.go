@@ -1,0 +1,12 @@
+// Copyright 2025 Sylos contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
+package main 
+
+import (
+	"fmt"
+)
+
+func main() {
+	fmt.Println("Hello, World!")
+}
