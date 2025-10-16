@@ -5,6 +5,7 @@ package logservice
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"time"
 )
@@ -15,6 +16,25 @@ type Sender struct {
 	Level      string // current threshold
 	conn       net.Conn
 	minLevelIx int
+}
+
+func getLevelIndex(level string) int {
+	switch level {
+	case "trace":
+		return 0
+	case "debug":
+		return 1
+	case "info":
+		return 2
+	case "warning":
+		return 3
+	case "error":
+		return 4
+	case "critical":
+		return 5
+	default:
+		return -1
+	}
 }
 
 // NewSender initializes a UDP log sender.
@@ -39,6 +59,20 @@ func (s *Sender) Log(level, message, entity, entityID string) error {
 	data, err := json.Marshal(pkt)
 	if err != nil {
 		return err
+	}
+
+	minLevelIx := getLevelIndex(s.Level)
+	if minLevelIx == -1 {
+		return fmt.Errorf("invalid level: %s", s.Level)
+	}
+
+	levelIx := getLevelIndex(level)
+	if levelIx == -1 {
+		return fmt.Errorf("invalid level: %s", level)
+	}
+
+	if levelIx < minLevelIx {
+		return nil
 	}
 
 	_, err = s.conn.Write(data)
