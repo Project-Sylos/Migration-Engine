@@ -14,17 +14,32 @@ import (
 	"github.com/Project-Sylos/Migration-Engine/internal/db"
 )
 
+// LS is the global log service sender instance.
+// It must be initialized via InitGlobalLogger before use.
+var LS *Sender
+
+// InitGlobalLogger initializes the global LS instance.
+// This should be called once during application startup.
+func InitGlobalLogger(dbInstance *db.DB, addr, level string) error {
+	sender, err := NewSender(dbInstance, addr, level)
+	if err != nil {
+		return fmt.Errorf("failed to initialize global logger: %w", err)
+	}
+	LS = sender
+	return nil
+}
+
 // Sender transmits logs over UDP and writes them to the database.
 type Sender struct {
-	DB          *db.DB      // database handle for persistence
-	Addr        string      // e.g. "127.0.0.1:1997"
-	Level       string      // threshold for UDP output
-	conn        net.Conn
-	minLevelIx  int
-	mu          sync.Mutex  // guards buffer/encoder
-	buf         *bytes.Buffer
-	enc         *json.Encoder
-	tmp         LogPacket   // reusable scratch struct
+	DB         *db.DB // database handle for persistence
+	Addr       string // e.g. "127.0.0.1:1997"
+	Level      string // threshold for UDP output
+	conn       net.Conn
+	minLevelIx int
+	mu         sync.Mutex // guards buffer/encoder
+	buf        *bytes.Buffer
+	enc        *json.Encoder
+	tmp        LogPacket // reusable scratch struct
 }
 
 // getLevelIndex assigns numeric priority to levels.

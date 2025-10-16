@@ -4,11 +4,14 @@
 package fsservices
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/Project-Sylos/Migration-Engine/internal/logservice"
 )
 
 // LocalFS implements FSAdapter for the local filesystem.
@@ -50,12 +53,28 @@ func (l *LocalFS) ListChildren(identifier string) (ListResult, error) {
 
 	entries, err := os.ReadDir(identifier)
 	if err != nil {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log(
+				"error",
+				fmt.Sprintf("Failed to read directory %s: %v", identifier, err),
+				"fsservices",
+				"local",
+			)
+		}
 		return result, err
 	}
 
 	for _, entry := range entries {
 		info, err := entry.Info()
 		if err != nil {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log(
+					"warning",
+					fmt.Sprintf("Failed to get info for %s: %v", entry.Name(), err),
+					"fsservices",
+					"local",
+				)
+			}
 			continue
 		}
 
@@ -86,6 +105,15 @@ func (l *LocalFS) ListChildren(identifier string) (ListResult, error) {
 		}
 	}
 
+	if logservice.LS != nil {
+		_ = logservice.LS.Log(
+			"trace",
+			fmt.Sprintf("Listed %d folders, %d files in %s", len(result.Folders), len(result.Files), l.relativize(identifier)),
+			"fsservices",
+			"local",
+		)
+	}
+
 	return result, nil
 }
 
@@ -98,12 +126,30 @@ func (l *LocalFS) DownloadFile(identifier string) (io.ReadCloser, error) {
 func (l *LocalFS) CreateFolder(parentId, name string) (Folder, error) {
 	fullPath := filepath.Join(parentId, name)
 	if err := os.MkdirAll(fullPath, os.ModePerm); err != nil {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log(
+				"error",
+				fmt.Sprintf("Failed to create folder %s: %v", l.relativize(fullPath), err),
+				"fsservices",
+				"local",
+			)
+		}
 		return Folder{}, err
 	}
 	info, err := os.Stat(fullPath)
 	if err != nil {
 		return Folder{}, err
 	}
+
+	if logservice.LS != nil {
+		_ = logservice.LS.Log(
+			"info",
+			fmt.Sprintf("Created folder %s", l.relativize(fullPath)),
+			"fsservices",
+			"local",
+		)
+	}
+
 	return Folder{
 		Id:           fullPath,
 		ParentId:     parentId,
@@ -118,14 +164,40 @@ func (l *LocalFS) CreateFolder(parentId, name string) (Folder, error) {
 func (l *LocalFS) UploadFile(destId string, content io.Reader) (File, error) {
 	f, err := os.Create(destId)
 	if err != nil {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log(
+				"error",
+				fmt.Sprintf("Failed to create file %s: %v", l.relativize(destId), err),
+				"fsservices",
+				"local",
+			)
+		}
 		return File{}, err
 	}
 	defer f.Close()
 	n, err := io.Copy(f, content)
 	if err != nil {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log(
+				"error",
+				fmt.Sprintf("Failed to write file %s: %v", l.relativize(destId), err),
+				"fsservices",
+				"local",
+			)
+		}
 		return File{}, err
 	}
 	info, _ := os.Stat(destId)
+
+	if logservice.LS != nil {
+		_ = logservice.LS.Log(
+			"info",
+			fmt.Sprintf("Uploaded file %s (%d bytes)", l.relativize(destId), n),
+			"fsservices",
+			"local",
+		)
+	}
+
 	return File{
 		Id:           destId,
 		DisplayName:  filepath.Base(destId),
