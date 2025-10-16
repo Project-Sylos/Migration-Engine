@@ -1,17 +1,19 @@
 // Copyright 2025 Sylos contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
- 
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
 package db
 
 import (
 	"context"
 	"database/sql"
+	"sync"
 )
 
 type DB struct {
 	conn   *sql.DB
 	ctx    context.Context
 	cancel context.CancelFunc
+	mu     sync.Mutex
 }
 
 func NewDB(dbPath string) (*DB, error) {
@@ -20,8 +22,8 @@ func NewDB(dbPath string) (*DB, error) {
 		return nil, err
 	}
 	return &DB{
-		conn: db,
-		ctx:  context.Background(),
+		conn:   db,
+		ctx:    context.Background(),
 		cancel: func() {},
 	}, nil
 }
