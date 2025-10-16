@@ -17,7 +17,7 @@ This is a collaborative space focused on learning and building useful software.
 By submitting code, documentation, or any other material to this repository (via pull request, issue, patch, or other form of contribution), you agree that:
 
 1. **License Alignment:**
-   Your contribution is provided under the same license that governs this repository (currently **LGPL-3.0-or-later**).
+   Your contribution is provided under the same license that governs this repository (currently **LGPL-2.1-or-later**).
 
 2. **Ownership and Rights:**
    You are the original author of your contribution, or you have the legal right to contribute it under the same license.
