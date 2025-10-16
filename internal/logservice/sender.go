@@ -10,22 +10,24 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/Project-Sylos/Migration-Engine/internal/db"
 )
 
-// Sender sends log packets to a UDP listener.
+// Sender transmits logs over UDP and writes them to the database.
 type Sender struct {
-	Addr       string // e.g. "127.0.0.1:1997"
-	Level      string // threshold, e.g. "info"
-	conn       net.Conn
-	minLevelIx int
-
-	mu   sync.Mutex      // guards buffer/encoder
-	buf  *bytes.Buffer   // reusable JSON buffer
-	enc  *json.Encoder   // bound to buf
-	tmp  LogPacket       // small scratch value reused per call
+	DB          *db.DB      // database handle for persistence
+	Addr        string      // e.g. "127.0.0.1:1997"
+	Level       string      // threshold for UDP output
+	conn        net.Conn
+	minLevelIx  int
+	mu          sync.Mutex  // guards buffer/encoder
+	buf         *bytes.Buffer
+	enc         *json.Encoder
+	tmp         LogPacket   // reusable scratch struct
 }
 
-// getLevelIndex maps log levels to integer weights.
+// getLevelIndex assigns numeric priority to levels.
 func getLevelIndex(level string) int {
 	switch level {
 	case "trace":
@@ -45,8 +47,8 @@ func getLevelIndex(level string) int {
 	}
 }
 
-// NewSender initializes a UDP log sender.
-func NewSender(addr, level string) (*Sender, error) {
+// NewSender initializes a new dual-channel sender.
+func NewSender(dbInstance *db.DB, addr, level string) (*Sender, error) {
 	conn, err := net.Dial("udp", addr)
 	if err != nil {
 		return nil, err
@@ -57,6 +59,7 @@ func NewSender(addr, level string) (*Sender, error) {
 	}
 	buf := new(bytes.Buffer)
 	return &Sender{
+		DB:         dbInstance,
 		Addr:       addr,
 		Level:      level,
 		conn:       conn,
@@ -66,21 +69,29 @@ func NewSender(addr, level string) (*Sender, error) {
 	}, nil
 }
 
-// Log sends a log message if it meets the threshold.
+// Log sends the message via UDP (if level >= threshold)
+// and writes it unconditionally to the logs table in the DB.
 // Safe for concurrent use.
 func (s *Sender) Log(level, message, entity, entityID string) error {
+	timestamp := time.Now()
+
+	// --- DB write (always) ---
+	id := fmt.Sprintf("%d", timestamp.UnixNano()) // basic unique ID for now
+	_ = s.DB.Write("logs", id, timestamp, level, entity, entityID, nil, message, nil)
+
+	// --- UDP send (conditional) ---
 	levelIx := getLevelIndex(level)
 	if levelIx == -1 {
 		return fmt.Errorf("invalid level: %s", level)
 	}
 	if levelIx < s.minLevelIx {
-		return nil // below threshold
+		return nil // below UDP threshold
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.tmp.Timestamp = time.Now()
+	s.tmp.Timestamp = timestamp
 	s.tmp.Level = level
 	s.tmp.Message = message
 	s.tmp.Entity = entity
@@ -95,7 +106,7 @@ func (s *Sender) Log(level, message, entity, entityID string) error {
 	return err
 }
 
-// Close closes the UDP connection.
+// Close terminates the UDP connection.
 func (s *Sender) Close() error {
 	if s.conn != nil {
 		_ = s.conn.Close()
