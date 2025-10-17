@@ -417,6 +417,7 @@ func (q *Queue) setState(state QueueState) {
 
 // checkIfExhausted checks if traversal is exhausted when no tasks are found.
 func (q *Queue) checkIfExhausted(round int, queueType string) {
+	// I'm exhausted writing this. lol
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
