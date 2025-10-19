@@ -1,0 +1,97 @@
+// Copyright 2025 Sylos contributors
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+package queue
+
+import (
+	"github.com/Project-Sylos/Migration-Engine/internal/fsservices"
+)
+
+// Task types
+const (
+	TaskTypeSrcTraversal = "src-traversal"
+	TaskTypeDstTraversal = "dst-traversal"
+	TaskTypeUpload       = "upload"
+	TaskTypeCopy         = "copy"
+)
+
+// TaskBase represents the foundational structure for all task types.
+// Workers lease tasks, mark them Locked, and attempt execution.
+// Tasks are identified by absolute paths (Id) but reconciled by root-relative paths (LocationPath).
+type TaskBase struct {
+	Type               string              // Task type: "src-traversal", "dst-traversal", "upload", etc.
+	Folder             fsservices.Folder   // Folder to process (if applicable)
+	File               fsservices.File     // File to process (if applicable)
+	Locked             bool                // Whether this task is currently leased by a worker
+	Attempts           int                 // Number of execution attempts
+	Status             string              // Execution result: "successful", "failed"
+	ExpectedFolders    []fsservices.Folder // Expected folders (dst tasks only)
+	ExpectedFiles      []fsservices.File   // Expected files (dst tasks only)
+	DiscoveredChildren []ChildResult       // Children discovered during execution
+}
+
+// ChildResult represents a discovered child node with its traversal status.
+type ChildResult struct {
+	Folder fsservices.Folder // Folder info (if folder)
+	File   fsservices.File   // File info (if file)
+	Status string            // "pending", "successful", "missing", "not_on_src"
+	IsFile bool              // true if this is a file, false if folder
+}
+
+// Identifier returns the unique identifier for this task (absolute path).
+func (t *TaskBase) Identifier() string {
+	if t.Folder.Id != "" {
+		return t.Folder.Id
+	}
+	return t.File.Id
+}
+
+// LocationPath returns the logical, root-relative path for this task.
+func (t *TaskBase) LocationPath() string {
+	if t.Folder.LocationPath != "" {
+		return t.Folder.LocationPath
+	}
+	return t.File.LocationPath
+}
+
+// IsFolder returns whether this task represents a folder traversal.
+func (t *TaskBase) IsFolder() bool {
+	return t.Folder.Id != ""
+}
+
+// IsFile returns whether this task represents a file operation.
+func (t *TaskBase) IsFile() bool {
+	return t.File.Id != ""
+}
+
+// TraversalTask represents a task to list children of a folder.
+type TraversalTask struct {
+	TaskBase
+	Round           int                 // BFS round (depth level) for this traversal
+	ExpectedFolders []fsservices.Folder // Expected folders from src (dst tasks only)
+	ExpectedFiles   []fsservices.File   // Expected files from src (dst tasks only)
+}
+
+// UploadTask represents a task to upload a file from source to destination.
+type UploadTask struct {
+	TaskBase
+	SrcId  string // Source file identifier
+	DstId  string // Destination parent folder identifier
+	DstCtx fsservices.ServiceContext
+}
+
+// CopyTask represents a generic copy operation.
+type CopyTask struct {
+	TaskBase
+	SrcId  string
+	DstId  string
+	DstCtx fsservices.ServiceContext
+}
+
+// TaskResult represents the outcome of a task execution.
+type TaskResult struct {
+	Task    *TaskBase
+	Success bool
+	Error   error
+	Data    interface{} // Optional result data (e.g., ListResult)
+}
