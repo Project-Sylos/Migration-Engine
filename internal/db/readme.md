@@ -22,26 +22,24 @@ Sylos uses **DuckDB** as its local database engine. There are several reasons fo
 
 ---
 
-## Buffer System
+## Database Operations
 
-The database package includes a flexible **unified buffer system** that batches operations for maximum efficiency.
+The database package provides a simple, direct interface for database operations:
 
-### Architecture
+### Core Operations
 
-* **`Buffer`** – The main manager that coordinates multiple sub-buffers with shared timer and threshold behavior.
-* **`SubBuffer`** – Individual buffered channels, each with a custom flush function for specific operation types.
-* **`FlushFunc`** – User-defined function that processes accumulated items: `func(items []interface{}) error`.
+* **`Write(table, args...)`** – Performs immediate INSERT operations into the specified table. No buffering for node data.
+* **`Query(query, args...)`** – Executes SQL queries directly against the database. No special flushing needed.
+* **`RegisterTable(def)`** – Registers a table schema and creates the table if it doesn't exist.
+* **`Close()`** – Cleanly closes the database connection.
 
-### Features
+### Log Buffering
 
-* **Multi-channel support** – Register multiple sub-buffers for different operation types (e.g., "completed", "updates", "inserts").
-* **Threshold-based flushing** – Automatically flushes when total items across all sub-buffers reach the configured threshold.
-* **Timer-based flushing** – Periodic automatic flushing based on configurable intervals.
-* **Independent design** – The buffer is not owned by the DB or any specific component; each consumer creates and manages its own buffer instance.
-* **Thread-safe** – All operations are properly synchronized with mutexes.
+While most database operations are immediate, **logs are an exception**. The package includes a lightweight `LogBuffer` that:
 
-### Usage Pattern
+* Batches log entries for efficient bulk inserts
+* Flushes automatically every N entries or every time interval
+* Runs asynchronously in a background goroutine
+* Gracefully stops and flushes remaining entries on shutdown
 
-Components like queues and loggers create their own `Buffer` instance, register sub-buffers for different operations, and simply call `buffer.Add(subBufferName, item)`. The buffer handles all batching, timing, and flushing automatically.
-
-This design keeps batch operations efficient while maintaining clean separation of concerns.
+This specialized buffering improves log write performance without adding complexity to the general database layer. The log buffer is managed by the log service and is transparent to other components.

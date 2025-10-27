@@ -57,11 +57,19 @@ func NewTraversalWorker(
 
 // Run is the main worker loop. It continuously polls the queue for tasks.
 // When a task is found, it leases it, executes it, and reports the result.
-// When no work is available, it briefly sleeps before polling again.
+// When no work is available or queue is paused, it briefly sleeps before polling again.
+// When queue is exhausted, the worker exits.
 func (w *TraversalWorker) Run() {
 	for {
-		// Check if we should stop
-		if w.queue.ShouldStop() {
+		// Check lifecycle state first
+		if w.queue.IsPaused() {
+			// Queue is paused, sleep and continue polling
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		// Check if queue is exhausted (traversal complete) - exit worker
+		if w.queue.IsExhausted() {
 			return
 		}
 
@@ -80,12 +88,18 @@ func (w *TraversalWorker) Run() {
 			willRetry := w.queue.Fail(task)
 			w.logError(task, err, willRetry)
 		} else {
-			// Task succeeded, mark as complete
-			w.queue.Complete(task)
-			w.logSuccess(task)
+			// Task succeeded - write results to database immediately
+			dbErr := w.writeResultsToDB(task)
+			if dbErr != nil {
+				// DB write failed, treat as task failure
+				willRetry := w.queue.Fail(task)
+				w.logError(task, dbErr, willRetry)
+			} else {
+				// DB write succeeded, mark task as complete in queue
+				w.queue.Complete(task)
+				w.logSuccess(task)
+			}
 		}
-
-		// Immediately check for more work (no sleep)
 	}
 }
 
@@ -225,6 +239,140 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsse
 	}
 
 	return nil
+}
+
+// writeResultsToDB performs the 2 database writes after task execution:
+// 1. Updates parent folder traversal_status to "successful"
+// 2. Batch inserts all discovered children
+func (w *TraversalWorker) writeResultsToDB(task *TaskBase) error {
+	folder := task.Folder
+
+	// Write 1: Update parent folder status to "successful"
+	updateQuery := fmt.Sprintf("UPDATE %s SET traversal_status = 'successful' WHERE id = ?", w.tableName)
+	_, err := w.db.Conn().Exec(updateQuery, folder.Id)
+	if err != nil {
+		return fmt.Errorf("failed to update parent status: %w", err)
+	}
+
+	// Write 2: Batch insert all discovered children
+	if len(task.DiscoveredChildren) > 0 {
+		err = w.insertChildren(task)
+		if err != nil {
+			return fmt.Errorf("failed to insert children: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// insertChildren batch inserts all discovered children into the database in a single query.
+func (w *TraversalWorker) insertChildren(task *TaskBase) error {
+	if len(task.DiscoveredChildren) == 0 {
+		return nil
+	}
+
+	// Build batch insert query
+	var values []interface{}
+	var placeholders string
+
+	// Determine column count based on queue type
+	colCount := 9 // dst has 9 columns
+	if w.queueName == "src" {
+		colCount = 10 // src has 10 columns (includes copy_status)
+	}
+
+	for i, child := range task.DiscoveredChildren {
+		if i > 0 {
+			placeholders += ", "
+		}
+		placeholders += buildPlaceholderGroup(colCount)
+
+		if child.IsFile {
+			values = append(values, w.getFileValues(child.File, child.Status)...)
+		} else {
+			values = append(values, w.getFolderValues(child.Folder, child.Status)...)
+		}
+	}
+
+	query := fmt.Sprintf("INSERT INTO %s VALUES %s", w.tableName, placeholders)
+	_, err := w.db.Conn().Exec(query, values...)
+	return err
+}
+
+// buildPlaceholderGroup creates "(?, ?, ?)" etc for SQL placeholders.
+func buildPlaceholderGroup(n int) string {
+	if n <= 0 {
+		return "()"
+	}
+	s := "("
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			s += ", "
+		}
+		s += "?"
+	}
+	s += ")"
+	return s
+}
+
+// getFolderValues returns the values slice for a folder insert.
+func (w *TraversalWorker) getFolderValues(folder fsservices.Folder, status string) []interface{} {
+	if w.queueName == "src" {
+		return []interface{}{
+			folder.Id,
+			folder.ParentId,
+			folder.DisplayName,
+			folder.LocationPath,
+			fsservices.NodeTypeFolder,
+			folder.DepthLevel,
+			nil, // size (folders have no size)
+			folder.LastUpdated,
+			status,    // traversal_status
+			"pending", // copy_status
+		}
+	} else {
+		return []interface{}{
+			folder.Id,
+			folder.ParentId,
+			folder.DisplayName,
+			folder.LocationPath,
+			fsservices.NodeTypeFolder,
+			folder.DepthLevel,
+			nil, // size
+			folder.LastUpdated,
+			status, // traversal_status
+		}
+	}
+}
+
+// getFileValues returns the values slice for a file insert.
+func (w *TraversalWorker) getFileValues(file fsservices.File, status string) []interface{} {
+	if w.queueName == "src" {
+		return []interface{}{
+			file.Id,
+			file.ParentId,
+			file.DisplayName,
+			file.LocationPath,
+			fsservices.NodeTypeFile,
+			file.DepthLevel,
+			file.Size,
+			file.LastUpdated,
+			"successful", // traversal_status (files don't need traversal)
+			"pending",    // copy_status
+		}
+	} else {
+		return []interface{}{
+			file.Id,
+			file.ParentId,
+			file.DisplayName,
+			file.LocationPath,
+			fsservices.NodeTypeFile,
+			file.DepthLevel,
+			file.Size,
+			file.LastUpdated,
+			status, // traversal_status (from comparison)
+		}
+	}
 }
 
 // logSuccess logs a successful task execution.
