@@ -6,6 +6,7 @@ package queue
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/internal/db"
 	"github.com/Project-Sylos/Migration-Engine/internal/fsservices"
@@ -39,10 +40,11 @@ type Queue struct {
 	db         *db.DB                     // Database handle for task pulling
 	tableName  string                     // "src_nodes" or "dst_nodes"
 	srcCtx     *fsservices.ServiceContext // For dst queue: needed to query src nodes
+	srcQueue   *Queue                     // For dst queue: reference to src queue for round coordination
 }
 
 // NewQueue creates a new Queue instance.
-func NewQueue(name string, maxRetries int, batchSize int) *Queue {
+func NewQueue(name string, maxRetries int, batchSize int, workerCount int) *Queue {
 	return &Queue{
 		name:       name,
 		state:      QueueStateRunning,
@@ -52,17 +54,42 @@ func NewQueue(name string, maxRetries int, batchSize int) *Queue {
 		maxRetries: maxRetries,
 		round:      0,
 		batchSize:  batchSize,
-		workers:    make([]Worker, 0),
+		workers:    make([]Worker, 0, workerCount),
 	}
 }
 
-// Initialize sets up the queue with database and context references.
-func (q *Queue) Initialize(database *db.DB, tableName string, srcContext *fsservices.ServiceContext) {
+// Initialize sets up the queue with database, context, and filesystem adapter references.
+// Creates and starts workers immediately - they'll poll for tasks autonomously.
+// For dst queues, srcContext and srcQueue are required for round coordination.
+func (q *Queue) Initialize(database *db.DB, tableName string, adapter fsservices.FSAdapter, srcContext *fsservices.ServiceContext, srcQueue *Queue) {
 	q.mu.Lock()
 	q.db = database
 	q.tableName = tableName
 	q.srcCtx = srcContext
+	q.srcQueue = srcQueue
+	workerCount := cap(q.workers) // Get the worker count we preallocated for
 	q.mu.Unlock()
+
+	// Create and start workers - they manage themselves
+	for i := 0; i < workerCount; i++ {
+		worker := NewTraversalWorker(
+			i,
+			q,
+			database,
+			adapter,
+			tableName,
+			q.name,
+		)
+		q.AddWorker(worker)
+		go worker.Run()
+
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("debug",
+				fmt.Sprintf("Worker %d started", i),
+				"queue",
+				q.name)
+		}
+	}
 
 	// Scenario 2: Initial pull when queue is created
 	q.pullTasks()
@@ -159,14 +186,27 @@ func (q *Queue) AddBatch(tasks []*TaskBase) int {
 func (q *Queue) Lease() *TaskBase {
 	q.mu.Lock()
 
+	if logservice.LS != nil {
+		_ = logservice.LS.Log("debug",
+			fmt.Sprintf("Lease called - state:%s pending:%d inProgress:%d", q.state, len(q.pending), len(q.inProgress)),
+			"queue",
+			q.name)
+	}
+
 	// Don't lease if paused or completed
 	if q.state == QueueStatePaused || q.state == QueueStateCompleted {
 		q.mu.Unlock()
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("debug", fmt.Sprintf("Cannot lease - state is %s", q.state), "queue", q.name)
+		}
 		return nil
 	}
 
 	if len(q.pending) == 0 {
 		q.mu.Unlock()
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("debug", "Cannot lease - no pending tasks", "queue", q.name)
+		}
 		return nil
 	}
 
@@ -178,6 +218,10 @@ func (q *Queue) Lease() *TaskBase {
 	task.Locked = true
 	id := task.Identifier()
 	q.inProgress[id] = task
+
+	if logservice.LS != nil {
+		_ = logservice.LS.Log("info", fmt.Sprintf("Leased task %s - now pending:%d inProgress:%d", id, len(q.pending), len(q.inProgress)), "queue", q.name)
+	}
 
 	// Scenario 1: Running low on tasks - pull more (if not completed)
 	totalActive := len(q.pending) + len(q.inProgress)
@@ -375,7 +419,13 @@ func (q *Queue) markRoundComplete() {
 }
 
 // advanceToNextRound advances the queue to the next round and checks for completion.
+// For dst queues, this will wait for src queue to be at least one round ahead.
 func (q *Queue) advanceToNextRound() {
+	// If this is a dst queue, wait for src to be ahead
+	if q.name == "dst" && q.srcQueue != nil {
+		q.waitForSrcRound()
+	}
+
 	q.mu.Lock()
 	q.round++
 	newRound := q.round
@@ -388,6 +438,49 @@ func (q *Queue) advanceToNextRound() {
 	// Scenario 3: Round advanced - pull tasks for new round
 	// This will call checkForCompletion if no tasks are found
 	q.pullTasks()
+}
+
+// waitForSrcRound blocks until src queue is at least one round ahead.
+// This ensures dst always stays behind src in the BFS traversal.
+func (q *Queue) waitForSrcRound() {
+	if q.srcQueue == nil {
+		return
+	}
+
+	q.mu.RLock()
+	myRound := q.round
+	q.mu.RUnlock()
+
+	targetRound := myRound // dst round N needs src to complete round N (be on N+1)
+
+	for {
+		srcRound := q.srcQueue.Round()
+
+		// Src needs to be at least one round ahead (src finished targetRound, now on targetRound+1)
+		if srcRound > targetRound {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("debug",
+					fmt.Sprintf("Src round %d ready, advancing dst to round %d", srcRound, targetRound+1),
+					"queue",
+					q.name)
+			}
+			return
+		}
+
+		// Check if src is completed - if so, dst can proceed
+		if q.srcQueue.IsExhausted() {
+			return
+		}
+
+		// Src not ready yet, sleep and check again
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("debug",
+				fmt.Sprintf("Waiting for src (currently round %d) before advancing dst to round %d", srcRound, targetRound+1),
+				"queue",
+				q.name)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // pullSrcTasks queries src_nodes for pending folders at current round.
@@ -595,7 +688,7 @@ func (q *Queue) pullDstTasks() {
 	}
 
 	// Group children by parent_id
-	childrenByParent := make(map[string][]interface{})
+	childrenByParent := make(map[string][]any)
 
 	for rows.Next() {
 		var id, parentId, name, path, nodeType, lastUpdated string
