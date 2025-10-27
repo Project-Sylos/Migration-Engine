@@ -18,9 +18,9 @@ type LogEntry struct {
 	Level     string
 	Entity    string
 	EntityID  string
-	Details   interface{}
+	Details   any
 	Message   string
-	Queue     interface{}
+	Queue     any
 }
 
 // LogBuffer is a lightweight buffer specifically for log entries.

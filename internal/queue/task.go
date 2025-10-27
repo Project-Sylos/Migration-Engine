@@ -93,5 +93,5 @@ type TaskResult struct {
 	Task    *TaskBase
 	Success bool
 	Error   error
-	Data    interface{} // Optional result data (e.g., ListResult)
+	Data    any // Optional result data (e.g., ListResult)
 }

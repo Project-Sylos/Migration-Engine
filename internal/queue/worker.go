@@ -60,25 +60,45 @@ func NewTraversalWorker(
 // When no work is available or queue is paused, it briefly sleeps before polling again.
 // When queue is exhausted, the worker exits.
 func (w *TraversalWorker) Run() {
+	if logservice.LS != nil {
+		_ = logservice.LS.Log("debug", "Worker starting run loop", "worker", fmt.Sprintf("%s-worker-%d", w.queueName, w.id))
+	}
+
 	for {
 		// Check lifecycle state first
 		if w.queue.IsPaused() {
 			// Queue is paused, sleep and continue polling
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("debug", "Queue is paused, sleeping", "worker", fmt.Sprintf("%s-worker-%d", w.queueName, w.id))
+			}
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 
 		// Check if queue is exhausted (traversal complete) - exit worker
 		if w.queue.IsExhausted() {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("info", "Queue exhausted, worker exiting", "worker", fmt.Sprintf("%s-worker-%d", w.queueName, w.id))
+			}
 			return
 		}
 
 		// Try to lease a task from the queue
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("debug", "Attempting to lease task", "worker", fmt.Sprintf("%s-worker-%d", w.queueName, w.id))
+		}
 		task := w.queue.Lease()
 		if task == nil {
 			// No work available, sleep briefly before checking again
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("debug", "No task available, sleeping 50ms", "worker", fmt.Sprintf("%s-worker-%d", w.queueName, w.id))
+			}
 			time.Sleep(50 * time.Millisecond)
 			continue
+		}
+
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("info", fmt.Sprintf("Leased task: %s", task.LocationPath()), "worker", fmt.Sprintf("%s-worker-%d", w.queueName, w.id))
 		}
 
 		// Execute the task
@@ -272,7 +292,7 @@ func (w *TraversalWorker) insertChildren(task *TaskBase) error {
 	}
 
 	// Build batch insert query
-	var values []interface{}
+	var values []any
 	var placeholders string
 
 	// Determine column count based on queue type
@@ -316,9 +336,9 @@ func buildPlaceholderGroup(n int) string {
 }
 
 // getFolderValues returns the values slice for a folder insert.
-func (w *TraversalWorker) getFolderValues(folder fsservices.Folder, status string) []interface{} {
+func (w *TraversalWorker) getFolderValues(folder fsservices.Folder, status string) []any {
 	if w.queueName == "src" {
-		return []interface{}{
+		return []any{
 			folder.Id,
 			folder.ParentId,
 			folder.DisplayName,
@@ -331,7 +351,7 @@ func (w *TraversalWorker) getFolderValues(folder fsservices.Folder, status strin
 			"pending", // copy_status
 		}
 	} else {
-		return []interface{}{
+		return []any{
 			folder.Id,
 			folder.ParentId,
 			folder.DisplayName,
@@ -346,9 +366,9 @@ func (w *TraversalWorker) getFolderValues(folder fsservices.Folder, status strin
 }
 
 // getFileValues returns the values slice for a file insert.
-func (w *TraversalWorker) getFileValues(file fsservices.File, status string) []interface{} {
+func (w *TraversalWorker) getFileValues(file fsservices.File, status string) []any {
 	if w.queueName == "src" {
-		return []interface{}{
+		return []any{
 			file.Id,
 			file.ParentId,
 			file.DisplayName,
@@ -361,7 +381,7 @@ func (w *TraversalWorker) getFileValues(file fsservices.File, status string) []i
 			"pending",    // copy_status
 		}
 	} else {
-		return []interface{}{
+		return []any{
 			file.Id,
 			file.ParentId,
 			file.DisplayName,

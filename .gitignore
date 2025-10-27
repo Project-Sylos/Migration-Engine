@@ -38,6 +38,8 @@ __pycache__/
 # ignore db files
 *.db
 *.db.wal
+*.duckdb
+*.duckdb.wal
 
 # ignore logs
 *logs.txt
