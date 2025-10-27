@@ -31,9 +31,10 @@ func InitGlobalLogger(dbInstance *db.DB, addr, level string) error {
 
 // Sender transmits logs over UDP and writes them to the database.
 type Sender struct {
-	DB         *db.DB // database handle for persistence
-	Addr       string // e.g. "127.0.0.1:1997"
-	Level      string // threshold for UDP output
+	DB         *db.DB         // database handle for persistence
+	logBuffer  *db.LogBuffer  // buffered log writer
+	Addr       string         // e.g. "127.0.0.1:1997"
+	Level      string         // threshold for UDP output
 	conn       net.Conn
 	minLevelIx int
 	mu         sync.Mutex // guards buffer/encoder
@@ -73,8 +74,13 @@ func NewSender(dbInstance *db.DB, addr, level string) (*Sender, error) {
 		return nil, fmt.Errorf("invalid threshold level: %s", level)
 	}
 	buf := new(bytes.Buffer)
+	
+	// Create a log buffer that flushes every 100 entries or every 2 seconds
+	logBuffer := db.NewLogBuffer(dbInstance.Conn(), 100, 2*time.Second)
+	
 	return &Sender{
 		DB:         dbInstance,
+		logBuffer:  logBuffer,
 		Addr:       addr,
 		Level:      level,
 		conn:       conn,
@@ -85,14 +91,23 @@ func NewSender(dbInstance *db.DB, addr, level string) (*Sender, error) {
 }
 
 // Log sends the message via UDP (if level >= threshold)
-// and writes it unconditionally to the logs table in the DB.
+// and writes it unconditionally to the logs table in the DB via the buffer.
 // Safe for concurrent use.
 func (s *Sender) Log(level, message, entity, entityID string) error {
 	timestamp := time.Now()
 
-	// --- DB write (always) ---
+	// --- DB write (always, buffered) ---
 	id := fmt.Sprintf("%d", timestamp.UnixNano()) // basic unique ID for now
-	_ = s.DB.Write("logs", id, timestamp, level, entity, entityID, nil, message, nil)
+	s.logBuffer.Add(db.LogEntry{
+		ID:        id,
+		Timestamp: timestamp,
+		Level:     level,
+		Entity:    entity,
+		EntityID:  entityID,
+		Details:   nil,
+		Message:   message,
+		Queue:     nil,
+	})
 
 	// --- UDP send (conditional) ---
 	levelIx := getLevelIndex(level)
@@ -121,8 +136,11 @@ func (s *Sender) Log(level, message, entity, entityID string) error {
 	return err
 }
 
-// Close terminates the UDP connection.
+// Close terminates the UDP connection and stops the log buffer.
 func (s *Sender) Close() error {
+	if s.logBuffer != nil {
+		s.logBuffer.Stop()
+	}
 	if s.conn != nil {
 		_ = s.conn.Close()
 	}

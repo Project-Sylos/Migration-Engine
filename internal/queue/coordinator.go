@@ -44,11 +44,9 @@ func NewCoordinator(
 	dstContext fsservices.ServiceContext,
 	maxRetries int,
 	batchSize int,
-	flushThreshold int,
-	flushInterval time.Duration,
 ) *Coordinator {
-	srcQueue := NewQueue("src", maxRetries, batchSize, flushThreshold, flushInterval)
-	dstQueue := NewQueue("dst", maxRetries, batchSize, flushThreshold, flushInterval)
+	srcQueue := NewQueue("src", maxRetries, batchSize)
+	dstQueue := NewQueue("dst", maxRetries, batchSize)
 
 	// Initialize queues with DB and context references
 	srcQueue.Initialize(db, "src_nodes", nil)
@@ -66,7 +64,7 @@ func NewCoordinator(
 	}
 }
 
-// Start begins the coordinator and all workers.
+// Start begins the coordinator monitoring loop.
 func (c *Coordinator) Start() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -83,10 +81,6 @@ func (c *Coordinator) Start() error {
 		_ = logservice.LS.Log("info", "Coordinator starting", "coordinator", "main")
 	}
 
-	// Start workers for both queues
-	c.srcQueue.StartWorkers()
-	c.dstQueue.StartWorkers()
-
 	// Start the round monitoring loop
 	c.wg.Add(1)
 	go c.roundMonitorLoop()
@@ -98,7 +92,8 @@ func (c *Coordinator) Start() error {
 	return nil
 }
 
-// Stop gracefully stops the coordinator and all workers.
+// Stop gracefully stops the coordinator.
+// Workers will stop automatically when queues are exhausted.
 func (c *Coordinator) Stop() error {
 	c.mu.Lock()
 	if c.state == StateStopped {
@@ -115,10 +110,6 @@ func (c *Coordinator) Stop() error {
 	// Signal coordination loop to stop
 	close(c.stopChan)
 	c.wg.Wait()
-
-	// Stop all workers
-	c.srcQueue.StopWorkers()
-	c.dstQueue.StopWorkers()
 
 	if logservice.LS != nil {
 		_ = logservice.LS.Log("info", "Coordinator stopped", "coordinator", "main")
@@ -172,12 +163,33 @@ func (c *Coordinator) State() CoordinatorState {
 	return c.state
 }
 
-// roundMonitorLoop monitors queue states and advances rounds when queues complete a level.
-// Queues pull their own tasks, so coordinator only monitors for completion.
+// roundMonitorLoop waits for both queues to complete their traversals.
+// Queues manage their own round advancement, so coordinator just waits for exhaustion.
 func (c *Coordinator) roundMonitorLoop() {
 	defer c.wg.Done()
 
-	ticker := time.NewTicker(100 * time.Millisecond)
+	if logservice.LS != nil {
+		_ = logservice.LS.Log("info", "Waiting for src queue to complete...", "coordinator", "main")
+	}
+
+	// Wait for src queue to exhaust
+	c.waitForQueueCompletion(c.srcQueue, "src")
+
+	if logservice.LS != nil {
+		_ = logservice.LS.Log("info", "Src queue complete. Waiting for dst queue to complete...", "coordinator", "main")
+	}
+
+	// Wait for dst queue to exhaust
+	c.waitForQueueCompletion(c.dstQueue, "dst")
+
+	if logservice.LS != nil {
+		_ = logservice.LS.Log("info", "Migration complete! Both queues finished.", "coordinator", "main")
+	}
+}
+
+// waitForQueueCompletion blocks until the specified queue reaches exhausted state.
+func (c *Coordinator) waitForQueueCompletion(queue *Queue, queueName string) {
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -193,137 +205,83 @@ func (c *Coordinator) roundMonitorLoop() {
 				continue
 			}
 		case <-ticker.C:
-			c.mu.RLock()
-			if c.state == StateRunning {
-				c.mu.RUnlock()
-				c.checkRoundAdvancement()
-			} else {
-				c.mu.RUnlock()
+			if queue.IsExhausted() {
+				if logservice.LS != nil {
+					_ = logservice.LS.Log("info",
+						fmt.Sprintf("%s queue exhausted at round %d", queueName, queue.Round()),
+						"coordinator",
+						queueName)
+				}
+				return
 			}
 		}
 	}
 }
 
-// checkRoundAdvancement checks queue states and advances rounds when appropriate.
-func (c *Coordinator) checkRoundAdvancement() {
-	// Check src queue state
-	srcState := c.srcQueue.State()
+// AddWorkers creates and starts workers for the specified queue.
+// Workers run immediately and autonomously - they manage their own lifecycle.
+// queueName should be "src" or "dst".
+func (c *Coordinator) AddWorkers(queueName string, count int) error {
+	var queue *Queue
+	var ctx fsservices.ServiceContext
+	var tableName string
 
-	switch srcState {
-	case QueueStateRoundComplete:
-		// Round finished, advance to next
-		c.advanceSrcRound()
-	case QueueStateExhausted:
-		// Src traversal complete - log and do nothing
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("info", "Src traversal complete", "coordinator", "src")
-		}
+	switch queueName {
+	case "src":
+		queue = c.srcQueue
+		ctx = c.srcCtx
+		tableName = "src_nodes"
+	case "dst":
+		queue = c.dstQueue
+		ctx = c.dstCtx
+		tableName = "dst_nodes"
+	default:
+		return fmt.Errorf("invalid queue name: %s (expected 'src' or 'dst')", queueName)
 	}
 
-	// Check dst queue state
-	dstState := c.dstQueue.State()
-	srcRound := c.srcQueue.Round()
-	dstRound := c.dstQueue.Round()
-
-	// Dst can only advance if it's behind src
-	if dstRound >= srcRound {
-		return // Dst is caught up or ahead (shouldn't happen)
-	}
-
-	switch dstState {
-	case QueueStateRoundComplete:
-		// Round finished, advance to next
-		c.advanceDstRound()
-	case QueueStateExhausted:
-		// Dst traversal complete - log and do nothing
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("info", "Dst traversal complete", "coordinator", "dst")
-		}
-	}
-}
-
-// advanceSrcRound advances the src queue to the next round after flushing buffers.
-func (c *Coordinator) advanceSrcRound() {
-	currentRound := c.srcQueue.Round()
-
-	// Flush database buffers to ensure round completion is durable
-	c.flushDatabase()
-
-	// Advance to next round
-	c.srcQueue.SetRound(currentRound + 1)
-
-	if logservice.LS != nil {
-		_ = logservice.LS.Log(
-			"info",
-			fmt.Sprintf("Src queue advanced to round %d", currentRound+1),
-			"coordinator",
-			"src",
-		)
-	}
-}
-
-// advanceDstRound advances the dst queue to the next round after flushing buffers.
-func (c *Coordinator) advanceDstRound() {
-	currentRound := c.dstQueue.Round()
-
-	// Flush database buffers
-	c.flushDatabase()
-
-	// Advance to next round
-	c.dstQueue.SetRound(currentRound + 1)
-
-	if logservice.LS != nil {
-		_ = logservice.LS.Log(
-			"info",
-			fmt.Sprintf("Dst queue advanced to round %d", currentRound+1),
-			"coordinator",
-			"dst",
-		)
-	}
-}
-
-// flushDatabase forces all buffered DB writes to complete.
-func (c *Coordinator) flushDatabase() {
-	// Trigger a dummy query to force buffer flush (Query() flushes all buffers)
-	_, _ = c.db.Query("SELECT 1")
-}
-
-// AddSrcWorkers adds workers to the src queue.
-func (c *Coordinator) AddSrcWorkers(count int) {
 	for i := 0; i < count; i++ {
 		worker := NewTraversalWorker(
 			i,
-			c.srcQueue,
+			queue,
 			c.db,
-			c.srcCtx.Connector,
-			"src_nodes",
-			"src",
+			ctx.Connector,
+			tableName,
+			queueName,
 		)
-		c.srcQueue.AddWorker(worker)
+
+		// Register worker with queue (for reference/tracking)
+		queue.AddWorker(worker)
+
+		// Worker starts running immediately and manages itself
+		go worker.Run()
+
+		if logservice.LS != nil {
+			_ = logservice.LS.Log(
+				"info",
+				fmt.Sprintf("Worker %d started", i),
+				"queue",
+				queueName,
+			)
+		}
+	}
+
+	return nil
+}
+
+// QueueStats returns stats for the specified queue.
+// queueName should be "src" or "dst".
+func (c *Coordinator) QueueStats(queueName string) (QueueStats, error) {
+	switch queueName {
+	case "src":
+		return c.srcQueue.Stats(), nil
+	case "dst":
+		return c.dstQueue.Stats(), nil
+	default:
+		return QueueStats{}, fmt.Errorf("invalid queue name: %s (expected 'src' or 'dst')", queueName)
 	}
 }
 
-// AddDstWorkers adds workers to the dst queue.
-func (c *Coordinator) AddDstWorkers(count int) {
-	for i := 0; i < count; i++ {
-		worker := NewTraversalWorker(
-			i,
-			c.dstQueue,
-			c.db,
-			c.dstCtx.Connector,
-			"dst_nodes",
-			"dst",
-		)
-		c.dstQueue.AddWorker(worker)
-	}
-}
-
-// SrcQueueStats returns stats for the source queue.
-func (c *Coordinator) SrcQueueStats() QueueStats {
-	return c.srcQueue.Stats()
-}
-
-// DstQueueStats returns stats for the destination queue.
-func (c *Coordinator) DstQueueStats() QueueStats {
-	return c.dstQueue.Stats()
+// IsComplete returns true if both queues have exhausted their traversals.
+func (c *Coordinator) IsComplete() bool {
+	return c.srcQueue.IsExhausted() && c.dstQueue.IsExhausted()
 }
