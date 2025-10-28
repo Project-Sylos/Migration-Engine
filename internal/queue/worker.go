@@ -61,16 +61,13 @@ func NewTraversalWorker(
 // When queue is exhausted, the worker exits.
 func (w *TraversalWorker) Run() {
 	if logservice.LS != nil {
-		_ = logservice.LS.Log("debug", "Worker starting run loop", "worker", fmt.Sprintf("%s-worker-%d", w.queueName, w.id))
+		_ = logservice.LS.Log("info", "Worker started", "worker", fmt.Sprintf("%s-worker-%d", w.queueName, w.id))
 	}
 
 	for {
 		// Check lifecycle state first
 		if w.queue.IsPaused() {
 			// Queue is paused, sleep and continue polling
-			if logservice.LS != nil {
-				_ = logservice.LS.Log("debug", "Queue is paused, sleeping", "worker", fmt.Sprintf("%s-worker-%d", w.queueName, w.id))
-			}
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
@@ -78,27 +75,17 @@ func (w *TraversalWorker) Run() {
 		// Check if queue is exhausted (traversal complete) - exit worker
 		if w.queue.IsExhausted() {
 			if logservice.LS != nil {
-				_ = logservice.LS.Log("info", "Queue exhausted, worker exiting", "worker", fmt.Sprintf("%s-worker-%d", w.queueName, w.id))
+				_ = logservice.LS.Log("info", "Worker exiting - queue exhausted", "worker", fmt.Sprintf("%s-worker-%d", w.queueName, w.id))
 			}
 			return
 		}
 
 		// Try to lease a task from the queue
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug", "Attempting to lease task", "worker", fmt.Sprintf("%s-worker-%d", w.queueName, w.id))
-		}
 		task := w.queue.Lease()
 		if task == nil {
 			// No work available, sleep briefly before checking again
-			if logservice.LS != nil {
-				_ = logservice.LS.Log("debug", "No task available, sleeping 50ms", "worker", fmt.Sprintf("%s-worker-%d", w.queueName, w.id))
-			}
 			time.Sleep(50 * time.Millisecond)
 			continue
-		}
-
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("info", fmt.Sprintf("Leased task: %s", task.LocationPath()), "worker", fmt.Sprintf("%s-worker-%d", w.queueName, w.id))
 		}
 
 		// Execute the task
@@ -144,13 +131,13 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 		return w.executeDstComparison(task, result)
 	}
 
-	// Source mode: all discovered children get "pending" status
+	// Source mode: all discovered children get "Pending" status
 	task.DiscoveredChildren = make([]ChildResult, 0, len(result.Folders)+len(result.Files))
 
 	for _, childFolder := range result.Folders {
 		task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 			Folder: childFolder,
-			Status: "pending",
+			Status: "Pending",
 			IsFile: false,
 		})
 	}
@@ -158,7 +145,7 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 	for _, childFile := range result.Files {
 		task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 			File:   childFile,
-			Status: "successful", // Files are immediately successful (no traversal needed)
+			Status: "Successful", // Files are immediately successful (no traversal needed)
 			IsFile: true,
 		})
 	}
@@ -199,17 +186,17 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsse
 	// Compare folders
 	for _, expectedFolder := range expectedFolders {
 		if actualFolder, exists := actualFolderMap[expectedFolder.LocationPath]; exists {
-			// Folder exists on both: mark as "pending"
+			// Folder exists on both: mark as "Pending"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				Folder: actualFolder,
-				Status: "pending",
+				Status: "Pending",
 				IsFile: false,
 			})
 		} else {
-			// Folder missing from dst: mark as "missing"
+			// Folder missing from dst: mark as "Missing"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				Folder: expectedFolder,
-				Status: "missing",
+				Status: "Missing",
 				IsFile: false,
 			})
 		}
@@ -218,10 +205,10 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsse
 	// Check for extra folders on dst (not on src)
 	for _, actualFolder := range actualResult.Folders {
 		if _, exists := expectedFolderMap[actualFolder.LocationPath]; !exists {
-			// Folder exists on dst but not src: mark as "not_on_src"
+			// Folder exists on dst but not src: mark as "NotOnSrc"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				Folder: actualFolder,
-				Status: "not_on_src",
+				Status: "NotOnSrc",
 				IsFile: false,
 			})
 		}
@@ -230,17 +217,17 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsse
 	// Compare files
 	for _, expectedFile := range expectedFiles {
 		if actualFile, exists := actualFileMap[expectedFile.LocationPath]; exists {
-			// File exists on both: mark as "successful" (files don't need traversal)
+			// File exists on both: mark as "Successful" (files don't need traversal)
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				File:   actualFile,
-				Status: "successful",
+				Status: "Successful",
 				IsFile: true,
 			})
 		} else {
-			// File missing from dst: mark as "missing"
+			// File missing from dst: mark as "Missing"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				File:   expectedFile,
-				Status: "missing",
+				Status: "Missing",
 				IsFile: true,
 			})
 		}
@@ -249,10 +236,10 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsse
 	// Check for extra files on dst (not on src)
 	for _, actualFile := range actualResult.Files {
 		if _, exists := expectedFileMap[actualFile.LocationPath]; !exists {
-			// File exists on dst but not src: mark as "not_on_src"
+			// File exists on dst but not src: mark as "NotOnSrc"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				File:   actualFile,
-				Status: "not_on_src",
+				Status: "NotOnSrc",
 				IsFile: true,
 			})
 		}
@@ -267,8 +254,8 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsse
 func (w *TraversalWorker) writeResultsToDB(task *TaskBase) error {
 	folder := task.Folder
 
-	// Write 1: Update parent folder status to "successful"
-	updateQuery := fmt.Sprintf("UPDATE %s SET traversal_status = 'successful' WHERE id = ?", w.tableName)
+	// Write 1: Update parent folder status to "Successful"
+	updateQuery := fmt.Sprintf("UPDATE %s SET traversal_status = 'Successful' WHERE id = ?", w.tableName)
 	_, err := w.db.Conn().Exec(updateQuery, folder.Id)
 	if err != nil {
 		return fmt.Errorf("failed to update parent status: %w", err)
@@ -348,7 +335,7 @@ func (w *TraversalWorker) getFolderValues(folder fsservices.Folder, status strin
 			nil, // size (folders have no size)
 			folder.LastUpdated,
 			status,    // traversal_status
-			"pending", // copy_status
+			"Pending", // copy_status
 		}
 	} else {
 		return []any{
@@ -377,8 +364,8 @@ func (w *TraversalWorker) getFileValues(file fsservices.File, status string) []a
 			file.DepthLevel,
 			file.Size,
 			file.LastUpdated,
-			"successful", // traversal_status (files don't need traversal)
-			"pending",    // copy_status
+			"Successful", // traversal_status (files don't need traversal)
+			"Pending",    // copy_status
 		}
 	} else {
 		return []any{

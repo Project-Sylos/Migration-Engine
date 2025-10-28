@@ -83,16 +83,17 @@ func (q *Queue) Initialize(database *db.DB, tableName string, adapter fsservices
 		q.AddWorker(worker)
 		go worker.Run()
 
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug",
-				fmt.Sprintf("Worker %d started", i),
-				"queue",
-				q.name)
-		}
 	}
 
 	// Scenario 2: Initial pull when queue is created
-	q.pullTasks()
+	// DST queues should NOT pull on initialization - they wait for SRC to be ahead
+	if q.name != "dst" {
+		q.pullTasks()
+	} else {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("info", "DST queue initialized - waiting for SRC to advance before pulling tasks", "queue", q.name)
+		}
+	}
 }
 
 // Name returns the queue's name.
@@ -186,27 +187,14 @@ func (q *Queue) AddBatch(tasks []*TaskBase) int {
 func (q *Queue) Lease() *TaskBase {
 	q.mu.Lock()
 
-	if logservice.LS != nil {
-		_ = logservice.LS.Log("debug",
-			fmt.Sprintf("Lease called - state:%s pending:%d inProgress:%d", q.state, len(q.pending), len(q.inProgress)),
-			"queue",
-			q.name)
-	}
-
 	// Don't lease if paused or completed
 	if q.state == QueueStatePaused || q.state == QueueStateCompleted {
 		q.mu.Unlock()
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug", fmt.Sprintf("Cannot lease - state is %s", q.state), "queue", q.name)
-		}
 		return nil
 	}
 
 	if len(q.pending) == 0 {
 		q.mu.Unlock()
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug", "Cannot lease - no pending tasks", "queue", q.name)
-		}
 		return nil
 	}
 
@@ -218,10 +206,6 @@ func (q *Queue) Lease() *TaskBase {
 	task.Locked = true
 	id := task.Identifier()
 	q.inProgress[id] = task
-
-	if logservice.LS != nil {
-		_ = logservice.LS.Log("info", fmt.Sprintf("Leased task %s - now pending:%d inProgress:%d", id, len(q.pending), len(q.inProgress)), "queue", q.name)
-	}
 
 	// Scenario 1: Running low on tasks - pull more (if not completed)
 	totalActive := len(q.pending) + len(q.inProgress)
