@@ -59,10 +59,15 @@ func runTest() error {
 func runMigration(database *db.DB, spectraFS *sdk.SpectraFS) error {
 	// Start logging service
 	fmt.Println("Starting logging service...")
-	if err := logservice.StartListener("127.0.0.1:8080"); err != nil {
+	if err := logservice.StartListener("127.0.0.1:8081"); err != nil {
 		fmt.Printf("Warning: failed to start listener: %v\n", err)
 	}
 	time.Sleep(3 * time.Second)
+
+	// Initialize global logger
+	if err := logservice.InitGlobalLogger(database, "127.0.0.1:8081", "debug"); err != nil {
+		return fmt.Errorf("failed to initialize global logger: %w", err)
+	}
 	fmt.Println("✓ Log service started")
 	fmt.Println()
 

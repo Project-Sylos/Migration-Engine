@@ -83,8 +83,6 @@ func RunListener(addr string) error {
 	}
 	defer conn.Close()
 
-	fmt.Printf("[LogService] Listening for logs on %s...\n", addr)
-
 	buf := make([]byte, 4096)
 	for {
 		n, _, err := conn.ReadFromUDP(buf)

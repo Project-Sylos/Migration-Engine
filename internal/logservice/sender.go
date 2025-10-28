@@ -26,6 +26,12 @@ func InitGlobalLogger(dbInstance *db.DB, addr, level string) error {
 		return fmt.Errorf("failed to initialize global logger: %w", err)
 	}
 	LS = sender
+
+	// send a test log on the global logger
+	if err := LS.Log("info", "Test log", "test", "test"); err != nil {
+		return fmt.Errorf("failed to send test log: %w", err)
+	}
+
 	return nil
 }
 
@@ -75,8 +81,8 @@ func NewSender(dbInstance *db.DB, addr, level string) (*Sender, error) {
 	}
 	buf := new(bytes.Buffer)
 	
-	// Create a log buffer that flushes every 100 entries or every 2 seconds
-	logBuffer := db.NewLogBuffer(dbInstance.Conn(), 100, 2*time.Second)
+	// Create a log buffer that flushes every 1000 entries or every 2 seconds
+	logBuffer := db.NewLogBuffer(dbInstance.Conn(), 1000, 2*time.Second)
 	
 	return &Sender{
 		DB:         dbInstance,
