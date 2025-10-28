@@ -1,133 +1,296 @@
-# Task Queue System
+# Queue System
 
-The **Task Queue System** orchestrates parallel traversal and migration workloads within Sylos.
-It provides fault-tolerant leasing, retry management, and coordinated round control for both **source (src)** and **destination (dst)** traversal processes.
+The **Queue System** orchestrates parallel traversal and migration workloads within Sylos. It provides a self-managing, fault-tolerant task execution framework with automatic retry logic, coordinated round progression, and autonomous worker management.
 
 ---
 
 ## Overview
 
-Traversal in Sylos is breadth-first (BFS), performed in **rounds** that correspond to depth levels in each node tree.
-Each queue represents a pipeline of discrete, stateless work units (**tasks**) executed by worker goroutines.
-Two queues run concurrently:
+Traversal in Sylos follows a **breadth-first search (BFS)** pattern, performed in **rounds** that correspond to depth levels in the filesystem tree. The system runs two queues concurrently:
 
-* **Source Queue (src)** – Drives discovery; lists children from the source file system.
-* **Destination Queue (dst)** – Validates or creates destination nodes, always operating at least one round behind the source.
+* **Source Queue (src)** – Discovers and lists children from the source filesystem
+* **Destination Queue (dst)** – Validates destination nodes by comparing against source, always staying at least one round behind
 
-This design is *semi-coupled*:
-the destination’s progression depends on the source’s completion of the previous round, but the source can advance freely.
+The queues are **self-managing**: they create their own workers, pull tasks from the database when needed, coordinate round advancement, and handle their complete lifecycle without external orchestration.
+
+---
+
+## Architecture
+
+### Self-Managing Design
+
+The queue system uses a **direct instantiation** pattern with no coordinator:
+
+```go
+// Create source queue - workers start immediately
+srcQueue := queue.NewQueue("src", maxRetries, batchSize, workerCount)
+srcQueue.Initialize(database, "src_nodes", srcAdapter, nil, nil)
+
+// Create destination queue - workers start immediately, coordinated with src
+dstQueue := queue.NewQueue("dst", maxRetries, batchSize, workerCount)
+dstQueue.Initialize(database, "dst_nodes", dstAdapter, srcContext, srcQueue)
+
+// Wait for completion - queues manage themselves
+for !(srcQueue.IsExhausted() && dstQueue.IsExhausted()) {
+    srcStats := srcQueue.Stats()
+    dstStats := dstQueue.Stats()
+    fmt.Printf("Src: Round %d (P:%d IP:%d) | Dst: Round %d (P:%d IP:%d)\n",
+        srcStats.Round, srcStats.Pending, srcStats.InProgress,
+        dstStats.Round, dstStats.Pending, dstStats.InProgress)
+    time.Sleep(500 * time.Millisecond)
+}
+```
+
+**Key Benefits:**
+1. No coordinator or setup wrapper needed
+2. Queues are created and immediately operational
+3. Workers start autonomously and manage their own lifecycle
+4. Direct access to queue state and operations
 
 ---
 
 ## Core Components
 
-| File             | Purpose                                                                                           |
-| ---------------- | ------------------------------------------------------------------------------------------------- |
-| `task.go`        | Defines base task structures and specialized types (e.g. traversal, upload).                      |
-| `queue.go`       | Maintains pending/in-progress tasks, manages workers, pulls tasks from DB, and buffers results.   |
-| `worker.go`      | Executes tasks concurrently using shared filesystem adapters; reports results.                    |
-| `coordinator.go` | Manages queue lifecycles, monitors queue states, and coordinates round advancement.               |
+| File          | Purpose                                                                                |
+| ------------- | -------------------------------------------------------------------------------------- |
+| `queue.go`    | Self-managing queue with task leasing, event-driven DB pulling, and round coordination |
+| `worker.go`   | Autonomous workers that poll their queue, execute tasks, and write results to DB       |
+| `task.go`     | Task definitions and specialized types (traversal, upload, copy)                       |
+| `seeding.go`  | Initial task seeding functions for starting traversal                                  |
 
 ---
 
 ## Task Model
 
-Every unit of work derives from `TaskBase`:
+Every unit of work is represented by `TaskBase`:
 
 ```go
 type TaskBase struct {
-    Type               string          // "src-traversal", "dst-traversal", "upload", etc.
+    Type               TaskType         // TaskTypeSrcTraversal or TaskTypeDstTraversal
     Folder             fsservices.Folder
     File               fsservices.File
     Locked             bool
     Attempts           int
-    Status             string          // "successful" or "failed"
-    DiscoveredChildren []ChildResult   // Children found during traversal
-    ExpectedFolders    []Folder        // Expected child folders (for dst comparison)
-    ExpectedFiles      []File          // Expected child files (for dst comparison)
+    Status             string           // "successful" or "failed"
+    DiscoveredChildren []ChildResult    // Children found during traversal
+    ExpectedFolders    []Folder         // Expected child folders (dst comparison)
+    ExpectedFiles      []File           // Expected child files (dst comparison)
 }
 ```
 
-Workers lease tasks from the queue, mark them `Locked`, and attempt execution.
-On success or final failure, tasks are added to the queue's buffer with their execution results.
-Workers populate `DiscoveredChildren` during traversal, and the queue handles batch database writes during flush.
-
-Tasks are identified by **absolute paths** (`Id`) but reconciled logically by **root-relative paths** (`LocationPath`) shared between `src_nodes` and `dst_nodes` tables.
+**Task Lifecycle:**
+1. Task is pulled from DB and added to queue's pending list
+2. Worker calls `queue.Lease()` - task moves to in-progress
+3. Worker executes task (lists children via filesystem adapter)
+4. Worker writes results to DB:
+   - Updates parent status to "Successful"
+   - Batch inserts all discovered children
+5. Worker calls `queue.Complete(task)` - task removed from tracking
+6. If round is empty, queue auto-advances to next round
 
 ---
 
-## Leasing and Retry Behavior
+## Queue Lifecycle States
 
-* Tasks are **leased** when a worker begins execution and remain locked until the worker reports completion.
-* Failed tasks are retried up to a configurable limit (default: 3 attempts).
-* Leased task identifiers remain in the queue’s `TrackedIDs` list until completion, preventing re-querying of in-flight work.
-* This allows the coordinator to fetch new tasks using lightweight SQL such as
-  `WHERE path NOT IN (tracked_ids)`.
+Each queue maintains a `QueueState` to track its operational phase:
+
+| State           | Description                                                |
+| --------------- | ---------------------------------------------------------- |
+| `Running`       | Queue is active and processing tasks                       |
+| `Paused`        | Queue is paused; workers will not lease new tasks          |
+| `Stopped`       | Queue is stopped (reserved for explicit shutdown)          |
+| `Completed`     | Traversal complete (max depth reached, no more work)       |
+
+**State Transitions:**
+```
+Running → Paused (manual pause)
+Paused → Running (manual resume)
+Running → Completed (no tasks found after round advance)
+```
+
+---
+
+## Event-Driven Task Pulling
+
+Tasks are pulled from the database only when necessary, not on a continuous polling schedule:
+
+### Pull Triggers
+1. **Queue Initialization** – Initial pull when queue is created (src only; dst waits)
+2. **Running Low** – When `pending + inProgress < batchSize` during task leasing
+3. **Round Advancement** – After completing a round and advancing to the next
+
+### Concurrency Control
+- A `pulling` flag prevents concurrent DB queries
+- If a pull is already in progress, subsequent triggers are ignored
+- This ensures efficient DB usage without redundant queries
 
 ---
 
 ## Round Coordination
 
-Traversal proceeds in layers of depth:
+Traversal proceeds in synchronized depth layers:
 
 ```
 src round 0  → dst round 0
-src round 1  → dst waits
-src round 2  → dst round 1
+src round 1  → dst waits...
+src round 2  → dst round 1 (after src finishes round 1)
 ...
 ```
 
-* The **source queue** advances immediately when its current round completes.
-* The **destination queue** begins a round only after the source has fully completed (and flushed) the previous one.
-* When the source finishes all rounds, the destination runs freely to completion.
+### Source Queue
+- Advances immediately when current round completes (no pending, no in-progress)
+- Pulls tasks for new round from DB
+- If no tasks found, marks queue as `Completed`
 
-### Queue State Tracking
+### Destination Queue
+- **Waits for source** before advancing each round
+- Uses `waitForSrcRound()` to block until `srcQueue.Round() > dstQueue.Round()`
+- This ensures dst always has the expected children from src to compare against
 
-Each queue maintains a `QueueState` attribute to distinguish between different operational phases:
+### Completion Logic
+After advancing rounds, if no tasks are found:
+```go
+func (q *Queue) checkForCompletion(round int) {
+    if q.state == QueueStateRunning {
+        q.state = QueueStateCompleted
+        // Max depth reached - traversal complete
+    }
+}
+```
 
-* **`NeedsPull`** – Round just advanced; needs to query DB for tasks
-* **`Running`** – Has active tasks; currently processing
-* **`RoundComplete`** – All tasks in current round finished; ready to advance
-* **`Exhausted`** – No tasks found in DB; traversal complete
-
-This state tracking prevents premature round advancement and enables the coordinator to make intelligent decisions about when to progress through BFS layers.
+This ensures at least one round of work happens before declaring completion.
 
 ---
 
-## Buffering and Checkpointing
+## Workers
 
-Each queue owns its own **`db.Buffer`** instance for batching database operations.
-The buffer system provides:
+### Autonomous Workers
 
-* **Multi-channel batching** – Queues register sub-buffers for different operation types (e.g., "completed" tasks).
-* **Automatic flushing** – Buffers flush when item threshold is reached or when the flush timer expires.
-* **Clean separation** – Workers just report results; the buffer handles all batch writes asynchronously.
+Workers are created during `queue.Initialize()` and run independently:
 
-### Queue Buffer Operations
+```go
+func (w *TraversalWorker) Run() {
+    for {
+        if w.queue.IsPaused() {
+            time.Sleep(100 * time.Millisecond)
+            continue
+        }
+        
+        if w.queue.IsExhausted() {
+            return // Worker exits when queue completes
+        }
+        
+        task := w.queue.Lease()
+        if task == nil {
+            time.Sleep(50 * time.Millisecond)
+            continue
+        }
+        
+        // Execute and write results
+        err := w.execute(task)
+        if err != nil {
+            w.queue.Fail(task) // Retry or mark failed
+        } else {
+            w.writeResultsToDB(task) // Immediate DB writes
+            w.queue.Complete(task)
+        }
+    }
+}
+```
 
-When a task completes (successfully or after max retries), the queue adds it to the buffer via `buffer.Add("completed", task)`.
-The buffer automatically batches completed tasks and flushes them using a custom `FlushFunc` that:
+**Worker Characteristics:**
+- Poll their queue continuously
+- Respect queue lifecycle (pause/complete states)
+- Exit gracefully when queue is exhausted
+- No external start/stop management needed
 
-1. Groups parent tasks by status (`successful` vs `failed`)
-2. Performs batch `UPDATE` operations for parent traversal statuses
-3. Performs batch `INSERT` operations for all discovered children
+### Database Writes
 
-This design maximizes write efficiency while keeping the queue logic clean and maintainable.
+Workers perform **immediate database operations** after task execution:
 
-### Round Boundaries
+1. **Update Parent Status**:
+   ```sql
+   UPDATE src_nodes SET traversal_status = 'Successful' WHERE id = ?
+   ```
 
-Queue state transitions (`NeedsPull` → `Running` → `RoundComplete`) enable the coordinator to advance rounds deterministically.
-When a queue stops, its buffer performs a final flush, ensuring every BFS layer boundary corresponds to a durable state in DuckDB.
-If the system restarts, it can resume traversal from the last completed round.
+2. **Batch Insert Children**:
+   ```sql
+   INSERT INTO src_nodes VALUES (?, ?, ...), (?, ?, ...), ...
+   ```
+
+This direct write pattern ensures:
+- No buffering delays
+- Immediate visibility of results
+- Simple error handling
+- Clear causality (task → DB write → completion)
+
+---
+
+## Leasing and Retry Behavior
+
+### Task Leasing
+- Workers call `queue.Lease()` to obtain work
+- Task moves from `pending` to `inProgress`
+- Task's `Locked` flag is set to `true`
+- Identifier is added to `trackedIDs` to prevent re-querying
+
+### Retry Logic
+Failed tasks are automatically retried:
+```go
+func (q *Queue) Fail(task *TaskBase) bool {
+    task.Attempts++
+    if task.Attempts < q.maxRetries {
+        q.pending = append(q.pending, task) // Re-queue
+        return true // Will retry
+    }
+    // Max retries exceeded - task permanently failed
+    return false
+}
+```
+
+### Tracked IDs
+The `trackedIDs` map prevents pulling tasks that are already in-flight:
+```sql
+SELECT ... FROM src_nodes
+WHERE traversal_status = 'Pending'
+  AND depth_level = ?
+  AND id NOT IN ('tracked_id_1', 'tracked_id_2', ...)
+LIMIT ?
+```
+
+---
+
+## Task Types
+
+### Source Traversal (`TaskTypeSrcTraversal`)
+- Lists children of a folder from the source filesystem
+- All discovered children get status:
+  - Folders: `"Pending"` (need traversal)
+  - Files: `"Successful"` (no traversal needed)
+
+### Destination Traversal (`TaskTypeDstTraversal`)
+- Lists children from destination filesystem
+- Compares against expected children from source
+- Assigns comparison status:
+  - `"Pending"` – Folder exists on both src and dst
+  - `"Successful"` – File exists on both src and dst
+  - `"Missing"` – Item exists on src but not dst
+  - `"NotOnSrc"` – Item exists on dst but not src
 
 ---
 
 ## Concurrency Model
 
-* Each queue maintains its own worker pool.
-* Workers share common `fsservices.FS` adapters for efficient rate-limiting and caching.
-* Coordinators may scale worker count dynamically based on queue depth or throughput metrics.
-* Logging is fully asynchronous via the `logservice.Sender`, which mirrors messages to UDP and DuckDB.
+- Each queue owns its own worker pool (configured at creation)
+- Workers share filesystem adapters for efficient rate-limiting
+- All logging is asynchronous via `logservice.Sender` (UDP + DuckDB buffer)
+- Database writes are immediate but use batch inserts for children
+
+**Thread Safety:**
+- Queue operations protected by `sync.RWMutex`
+- Task leasing is atomic
+- State transitions are synchronized
+- No data races between workers
 
 ---
 
@@ -135,11 +298,23 @@ If the system restarts, it can resume traversal from the last completed round.
 
 The queue framework is designed to generalize beyond traversal:
 
-* **Upload / Copy Tasks** will reuse the same leasing and retry logic.
-* **Dynamic Scaling Policies** may adjust worker counts automatically.
-* **Pluggable Backends** (e.g., cloud storage adapters) can slot into the same worker interface.
+* **Upload/Copy Tasks** – Will reuse the same leasing and retry logic
+* **Dynamic Worker Scaling** – Adjust worker count based on queue depth
+* **Pluggable Adapters** – Cloud storage backends (S3, Azure, GCS)
+* **Priority Queues** – High-priority tasks for critical files
+* **Progress Checkpointing** – Resume from specific round after crash
 
 ---
 
-The queue package forms the backbone of Sylos’ concurrency model:
-a deterministic, recoverable, high-throughput engine for orchestrating two independent BFS traversals in a single migration pipeline.
+## Summary
+
+The queue system provides:
+- ✅ **Self-managing** – No coordinator needed, queues own their lifecycle
+- ✅ **Autonomous workers** – Poll continuously, respect state, exit gracefully
+- ✅ **Event-driven pulling** – Tasks pulled only when needed
+- ✅ **Coordinated rounds** – DST automatically waits for SRC
+- ✅ **Immediate DB writes** – No buffering delays, clear causality
+- ✅ **Fault tolerance** – Automatic retries, graceful failure handling
+- ✅ **Simple API** – Direct queue instantiation and interaction
+
+This design forms the backbone of Sylos' concurrency model: a deterministic, recoverable, high-throughput engine for orchestrating parallel BFS traversals in a single migration pipeline.
