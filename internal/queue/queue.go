@@ -26,21 +26,22 @@ const (
 // Queue maintains pending, in-progress task lists and uses a Buffer for batch writes.
 // It handles task leasing, retry logic, task pulling from DB, and coordinated flushing.
 type Queue struct {
-	name       string                     // Queue name ("src" or "dst")
-	mu         sync.RWMutex               // Protects all internal state
-	state      QueueState                 // Lifecycle state (running/paused/stopped/completed)
-	pending    []*TaskBase                // Tasks waiting to be leased
-	inProgress map[string]*TaskBase       // Tasks currently being executed (keyed by identifier)
-	trackedIDs map[string]bool            // All task IDs currently tracked (prevents re-querying)
-	maxRetries int                        // Maximum retry attempts per task
-	round      int                        // Current BFS round/depth level
-	batchSize  int                        // Number of tasks to fetch from DB per batch
-	workers    []Worker                   // Workers associated with this queue (for reference only)
-	pulling    bool                       // True when a pull is in progress (prevents concurrent pulls)
-	db         *db.DB                     // Database handle for task pulling
-	tableName  string                     // "src_nodes" or "dst_nodes"
-	srcCtx     *fsservices.ServiceContext // For dst queue: needed to query src nodes
-	srcQueue   *Queue                     // For dst queue: reference to src queue for round coordination
+	name                string                     // Queue name ("src" or "dst")
+	mu                  sync.RWMutex               // Protects all internal state
+	state               QueueState                 // Lifecycle state (running/paused/stopped/completed)
+	pending             []*TaskBase                // Tasks waiting to be leased
+	inProgress          map[string]*TaskBase       // Tasks currently being executed (keyed by identifier)
+	trackedIDs          map[string]bool            // All task IDs currently tracked (prevents re-querying)
+	maxRetries          int                        // Maximum retry attempts per task
+	round               int                        // Current BFS round/depth level
+	batchSize           int                        // Number of tasks to fetch from DB per batch
+	workers             []Worker                   // Workers associated with this queue (for reference only)
+	pulling             bool                       // True when a pull is in progress (prevents concurrent pulls)
+	pendingRoundAdvance bool                       // True when partial batch detected, waiting for tasks to complete before advancing
+	db                  *db.DB                     // Database handle for task pulling
+	tableName           string                     // "src_nodes" or "dst_nodes"
+	srcCtx              *fsservices.ServiceContext // For dst queue: needed to query src nodes
+	srcQueue            *Queue                     // For dst queue: reference to src queue for round coordination
 }
 
 // NewQueue creates a new Queue instance.
@@ -229,8 +230,16 @@ func (q *Queue) Complete(task *TaskBase) {
 	task.Locked = false
 	task.Status = "successful"
 
-	// Check if round is complete (no pending, no in-progress, not completed)
-	if q.state == QueueStateRunning && len(q.pending) == 0 && len(q.inProgress) == 0 {
+	// Check if we're waiting for round advance and all tasks are done
+	if q.pendingRoundAdvance && len(q.pending) == 0 && len(q.inProgress) == 0 {
+		q.pendingRoundAdvance = false // Reset flag - round will advance and reset pulling
+		q.mu.Unlock()
+		q.advanceToNextRound() // This will reset pulling flag
+		return
+	}
+
+	// Normal round completion check (for edge cases where we didn't detect partial batch)
+	if q.state == QueueStateRunning && len(q.pending) == 0 && len(q.inProgress) == 0 && !q.pendingRoundAdvance {
 		q.mu.Unlock()
 		q.markRoundComplete()
 		return
@@ -364,27 +373,31 @@ func (q *Queue) pullTasks() {
 		return
 	}
 
-	// Check if already pulling or completed (prevent concurrent pulls)
+	// Check if already pulling, waiting for round advance, or completed (prevent concurrent pulls)
 	q.mu.Lock()
-	if q.pulling || q.state == QueueStateCompleted {
+	if q.pulling || q.pendingRoundAdvance || q.state == QueueStateCompleted {
 		q.mu.Unlock()
 		return
 	}
 	q.pulling = true
+	requestedBatchSize := q.batchSize // Capture immutable batch size for comparison
 	q.mu.Unlock()
 
-	// Ensure we clear the pulling flag when done
+	// Ensure we clear the pulling flag when done (unless pendingRoundAdvance is set)
 	defer func() {
 		q.mu.Lock()
-		q.pulling = false
+		if !q.pendingRoundAdvance {
+			q.pulling = false
+		}
+		// If pendingRoundAdvance is true, pulling stays true to block more pulls
 		q.mu.Unlock()
 	}()
 
 	// Pull tasks based on queue type
 	if q.name == "src" {
-		q.pullSrcTasks()
+		q.pullSrcTasks(requestedBatchSize)
 	} else {
-		q.pullDstTasks()
+		q.pullDstTasks(requestedBatchSize)
 	}
 }
 
@@ -413,6 +426,8 @@ func (q *Queue) advanceToNextRound() {
 	q.mu.Lock()
 	q.round++
 	newRound := q.round
+	// Reset pulling flag so we can pull tasks for the new round
+	q.pulling = false
 	q.mu.Unlock()
 
 	if logservice.LS != nil {
@@ -468,7 +483,7 @@ func (q *Queue) waitForSrcRound() {
 }
 
 // pullSrcTasks queries src_nodes for pending folders at current round.
-func (q *Queue) pullSrcTasks() {
+func (q *Queue) pullSrcTasks(requestedBatchSize int) {
 	trackedIDs := q.TrackedIDs()
 	round := q.Round()
 
@@ -492,7 +507,7 @@ func (q *Queue) pullSrcTasks() {
 		  AND type = 'folder'
 		  %s
 		LIMIT %d
-	`, q.tableName, round, exclusionClause, q.batchSize)
+	`, q.tableName, round, exclusionClause, requestedBatchSize)
 
 	rows, err := q.db.Query(query)
 	if err != nil {
@@ -527,20 +542,36 @@ func (q *Queue) pullSrcTasks() {
 		})
 	}
 
+	pulledCount := len(tasks)
+
 	// Update state based on results
-	if len(tasks) > 0 {
+	if pulledCount > 0 {
 		added := q.AddBatch(tasks)
 		if logservice.LS != nil && added > 0 {
 			_ = logservice.LS.Log("debug", fmt.Sprintf("Pulled %d src tasks for round %d", added, round), "queue", q.name)
 		}
+
+		// Check if we got a partial batch (fewer than requested)
+		if pulledCount < requestedBatchSize {
+			q.mu.Lock()
+			q.pendingRoundAdvance = true
+			// pulling flag stays true (set in defer of pullTasks) until round advances
+			q.mu.Unlock()
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("info",
+					fmt.Sprintf("Partial batch detected (%d < %d) - will advance round after current tasks complete", pulledCount, requestedBatchSize),
+					"queue",
+					q.name)
+			}
+		}
 	} else {
-		// No tasks found after round advancement - check for completion
+		// No tasks found - check for completion
 		q.checkForCompletion(round)
 	}
 }
 
 // pullDstTasks queries dst_nodes and populates expected children from src_nodes.
-func (q *Queue) pullDstTasks() {
+func (q *Queue) pullDstTasks(requestedBatchSize int) {
 	if q.srcCtx == nil {
 		return // Need src context to query expected children
 	}
@@ -569,7 +600,7 @@ func (q *Queue) pullDstTasks() {
 		  AND type = 'folder'
 		  %s
 		LIMIT %d
-	`, q.tableName, round, exclusionClause, q.batchSize)
+	`, q.tableName, round, exclusionClause, requestedBatchSize)
 
 	rows, err := q.db.Query(query1)
 	if err != nil {
@@ -752,14 +783,30 @@ func (q *Queue) pullDstTasks() {
 		})
 	}
 
+	pulledCount := len(tasks)
+
 	// Update state based on results
-	if len(tasks) > 0 {
+	if pulledCount > 0 {
 		added := q.AddBatch(tasks)
 		if logservice.LS != nil && added > 0 {
 			_ = logservice.LS.Log("debug", fmt.Sprintf("Pulled %d dst tasks for round %d", added, round), "queue", q.name)
 		}
+
+		// Check if we got a partial batch (fewer than requested)
+		if pulledCount < requestedBatchSize {
+			q.mu.Lock()
+			q.pendingRoundAdvance = true
+			// pulling flag stays true (set in defer of pullTasks) until round advances
+			q.mu.Unlock()
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("info",
+					fmt.Sprintf("Partial batch detected (%d < %d) - will advance round after current tasks complete", pulledCount, requestedBatchSize),
+					"queue",
+					q.name)
+			}
+		}
 	} else {
-		// No tasks found after round advancement - check for completion
+		// No tasks found - check for completion
 		q.checkForCompletion(round)
 	}
 }
