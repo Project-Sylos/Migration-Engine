@@ -31,18 +31,18 @@ func StartListener(addr string) error {
 	case "windows":
 		// Spawn a new cmd window that runs the listener
 		cmd = exec.Command("C:\\Windows\\System32\\cmd.exe", "/C", "start", "cmd", "/K",
-			fmt.Sprintf("go run ../../../internal/logservice/main/spawn.go %s", addr))
+			fmt.Sprintf("go run internal/logservice/main/spawn.go %s", addr))
 	case "darwin":
 		// macOS: use Terminal.app
 		cmd = exec.Command("osascript", "-e",
-			fmt.Sprintf(`tell application "Terminal" to do script "cd %s && go run ../../../internal/logservice/main/spawn.go %s"`,
+			fmt.Sprintf(`tell application "Terminal" to do script "cd %s && go run internal/logservice/main/spawn.go %s"`,
 				getCurrentDir(), addr))
 	case "linux":
 		// Linux: try common terminal emulators
 		for _, term := range []string{"x-terminal-emulator", "gnome-terminal", "xterm"} {
 			if _, err := exec.LookPath(term); err == nil {
 				cmd = exec.Command(term, "-e",
-					fmt.Sprintf("bash -c 'cd %s && go run ../../../internal/logservice/main/spawn.go %s'",
+					fmt.Sprintf("bash -c 'cd %s && go run internal/logservice/main/spawn.go %s'",
 						getCurrentDir(), addr))
 				break
 			}

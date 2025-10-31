@@ -16,19 +16,27 @@ import (
 // SpectraFS implements FSAdapter for Spectra filesystem simulator.
 type SpectraFS struct {
 	fs     *sdk.SpectraFS
-	rootID string // The root node ID for this migration context
+	rootID string // The root node ID (now always "root" in single-table design)
+	world  string // The world name ("primary", "s1", "s2", etc.) for filtering queries
 }
 
 // NewSpectraFS constructs a new SpectraFS adapter.
-func NewSpectraFS(spectraFS *sdk.SpectraFS, rootPath string) (*SpectraFS, error) {
+// rootID is the node ID (typically "root"), and world is the world name ("primary", "s1", etc.).
+func NewSpectraFS(spectraFS *sdk.SpectraFS, rootID string, world string) (*SpectraFS, error) {
 	if spectraFS == nil {
 		return nil, fmt.Errorf("spectra filesystem instance cannot be nil")
 	}
 
-	// Validate that the root node exists
-	rootNode, err := spectraFS.GetNode(rootPath)
+	if world == "" {
+		world = "primary" // Default to primary world if not specified
+	}
+
+	// Validate that the root node exists using request struct
+	rootNode, err := spectraFS.GetNode(&sdk.GetNodeRequest{
+		ID: rootID,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("invalid root node ID '%s': %w", rootPath, err)
+		return nil, fmt.Errorf("invalid root node ID '%s': %w", rootID, err)
 	}
 
 	if rootNode.Type != NodeTypeFolder {
@@ -37,27 +45,30 @@ func NewSpectraFS(spectraFS *sdk.SpectraFS, rootPath string) (*SpectraFS, error)
 
 	return &SpectraFS{
 		fs:     spectraFS,
-		rootID: rootPath,
+		rootID: rootID,
+		world:  world,
 	}, nil
 }
 
-// relativize turns a Spectra node path into a logical relative path.
-func (s *SpectraFS) relativize(nodeID string, nodeName string) string {
-	if nodeID == s.rootID {
-		return "/"
+// relativize builds a relative path from the parent's path and the node name.
+func (s *SpectraFS) relativize(nodeName string, parentRelPath string) string {
+	// If parent is root, child path is /{childName}
+	if parentRelPath == "/" {
+		return "/" + nodeName
 	}
 
-	// For now, we'll use the node name as the relative path
-	// In a more sophisticated implementation, we might traverse up to build the full path
-	return "/" + nodeName
+	// Otherwise, build path as {parentRelPath}/{name}
+	return parentRelPath + "/" + nodeName
 }
 
 // ListChildren lists immediate children of the given node identifier (Spectra node ID).
 func (s *SpectraFS) ListChildren(identifier string) (ListResult, error) {
 	var result ListResult
 
-	// Get the node to verify it exists and is a folder
-	parentNode, err := s.fs.GetNode(identifier)
+	// Get the node to verify it exists and is a folder using request struct
+	parentNode, err := s.fs.GetNode(&sdk.GetNodeRequest{
+		ID: identifier,
+	})
 	if err != nil {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log(
@@ -74,8 +85,14 @@ func (s *SpectraFS) ListChildren(identifier string) (ListResult, error) {
 		return result, fmt.Errorf("node %s is not a folder", identifier)
 	}
 
-	// List children from Spectra
-	listResult, err := s.fs.ListChildren(identifier)
+	// Get the parent's relative path using the same pattern as LocalFS
+	parentRelPath := parentNode.ParentPath
+
+	// List children from Spectra using request struct with world filter
+	listResult, err := s.fs.ListChildren(&sdk.ListChildrenRequest{
+		ParentID:  identifier,
+		TableName: s.world, // Filter by world (e.g., "primary", "s1")
+	})
 	if err != nil {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log(
@@ -90,10 +107,11 @@ func (s *SpectraFS) ListChildren(identifier string) (ListResult, error) {
 
 	// Convert Spectra nodes to our internal format
 	for _, node := range listResult.Folders {
-		relPath := s.relativize(node.ID, node.Name)
+		relPath := s.relativize(node.Name, node.ParentPath)
 		result.Folders = append(result.Folders, Folder{
 			Id:           node.ID,
 			ParentId:     identifier,
+			ParentPath:   parentRelPath, // parent's relative path
 			DisplayName:  node.Name,
 			LocationPath: relPath,
 			LastUpdated:  node.LastUpdated.Format(time.RFC3339),
@@ -102,10 +120,11 @@ func (s *SpectraFS) ListChildren(identifier string) (ListResult, error) {
 		})
 	}
 	for _, node := range listResult.Files {
-		relPath := s.relativize(node.ID, node.Name)
+		relPath := s.relativize(node.Name, parentRelPath)
 		result.Files = append(result.Files, File{
 			Id:           node.ID,
 			ParentId:     identifier,
+			ParentPath:   parentRelPath, // parent's relative path
 			DisplayName:  node.Name,
 			LocationPath: relPath,
 			LastUpdated:  node.LastUpdated.Format(time.RFC3339),
@@ -118,7 +137,7 @@ func (s *SpectraFS) ListChildren(identifier string) (ListResult, error) {
 	if logservice.LS != nil {
 		_ = logservice.LS.Log(
 			"trace",
-			fmt.Sprintf("Listed %d folders, %d files in %s", len(result.Folders), len(result.Files), s.relativize(identifier, parentNode.Name)),
+			fmt.Sprintf("Listed %d folders, %d files in %s", len(result.Folders), len(result.Files), parentRelPath),
 			"fsservices",
 			"spectra",
 		)
@@ -149,8 +168,12 @@ func (s *SpectraFS) DownloadFile(identifier string) (io.ReadCloser, error) {
 
 // CreateFolder creates a new folder under the specified parent node.
 func (s *SpectraFS) CreateFolder(parentId, name string) (Folder, error) {
-	// Create folder in Spectra
-	node, err := s.fs.CreateFolder(parentId, name)
+	// Create folder in Spectra using request struct with world
+	node, err := s.fs.CreateFolder(&sdk.CreateFolderRequest{
+		ParentID:  parentId,
+		Name:      name,
+		TableName: s.world, // Create in the configured world
+	})
 	if err != nil {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log(
@@ -163,7 +186,10 @@ func (s *SpectraFS) CreateFolder(parentId, name string) (Folder, error) {
 		return Folder{}, err
 	}
 
-	relPath := s.relativize(node.ID, node.Name)
+	// Get parent's relative path
+	parentRelPath := node.ParentPath
+
+	relPath := s.relativize(node.Name, parentRelPath)
 
 	if logservice.LS != nil {
 		_ = logservice.LS.Log(
@@ -177,6 +203,7 @@ func (s *SpectraFS) CreateFolder(parentId, name string) (Folder, error) {
 	return Folder{
 		Id:           node.ID,
 		ParentId:     parentId,
+		ParentPath:   parentRelPath,
 		DisplayName:  node.Name,
 		LocationPath: relPath,
 		LastUpdated:  node.LastUpdated.Format(time.RFC3339),
@@ -204,8 +231,13 @@ func (s *SpectraFS) UploadFile(parentId string, content io.Reader) (File, error)
 	// Generate a name for the file (in a real scenario, this might come from metadata)
 	fileName := fmt.Sprintf("uploaded_file_%d", time.Now().Unix())
 
-	// Upload file to Spectra
-	node, err := s.fs.UploadFile(parentId, fileName, data)
+	// Upload file to Spectra using request struct with world
+	node, err := s.fs.UploadFile(&sdk.UploadFileRequest{
+		ParentID:  parentId,
+		Name:      fileName,
+		Data:      data,
+		TableName: s.world, // Upload to the configured world
+	})
 	if err != nil {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log(
@@ -218,7 +250,10 @@ func (s *SpectraFS) UploadFile(parentId string, content io.Reader) (File, error)
 		return File{}, err
 	}
 
-	relPath := s.relativize(node.ID, node.Name)
+	// Get parent's relative path
+	parentRelPath := node.ParentPath
+
+	relPath := s.relativize(node.Name, parentRelPath)
 
 	if logservice.LS != nil {
 		_ = logservice.LS.Log(
@@ -232,6 +267,7 @@ func (s *SpectraFS) UploadFile(parentId string, content io.Reader) (File, error)
 	return File{
 		Id:           node.ID,
 		ParentId:     parentId,
+		ParentPath:   parentRelPath,
 		DisplayName:  node.Name,
 		LocationPath: relPath,
 		LastUpdated:  node.LastUpdated.Format(time.RFC3339),

@@ -278,48 +278,20 @@ func (w *TraversalWorker) insertChildren(task *TaskBase) error {
 		return nil
 	}
 
-	// Build batch insert query
-	var values []any
-	var placeholders string
-
-	// Determine column count based on queue type
-	colCount := 9 // dst has 9 columns
-	if w.queueName == "src" {
-		colCount = 10 // src has 10 columns (includes copy_status)
-	}
-
-	for i, child := range task.DiscoveredChildren {
-		if i > 0 {
-			placeholders += ", "
-		}
-		placeholders += buildPlaceholderGroup(colCount)
-
+	rows := make([][]any, 0, len(task.DiscoveredChildren))
+	for _, child := range task.DiscoveredChildren {
 		if child.IsFile {
-			values = append(values, w.getFileValues(child.File, child.Status)...)
+			rows = append(rows, w.getFileValues(child.File, child.Status))
 		} else {
-			values = append(values, w.getFolderValues(child.Folder, child.Status)...)
+			rows = append(rows, w.getFolderValues(child.Folder, child.Status))
 		}
 	}
 
-	query := fmt.Sprintf("INSERT INTO %s VALUES %s", w.tableName, placeholders)
-	_, err := w.db.Conn().Exec(query, values...)
-	return err
-}
+	if err := w.db.BulkWrite(w.tableName, rows); err != nil {
+		return fmt.Errorf("failed to insert children: %w", err)
+	}
 
-// buildPlaceholderGroup creates "(?, ?, ?)" etc for SQL placeholders.
-func buildPlaceholderGroup(n int) string {
-	if n <= 0 {
-		return "()"
-	}
-	s := "("
-	for i := 0; i < n; i++ {
-		if i > 0 {
-			s += ", "
-		}
-		s += "?"
-	}
-	s += ")"
-	return s
+	return nil
 }
 
 // getFolderValues returns the values slice for a folder insert.
@@ -330,6 +302,7 @@ func (w *TraversalWorker) getFolderValues(folder fsservices.Folder, status strin
 			folder.ParentId,
 			folder.DisplayName,
 			folder.LocationPath,
+			folder.ParentPath, // parent_path column
 			fsservices.NodeTypeFolder,
 			folder.DepthLevel,
 			nil, // size (folders have no size)
@@ -343,6 +316,7 @@ func (w *TraversalWorker) getFolderValues(folder fsservices.Folder, status strin
 			folder.ParentId,
 			folder.DisplayName,
 			folder.LocationPath,
+			folder.ParentPath, // parent_path column
 			fsservices.NodeTypeFolder,
 			folder.DepthLevel,
 			nil, // size
@@ -360,6 +334,7 @@ func (w *TraversalWorker) getFileValues(file fsservices.File, status string) []a
 			file.ParentId,
 			file.DisplayName,
 			file.LocationPath,
+			file.ParentPath, // parent_path column
 			fsservices.NodeTypeFile,
 			file.DepthLevel,
 			file.Size,
@@ -373,6 +348,7 @@ func (w *TraversalWorker) getFileValues(file fsservices.File, status string) []a
 			file.ParentId,
 			file.DisplayName,
 			file.LocationPath,
+			file.ParentPath, // parent_path column
 			fsservices.NodeTypeFile,
 			file.DepthLevel,
 			file.Size,

@@ -23,6 +23,7 @@ func SeedRootTask(database *db.DB, tableName string, rootFolder fsservices.Folde
 			rootFolder.ParentId,     // parent_id (empty for root)
 			rootFolder.DisplayName,  // name
 			rootFolder.LocationPath, // path
+			"",                      // ParentPatharent_path
 			rootFolder.Type,         // type
 			0,                       // depth_level (root is always 0)
 			nil,                     // size (folders have no size)
@@ -41,6 +42,7 @@ func SeedRootTask(database *db.DB, tableName string, rootFolder fsservices.Folde
 			rootFolder.ParentId,     // parent_id (empty for root)
 			rootFolder.DisplayName,  // name
 			rootFolder.LocationPath, // path
+			"",                      // parent_path
 			rootFolder.Type,         // type
 			0,                       // depth_level (root is always 0)
 			nil,                     // size (folders have no size)

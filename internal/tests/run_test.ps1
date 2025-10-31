@@ -1,8 +1,8 @@
-# Spectra Migration Test Runner
+# Sylos Migration Test Runner
 # Copyright 2025 Sylos contributors
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-Write-Host "=== Spectra Migration Test Runner ===" -ForegroundColor Cyan
+Write-Host "=== Sylos Migration Test Runner ===" -ForegroundColor Cyan
 Write-Host ""
 
 # Clean up existing test databases
