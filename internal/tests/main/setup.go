@@ -4,8 +4,8 @@
 package main
 
 import (
-	"os"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/internal/db"
@@ -20,11 +20,11 @@ func setupTest() (*db.DB, *sdk.SpectraFS, error) {
 	fmt.Println("Creating database...")
 
 	// if the database file exists, remove it
-	if _, err := os.Stat("migration_test.duckdb"); err == nil {
-		os.Remove("migration_test.duckdb")
+	if _, err := os.Stat("internal/tests/migration_test.duckdb"); err == nil {
+		os.Remove("internal/tests/migration_test.duckdb")
 	}
 
-	database, err := db.NewDB("migration_test.duckdb")
+	database, err := db.NewDB("internal/tests/migration_test.duckdb")
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create database: %w", err)
 	}
@@ -48,11 +48,11 @@ func setupTest() (*db.DB, *sdk.SpectraFS, error) {
 	fmt.Println("Initializing Spectra filesystem...")
 
 	// if the spectra db file exists, remove it
-	if _, err := os.Stat("spectra.db"); err == nil {
-		os.Remove("spectra.db")
+	if _, err := os.Stat("internal/tests/spectra.db"); err == nil {
+		os.Remove("internal/tests/spectra.db")
 	}
 
-	spectraFS, err := sdk.New("../../configs/spectra.json")
+	spectraFS, err := sdk.New("internal/configs/spectra.json")
 	if err != nil {
 		database.Close()
 		return nil, nil, fmt.Errorf("failed to create Spectra: %w", err)
@@ -91,13 +91,17 @@ func setupTest() (*db.DB, *sdk.SpectraFS, error) {
 
 // seedRootTasks inserts the initial root folders into the database
 func seedRootTasks(database *db.DB, spectraFS *sdk.SpectraFS) error {
-	// Get root nodes from Spectra
-	srcRoot, err := spectraFS.GetNode("p-root")
+	// Get root nodes from Spectra using request structs
+	srcRoot, err := spectraFS.GetNode(&sdk.GetNodeRequest{
+		ID: "root",
+	})
 	if err != nil {
 		return fmt.Errorf("failed to get src root from Spectra: %w", err)
 	}
 
-	dstRoot, err := spectraFS.GetNode("s1-root")
+	dstRoot, err := spectraFS.GetNode(&sdk.GetNodeRequest{
+		ID: "root",
+	})
 	if err != nil {
 		return fmt.Errorf("failed to get dst root from Spectra: %w", err)
 	}

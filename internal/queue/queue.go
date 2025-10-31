@@ -183,8 +183,9 @@ func (q *Queue) AddBatch(tasks []*TaskBase) int {
 	return added
 }
 
-// Lease attempts to lease a task for execution.
+// Lease attempts to lease a task for execution atomically.
 // Returns nil if no tasks are available, queue is paused, or completed.
+// The task is atomically removed from pending and moved to in-progress with the mutex held.
 func (q *Queue) Lease() *TaskBase {
 	q.mu.Lock()
 
@@ -199,20 +200,21 @@ func (q *Queue) Lease() *TaskBase {
 		return nil
 	}
 
-	// Pop from front (FIFO)
+	// Atomically pop from front (FIFO) and move to in-progress
 	task := q.pending[0]
 	q.pending = q.pending[1:]
 
-	// Mark as locked and move to in-progress
+	// Mark as locked and move to in-progress (task ID already in trackedIDs from Add/AddBatch)
 	task.Locked = true
 	id := task.Identifier()
 	q.inProgress[id] = task
 
-	// Scenario 1: Running low on tasks - pull more (if not completed)
+	// Check if we should trigger a pull
 	totalActive := len(q.pending) + len(q.inProgress)
 	shouldPull := totalActive < q.batchSize && q.state == QueueStateRunning
 	q.mu.Unlock()
 
+	// Trigger pull after releasing lock
 	if shouldPull {
 		go q.pullTasks()
 	}
@@ -248,7 +250,8 @@ func (q *Queue) Complete(task *TaskBase) {
 }
 
 // Fail handles a failed task. If retry limit is not exceeded, re-queues the task.
-// Otherwise, adds it to buffer with failed status.
+// Otherwise, marks it as failed and removes from tracking.
+// Also checks for round completion when all tasks are exhausted (succeeded or failed).
 func (q *Queue) Fail(task *TaskBase) bool {
 	q.mu.Lock()
 	id := task.Identifier()
@@ -259,20 +262,34 @@ func (q *Queue) Fail(task *TaskBase) bool {
 
 	// Check if we should retry
 	if task.Attempts < q.maxRetries {
-		// Re-queue for retry
+		// Re-queue for retry (don't check round completion here since task is back in queue)
 		task.Locked = false
 		q.pending = append(q.pending, task)
 		q.mu.Unlock()
 		return true // Will retry
 	}
 
-	// Max retries exceeded
+	// Max retries exceeded - remove from tracking immediately
 	delete(q.trackedIDs, id)
-	q.mu.Unlock()
-
 	task.Locked = false
 	task.Status = "failed"
 
+	// Check if we're waiting for round advance and all tasks are done
+	if q.pendingRoundAdvance && len(q.pending) == 0 && len(q.inProgress) == 0 {
+		q.pendingRoundAdvance = false // Reset flag - round will advance and reset pulling
+		q.mu.Unlock()
+		q.advanceToNextRound() // This will reset pulling flag
+		return false
+	}
+
+	// Normal round completion check (for edge cases where we didn't detect partial batch)
+	if q.state == QueueStateRunning && len(q.pending) == 0 && len(q.inProgress) == 0 && !q.pendingRoundAdvance {
+		q.mu.Unlock()
+		q.markRoundComplete()
+		return false
+	}
+
+	q.mu.Unlock()
 	return false // Will not retry
 }
 
@@ -500,7 +517,7 @@ func (q *Queue) pullSrcTasks(requestedBatchSize int) {
 	}
 
 	query := fmt.Sprintf(`
-		SELECT id, parent_id, name, path, type, depth_level, last_updated
+		SELECT id, parent_id, name, path, parent_path, type, depth_level, last_updated
 		FROM %s
 		WHERE traversal_status = 'Pending'
 		  AND depth_level = %d
@@ -520,10 +537,10 @@ func (q *Queue) pullSrcTasks(requestedBatchSize int) {
 
 	var tasks []*TaskBase
 	for rows.Next() {
-		var id, parentId, name, path, nodeType, lastUpdated string
+		var id, parentId, name, path, parentPath, nodeType, lastUpdated string
 		var depthLevel int
 
-		err := rows.Scan(&id, &parentId, &name, &path, &nodeType, &depthLevel, &lastUpdated)
+		err := rows.Scan(&id, &parentId, &name, &path, &parentPath, &nodeType, &depthLevel, &lastUpdated)
 		if err != nil {
 			continue
 		}
@@ -535,6 +552,7 @@ func (q *Queue) pullSrcTasks(requestedBatchSize int) {
 				ParentId:     parentId,
 				DisplayName:  name,
 				LocationPath: path,
+				ParentPath:   parentPath,
 				LastUpdated:  lastUpdated,
 				DepthLevel:   depthLevel,
 				Type:         nodeType,
@@ -593,7 +611,7 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 
 	// Query 1: Get dst parent nodes
 	query1 := fmt.Sprintf(`
-		SELECT id, parent_id, name, path, type, depth_level, last_updated
+		SELECT id, parent_id, name, path, parent_path, type, depth_level, last_updated
 		FROM %s
 		WHERE traversal_status = 'Pending'
 		  AND depth_level = %d
@@ -615,6 +633,7 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 		parentId    string
 		name        string
 		path        string
+		parentPath  string
 		nodeType    string
 		depthLevel  int
 		lastUpdated string
@@ -625,7 +644,7 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 
 	for rows.Next() {
 		var node dstNode
-		err := rows.Scan(&node.id, &node.parentId, &node.name, &node.path, &node.nodeType, &node.depthLevel, &node.lastUpdated)
+		err := rows.Scan(&node.id, &node.parentId, &node.name, &node.path, &node.parentPath, &node.nodeType, &node.depthLevel, &node.lastUpdated)
 		if err != nil {
 			continue
 		}
@@ -638,7 +657,7 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 		return
 	}
 
-	// Query 2: Get corresponding src parent nodes by path
+	// Query 2: Get src children directly by parent_path (optimized to 2 queries instead of 3)
 	pathsClause := ""
 	for i, path := range dstPaths {
 		if i > 0 {
@@ -648,53 +667,12 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 	}
 
 	query2 := fmt.Sprintf(`
-		SELECT id, path
+		SELECT id, parent_id, name, path, parent_path, type, depth_level, size, last_updated
 		FROM src_nodes
-		WHERE path IN (%s)
+		WHERE parent_path IN (%s)
 	`, pathsClause)
 
 	rows, err = q.db.Query(query2)
-	if err != nil {
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to query src parents: %v", err), "queue", q.name)
-		}
-		return
-	}
-
-	srcParentIDs := make([]string, 0)
-	pathToSrcID := make(map[string]string)
-
-	for rows.Next() {
-		var srcID, srcPath string
-		err := rows.Scan(&srcID, &srcPath)
-		if err != nil {
-			continue
-		}
-		srcParentIDs = append(srcParentIDs, srcID)
-		pathToSrcID[srcPath] = srcID
-	}
-	rows.Close()
-
-	if len(srcParentIDs) == 0 {
-		return
-	}
-
-	// Query 3: Get all src children for these parents
-	parentIDsClause := ""
-	for i, id := range srcParentIDs {
-		if i > 0 {
-			parentIDsClause += ", "
-		}
-		parentIDsClause += fmt.Sprintf("'%s'", id)
-	}
-
-	query3 := fmt.Sprintf(`
-		SELECT id, parent_id, name, path, type, depth_level, size, last_updated
-		FROM src_nodes
-		WHERE parent_id IN (%s)
-	`, parentIDsClause)
-
-	rows, err = q.db.Query(query3)
 	if err != nil {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to query src children: %v", err), "queue", q.name)
@@ -702,15 +680,15 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 		return
 	}
 
-	// Group children by parent_id
-	childrenByParent := make(map[string][]any)
+	// Group children by parent_path (instead of parent_id)
+	childrenByParentPath := make(map[string][]any)
 
 	for rows.Next() {
-		var id, parentId, name, path, nodeType, lastUpdated string
+		var id, parentId, name, path, parentPath, nodeType, lastUpdated string
 		var depthLevel int
 		var size *int64
 
-		err := rows.Scan(&id, &parentId, &name, &path, &nodeType, &depthLevel, &size, &lastUpdated)
+		err := rows.Scan(&id, &parentId, &name, &path, &parentPath, &nodeType, &depthLevel, &size, &lastUpdated)
 		if err != nil {
 			continue
 		}
@@ -719,17 +697,19 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 			folder := fsservices.Folder{
 				Id:           id,
 				ParentId:     parentId,
+				ParentPath:   parentPath,
 				DisplayName:  name,
 				LocationPath: path,
 				LastUpdated:  lastUpdated,
 				DepthLevel:   depthLevel,
 				Type:         nodeType,
 			}
-			childrenByParent[parentId] = append(childrenByParent[parentId], folder)
+			childrenByParentPath[parentPath] = append(childrenByParentPath[parentPath], folder)
 		} else {
 			file := fsservices.File{
 				Id:           id,
 				ParentId:     parentId,
+				ParentPath:   parentPath,
 				DisplayName:  name,
 				LocationPath: path,
 				LastUpdated:  lastUpdated,
@@ -740,7 +720,7 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 			if size != nil {
 				file.Size = *size
 			}
-			childrenByParent[parentId] = append(childrenByParent[parentId], file)
+			childrenByParentPath[parentPath] = append(childrenByParentPath[parentPath], file)
 		}
 	}
 	rows.Close()
@@ -748,12 +728,8 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 	// Build tasks with expected children
 	var tasks []*TaskBase
 	for _, dstNode := range dstNodes {
-		srcParentID, ok := pathToSrcID[dstNode.path]
-		if !ok {
-			continue
-		}
-
-		children := childrenByParent[srcParentID]
+		// Match children directly by parent_path (dst node's path)
+		children := childrenByParentPath[dstNode.path]
 
 		var expectedFolders []fsservices.Folder
 		var expectedFiles []fsservices.File

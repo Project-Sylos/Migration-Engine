@@ -4,6 +4,8 @@
 package db
 
 import (
+	"fmt"
+	"strings"
 	"context"
 	"database/sql"
 	"sync"
@@ -68,8 +70,60 @@ func (db *DB) Query(query string, args ...any) (*sql.Rows, error) {
 func (db *DB) Write(table string, args ...any) error {
 	colCount := len(args)
 	query := "INSERT INTO " + table + " VALUES " + buildPlaceholderGroup(colCount)
-	_, err := db.conn.ExecContext(db.ctx, query, args...)
-	return err
+	res, err := db.conn.ExecContext(db.ctx, query, args...)
+	if err != nil {
+		fmt.Printf("[DB ERROR] Failed to insert into %s: %v\nQuery: %s\nArgs: %v\n", table, err, query, args)
+		return err
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		fmt.Printf("[DB WARNING] Insert into %s affected 0 rows (query may have been ignored)\nQuery: %s\n", table, query)
+	}
+	return nil
+}
+
+// BulkWrite inserts multiple rows into a table in one statement.
+// Each inner slice in rows is a full row of column values.
+func (db *DB) BulkWrite(table string, rows [][]any) error {
+	if len(rows) == 0 {
+		return nil
+	}
+
+	colCount := len(rows[0])
+	for i, row := range rows {
+		if len(row) != colCount {
+			return fmt.Errorf("[DB ERROR] BulkWrite: row %d has %d columns, expected %d", i, len(row), colCount)
+		}
+	}
+
+	// Build "(?, ?, ?), (?, ?, ?), ..." placeholder string
+	group := buildPlaceholderGroup(colCount)
+	var groups []string
+	for range rows {
+		groups = append(groups, group)
+	}
+
+	query := fmt.Sprintf("INSERT INTO %s VALUES %s", table, strings.Join(groups, ", "))
+
+	// Flatten [][]any into []any for Exec()
+	allArgs := make([]any, 0, len(rows)*colCount)
+	for _, row := range rows {
+		allArgs = append(allArgs, row...)
+	}
+
+	res, err := db.conn.ExecContext(db.ctx, query, allArgs...)
+	if err != nil {
+		fmt.Printf("[DB ERROR] Bulk insert into %s failed: %v\nQuery: %s\nArgs len: %d\n", table, err, query, len(allArgs))
+		return err
+	}
+
+	if n, _ := res.RowsAffected(); n > 0 {
+	} else {
+		// print out the query and args it was trying to do for debugging purposes
+		fmt.Printf("[DB DEBUG] Query: %s\nArgs: %v\n", query, allArgs)
+		fmt.Printf("[DB WARN] Bulk insert into %s affected 0 rows (possible duplicates)\n", table)
+	}
+	return nil
 }
 
 // buildPlaceholderGroup creates "(?, ?, ?)" etc.

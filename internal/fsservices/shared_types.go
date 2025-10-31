@@ -16,6 +16,7 @@ const (
 type Folder struct {
 	Id           string
 	ParentId     string
+	ParentPath   string // The parent's relative path (root-relative)
 	DisplayName  string
 	LocationPath string
 	LastUpdated  string
@@ -33,6 +34,7 @@ func (f Folder) NodeType() string { return f.Type }
 type File struct {
 	Id           string
 	ParentId     string
+	ParentPath   string // The parent's relative path (root-relative)
 	DisplayName  string
 	LocationPath string
 	LastUpdated  string

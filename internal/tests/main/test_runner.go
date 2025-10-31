@@ -73,12 +73,14 @@ func runMigration(database *db.DB, spectraFS *sdk.SpectraFS) error {
 
 	// Create filesystem adapters
 	fmt.Println("Creating filesystem adapters...")
-	srcAdapter, err := fsservices.NewSpectraFS(spectraFS, "p-root")
+	// Source uses "primary" world, destination uses "s1" world
+	// Both use the same root ID "root" but filter by different worlds
+	srcAdapter, err := fsservices.NewSpectraFS(spectraFS, "root", "primary")
 	if err != nil {
 		return fmt.Errorf("failed to create src adapter: %w", err)
 	}
 
-	dstAdapter, err := fsservices.NewSpectraFS(spectraFS, "s1-root")
+	dstAdapter, err := fsservices.NewSpectraFS(spectraFS, "root", "s1")
 	if err != nil {
 		return fmt.Errorf("failed to create dst adapter: %w", err)
 	}
