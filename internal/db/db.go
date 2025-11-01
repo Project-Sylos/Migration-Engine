@@ -113,7 +113,7 @@ func (db *DB) BulkWrite(table string, rows [][]any) error {
 
 	res, err := db.conn.ExecContext(db.ctx, query, allArgs...)
 	if err != nil {
-		fmt.Printf("[DB ERROR] Bulk insert into %s failed: %v\nQuery: %s\nArgs len: %d\n", table, err, query, len(allArgs))
+		fmt.Printf("[DB ERROR] Bulk insert into %s failed: %v\nQuery: %s\nArgs len: %d\n", table, err, query, allArgs)
 		return err
 	}
 

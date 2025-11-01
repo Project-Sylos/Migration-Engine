@@ -50,17 +50,6 @@ func NewSpectraFS(spectraFS *sdk.SpectraFS, rootID string, world string) (*Spect
 	}, nil
 }
 
-// relativize builds a relative path from the parent's path and the node name.
-func (s *SpectraFS) relativize(nodeName string, parentRelPath string) string {
-	// If parent is root, child path is /{childName}
-	if parentRelPath == "/" {
-		return "/" + nodeName
-	}
-
-	// Otherwise, build path as {parentRelPath}/{name}
-	return parentRelPath + "/" + nodeName
-}
-
 // ListChildren lists immediate children of the given node identifier (Spectra node ID).
 func (s *SpectraFS) ListChildren(identifier string) (ListResult, error) {
 	var result ListResult
@@ -85,8 +74,6 @@ func (s *SpectraFS) ListChildren(identifier string) (ListResult, error) {
 		return result, fmt.Errorf("node %s is not a folder", identifier)
 	}
 
-	// Get the parent's relative path using the same pattern as LocalFS
-	parentRelPath := parentNode.ParentPath
 
 	// List children from Spectra using request struct with world filter
 	listResult, err := s.fs.ListChildren(&sdk.ListChildrenRequest{
@@ -107,26 +94,24 @@ func (s *SpectraFS) ListChildren(identifier string) (ListResult, error) {
 
 	// Convert Spectra nodes to our internal format
 	for _, node := range listResult.Folders {
-		relPath := s.relativize(node.Name, node.ParentPath)
 		result.Folders = append(result.Folders, Folder{
 			Id:           node.ID,
 			ParentId:     identifier,
-			ParentPath:   parentRelPath, // parent's relative path
+			ParentPath:   node.ParentPath,
 			DisplayName:  node.Name,
-			LocationPath: relPath,
+			LocationPath: node.Path,
 			LastUpdated:  node.LastUpdated.Format(time.RFC3339),
 			DepthLevel:   node.DepthLevel,
 			Type:         NodeTypeFolder,
 		})
 	}
 	for _, node := range listResult.Files {
-		relPath := s.relativize(node.Name, parentRelPath)
 		result.Files = append(result.Files, File{
 			Id:           node.ID,
 			ParentId:     identifier,
-			ParentPath:   parentRelPath, // parent's relative path
+			ParentPath:   node.ParentPath, // parent's relative path
 			DisplayName:  node.Name,
-			LocationPath: relPath,
+			LocationPath: node.Path,
 			LastUpdated:  node.LastUpdated.Format(time.RFC3339),
 			Size:         node.Size,
 			DepthLevel:   node.DepthLevel,
@@ -137,7 +122,7 @@ func (s *SpectraFS) ListChildren(identifier string) (ListResult, error) {
 	if logservice.LS != nil {
 		_ = logservice.LS.Log(
 			"trace",
-			fmt.Sprintf("Listed %d folders, %d files in %s", len(result.Folders), len(result.Files), parentRelPath),
+			fmt.Sprintf("Listed %d folders, %d files in %s", len(result.Folders), len(result.Files), identifier),
 			"fsservices",
 			"spectra",
 		)
@@ -186,15 +171,11 @@ func (s *SpectraFS) CreateFolder(parentId, name string) (Folder, error) {
 		return Folder{}, err
 	}
 
-	// Get parent's relative path
-	parentRelPath := node.ParentPath
-
-	relPath := s.relativize(node.Name, parentRelPath)
 
 	if logservice.LS != nil {
 		_ = logservice.LS.Log(
 			"info",
-			fmt.Sprintf("Created folder %s", relPath),
+			fmt.Sprintf("Created folder %s", strings.Join([]string{node.ParentPath, node.Name}, "/")),
 			"fsservices",
 			"spectra",
 		)
@@ -203,9 +184,9 @@ func (s *SpectraFS) CreateFolder(parentId, name string) (Folder, error) {
 	return Folder{
 		Id:           node.ID,
 		ParentId:     parentId,
-		ParentPath:   parentRelPath,
+		ParentPath:   node.ParentPath,
 		DisplayName:  node.Name,
-		LocationPath: relPath,
+		LocationPath: node.Path,
 		LastUpdated:  node.LastUpdated.Format(time.RFC3339),
 		DepthLevel:   node.DepthLevel,
 		Type:         NodeTypeFolder,
@@ -250,15 +231,10 @@ func (s *SpectraFS) UploadFile(parentId string, content io.Reader) (File, error)
 		return File{}, err
 	}
 
-	// Get parent's relative path
-	parentRelPath := node.ParentPath
-
-	relPath := s.relativize(node.Name, parentRelPath)
-
 	if logservice.LS != nil {
 		_ = logservice.LS.Log(
 			"info",
-			fmt.Sprintf("Uploaded file %s (%d bytes)", relPath, len(data)),
+			fmt.Sprintf("Uploaded file %s (%d bytes)", node.Path, len(data)),
 			"fsservices",
 			"spectra",
 		)
@@ -267,9 +243,9 @@ func (s *SpectraFS) UploadFile(parentId string, content io.Reader) (File, error)
 	return File{
 		Id:           node.ID,
 		ParentId:     parentId,
-		ParentPath:   parentRelPath,
+		ParentPath:   node.ParentPath,
 		DisplayName:  node.Name,
-		LocationPath: relPath,
+		LocationPath: node.Path,
 		LastUpdated:  node.LastUpdated.Format(time.RFC3339),
 		Size:         node.Size,
 		DepthLevel:   node.DepthLevel,
