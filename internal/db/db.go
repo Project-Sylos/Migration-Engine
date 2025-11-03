@@ -5,10 +5,12 @@ package db
 
 import (
 	"fmt"
+	"time"
+	"sync"
 	"strings"
 	"context"
 	"database/sql"
-	"sync"
+	_ "github.com/marcboeker/go-duckdb"
 )
 
 // TableDef is implemented by every table definition struct in tables.go.
@@ -26,12 +28,24 @@ type DB struct {
 	tables map[string]TableDef
 }
 
-// NewDB opens a new DuckDB connection and prepares the registry.
+// NewDB opens a new DB connection and prepares the registry.
 func NewDB(dbPath string) (*DB, error) {
 	conn, err := sql.Open("duckdb", dbPath)
 	if err != nil {
 		return nil, err
 	}
+
+	// god help you if you ever need more than 1GB of memory for a migration lol
+	conn.Exec("PRAGMA threads = 1;")
+	conn.Exec("PRAGMA disable_object_cache;")
+	conn.Exec("PRAGMA memory_limit = '1GB';")
+
+	// Set the maximum number of open connections to 1
+	conn.SetMaxOpenConns(1)
+	// Set the maximum number of idle connections to 1
+	conn.SetMaxIdleConns(1)
+
+
 	return &DB{
 		conn:   conn,
 		ctx:    context.Background(),
@@ -58,16 +72,33 @@ func (db *DB) RegisterTable(def TableDef) error {
 
 // Close gracefully closes the DB connection.
 func (db *DB) Close() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	return db.conn.Close()
+}
+
+// Checkpoint saves the database to a file.
+func (db *DB) Checkpoint() error {
+	_, err := db.Query("PRAGMA wal_checkpoint(FULL);")
+	if err != nil {
+		return err
+	}
+	time.Sleep(100 * time.Millisecond)
+	return nil
 }
 
 // Query executes a SQL query and returns rows.
 func (db *DB) Query(query string, args ...any) (*sql.Rows, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	return db.conn.QueryContext(db.ctx, query, args...)
 }
 
 // Write performs a direct INSERT into the specified table.
 func (db *DB) Write(table string, args ...any) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	colCount := len(args)
 	query := "INSERT INTO " + table + " VALUES " + buildPlaceholderGroup(colCount)
 	res, err := db.conn.ExecContext(db.ctx, query, args...)
@@ -85,6 +116,9 @@ func (db *DB) Write(table string, args ...any) error {
 // BulkWrite inserts multiple rows into a table in one statement.
 // Each inner slice in rows is a full row of column values.
 func (db *DB) BulkWrite(table string, rows [][]any) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	if len(rows) == 0 {
 		return nil
 	}
@@ -95,6 +129,19 @@ func (db *DB) BulkWrite(table string, rows [][]any) error {
 			return fmt.Errorf("[DB ERROR] BulkWrite: row %d has %d columns, expected %d", i, len(row), colCount)
 		}
 	}
+
+	// Begin transaction
+	tx, err := db.conn.BeginTx(db.ctx, nil)
+	if err != nil {
+		fmt.Printf("[DB ERROR] Failed to begin transaction: %v\n", err)
+		return err
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback()
+			panic(p)
+		}
+	}()
 
 	// Build "(?, ?, ?), (?, ?, ?), ..." placeholder string
 	group := buildPlaceholderGroup(colCount)
@@ -111,18 +158,24 @@ func (db *DB) BulkWrite(table string, rows [][]any) error {
 		allArgs = append(allArgs, row...)
 	}
 
-	res, err := db.conn.ExecContext(db.ctx, query, allArgs...)
+	res, err := tx.ExecContext(db.ctx, query, allArgs...)
 	if err != nil {
+		_ = tx.Rollback()
 		fmt.Printf("[DB ERROR] Bulk insert into %s failed: %v\nQuery: %s\nArgs len: %d\n", table, err, query, allArgs)
 		return err
 	}
 
-	if n, _ := res.RowsAffected(); n > 0 {
-	} else {
+	if n, _ := res.RowsAffected(); n == 0 {
 		// print out the query and args it was trying to do for debugging purposes
 		fmt.Printf("[DB DEBUG] Query: %s\nArgs: %v\n", query, allArgs)
 		fmt.Printf("[DB WARN] Bulk insert into %s affected 0 rows (possible duplicates)\n", table)
 	}
+
+	if err := tx.Commit(); err != nil {
+		fmt.Printf("[DB ERROR] Failed to commit transaction for bulk insert into %s: %v\n", table, err)
+		return err
+	}
+
 	return nil
 }
 
@@ -144,6 +197,9 @@ func buildPlaceholderGroup(n int) string {
 
 // CreateTable ensures a table exists.
 func (db *DB) CreateTable(name, schema string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	query := "CREATE TABLE IF NOT EXISTS " + name + " (" + schema + ")"
 	_, err := db.conn.ExecContext(db.ctx, query)
 	return err
@@ -151,5 +207,7 @@ func (db *DB) CreateTable(name, schema string) error {
 
 // Conn returns the underlying sql.DB connection for advanced usage.
 func (db *DB) Conn() *sql.DB {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	return db.conn
 }

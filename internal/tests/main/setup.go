@@ -20,11 +20,11 @@ func setupTest() (*db.DB, *sdk.SpectraFS, error) {
 	fmt.Println("Creating database...")
 
 	// if the database file exists, remove it
-	if _, err := os.Stat("internal/tests/migration_test.duckdb"); err == nil {
-		os.Remove("internal/tests/migration_test.duckdb")
+	if _, err := os.Stat("internal/tests/migration_test.db"); err == nil {
+		os.Remove("internal/tests/migration_test.db")
 	}
 
-	database, err := db.NewDB("internal/tests/migration_test.duckdb")
+	database, err := db.NewDB("internal/tests/migration_test.db")
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create database: %w", err)
 	}
