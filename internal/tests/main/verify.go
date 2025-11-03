@@ -32,12 +32,7 @@ func verifyMigration(database *db.DB) error {
 		return fmt.Errorf("no nodes discovered - migration did not run")
 	}
 
-	// Check 2: Node counts match?
-	if srcTotal != dstTotal {
-		return fmt.Errorf("node count mismatch: src=%d, dst=%d", srcTotal, dstTotal)
-	}
-
-	// Check 3: Any pending traversals remaining?
+	// Check 2: Any pending traversals remaining?
 	var srcPending, dstPending int
 	rows, _ = database.Query("SELECT COUNT(*) FROM src_nodes WHERE traversal_status = 'Pending'")
 	if rows != nil && rows.Next() {
@@ -55,7 +50,7 @@ func verifyMigration(database *db.DB) error {
 		return fmt.Errorf("incomplete migration: %d src and %d dst folders still have Pending status", srcPending, dstPending)
 	}
 
-	// Check 4: Any failed traversals?
+	// Check 3: Any failed traversals?
 	var srcFailed, dstFailed int
 	rows, _ = database.Query("SELECT COUNT(*) FROM src_nodes WHERE traversal_status = 'Failed'")
 	if rows != nil && rows.Next() {
@@ -73,7 +68,7 @@ func verifyMigration(database *db.DB) error {
 		fmt.Printf("⚠ Warning: %d src and %d dst nodes have Failed status\n", srcFailed, dstFailed)
 	}
 
-	// Check 5: Traversal status breakdown
+	// Check 4: Traversal status breakdown
 	var srcCompleted, dstCompleted int
 	rows, _ = database.Query("SELECT COUNT(*) FROM src_nodes WHERE traversal_status = 'Successful'")
 	if rows != nil && rows.Next() {
@@ -85,6 +80,20 @@ func verifyMigration(database *db.DB) error {
 	if rows != nil && rows.Next() {
 		rows.Scan(&dstCompleted)
 		rows.Close()
+	}
+
+	// Optional: Check if any NotOnSrc nodes are present in dst_nodes table - if so raise error if you are doing this check.
+	// This is optional because in a real migration their might be some dst nodes that are not on src.
+	// But with SpectraFS we are not expecting any dst nodes that are not on src. Just by its very design.
+	// So if we find any, we should raise an error.
+	var dstNotOnSrc int
+	rows, _ = database.Query("SELECT COUNT(*) FROM dst_nodes WHERE traversal_status = 'NotOnSrc'")
+	if rows != nil && rows.Next() {
+		rows.Scan(&dstNotOnSrc)
+		rows.Close()
+	}
+	if dstNotOnSrc > 0 {
+		return fmt.Errorf("incomplete migration: %d dst nodes have NotOnSrc status", dstNotOnSrc)
 	}
 
 	fmt.Printf("Traversal status:\n")

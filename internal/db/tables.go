@@ -71,7 +71,7 @@ func (t LogsTable) Name() string {
 	return "logs"
 }
 
-// Schema returns the DuckDB-compatible schema definition.
+// Schema returns the schema definition.
 func (t LogsTable) Schema() string {
 	return `
 		id VARCHAR PRIMARY KEY,

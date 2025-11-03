@@ -20,6 +20,7 @@ type LogPacket struct {
 	Message   string    `json:"message"`
 	Entity    string    `json:"entity,omitempty"`
 	EntityID  string    `json:"entity_id,omitempty"`
+	Queue     string    `json:"queue,omitempty"`
 }
 
 // StartListener spawns a new terminal window with a UDP listener on the given address.
@@ -98,9 +99,10 @@ func RunListener(addr string) error {
 		}
 
 		// Simple display format
-		fmt.Printf("%s [%s] %s\n",
+		fmt.Printf("%s [%s] %s [%s]\n",
 			pkt.Timestamp.Format("2006-01-02 15:04:05"),
 			pkt.Level,
-			pkt.Message)
+			pkt.Message,
+			pkt.Queue)
 	}
 }

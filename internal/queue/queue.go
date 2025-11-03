@@ -42,20 +42,25 @@ type Queue struct {
 	tableName           string                     // "src_nodes" or "dst_nodes"
 	srcCtx              *fsservices.ServiceContext // For dst queue: needed to query src nodes
 	srcQueue            *Queue                     // For dst queue: reference to src queue for round coordination
+	// Round-based statistics for completion detection
+	roundStats    map[int]*RoundStats // Per-round statistics (key: round number, value: stats for that round)
+	hasEverPulled bool                // Whether we've ever successfully pulled tasks from DB
 }
 
 // NewQueue creates a new Queue instance.
 func NewQueue(name string, maxRetries int, batchSize int, workerCount int) *Queue {
 	return &Queue{
-		name:       name,
-		state:      QueueStateRunning,
-		pending:    make([]*TaskBase, 0),
-		inProgress: make(map[string]*TaskBase),
-		trackedIDs: make(map[string]bool),
-		maxRetries: maxRetries,
-		round:      0,
-		batchSize:  batchSize,
-		workers:    make([]Worker, 0, workerCount),
+		name:          name,
+		state:         QueueStateRunning,
+		pending:       make([]*TaskBase, 0),
+		inProgress:    make(map[string]*TaskBase),
+		trackedIDs:    make(map[string]bool),
+		maxRetries:    maxRetries,
+		round:         0,
+		batchSize:     batchSize,
+		workers:       make([]Worker, 0, workerCount),
+		roundStats:    make(map[int]*RoundStats),
+		hasEverPulled: false,
 	}
 }
 
@@ -74,7 +79,7 @@ func (q *Queue) Initialize(database *db.DB, tableName string, adapter fsservices
 	// Create and start workers - they manage themselves
 	for i := 0; i < workerCount; i++ {
 		worker := NewTraversalWorker(
-			i,
+			fmt.Sprintf("%s-worker-%d", q.name, i),
 			q,
 			database,
 			adapter,
@@ -92,7 +97,7 @@ func (q *Queue) Initialize(database *db.DB, tableName string, adapter fsservices
 		q.pullTasks()
 	} else {
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("info", "DST queue initialized - waiting for SRC to advance before pulling tasks", "queue", q.name)
+			_ = logservice.LS.Log("info", "DST queue initialized - waiting for SRC to advance before pulling tasks", "queue", q.name, q.name)
 		}
 	}
 }
@@ -137,6 +142,13 @@ func (q *Queue) IsPaused() bool {
 	return q.state == QueueStatePaused
 }
 
+// IsPulling returns true if the queue is currently pulling tasks from the database.
+func (q *Queue) IsPulling() bool {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.pulling
+}
+
 // Pause pauses the queue (workers will not lease new tasks).
 func (q *Queue) Pause() {
 	q.mu.Lock()
@@ -166,6 +178,15 @@ func (q *Queue) Add(task *TaskBase) bool {
 	return true
 }
 
+// getOrCreateRoundStats returns the RoundStats for the current round, creating it if it doesn't exist.
+// Must be called with mutex held.
+func (q *Queue) getOrCreateRoundStats(round int) *RoundStats {
+	if q.roundStats[round] == nil {
+		q.roundStats[round] = &RoundStats{}
+	}
+	return q.roundStats[round]
+}
+
 // AddBatch enqueues multiple tasks atomically.
 func (q *Queue) AddBatch(tasks []*TaskBase) int {
 	q.mu.Lock()
@@ -179,6 +200,11 @@ func (q *Queue) AddBatch(tasks []*TaskBase) int {
 			q.trackedIDs[id] = true
 			added++
 		}
+	}
+	// Track tasks queued for current round
+	if added > 0 {
+		roundStats := q.getOrCreateRoundStats(q.round)
+		roundStats.Queued += added
 	}
 	return added
 }
@@ -196,6 +222,18 @@ func (q *Queue) Lease() *TaskBase {
 	}
 
 	if len(q.pending) == 0 {
+		// For DST queues: check if SRC is ready and we can pull tasks
+		// This provides the polling fallback mechanism when DST is waiting for SRC
+		if q.name == "dst" && q.state == QueueStateRunning && !q.pulling {
+			q.mu.Unlock() // Release lock before checking external state
+
+			// Check if we can pull tasks (SRC is ready)
+			if q.canWePullTasks() {
+				// Trigger pull attempt - pullTasks() will handle the actual coordination
+				go q.pullTasks()
+			}
+			return nil
+		}
 		q.mu.Unlock()
 		return nil
 	}
@@ -231,6 +269,10 @@ func (q *Queue) Complete(task *TaskBase) {
 
 	task.Locked = false
 	task.Status = "successful"
+
+	// Increment completed count for current round
+	roundStats := q.getOrCreateRoundStats(q.round)
+	roundStats.Completed++
 
 	// Check if we're waiting for round advance and all tasks are done
 	if q.pendingRoundAdvance && len(q.pending) == 0 && len(q.inProgress) == 0 {
@@ -273,6 +315,10 @@ func (q *Queue) Fail(task *TaskBase) bool {
 	delete(q.trackedIDs, id)
 	task.Locked = false
 	task.Status = "failed"
+
+	// Increment completed count for current round (failed tasks still count as completed work)
+	roundStats := q.getOrCreateRoundStats(q.round)
+	roundStats.Completed++
 
 	// Check if we're waiting for round advance and all tasks are done
 	if q.pendingRoundAdvance && len(q.pending) == 0 && len(q.inProgress) == 0 {
@@ -342,6 +388,12 @@ func (q *Queue) Clear() {
 	q.pending = make([]*TaskBase, 0)
 	q.inProgress = make(map[string]*TaskBase)
 	q.trackedIDs = make(map[string]bool)
+}
+
+// RoundStats tracks statistics for a specific round.
+type RoundStats struct {
+	Queued    int // Tasks queued in this round (from AddBatch)
+	Completed int // Tasks completed in this round (successful + failed)
 }
 
 // Stats returns current queue statistics.
@@ -425,7 +477,7 @@ func (q *Queue) markRoundComplete() {
 	q.mu.Unlock()
 
 	if logservice.LS != nil {
-		_ = logservice.LS.Log("info", fmt.Sprintf("Round %d complete", currentRound), "queue", q.name)
+		_ = logservice.LS.Log("info", fmt.Sprintf("Round %d complete", currentRound), "queue", q.name, q.name)
 	}
 
 	// Auto-advance to next round
@@ -445,15 +497,42 @@ func (q *Queue) advanceToNextRound() {
 	newRound := q.round
 	// Reset pulling flag so we can pull tasks for the new round
 	q.pulling = false
+	// Initialize stats for the new round (if not already exists)
+	q.getOrCreateRoundStats(newRound)
 	q.mu.Unlock()
 
 	if logservice.LS != nil {
-		_ = logservice.LS.Log("info", fmt.Sprintf("Advanced to round %d", newRound), "queue", q.name)
+		_ = logservice.LS.Log("info", fmt.Sprintf("Advanced to round %d", newRound), "queue", q.name, q.name)
 	}
 
 	// Scenario 3: Round advanced - pull tasks for new round
 	// This will call checkForCompletion if no tasks are found
 	q.pullTasks()
+}
+
+// canWePullTasks checks if the DST queue can pull tasks (SRC is ready).
+// Returns true if this is not a DST queue, or if DST queue and SRC is at least one round ahead.
+// This function encapsulates the logic for determining when DST can start pulling tasks.
+func (q *Queue) canWePullTasks() bool {
+	// Source queues can always pull (they're independent)
+	if q.name != "dst" {
+		return true
+	}
+
+	// DST queues need SRC to be ready
+	if q.srcQueue == nil {
+		return false
+	}
+
+	q.mu.RLock()
+	myRound := q.round
+	q.mu.RUnlock()
+
+	srcRound := q.srcQueue.Round()
+	srcExhausted := q.srcQueue.IsExhausted()
+
+	// DST round N can pull when SRC is at least on round N+1 (or SRC is exhausted)
+	return srcRound > myRound || srcExhausted
 }
 
 // waitForSrcRound blocks until src queue is at least one round ahead.
@@ -472,30 +551,20 @@ func (q *Queue) waitForSrcRound() {
 	for {
 		srcRound := q.srcQueue.Round()
 
-		// Src needs to be at least one round ahead (src finished targetRound, now on targetRound+1)
-		if srcRound > targetRound {
+		// Src needs to be at least one round ahead (src finished targetRound, now on targetRound+1) or if src queue is finished entirely
+		if srcRound > targetRound || q.srcQueue.IsExhausted() {
 			if logservice.LS != nil {
 				_ = logservice.LS.Log("debug",
 					fmt.Sprintf("Src round %d ready, advancing dst to round %d", srcRound, targetRound+1),
 					"queue",
+					q.name,
 					q.name)
 			}
 			return
 		}
 
-		// Check if src is completed - if so, dst can proceed
-		if q.srcQueue.IsExhausted() {
-			return
-		}
-
-		// Src not ready yet, sleep and check again
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug",
-				fmt.Sprintf("Waiting for src (currently round %d) before advancing dst to round %d", srcRound, targetRound+1),
-				"queue",
-				q.name)
-		}
-		time.Sleep(200 * time.Millisecond)
+		// src is not ready yet, sleep and check again
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -529,7 +598,7 @@ func (q *Queue) pullSrcTasks(requestedBatchSize int) {
 	rows, err := q.db.Query(query)
 	if err != nil {
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to pull src tasks: %v", err), "queue", q.name)
+			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to pull src tasks: %v", err), "queue", q.name, q.name)
 		}
 		return
 	}
@@ -565,8 +634,14 @@ func (q *Queue) pullSrcTasks(requestedBatchSize int) {
 	// Update state based on results
 	if pulledCount > 0 {
 		added := q.AddBatch(tasks)
+		if added > 0 {
+			// Mark that we've successfully pulled tasks
+			q.mu.Lock()
+			q.hasEverPulled = true
+			q.mu.Unlock()
+		}
 		if logservice.LS != nil && added > 0 {
-			_ = logservice.LS.Log("debug", fmt.Sprintf("Pulled %d src tasks for round %d", added, round), "queue", q.name)
+			_ = logservice.LS.Log("debug", fmt.Sprintf("Pulled %d src tasks for round %d", added, round), "queue", q.name, q.name)
 		}
 
 		// Check if we got a partial batch (fewer than requested)
@@ -579,6 +654,7 @@ func (q *Queue) pullSrcTasks(requestedBatchSize int) {
 				_ = logservice.LS.Log("info",
 					fmt.Sprintf("Partial batch detected (%d < %d) - will advance round after current tasks complete", pulledCount, requestedBatchSize),
 					"queue",
+					q.name,
 					q.name)
 			}
 		}
@@ -623,7 +699,7 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 	rows, err := q.db.Query(query1)
 	if err != nil {
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to pull dst tasks: %v", err), "queue", q.name)
+			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to pull dst tasks: %v", err), "queue", q.name, q.name)
 		}
 		return
 	}
@@ -640,7 +716,6 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 	}
 
 	var dstNodes []dstNode
-	dstPaths := make([]string, 0)
 
 	for rows.Next() {
 		var node dstNode
@@ -649,38 +724,43 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 			continue
 		}
 		dstNodes = append(dstNodes, node)
-		dstPaths = append(dstPaths, node.path)
 	}
 	rows.Close()
 
 	if len(dstNodes) == 0 {
+		// No tasks found - check for completion
+		q.checkForCompletion(round)
 		return
 	}
 
-	// Query 2: Get src children directly by parent_path (optimized to 2 queries instead of 3)
-	pathsClause := ""
-	for i, path := range dstPaths {
-		if i > 0 {
-			pathsClause += ", "
+	// checkpoint here just to be safe before we query the other table
+	err = q.db.Checkpoint()
+	if err != nil {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to checkpoint database: %v", err), "queue", q.name, q.name)
 		}
-		pathsClause += fmt.Sprintf("'%s'", path)
+		return
 	}
 
+	// query the src nodes table
 	query2 := fmt.Sprintf(`
-		SELECT id, parent_id, name, path, parent_path, type, depth_level, size, last_updated
-		FROM src_nodes
-		WHERE parent_path IN (%s)
-	`, pathsClause)
+		SELECT s.id, s.parent_id, s.name, s.path, s.parent_path, s.type,
+		       s.depth_level, s.size, s.last_updated
+		FROM src_nodes s
+		JOIN dst_nodes d ON s.parent_path = d.path
+		WHERE d.traversal_status = 'Successful'
+		LIMIT %d
+	`, requestedBatchSize)
 
 	rows, err = q.db.Query(query2)
 	if err != nil {
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to query src children: %v", err), "queue", q.name)
+			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to query src children: %v", err), "queue", q.name, q.name)
 		}
 		return
 	}
 
-	// Group children by parent_path (instead of parent_id)
+	// Group children by parent_path
 	childrenByParentPath := make(map[string][]any)
 
 	for rows.Next() {
@@ -690,6 +770,9 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 
 		err := rows.Scan(&id, &parentId, &name, &path, &parentPath, &nodeType, &depthLevel, &size, &lastUpdated)
 		if err != nil {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("error", fmt.Sprintf("Error scanning src children: %v", err), "queue", q.name, q.name)
+			}
 			continue
 		}
 
@@ -764,8 +847,14 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 	// Update state based on results
 	if pulledCount > 0 {
 		added := q.AddBatch(tasks)
+		if added > 0 {
+			// Mark that we've successfully pulled tasks
+			q.mu.Lock()
+			q.hasEverPulled = true
+			q.mu.Unlock()
+		}
 		if logservice.LS != nil && added > 0 {
-			_ = logservice.LS.Log("debug", fmt.Sprintf("Pulled %d dst tasks for round %d", added, round), "queue", q.name)
+			_ = logservice.LS.Log("debug", fmt.Sprintf("Pulled %d dst tasks for round %d", added, round), "queue", q.name, q.name)
 		}
 
 		// Check if we got a partial batch (fewer than requested)
@@ -778,6 +867,7 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 				_ = logservice.LS.Log("info",
 					fmt.Sprintf("Partial batch detected (%d < %d) - will advance round after current tasks complete", pulledCount, requestedBatchSize),
 					"queue",
+					q.name,
 					q.name)
 			}
 		}
@@ -787,20 +877,47 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 	}
 }
 
-// checkForCompletion marks the queue as completed if no tasks were found after advancing rounds.
-// This ensures we've done at least one round of work before declaring completion.
+// checkForCompletion marks the queue as completed if no tasks were found.
+// Completion is valid if:
+// 1. First query ever and DB is empty (graceful failure)
+// 2. Just advanced rounds and previous round had completed work (BFS reached max depth)
 func (q *Queue) checkForCompletion(round int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	// Only mark as completed if we're currently running
-	if q.state == QueueStateRunning {
+	// Only check if we're currently running
+	if q.state != QueueStateRunning {
+		return
+	}
+
+	// Condition 1: First query ever and found nothing (graceful failure)
+	if !q.hasEverPulled {
 		q.state = QueueStateCompleted
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("info",
-				fmt.Sprintf("No tasks found for round %d - traversal complete (max depth reached)", round),
+				fmt.Sprintf("First query found no tasks for round %d - traversal complete (empty database)", round),
 				"queue",
+				q.name,
 				q.name)
+		}
+		return
+	}
+
+	// Condition 2: Just advanced rounds and previous round had completed work
+	// Check if round-1 had completed tasks (meaning we did work last round)
+	prevRound := round - 1
+	if prevRound >= 0 {
+		prevRoundStats := q.roundStats[prevRound]
+		if prevRoundStats != nil && prevRoundStats.Completed > 0 {
+			q.state = QueueStateCompleted
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("info",
+					fmt.Sprintf("No tasks found for round %d after completing round %d - traversal complete (max depth reached)", round, prevRound),
+					"queue",
+					q.name,
+					q.name)
+			}
+			return
 		}
 	}
 }

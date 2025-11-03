@@ -26,7 +26,7 @@ type Worker interface {
 // TraversalWorker executes traversal tasks by listing children and recording them to the database.
 // Each worker runs independently in its own goroutine, continuously polling the queue for work.
 type TraversalWorker struct {
-	id        int
+	id        string
 	queue     *Queue
 	db        *db.DB
 	fsAdapter fsservices.FSAdapter
@@ -37,7 +37,7 @@ type TraversalWorker struct {
 
 // NewTraversalWorker creates a worker that executes traversal tasks.
 func NewTraversalWorker(
-	id int,
+	id string,
 	queue *Queue,
 	database *db.DB,
 	adapter fsservices.FSAdapter,
@@ -61,7 +61,7 @@ func NewTraversalWorker(
 // When queue is exhausted, the worker exits.
 func (w *TraversalWorker) Run() {
 	if logservice.LS != nil {
-		_ = logservice.LS.Log("info", "Worker started", "worker", fmt.Sprintf("%s-worker-%d", w.queueName, w.id))
+		_ = logservice.LS.Log("info", "Worker started", "worker", w.id, w.queueName)
 	}
 
 	for {
@@ -75,7 +75,7 @@ func (w *TraversalWorker) Run() {
 		// Check if queue is exhausted (traversal complete) - exit worker
 		if w.queue.IsExhausted() {
 			if logservice.LS != nil {
-				_ = logservice.LS.Log("info", "Worker exiting - queue exhausted", "worker", fmt.Sprintf("%s-worker-%d", w.queueName, w.id))
+				_ = logservice.LS.Log("info", "Worker exiting - queue exhausted", "worker", w.id, w.queueName)
 			}
 			return
 		}
@@ -181,6 +181,13 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsse
 	expectedFileMap := make(map[string]fsservices.File)
 	for _, f := range expectedFiles {
 		expectedFileMap[f.LocationPath] = f
+	}
+
+	// if there are no expected children, log an info message and keep going
+	if len(expectedFolders) == 0 && len(expectedFiles) == 0 {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("info", "No expected children found for dst task", "task", task.LocationPath(), w.id, w.queueName)
+		}
 	}
 
 	// Compare folders
@@ -368,7 +375,8 @@ func (w *TraversalWorker) logSuccess(task *TaskBase) {
 		"debug",
 		fmt.Sprintf("Successfully traversed %s", path),
 		"worker",
-		fmt.Sprintf("%s-worker-%d", w.queueName, w.id),
+		w.id,
+		w.queueName,
 	)
 }
 
@@ -387,6 +395,7 @@ func (w *TraversalWorker) logError(task *TaskBase, err error, willRetry bool) {
 		"error",
 		fmt.Sprintf("Failed to traverse %s: %v (%s)", path, err, retryMsg),
 		"worker",
-		fmt.Sprintf("%s-worker-%d", w.queueName, w.id),
+		w.id,
+		w.queueName,
 	)
 }

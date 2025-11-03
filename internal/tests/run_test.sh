@@ -15,8 +15,7 @@ echo ""
 
 # Clean up existing test databases
 echo -e "${YELLOW}Cleaning up test databases...${NC}"
-rm -f internal/tests/main/migration_test.duckdb
-rm -f internal/tests/main/migration_test.duckdb.wal
+rm -f internal/tests/main/migration_test.db
 echo -e "${GREEN}Cleanup complete${NC}"
 echo ""
 

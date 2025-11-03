@@ -99,8 +99,13 @@ func NewSender(dbInstance *db.DB, addr, level string) (*Sender, error) {
 // Log sends the message via UDP (if level >= threshold)
 // and writes it unconditionally to the logs table in the DB via the buffer.
 // Safe for concurrent use.
-func (s *Sender) Log(level, message, entity, entityID string) error {
+func (s *Sender) Log(level, message, entity, entityID string, queues ...string) error {
 	timestamp := time.Now()
+
+	queue := ""
+	if len(queues) > 0 {
+		queue = queues[0]
+	}
 
 	// --- DB write (always, buffered) ---
 	id := fmt.Sprintf("%d", timestamp.UnixNano()) // basic unique ID for now
@@ -112,7 +117,7 @@ func (s *Sender) Log(level, message, entity, entityID string) error {
 		EntityID:  entityID,
 		Details:   nil,
 		Message:   message,
-		Queue:     nil,
+		Queue:     queue,
 	})
 
 	// --- UDP send (conditional) ---
@@ -132,6 +137,7 @@ func (s *Sender) Log(level, message, entity, entityID string) error {
 	s.tmp.Message = message
 	s.tmp.Entity = entity
 	s.tmp.EntityID = entityID
+	s.tmp.Queue = queue
 
 	s.buf.Reset()
 	if err := s.enc.Encode(&s.tmp); err != nil {
