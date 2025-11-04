@@ -42,13 +42,15 @@ type Queue struct {
 	tableName           string                     // "src_nodes" or "dst_nodes"
 	srcCtx              *fsservices.ServiceContext // For dst queue: needed to query src nodes
 	srcQueue            *Queue                     // For dst queue: reference to src queue for round coordination
+	coordinator         *QueueCoordinator          // Shared coordinator for round synchronization
+	outputBuffer        *OutputBuffer              // Shared buffer for src->dst visibility
 	// Round-based statistics for completion detection
 	roundStats    map[int]*RoundStats // Per-round statistics (key: round number, value: stats for that round)
 	hasEverPulled bool                // Whether we've ever successfully pulled tasks from DB
 }
 
 // NewQueue creates a new Queue instance.
-func NewQueue(name string, maxRetries int, batchSize int, workerCount int) *Queue {
+func NewQueue(name string, maxRetries int, batchSize int, workerCount int, coordinator *QueueCoordinator, outputBuffer *OutputBuffer) *Queue {
 	return &Queue{
 		name:          name,
 		state:         QueueStateRunning,
@@ -61,6 +63,8 @@ func NewQueue(name string, maxRetries int, batchSize int, workerCount int) *Queu
 		workers:       make([]Worker, 0, workerCount),
 		roundStats:    make(map[int]*RoundStats),
 		hasEverPulled: false,
+		coordinator:   coordinator,
+		outputBuffer:  outputBuffer,
 	}
 }
 
@@ -85,6 +89,8 @@ func (q *Queue) Initialize(database *db.DB, tableName string, adapter fsservices
 			adapter,
 			tableName,
 			q.name,
+			q.coordinator,
+			q.outputBuffer,
 		)
 		q.AddWorker(worker)
 		go worker.Run()
@@ -179,7 +185,7 @@ func (q *Queue) Add(task *TaskBase) bool {
 }
 
 // getOrCreateRoundStats returns the RoundStats for the current round, creating it if it doesn't exist.
-// Must be called with mutex held.
+// Must be called with q.mu.Lock() or q.mu.RLock() held by the caller.
 func (q *Queue) getOrCreateRoundStats(round int) *RoundStats {
 	if q.roundStats[round] == nil {
 		q.roundStats[round] = &RoundStats{}
@@ -485,11 +491,22 @@ func (q *Queue) markRoundComplete() {
 }
 
 // advanceToNextRound advances the queue to the next round and checks for completion.
-// For dst queues, this will wait for src queue to be at least one round ahead.
+// Uses coordinator to ensure bounded concurrency between src and dst queues.
 func (q *Queue) advanceToNextRound() {
-	// If this is a dst queue, wait for src to be ahead
-	if q.name == "dst" && q.srcQueue != nil {
-		q.waitForSrcRound()
+	// Check coordinator conditions before advancing
+	if q.coordinator != nil {
+		switch q.name {
+		case "src":
+			// Src waits if it's too far ahead of dst
+			for !q.coordinator.CanSrcAdvance() {
+				time.Sleep(50 * time.Millisecond)
+			}
+		case "dst":
+			// Dst waits until src is at least one round ahead
+			for !q.coordinator.CanDstAdvance() {
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
 	}
 
 	q.mu.Lock()
@@ -500,6 +517,16 @@ func (q *Queue) advanceToNextRound() {
 	// Initialize stats for the new round (if not already exists)
 	q.getOrCreateRoundStats(newRound)
 	q.mu.Unlock()
+
+	// Update coordinator state
+	if q.coordinator != nil {
+		switch q.name {
+		case "src":
+			q.coordinator.UpdateSrcRound(newRound)
+		case "dst":
+			q.coordinator.UpdateDstRound(newRound)
+		}
+	}
 
 	if logservice.LS != nil {
 		_ = logservice.LS.Log("info", fmt.Sprintf("Advanced to round %d", newRound), "queue", q.name, q.name)
@@ -528,44 +555,17 @@ func (q *Queue) canWePullTasks() bool {
 	myRound := q.round
 	q.mu.RUnlock()
 
-	srcRound := q.srcQueue.Round()
+	// Use coordinator if available, otherwise fallback to direct queue check
+	srcRound := myRound
+	if q.coordinator != nil {
+		srcRound = q.coordinator.GetSrcRound()
+	} else {
+		srcRound = q.srcQueue.Round()
+	}
 	srcExhausted := q.srcQueue.IsExhausted()
 
 	// DST round N can pull when SRC is at least on round N+1 (or SRC is exhausted)
 	return srcRound > myRound || srcExhausted
-}
-
-// waitForSrcRound blocks until src queue is at least one round ahead.
-// This ensures dst always stays behind src in the BFS traversal.
-func (q *Queue) waitForSrcRound() {
-	if q.srcQueue == nil {
-		return
-	}
-
-	q.mu.RLock()
-	myRound := q.round
-	q.mu.RUnlock()
-
-	targetRound := myRound // dst round N needs src to complete round N (be on N+1)
-
-	for {
-		srcRound := q.srcQueue.Round()
-
-		// Src needs to be at least one round ahead (src finished targetRound, now on targetRound+1) or if src queue is finished entirely
-		if srcRound > targetRound || q.srcQueue.IsExhausted() {
-			if logservice.LS != nil {
-				_ = logservice.LS.Log("debug",
-					fmt.Sprintf("Src round %d ready, advancing dst to round %d", srcRound, targetRound+1),
-					"queue",
-					q.name,
-					q.name)
-			}
-			return
-		}
-
-		// src is not ready yet, sleep and check again
-		time.Sleep(20 * time.Millisecond)
-	}
 }
 
 // pullSrcTasks queries src_nodes for pending folders at current round.
@@ -626,6 +626,7 @@ func (q *Queue) pullSrcTasks(requestedBatchSize int) {
 				DepthLevel:   depthLevel,
 				Type:         nodeType,
 			},
+			Round: round,
 		})
 	}
 
@@ -733,80 +734,26 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 		return
 	}
 
-	// checkpoint here just to be safe before we query the other table
-	err = q.db.Checkpoint()
-	if err != nil {
+	// Get expected children from OutputBuffer instead of DB join
+	var childrenByParentPath map[string][]any
+	if q.outputBuffer != nil {
+		// Extract paths from dst nodes
+		dstPaths := make([]string, len(dstNodes))
+		for i, node := range dstNodes {
+			dstPaths[i] = node.path
+		}
+		childrenByParentPath = q.outputBuffer.GetChildrenForPaths(round, dstPaths)
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to checkpoint database: %v", err), "queue", q.name, q.name)
+			_ = logservice.LS.Log("debug", fmt.Sprintf("Buffer returned children for %d paths", len(childrenByParentPath)), "queue", q.name, q.name)
 		}
-		return
-	}
-
-	// query the src nodes table
-	query2 := fmt.Sprintf(`
-		SELECT s.id, s.parent_id, s.name, s.path, s.parent_path, s.type,
-		       s.depth_level, s.size, s.last_updated
-		FROM src_nodes s
-		JOIN dst_nodes d ON s.parent_path = d.path
-		WHERE d.traversal_status = 'Successful'
-		LIMIT %d
-	`, requestedBatchSize)
-
-	rows, err = q.db.Query(query2)
-	if err != nil {
+	} else {
+		// Fallback: no buffer available, create empty map
+		childrenByParentPath = make(map[string][]any)
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to query src children: %v", err), "queue", q.name, q.name)
-		}
-		return
-	}
-
-	// Group children by parent_path
-	childrenByParentPath := make(map[string][]any)
-
-	for rows.Next() {
-		var id, parentId, name, path, parentPath, nodeType, lastUpdated string
-		var depthLevel int
-		var size *int64
-
-		err := rows.Scan(&id, &parentId, &name, &path, &parentPath, &nodeType, &depthLevel, &size, &lastUpdated)
-		if err != nil {
-			if logservice.LS != nil {
-				_ = logservice.LS.Log("error", fmt.Sprintf("Error scanning src children: %v", err), "queue", q.name, q.name)
-			}
-			continue
-		}
-
-		if nodeType == fsservices.NodeTypeFolder {
-			folder := fsservices.Folder{
-				Id:           id,
-				ParentId:     parentId,
-				ParentPath:   parentPath,
-				DisplayName:  name,
-				LocationPath: path,
-				LastUpdated:  lastUpdated,
-				DepthLevel:   depthLevel,
-				Type:         nodeType,
-			}
-			childrenByParentPath[parentPath] = append(childrenByParentPath[parentPath], folder)
-		} else {
-			file := fsservices.File{
-				Id:           id,
-				ParentId:     parentId,
-				ParentPath:   parentPath,
-				DisplayName:  name,
-				LocationPath: path,
-				LastUpdated:  lastUpdated,
-				DepthLevel:   depthLevel,
-				Size:         0,
-				Type:         nodeType,
-			}
-			if size != nil {
-				file.Size = *size
-			}
-			childrenByParentPath[parentPath] = append(childrenByParentPath[parentPath], file)
+			_ = logservice.LS.Log("warning", "No output buffer available for dst query", "queue", q.name, q.name)
 		}
 	}
-	rows.Close()
+
 
 	// Build tasks with expected children
 	var tasks []*TaskBase
@@ -839,6 +786,7 @@ func (q *Queue) pullDstTasks(requestedBatchSize int) {
 			},
 			ExpectedFolders: expectedFolders,
 			ExpectedFiles:   expectedFiles,
+			Round:           round,
 		})
 	}
 
@@ -910,6 +858,12 @@ func (q *Queue) checkForCompletion(round int) {
 		prevRoundStats := q.roundStats[prevRound]
 		if prevRoundStats != nil && prevRoundStats.Completed > 0 {
 			q.state = QueueStateCompleted
+			switch q.name {
+			case "dst":
+				q.coordinator.UpdateDstCompleted()
+			case "src":
+				q.coordinator.UpdateSrcCompleted()
+			}
 			if logservice.LS != nil {
 				_ = logservice.LS.Log("info",
 					fmt.Sprintf("No tasks found for round %d after completing round %d - traversal complete (max depth reached)", round, prevRound),

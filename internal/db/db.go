@@ -5,7 +5,6 @@ package db
 
 import (
 	"fmt"
-	"time"
 	"sync"
 	"strings"
 	"context"
@@ -39,6 +38,9 @@ func NewDB(dbPath string) (*DB, error) {
 	conn.Exec("PRAGMA threads = 1;")
 	conn.Exec("PRAGMA disable_object_cache;")
 	conn.Exec("PRAGMA memory_limit = '1GB';")
+	conn.Exec("PRAGMA checkpoint_on_shutdown;")  // optional
+	conn.Exec("PRAGMA force_checkpoint_on_commit=true;") // see above
+
 
 	// Set the maximum number of open connections to 1
 	conn.SetMaxOpenConns(1)
@@ -77,16 +79,6 @@ func (db *DB) Close() error {
 	return db.conn.Close()
 }
 
-// Checkpoint saves the database to a file.
-func (db *DB) Checkpoint() error {
-	_, err := db.Query("PRAGMA wal_checkpoint(FULL);")
-	if err != nil {
-		return err
-	}
-	time.Sleep(100 * time.Millisecond)
-	return nil
-}
-
 // Query executes a SQL query and returns rows.
 func (db *DB) Query(query string, args ...any) (*sql.Rows, error) {
 	db.mu.Lock()
@@ -100,16 +92,41 @@ func (db *DB) Write(table string, args ...any) error {
 	defer db.mu.Unlock()
 
 	colCount := len(args)
-	query := "INSERT INTO " + table + " VALUES " + buildPlaceholderGroup(colCount)
-	res, err := db.conn.ExecContext(db.ctx, query, args...)
+
+	// Begin transaction
+	tx, err := db.conn.BeginTx(db.ctx, nil)
 	if err != nil {
+		fmt.Printf("[DB ERROR] Failed to begin transaction: %v\n", err)
+		return err
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback()
+			panic(p)
+		}
+	}()
+
+	query := "INSERT INTO " + table + " VALUES " + buildPlaceholderGroup(colCount)
+
+	res, err := tx.ExecContext(db.ctx, query, args...)
+	if err != nil {
+		_ = tx.Rollback()
 		fmt.Printf("[DB ERROR] Failed to insert into %s: %v\nQuery: %s\nArgs: %v\n", table, err, query, args)
 		return err
 	}
-	affected, _ := res.RowsAffected()
-	if affected == 0 {
-		fmt.Printf("[DB WARNING] Insert into %s affected 0 rows (query may have been ignored)\nQuery: %s\n", table, query)
+
+	if n, _ := res.RowsAffected(); n == 0 {
+		fmt.Printf("[DB WARN] Insert into %s affected 0 rows (query may have been ignored)\nQuery: %s\nArgs: %v\n", table, query, args)
 	}
+
+	if err := tx.Commit(); err != nil {
+		fmt.Printf("[DB ERROR] Failed to commit transaction for insert into %s: %v\n", table, err)
+		return err
+	}
+	
+	// force a checkpoint to ensure all data is written directly and synchronized properly.
+	_, _ = db.conn.ExecContext(db.ctx, "PRAGMA checkpoint;")
+
 	return nil
 }
 
@@ -175,6 +192,10 @@ func (db *DB) BulkWrite(table string, rows [][]any) error {
 		fmt.Printf("[DB ERROR] Failed to commit transaction for bulk insert into %s: %v\n", table, err)
 		return err
 	}
+
+	// force a checkpoint to ensure all data is written directly and synchronized properly.
+	_, _ = db.conn.ExecContext(db.ctx, "PRAGMA checkpoint;")
+
 
 	return nil
 }
