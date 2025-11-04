@@ -3,7 +3,7 @@ module github.com/Project-Sylos/Migration-Engine
 go 1.24.2
 
 require (
-	github.com/Project-Sylos/Spectra v0.0.1-alpha
+	github.com/Project-Sylos/Spectra v0.1.0
 	github.com/marcboeker/go-duckdb v1.7.0
 )
 
@@ -23,5 +23,3 @@ require (
 	golang.org/x/tools v0.29.0 // indirect
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
 )
-
-replace github.com/Project-Sylos/Spectra => ../Spectra
