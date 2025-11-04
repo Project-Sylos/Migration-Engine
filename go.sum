@@ -1,3 +1,5 @@
+github.com/Project-Sylos/Spectra v0.1.0 h1:7kbynIBnjvV6deU0DNI6XZ9lAzG5QB3JtqoEV2XMSe8=
+github.com/Project-Sylos/Spectra v0.1.0/go.mod h1:sKbSzUCPJKHq0FgMqkTbsJcPiQOkdivMRZzk7tKU4vk=
 github.com/apache/arrow/go/v14 v14.0.2 h1:N8OkaJEOfI3mEZt07BIkvo4sC6XDbL+48MBPWO5IONw=
 github.com/apache/arrow/go/v14 v14.0.2/go.mod h1:u3fgh3EdgN/YQ8cVQRguVW3R+seMybFg8QBQ5LU+eBY=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
