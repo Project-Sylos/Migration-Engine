@@ -65,7 +65,7 @@ func runMigration(database *db.DB, spectraFS *sdk.SpectraFS) error {
 	time.Sleep(3 * time.Second)
 
 	// Initialize global logger
-	if err := logservice.InitGlobalLogger(database, "127.0.0.1:8081", "debug"); err != nil {
+	if err := logservice.InitGlobalLogger(database, "127.0.0.1:8081", "trace"); err != nil {
 		return fmt.Errorf("failed to initialize global logger: %w", err)
 	}
 	fmt.Println("✓ Log service started")
@@ -89,17 +89,26 @@ func runMigration(database *db.DB, spectraFS *sdk.SpectraFS) error {
 	fmt.Println("✓ Adapters ready")
 	fmt.Println()
 
+	// Create shared coordinator and buffer for queue coordination
+	fmt.Println("Creating coordinator and output buffer...")
+	maxLead := 2 // Coordinator maxLead determines how far ahead src can get
+	coordinator := queue.NewQueueCoordinator(maxLead)
+	outputBuffer := queue.NewOutputBuffer()
+	fmt.Println("✓ Coordinator and buffer initialized")
+
+	numWorkers := 15
+
 	// Create and initialize queues - workers start automatically
 	fmt.Println("Creating source queue...")
-	srcQueue := queue.NewQueue("src", 3, 1000, 1)
+	srcQueue := queue.NewQueue("src", 3, 1000, numWorkers, coordinator, outputBuffer)
 	srcQueue.Initialize(database, "src_nodes", srcAdapter, nil, nil)
-	fmt.Println("✓ Source queue initialized with 1 worker")
+	fmt.Println("✓ Source queue initialized with ", numWorkers, " workers")
 
 	fmt.Println("Creating destination queue...")
-	dstQueue := queue.NewQueue("dst", 3, 1000, 1)
+	dstQueue := queue.NewQueue("dst", 3, 1000, numWorkers, coordinator, outputBuffer)
 	// dst needs src context to query src_nodes for expected children
 	dstQueue.Initialize(database, "dst_nodes", dstAdapter, srcContext, srcQueue)
-	fmt.Println("✓ Destination queue initialized with 1 worker")
+	fmt.Println("✓ Destination queue initialized with ", numWorkers, " workers")
 	fmt.Println()
 
 	// Wait for migration to complete (queues manage themselves)

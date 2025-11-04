@@ -26,13 +26,15 @@ type Worker interface {
 // TraversalWorker executes traversal tasks by listing children and recording them to the database.
 // Each worker runs independently in its own goroutine, continuously polling the queue for work.
 type TraversalWorker struct {
-	id        string
-	queue     *Queue
-	db        *db.DB
-	fsAdapter fsservices.FSAdapter
-	tableName string // "src_nodes" or "dst_nodes"
-	queueName string // "src" or "dst" for logging
-	isDst     bool   // true if this is a destination worker (performs comparison)
+	id           string
+	queue        *Queue
+	db           *db.DB
+	fsAdapter    fsservices.FSAdapter
+	tableName    string            // "src_nodes" or "dst_nodes"
+	queueName    string            // "src" or "dst" for logging
+	isDst        bool              // true if this is a destination worker (performs comparison)
+	outputBuffer *OutputBuffer     // Shared buffer for src->dst visibility
+	coordinator  *QueueCoordinator // Shared coordinator for round synchronization
 }
 
 // NewTraversalWorker creates a worker that executes traversal tasks.
@@ -43,15 +45,19 @@ func NewTraversalWorker(
 	adapter fsservices.FSAdapter,
 	tableName string,
 	queueName string,
+	coordinator *QueueCoordinator,
+	outputBuffer *OutputBuffer,
 ) *TraversalWorker {
 	return &TraversalWorker{
-		id:        id,
-		queue:     queue,
-		db:        database,
-		fsAdapter: adapter,
-		tableName: tableName,
-		queueName: queueName,
-		isDst:     queueName == "dst",
+		id:           id,
+		queue:        queue,
+		db:           database,
+		fsAdapter:    adapter,
+		tableName:    tableName,
+		queueName:    queueName,
+		isDst:        queueName == "dst",
+		coordinator:  coordinator,
+		outputBuffer: outputBuffer,
 	}
 }
 
@@ -183,13 +189,6 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsse
 		expectedFileMap[f.LocationPath] = f
 	}
 
-	// if there are no expected children, log an info message and keep going
-	if len(expectedFolders) == 0 && len(expectedFiles) == 0 {
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("info", "No expected children found for dst task", "task", task.LocationPath(), w.id, w.queueName)
-		}
-	}
-
 	// Compare folders
 	for _, expectedFolder := range expectedFolders {
 		if actualFolder, exists := actualFolderMap[expectedFolder.LocationPath]; exists {
@@ -258,6 +257,7 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsse
 // writeResultsToDB performs the 2 database writes after task execution:
 // 1. Updates parent folder traversal_status to "successful"
 // 2. Batch inserts all discovered children
+// For src workers, also pushes data to OutputBuffer for dst visibility.
 func (w *TraversalWorker) writeResultsToDB(task *TaskBase) error {
 	folder := task.Folder
 
@@ -273,6 +273,24 @@ func (w *TraversalWorker) writeResultsToDB(task *TaskBase) error {
 		err = w.insertChildren(task)
 		if err != nil {
 			return fmt.Errorf("failed to insert children: %w", err)
+		}
+
+		// For src workers: push data to output buffer for dst visibility
+		if !w.isDst && w.outputBuffer != nil {
+			parentPath := folder.LocationPath
+
+			for _, child := range task.DiscoveredChildren {
+				if child.IsFile {
+					w.outputBuffer.Add(task.Round, folder.LocationPath, child.File)
+				} else {
+					w.outputBuffer.Add(task.Round, folder.LocationPath, child.Folder)
+				}
+			}
+
+			// Debug: log what we're adding
+			if logservice.LS != nil && len(task.DiscoveredChildren) > 0 {
+				_ = logservice.LS.Log("info", fmt.Sprintf("Added %d children to buffer[round=%d, parentPath=%s]", len(task.DiscoveredChildren), task.Round, parentPath), "worker", w.id, w.queueName)
+			}
 		}
 	}
 

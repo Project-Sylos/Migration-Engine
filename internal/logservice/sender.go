@@ -81,8 +81,8 @@ func NewSender(dbInstance *db.DB, addr, level string) (*Sender, error) {
 	}
 	buf := new(bytes.Buffer)
 	
-	// Create a log buffer that flushes every 1000 entries or every 2 seconds
-	logBuffer := db.NewLogBuffer(dbInstance.Conn(), 1000, 2*time.Second)
+	// Create a log buffer that flushes every 500 entries or every 2 seconds
+	logBuffer := db.NewLogBuffer(dbInstance.Conn(), 500, 2 * time.Second)
 	
 	return &Sender{
 		DB:         dbInstance,

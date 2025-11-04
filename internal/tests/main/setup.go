@@ -48,8 +48,8 @@ func setupTest() (*db.DB, *sdk.SpectraFS, error) {
 	fmt.Println("Initializing Spectra filesystem...")
 
 	// if the spectra db file exists, remove it
-	if _, err := os.Stat("internal/tests/spectra.db"); err == nil {
-		os.Remove("internal/tests/spectra.db")
+	if _, err := os.Stat("./spectra.db"); err == nil {
+		os.Remove("./spectra.db")
 	}
 
 	spectraFS, err := sdk.New("internal/configs/spectra.json")
