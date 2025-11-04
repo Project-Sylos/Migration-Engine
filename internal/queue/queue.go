@@ -13,82 +13,99 @@ import (
 	"github.com/Project-Sylos/Migration-Engine/internal/logservice"
 )
 
-// QueueState represents the current operational state of a queue.
+// QueueState represents the lifecycle state of a queue.
 type QueueState string
 
 const (
-	QueueStateNeedsPull     QueueState = "needs_pull"     // Round advanced, need to pull tasks
-	QueueStateRunning       QueueState = "running"        // Have tasks, actively processing
-	QueueStateRoundComplete QueueState = "round_complete" // Round finished, ready to advance
-	QueueStateExhausted     QueueState = "exhausted"      // No more tasks in DB, traversal complete
+	QueueStateRunning   QueueState = "running"   // Queue is active and processing
+	QueueStatePaused    QueueState = "paused"    // Queue is paused
+	QueueStateStopped   QueueState = "stopped"   // Queue is stopped
+	QueueStateCompleted QueueState = "completed" // Traversal complete (max depth reached)
 )
 
 // Queue maintains pending, in-progress task lists and uses a Buffer for batch writes.
 // It handles task leasing, retry logic, task pulling from DB, and coordinated flushing.
 type Queue struct {
-	name       string                     // Queue name ("src" or "dst")
-	mu         sync.RWMutex               // Protects all internal state
-	state      QueueState                 // Current operational state
-	pending    []*TaskBase                // Tasks waiting to be leased
-	inProgress map[string]*TaskBase       // Tasks currently being executed (keyed by identifier)
-	trackedIDs map[string]bool            // All task IDs currently tracked (prevents re-querying)
-	maxRetries int                        // Maximum retry attempts per task
-	round      int                        // Current BFS round/depth level
-	batchSize  int                        // Number of tasks to fetch from DB per batch
-	buffer     *db.Buffer                 // Buffer for batch DB operations
-	workers    []Worker                   // Workers attached to this queue
-	wg         sync.WaitGroup             // Tracks active workers
-	stopChan   chan struct{}              // Signals workers and management goroutine to stop
-	db         *db.DB                     // Database handle for task pulling and flushing
-	tableName  string                     // "src_nodes" or "dst_nodes"
-	srcCtx     *fsservices.ServiceContext // For dst queue: needed to query src nodes
+	name                string                     // Queue name ("src" or "dst")
+	mu                  sync.RWMutex               // Protects all internal state
+	state               QueueState                 // Lifecycle state (running/paused/stopped/completed)
+	pending             []*TaskBase                // Tasks waiting to be leased
+	inProgress          map[string]*TaskBase       // Tasks currently being executed (keyed by identifier)
+	trackedIDs          map[string]bool            // All task IDs currently tracked (prevents re-querying)
+	maxRetries          int                        // Maximum retry attempts per task
+	round               int                        // Current BFS round/depth level
+	batchSize           int                        // Number of tasks to fetch from DB per batch
+	workers             []Worker                   // Workers associated with this queue (for reference only)
+	pulling             bool                       // True when a pull is in progress (prevents concurrent pulls)
+	pendingRoundAdvance bool                       // True when partial batch detected, waiting for tasks to complete before advancing
+	db                  *db.DB                     // Database handle for task pulling
+	tableName           string                     // "src_nodes" or "dst_nodes"
+	srcCtx              *fsservices.ServiceContext // For dst queue: needed to query src nodes
+	srcQueue            *Queue                     // For dst queue: reference to src queue for round coordination
+	coordinator         *QueueCoordinator          // Shared coordinator for round synchronization
+	outputBuffer        *OutputBuffer              // Shared buffer for src->dst visibility
+	// Round-based statistics for completion detection
+	roundStats    map[int]*RoundStats // Per-round statistics (key: round number, value: stats for that round)
+	hasEverPulled bool                // Whether we've ever successfully pulled tasks from DB
 }
 
 // NewQueue creates a new Queue instance.
-func NewQueue(name string, maxRetries int, batchSize int, flushThreshold int, flushInterval time.Duration) *Queue {
-	// Create buffer for batch operations
-	buffer := db.NewBuffer(flushInterval, flushThreshold)
-
+func NewQueue(name string, maxRetries int, batchSize int, workerCount int, coordinator *QueueCoordinator, outputBuffer *OutputBuffer) *Queue {
 	return &Queue{
-		name:       name,
-		state:      QueueStateNeedsPull,
-		pending:    make([]*TaskBase, 0),
-		inProgress: make(map[string]*TaskBase),
-		trackedIDs: make(map[string]bool),
-		maxRetries: maxRetries,
-		round:      0,
-		batchSize:  batchSize,
-		buffer:     buffer,
-		workers:    make([]Worker, 0),
-		stopChan:   make(chan struct{}),
+		name:          name,
+		state:         QueueStateRunning,
+		pending:       make([]*TaskBase, 0),
+		inProgress:    make(map[string]*TaskBase),
+		trackedIDs:    make(map[string]bool),
+		maxRetries:    maxRetries,
+		round:         0,
+		batchSize:     batchSize,
+		workers:       make([]Worker, 0, workerCount),
+		roundStats:    make(map[int]*RoundStats),
+		hasEverPulled: false,
+		coordinator:   coordinator,
+		outputBuffer:  outputBuffer,
 	}
 }
 
-// Initialize sets up the queue with database and context references and starts management goroutine.
-func (q *Queue) Initialize(database *db.DB, tableName string, srcContext *fsservices.ServiceContext) {
+// Initialize sets up the queue with database, context, and filesystem adapter references.
+// Creates and starts workers immediately - they'll poll for tasks autonomously.
+// For dst queues, srcContext and srcQueue are required for round coordination.
+func (q *Queue) Initialize(database *db.DB, tableName string, adapter fsservices.FSAdapter, srcContext *fsservices.ServiceContext, srcQueue *Queue) {
 	q.mu.Lock()
 	q.db = database
 	q.tableName = tableName
 	q.srcCtx = srcContext
+	q.srcQueue = srcQueue
+	workerCount := cap(q.workers) // Get the worker count we preallocated for
 	q.mu.Unlock()
 
-	// Register sub-buffers for different operation types
-	q.setupBuffers()
+	// Create and start workers - they manage themselves
+	for i := 0; i < workerCount; i++ {
+		worker := NewTraversalWorker(
+			fmt.Sprintf("%s-worker-%d", q.name, i),
+			q,
+			database,
+			adapter,
+			tableName,
+			q.name,
+			q.coordinator,
+			q.outputBuffer,
+		)
+		q.AddWorker(worker)
+		go worker.Run()
 
-	// Start buffer's automatic flush timer
-	q.buffer.Start()
+	}
 
-	// Start management goroutine for task pulling
-	q.wg.Add(1)
-	go q.managementLoop()
-}
-
-// setupBuffers registers sub-buffers for batch operations.
-func (q *Queue) setupBuffers() {
-	// Sub-buffer for completed tasks (handles parent status updates + child writes)
-	q.buffer.RegisterSubBuffer("completed", func(items []interface{}) error {
-		return q.processCompletedTasks(items)
-	})
+	// Scenario 2: Initial pull when queue is created
+	// DST queues should NOT pull on initialization - they wait for SRC to be ahead
+	if q.name != "dst" {
+		q.pullTasks()
+	} else {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("info", "DST queue initialized - waiting for SRC to advance before pulling tasks", "queue", q.name, q.name)
+		}
+	}
 }
 
 // Name returns the queue's name.
@@ -110,19 +127,46 @@ func (q *Queue) BatchSize() int {
 	return q.batchSize
 }
 
-// SetRound updates the current round and resets state to needs pull.
-func (q *Queue) SetRound(round int) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.round = round
-	q.state = QueueStateNeedsPull
+// IsExhausted returns true if the queue has finished all traversal.
+func (q *Queue) IsExhausted() bool {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.state == QueueStateCompleted
 }
 
-// State returns the current queue state.
+// State returns the current queue lifecycle state.
 func (q *Queue) State() QueueState {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.state
+}
+
+// IsPaused returns true if the queue is paused.
+func (q *Queue) IsPaused() bool {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.state == QueueStatePaused
+}
+
+// IsPulling returns true if the queue is currently pulling tasks from the database.
+func (q *Queue) IsPulling() bool {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.pulling
+}
+
+// Pause pauses the queue (workers will not lease new tasks).
+func (q *Queue) Pause() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.state = QueueStatePaused
+}
+
+// Resume resumes the queue after a pause.
+func (q *Queue) Resume() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.state = QueueStateRunning
 }
 
 // Add enqueues a new task if it's not already tracked.
@@ -140,6 +184,15 @@ func (q *Queue) Add(task *TaskBase) bool {
 	return true
 }
 
+// getOrCreateRoundStats returns the RoundStats for the current round, creating it if it doesn't exist.
+// Must be called with q.mu.Lock() or q.mu.RLock() held by the caller.
+func (q *Queue) getOrCreateRoundStats(round int) *RoundStats {
+	if q.roundStats[round] == nil {
+		q.roundStats[round] = &RoundStats{}
+	}
+	return q.roundStats[round]
+}
+
 // AddBatch enqueues multiple tasks atomically.
 func (q *Queue) AddBatch(tasks []*TaskBase) int {
 	q.mu.Lock()
@@ -154,48 +207,99 @@ func (q *Queue) AddBatch(tasks []*TaskBase) int {
 			added++
 		}
 	}
+	// Track tasks queued for current round
+	if added > 0 {
+		roundStats := q.getOrCreateRoundStats(q.round)
+		roundStats.Queued += added
+	}
 	return added
 }
 
-// Lease attempts to lease a task for execution.
-// Returns nil if no tasks are available.
+// Lease attempts to lease a task for execution atomically.
+// Returns nil if no tasks are available, queue is paused, or completed.
+// The task is atomically removed from pending and moved to in-progress with the mutex held.
 func (q *Queue) Lease() *TaskBase {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 
-	if len(q.pending) == 0 {
+	// Don't lease if paused or completed
+	if q.state == QueueStatePaused || q.state == QueueStateCompleted {
+		q.mu.Unlock()
 		return nil
 	}
 
-	// Pop from front (FIFO)
+	if len(q.pending) == 0 {
+		// For DST queues: check if SRC is ready and we can pull tasks
+		// This provides the polling fallback mechanism when DST is waiting for SRC
+		if q.name == "dst" && q.state == QueueStateRunning && !q.pulling {
+			q.mu.Unlock() // Release lock before checking external state
+
+			// Check if we can pull tasks (SRC is ready)
+			if q.canWePullTasks() {
+				// Trigger pull attempt - pullTasks() will handle the actual coordination
+				go q.pullTasks()
+			}
+			return nil
+		}
+		q.mu.Unlock()
+		return nil
+	}
+
+	// Atomically pop from front (FIFO) and move to in-progress
 	task := q.pending[0]
 	q.pending = q.pending[1:]
 
-	// Mark as locked and move to in-progress
+	// Mark as locked and move to in-progress (task ID already in trackedIDs from Add/AddBatch)
 	task.Locked = true
 	id := task.Identifier()
 	q.inProgress[id] = task
 
+	// Check if we should trigger a pull
+	totalActive := len(q.pending) + len(q.inProgress)
+	shouldPull := totalActive < q.batchSize && q.state == QueueStateRunning
+	q.mu.Unlock()
+
+	// Trigger pull after releasing lock
+	if shouldPull {
+		go q.pullTasks()
+	}
+
 	return task
 }
 
-// Complete marks a task as successfully completed and adds it to the buffer.
+// Complete marks a task as successfully completed.
 func (q *Queue) Complete(task *TaskBase) {
 	q.mu.Lock()
 	id := task.Identifier()
 	delete(q.inProgress, id)
 	delete(q.trackedIDs, id)
-	q.mu.Unlock()
 
 	task.Locked = false
 	task.Status = "successful"
 
-	// Add to buffer for batch processing
-	q.buffer.Add("completed", task)
+	// Increment completed count for current round
+	roundStats := q.getOrCreateRoundStats(q.round)
+	roundStats.Completed++
+
+	// Check if we're waiting for round advance and all tasks are done
+	if q.pendingRoundAdvance && len(q.pending) == 0 && len(q.inProgress) == 0 {
+		q.pendingRoundAdvance = false // Reset flag - round will advance and reset pulling
+		q.mu.Unlock()
+		q.advanceToNextRound() // This will reset pulling flag
+		return
+	}
+
+	// Normal round completion check (for edge cases where we didn't detect partial batch)
+	if q.state == QueueStateRunning && len(q.pending) == 0 && len(q.inProgress) == 0 && !q.pendingRoundAdvance {
+		q.mu.Unlock()
+		q.markRoundComplete()
+		return
+	}
+	q.mu.Unlock()
 }
 
 // Fail handles a failed task. If retry limit is not exceeded, re-queues the task.
-// Otherwise, adds it to buffer with failed status.
+// Otherwise, marks it as failed and removes from tracking.
+// Also checks for round completion when all tasks are exhausted (succeeded or failed).
 func (q *Queue) Fail(task *TaskBase) bool {
 	q.mu.Lock()
 	id := task.Identifier()
@@ -206,23 +310,38 @@ func (q *Queue) Fail(task *TaskBase) bool {
 
 	// Check if we should retry
 	if task.Attempts < q.maxRetries {
-		// Re-queue for retry
+		// Re-queue for retry (don't check round completion here since task is back in queue)
 		task.Locked = false
 		q.pending = append(q.pending, task)
 		q.mu.Unlock()
 		return true // Will retry
 	}
 
-	// Max retries exceeded
+	// Max retries exceeded - remove from tracking immediately
 	delete(q.trackedIDs, id)
-	q.mu.Unlock()
-
 	task.Locked = false
 	task.Status = "failed"
 
-	// Add to buffer for batch processing
-	q.buffer.Add("completed", task)
+	// Increment completed count for current round (failed tasks still count as completed work)
+	roundStats := q.getOrCreateRoundStats(q.round)
+	roundStats.Completed++
 
+	// Check if we're waiting for round advance and all tasks are done
+	if q.pendingRoundAdvance && len(q.pending) == 0 && len(q.inProgress) == 0 {
+		q.pendingRoundAdvance = false // Reset flag - round will advance and reset pulling
+		q.mu.Unlock()
+		q.advanceToNextRound() // This will reset pulling flag
+		return false
+	}
+
+	// Normal round completion check (for edge cases where we didn't detect partial batch)
+	if q.state == QueueStateRunning && len(q.pending) == 0 && len(q.inProgress) == 0 && !q.pendingRoundAdvance {
+		q.mu.Unlock()
+		q.markRoundComplete()
+		return false
+	}
+
+	q.mu.Unlock()
 	return false // Will not retry
 }
 
@@ -277,6 +396,12 @@ func (q *Queue) Clear() {
 	q.trackedIDs = make(map[string]bool)
 }
 
+// RoundStats tracks statistics for a specific round.
+type RoundStats struct {
+	Queued    int // Tasks queued in this round (from AddBatch)
+	Completed int // Tasks completed in this round (successful + failed)
+}
+
 // Stats returns current queue statistics.
 type QueueStats struct {
 	Name         string
@@ -284,6 +409,7 @@ type QueueStats struct {
 	Pending      int
 	InProgress   int
 	TotalTracked int
+	Workers      int
 }
 
 // Stats returns a snapshot of the queue's current state.
@@ -297,140 +423,153 @@ func (q *Queue) Stats() QueueStats {
 		Pending:      len(q.pending),
 		InProgress:   len(q.inProgress),
 		TotalTracked: len(q.trackedIDs),
+		Workers:      len(q.workers),
 	}
 }
 
-// AddWorker attaches a worker to this queue.
+// AddWorker registers a worker with this queue for reference.
+// Workers manage their own lifecycle - this is just for tracking/debugging.
 func (q *Queue) AddWorker(worker Worker) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.workers = append(q.workers, worker)
 }
 
-// StartWorkers begins all attached workers.
-func (q *Queue) StartWorkers() {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	for i, worker := range q.workers {
-		q.wg.Add(1)
-		workerIdx := i // capture for closure
-		go func(w Worker, idx int) {
-			defer q.wg.Done()
-			if logservice.LS != nil {
-				_ = logservice.LS.Log(
-					"info",
-					fmt.Sprintf("Worker %d started", idx),
-					"queue",
-					q.name,
-				)
-			}
-			w.Run()
-			if logservice.LS != nil {
-				_ = logservice.LS.Log(
-					"info",
-					fmt.Sprintf("Worker %d stopped", idx),
-					"queue",
-					q.name,
-				)
-			}
-		}(worker, workerIdx)
-	}
-
-	if logservice.LS != nil {
-		_ = logservice.LS.Log(
-			"info",
-			fmt.Sprintf("Started %d workers", len(q.workers)),
-			"queue",
-			q.name,
-		)
-	}
-}
-
-// managementLoop runs in a goroutine to periodically pull tasks.
-// Flushing is handled automatically by the buffer.
-func (q *Queue) managementLoop() {
-	defer q.wg.Done()
-
-	pullTicker := time.NewTicker(50 * time.Millisecond)
-	defer pullTicker.Stop()
-
-	for {
-		select {
-		case <-q.stopChan:
-			// Stop buffer (triggers final flush)
-			q.buffer.Stop()
-			return
-		case <-pullTicker.C:
-			q.pullTasks()
-		}
-	}
+// WorkerCount returns the number of workers associated with this queue.
+func (q *Queue) WorkerCount() int {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return len(q.workers)
 }
 
 // pullTasks queries the database for new tasks and adds them to the pending queue.
 func (q *Queue) pullTasks() {
-	// Get current state and counts (methods handle their own locking)
 	if q.db == nil {
 		return
 	}
 
-	currentState := q.State()
-	pendingCount := q.PendingCount()
-	inProgressCount := q.InProgressCount()
-
-	// If we're running and queue is empty, mark round as complete
-	if currentState == QueueStateRunning && pendingCount == 0 && inProgressCount == 0 {
-		q.markRoundComplete()
+	// Check if already pulling, waiting for round advance, or completed (prevent concurrent pulls)
+	q.mu.Lock()
+	if q.pulling || q.pendingRoundAdvance || q.state == QueueStateCompleted {
+		q.mu.Unlock()
 		return
 	}
+	q.pulling = true
+	requestedBatchSize := q.batchSize // Capture immutable batch size for comparison
+	q.mu.Unlock()
 
-	// Only pull if we need to and have room
-	if currentState == QueueStateNeedsPull || (pendingCount+inProgressCount < q.BatchSize() && currentState == QueueStateRunning) {
-		// Pull tasks based on queue type
-		if q.name == "src" {
-			q.pullSrcTasks()
-		} else {
-			q.pullDstTasks()
+	// Ensure we clear the pulling flag when done (unless pendingRoundAdvance is set)
+	defer func() {
+		q.mu.Lock()
+		if !q.pendingRoundAdvance {
+			q.pulling = false
 		}
+		// If pendingRoundAdvance is true, pulling stays true to block more pulls
+		q.mu.Unlock()
+	}()
+
+	// Pull tasks based on queue type
+	if q.name == "src" {
+		q.pullSrcTasks(requestedBatchSize)
+	} else {
+		q.pullDstTasks(requestedBatchSize)
 	}
 }
 
-// markRoundComplete marks the current round as complete if still running.
+// markRoundComplete marks the current round as complete and automatically advances to next round.
 func (q *Queue) markRoundComplete() {
 	q.mu.Lock()
-	defer q.mu.Unlock()
+	currentRound := q.round
+	q.mu.Unlock()
 
-	if q.state == QueueStateRunning {
-		q.state = QueueStateRoundComplete
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("info", fmt.Sprintf("Round %d complete", q.round), "queue", q.name)
-		}
+	if logservice.LS != nil {
+		_ = logservice.LS.Log("info", fmt.Sprintf("Round %d complete", currentRound), "queue", q.name, q.name)
 	}
+
+	// Auto-advance to next round
+	q.advanceToNextRound()
 }
 
-// setState updates the queue state.
-func (q *Queue) setState(state QueueState) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.state = state
-}
-
-// checkIfExhausted checks if traversal is exhausted when no tasks are found.
-func (q *Queue) checkIfExhausted(round int, queueType string) {
-	// I'm exhausted writing this. lol
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	if q.state == QueueStateNeedsPull {
-		q.state = QueueStateExhausted
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("info", fmt.Sprintf("No %s tasks found for round %d - traversal exhausted", queueType, round), "queue", q.name)
+// advanceToNextRound advances the queue to the next round and checks for completion.
+// Uses coordinator to ensure bounded concurrency between src and dst queues.
+func (q *Queue) advanceToNextRound() {
+	// Check coordinator conditions before advancing
+	if q.coordinator != nil {
+		switch q.name {
+		case "src":
+			// Src waits if it's too far ahead of dst
+			for !q.coordinator.CanSrcAdvance() {
+				time.Sleep(50 * time.Millisecond)
+			}
+		case "dst":
+			// Dst waits until src is at least one round ahead
+			for !q.coordinator.CanDstAdvance() {
+				time.Sleep(50 * time.Millisecond)
+			}
 		}
 	}
+
+	q.mu.Lock()
+	q.round++
+	newRound := q.round
+	// Reset pulling flag so we can pull tasks for the new round
+	q.pulling = false
+	// Initialize stats for the new round (if not already exists)
+	q.getOrCreateRoundStats(newRound)
+	q.mu.Unlock()
+
+	// Update coordinator state
+	if q.coordinator != nil {
+		switch q.name {
+		case "src":
+			q.coordinator.UpdateSrcRound(newRound)
+		case "dst":
+			q.coordinator.UpdateDstRound(newRound)
+		}
+	}
+
+	if logservice.LS != nil {
+		_ = logservice.LS.Log("info", fmt.Sprintf("Advanced to round %d", newRound), "queue", q.name, q.name)
+	}
+
+	// Scenario 3: Round advanced - pull tasks for new round
+	// This will call checkForCompletion if no tasks are found
+	q.pullTasks()
+}
+
+// canWePullTasks checks if the DST queue can pull tasks (SRC is ready).
+// Returns true if this is not a DST queue, or if DST queue and SRC is at least one round ahead.
+// This function encapsulates the logic for determining when DST can start pulling tasks.
+func (q *Queue) canWePullTasks() bool {
+	// Source queues can always pull (they're independent)
+	if q.name != "dst" {
+		return true
+	}
+
+	// DST queues need SRC to be ready
+	if q.srcQueue == nil {
+		return false
+	}
+
+	q.mu.RLock()
+	myRound := q.round
+	q.mu.RUnlock()
+
+	// Use coordinator if available, otherwise fallback to direct queue check
+	srcRound := myRound
+	if q.coordinator != nil {
+		srcRound = q.coordinator.GetSrcRound()
+	} else {
+		srcRound = q.srcQueue.Round()
+	}
+	srcExhausted := q.srcQueue.IsExhausted()
+
+	// DST round N can pull when SRC is at least on round N+1 (or SRC is exhausted)
+	return srcRound > myRound || srcExhausted
 }
 
 // pullSrcTasks queries src_nodes for pending folders at current round.
-func (q *Queue) pullSrcTasks() {
+func (q *Queue) pullSrcTasks(requestedBatchSize int) {
 	trackedIDs := q.TrackedIDs()
 	round := q.Round()
 
@@ -447,19 +586,19 @@ func (q *Queue) pullSrcTasks() {
 	}
 
 	query := fmt.Sprintf(`
-		SELECT id, parent_id, name, path, type, depth_level, last_updated
+		SELECT id, parent_id, name, path, parent_path, type, depth_level, last_updated
 		FROM %s
-		WHERE traversal_status = 'pending'
+		WHERE traversal_status = 'Pending'
 		  AND depth_level = %d
 		  AND type = 'folder'
 		  %s
 		LIMIT %d
-	`, q.tableName, round, exclusionClause, q.batchSize)
+	`, q.tableName, round, exclusionClause, requestedBatchSize)
 
 	rows, err := q.db.Query(query)
 	if err != nil {
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to pull src tasks: %v", err), "queue", q.name)
+			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to pull src tasks: %v", err), "queue", q.name, q.name)
 		}
 		return
 	}
@@ -467,10 +606,10 @@ func (q *Queue) pullSrcTasks() {
 
 	var tasks []*TaskBase
 	for rows.Next() {
-		var id, parentId, name, path, nodeType, lastUpdated string
+		var id, parentId, name, path, parentPath, nodeType, lastUpdated string
 		var depthLevel int
 
-		err := rows.Scan(&id, &parentId, &name, &path, &nodeType, &depthLevel, &lastUpdated)
+		err := rows.Scan(&id, &parentId, &name, &path, &parentPath, &nodeType, &depthLevel, &lastUpdated)
 		if err != nil {
 			continue
 		}
@@ -482,28 +621,52 @@ func (q *Queue) pullSrcTasks() {
 				ParentId:     parentId,
 				DisplayName:  name,
 				LocationPath: path,
+				ParentPath:   parentPath,
 				LastUpdated:  lastUpdated,
 				DepthLevel:   depthLevel,
 				Type:         nodeType,
 			},
+			Round: round,
 		})
 	}
 
+	pulledCount := len(tasks)
+
 	// Update state based on results
-	if len(tasks) > 0 {
-		q.setState(QueueStateRunning)
+	if pulledCount > 0 {
 		added := q.AddBatch(tasks)
+		if added > 0 {
+			// Mark that we've successfully pulled tasks
+			q.mu.Lock()
+			q.hasEverPulled = true
+			q.mu.Unlock()
+		}
 		if logservice.LS != nil && added > 0 {
-			_ = logservice.LS.Log("debug", fmt.Sprintf("Pulled %d src tasks for round %d", added, round), "queue", q.name)
+			_ = logservice.LS.Log("debug", fmt.Sprintf("Pulled %d src tasks for round %d", added, round), "queue", q.name, q.name)
+		}
+
+		// Check if we got a partial batch (fewer than requested)
+		if pulledCount < requestedBatchSize {
+			q.mu.Lock()
+			q.pendingRoundAdvance = true
+			// pulling flag stays true (set in defer of pullTasks) until round advances
+			q.mu.Unlock()
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("info",
+					fmt.Sprintf("Partial batch detected (%d < %d) - will advance round after current tasks complete", pulledCount, requestedBatchSize),
+					"queue",
+					q.name,
+					q.name)
+			}
 		}
 	} else {
-		// No tasks found - check if traversal exhausted
-		q.checkIfExhausted(round, "src")
+		// No tasks found - check for completion
+		q.checkForCompletion(round)
 	}
 }
 
 // pullDstTasks queries dst_nodes and populates expected children from src_nodes.
-func (q *Queue) pullDstTasks() {
+func (q *Queue) pullDstTasks(requestedBatchSize int) {
 	if q.srcCtx == nil {
 		return // Need src context to query expected children
 	}
@@ -525,19 +688,19 @@ func (q *Queue) pullDstTasks() {
 
 	// Query 1: Get dst parent nodes
 	query1 := fmt.Sprintf(`
-		SELECT id, parent_id, name, path, type, depth_level, last_updated
+		SELECT id, parent_id, name, path, parent_path, type, depth_level, last_updated
 		FROM %s
-		WHERE traversal_status = 'pending'
+		WHERE traversal_status = 'Pending'
 		  AND depth_level = %d
 		  AND type = 'folder'
 		  %s
 		LIMIT %d
-	`, q.tableName, round, exclusionClause, q.batchSize)
+	`, q.tableName, round, exclusionClause, requestedBatchSize)
 
 	rows, err := q.db.Query(query1)
 	if err != nil {
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to pull dst tasks: %v", err), "queue", q.name)
+			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to pull dst tasks: %v", err), "queue", q.name, q.name)
 		}
 		return
 	}
@@ -547,145 +710,56 @@ func (q *Queue) pullDstTasks() {
 		parentId    string
 		name        string
 		path        string
+		parentPath  string
 		nodeType    string
 		depthLevel  int
 		lastUpdated string
 	}
 
 	var dstNodes []dstNode
-	dstPaths := make([]string, 0)
 
 	for rows.Next() {
 		var node dstNode
-		err := rows.Scan(&node.id, &node.parentId, &node.name, &node.path, &node.nodeType, &node.depthLevel, &node.lastUpdated)
+		err := rows.Scan(&node.id, &node.parentId, &node.name, &node.path, &node.parentPath, &node.nodeType, &node.depthLevel, &node.lastUpdated)
 		if err != nil {
 			continue
 		}
 		dstNodes = append(dstNodes, node)
-		dstPaths = append(dstPaths, node.path)
 	}
 	rows.Close()
 
 	if len(dstNodes) == 0 {
+		// No tasks found - check for completion
+		q.checkForCompletion(round)
 		return
 	}
 
-	// Query 2: Get corresponding src parent nodes by path
-	pathsClause := ""
-	for i, path := range dstPaths {
-		if i > 0 {
-			pathsClause += ", "
+	// Get expected children from OutputBuffer instead of DB join
+	var childrenByParentPath map[string][]any
+	if q.outputBuffer != nil {
+		// Extract paths from dst nodes
+		dstPaths := make([]string, len(dstNodes))
+		for i, node := range dstNodes {
+			dstPaths[i] = node.path
 		}
-		pathsClause += fmt.Sprintf("'%s'", path)
-	}
-
-	query2 := fmt.Sprintf(`
-		SELECT id, path
-		FROM src_nodes
-		WHERE path IN (%s)
-	`, pathsClause)
-
-	rows, err = q.db.Query(query2)
-	if err != nil {
+		childrenByParentPath = q.outputBuffer.GetChildrenForPaths(round, dstPaths)
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to query src parents: %v", err), "queue", q.name)
+			_ = logservice.LS.Log("debug", fmt.Sprintf("Buffer returned children for %d paths", len(childrenByParentPath)), "queue", q.name, q.name)
 		}
-		return
-	}
-
-	srcParentIDs := make([]string, 0)
-	pathToSrcID := make(map[string]string)
-
-	for rows.Next() {
-		var srcID, srcPath string
-		err := rows.Scan(&srcID, &srcPath)
-		if err != nil {
-			continue
-		}
-		srcParentIDs = append(srcParentIDs, srcID)
-		pathToSrcID[srcPath] = srcID
-	}
-	rows.Close()
-
-	if len(srcParentIDs) == 0 {
-		return
-	}
-
-	// Query 3: Get all src children for these parents
-	parentIDsClause := ""
-	for i, id := range srcParentIDs {
-		if i > 0 {
-			parentIDsClause += ", "
-		}
-		parentIDsClause += fmt.Sprintf("'%s'", id)
-	}
-
-	query3 := fmt.Sprintf(`
-		SELECT id, parent_id, name, path, type, depth_level, size, last_updated
-		FROM src_nodes
-		WHERE parent_id IN (%s)
-	`, parentIDsClause)
-
-	rows, err = q.db.Query(query3)
-	if err != nil {
+	} else {
+		// Fallback: no buffer available, create empty map
+		childrenByParentPath = make(map[string][]any)
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to query src children: %v", err), "queue", q.name)
-		}
-		return
-	}
-
-	// Group children by parent_id
-	childrenByParent := make(map[string][]interface{})
-
-	for rows.Next() {
-		var id, parentId, name, path, nodeType, lastUpdated string
-		var depthLevel int
-		var size *int64
-
-		err := rows.Scan(&id, &parentId, &name, &path, &nodeType, &depthLevel, &size, &lastUpdated)
-		if err != nil {
-			continue
-		}
-
-		if nodeType == fsservices.NodeTypeFolder {
-			folder := fsservices.Folder{
-				Id:           id,
-				ParentId:     parentId,
-				DisplayName:  name,
-				LocationPath: path,
-				LastUpdated:  lastUpdated,
-				DepthLevel:   depthLevel,
-				Type:         nodeType,
-			}
-			childrenByParent[parentId] = append(childrenByParent[parentId], folder)
-		} else {
-			file := fsservices.File{
-				Id:           id,
-				ParentId:     parentId,
-				DisplayName:  name,
-				LocationPath: path,
-				LastUpdated:  lastUpdated,
-				DepthLevel:   depthLevel,
-				Size:         0,
-				Type:         nodeType,
-			}
-			if size != nil {
-				file.Size = *size
-			}
-			childrenByParent[parentId] = append(childrenByParent[parentId], file)
+			_ = logservice.LS.Log("warning", "No output buffer available for dst query", "queue", q.name, q.name)
 		}
 	}
-	rows.Close()
+
 
 	// Build tasks with expected children
 	var tasks []*TaskBase
 	for _, dstNode := range dstNodes {
-		srcParentID, ok := pathToSrcID[dstNode.path]
-		if !ok {
-			continue
-		}
-
-		children := childrenByParent[srcParentID]
+		// Match children directly by parent_path (dst node's path)
+		children := childrenByParentPath[dstNode.path]
 
 		var expectedFolders []fsservices.Folder
 		var expectedFiles []fsservices.File
@@ -712,217 +786,92 @@ func (q *Queue) pullDstTasks() {
 			},
 			ExpectedFolders: expectedFolders,
 			ExpectedFiles:   expectedFiles,
+			Round:           round,
 		})
 	}
 
+	pulledCount := len(tasks)
+
 	// Update state based on results
-	if len(tasks) > 0 {
-		q.setState(QueueStateRunning)
+	if pulledCount > 0 {
 		added := q.AddBatch(tasks)
+		if added > 0 {
+			// Mark that we've successfully pulled tasks
+			q.mu.Lock()
+			q.hasEverPulled = true
+			q.mu.Unlock()
+		}
 		if logservice.LS != nil && added > 0 {
-			_ = logservice.LS.Log("debug", fmt.Sprintf("Pulled %d dst tasks for round %d", added, round), "queue", q.name)
+			_ = logservice.LS.Log("debug", fmt.Sprintf("Pulled %d dst tasks for round %d", added, round), "queue", q.name, q.name)
+		}
+
+		// Check if we got a partial batch (fewer than requested)
+		if pulledCount < requestedBatchSize {
+			q.mu.Lock()
+			q.pendingRoundAdvance = true
+			// pulling flag stays true (set in defer of pullTasks) until round advances
+			q.mu.Unlock()
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("info",
+					fmt.Sprintf("Partial batch detected (%d < %d) - will advance round after current tasks complete", pulledCount, requestedBatchSize),
+					"queue",
+					q.name,
+					q.name)
+			}
 		}
 	} else {
-		// No tasks found - check if traversal exhausted
-		q.checkIfExhausted(round, "dst")
+		// No tasks found - check for completion
+		q.checkForCompletion(round)
 	}
 }
 
-// processCompletedTasks is the flush function for the "completed" sub-buffer.
-// It receives completed tasks, updates parent statuses, and writes children.
-func (q *Queue) processCompletedTasks(items []interface{}) error {
-	if len(items) == 0 {
-		return nil
-	}
+// checkForCompletion marks the queue as completed if no tasks were found.
+// Completion is valid if:
+// 1. First query ever and DB is empty (graceful failure)
+// 2. Just advanced rounds and previous round had completed work (BFS reached max depth)
+func (q *Queue) checkForCompletion(round int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 
-	if q.db == nil {
-		return nil
-	}
-
-	// Convert items to tasks
-	tasks := make([]*TaskBase, 0, len(items))
-	for _, item := range items {
-		if task, ok := item.(*TaskBase); ok {
-			tasks = append(tasks, task)
-		}
-	}
-
-	// Group tasks by status for parent updates
-	parentSuccessful := make([]string, 0)
-	parentFailed := make([]string, 0)
-
-	// Collect all children to write
-	var allChildren []ChildResult
-
-	for _, task := range tasks {
-		// Group parent status updates
-		switch task.Status {
-		case "successful":
-			parentSuccessful = append(parentSuccessful, task.Identifier())
-		case "failed":
-			parentFailed = append(parentFailed, task.Identifier())
-		}
-
-		// Collect children
-		allChildren = append(allChildren, task.DiscoveredChildren...)
-	}
-
-	// Batch update parent statuses
-	if len(parentSuccessful) > 0 {
-		q.batchUpdateStatus(parentSuccessful, "successful")
-	}
-	if len(parentFailed) > 0 {
-		q.batchUpdateStatus(parentFailed, "failed")
-	}
-
-	// Batch write children grouped by status
-	q.batchWriteChildren(allChildren)
-
-	if logservice.LS != nil {
-		_ = logservice.LS.Log("debug", fmt.Sprintf("Flushed %d completed tasks", len(tasks)), "queue", q.name)
-	}
-
-	return nil
-}
-
-// batchUpdateStatus performs a batch UPDATE for traversal status.
-func (q *Queue) batchUpdateStatus(ids []string, status string) {
-	if len(ids) == 0 {
+	// Only check if we're currently running
+	if q.state != QueueStateRunning {
 		return
 	}
 
-	idsClause := ""
-	for i, id := range ids {
-		if i > 0 {
-			idsClause += ", "
+	// Condition 1: First query ever and found nothing (graceful failure)
+	if !q.hasEverPulled {
+		q.state = QueueStateCompleted
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("info",
+				fmt.Sprintf("First query found no tasks for round %d - traversal complete (empty database)", round),
+				"queue",
+				q.name,
+				q.name)
 		}
-		idsClause += fmt.Sprintf("'%s'", id)
+		return
 	}
 
-	query := fmt.Sprintf(`
-		UPDATE %s
-		SET traversal_status = '%s'
-		WHERE id IN (%s)
-	`, q.tableName, status, idsClause)
-
-	_, err := q.db.Query(query)
-	if err != nil && logservice.LS != nil {
-		_ = logservice.LS.Log("error", fmt.Sprintf("Failed to batch update status: %v", err), "queue", q.name)
-	}
-}
-
-// batchWriteChildren writes all discovered children, grouped by status.
-func (q *Queue) batchWriteChildren(children []ChildResult) {
-	// Group by status
-	byStatus := make(map[string][]ChildResult)
-	for _, child := range children {
-		byStatus[child.Status] = append(byStatus[child.Status], child)
-	}
-
-	// Write each group
-	for status, group := range byStatus {
-		for _, child := range group {
-			if child.IsFile {
-				q.writeFile(child.File, status)
-			} else {
-				q.writeFolder(child.Folder, status)
+	// Condition 2: Just advanced rounds and previous round had completed work
+	// Check if round-1 had completed tasks (meaning we did work last round)
+	prevRound := round - 1
+	if prevRound >= 0 {
+		prevRoundStats := q.roundStats[prevRound]
+		if prevRoundStats != nil && prevRoundStats.Completed > 0 {
+			q.state = QueueStateCompleted
+			switch q.name {
+			case "dst":
+				q.coordinator.UpdateDstCompleted()
+			case "src":
+				q.coordinator.UpdateSrcCompleted()
 			}
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("info",
+					fmt.Sprintf("No tasks found for round %d after completing round %d - traversal complete (max depth reached)", round, prevRound),
+					"queue",
+					q.name,
+					q.name)
+			}
+			return
 		}
-	}
-}
-
-// writeFolder writes a folder to the database with the given status.
-func (q *Queue) writeFolder(folder fsservices.Folder, status string) {
-	if q.name == "src" {
-		_ = q.db.Write(
-			q.tableName,
-			folder.Id,
-			folder.ParentId,
-			folder.DisplayName,
-			folder.LocationPath,
-			fsservices.NodeTypeFolder,
-			folder.DepthLevel,
-			nil,
-			folder.LastUpdated,
-			status,
-			"pending",
-		)
-	} else {
-		_ = q.db.Write(
-			q.tableName,
-			folder.Id,
-			folder.ParentId,
-			folder.DisplayName,
-			folder.LocationPath,
-			fsservices.NodeTypeFolder,
-			folder.DepthLevel,
-			nil,
-			folder.LastUpdated,
-			status,
-		)
-	}
-}
-
-// writeFile writes a file to the database with the given status.
-func (q *Queue) writeFile(file fsservices.File, status string) {
-	if q.name == "src" {
-		_ = q.db.Write(
-			q.tableName,
-			file.Id,
-			file.ParentId,
-			file.DisplayName,
-			file.LocationPath,
-			fsservices.NodeTypeFile,
-			file.DepthLevel,
-			file.Size,
-			file.LastUpdated,
-			"successful",
-			"pending",
-		)
-	} else {
-		_ = q.db.Write(
-			q.tableName,
-			file.Id,
-			file.ParentId,
-			file.DisplayName,
-			file.LocationPath,
-			fsservices.NodeTypeFile,
-			file.DepthLevel,
-			file.Size,
-			file.LastUpdated,
-			status,
-		)
-	}
-}
-
-// StopWorkers signals all workers to stop and waits for them to finish.
-func (q *Queue) StopWorkers() {
-	if logservice.LS != nil {
-		_ = logservice.LS.Log(
-			"info",
-			"Stopping all workers",
-			"queue",
-			q.name,
-		)
-	}
-	close(q.stopChan)
-	q.wg.Wait()
-	if logservice.LS != nil {
-		_ = logservice.LS.Log(
-			"info",
-			"All workers stopped",
-			"queue",
-			q.name,
-		)
-	}
-}
-
-// ShouldStop returns whether workers should stop.
-func (q *Queue) ShouldStop() bool {
-	select {
-	case <-q.stopChan:
-		return true
-	default:
-		return false
 	}
 }

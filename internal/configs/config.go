@@ -55,3 +55,32 @@ func LoadLogServiceConfig(configDir string) (LogServiceConfig, error) {
 	}
 	return cfg, nil
 }
+
+// SpectraConfig holds Spectra filesystem settings.
+type SpectraConfig struct {
+	ConfigPath    string `json:"config_path"`
+	SrcRootID     string `json:"src_root_id"`
+	DstRootID     string `json:"dst_root_id"`
+	SharedInstance bool  `json:"shared_instance"`
+	Description   string `json:"description"`
+}
+
+// SpectraConfigWrapper wraps the Spectra configuration.
+type SpectraConfigWrapper struct {
+	Spectra SpectraConfig `json:"spectra"`
+}
+
+// LoadSpectraConfig reads internal/configs/spectra.json.
+func LoadSpectraConfig(configDir string) (SpectraConfig, error) {
+	path := filepath.Join(configDir, "spectra.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return SpectraConfig{}, fmt.Errorf("failed to read spectra config: %w", err)
+	}
+
+	var wrapper SpectraConfigWrapper
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return SpectraConfig{}, fmt.Errorf("failed to parse spectra config: %w", err)
+	}
+	return wrapper.Spectra, nil
+}

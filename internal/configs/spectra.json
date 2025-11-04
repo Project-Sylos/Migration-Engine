@@ -1,0 +1,19 @@
+{
+  "seed": {
+    "max_depth": 3,
+    "min_folders": 1,
+    "max_folders": 4,
+    "min_files": 1,
+    "max_files": 4,
+    "seed": 42,
+    "db_path": "./spectra.db"
+  },
+  "api": {
+    "host": "localhost",
+    "port": 8086
+  },
+  "secondary_tables": {
+    "s1": 0.9
+  }
+}
+

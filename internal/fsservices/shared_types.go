@@ -16,6 +16,7 @@ const (
 type Folder struct {
 	Id           string
 	ParentId     string
+	ParentPath   string // The parent's relative path (root-relative)
 	DisplayName  string
 	LocationPath string
 	LastUpdated  string
@@ -33,6 +34,7 @@ func (f Folder) NodeType() string { return f.Type }
 type File struct {
 	Id           string
 	ParentId     string
+	ParentPath   string // The parent's relative path (root-relative)
 	DisplayName  string
 	LocationPath string
 	LastUpdated  string
@@ -69,6 +71,15 @@ type FSAdapter interface {
 }
 
 type ServiceContext struct {
-	Name      string    // 'Windows', 'Dropbox', 'Google Drive', etc.
+	Name      string    // 'Windows', 'Dropbox', 'Google Drive', 'Spectra', etc.
 	Connector FSAdapter // The pointer to the actual instance of the service adapter
+}
+
+// NewServiceContext creates a new ServiceContext with the given name and adapter.
+// This is the universal way to create service contexts for any filesystem type.
+func NewServiceContext(name string, adapter FSAdapter) *ServiceContext {
+	return &ServiceContext{
+		Name:      name,
+		Connector: adapter,
+	}
 }

@@ -4,10 +4,12 @@
 package db
 
 import (
+	"fmt"
+	"sync"
+	"strings"
 	"context"
 	"database/sql"
-	"sync"
-	"time"
+	_ "github.com/marcboeker/go-duckdb"
 )
 
 // TableDef is implemented by every table definition struct in tables.go.
@@ -16,38 +18,46 @@ type TableDef interface {
 	Schema() string
 }
 
-// Table wraps runtime metadata for each registered table.
-type Table struct {
-	Def        TableDef
-	IsBuffered bool
-	Buffer     *InsertBuffer
-}
-
 // DB acts as the root database manager and table registry.
 type DB struct {
-	conn    *sql.DB
-	ctx     context.Context
-	cancel  context.CancelFunc
-	mu      sync.Mutex
-	tables  map[string]*Table
+	conn   *sql.DB
+	ctx    context.Context
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	tables map[string]TableDef
 }
 
-// NewDB opens a new DuckDB connection and prepares the registry.
+// NewDB opens a new DB connection and prepares the registry.
 func NewDB(dbPath string) (*DB, error) {
 	conn, err := sql.Open("duckdb", dbPath)
 	if err != nil {
 		return nil, err
 	}
+
+	// god help you if you ever need more than 1GB of memory for a migration lol
+	conn.Exec("PRAGMA threads = 1;")
+	conn.Exec("PRAGMA disable_object_cache;")
+	conn.Exec("PRAGMA memory_limit = '1GB';")
+	conn.Exec("PRAGMA checkpoint_on_shutdown;")  // optional
+	conn.Exec("PRAGMA force_checkpoint_on_commit=true;") // see above
+
+
+	// Set the maximum number of open connections to 1
+	conn.SetMaxOpenConns(1)
+	// Set the maximum number of idle connections to 1
+	conn.SetMaxIdleConns(1)
+
+
 	return &DB{
 		conn:   conn,
 		ctx:    context.Background(),
 		cancel: func() {},
-		tables: make(map[string]*Table),
+		tables: make(map[string]TableDef),
 	}, nil
 }
 
-// RegisterTable registers a schema object (e.g. LogsTable{}) and attaches a buffer if configured.
-func (db *DB) RegisterTable(def TableDef, buffered bool, batchSize int, flushInt time.Duration) error {
+// RegisterTable registers a schema object (e.g. LogsTable{}) and creates the table if needed.
+func (db *DB) RegisterTable(def TableDef) error {
 	name := def.Name()
 	schema := def.Schema()
 
@@ -58,67 +68,167 @@ func (db *DB) RegisterTable(def TableDef, buffered bool, batchSize int, flushInt
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	t := &Table{
-		Def:        def,
-		IsBuffered: buffered,
-	}
-	if buffered {
-		t.Buffer = NewInsertBuffer(db.conn, name, batchSize, flushInt)
-	}
-	db.tables[name] = t
+	db.tables[name] = def
 	return nil
 }
 
-// Close gracefully stops buffers and closes the DB connection.
+// Close gracefully closes the DB connection.
 func (db *DB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	for _, t := range db.tables {
-		if t.IsBuffered && t.Buffer != nil {
-			t.Buffer.Stop()
-		}
-	}
 	return db.conn.Close()
 }
 
+// Query executes a SQL query and returns rows.
 func (db *DB) Query(query string, args ...any) (*sql.Rows, error) {
-    db.mu.Lock()
-    defer db.mu.Unlock()
-
-    // Flush any buffered tables involved in the query
-    for _, tbl := range db.tables {
-        if tbl.IsBuffered && tbl.Buffer != nil {
-            tbl.Buffer.Flush()
-        }
-    }
-
-    return db.conn.QueryContext(db.ctx, query, args...)
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.conn.QueryContext(db.ctx, query, args...)
 }
 
-// Write routes to a buffer if one exists; otherwise performs direct insert.
+// Write performs a direct INSERT into the specified table.
 func (db *DB) Write(table string, args ...any) error {
 	db.mu.Lock()
-	t, ok := db.tables[table]
-	db.mu.Unlock()
+	defer db.mu.Unlock()
 
-	if ok && t.IsBuffered && t.Buffer != nil {
-		t.Buffer.Add(args)
-		return nil
+	colCount := len(args)
+
+	// Begin transaction
+	tx, err := db.conn.BeginTx(db.ctx, nil)
+	if err != nil {
+		fmt.Printf("[DB ERROR] Failed to begin transaction: %v\n", err)
+		return err
 	}
-	return db.directInsert(table, args)
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback()
+			panic(p)
+		}
+	}()
+
+	query := "INSERT INTO " + table + " VALUES " + buildPlaceholderGroup(colCount)
+
+	res, err := tx.ExecContext(db.ctx, query, args...)
+	if err != nil {
+		_ = tx.Rollback()
+		fmt.Printf("[DB ERROR] Failed to insert into %s: %v\nQuery: %s\nArgs: %v\n", table, err, query, args)
+		return err
+	}
+
+	if n, _ := res.RowsAffected(); n == 0 {
+		fmt.Printf("[DB WARN] Insert into %s affected 0 rows (query may have been ignored)\nQuery: %s\nArgs: %v\n", table, query, args)
+	}
+
+	if err := tx.Commit(); err != nil {
+		fmt.Printf("[DB ERROR] Failed to commit transaction for insert into %s: %v\n", table, err)
+		return err
+	}
+	
+	// force a checkpoint to ensure all data is written directly and synchronized properly.
+	_, _ = db.conn.ExecContext(db.ctx, "PRAGMA checkpoint;")
+
+	return nil
 }
 
-// directInsert performs a simple INSERT for non-buffered tables.
-func (db *DB) directInsert(table string, args []any) error {
-	colCount := len(args)
-	query := "INSERT INTO " + table + " VALUES " + buildPlaceholderGroup(colCount)
-	_, err := db.conn.ExecContext(db.ctx, query, args...)
-	return err
+// BulkWrite inserts multiple rows into a table in one statement.
+// Each inner slice in rows is a full row of column values.
+func (db *DB) BulkWrite(table string, rows [][]any) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if len(rows) == 0 {
+		return nil
+	}
+
+	colCount := len(rows[0])
+	for i, row := range rows {
+		if len(row) != colCount {
+			return fmt.Errorf("[DB ERROR] BulkWrite: row %d has %d columns, expected %d", i, len(row), colCount)
+		}
+	}
+
+	// Begin transaction
+	tx, err := db.conn.BeginTx(db.ctx, nil)
+	if err != nil {
+		fmt.Printf("[DB ERROR] Failed to begin transaction: %v\n", err)
+		return err
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback()
+			panic(p)
+		}
+	}()
+
+	// Build "(?, ?, ?), (?, ?, ?), ..." placeholder string
+	group := buildPlaceholderGroup(colCount)
+	var groups []string
+	for range rows {
+		groups = append(groups, group)
+	}
+
+	query := fmt.Sprintf("INSERT INTO %s VALUES %s", table, strings.Join(groups, ", "))
+
+	// Flatten [][]any into []any for Exec()
+	allArgs := make([]any, 0, len(rows)*colCount)
+	for _, row := range rows {
+		allArgs = append(allArgs, row...)
+	}
+
+	res, err := tx.ExecContext(db.ctx, query, allArgs...)
+	if err != nil {
+		_ = tx.Rollback()
+		fmt.Printf("[DB ERROR] Bulk insert into %s failed: %v\nQuery: %s\nArgs len: %d\n", table, err, query, allArgs)
+		return err
+	}
+
+	if n, _ := res.RowsAffected(); n == 0 {
+		// print out the query and args it was trying to do for debugging purposes
+		fmt.Printf("[DB DEBUG] Query: %s\nArgs: %v\n", query, allArgs)
+		fmt.Printf("[DB WARN] Bulk insert into %s affected 0 rows (possible duplicates)\n", table)
+	}
+
+	if err := tx.Commit(); err != nil {
+		fmt.Printf("[DB ERROR] Failed to commit transaction for bulk insert into %s: %v\n", table, err)
+		return err
+	}
+
+	// force a checkpoint to ensure all data is written directly and synchronized properly.
+	_, _ = db.conn.ExecContext(db.ctx, "PRAGMA checkpoint;")
+
+
+	return nil
+}
+
+// buildPlaceholderGroup creates "(?, ?, ?)" etc.
+func buildPlaceholderGroup(n int) string {
+	if n <= 0 {
+		return "()"
+	}
+	s := "("
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			s += ", "
+		}
+		s += "?"
+	}
+	s += ")"
+	return s
 }
 
 // CreateTable ensures a table exists.
 func (db *DB) CreateTable(name, schema string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	query := "CREATE TABLE IF NOT EXISTS " + name + " (" + schema + ")"
 	_, err := db.conn.ExecContext(db.ctx, query)
 	return err
+}
+
+// Conn returns the underlying sql.DB connection for advanced usage.
+func (db *DB) Conn() *sql.DB {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.conn
 }

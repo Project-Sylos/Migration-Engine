@@ -26,42 +26,63 @@ type Worker interface {
 // TraversalWorker executes traversal tasks by listing children and recording them to the database.
 // Each worker runs independently in its own goroutine, continuously polling the queue for work.
 type TraversalWorker struct {
-	id        int
-	queue     *Queue
-	db        *db.DB
-	fsAdapter fsservices.FSAdapter
-	tableName string // "src_nodes" or "dst_nodes"
-	queueName string // "src" or "dst" for logging
-	isDst     bool   // true if this is a destination worker (performs comparison)
+	id           string
+	queue        *Queue
+	db           *db.DB
+	fsAdapter    fsservices.FSAdapter
+	tableName    string            // "src_nodes" or "dst_nodes"
+	queueName    string            // "src" or "dst" for logging
+	isDst        bool              // true if this is a destination worker (performs comparison)
+	outputBuffer *OutputBuffer     // Shared buffer for src->dst visibility
+	coordinator  *QueueCoordinator // Shared coordinator for round synchronization
 }
 
 // NewTraversalWorker creates a worker that executes traversal tasks.
 func NewTraversalWorker(
-	id int,
+	id string,
 	queue *Queue,
 	database *db.DB,
 	adapter fsservices.FSAdapter,
 	tableName string,
 	queueName string,
+	coordinator *QueueCoordinator,
+	outputBuffer *OutputBuffer,
 ) *TraversalWorker {
 	return &TraversalWorker{
-		id:        id,
-		queue:     queue,
-		db:        database,
-		fsAdapter: adapter,
-		tableName: tableName,
-		queueName: queueName,
-		isDst:     queueName == "dst",
+		id:           id,
+		queue:        queue,
+		db:           database,
+		fsAdapter:    adapter,
+		tableName:    tableName,
+		queueName:    queueName,
+		isDst:        queueName == "dst",
+		coordinator:  coordinator,
+		outputBuffer: outputBuffer,
 	}
 }
 
 // Run is the main worker loop. It continuously polls the queue for tasks.
 // When a task is found, it leases it, executes it, and reports the result.
-// When no work is available, it briefly sleeps before polling again.
+// When no work is available or queue is paused, it briefly sleeps before polling again.
+// When queue is exhausted, the worker exits.
 func (w *TraversalWorker) Run() {
+	if logservice.LS != nil {
+		_ = logservice.LS.Log("info", "Worker started", "worker", w.id, w.queueName)
+	}
+
 	for {
-		// Check if we should stop
-		if w.queue.ShouldStop() {
+		// Check lifecycle state first
+		if w.queue.IsPaused() {
+			// Queue is paused, sleep and continue polling
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		// Check if queue is exhausted (traversal complete) - exit worker
+		if w.queue.IsExhausted() {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("info", "Worker exiting - queue exhausted", "worker", w.id, w.queueName)
+			}
 			return
 		}
 
@@ -80,12 +101,18 @@ func (w *TraversalWorker) Run() {
 			willRetry := w.queue.Fail(task)
 			w.logError(task, err, willRetry)
 		} else {
-			// Task succeeded, mark as complete
-			w.queue.Complete(task)
-			w.logSuccess(task)
+			// Task succeeded - write results to database immediately
+			dbErr := w.writeResultsToDB(task)
+			if dbErr != nil {
+				// DB write failed, treat as task failure
+				willRetry := w.queue.Fail(task)
+				w.logError(task, dbErr, willRetry)
+			} else {
+				// DB write succeeded, mark task as complete in queue
+				w.queue.Complete(task)
+				w.logSuccess(task)
+			}
 		}
-
-		// Immediately check for more work (no sleep)
 	}
 }
 
@@ -110,13 +137,13 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 		return w.executeDstComparison(task, result)
 	}
 
-	// Source mode: all discovered children get "pending" status
+	// Source mode: all discovered children get "Pending" status
 	task.DiscoveredChildren = make([]ChildResult, 0, len(result.Folders)+len(result.Files))
 
 	for _, childFolder := range result.Folders {
 		task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 			Folder: childFolder,
-			Status: "pending",
+			Status: "Pending",
 			IsFile: false,
 		})
 	}
@@ -124,7 +151,7 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 	for _, childFile := range result.Files {
 		task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 			File:   childFile,
-			Status: "successful", // Files are immediately successful (no traversal needed)
+			Status: "Successful", // Files are immediately successful (no traversal needed)
 			IsFile: true,
 		})
 	}
@@ -165,17 +192,17 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsse
 	// Compare folders
 	for _, expectedFolder := range expectedFolders {
 		if actualFolder, exists := actualFolderMap[expectedFolder.LocationPath]; exists {
-			// Folder exists on both: mark as "pending"
+			// Folder exists on both: mark as "Pending"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				Folder: actualFolder,
-				Status: "pending",
+				Status: "Pending",
 				IsFile: false,
 			})
 		} else {
-			// Folder missing from dst: mark as "missing"
+			// Folder missing from dst: mark as "Missing"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				Folder: expectedFolder,
-				Status: "missing",
+				Status: "Missing",
 				IsFile: false,
 			})
 		}
@@ -184,10 +211,10 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsse
 	// Check for extra folders on dst (not on src)
 	for _, actualFolder := range actualResult.Folders {
 		if _, exists := expectedFolderMap[actualFolder.LocationPath]; !exists {
-			// Folder exists on dst but not src: mark as "not_on_src"
+			// Folder exists on dst but not src: mark as "NotOnSrc"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				Folder: actualFolder,
-				Status: "not_on_src",
+				Status: "NotOnSrc",
 				IsFile: false,
 			})
 		}
@@ -196,17 +223,17 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsse
 	// Compare files
 	for _, expectedFile := range expectedFiles {
 		if actualFile, exists := actualFileMap[expectedFile.LocationPath]; exists {
-			// File exists on both: mark as "successful" (files don't need traversal)
+			// File exists on both: mark as "Successful" (files don't need traversal)
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				File:   actualFile,
-				Status: "successful",
+				Status: "Successful",
 				IsFile: true,
 			})
 		} else {
-			// File missing from dst: mark as "missing"
+			// File missing from dst: mark as "Missing"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				File:   expectedFile,
-				Status: "missing",
+				Status: "Missing",
 				IsFile: true,
 			})
 		}
@@ -215,16 +242,145 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsse
 	// Check for extra files on dst (not on src)
 	for _, actualFile := range actualResult.Files {
 		if _, exists := expectedFileMap[actualFile.LocationPath]; !exists {
-			// File exists on dst but not src: mark as "not_on_src"
+			// File exists on dst but not src: mark as "NotOnSrc"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				File:   actualFile,
-				Status: "not_on_src",
+				Status: "NotOnSrc",
 				IsFile: true,
 			})
 		}
 	}
 
 	return nil
+}
+
+// writeResultsToDB performs the 2 database writes after task execution:
+// 1. Updates parent folder traversal_status to "successful"
+// 2. Batch inserts all discovered children
+// For src workers, also pushes data to OutputBuffer for dst visibility.
+func (w *TraversalWorker) writeResultsToDB(task *TaskBase) error {
+	folder := task.Folder
+
+	// Write 1: Update parent folder status to "Successful"
+	updateQuery := fmt.Sprintf("UPDATE %s SET traversal_status = 'Successful' WHERE id = ?", w.tableName)
+	_, err := w.db.Conn().Exec(updateQuery, folder.Id)
+	if err != nil {
+		return fmt.Errorf("failed to update parent status: %w", err)
+	}
+
+	// Write 2: Batch insert all discovered children
+	if len(task.DiscoveredChildren) > 0 {
+		err = w.insertChildren(task)
+		if err != nil {
+			return fmt.Errorf("failed to insert children: %w", err)
+		}
+
+		// For src workers: push data to output buffer for dst visibility
+		if !w.isDst && w.outputBuffer != nil {
+			parentPath := folder.LocationPath
+
+			for _, child := range task.DiscoveredChildren {
+				if child.IsFile {
+					w.outputBuffer.Add(task.Round, folder.LocationPath, child.File)
+				} else {
+					w.outputBuffer.Add(task.Round, folder.LocationPath, child.Folder)
+				}
+			}
+
+			// Debug: log what we're adding
+			if logservice.LS != nil && len(task.DiscoveredChildren) > 0 {
+				_ = logservice.LS.Log("info", fmt.Sprintf("Added %d children to buffer[round=%d, parentPath=%s]", len(task.DiscoveredChildren), task.Round, parentPath), "worker", w.id, w.queueName)
+			}
+		}
+	}
+
+	return nil
+}
+
+// insertChildren batch inserts all discovered children into the database in a single query.
+func (w *TraversalWorker) insertChildren(task *TaskBase) error {
+	if len(task.DiscoveredChildren) == 0 {
+		return nil
+	}
+
+	rows := make([][]any, 0, len(task.DiscoveredChildren))
+	for _, child := range task.DiscoveredChildren {
+		if child.IsFile {
+			rows = append(rows, w.getFileValues(child.File, child.Status))
+		} else {
+			rows = append(rows, w.getFolderValues(child.Folder, child.Status))
+		}
+	}
+
+	if err := w.db.BulkWrite(w.tableName, rows); err != nil {
+		return fmt.Errorf("failed to insert children: %w", err)
+	}
+
+	return nil
+}
+
+// getFolderValues returns the values slice for a folder insert.
+func (w *TraversalWorker) getFolderValues(folder fsservices.Folder, status string) []any {
+	if w.queueName == "src" {
+		return []any{
+			folder.Id,
+			folder.ParentId,
+			folder.DisplayName,
+			folder.LocationPath,
+			folder.ParentPath, // parent_path column
+			fsservices.NodeTypeFolder,
+			folder.DepthLevel,
+			nil, // size (folders have no size)
+			folder.LastUpdated,
+			status,    // traversal_status
+			"Pending", // copy_status
+		}
+	} else {
+		return []any{
+			folder.Id,
+			folder.ParentId,
+			folder.DisplayName,
+			folder.LocationPath,
+			folder.ParentPath, // parent_path column
+			fsservices.NodeTypeFolder,
+			folder.DepthLevel,
+			nil, // size
+			folder.LastUpdated,
+			status, // traversal_status
+		}
+	}
+}
+
+// getFileValues returns the values slice for a file insert.
+func (w *TraversalWorker) getFileValues(file fsservices.File, status string) []any {
+	if w.queueName == "src" {
+		return []any{
+			file.Id,
+			file.ParentId,
+			file.DisplayName,
+			file.LocationPath,
+			file.ParentPath, // parent_path column
+			fsservices.NodeTypeFile,
+			file.DepthLevel,
+			file.Size,
+			file.LastUpdated,
+			"Successful", // traversal_status (files don't need traversal)
+			"Pending",    // copy_status
+		}
+	} else {
+		return []any{
+			file.Id,
+			file.ParentId,
+			file.DisplayName,
+			file.LocationPath,
+			file.ParentPath, // parent_path column
+			fsservices.NodeTypeFile,
+			file.DepthLevel,
+			file.Size,
+			file.LastUpdated,
+			status, // traversal_status (from comparison)
+		}
+	}
 }
 
 // logSuccess logs a successful task execution.
@@ -237,7 +393,8 @@ func (w *TraversalWorker) logSuccess(task *TaskBase) {
 		"debug",
 		fmt.Sprintf("Successfully traversed %s", path),
 		"worker",
-		fmt.Sprintf("%s-worker-%d", w.queueName, w.id),
+		w.id,
+		w.queueName,
 	)
 }
 
@@ -256,6 +413,7 @@ func (w *TraversalWorker) logError(task *TaskBase, err error, willRetry bool) {
 		"error",
 		fmt.Sprintf("Failed to traverse %s: %v (%s)", path, err, retryMsg),
 		"worker",
-		fmt.Sprintf("%s-worker-%d", w.queueName, w.id),
+		w.id,
+		w.queueName,
 	)
 }
