@@ -23,6 +23,7 @@ func (t SrcNodesTable) Schema() string {
 		parent_id VARCHAR NOT NULL,
 		name VARCHAR NOT NULL,
 		path VARCHAR NOT NULL UNIQUE,
+		parent_path VARCHAR NOT NULL,
 		type VARCHAR NOT NULL,
 		depth_level INTEGER NOT NULL,
 		size BIGINT,
@@ -55,6 +56,7 @@ func (t DstNodesTable) Schema() string {
 		parent_id VARCHAR NOT NULL,
 		name VARCHAR NOT NULL,
 		path VARCHAR NOT NULL UNIQUE,
+		parent_path VARCHAR NOT NULL,
 		type VARCHAR NOT NULL,
 		depth_level INTEGER NOT NULL,
 		size BIGINT,
@@ -69,7 +71,7 @@ func (t LogsTable) Name() string {
 	return "logs"
 }
 
-// Schema returns the DuckDB-compatible schema definition.
+// Schema returns the schema definition.
 func (t LogsTable) Schema() string {
 	return `
 		id VARCHAR PRIMARY KEY,

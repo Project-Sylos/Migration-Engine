@@ -28,6 +28,7 @@ type TaskBase struct {
 	ExpectedFolders    []fsservices.Folder // Expected folders (dst tasks only)
 	ExpectedFiles      []fsservices.File   // Expected files (dst tasks only)
 	DiscoveredChildren []ChildResult       // Children discovered during execution
+	Round              int                 // The round this task belongs to (for buffer coordination)
 }
 
 // ChildResult represents a discovered child node with its traversal status.
@@ -64,14 +65,6 @@ func (t *TaskBase) IsFile() bool {
 	return t.File.Id != ""
 }
 
-// TraversalTask represents a task to list children of a folder.
-type TraversalTask struct {
-	TaskBase
-	Round           int                 // BFS round (depth level) for this traversal
-	ExpectedFolders []fsservices.Folder // Expected folders from src (dst tasks only)
-	ExpectedFiles   []fsservices.File   // Expected files from src (dst tasks only)
-}
-
 // UploadTask represents a task to upload a file from source to destination.
 type UploadTask struct {
 	TaskBase
@@ -93,5 +86,5 @@ type TaskResult struct {
 	Task    *TaskBase
 	Success bool
 	Error   error
-	Data    interface{} // Optional result data (e.g., ListResult)
+	Data    any // Optional result data (e.g., ListResult)
 }

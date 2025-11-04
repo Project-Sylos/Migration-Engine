@@ -1,6 +1,0 @@
-{
-    "logs": {
-      "batch_size": 1000,
-      "flush_interval_seconds": 3
-    }
-}
