@@ -26,7 +26,7 @@ func (t SrcNodesTable) Schema() string {
 		parent_path VARCHAR NOT NULL,
 		type VARCHAR NOT NULL,
 		depth_level INTEGER NOT NULL,
-		size BIGINT,
+		size INTEGER,
 		last_updated TIMESTAMP NOT NULL,
 		traversal_status VARCHAR NOT NULL CHECK(traversal_status IN ('Missing', 'Pending', 'Successful', 'Failed')),
 		copy_status VARCHAR NOT NULL CHECK(copy_status IN ('Missing', 'Pending', 'Successful', 'Failed'))
@@ -59,7 +59,7 @@ func (t DstNodesTable) Schema() string {
 		parent_path VARCHAR NOT NULL,
 		type VARCHAR NOT NULL,
 		depth_level INTEGER NOT NULL,
-		size BIGINT,
+		size INTEGER,
 		last_updated TIMESTAMP NOT NULL,
 		traversal_status VARCHAR NOT NULL CHECK(traversal_status IN ('Missing', 'NotOnSrc', 'Pending', 'Successful', 'Failed'))
 	`

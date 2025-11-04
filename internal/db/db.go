@@ -4,12 +4,13 @@
 package db
 
 import (
-	"fmt"
-	"sync"
-	"strings"
 	"context"
 	"database/sql"
-	_ "github.com/marcboeker/go-duckdb"
+	"fmt"
+	"strings"
+	"sync"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // TableDef is implemented by every table definition struct in tables.go.
@@ -29,24 +30,21 @@ type DB struct {
 
 // NewDB opens a new DB connection and prepares the registry.
 func NewDB(dbPath string) (*DB, error) {
-	conn, err := sql.Open("duckdb", dbPath)
+	conn, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, err
 	}
 
-	// god help you if you ever need more than 1GB of memory for a migration lol
-	conn.Exec("PRAGMA threads = 1;")
-	conn.Exec("PRAGMA disable_object_cache;")
-	conn.Exec("PRAGMA memory_limit = '1GB';")
-	conn.Exec("PRAGMA checkpoint_on_shutdown;")  // optional
-	conn.Exec("PRAGMA force_checkpoint_on_commit=true;") // see above
-
+	// SQLite WAL mode configuration for concurrent reads + writes
+	conn.Exec("PRAGMA journal_mode = WAL;")
+	conn.Exec("PRAGMA synchronous = NORMAL;")
+	conn.Exec("PRAGMA temp_store = MEMORY;")
+	conn.Exec("PRAGMA foreign_keys = ON;")
 
 	// Set the maximum number of open connections to 1
 	conn.SetMaxOpenConns(1)
 	// Set the maximum number of idle connections to 1
 	conn.SetMaxIdleConns(1)
-
 
 	return &DB{
 		conn:   conn,
@@ -123,9 +121,6 @@ func (db *DB) Write(table string, args ...any) error {
 		fmt.Printf("[DB ERROR] Failed to commit transaction for insert into %s: %v\n", table, err)
 		return err
 	}
-	
-	// force a checkpoint to ensure all data is written directly and synchronized properly.
-	_, _ = db.conn.ExecContext(db.ctx, "PRAGMA checkpoint;")
 
 	return nil
 }
@@ -192,10 +187,6 @@ func (db *DB) BulkWrite(table string, rows [][]any) error {
 		fmt.Printf("[DB ERROR] Failed to commit transaction for bulk insert into %s: %v\n", table, err)
 		return err
 	}
-
-	// force a checkpoint to ensure all data is written directly and synchronized properly.
-	_, _ = db.conn.ExecContext(db.ctx, "PRAGMA checkpoint;")
-
 
 	return nil
 }

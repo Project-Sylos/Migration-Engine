@@ -9,16 +9,16 @@ The local database instance in Sylos acts as the central ledger for the migratio
 * **Audit Logs** – Contains structured logs of all application events, including configuration changes and mid-migration debug output. These logs are SQL-queryable, making them useful for debugging, scripting, and automation.
 * **Performance Metrics** – Records performance snapshots and health statistics for analytical and reporting purposes.
 
-## Why DuckDB?
+## Why SQLite?
 
-Sylos uses **DuckDB** as its local database engine. There are several reasons for this choice:
+Sylos uses **SQLite** with WAL (Write-Ahead Logging) mode as its local database engine. There are several reasons for this choice:
 
-1. **Open Source and Actively Maintained** – DuckDB is free, open, and developed by a strong community. Supporting open-source software aligns with Sylos' values.
-2. **Local-Only Operation** – DuckDB runs entirely on the user's machine. It never phones home, which is essential for protecting sensitive migration data.
-3. **High Performance** – Compared to SQLite, DuckDB consistently offers better performance in analytical workloads and supports much larger `IN` lists (SQLite limits these to 999 items). This allows Sylos to perform bulk operations efficiently.
-4. **Lightweight and Native** – Unlike MongoDB or PostgreSQL, DuckDB requires no background daemons, Docker containers, or servers. It's a zero-dependency, native database that fits seamlessly into Sylos' self-contained design.
-5. **Columnar Storage Model** – DuckDB's columnar architecture is ideal for Sylos' structured data and performance analytics.
-6. **We Genuinely Like It** – It's elegant, fast, and developer-friendly. DuckDB just *feels right* for Sylos.
+1. **Open Source and Ubiquitous** – SQLite is free, open-source, and widely supported. It's battle-tested and reliable.
+2. **Local-Only Operation** – SQLite runs entirely on the user's machine. It never phones home, which is essential for protecting sensitive migration data.
+3. **WAL Mode for Concurrency** – SQLite's WAL mode allows concurrent reads and writes safely, which is essential for the queue system's parallel workers.
+4. **Lightweight and Zero-Configuration** – Unlike MongoDB or PostgreSQL, SQLite requires no background daemons, Docker containers, or servers. It's a zero-dependency, file-based database that fits seamlessly into Sylos' self-contained design.
+5. **Immediate Durability** – With WAL mode and `PRAGMA synchronous = NORMAL`, SQLite provides a good balance between performance and durability, ensuring data is safely persisted without significant performance overhead.
+6. **Simple and Reliable** – SQLite is elegant, fast enough for our use case, and developer-friendly. It provides all the features we need without unnecessary complexity.
 
 ---
 

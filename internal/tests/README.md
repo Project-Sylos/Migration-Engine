@@ -26,11 +26,11 @@ go run setup.go test_runner.go verify.go
 The test suite is organized in three phases:
 
 ### Phase 1: Setup (`main/setup.go`)
-- Creates DuckDB database (`migration_test.duckdb`)
+- Creates SQLite database (`migration_test.db`)
 - Registers tables (src_nodes, dst_nodes, logs)
 - Initializes Spectra filesystem from `configs/spectra_test.json`
-- Seeds root tasks into the database
-- Verifies root tasks are properly inserted
+- Seeds root tasks to database (for logging/persistence)
+- Initial tasks are then injected directly into queue round 0 via `seedQueueRootTasks()`
 
 ### Phase 2: Migration (`main/test_runner.go`)
 - Starts logging service (spawns separate terminal window)
@@ -64,7 +64,7 @@ The test validates:
 - ✓ Database schema creation and table registration
 - ✓ Spectra filesystem integration (shared instance)
 - ✓ Queue coordination and round advancement
-- ✓ Worker task processing (3 src + 3 dst workers)
+- ✓ Worker task processing (configurable worker count per queue)
 - ✓ BFS traversal correctness
 - ✓ Data integrity and completeness
 - ✓ No pending or failed traversals
@@ -93,7 +93,7 @@ Creating filesystem adapters...
 ✓ Adapters ready
 
 Starting coordinator...
-✓ Coordinator started (3 src + 3 dst workers)
+✓ Coordinator started
 
 Monitoring migration progress...
   [2.0s] Src: 5 pending, 2 active | Dst: 0 pending, 0 active
@@ -124,18 +124,18 @@ Status: PASSED
 Test databases are automatically cleaned up by `run_test.ps1`. To manually clean:
 
 ```powershell
-Remove-Item internal\tests\main\migration_test.duckdb*
+Remove-Item internal\tests\main\migration_test.db*
 ```
 
 ## Troubleshooting
 
 **"Config file not found"**: Ensure `internal/configs/spectra.json` exists
 
-**"Root tasks not inserted"**: Check that Spectra has `p-root` and `s1-root` nodes configured
+**"Root tasks not seeded"**: Check that Spectra has `p-root` and `s1-root` nodes configured and that queue seeding completed successfully
 
 **"Migration timeout after 30s"**: Check the log service window for worker errors
 
-**Workers not processing**: Verify root tasks were seeded and flushed to database
+**Workers not processing**: Verify root tasks were seeded into queues (check that `seedQueueRootTasks()` completed successfully)
 
 ## Adding More Tests
 

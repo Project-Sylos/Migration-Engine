@@ -7,8 +7,9 @@ Write-Host ""
 
 # Clean up existing test databases
 Write-Host "Cleaning up test databases..." -ForegroundColor Yellow
-Remove-Item -Path "internal\tests\main\migration_test.duckdb" -ErrorAction SilentlyContinue
-Remove-Item -Path "internal\tests\main\migration_test.duckdb.wal" -ErrorAction SilentlyContinue
+Remove-Item -Path "internal\tests\main\migration_test.db" -ErrorAction SilentlyContinue
+Remove-Item -Path "internal\tests\main\migration_test.db-wal" -ErrorAction SilentlyContinue
+Remove-Item -Path "internal\tests\main\migration_test.db-shm" -ErrorAction SilentlyContinue
 Write-Host "Cleanup complete" -ForegroundColor Green
 Write-Host ""
 
