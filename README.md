@@ -22,8 +22,8 @@ Each traversal operation is isolated into discrete, non-recursive **tasks** so t
    This keeps each task stateless and lightweight.
 
 3. **Record Results**
-   Children that pass filtering are recorded in a buffer for later batch writes to the database.
-   (Currently written immediately, but batching will be introduced for efficiency.)
+   Children that pass filtering are written immediately to the database (write-ahead log).
+   Task propagation between queues happens entirely in-memory via the RoundQueue system for deterministic coordination.
 
 ---
 

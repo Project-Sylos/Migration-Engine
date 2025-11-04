@@ -11,29 +11,31 @@ Traversal in Sylos follows a **breadth-first search (BFS)** pattern, performed i
 * **Source Queue (src)** – Discovers and lists children from the source filesystem
 * **Destination Queue (dst)** – Validates destination nodes by comparing against source, always staying at least one round behind
 
-The queues are **self-managing**: they create their own workers, pull tasks from the database when needed, coordinate round advancement, and handle their complete lifecycle without external orchestration.
+The queues are **self-managing**: they create their own workers, manage tasks in-memory via the RoundQueue system, coordinate round advancement, and handle their complete lifecycle without external orchestration.
 
 ---
 
 ## Architecture
 
-### Self-Managing Design with Coordination
+### Self-Managing Design with RoundQueue System
 
-The queue system uses a **coordinated instantiation** pattern with a shared `QueueCoordinator` and `OutputBuffer`:
+The queue system uses a **coordinated instantiation** pattern with a shared `QueueCoordinator` and round-scoped in-memory queues:
 
 ```go
-// Create shared coordinator and buffer
+// Create shared coordinator
 maxLead := 2
 coordinator := queue.NewQueueCoordinator(maxLead)
-outputBuffer := queue.NewOutputBuffer()
 
 // Create source queue - workers start immediately
-srcQueue := queue.NewQueue("src", maxRetries, batchSize, workerCount, coordinator, outputBuffer)
+srcQueue := queue.NewQueue("src", maxRetries, workerCount, coordinator)
 srcQueue.Initialize(database, "src_nodes", srcAdapter, nil, nil)
 
 // Create destination queue - workers start immediately, coordinated with src
-dstQueue := queue.NewQueue("dst", maxRetries, batchSize, workerCount, coordinator, outputBuffer)
+dstQueue := queue.NewQueue("dst", maxRetries, workerCount, coordinator)
 dstQueue.Initialize(database, "dst_nodes", dstAdapter, srcContext, srcQueue)
+
+// Seed initial root tasks
+seedQueueRootTasks(database, spectraFS, srcQueue, dstQueue)
 
 // Wait for completion - queues manage themselves
 for !(srcQueue.IsExhausted() && dstQueue.IsExhausted()) {
@@ -48,10 +50,11 @@ for !(srcQueue.IsExhausted() && dstQueue.IsExhausted()) {
 
 **Key Benefits:**
 1. Explicit round coordination via `QueueCoordinator` - eliminates timing dependence
-2. In-memory `OutputBuffer` provides deterministic visibility between queues
+2. RoundQueue system provides in-memory task propagation between queues
 3. Queues are created and immediately operational
 4. Workers start autonomously and manage their own lifecycle
 5. Direct access to queue state and operations
+6. Database is write-ahead log only - task flow happens in memory
 
 ---
 
@@ -59,12 +62,12 @@ for !(srcQueue.IsExhausted() && dstQueue.IsExhausted()) {
 
 | File             | Purpose                                                                                |
 | ---------------- | -------------------------------------------------------------------------------------- |
-| `queue.go`       | Self-managing queue with task leasing, event-driven DB pulling, and round coordination |
+| `queue.go`       | Self-managing queue with task leasing, round coordination, and RoundQueue management  |
+| `round_queue.go` | Round-scoped in-memory queues (pending/successful sub-queues per round)               |
 | `worker.go`      | Autonomous workers that poll their queue, execute tasks, and write results to DB       |
 | `task.go`        | Task definitions and specialized types (traversal, upload, copy)                       |
-| `seeding.go`     | Initial task seeding functions for starting traversal                                  |
+| `seeding.go`     | Initial task seeding functions for database initialization                             |
 | `coordinator.go` | Round synchronization between src and dst queues                                       |
-| `output_buffer.go` | In-memory visibility layer for src→dst data propagation                               |
 
 ---
 
@@ -83,21 +86,23 @@ type TaskBase struct {
     DiscoveredChildren []ChildResult    // Children found during traversal
     ExpectedFolders    []Folder         // Expected child folders (dst comparison)
     ExpectedFiles      []File           // Expected child files (dst comparison)
-    Round              int              // The round this task belongs to (for buffer coordination)
+    Round              int              // The round this task belongs to (for RoundQueue coordination)
 }
 ```
 
 **Task Lifecycle:**
-1. Task is pulled from DB and added to queue's pending list
-   - Task's `Round` field is set to the current queue round
-2. Worker calls `queue.Lease()` - task moves to in-progress
+1. Task is added to queue's round 0 (initial seeding) or propagated from previous round
+   - Task's `Round` field is set when created
+2. Worker calls `queue.Lease()` - task moves from `pending` to `inProgress`
 3. Worker executes task (lists children via filesystem adapter)
-4. Worker writes results to DB:
+4. Worker writes results to DB immediately:
    - Updates parent status to "Successful"
    - Batch inserts all discovered children
-   - For src workers: adds children to `OutputBuffer` using `task.Round`
-5. Worker calls `queue.Complete(task)` - task removed from tracking
-6. If round is empty, queue auto-advances to next round
+5. Worker calls `queue.Complete(task)` - task moves to `successful` sub-queue
+6. Queue propagates children to next round:
+   - SRC: Creates new tasks for discovered folders, adds to next round's `pending`
+   - DST: Retrieves corresponding SRC task, creates DST tasks with expected children
+7. If round is empty, queue auto-advances to next round
 
 ---
 
@@ -121,19 +126,21 @@ Running → Completed (no tasks found after round advance)
 
 ---
 
-## Event-Driven Task Pulling
+## RoundQueue System
 
-Tasks are pulled from the database only when necessary, not on a continuous polling schedule:
+Tasks are managed in round-scoped in-memory queues. Each queue maintains a `map[int]*RoundQueue` where the key is the round number:
 
-### Pull Triggers
-1. **Queue Initialization** – Initial pull when queue is created (src only; dst waits)
-2. **Running Low** – When `pending + inProgress < batchSize` during task leasing
-3. **Round Advancement** – After completing a round and advancing to the next
+### RoundQueue Structure
 
-### Concurrency Control
-- A `pulling` flag prevents concurrent DB queries
-- If a pull is already in progress, subsequent triggers are ignored
-- This ensures efficient DB usage without redundant queries
+Each `RoundQueue` contains:
+- **`pending []*TaskBase`** – Tasks waiting to be leased by workers
+- **`successful []*TaskBase`** – Tasks that completed successfully (used for cross-queue propagation)
+
+### Task Propagation
+
+- **SRC Queue**: When a task completes, discovered folder children are added to the next round's `pending` sub-queue
+- **DST Queue**: When a task completes, it retrieves the corresponding SRC task from the same round's `successful` sub-queue to get expected children, then creates new DST tasks for the next round
+- **Memory Management**: When DST advances rounds, it cleans up both its own and SRC's corresponding completed round queues
 
 ---
 
@@ -150,14 +157,13 @@ src round 2  → dst round 1 (after src finishes round 1)
 
 ### Source Queue
 - Advances immediately when current round completes (no pending, no in-progress)
-- Pulls tasks for new round from DB
-- If no tasks found, marks queue as `Completed`
+- Tasks are propagated in-memory to next round via RoundQueue system
+- If no tasks found in new round, marks queue as `Completed`
 
 ### Destination Queue
 - **Waits for source** before advancing each round
 - Uses `QueueCoordinator.CanDstAdvance()` to ensure src is at least one round ahead (or src is completed)
-- Queries `OutputBuffer` for expected children instead of database joins
-- Consumed paths are automatically removed from the buffer when retrieved
+- Retrieves corresponding SRC tasks from `srcQueue.GetSuccessfulTask(round, path)` when creating next round tasks
 - This ensures dst always has deterministic visibility of src children to compare against
 
 ### Completion Logic
@@ -223,7 +229,7 @@ func (w *TraversalWorker) Run() {
 - Exit gracefully when queue is exhausted
 - No external start/stop management needed
 
-### Database Writes and OutputBuffer
+### Database Writes
 
 Workers perform **immediate database operations** after task execution:
 
@@ -237,17 +243,11 @@ Workers perform **immediate database operations** after task execution:
    INSERT INTO src_nodes VALUES (?, ?, ...), (?, ?, ...), ...
    ```
 
-3. **Push to OutputBuffer** (src workers only):
-   - After DB writes, discovered children are added to `OutputBuffer`
-   - Uses `task.Round` (the round the parent task was pulled in) as the buffer round
-   - Indexed by parent path and round number
-   - Provides deterministic visibility for dst queue queries
-
-This dual-write pattern ensures:
+The database serves as a write-ahead log for persistence and logging. Task propagation happens entirely through in-memory RoundQueues, ensuring:
 - No buffering delays - DB writes are immediate
-- Deterministic visibility via OutputBuffer eliminates timing issues
-- Simple error handling - DB and buffer operations are independent
-- Clear causality (task → DB write + buffer write → completion)
+- Deterministic visibility via RoundQueue system eliminates timing issues
+- Simple error handling - DB writes are independent of task propagation
+- Clear causality (task → DB write → queue propagation → completion)
 
 ---
 
@@ -255,9 +255,8 @@ This dual-write pattern ensures:
 
 ### Task Leasing
 - Workers call `queue.Lease()` to obtain work
-- Task moves from `pending` to `inProgress`
+- Task moves from current round's `pending` sub-queue to `inProgress`
 - Task's `Locked` flag is set to `true`
-- Identifier is added to `trackedIDs` to prevent re-querying
 
 ### Retry Logic
 Failed tasks are automatically retried:
@@ -265,22 +264,13 @@ Failed tasks are automatically retried:
 func (q *Queue) Fail(task *TaskBase) bool {
     task.Attempts++
     if task.Attempts < q.maxRetries {
-        q.pending = append(q.pending, task) // Re-queue
+        // Re-queue to same round's pending sub-queue
+        currentRoundQueue.AddPending(task)
         return true // Will retry
     }
-    // Max retries exceeded - task permanently failed
+    // Max retries exceeded - task is dropped from memory (already written to DB)
     return false
 }
-```
-
-### Tracked IDs
-The `trackedIDs` map prevents pulling tasks that are already in-flight:
-```sql
-SELECT ... FROM src_nodes
-WHERE traversal_status = 'Pending'
-  AND depth_level = ?
-  AND id NOT IN ('tracked_id_1', 'tracked_id_2', ...)
-LIMIT ?
 ```
 
 ---
@@ -304,7 +294,7 @@ LIMIT ?
 
 ---
 
-## Coordinator and OutputBuffer
+## Coordinator and RoundQueue System
 
 ### QueueCoordinator
 
@@ -333,28 +323,28 @@ if !coordinator.CanDstAdvance() {
 - `CanDstAdvance()`: Returns true if `(dstRound + 1 < srcRound || srcCompleted) && !dstCompleted`
 - Completion flags are set when queues reach max depth and have no more work
 
-### OutputBuffer
+### RoundQueue System
 
-The `OutputBuffer` provides deterministic in-memory visibility between queues:
+The RoundQueue system provides in-memory task propagation between queues:
 
-- **Round-Scoped Storage**: Children indexed by round and parent path
-- **Automatic Path Cleanup**: Individual paths are deleted from the buffer when retrieved by dst queue
-- **Memory Efficient**: Only consumed paths are removed, allowing partial rounds to persist
-- **Bounded Memory**: Contains at most `maxLead` rounds of data due to coordination constraints
+- **Round-Scoped Queues**: Each queue maintains `map[int]*RoundQueue` indexed by round number
+- **Sub-Queues Per Round**: Each `RoundQueue` has `pending` and `successful` sub-queues
+- **Cross-Queue Access**: DST queue can retrieve SRC tasks from `srcQueue.GetSuccessfulTask(round, path)`
+- **Automatic Cleanup**: When DST advances rounds, both its own and SRC's completed round queues are deleted
 
 **Data Flow:**
-1. Src workers write to DB and push to `OutputBuffer[task.Round]` using the round the parent task was pulled in
-2. Dst queue queries `OutputBuffer[round]` for expected children
-3. `GetChildrenForPaths()` automatically removes retrieved paths from the buffer after reading
-4. Memory footprint bounded by coordination window and discovered nodes
-5. No explicit round deletion needed - paths are consumed incrementally
+1. Initial tasks seeded into round 0's `pending` sub-queue
+2. Workers lease from `pending`, execute, write to DB, then move to `successful`
+3. On completion, `handleSrcComplete()` / `handleDstComplete()` creates next round tasks
+4. DST tasks retrieve expected children from SRC's `successful` sub-queue of the same round
+5. Memory bounded by `maxLead` - old rounds are cleaned up as DST advances
 
 **Benefits:**
-- Eliminates database visibility lag issues
+- Eliminates database query dependencies for task propagation
 - Removes timing-dependent race conditions
-- Provides predictable, deterministic task propagation
-- Efficient memory usage - only consumed data is removed
-- DB remains authoritative; buffer is purely a visibility layer
+- Provides predictable, deterministic task flow
+- Efficient memory usage - only active rounds are kept
+- DB remains write-ahead log only
 
 ---
 
@@ -362,15 +352,15 @@ The `OutputBuffer` provides deterministic in-memory visibility between queues:
 
 - Each queue owns its own worker pool (configured at creation)
 - Shared `QueueCoordinator` ensures bounded round synchronization
-- Shared `OutputBuffer` provides deterministic inter-queue visibility
+- RoundQueue system provides in-memory task propagation
 - Workers share filesystem adapters for efficient rate-limiting
-- All logging is asynchronous via `logservice.Sender` (UDP + DuckDB buffer)
+- All logging is asynchronous via `logservice.Sender` (UDP + SQLite)
 - Database writes are immediate but use batch inserts for children
 
 **Thread Safety:**
 - Queue operations protected by `sync.RWMutex`
 - Coordinator state protected by `sync.RWMutex`
-- OutputBuffer operations protected by `sync.RWMutex`
+- RoundQueue operations protected by `sync.RWMutex`
 - Task leasing is atomic
 - State transitions are synchronized
 - No data races between workers
@@ -394,9 +384,9 @@ The queue framework is designed to generalize beyond traversal:
 The queue system provides:
 - ✅ **Self-managing** – Queues own their lifecycle with explicit coordination
 - ✅ **Autonomous workers** – Poll continuously, respect state, exit gracefully
-- ✅ **Event-driven pulling** – Tasks pulled only when needed
+- ✅ **RoundQueue system** – In-memory task propagation eliminates DB query dependencies
 - ✅ **Coordinated rounds** – Explicit `QueueCoordinator` ensures bounded concurrency
-- ✅ **Deterministic visibility** – `OutputBuffer` eliminates DB timing dependencies
+- ✅ **Deterministic visibility** – RoundQueue system eliminates DB timing dependencies
 - ✅ **Immediate DB writes** – No buffering delays, clear causality
 - ✅ **Fault tolerance** – Automatic retries, graceful failure handling
 - ✅ **Simple API** – Direct queue instantiation and interaction

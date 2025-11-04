@@ -89,26 +89,32 @@ func runMigration(database *db.DB, spectraFS *sdk.SpectraFS) error {
 	fmt.Println("✓ Adapters ready")
 	fmt.Println()
 
-	// Create shared coordinator and buffer for queue coordination
-	fmt.Println("Creating coordinator and output buffer...")
+	// Create shared coordinator for queue coordination
+	fmt.Println("Creating coordinator...")
 	maxLead := 2 // Coordinator maxLead determines how far ahead src can get
 	coordinator := queue.NewQueueCoordinator(maxLead)
-	outputBuffer := queue.NewOutputBuffer()
-	fmt.Println("✓ Coordinator and buffer initialized")
+	fmt.Println("✓ Coordinator initialized")
 
 	numWorkers := 15
 
 	// Create and initialize queues - workers start automatically
 	fmt.Println("Creating source queue...")
-	srcQueue := queue.NewQueue("src", 3, 1000, numWorkers, coordinator, outputBuffer)
+	srcQueue := queue.NewQueue("src", 3, numWorkers, coordinator)
 	srcQueue.Initialize(database, "src_nodes", srcAdapter, nil, nil)
 	fmt.Println("✓ Source queue initialized with ", numWorkers, " workers")
 
 	fmt.Println("Creating destination queue...")
-	dstQueue := queue.NewQueue("dst", 3, 1000, numWorkers, coordinator, outputBuffer)
+	dstQueue := queue.NewQueue("dst", 3, numWorkers, coordinator)
 	// dst needs src context to query src_nodes for expected children
 	dstQueue.Initialize(database, "dst_nodes", dstAdapter, srcContext, srcQueue)
 	fmt.Println("✓ Destination queue initialized with ", numWorkers, " workers")
+
+	// Seed initial root tasks into queues (also writes to DB for logging/persistence)
+	fmt.Println("Seeding root tasks into queues...")
+	if err := seedQueueRootTasks(database, spectraFS, srcQueue, dstQueue); err != nil {
+		return fmt.Errorf("failed to seed queue root tasks: %w", err)
+	}
+	fmt.Println("✓ Root tasks seeded into queues")
 	fmt.Println()
 
 	// Wait for migration to complete (queues manage themselves)
@@ -131,4 +137,68 @@ func runMigration(database *db.DB, spectraFS *sdk.SpectraFS) error {
 
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+// seedQueueRootTasks writes root tasks to DB and injects them directly into queue round 0.
+func seedQueueRootTasks(database *db.DB, spectraFS *sdk.SpectraFS, srcQueue *queue.Queue, dstQueue *queue.Queue) error {
+	// Get root nodes from Spectra
+	srcRoot, err := spectraFS.GetNode(&sdk.GetNodeRequest{
+		ID: "root",
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get src root from Spectra: %w", err)
+	}
+
+	dstRoot, err := spectraFS.GetNode(&sdk.GetNodeRequest{
+		ID: "root",
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get dst root from Spectra: %w", err)
+	}
+
+	// Create folder structs
+	srcFolder := fsservices.Folder{
+		Id:           srcRoot.ID,
+		ParentId:     "",
+		DisplayName:  srcRoot.Name,
+		LocationPath: "/",
+		ParentPath:   "",
+		LastUpdated:  srcRoot.LastUpdated.Format(time.RFC3339),
+		DepthLevel:   0,
+		Type:         fsservices.NodeTypeFolder,
+	}
+
+	dstFolder := fsservices.Folder{
+		Id:           dstRoot.ID,
+		ParentId:     "",
+		DisplayName:  dstRoot.Name,
+		LocationPath: "/",
+		ParentPath:   "",
+		LastUpdated:  dstRoot.LastUpdated.Format(time.RFC3339),
+		DepthLevel:   0,
+		Type:         fsservices.NodeTypeFolder,
+	}
+
+	// Write to DB first (for logging/persistence)
+	if err := queue.SeedRootTasks(database, srcFolder, dstFolder); err != nil {
+		return fmt.Errorf("failed to seed root tasks to DB: %w", err)
+	}
+
+	// Inject tasks directly into queue round 0
+	srcTask := &queue.TaskBase{
+		Type:   queue.TaskTypeSrcTraversal,
+		Folder: srcFolder,
+		Round:  0,
+	}
+
+	dstTask := &queue.TaskBase{
+		Type:   queue.TaskTypeDstTraversal,
+		Folder: dstFolder,
+		Round:  0,
+	}
+
+	srcQueue.Add(srcTask)
+	dstQueue.Add(dstTask)
+
+	return nil
 }
