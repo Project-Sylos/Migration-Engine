@@ -119,15 +119,6 @@ func (s *SpectraFS) ListChildren(identifier string) (ListResult, error) {
 		})
 	}
 
-	if logservice.LS != nil {
-		_ = logservice.LS.Log(
-			"trace",
-			fmt.Sprintf("Listed %d folders, %d files in %s", len(result.Folders), len(result.Files), identifier),
-			"fsservices",
-			"spectra",
-		)
-	}
-
 	return result, nil
 }
 

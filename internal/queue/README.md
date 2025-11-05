@@ -9,7 +9,7 @@ The **Queue System** orchestrates parallel traversal and migration workloads wit
 Traversal in Sylos follows a **breadth-first search (BFS)** pattern, performed in **rounds** that correspond to depth levels in the filesystem tree. The system runs two queues concurrently:
 
 * **Source Queue (src)** – Discovers and lists children from the source filesystem
-* **Destination Queue (dst)** – Validates destination nodes by comparing against source, always staying at least one round behind
+* **Destination Queue (dst)** – Validates destination nodes by comparing against source, always staying at least 3 rounds behind (via coordinator)
 
 The queues are **self-managing**: they create their own workers, manage tasks in-memory via the RoundQueue system, coordinate round advancement, and handle their complete lifecycle without external orchestration.
 
@@ -23,7 +23,7 @@ The queue system uses a **coordinated instantiation** pattern with a shared `Que
 
 ```go
 // Create shared coordinator
-maxLead := 2
+maxLead := 4  // Must be at least 3 (DST needs SRC to be 3 rounds ahead)
 coordinator := queue.NewQueueCoordinator(maxLead)
 
 // Create source queue - workers start immediately
@@ -136,6 +136,8 @@ Each `RoundQueue` contains:
 - **`pending []*TaskBase`** – Tasks waiting to be leased by workers
 - **`successful []*TaskBase`** – Tasks that completed successfully (used for cross-queue propagation)
 
+**Note**: `RoundQueue` has no internal mutex. All operations must be called while holding `Queue.mu`. This eliminates nested locks and simplifies the locking model.
+
 ### Task Propagation
 
 - **SRC Queue**: When a task completes, discovered folder children are added to the next round's `pending` sub-queue
@@ -162,28 +164,22 @@ src round 2  → dst round 1 (after src finishes round 1)
 
 ### Destination Queue
 - **Waits for source** before advancing each round
-- Uses `QueueCoordinator.CanDstAdvance()` to ensure src is at least one round ahead (or src is completed)
+- Uses `QueueCoordinator.CanDstAdvance()` to ensure src is at least 3 rounds ahead (or src is completed)
+- When DST is on round N, it can only advance to round N+1 if SRC is at least on round N+3
+- This ensures that when DST completes round N and queries SRC tasks from round N+1, those tasks are guaranteed to exist (SRC round N+1 completed when SRC advanced to round N+2)
 - Retrieves corresponding SRC tasks from `srcQueue.GetSuccessfulTask(round, path)` when creating next round tasks
 - This ensures dst always has deterministic visibility of src children to compare against
 
 ### Completion Logic
-After advancing rounds, if no tasks are found:
+After completing tasks, the queue checks if the round is complete using `checkRoundComplete()`:
 ```go
-func (q *Queue) checkForCompletion(round int) {
-    if q.state == QueueStateRunning {
-        q.state = QueueStateCompleted
-        // Update coordinator with completion status
-        if q.name == "dst" {
-            q.coordinator.UpdateDstCompleted()
-        } else if q.name == "src" {
-            q.coordinator.UpdateSrcCompleted()
-        }
-        // Max depth reached - traversal complete
-    }
+func (q *Queue) checkRoundComplete(currentRound int) bool {
+    // Thread-safe check: acquires RLock, checks all conditions atomically
+    // Returns true if round is complete (no pending, no in-progress)
 }
 ```
 
-This ensures at least one round of work happens before declaring completion, and notifies the coordinator of completion status.
+If a round is complete, the queue advances to the next round. If no tasks are found in the new round, the queue is marked as `Completed` and the coordinator is notified.
 
 ---
 
@@ -319,9 +315,12 @@ if !coordinator.CanDstAdvance() {
 ```
 
 **Coordination Logic:**
-- `CanSrcAdvance()`: Returns true if `(srcRound - dstRound) < maxLead`
-- `CanDstAdvance()`: Returns true if `(dstRound + 1 < srcRound || srcCompleted) && !dstCompleted`
+- `CanSrcAdvance()`: Returns true if `(srcRound - dstRound) < maxLead` and dst has not completed
+- `CanDstAdvance()`: Returns true if `(dstRound + 3 <= srcRound || srcCompleted) && !dstCompleted`
+  - DST on round N can only advance to round N+1 if SRC is at least on round N+3
+  - This ensures SRC round N+1 is complete (and all tasks in successful queue) before DST queries it
 - Completion flags are set when queues reach max depth and have no more work
+- `maxLead` must be at least 3 for proper coordination (DST needs 3 rounds ahead)
 
 ### RoundQueue System
 
@@ -338,6 +337,12 @@ The RoundQueue system provides in-memory task propagation between queues:
 3. On completion, `handleSrcComplete()` / `handleDstComplete()` creates next round tasks
 4. DST tasks retrieve expected children from SRC's `successful` sub-queue of the same round
 5. Memory bounded by `maxLead` - old rounds are cleaned up as DST advances
+
+**Locking Pattern:**
+- All RoundQueue operations (`AddPending()`, `PopPending()`, `AddSuccessful()`, etc.) must be called while holding `Queue.mu`
+- Simple attribute access uses accessor methods (`getRound()`, `getState()`, etc.) that handle locking internally
+- Complex operations that need multiple attributes atomically hold the lock themselves
+- No nested locks - eliminates deadlock risk
 
 **Benefits:**
 - Eliminates database query dependencies for task propagation
@@ -358,11 +363,14 @@ The RoundQueue system provides in-memory task propagation between queues:
 - Database writes are immediate but use batch inserts for children
 
 **Thread Safety:**
-- Queue operations protected by `sync.RWMutex`
+- **Single Mutex Model**: `Queue.mu` (RWMutex) protects all queue state including RoundQueue operations
+- RoundQueue has no internal mutex - all operations must be called while holding `Queue.mu`
 - Coordinator state protected by `sync.RWMutex`
-- RoundQueue operations protected by `sync.RWMutex`
+- Attribute accessors (`getRound()`, `getState()`, etc.) handle locking internally with defer unlock
+- Methods like `getOrCreateRoundQueue()` are called from within locked sections (no internal lock)
 - Task leasing is atomic
 - State transitions are synchronized
+- No nested locks - eliminates deadlock risk
 - No data races between workers
 
 ---
@@ -385,7 +393,9 @@ The queue system provides:
 - ✅ **Self-managing** – Queues own their lifecycle with explicit coordination
 - ✅ **Autonomous workers** – Poll continuously, respect state, exit gracefully
 - ✅ **RoundQueue system** – In-memory task propagation eliminates DB query dependencies
-- ✅ **Coordinated rounds** – Explicit `QueueCoordinator` ensures bounded concurrency
+- ✅ **Coordinated rounds** – Explicit `QueueCoordinator` ensures bounded concurrency (DST stays 3 rounds behind)
+- ✅ **Single mutex model** – Queue.mu protects all state, eliminating nested locks and deadlock risk
+- ✅ **Attribute accessors** – Thread-safe getters/setters handle locking internally
 - ✅ **Deterministic visibility** – RoundQueue system eliminates DB timing dependencies
 - ✅ **Immediate DB writes** – No buffering delays, clear causality
 - ✅ **Fault tolerance** – Automatic retries, graceful failure handling

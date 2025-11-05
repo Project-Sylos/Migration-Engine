@@ -91,11 +91,11 @@ func runMigration(database *db.DB, spectraFS *sdk.SpectraFS) error {
 
 	// Create shared coordinator for queue coordination
 	fmt.Println("Creating coordinator...")
-	maxLead := 2 // Coordinator maxLead determines how far ahead src can get
+	maxLead := 4 // Coordinator maxLead determines how far ahead src can get
 	coordinator := queue.NewQueueCoordinator(maxLead)
 	fmt.Println("✓ Coordinator initialized")
 
-	numWorkers := 15
+	numWorkers := 10
 
 	// Create and initialize queues - workers start automatically
 	fmt.Println("Creating source queue...")
@@ -109,12 +109,33 @@ func runMigration(database *db.DB, spectraFS *sdk.SpectraFS) error {
 	dstQueue.Initialize(database, "dst_nodes", dstAdapter, srcContext, srcQueue)
 	fmt.Println("✓ Destination queue initialized with ", numWorkers, " workers")
 
-	// Seed initial root tasks into queues (also writes to DB for logging/persistence)
-	fmt.Println("Seeding root tasks into queues...")
-	if err := seedQueueRootTasks(database, spectraFS, srcQueue, dstQueue); err != nil {
-		return fmt.Errorf("failed to seed queue root tasks: %w", err)
+	// Seed SRC root task initially (database seeding already done in setup.go)
+	fmt.Println("Seeding SRC root task into queue...")
+	if err := seedSrcRootTask(spectraFS, srcQueue); err != nil {
+		return fmt.Errorf("failed to seed SRC root task: %w", err)
 	}
-	fmt.Println("✓ Root tasks seeded into queues")
+	fmt.Println("✓ SRC root task seeded")
+
+	// Wait for SRC to complete round 0, then seed DST root with expected children
+	fmt.Println("Waiting for SRC round 0 to complete...")
+	for {
+		if srcQueue.IsExhausted() {
+			return fmt.Errorf("SRC queue exhausted before completing round 0")
+		}
+		srcStats := srcQueue.Stats()
+		if srcStats.Round > 0 {
+			// SRC has advanced to round 1, meaning round 0 is complete
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Get SRC root task from successful queue to extract expected children
+	fmt.Println("Seeding DST root task with expected children from SRC...")
+	if err := seedDstRootTask(spectraFS, srcQueue, dstQueue); err != nil {
+		return fmt.Errorf("failed to seed DST root task: %w", err)
+	}
+	fmt.Println("✓ DST root task seeded")
 	fmt.Println()
 
 	// Wait for migration to complete (queues manage themselves)
@@ -139,9 +160,10 @@ func runMigration(database *db.DB, spectraFS *sdk.SpectraFS) error {
 	}
 }
 
-// seedQueueRootTasks writes root tasks to DB and injects them directly into queue round 0.
-func seedQueueRootTasks(database *db.DB, spectraFS *sdk.SpectraFS, srcQueue *queue.Queue, dstQueue *queue.Queue) error {
-	// Get root nodes from Spectra
+// seedSrcRootTask injects SRC root task directly into queue round 0.
+// Note: Database seeding already happened in setup.go, so we only inject into queues.
+func seedSrcRootTask(spectraFS *sdk.SpectraFS, srcQueue *queue.Queue) error {
+	// Get root node from Spectra
 	srcRoot, err := spectraFS.GetNode(&sdk.GetNodeRequest{
 		ID: "root",
 	})
@@ -149,14 +171,7 @@ func seedQueueRootTasks(database *db.DB, spectraFS *sdk.SpectraFS, srcQueue *que
 		return fmt.Errorf("failed to get src root from Spectra: %w", err)
 	}
 
-	dstRoot, err := spectraFS.GetNode(&sdk.GetNodeRequest{
-		ID: "root",
-	})
-	if err != nil {
-		return fmt.Errorf("failed to get dst root from Spectra: %w", err)
-	}
-
-	// Create folder structs
+	// Create folder struct
 	srcFolder := fsservices.Folder{
 		Id:           srcRoot.ID,
 		ParentId:     "",
@@ -168,6 +183,29 @@ func seedQueueRootTasks(database *db.DB, spectraFS *sdk.SpectraFS, srcQueue *que
 		Type:         fsservices.NodeTypeFolder,
 	}
 
+	// Inject task directly into queue round 0
+	srcTask := &queue.TaskBase{
+		Type:   queue.TaskTypeSrcTraversal,
+		Folder: srcFolder,
+		Round:  0,
+	}
+
+	srcQueue.Add(srcTask)
+	return nil
+}
+
+// seedDstRootTask injects DST root task into queue round 0 with expected children from SRC's completed root task.
+// Note: Database seeding already happened in setup.go, so we only inject into queues.
+func seedDstRootTask(spectraFS *sdk.SpectraFS, srcQueue *queue.Queue, dstQueue *queue.Queue) error {
+	// Get root node from Spectra
+	dstRoot, err := spectraFS.GetNode(&sdk.GetNodeRequest{
+		ID: "root",
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get dst root from Spectra: %w", err)
+	}
+
+	// Create folder struct
 	dstFolder := fsservices.Folder{
 		Id:           dstRoot.ID,
 		ParentId:     "",
@@ -179,26 +217,32 @@ func seedQueueRootTasks(database *db.DB, spectraFS *sdk.SpectraFS, srcQueue *que
 		Type:         fsservices.NodeTypeFolder,
 	}
 
-	// Write to DB first (for logging/persistence)
-	if err := queue.SeedRootTasks(database, srcFolder, dstFolder); err != nil {
-		return fmt.Errorf("failed to seed root tasks to DB: %w", err)
+	// Get SRC root task from successful queue (round 0)
+	srcTask := srcQueue.GetSuccessfulTask(0, "/")
+	if srcTask == nil {
+		return fmt.Errorf("SRC root task not found in successful queue - cannot seed DST with expected children")
 	}
 
-	// Inject tasks directly into queue round 0
-	srcTask := &queue.TaskBase{
-		Type:   queue.TaskTypeSrcTraversal,
-		Folder: srcFolder,
-		Round:  0,
+	// Extract expected children from SRC task's discovered children
+	var expectedFolders []fsservices.Folder
+	var expectedFiles []fsservices.File
+	for _, srcChild := range srcTask.DiscoveredChildren {
+		if srcChild.IsFile {
+			expectedFiles = append(expectedFiles, srcChild.File)
+		} else {
+			expectedFolders = append(expectedFolders, srcChild.Folder)
+		}
 	}
 
+	// Inject task directly into queue round 0 with expected children
 	dstTask := &queue.TaskBase{
-		Type:   queue.TaskTypeDstTraversal,
-		Folder: dstFolder,
-		Round:  0,
+		Type:            queue.TaskTypeDstTraversal,
+		Folder:          dstFolder,
+		ExpectedFolders: expectedFolders,
+		ExpectedFiles:   expectedFiles,
+		Round:           0,
 	}
 
-	srcQueue.Add(srcTask)
 	dstQueue.Add(dstTask)
-
 	return nil
 }

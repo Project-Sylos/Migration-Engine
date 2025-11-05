@@ -98,6 +98,19 @@ func (w *TraversalWorker) Run() {
 			willRetry := w.queue.Fail(task)
 			w.logError(task, err, willRetry)
 		} else {
+			// For DST tasks, log count of "NotOnSrc" items if any found
+			if w.isDst && logservice.LS != nil {
+				notOnSrcCount := 0
+				for _, child := range task.DiscoveredChildren {
+					if child.Status == "NotOnSrc" {
+						notOnSrcCount++
+					}
+				}
+				if notOnSrcCount > 0 {
+					_ = logservice.LS.Log("debug", fmt.Sprintf("[ERROR] - Found %d NotOnSrc items for path %s", notOnSrcCount, task.LocationPath()), "worker", w.id, w.queueName)
+				}
+			}
+
 			// Task succeeded - write results to database immediately
 			dbErr := w.writeResultsToDB(task)
 			if dbErr != nil {
@@ -275,18 +288,38 @@ func (w *TraversalWorker) writeResultsToDB(task *TaskBase) error {
 }
 
 // insertChildren batch inserts all discovered children into the database in a single query.
+// Deduplicates children by path to prevent duplicate inserts.
 func (w *TraversalWorker) insertChildren(task *TaskBase) error {
 	if len(task.DiscoveredChildren) == 0 {
 		return nil
 	}
 
+	// Deduplicate children by path (in case of any bugs causing duplicates)
+	seenPaths := make(map[string]bool)
 	rows := make([][]any, 0, len(task.DiscoveredChildren))
 	for _, child := range task.DiscoveredChildren {
+		var path string
+		if child.IsFile {
+			path = child.File.LocationPath
+		} else {
+			path = child.Folder.LocationPath
+		}
+
+		// Skip if we've already seen this path
+		if seenPaths[path] {
+			continue
+		}
+		seenPaths[path] = true
+
 		if child.IsFile {
 			rows = append(rows, w.getFileValues(child.File, child.Status))
 		} else {
 			rows = append(rows, w.getFolderValues(child.Folder, child.Status))
 		}
+	}
+
+	if len(rows) == 0 {
+		return nil // All children were duplicates
 	}
 
 	if err := w.db.BulkWrite(w.tableName, rows); err != nil {
