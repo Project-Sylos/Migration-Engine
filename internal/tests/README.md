@@ -35,7 +35,8 @@ The test suite is organized in three phases:
 ### Phase 2: Migration (`main/test_runner.go`)
 - Starts logging service (spawns separate terminal window)
 - Creates filesystem adapters for src (p-root) and dst (s1-root)
-- Configures coordinator with 3 src and 3 dst workers
+- Creates coordinator with maxLead (typically 4, must be at least 3)
+- Configures queues with 3 src and 3 dst workers
 - Monitors migration progress every 2 seconds
 - Runs with 30-second timeout protection
 

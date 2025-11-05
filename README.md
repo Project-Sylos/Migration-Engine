@@ -48,10 +48,11 @@ The Node Migration Engine (NME) serializes traversal data to a local database af
 
 * Source and destination are traversed **in rounds**.
 * **Round 0**: traverse the source root and list its children.
-* **Round 1**: traverse those children; destination traversal remains one level behind the source.
+* **Round 1**: traverse those children; destination traversal remains coordinated behind the source.
+* The destination queue is coordinated to stay at least 3 rounds behind the source via the `QueueCoordinator`.
 * When the destination processes its corresponding level, it compares existing nodes against the expected list from the source.
 * Extra items in the destination are logged but not traversed further.
-* The destination can run as fast as possible as long as it stays one level behind the source.
+* The destination can run as fast as possible while staying coordinated with the source.
 * Because each round is batched and stored, the system can resume exactly where it left off after a crash.
 * This maximizes both safety and throughput.
 

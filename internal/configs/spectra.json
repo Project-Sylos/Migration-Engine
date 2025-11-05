@@ -1,9 +1,9 @@
 {
   "seed": {
     "max_depth": 6,
-    "min_folders": 10,
-    "max_folders": 10,
-    "min_files": 25,
+    "min_folders": 8,
+    "max_folders": 12,
+    "min_files": 20,
     "max_files": 50,
     "seed": 42,
     "db_path": "./spectra.db"

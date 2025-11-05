@@ -120,15 +120,6 @@ func (l *LocalFS) ListChildren(identifier string) (ListResult, error) {
 		}
 	}
 
-	if logservice.LS != nil {
-		_ = logservice.LS.Log(
-			"trace",
-			fmt.Sprintf("Listed %d folders, %d files in %s", len(result.Folders), len(result.Files), parentRelPath),
-			"fsservices",
-			"local",
-		)
-	}
-
 	return result, nil
 }
 

@@ -251,7 +251,6 @@ logservice.LS.Log("error", fmt.Sprintf("Failed to traverse %s: %v", path, err), 
 Adapters log operations:
 
 ```go
-logservice.LS.Log("trace", fmt.Sprintf("Listed %d folders, %d files", folders, files), "fsservices", "spectra")
 logservice.LS.Log("info", fmt.Sprintf("Created folder %s", path), "fsservices", "local")
 logservice.LS.Log("error", fmt.Sprintf("Failed to list children: %v", err), "fsservices", "spectra")
 ```

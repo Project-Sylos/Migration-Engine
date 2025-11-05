@@ -147,7 +147,9 @@ func (q *Queue) Add(task *TaskBase) bool {
 
 	// Get or create round queue for task's round
 	rq := q.getOrCreateRoundQueue(task.Round)
-	rq.AddPending(task)
+	if !rq.AddPending(task) {
+		return false // Task with this path already exists
+	}
 
 	// Track stats
 	roundStats := q.getOrCreateRoundStats(task.Round)
@@ -156,8 +158,40 @@ func (q *Queue) Add(task *TaskBase) bool {
 	return true
 }
 
+// ============================================================================
+// Locked attribute accessors - these methods handle locking internally
+// ============================================================================
+
+// getRound returns the current round. Thread-safe.
+func (q *Queue) getRound() int {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.round
+}
+
+// setState sets the state. Thread-safe.
+func (q *Queue) setState(state QueueState) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.state = state
+}
+
+// getInProgressCount returns the number of in-progress tasks. Thread-safe.
+func (q *Queue) getInProgressCount() int {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return len(q.inProgress)
+}
+
+// getRoundQueue returns the RoundQueue for the specified round, or nil if not found. Thread-safe.
+func (q *Queue) getRoundQueue(round int) *RoundQueue {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.roundQueues[round]
+}
+
 // getOrCreateRoundQueue returns the RoundQueue for the specified round, creating it if needed.
-// Must be called with q.mu.Lock() or q.mu.RLock() held by the caller.
+// Must be called with q.mu.Lock() held (use within locked sections).
 func (q *Queue) getOrCreateRoundQueue(round int) *RoundQueue {
 	if q.roundQueues[round] == nil {
 		q.roundQueues[round] = NewRoundQueue()
@@ -165,8 +199,14 @@ func (q *Queue) getOrCreateRoundQueue(round int) *RoundQueue {
 	return q.roundQueues[round]
 }
 
+// deleteRoundQueue deletes the RoundQueue for the specified round.
+// Must be called with q.mu.Lock() held (use within locked sections).
+func (q *Queue) deleteRoundQueue(round int) {
+	delete(q.roundQueues, round)
+}
+
 // getOrCreateRoundStats returns the RoundStats for the current round, creating it if it doesn't exist.
-// Must be called with q.mu.Lock() or q.mu.RLock() held by the caller.
+// Must be called with q.mu.Lock() held (use within locked sections).
 func (q *Queue) getOrCreateRoundStats(round int) *RoundStats {
 	if q.roundStats[round] == nil {
 		q.roundStats[round] = &RoundStats{}
@@ -183,12 +223,12 @@ func (q *Queue) AddBatch(tasks []*TaskBase) int {
 	for _, task := range tasks {
 		// Get or create round queue for task's round
 		rq := q.getOrCreateRoundQueue(task.Round)
-		rq.AddPending(task)
-		added++
-
-		// Track stats per round
-		roundStats := q.getOrCreateRoundStats(task.Round)
-		roundStats.Queued++
+		if rq.AddPending(task) {
+			added++
+			// Track stats per round
+			roundStats := q.getOrCreateRoundStats(task.Round)
+			roundStats.Queued++
+		}
 	}
 	return added
 }
@@ -198,10 +238,10 @@ func (q *Queue) AddBatch(tasks []*TaskBase) int {
 // The task is atomically removed from current round's pending queue and moved to in-progress.
 func (q *Queue) Lease() *TaskBase {
 	q.mu.Lock()
+	defer q.mu.Unlock()
 
 	// Don't lease if paused or completed
 	if q.state == QueueStatePaused || q.state == QueueStateCompleted {
-		q.mu.Unlock()
 		return nil
 	}
 
@@ -211,7 +251,6 @@ func (q *Queue) Lease() *TaskBase {
 	// Pop a pending task
 	task := rq.PopPending()
 	if task == nil {
-		q.mu.Unlock()
 		return nil
 	}
 
@@ -220,26 +259,53 @@ func (q *Queue) Lease() *TaskBase {
 	id := task.Identifier()
 	q.inProgress[id] = task
 
-	q.mu.Unlock()
 	return task
 }
 
-// GetSuccessfulTask returns a successful task from the specified round matching the path, removing it from the queue.
+// GetSuccessfulTask returns a successful task from the specified round matching the path, without removing it.
 // This is used by DST queues to get expected children from SRC queues.
+// Note: We don't remove the task because multiple DST tasks may need to reference the same SRC task
+// when they complete and need to create next-round tasks for their children.
 func (q *Queue) GetSuccessfulTask(round int, path string) *TaskBase {
-	q.mu.RLock()
-	rq := q.roundQueues[round]
-	q.mu.RUnlock()
+	rq := q.getRoundQueue(round)
 	if rq == nil {
 		return nil
 	}
-	return rq.PopSuccessfulByPath(path)
+	return rq.GetSuccessfulByPath(path)
+}
+
+// checkRoundComplete checks if the specified round is complete (no pending tasks and no in-progress tasks).
+// Returns true if the round should be marked complete. Thread-safe.
+func (q *Queue) checkRoundComplete(currentRound int) bool {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+
+	// Check if queue is still running
+	if q.state != QueueStateRunning {
+		return false
+	}
+
+	// Verify we're still on the same round
+	if q.round != currentRound {
+		return false // Round already advanced
+	}
+
+	// Get round queue
+	currentRoundQueue := q.roundQueues[currentRound]
+	if currentRoundQueue == nil {
+		return false // Round queue was deleted
+	}
+
+	// Check if round is complete: no pending tasks and no in-progress tasks
+	pendingCount := currentRoundQueue.PendingCount()
+	inProgressCount := len(q.inProgress)
+
+	return pendingCount == 0 && inProgressCount == 0
 }
 
 // Complete marks a task as successfully completed and propagates children to the next round.
 func (q *Queue) Complete(task *TaskBase) {
 	currentRound := task.Round
-	currentRoundQueue := q.getOrCreateRoundQueue(currentRound)
 
 	q.mu.Lock()
 	id := task.Identifier()
@@ -248,17 +314,24 @@ func (q *Queue) Complete(task *TaskBase) {
 	task.Locked = false
 	task.Status = "successful"
 
-	// Move task to successful queue
-	currentRoundQueue.AddSuccessful(task)
+	// Get or create round queue (must hold lock)
+	currentRoundQueue := q.getOrCreateRoundQueue(currentRound)
+
+	// Move task to successful queue - if already successful, skip processing
+	wasAdded := currentRoundQueue.AddSuccessful(task)
+	if !wasAdded {
+		// Task already completed, just remove from in-progress and return
+		q.mu.Unlock()
+		return
+	}
 
 	// Increment completed count for current round
 	roundStats := q.getOrCreateRoundStats(currentRound)
 	roundStats.Completed++
 
-	// Check round completion (release lock before potentially long operations)
 	q.mu.Unlock()
 
-	// Handle task propagation based on queue type
+	// Handle task propagation based on queue type (may take time, don't hold lock)
 	nextRound := currentRound + 1
 	switch q.name {
 	case "src":
@@ -270,14 +343,10 @@ func (q *Queue) Complete(task *TaskBase) {
 	}
 
 	// Check if round is complete and should advance
-	q.mu.Lock()
-	currentRoundQueue = q.getOrCreateRoundQueue(currentRound)
-	if q.state == QueueStateRunning && currentRoundQueue.PendingCount() == 0 && len(q.inProgress) == 0 {
-		q.mu.Unlock()
+	if q.checkRoundComplete(currentRound) {
 		q.markRoundComplete()
 		return
 	}
-	q.mu.Unlock()
 }
 
 // handleSrcComplete creates tasks for discovered folder children and adds them to the next round's pending queue.
@@ -290,8 +359,14 @@ func (q *Queue) handleSrcComplete(task *TaskBase, nextRound int) {
 		}
 	}
 
-	if len(childFolders) == 0 {
+	numChildren := len(childFolders)
+
+	if numChildren == 0 {
 		return // No folders to traverse
+	} else {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("debug", fmt.Sprintf("Found %d children from path %s", numChildren, task.LocationPath()), "queue", q.name, q.name)
+		}
 	}
 
 	// Create tasks for next round
@@ -307,62 +382,69 @@ func (q *Queue) handleSrcComplete(task *TaskBase, nextRound int) {
 	// Add to next round's pending queue
 	q.mu.Lock()
 	nextRoundQueue := q.getOrCreateRoundQueue(nextRound)
+	actuallyAdded := 0
 	for _, newTask := range newTasks {
-		nextRoundQueue.AddPending(newTask)
+		if nextRoundQueue.AddPending(newTask) {
+			actuallyAdded++
+		}
 	}
 	roundStats := q.getOrCreateRoundStats(nextRound)
-	roundStats.Queued += len(newTasks)
+	roundStats.Queued += actuallyAdded
 	q.mu.Unlock()
 }
 
 // handleDstComplete creates DST tasks for next round by matching with SRC successful tasks.
+// This follows the same logic as seeding: for each discovered child folder, we look up the
+// corresponding SRC task for that child's path at the same round to get expected children.
 func (q *Queue) handleDstComplete(task *TaskBase, nextRound int) {
 	if q.srcQueue == nil {
 		return // No src queue to match against
 	}
 
 	// Extract folder children from discovered children
+	// Only include "Pending" folders - "Missing" and "NotOnSrc" are diagnostic only and should not be traversed
 	var childFolders []fsservices.Folder
 	for _, child := range task.DiscoveredChildren {
-		if !child.IsFile && (child.Status == "Pending" || child.Status == "Missing") {
+		if !child.IsFile && child.Status == "Pending" {
 			childFolders = append(childFolders, child.Folder)
 		}
 	}
 
-	if len(childFolders) == 0 {
+	numChildren := len(childFolders)
+
+	if numChildren == 0 {
 		return // No folders to traverse
+	} else {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("debug", fmt.Sprintf("Found %d children from path %s", numChildren, task.LocationPath()), "queue", q.name, q.name)
+		}
 	}
 
-	// For each child folder, get the corresponding SRC task to extract expected children
+	// For each child folder, look up its corresponding SRC task at the next round
+	// When DST task at round N completes, it creates tasks for round N+1
+	// The SRC tasks for those children were completed in round N+1 (because SRC is one round ahead)
 	var newTasks []*TaskBase
-	currentRound := task.Round
 
 	for _, childFolder := range childFolders {
-		// Get corresponding SRC task for this path
-		srcTask := q.srcQueue.GetSuccessfulTask(currentRound, childFolder.ParentPath)
+		// Get the SRC task for this child folder at the next round
+		// This SRC task's discovered children become expected children for the child DST task
+		childPath := childFolder.LocationPath
+		srcTask := q.srcQueue.GetSuccessfulTask(nextRound, childPath)
 
-		if srcTask == nil {
-			// No matching SRC task - create DST task without expected children
-			newTasks = append(newTasks, &TaskBase{
-				Type:   TaskTypeDstTraversal,
-				Folder: childFolder,
-				Round:  nextRound,
-			})
-			continue
-		}
-
-		// Extract expected children from SRC task's discovered children
+		// Extract expected children from SRC task's discovered children (if found)
 		var expectedFolders []fsservices.Folder
 		var expectedFiles []fsservices.File
-		for _, srcChild := range srcTask.DiscoveredChildren {
-			if srcChild.IsFile {
-				expectedFiles = append(expectedFiles, srcChild.File)
-			} else {
-				expectedFolders = append(expectedFolders, srcChild.Folder)
+		if srcTask != nil {
+			for _, srcChild := range srcTask.DiscoveredChildren {
+				if srcChild.IsFile {
+					expectedFiles = append(expectedFiles, srcChild.File)
+				} else {
+					expectedFolders = append(expectedFolders, srcChild.Folder)
+				}
 			}
 		}
 
-		// Create DST task with expected children
+		// Create DST task for this child with expected children from its corresponding SRC task
 		newTasks = append(newTasks, &TaskBase{
 			Type:            TaskTypeDstTraversal,
 			Folder:          childFolder,
@@ -375,11 +457,14 @@ func (q *Queue) handleDstComplete(task *TaskBase, nextRound int) {
 	// Add to next round's pending queue
 	q.mu.Lock()
 	nextRoundQueue := q.getOrCreateRoundQueue(nextRound)
+	actuallyAdded := 0
 	for _, newTask := range newTasks {
-		nextRoundQueue.AddPending(newTask)
+		if nextRoundQueue.AddPending(newTask) {
+			actuallyAdded++
+		}
 	}
 	roundStats := q.getOrCreateRoundStats(nextRound)
-	roundStats.Queued += len(newTasks)
+	roundStats.Queued += actuallyAdded
 	q.mu.Unlock()
 }
 
@@ -388,7 +473,6 @@ func (q *Queue) handleDstComplete(task *TaskBase, nextRound int) {
 // Also checks for round completion when all tasks are exhausted (succeeded or failed).
 func (q *Queue) Fail(task *TaskBase) bool {
 	currentRound := task.Round
-	currentRoundQueue := q.getOrCreateRoundQueue(currentRound)
 
 	q.mu.Lock()
 	id := task.Identifier()
@@ -397,6 +481,9 @@ func (q *Queue) Fail(task *TaskBase) bool {
 	// Remove from in-progress
 	delete(q.inProgress, id)
 
+	// Get round queue (must hold lock)
+	currentRoundQueue := q.getOrCreateRoundQueue(currentRound)
+
 	// Check if we should retry
 	if task.Attempts < q.maxRetries {
 		// Re-queue for retry in the same round
@@ -404,6 +491,10 @@ func (q *Queue) Fail(task *TaskBase) bool {
 		currentRoundQueue.AddPending(task)
 		q.mu.Unlock()
 		return true // Will retry
+	}
+
+	if logservice.LS != nil {
+		_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to list children from path %s", task.LocationPath()), "queue", q.name, q.name)
 	}
 
 	// Max retries exceeded - task is already written to DB with failed status
@@ -415,8 +506,8 @@ func (q *Queue) Fail(task *TaskBase) bool {
 	roundStats := q.getOrCreateRoundStats(currentRound)
 	roundStats.Completed++
 
-	// Check round completion
-	if q.state == QueueStateRunning && currentRoundQueue.PendingCount() == 0 && len(q.inProgress) == 0 {
+	// Check if round is complete and should advance
+	if q.checkRoundComplete(currentRound) {
 		q.mu.Unlock()
 		q.markRoundComplete()
 		return false
@@ -439,21 +530,14 @@ func (q *Queue) PendingCount() int {
 
 // InProgressCount returns the number of tasks currently being executed.
 func (q *Queue) InProgressCount() int {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	return len(q.inProgress)
+	return q.getInProgressCount()
 }
 
 // TotalTracked returns the total number of tasks across all rounds (pending + in-progress).
 func (q *Queue) TotalTracked() int {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
-
-	total := len(q.inProgress)
-	for _, rq := range q.roundQueues {
-		total += rq.PendingCount()
-	}
-	return total
+	return q.totalTrackedLocked()
 }
 
 // IsEmpty returns whether the queue has no pending or in-progress tasks in the current round.
@@ -505,9 +589,18 @@ func (q *Queue) Stats() QueueStats {
 		Round:        q.round,
 		Pending:      pending,
 		InProgress:   len(q.inProgress),
-		TotalTracked: q.TotalTracked(),
+		TotalTracked: q.totalTrackedLocked(),
 		Workers:      len(q.workers),
 	}
+}
+
+// totalTrackedLocked returns total tracked tasks. Must be called with lock held.
+func (q *Queue) totalTrackedLocked() int {
+	total := len(q.inProgress)
+	for _, rq := range q.roundQueues {
+		total += rq.PendingCount()
+	}
+	return total
 }
 
 // AddWorker registers a worker with this queue for reference.
@@ -527,9 +620,7 @@ func (q *Queue) WorkerCount() int {
 
 // markRoundComplete marks the current round as complete and automatically advances to next round.
 func (q *Queue) markRoundComplete() {
-	q.mu.Lock()
-	currentRound := q.round
-	q.mu.Unlock()
+	currentRound := q.getRound()
 
 	if logservice.LS != nil {
 		_ = logservice.LS.Log("info", fmt.Sprintf("Round %d complete", currentRound), "queue", q.name, q.name)
@@ -546,12 +637,29 @@ func (q *Queue) advanceToNextRound() {
 	if q.coordinator != nil {
 		switch q.name {
 		case "src":
-			// Src waits if it's too far ahead of dst
-			for !q.coordinator.CanSrcAdvance() {
-				time.Sleep(50 * time.Millisecond)
+			// Src waits if it's too far ahead of dst, or if dst has completed early
+			if !q.coordinator.CanSrcAdvance() {
+				// Check if dst completed - if so, mark src as completed (migration failed)
+				if q.coordinator.IsDstCompleted() {
+					q.setState(QueueStateCompleted)
+					q.coordinator.UpdateSrcCompleted()
+					if logservice.LS != nil {
+						_ = logservice.LS.Log("info",
+							"SRC queue stopping - DST completed early (migration will fail)",
+							"queue",
+							q.name,
+							q.name)
+					}
+					return
+				}
+				// Otherwise wait for dst to catch up
+				for !q.coordinator.CanSrcAdvance() {
+					time.Sleep(50 * time.Millisecond)
+				}
 			}
 		case "dst":
-			// Dst waits until src is at least one round ahead
+			// Dst waits until src is at least 3 rounds ahead (via CanDstAdvance check)
+			// This ensures src has completed the round we need to query before dst advances
 			for !q.coordinator.CanDstAdvance() {
 				time.Sleep(50 * time.Millisecond)
 			}
@@ -566,23 +674,25 @@ func (q *Queue) advanceToNextRound() {
 	q.getOrCreateRoundStats(newRound)
 
 	// Cleanup: When DST advances, clear previous round queues for both DST and SRC
+	// Note: We don't delete SRC round queues here because DST workers might still be
+	// accessing them via GetSuccessfulTask(). Instead, we only delete DST's own completed round.
+	// SRC round queues will be cleaned up later when safe (after DST round advances further).
 	if q.name == "dst" {
 		// Clean up DST's completed round
-		delete(q.roundQueues, completedRound)
+		q.deleteRoundQueue(completedRound)
 
-		// Clean up SRC's corresponding round (if srcQueue exists)
-		if q.srcQueue != nil {
-			q.srcQueue.mu.Lock()
-			delete(q.srcQueue.roundQueues, completedRound)
-			q.srcQueue.mu.Unlock()
-		}
+		// Don't delete SRC round queues here - workers may still be accessing them
+		// SRC queues will be cleaned up naturally as rounds progress
 	}
 
 	// Check if the new round has no tasks (max depth reached)
 	newRoundQueue := q.roundQueues[newRound]
-	hasTasks := (newRoundQueue != nil && newRoundQueue.PendingCount() > 0) || len(q.inProgress) > 0
+	hasTasks := false
+	if newRoundQueue != nil {
+		hasTasks = newRoundQueue.PendingCount() > 0
+	}
 
-	if q.state == QueueStateRunning && !hasTasks {
+	if q.state == QueueStateRunning && !hasTasks && len(q.inProgress) == 0 {
 		// No tasks in new round means we've reached max depth - traversal complete
 		q.state = QueueStateCompleted
 		switch q.name {
