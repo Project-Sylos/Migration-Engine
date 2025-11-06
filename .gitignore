@@ -28,8 +28,9 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+*.cursor/
 
 # ignore pycache
 __pycache__/
@@ -39,9 +40,8 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+*.db-journal
 
 # ignore logs
 *logs.txt
 *.log
-
-*.cursor/
