@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/internal/db"
-	"github.com/Project-Sylos/Migration-Engine/internal/fsservices"
-	"github.com/Project-Sylos/Migration-Engine/internal/logservice"
+	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
+	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 )
 
 // QueueState represents the lifecycle state of a queue.

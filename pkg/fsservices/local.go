@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/internal/logservice"
+	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 )
 
 // LocalFS implements FSAdapter for the local filesystem.

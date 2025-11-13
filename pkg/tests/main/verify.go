@@ -6,7 +6,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/Project-Sylos/Migration-Engine/internal/db"
+	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 )
 
 // verifyMigration checks that the migration completed successfully

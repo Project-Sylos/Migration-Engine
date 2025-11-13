@@ -8,10 +8,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/internal/db"
-	"github.com/Project-Sylos/Migration-Engine/internal/fsservices"
-	"github.com/Project-Sylos/Migration-Engine/internal/logservice"
-	"github.com/Project-Sylos/Migration-Engine/internal/queue"
+	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
+	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
+	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
 	"github.com/Project-Sylos/Spectra/sdk"
 )
 

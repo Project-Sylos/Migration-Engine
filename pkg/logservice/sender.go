@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/internal/db"
+	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 )
 
 // LS is the global log service sender instance.
@@ -37,10 +37,10 @@ func InitGlobalLogger(dbInstance *db.DB, addr, level string) error {
 
 // Sender transmits logs over UDP and writes them to the database.
 type Sender struct {
-	DB         *db.DB         // database handle for persistence
-	logBuffer  *db.LogBuffer  // buffered log writer
-	Addr       string         // e.g. "127.0.0.1:1997"
-	Level      string         // threshold for UDP output
+	DB         *db.DB        // database handle for persistence
+	logBuffer  *db.LogBuffer // buffered log writer
+	Addr       string        // e.g. "127.0.0.1:1997"
+	Level      string        // threshold for UDP output
 	conn       net.Conn
 	minLevelIx int
 	mu         sync.Mutex // guards buffer/encoder
@@ -80,10 +80,10 @@ func NewSender(dbInstance *db.DB, addr, level string) (*Sender, error) {
 		return nil, fmt.Errorf("invalid threshold level: %s", level)
 	}
 	buf := new(bytes.Buffer)
-	
+
 	// Create a log buffer that flushes every 500 entries or every 2 seconds
-	logBuffer := db.NewLogBuffer(dbInstance.Conn(), 500, 2 * time.Second)
-	
+	logBuffer := db.NewLogBuffer(dbInstance.Conn(), 500, 2*time.Second)
+
 	return &Sender{
 		DB:         dbInstance,
 		logBuffer:  logBuffer,

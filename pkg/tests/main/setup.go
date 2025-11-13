@@ -8,9 +8,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/internal/db"
-	"github.com/Project-Sylos/Migration-Engine/internal/fsservices"
-	"github.com/Project-Sylos/Migration-Engine/internal/queue"
+	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
+	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
 	"github.com/Project-Sylos/Spectra/sdk"
 )
 
@@ -20,11 +20,11 @@ func setupTest() (*db.DB, *sdk.SpectraFS, error) {
 	fmt.Println("Creating database...")
 
 	// if the database file exists, remove it
-	if _, err := os.Stat("internal/tests/migration_test.db"); err == nil {
-		os.Remove("internal/tests/migration_test.db")
+	if _, err := os.Stat("pkg/tests/migration_test.db"); err == nil {
+		os.Remove("pkg/tests/migration_test.db")
 	}
 
-	database, err := db.NewDB("internal/tests/migration_test.db")
+	database, err := db.NewDB("pkg/tests/migration_test.db")
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create database: %w", err)
 	}
@@ -52,7 +52,7 @@ func setupTest() (*db.DB, *sdk.SpectraFS, error) {
 		os.Remove("./spectra.db")
 	}
 
-	spectraFS, err := sdk.New("internal/configs/spectra.json")
+	spectraFS, err := sdk.New("pkg/configs/spectra.json")
 	if err != nil {
 		database.Close()
 		return nil, nil, fmt.Errorf("failed to create Spectra: %w", err)

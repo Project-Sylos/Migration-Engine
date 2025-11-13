@@ -47,7 +47,7 @@ LogService.Sender
 Initialize the global logger during application startup:
 
 ```go
-import "github.com/Project-Sylos/Migration-Engine/internal/logservice"
+import "github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 
 // Start listener in a separate terminal (optional)
 if err := logservice.StartListener("127.0.0.1:8081"); err != nil {
@@ -71,7 +71,7 @@ if err := logservice.InitGlobalLogger(database, "127.0.0.1:8081", "info"); err !
 Use the global `logservice.LS` instance to log messages:
 
 ```go
-import "github.com/Project-Sylos/Migration-Engine/internal/logservice"
+import "github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 
 // Basic log
 err := logservice.LS.Log("info", "Worker started", "worker", "worker-1", "src")
@@ -145,7 +145,7 @@ if err := logservice.StartListener("127.0.0.1:8081"); err != nil {
 Run the listener manually:
 
 ```bash
-go run internal/logservice/main/spawn.go 127.0.0.1:8081
+go run pkg/logservice/main/spawn.go 127.0.0.1:8081
 ```
 
 Or use `RunListener()` programmatically:

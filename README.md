@@ -1,6 +1,6 @@
-# Node Migration Engine
+# Migration Engine
 
-The **Node Migration Engine** performs one-way migrations from a *source node tree* to a *destination node tree*.
+The **Migration Engine** performs one-way migrations from a *source node tree* to a *destination node tree*.
 It is **not** a two-way sync engine; implementing bidirectional sync would require a completely different algorithm.
 
 ---
@@ -31,7 +31,7 @@ Each traversal operation is isolated into discrete, non-recursive **tasks** so t
 
 Depth-First Search (DFS) is memory-efficient, but it’s less suited to managing two trees in parallel.
 BFS, while it requires storing all nodes at the current level, provides better control, checkpointing, and fault recovery.
-The Node Migration Engine (NME) serializes traversal data to a local database after each round, keeping memory use bounded while preserving full traversal context.
+The Migration Engine (ME) serializes traversal data to a local database after each round, keeping memory use bounded while preserving full traversal context.
 
 ### Two Possible Strategies
 

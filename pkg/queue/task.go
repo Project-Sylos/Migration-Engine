@@ -3,9 +3,7 @@
 
 package queue
 
-import (
-	"github.com/Project-Sylos/Migration-Engine/internal/fsservices"
-)
+import "github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 
 // Task types
 const (
