@@ -6,6 +6,16 @@ The **Filesystem Services** package provides a unified abstraction layer for int
 
 ## Overview
 
+### Importing
+
+```go
+import "github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
+```
+
+The package now lives at the module root so it can be consumed directly by external
+projects (for example, the API service) without going through the Go `internal`
+visibility barrier.
+
 The package defines an `FSAdapter` interface that abstracts filesystem operations, allowing the migration engine to traverse and manipulate files and folders without being tied to a specific storage implementation.
 
 ### Key Concepts

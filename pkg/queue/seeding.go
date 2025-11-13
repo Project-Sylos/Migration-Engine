@@ -6,9 +6,9 @@ package queue
 import (
 	"fmt"
 
-	"github.com/Project-Sylos/Migration-Engine/internal/db"
-	"github.com/Project-Sylos/Migration-Engine/internal/fsservices"
-	"github.com/Project-Sylos/Migration-Engine/internal/logservice"
+	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
+	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 )
 
 // SeedRootTask inserts the initial root folder task into the database to kickstart traversal.

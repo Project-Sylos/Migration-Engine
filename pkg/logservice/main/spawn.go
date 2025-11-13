@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/Project-Sylos/Migration-Engine/internal/logservice"
+	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 )
 
 func main() {

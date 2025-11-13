@@ -50,7 +50,7 @@ The test suite is organized in three phases:
 ## Files
 
 ```
-internal/tests/
+pkg/tests/
 ├── run_test.ps1           # PowerShell test runner
 ├── README.md              # This file
 └── main/
@@ -125,12 +125,12 @@ Status: PASSED
 Test databases are automatically cleaned up by `run_test.ps1`. To manually clean:
 
 ```powershell
-Remove-Item internal\tests\main\migration_test.db*
+Remove-Item pkg\tests\main\migration_test.db*
 ```
 
 ## Troubleshooting
 
-**"Config file not found"**: Ensure `internal/configs/spectra.json` exists
+**"Config file not found"**: Ensure `pkg/configs/spectra.json` exists
 
 **"Root tasks not seeded"**: Check that Spectra has `p-root` and `s1-root` nodes configured and that queue seeding completed successfully
 

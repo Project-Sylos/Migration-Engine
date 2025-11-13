@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/internal/logservice"
+	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 	"github.com/Project-Sylos/Spectra/sdk"
 )
 

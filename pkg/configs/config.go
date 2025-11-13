@@ -12,14 +12,14 @@ import (
 
 // BufferTableConfig represents one table's buffer settings.
 type BufferTableConfig struct {
-	BatchSize          int           `json:"batch_size"`
-	FlushIntervalSec   int           `json:"flush_interval_seconds"`
+	BatchSize        int `json:"batch_size"`
+	FlushIntervalSec int `json:"flush_interval_seconds"`
 }
 
 // BufferConfig maps table names to their configs.
 type BufferConfig map[string]BufferTableConfig
 
-// LoadBufferConfig reads internal/configs/buffers.json.
+// LoadBufferConfig reads pkg/configs/buffers.json.
 func LoadBufferConfig(configDir string) (BufferConfig, error) {
 	path := filepath.Join(configDir, "buffers.json")
 	data, err := os.ReadFile(path)
@@ -41,7 +41,7 @@ type LogServiceConfig struct {
 	Level   string `json:"level"`
 }
 
-// LoadLogServiceConfig reads internal/configs/log_service.json.
+// LoadLogServiceConfig reads pkg/configs/log_service.json.
 func LoadLogServiceConfig(configDir string) (LogServiceConfig, error) {
 	path := filepath.Join(configDir, "log_service.json")
 	data, err := os.ReadFile(path)
@@ -58,11 +58,11 @@ func LoadLogServiceConfig(configDir string) (LogServiceConfig, error) {
 
 // SpectraConfig holds Spectra filesystem settings.
 type SpectraConfig struct {
-	ConfigPath    string `json:"config_path"`
-	SrcRootID     string `json:"src_root_id"`
-	DstRootID     string `json:"dst_root_id"`
-	SharedInstance bool  `json:"shared_instance"`
-	Description   string `json:"description"`
+	ConfigPath     string `json:"config_path"`
+	SrcRootID      string `json:"src_root_id"`
+	DstRootID      string `json:"dst_root_id"`
+	SharedInstance bool   `json:"shared_instance"`
+	Description    string `json:"description"`
 }
 
 // SpectraConfigWrapper wraps the Spectra configuration.
@@ -70,7 +70,7 @@ type SpectraConfigWrapper struct {
 	Spectra SpectraConfig `json:"spectra"`
 }
 
-// LoadSpectraConfig reads internal/configs/spectra.json.
+// LoadSpectraConfig reads pkg/configs/spectra.json.
 func LoadSpectraConfig(configDir string) (SpectraConfig, error) {
 	path := filepath.Join(configDir, "spectra.json")
 	data, err := os.ReadFile(path)
