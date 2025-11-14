@@ -28,14 +28,32 @@ coordinator := queue.NewQueueCoordinator(maxLead)
 
 // Create source queue - workers start immediately
 srcQueue := queue.NewQueue("src", maxRetries, workerCount, coordinator)
-srcQueue.Initialize(database, "src_nodes", srcAdapter, nil, nil)
+srcQueue.Initialize(database, "src_nodes", srcAdapter, nil)
 
 // Create destination queue - workers start immediately, coordinated with src
 dstQueue := queue.NewQueue("dst", maxRetries, workerCount, coordinator)
-dstQueue.Initialize(database, "dst_nodes", dstAdapter, srcContext, srcQueue)
+dstQueue.Initialize(database, "dst_nodes", dstAdapter, srcQueue)
 
-// Seed initial root tasks
-seedQueueRootTasks(database, spectraFS, srcQueue, dstQueue)
+// Seed initial root tasks directly into queues
+// (Database seeding should be done separately before starting queues)
+srcRootTask := &queue.TaskBase{
+    Type:   queue.TaskTypeSrcTraversal,
+    Folder: srcRootFolder,
+    Round:  0,
+}
+srcQueue.Add(srcRootTask)
+
+// Wait for SRC round 0 to complete, then seed DST root
+// ... wait logic ...
+srcRootCompleted := srcQueue.GetSuccessfulTask(0, "/")
+dstRootTask := &queue.TaskBase{
+    Type:            queue.TaskTypeDstTraversal,
+    Folder:          dstRootFolder,
+    ExpectedFolders: extractFolders(srcRootCompleted.DiscoveredChildren),
+    ExpectedFiles:   extractFiles(srcRootCompleted.DiscoveredChildren),
+    Round:           0,
+}
+dstQueue.Add(dstRootTask)
 
 // Wait for completion - queues manage themselves
 for !(srcQueue.IsExhausted() && dstQueue.IsExhausted()) {

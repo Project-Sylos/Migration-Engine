@@ -27,17 +27,18 @@ const (
 // Queue maintains round-based task queues for BFS traversal coordination.
 // It handles task leasing, retry logic, and cross-queue task propagation.
 type Queue struct {
-	name        string                     // Queue name ("src" or "dst")
-	mu          sync.RWMutex               // Protects all internal state
-	state       QueueState                 // Lifecycle state (running/paused/stopped/completed)
-	inProgress  map[string]*TaskBase       // Tasks currently being executed (keyed by identifier)
-	maxRetries  int                        // Maximum retry attempts per task
-	round       int                        // Current BFS round/depth level
-	workers     []Worker                   // Workers associated with this queue (for reference only)
-	srcCtx      *fsservices.ServiceContext // For dst queue: needed to query src nodes
-	srcQueue    *Queue                     // For dst queue: reference to src queue for round coordination
-	coordinator *QueueCoordinator          // Shared coordinator for round synchronization
-	roundQueues map[int]*RoundQueue        // Round-indexed queues (pending/successful per round)
+	name        string               // Queue name ("src" or "dst")
+	mu          sync.RWMutex         // Protects all internal state
+	state       QueueState           // Lifecycle state (running/paused/stopped/completed)
+	inProgress  map[string]*TaskBase // Tasks currently being executed (keyed by identifier)
+	maxRetries  int                  // Maximum retry attempts per task
+	round       int                  // Current BFS round/depth level
+	workers     []Worker             // Workers associated with this queue (for reference only)
+	database    *db.DB               // Backing database connection
+	tableName   string               // Database table backing this queue
+	srcQueue    *Queue               // For dst queue: reference to src queue for fast in-memory lookups
+	coordinator *QueueCoordinator    // Shared coordinator for round synchronization
+	roundQueues map[int]*RoundQueue  // Round-indexed queues (pending/successful per round)
 	// Round-based statistics for completion detection
 	roundStats map[int]*RoundStats // Per-round statistics (key: round number, value: stats for that round)
 }
@@ -59,10 +60,11 @@ func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCo
 
 // Initialize sets up the queue with database, context, and filesystem adapter references.
 // Creates and starts workers immediately - they'll poll for tasks autonomously.
-// For dst queues, srcContext and srcQueue are required for round coordination.
-func (q *Queue) Initialize(database *db.DB, tableName string, adapter fsservices.FSAdapter, srcContext *fsservices.ServiceContext, srcQueue *Queue) {
+// For dst queues, srcQueue should be provided for fast in-memory expected children lookups.
+func (q *Queue) Initialize(database *db.DB, tableName string, adapter fsservices.FSAdapter, srcQueue *Queue) {
 	q.mu.Lock()
-	q.srcCtx = srcContext
+	q.database = database
+	q.tableName = tableName
 	q.srcQueue = srcQueue
 	workerCount := cap(q.workers) // Get the worker count we preallocated for
 	q.mu.Unlock()
@@ -216,8 +218,23 @@ func (q *Queue) getOrCreateRoundStats(round int) *RoundStats {
 
 // AddBatch enqueues multiple tasks atomically to their respective round queues.
 func (q *Queue) AddBatch(tasks []*TaskBase) int {
+	if len(tasks) == 0 {
+		return 0
+	}
+
+	minRound := tasks[0].Round
+	for _, task := range tasks[1:] {
+		if task.Round < minRound {
+			minRound = task.Round
+		}
+	}
+
 	q.mu.Lock()
 	defer q.mu.Unlock()
+
+	if q.totalTrackedLocked() == 0 || minRound < q.round {
+		q.round = minRound
+	}
 
 	added := 0
 	for _, task := range tasks {
@@ -424,34 +441,31 @@ func (q *Queue) handleDstComplete(task *TaskBase, nextRound int) {
 	// When DST task at round N completes, it creates tasks for round N+1
 	// The SRC tasks for those children were completed in round N+1 (because SRC is one round ahead)
 	var newTasks []*TaskBase
-
 	for _, childFolder := range childFolders {
-		// Get the SRC task for this child folder at the next round
-		// This SRC task's discovered children become expected children for the child DST task
+		// Lookup the corresponding SRC task by path at the next round
 		childPath := childFolder.LocationPath
 		srcTask := q.srcQueue.GetSuccessfulTask(nextRound, childPath)
-
-		// Extract expected children from SRC task's discovered children (if found)
-		var expectedFolders []fsservices.Folder
-		var expectedFiles []fsservices.File
-		if srcTask != nil {
-			for _, srcChild := range srcTask.DiscoveredChildren {
-				if srcChild.IsFile {
-					expectedFiles = append(expectedFiles, srcChild.File)
-				} else {
-					expectedFolders = append(expectedFolders, srcChild.Folder)
-				}
+		if srcTask == nil {
+			// It's possible the SRC task hasn't completed yet - skip for now
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("debug", fmt.Sprintf("SRC task not yet available for %s", childPath), "queue", q.name, q.name)
 			}
+			continue
 		}
 
-		// Create DST task for this child with expected children from its corresponding SRC task
-		newTasks = append(newTasks, &TaskBase{
+		// Create DST task with expected children from SRC task
+		newTask := &TaskBase{
 			Type:            TaskTypeDstTraversal,
 			Folder:          childFolder,
-			ExpectedFolders: expectedFolders,
-			ExpectedFiles:   expectedFiles,
+			ExpectedFolders: collectFolders(srcTask.DiscoveredChildren),
+			ExpectedFiles:   collectFiles(srcTask.DiscoveredChildren),
 			Round:           nextRound,
-		})
+		}
+		newTasks = append(newTasks, newTask)
+	}
+
+	if len(newTasks) == 0 {
+		return
 	}
 
 	// Add to next round's pending queue
@@ -466,6 +480,26 @@ func (q *Queue) handleDstComplete(task *TaskBase, nextRound int) {
 	roundStats := q.getOrCreateRoundStats(nextRound)
 	roundStats.Queued += actuallyAdded
 	q.mu.Unlock()
+}
+
+func collectFolders(children []ChildResult) []fsservices.Folder {
+	var folders []fsservices.Folder
+	for _, child := range children {
+		if !child.IsFile {
+			folders = append(folders, child.Folder)
+		}
+	}
+	return folders
+}
+
+func collectFiles(children []ChildResult) []fsservices.File {
+	var files []fsservices.File
+	for _, child := range children {
+		if child.IsFile {
+			files = append(files, child.File)
+		}
+	}
+	return files
 }
 
 // Fail handles a failed task. If retry limit is not exceeded, re-queues the task.
