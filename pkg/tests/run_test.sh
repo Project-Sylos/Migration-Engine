@@ -15,7 +15,7 @@ echo ""
 
 # Clean up existing test databases
 echo -e "${YELLOW}Cleaning up test databases...${NC}"
-rm -f pkg/tests/main/migration_test.db
+rm -f pkg/tests/migration_test.db
 echo -e "${GREEN}Cleanup complete${NC}"
 echo ""
 
@@ -23,7 +23,7 @@ echo ""
 startTime=$(date +%s)
 
 # Navigate to tests/main directory and run test runner
-go run pkg/tests/main/setup.go pkg/tests/main/test_runner.go pkg/tests/main/verify.go
+go run pkg/tests/spectra/setup.go pkg/tests/spectra/test_runner.go pkg/tests/spectra/verify.go
 exitCode=$?
 
 endTime=$(date +%s)

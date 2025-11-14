@@ -7,21 +7,19 @@ Write-Host ""
 
 # Clean up existing test databases
 Write-Host "Cleaning up test databases..." -ForegroundColor Yellow
-Remove-Item -Path "internal\tests\main\migration_test.db" -ErrorAction SilentlyContinue
-Remove-Item -Path "internal\tests\main\migration_test.db-wal" -ErrorAction SilentlyContinue
-Remove-Item -Path "internal\tests\main\migration_test.db-shm" -ErrorAction SilentlyContinue
+Remove-Item -Path "pkg\tests\migration_test.db" -ErrorAction SilentlyContinue
+Remove-Item -Path "pkg\tests\migration_test.db-wal" -ErrorAction SilentlyContinue
+Remove-Item -Path "pkg\tests\migration_test.db-shm" -ErrorAction SilentlyContinue
 Write-Host "Cleanup complete" -ForegroundColor Green
 Write-Host ""
 
 # Run the test
 $startTime = Get-Date
 
-# Navigate to tests/main directory and run test runner
-Push-Location internal\tests\main
-go run setup.go test_runner.go verify.go
+# Execute Spectra test runner
+go run pkg/tests/spectra/setup.go pkg/tests/spectra/test_runner.go pkg/tests/spectra/verify.go
 
 $exitCode = $LASTEXITCODE
-Pop-Location
 
 $endTime = Get-Date
 $duration = $endTime - $startTime
