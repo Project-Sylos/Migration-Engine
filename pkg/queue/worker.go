@@ -141,28 +141,55 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 		return fmt.Errorf("failed to list children of %s: %w", folder.LocationPath, err)
 	}
 
+	// Wrap result in a pager so we can process children in fixed-size pages.
+	// This mimics real cloud SDK pagination behavior and keeps per-page work bounded.
+	const pageSize = 100
+	pager := fsservices.NewListPager(result, pageSize)
+
 	// Check if this is a dst task with expected children (comparison mode)
 	if w.isDst {
-		return w.executeDstComparison(task, result)
+		// Aggregate all pages into a single ListResult for comparison.
+		aggregated := fsservices.ListResult{}
+		for {
+			page, ok := pager.Next()
+			if !ok {
+				break
+			}
+			aggregated.Folders = append(aggregated.Folders, page.Folders...)
+			aggregated.Files = append(aggregated.Files, page.Files...)
+		}
+		return w.executeDstComparison(task, aggregated)
 	}
 
 	// Source mode: all discovered children get "Pending" status
+	// DepthLevel is driven by BFS round: children of a task in round N live at depth N+1.
 	task.DiscoveredChildren = make([]ChildResult, 0, len(result.Folders)+len(result.Files))
 
-	for _, childFolder := range result.Folders {
-		task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
-			Folder: childFolder,
-			Status: "Pending",
-			IsFile: false,
-		})
-	}
+	for {
+		page, ok := pager.Next()
+		if !ok {
+			break
+		}
 
-	for _, childFile := range result.Files {
-		task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
-			File:   childFile,
-			Status: "Successful", // Files are immediately successful (no traversal needed)
-			IsFile: true,
-		})
+		for _, childFolder := range page.Folders {
+			// Override adapter-provided depth with BFS depth based on current round.
+			childFolder.DepthLevel = task.Round + 1
+			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
+				Folder: childFolder,
+				Status: "Pending",
+				IsFile: false,
+			})
+		}
+
+		for _, childFile := range page.Files {
+			// Override adapter-provided depth with BFS depth based on current round.
+			childFile.DepthLevel = task.Round + 1
+			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
+				File:   childFile,
+				Status: "Successful", // Files are immediately successful (no traversal needed)
+				IsFile: true,
+			})
+		}
 	}
 
 	return nil
@@ -180,11 +207,15 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsse
 	// Build maps for quick lookup
 	actualFolderMap := make(map[string]fsservices.Folder)
 	for _, f := range actualResult.Folders {
+		// Override adapter-provided depth with BFS depth based on current round.
+		f.DepthLevel = task.Round + 1
 		actualFolderMap[f.LocationPath] = f
 	}
 
 	actualFileMap := make(map[string]fsservices.File)
 	for _, f := range actualResult.Files {
+		// Override adapter-provided depth with BFS depth based on current round.
+		f.DepthLevel = task.Round + 1
 		actualFileMap[f.LocationPath] = f
 	}
 
@@ -322,8 +353,18 @@ func (w *TraversalWorker) insertChildren(task *TaskBase) error {
 		return nil // All children were duplicates
 	}
 
-	if err := w.db.BulkWrite(w.tableName, rows); err != nil {
-		return fmt.Errorf("failed to insert children: %w", err)
+	// Paginate inserts into smaller batches to keep individual DB writes bounded,
+	// even before the DB layer's own batching kicks in.
+	const maxBatchSize = 100
+	for start := 0; start < len(rows); start += maxBatchSize {
+		end := start + maxBatchSize
+		if end > len(rows) {
+			end = len(rows)
+		}
+
+		if err := w.db.BulkWrite(w.tableName, rows[start:end]); err != nil {
+			return fmt.Errorf("failed to insert children: %w", err)
+		}
 	}
 
 	return nil

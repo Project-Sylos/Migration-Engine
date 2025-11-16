@@ -241,6 +241,15 @@ func buildMigrationConfig(cfg cliConfig) (migration.Config, error) {
 		return migration.Config{}, fmt.Errorf("destination: %w", err)
 	}
 
+	// Default verification behavior:
+	// If verification options are omitted in the CLI config (zero-value struct),
+	// we treat "AllowNotOnSrc" as true by default so that extra items on the
+	// destination do not fail verification unless explicitly disallowed.
+	verifyOpts := cfg.Verification
+	if verifyOpts == (migration.VerifyOptions{}) {
+		verifyOpts.AllowNotOnSrc = true
+	}
+
 	migrationCfg := migration.Config{
 		Database:        cfg.Database,
 		Source:          sourceService,
@@ -252,7 +261,7 @@ func buildMigrationConfig(cfg cliConfig) (migration.Config, error) {
 		LogAddress:      cfg.LogAddress,
 		LogLevel:        cfg.LogLevel,
 		SkipListener:    cfg.SkipListener,
-		Verification:    cfg.Verification,
+		Verification:    verifyOpts,
 	}
 
 	if cfg.StartupDelayMillis > 0 {
@@ -295,10 +304,6 @@ func printResult(result migration.Result) {
 		report.DstPending,
 		report.DstFailed,
 	)
-
-	if report.DstNotOnSrc > 0 {
-		fmt.Printf("⚠ Warning: %d dst nodes marked as NotOnSrc\n", report.DstNotOnSrc)
-	}
 
 	fmt.Println()
 	fmt.Printf("✓ Successfully migrated %d nodes\n", report.SrcTotal)
