@@ -51,6 +51,10 @@ func NewSpectraFS(spectraFS *sdk.SpectraFS, rootID string, world string) (*Spect
 }
 
 // ListChildren lists immediate children of the given node identifier (Spectra node ID).
+// It currently retrieves the full child set in one call to the Spectra SDK.
+// For consistency with other services and future-proofing against backend pagination,
+// callers that want to process children in fixed-size pages should wrap this with
+// NewListPager(result, pageSize).
 func (s *SpectraFS) ListChildren(identifier string) (ListResult, error) {
 	var result ListResult
 
@@ -73,7 +77,6 @@ func (s *SpectraFS) ListChildren(identifier string) (ListResult, error) {
 	if parentNode.Type != NodeTypeFolder {
 		return result, fmt.Errorf("node %s is not a folder", identifier)
 	}
-
 
 	// List children from Spectra using request struct with world filter
 	listResult, err := s.fs.ListChildren(&sdk.ListChildrenRequest{
@@ -122,6 +125,17 @@ func (s *SpectraFS) ListChildren(identifier string) (ListResult, error) {
 	return result, nil
 }
 
+// NewChildrenPager is a convenience wrapper that returns a ListPager over the
+// children of a Spectra node. It mirrors the SDK-style pagination model used
+// by many cloud services while keeping the FSAdapter interface simple.
+func (s *SpectraFS) NewChildrenPager(identifier string, pageSize int) (*ListPager, error) {
+	result, err := s.ListChildren(identifier)
+	if err != nil {
+		return nil, err
+	}
+	return NewListPager(result, pageSize), nil
+}
+
 // DownloadFile retrieves file data from Spectra and returns it as a ReadCloser.
 func (s *SpectraFS) DownloadFile(identifier string) (io.ReadCloser, error) {
 	// Get file data from Spectra
@@ -161,7 +175,6 @@ func (s *SpectraFS) CreateFolder(parentId, name string) (Folder, error) {
 		}
 		return Folder{}, err
 	}
-
 
 	if logservice.LS != nil {
 		_ = logservice.LS.Log(

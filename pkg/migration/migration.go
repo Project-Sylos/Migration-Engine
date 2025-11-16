@@ -87,6 +87,22 @@ func LetsMigrate(cfg Config) (Result, error) {
 		defer database.Close()
 	}
 
+	// Validate core schema for any caller-supplied database instance. This is
+	// intentionally strict to avoid resuming or running against a modified or
+	// incompatible DB file. Databases created via SetupDatabase are assumed to
+	// have the correct schema because we just registered the tables.
+	if cfg.DatabaseInstance != nil {
+		if err := database.ValidateCoreSchema(); err != nil {
+			return Result{}, fmt.Errorf("database schema invalid: %w", err)
+		}
+	}
+
+	// Inspect existing migration status to decide between a fresh run and a resume.
+	status, err := InspectMigrationStatus(database)
+	if err != nil {
+		return Result{}, fmt.Errorf("failed to inspect migration status: %w", err)
+	}
+
 	if cfg.Source.Adapter == nil || cfg.Destination.Adapter == nil {
 		return Result{}, fmt.Errorf("source and destination adapters must be provided")
 	}
@@ -102,31 +118,67 @@ func LetsMigrate(cfg Config) (Result, error) {
 
 	result := Result{RootsSeeded: cfg.SeedRoots}
 
-	if cfg.SeedRoots {
-		summary, err := SeedRootTasks(database, srcRoot, dstRoot)
-		if err != nil {
-			return Result{}, err
+	// Decide whether to run a fresh migration (seed + traversal) or resume from
+	// an existing in-progress database.
+	var runtime RuntimeStats
+	var runErr error
+
+	switch {
+	case status.IsEmpty():
+		// Fresh run: optionally seed roots, then run normal traversal.
+		if cfg.SeedRoots {
+			summary, err := SeedRootTasks(database, srcRoot, dstRoot)
+			if err != nil {
+				return Result{}, err
+			}
+			fmt.Printf("Root tasks seeded (src:%d dst:%d)\n", summary.SrcRoots, summary.DstRoots)
+			result.RootSummary = summary
 		}
-		fmt.Printf("Root tasks seeded (src:%d dst:%d)\n", summary.SrcRoots, summary.DstRoots)
-		result.RootSummary = summary
+		runtime, runErr = RunMigration(MigrationConfig{
+			Database:        database,
+			SrcAdapter:      cfg.Source.Adapter,
+			DstAdapter:      cfg.Destination.Adapter,
+			SrcRoot:         srcRoot,
+			DstRoot:         dstRoot,
+			SrcServiceName:  cfg.Source.Name,
+			WorkerCount:     cfg.WorkerCount,
+			MaxRetries:      cfg.MaxRetries,
+			CoordinatorLead: cfg.CoordinatorLead,
+			LogAddress:      cfg.LogAddress,
+			LogLevel:        cfg.LogLevel,
+			SkipListener:    cfg.SkipListener,
+			StartupDelay:    cfg.StartupDelay,
+			ProgressTick:    cfg.ProgressTick,
+		})
+
+	case status.HasPending():
+		// Resume from an in-progress migration. Root seeding is assumed to have
+		// been done previously and is skipped here.
+		fmt.Println("Resuming migration from existing database state...")
+		runtime, runErr = RunMigrationResume(MigrationConfig{
+			Database:        database,
+			SrcAdapter:      cfg.Source.Adapter,
+			DstAdapter:      cfg.Destination.Adapter,
+			SrcRoot:         srcRoot,
+			DstRoot:         dstRoot,
+			SrcServiceName:  cfg.Source.Name,
+			WorkerCount:     cfg.WorkerCount,
+			MaxRetries:      cfg.MaxRetries,
+			CoordinatorLead: cfg.CoordinatorLead,
+			LogAddress:      cfg.LogAddress,
+			LogLevel:        cfg.LogLevel,
+			SkipListener:    cfg.SkipListener,
+			StartupDelay:    cfg.StartupDelay,
+			ProgressTick:    cfg.ProgressTick,
+		}, status)
+
+	default:
+		// Completed (or failed-only) migration with no pending work. For now we
+		// do not re-run traversal automatically; verification below will report
+		// success or failure based on the existing DB contents.
+		fmt.Println("Existing migration detected with no pending work; skipping traversal.")
 	}
 
-	runtime, runErr := RunMigration(MigrationConfig{
-		Database:        database,
-		SrcAdapter:      cfg.Source.Adapter,
-		DstAdapter:      cfg.Destination.Adapter,
-		SrcRoot:         srcRoot,
-		DstRoot:         dstRoot,
-		SrcServiceName:  cfg.Source.Name,
-		WorkerCount:     cfg.WorkerCount,
-		MaxRetries:      cfg.MaxRetries,
-		CoordinatorLead: cfg.CoordinatorLead,
-		LogAddress:      cfg.LogAddress,
-		LogLevel:        cfg.LogLevel,
-		SkipListener:    cfg.SkipListener,
-		StartupDelay:    cfg.StartupDelay,
-		ProgressTick:    cfg.ProgressTick,
-	})
 	result.Runtime = runtime
 	if runErr != nil {
 		return result, runErr

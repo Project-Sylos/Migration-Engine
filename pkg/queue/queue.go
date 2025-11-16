@@ -160,6 +160,40 @@ func (q *Queue) Add(task *TaskBase) bool {
 	return true
 }
 
+// SetRound sets the queue's current round. Used for resume operations.
+func (q *Queue) SetRound(round int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.round = round
+}
+
+// AddToRoundPending adds a task to the specified round's pending queue.
+// Used for resume operations to reconstruct queue state from database.
+func (q *Queue) AddToRoundPending(round int, task *TaskBase) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	rq := q.getOrCreateRoundQueue(round)
+	if !rq.AddPending(task) {
+		return false
+	}
+
+	roundStats := q.getOrCreateRoundStats(round)
+	roundStats.Queued++
+
+	return true
+}
+
+// AddToRoundSuccessful adds a task to the specified round's successful queue.
+// Used for resume operations to reconstruct queue state from database.
+func (q *Queue) AddToRoundSuccessful(round int, task *TaskBase) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	rq := q.getOrCreateRoundQueue(round)
+	return rq.AddSuccessful(task)
+}
+
 // ============================================================================
 // Locked attribute accessors - these methods handle locking internally
 // ============================================================================
@@ -169,13 +203,6 @@ func (q *Queue) getRound() int {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.round
-}
-
-// setState sets the state. Thread-safe.
-func (q *Queue) setState(state QueueState) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.state = state
 }
 
 // getInProgressCount returns the number of in-progress tasks. Thread-safe.
@@ -205,6 +232,41 @@ func (q *Queue) getOrCreateRoundQueue(round int) *RoundQueue {
 // Must be called with q.mu.Lock() held (use within locked sections).
 func (q *Queue) deleteRoundQueue(round int) {
 	delete(q.roundQueues, round)
+}
+
+// pruneRoundsBefore removes all round queues and stats for rounds less than the specified round.
+// This is used to free memory when DST advances and no longer needs old SRC round data.
+// Must be called with proper locking (called from DST queue which holds its own lock).
+func (q *Queue) pruneRoundsBefore(pruneRound int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	prunedQueues := 0
+	prunedStats := 0
+
+	// Prune round queues
+	for round := range q.roundQueues {
+		if round < pruneRound {
+			delete(q.roundQueues, round)
+			prunedQueues++
+		}
+	}
+
+	// Prune round stats
+	for round := range q.roundStats {
+		if round < pruneRound {
+			delete(q.roundStats, round)
+			prunedStats++
+		}
+	}
+
+	if (prunedQueues > 0 || prunedStats > 0) && logservice.LS != nil {
+		_ = logservice.LS.Log("debug",
+			fmt.Sprintf("Pruned %d round queues and %d round stats (rounds < %d)", prunedQueues, prunedStats, pruneRound),
+			"queue",
+			q.name,
+			q.name)
+	}
 }
 
 // getOrCreateRoundStats returns the RoundStats for the current round, creating it if it doesn't exist.
@@ -372,7 +434,10 @@ func (q *Queue) handleSrcComplete(task *TaskBase, nextRound int) {
 	var childFolders []fsservices.Folder
 	for _, child := range task.DiscoveredChildren {
 		if !child.IsFile && child.Status == "Pending" {
-			childFolders = append(childFolders, child.Folder)
+			// Ensure folder depth reflects BFS depth (child of round N is depth N+1)
+			f := child.Folder
+			f.DepthLevel = nextRound
+			childFolders = append(childFolders, f)
 		}
 	}
 
@@ -423,7 +488,10 @@ func (q *Queue) handleDstComplete(task *TaskBase, nextRound int) {
 	var childFolders []fsservices.Folder
 	for _, child := range task.DiscoveredChildren {
 		if !child.IsFile && child.Status == "Pending" {
-			childFolders = append(childFolders, child.Folder)
+			// Ensure folder depth reflects BFS depth (child of round N is depth N+1)
+			f := child.Folder
+			f.DepthLevel = nextRound
+			childFolders = append(childFolders, f)
 		}
 	}
 
@@ -671,22 +739,9 @@ func (q *Queue) advanceToNextRound() {
 	if q.coordinator != nil {
 		switch q.name {
 		case "src":
-			// Src waits if it's too far ahead of dst, or if dst has completed early
+			// Src waits if it's too far ahead of dst (but continues if dst has completed)
 			if !q.coordinator.CanSrcAdvance() {
-				// Check if dst completed - if so, mark src as completed (migration failed)
-				if q.coordinator.IsDstCompleted() {
-					q.setState(QueueStateCompleted)
-					q.coordinator.UpdateSrcCompleted()
-					if logservice.LS != nil {
-						_ = logservice.LS.Log("info",
-							"SRC queue stopping - DST completed early (migration will fail)",
-							"queue",
-							q.name,
-							q.name)
-					}
-					return
-				}
-				// Otherwise wait for dst to catch up
+				// Wait for dst to catch up
 				for !q.coordinator.CanSrcAdvance() {
 					time.Sleep(50 * time.Millisecond)
 				}
@@ -708,15 +763,20 @@ func (q *Queue) advanceToNextRound() {
 	q.getOrCreateRoundStats(newRound)
 
 	// Cleanup: When DST advances, clear previous round queues for both DST and SRC
-	// Note: We don't delete SRC round queues here because DST workers might still be
-	// accessing them via GetSuccessfulTask(). Instead, we only delete DST's own completed round.
-	// SRC round queues will be cleaned up later when safe (after DST round advances further).
 	if q.name == "dst" {
 		// Clean up DST's completed round
 		q.deleteRoundQueue(completedRound)
 
-		// Don't delete SRC round queues here - workers may still be accessing them
-		// SRC queues will be cleaned up naturally as rounds progress
+		// Prune SRC round queues that are no longer needed
+		// DST on round N queries SRC round N+1 when completing tasks
+		// DST on round N+1 will query SRC round N+2
+		// So we can safely prune SRC rounds < N-1 (keeping a buffer of 2 rounds for safety)
+		if q.srcQueue != nil {
+			pruneRound := newRound - 2 // Prune rounds < newRound - 2
+			if pruneRound > 0 {
+				q.srcQueue.pruneRoundsBefore(pruneRound)
+			}
+		}
 	}
 
 	// Check if the new round has no tasks (max depth reached)
@@ -751,6 +811,21 @@ func (q *Queue) advanceToNextRound() {
 	}
 
 	q.mu.Unlock()
+
+	// Cleanup: When SRC advances and DST is done, prune old SRC rounds
+	// (Must be done after releasing lock to avoid deadlock)
+	// Only prune if SRC is still running (not completed) and DST is completed
+	if q.name == "src" && q.state == QueueStateRunning {
+		// If DST is completed (but SRC is still running), we no longer need to keep old rounds for DST to query
+		// Prune all rounds up to (but not including) the current round
+		// Important: Only prune when DST is done, NOT when SRC is done
+		if q.coordinator != nil && q.coordinator.IsDstCompleted() && !q.coordinator.IsSrcCompleted() {
+			pruneRound := newRound // Prune rounds < newRound (keep only current round)
+			if pruneRound > 0 {
+				q.pruneRoundsBefore(pruneRound)
+			}
+		}
+	}
 
 	// Update coordinator state
 	if q.coordinator != nil {

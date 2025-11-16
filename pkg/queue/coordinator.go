@@ -32,13 +32,16 @@ func NewQueueCoordinator(maxLead int) *QueueCoordinator {
 
 // CanSrcAdvance returns true if src can advance to the next round.
 // Src can advance if it's not more than maxLead rounds ahead of dst.
-// If dst has completed, src should not advance (dst finished early, migration should fail).
+// If dst has completed early (no more folders to traverse), src should continue
+// traversing its own tree until it also completes.
 func (c *QueueCoordinator) CanSrcAdvance() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	// If dst has completed, allow src to continue (dst finished early but that's valid)
 	if c.dstCompleted {
-		return false // DST completed early, SRC should stop
+		return true
 	}
+	// Otherwise, enforce maxLead constraint
 	return (c.srcRound - c.dstRound) < c.maxLead
 }
 
@@ -100,4 +103,11 @@ func (c *QueueCoordinator) IsDstCompleted() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.dstCompleted
+}
+
+// IsSrcCompleted returns true if src has completed.
+func (c *QueueCoordinator) IsSrcCompleted() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.srcCompleted
 }

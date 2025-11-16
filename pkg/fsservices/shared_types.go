@@ -62,6 +62,95 @@ type ListResult struct {
 	Files   []File
 }
 
+// ListPage represents a single "page" of children returned from a paginated listing.
+// It includes a Total count so callers can understand how many children exist in
+// aggregate, even if only a subset is present in this page.
+type ListPage struct {
+	Folders  []Folder
+	Files    []File
+	Total    int // Total number of children (folders + files) across all pages
+	Page     int // 0-based page index
+	PageSize int // Requested maximum number of children per page
+	HasMore  bool
+}
+
+// ListPager provides a simple in-memory pagination wrapper around a full ListResult.
+// This allows callers (like traversal workers) to process children in fixed-size pages
+// even when the underlying filesystem adapter doesn't support pagination natively.
+//
+// For cloud services that do support pagination, a future adapter-specific pager can
+// be implemented that fetches one page at a time from the remote API. For now, this
+// implementation virtualizes pagination using a single ListChildren call and array
+// slicing, which is sufficient for local filesystems and small to medium directory sizes.
+type ListPager struct {
+	allFolders []Folder
+	allFiles   []File
+	total      int
+	pageSize   int
+	page       int
+	index      int // linear index across folders+files
+}
+
+// NewListPager constructs a ListPager over an existing ListResult, using the provided
+// pageSize as the maximum number of children (folders+files) per page.
+func NewListPager(result ListResult, pageSize int) *ListPager {
+	if pageSize <= 0 {
+		pageSize = 100
+	}
+	total := len(result.Folders) + len(result.Files)
+	return &ListPager{
+		allFolders: result.Folders,
+		allFiles:   result.Files,
+		total:      total,
+		pageSize:   pageSize,
+		page:       0,
+		index:      0,
+	}
+}
+
+// Next returns the next page of children and a boolean indicating whether any
+// page was returned. When no more pages remain, hasPage will be false.
+func (p *ListPager) Next() (page ListPage, hasPage bool) {
+	if p == nil || p.index >= p.total {
+		return ListPage{}, false
+	}
+
+	remaining := p.total - p.index
+	count := p.pageSize
+	if remaining < count {
+		count = remaining
+	}
+
+	// Build this page by walking a linear index across folders then files.
+	folders := make([]Folder, 0, count)
+	files := make([]File, 0, count)
+
+	for i := 0; i < count; i++ {
+		globalIdx := p.index + i
+		if globalIdx < len(p.allFolders) {
+			folders = append(folders, p.allFolders[globalIdx])
+		} else {
+			fileIdx := globalIdx - len(p.allFolders)
+			if fileIdx < len(p.allFiles) {
+				files = append(files, p.allFiles[fileIdx])
+			}
+		}
+	}
+
+	p.index += count
+	currentPage := p.page
+	p.page++
+
+	return ListPage{
+		Folders:  folders,
+		Files:    files,
+		Total:    p.total,
+		Page:     currentPage,
+		PageSize: p.pageSize,
+		HasMore:  p.index < p.total,
+	}, true
+}
+
 type FSAdapter interface {
 	ListChildren(identifier string) (ListResult, error)
 	DownloadFile(identifier string) (io.ReadCloser, error)
