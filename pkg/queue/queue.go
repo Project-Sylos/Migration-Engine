@@ -142,6 +142,56 @@ func (q *Queue) Resume() {
 	q.state = QueueStateRunning
 }
 
+// WaitForCoordinatorGate blocks until the coordinator allows this queue to proceed.
+// Used during startup/resume to mirror the same gating logic applied when advancing rounds.
+func (q *Queue) WaitForCoordinatorGate(reason string) {
+	if q.coordinator == nil {
+		return
+	}
+
+	var canProceed func() bool
+	switch q.name {
+	case "src":
+		canProceed = q.coordinator.CanSrcAdvance
+	case "dst":
+		canProceed = q.coordinator.CanDstAdvance
+	default:
+		return
+	}
+
+	if canProceed() {
+		return
+	}
+
+	if reason == "" {
+		reason = "coordination gate"
+	}
+
+	if logservice.LS != nil {
+		_ = logservice.LS.Log(
+			"debug",
+			fmt.Sprintf("%s queue waiting on %s", strings.ToUpper(q.name), reason),
+			"queue",
+			q.name,
+			q.name,
+		)
+	}
+
+	for !canProceed() {
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if logservice.LS != nil {
+		_ = logservice.LS.Log(
+			"debug",
+			fmt.Sprintf("%s queue coordinator gate released (%s)", strings.ToUpper(q.name), reason),
+			"queue",
+			q.name,
+			q.name,
+		)
+	}
+}
+
 // Add enqueues a new task to the current round's pending queue.
 func (q *Queue) Add(task *TaskBase) bool {
 	q.mu.Lock()

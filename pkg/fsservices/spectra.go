@@ -100,9 +100,9 @@ func (s *SpectraFS) ListChildren(identifier string) (ListResult, error) {
 		result.Folders = append(result.Folders, Folder{
 			Id:           node.ID,
 			ParentId:     identifier,
-			ParentPath:   node.ParentPath,
+			ParentPath:   NormalizeParentPath(node.ParentPath),
 			DisplayName:  node.Name,
-			LocationPath: node.Path,
+			LocationPath: NormalizeLocationPath(node.Path),
 			LastUpdated:  node.LastUpdated.Format(time.RFC3339),
 			DepthLevel:   node.DepthLevel,
 			Type:         NodeTypeFolder,
@@ -112,9 +112,9 @@ func (s *SpectraFS) ListChildren(identifier string) (ListResult, error) {
 		result.Files = append(result.Files, File{
 			Id:           node.ID,
 			ParentId:     identifier,
-			ParentPath:   node.ParentPath, // parent's relative path
+			ParentPath:   NormalizeParentPath(node.ParentPath), // parent's relative path
 			DisplayName:  node.Name,
-			LocationPath: node.Path,
+			LocationPath: NormalizeLocationPath(node.Path),
 			LastUpdated:  node.LastUpdated.Format(time.RFC3339),
 			Size:         node.Size,
 			DepthLevel:   node.DepthLevel,
@@ -177,9 +177,11 @@ func (s *SpectraFS) CreateFolder(parentId, name string) (Folder, error) {
 	}
 
 	if logservice.LS != nil {
+		normalizedParent := NormalizeParentPath(node.ParentPath)
+		relPath := NormalizeLocationPath(strings.Join([]string{strings.TrimPrefix(normalizedParent, "/"), node.Name}, "/"))
 		_ = logservice.LS.Log(
 			"info",
-			fmt.Sprintf("Created folder %s", strings.Join([]string{node.ParentPath, node.Name}, "/")),
+			fmt.Sprintf("Created folder %s", relPath),
 			"fsservices",
 			"spectra",
 		)
@@ -188,9 +190,9 @@ func (s *SpectraFS) CreateFolder(parentId, name string) (Folder, error) {
 	return Folder{
 		Id:           node.ID,
 		ParentId:     parentId,
-		ParentPath:   node.ParentPath,
+		ParentPath:   NormalizeParentPath(node.ParentPath),
 		DisplayName:  node.Name,
-		LocationPath: node.Path,
+		LocationPath: NormalizeLocationPath(node.Path),
 		LastUpdated:  node.LastUpdated.Format(time.RFC3339),
 		DepthLevel:   node.DepthLevel,
 		Type:         NodeTypeFolder,
@@ -235,10 +237,11 @@ func (s *SpectraFS) UploadFile(parentId string, content io.Reader) (File, error)
 		return File{}, err
 	}
 
+	normalizedPath := NormalizeLocationPath(node.Path)
 	if logservice.LS != nil {
 		_ = logservice.LS.Log(
 			"info",
-			fmt.Sprintf("Uploaded file %s (%d bytes)", node.Path, len(data)),
+			fmt.Sprintf("Uploaded file %s (%d bytes)", normalizedPath, len(data)),
 			"fsservices",
 			"spectra",
 		)
@@ -247,9 +250,9 @@ func (s *SpectraFS) UploadFile(parentId string, content io.Reader) (File, error)
 	return File{
 		Id:           node.ID,
 		ParentId:     parentId,
-		ParentPath:   node.ParentPath,
+		ParentPath:   NormalizeParentPath(node.ParentPath),
 		DisplayName:  node.Name,
-		LocationPath: node.Path,
+		LocationPath: normalizedPath,
 		LastUpdated:  node.LastUpdated.Format(time.RFC3339),
 		Size:         node.Size,
 		DepthLevel:   node.DepthLevel,
@@ -259,7 +262,5 @@ func (s *SpectraFS) UploadFile(parentId string, content io.Reader) (File, error)
 
 // NormalizePath normalizes a Spectra node ID or path string.
 func (s *SpectraFS) NormalizePath(path string) string {
-	// For Spectra, we primarily work with node IDs
-	// This could be enhanced to handle path-based lookups if needed
-	return strings.TrimSpace(path)
+	return NormalizeLocationPath(path)
 }

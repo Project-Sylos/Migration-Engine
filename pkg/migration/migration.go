@@ -73,34 +73,45 @@ func LetsMigrate(cfg Config) (Result, error) {
 		err      error
 	)
 
+	var wasFresh bool
 	if cfg.DatabaseInstance != nil {
 		database = cfg.DatabaseInstance
+		wasFresh = false // Existing database instance - always check status and validate schema
 	} else {
-		database, err = SetupDatabase(cfg.Database)
-		if err != nil {
-			return Result{}, err
+		var setupErr error
+		database, wasFresh, setupErr = SetupDatabase(cfg.Database)
+		if setupErr != nil {
+			return Result{}, setupErr
 		}
 		cfg.CloseDatabase = true
-	}
-
-	if cfg.CloseDatabase {
-		defer database.Close()
+		// Fresh database - no need to validate schema since we just registered the tables
 	}
 
 	// Validate core schema for any caller-supplied database instance. This is
 	// intentionally strict to avoid resuming or running against a modified or
 	// incompatible DB file. Databases created via SetupDatabase are assumed to
 	// have the correct schema because we just registered the tables.
+	// Skip validation for fresh databases since we just created them correctly.
 	if cfg.DatabaseInstance != nil {
 		if err := database.ValidateCoreSchema(); err != nil {
 			return Result{}, fmt.Errorf("database schema invalid: %w", err)
 		}
 	}
+	// Note: Fresh databases (wasFresh=true) don't need validation since we just registered the tables
 
-	// Inspect existing migration status to decide between a fresh run and a resume.
-	status, err := InspectMigrationStatus(database)
-	if err != nil {
-		return Result{}, fmt.Errorf("failed to inspect migration status: %w", err)
+	// Only inspect migration status if this isn't a fresh database.
+	// If we just created it (RemoveExisting=true or file didn't exist), skip the check.
+	var status MigrationStatus
+	if wasFresh {
+		// Fresh database - no need to check, it's definitely empty
+		status = MigrationStatus{}
+	} else {
+		// Existing database - inspect to decide between fresh run and resume
+		var inspectErr error
+		status, inspectErr = InspectMigrationStatus(database)
+		if inspectErr != nil {
+			return Result{}, fmt.Errorf("failed to inspect migration status: %w", inspectErr)
+		}
 	}
 
 	if cfg.Source.Adapter == nil || cfg.Destination.Adapter == nil {
@@ -155,7 +166,7 @@ func LetsMigrate(cfg Config) (Result, error) {
 		// Resume from an in-progress migration. Root seeding is assumed to have
 		// been done previously and is skipped here.
 		fmt.Println("Resuming migration from existing database state...")
-		runtime, runErr = RunMigrationResume(MigrationConfig{
+		runtime, runErr = RunMigration(MigrationConfig{
 			Database:        database,
 			SrcAdapter:      cfg.Source.Adapter,
 			DstAdapter:      cfg.Destination.Adapter,
@@ -170,7 +181,8 @@ func LetsMigrate(cfg Config) (Result, error) {
 			SkipListener:    cfg.SkipListener,
 			StartupDelay:    cfg.StartupDelay,
 			ProgressTick:    cfg.ProgressTick,
-		}, status)
+			ResumeStatus:    &status,
+		})
 
 	default:
 		// Completed (or failed-only) migration with no pending work. For now we
@@ -180,12 +192,29 @@ func LetsMigrate(cfg Config) (Result, error) {
 	}
 
 	result.Runtime = runtime
+
+	// Verify migration before closing database - verification needs database access
+	// Note: We run verification even if migration had errors, to provide full diagnostic info
+	report, verifyErr := VerifyMigration(database, cfg.Verification)
+	result.Verification = report
+
+	// Note: We do NOT close the log service here - it's a global singleton that should
+	// be managed at the application level (e.g., in the API that calls LetsMigrate).
+	// Closing it here would cause issues if:
+	// 1. Multiple migrations run in sequence
+	// 2. The API also tries to close it
+	// 3. Verification or other code needs to log after migration completes
+
+	// Close database after verification and log service are done (allows verification and log flushing to access DB)
+	if cfg.CloseDatabase {
+		defer database.Close()
+	}
+
+	// Return migration error if it occurred (verification ran for diagnostics)
 	if runErr != nil {
 		return result, runErr
 	}
 
-	report, verifyErr := VerifyMigration(database, cfg.Verification)
-	result.Verification = report
 	if verifyErr != nil {
 		return result, verifyErr
 	}
