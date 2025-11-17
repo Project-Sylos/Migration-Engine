@@ -3,7 +3,7 @@ module github.com/Project-Sylos/Migration-Engine
 go 1.24.2
 
 require (
-	github.com/Project-Sylos/Spectra v0.2.52
+	github.com/Project-Sylos/Spectra v0.2.53
 	github.com/mattn/go-sqlite3 v1.14.32
 )
 

@@ -7,8 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"time"
 )
@@ -30,21 +30,33 @@ func StartListener(addr string) error {
 
 	switch runtime.GOOS {
 	case "windows":
-		// Spawn a new cmd window that runs the listener
+		// Find the absolute path to spawn.go
+		spawnPath, err := getSpawnAbsPath()
+		if err != nil {
+			return fmt.Errorf("unable to locate spawn.go: %v", err)
+		}
+		// Spawn a new cmd window that runs the listener with abs path
+		// NOTE: We quote the path only for the shell command (NOT for Go import!), no malformed import path here.
 		cmd = exec.Command("C:\\Windows\\System32\\cmd.exe", "/C", "start", "cmd", "/K",
-			fmt.Sprintf("go run pkg/logservice/main/spawn.go %s", addr))
+			fmt.Sprintf("go run %s %s", quoteForWindowsCmd(spawnPath), addr))
 	case "darwin":
 		// macOS: use Terminal.app
+		spawnPath, err := getSpawnAbsPath()
+		if err != nil {
+			return fmt.Errorf("unable to locate spawn.go: %v", err)
+		}
 		cmd = exec.Command("osascript", "-e",
-			fmt.Sprintf(`tell application "Terminal" to do script "cd %s && go run pkg/logservice/main/spawn.go %s"`,
-				getCurrentDir(), addr))
+			fmt.Sprintf(`tell application "Terminal" to do script "go run '%s' %s"`, spawnPath, addr))
 	case "linux":
 		// Linux: try common terminal emulators
+		spawnPath, err := getSpawnAbsPath()
+		if err != nil {
+			return fmt.Errorf("unable to locate spawn.go: %v", err)
+		}
 		for _, term := range []string{"x-terminal-emulator", "gnome-terminal", "xterm"} {
 			if _, err := exec.LookPath(term); err == nil {
 				cmd = exec.Command(term, "-e",
-					fmt.Sprintf("bash -c 'cd %s && go run pkg/logservice/main/spawn.go %s'",
-						getCurrentDir(), addr))
+					fmt.Sprintf("bash -c 'go run \"%s\" %s'", spawnPath, addr))
 				break
 			}
 		}
@@ -62,13 +74,35 @@ func StartListener(addr string) error {
 	return nil
 }
 
-// getCurrentDir returns the current working directory.
-func getCurrentDir() string {
-	dir, err := os.Getwd()
-	if err != nil {
-		return "."
+// quoteForWindowsCmd surrounds the path in quotes if it contains a space.
+// This ensures we don't get malformed import/argument; used only for the shell command.
+func quoteForWindowsCmd(path string) string {
+	if len(path) == 0 {
+		return path
 	}
-	return dir
+	if path[0] == '"' && path[len(path)-1] == '"' {
+		return path
+	}
+	// Only quote if space or special chars
+	for _, c := range path {
+		if c == ' ' || c == '\t' {
+			return fmt.Sprintf("\"%s\"", path)
+		}
+	}
+	return path
+}
+
+// getSpawnAbsPath returns the absolute path to spawn.go based on the current file's directory.
+func getSpawnAbsPath() (string, error) {
+	// Use runtime.Caller to get the path to this source file, regardless of the working directory
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		return "", fmt.Errorf("unable to determine the caller source file path")
+	}
+	// The structure is listener.go → main/spawn.go
+	baseDir := filepath.Dir(currentFile)                  // .../pkg/logservice
+	spawnPath := filepath.Join(baseDir, "main", "spawn.go")
+	return spawnPath, nil
 }
 
 // RunListener is the actual listener loop (called when --listen flag is passed).

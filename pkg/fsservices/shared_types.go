@@ -5,6 +5,8 @@ package fsservices
 
 import (
 	"io"
+	"path"
+	"strings"
 )
 
 const (
@@ -48,6 +50,36 @@ func (f File) Name() string     { return f.DisplayName }
 func (f File) Path() string     { return f.LocationPath }
 func (f File) ParentID() string { return f.ParentId }
 func (f File) NodeType() string { return f.Type }
+
+// NormalizeLocationPath ensures logical paths always use forward slashes, are rooted,
+// and collapse redundant separators. Empty paths normalize to "/".
+func NormalizeLocationPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return "/"
+	}
+
+	p = strings.ReplaceAll(p, "\\", "/")
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+
+	cleaned := path.Clean(p)
+	if cleaned == "." {
+		return "/"
+	}
+	return cleaned
+}
+
+// NormalizeParentPath normalizes stored parent_path strings but preserves empty values
+// (used by root nodes which have no parent).
+func NormalizeParentPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	return NormalizeLocationPath(p)
+}
 
 type Node interface {
 	ID() string

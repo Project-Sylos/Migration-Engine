@@ -38,9 +38,9 @@ func LoadRootFolders(database *db.DB, table string) ([]fsservices.Folder, error)
 		folder := fsservices.Folder{
 			Id:           id,
 			ParentId:     parentID,
-			ParentPath:   parentPath,
+			ParentPath:   fsservices.NormalizeParentPath(parentPath),
 			DisplayName:  name,
-			LocationPath: path,
+			LocationPath: fsservices.NormalizeLocationPath(path),
 			DepthLevel:   depthLevel,
 			Type:         fsservices.NodeTypeFolder,
 		}
@@ -84,9 +84,9 @@ func LoadPendingFolders(database *db.DB, table string) ([]fsservices.Folder, err
 		folder := fsservices.Folder{
 			Id:           id,
 			ParentId:     parentID,
-			ParentPath:   parentPath,
+			ParentPath:   fsservices.NormalizeParentPath(parentPath),
 			DisplayName:  name,
-			LocationPath: path,
+			LocationPath: fsservices.NormalizeLocationPath(path),
 			DepthLevel:   depthLevel,
 			Type:         fsservices.NodeTypeFolder,
 		}
@@ -105,9 +105,11 @@ func LoadPendingFolders(database *db.DB, table string) ([]fsservices.Folder, err
 
 // LoadExpectedChildren returns the expected folders and files for a destination folder path based on src_nodes.
 func LoadExpectedChildren(database *db.DB, parentPath string) ([]fsservices.Folder, []fsservices.File, error) {
+	normalizedParent := fsservices.NormalizeLocationPath(parentPath)
+
 	rows, err := database.Query(
-		"SELECT id, parent_id, name, path, parent_path, type, depth_level, size, last_updated FROM src_nodes WHERE parent_path = ?",
-		parentPath,
+		"SELECT id, parent_id, name, path, parent_path, type, depth_level, size, last_updated FROM src_nodes WHERE parent_path IN (?)",
+		normalizedParent,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -138,9 +140,9 @@ func LoadExpectedChildren(database *db.DB, parentPath string) ([]fsservices.Fold
 			folders = append(folders, fsservices.Folder{
 				Id:           id,
 				ParentId:     parentID,
-				ParentPath:   nodeParentPath,
+				ParentPath:   fsservices.NormalizeParentPath(nodeParentPath),
 				DisplayName:  name,
-				LocationPath: path,
+				LocationPath: fsservices.NormalizeLocationPath(path),
 				LastUpdated:  last,
 				DepthLevel:   depthLevel,
 				Type:         fsservices.NodeTypeFolder,
@@ -149,9 +151,9 @@ func LoadExpectedChildren(database *db.DB, parentPath string) ([]fsservices.Fold
 			file := fsservices.File{
 				Id:           id,
 				ParentId:     parentID,
-				ParentPath:   nodeParentPath,
+				ParentPath:   fsservices.NormalizeParentPath(nodeParentPath),
 				DisplayName:  name,
-				LocationPath: path,
+				LocationPath: fsservices.NormalizeLocationPath(path),
 				LastUpdated:  last,
 				DepthLevel:   depthLevel,
 				Type:         fsservices.NodeTypeFile,

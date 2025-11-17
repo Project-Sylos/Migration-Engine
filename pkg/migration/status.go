@@ -63,10 +63,14 @@ func InspectMigrationStatus(database *db.DB) (MigrationStatus, error) {
 		return MigrationStatus{}, err
 	}
 
-	if err := singleCount(database, "SELECT COUNT(*) FROM src_nodes WHERE traversal_status = 'Pending'", &status.SrcPending); err != nil {
+	// When counting Pending, if 'initial' is true, only count those where depth_level != 0.
+	srcPendingQuery := "SELECT COUNT(*) FROM src_nodes WHERE traversal_status = 'Pending'"
+	dstPendingQuery := "SELECT COUNT(*) FROM dst_nodes WHERE traversal_status = 'Pending'"
+
+	if err := singleCount(database, srcPendingQuery, &status.SrcPending); err != nil {
 		return MigrationStatus{}, err
 	}
-	if err := singleCount(database, "SELECT COUNT(*) FROM dst_nodes WHERE traversal_status = 'Pending'", &status.DstPending); err != nil {
+	if err := singleCount(database, dstPendingQuery, &status.DstPending); err != nil {
 		return MigrationStatus{}, err
 	}
 
