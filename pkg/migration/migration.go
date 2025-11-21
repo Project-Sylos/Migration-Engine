@@ -4,11 +4,13 @@
 package migration
 
 import (
+	"context"
 	"fmt"
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
+	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 )
 
 // Service defines a single filesystem service participating in a migration.
@@ -39,6 +41,15 @@ type Config struct {
 	ProgressTick time.Duration
 
 	Verification VerifyOptions
+
+	// Config YAML management (internal use)
+	ConfigPath string
+	YAMLConfig *MigrationConfigYAML
+
+	// ShutdownContext is an optional context for force shutdown control.
+	// If not provided, LetsMigrate will create one internally.
+	// Set this when using StartMigration for programmatic shutdown control.
+	ShutdownContext context.Context
 }
 
 // Result captures the outcome of a migration run.
@@ -47,6 +58,39 @@ type Result struct {
 	RootSummary  RootSeedSummary
 	Runtime      RuntimeStats
 	Verification VerificationReport
+}
+
+// MigrationController provides programmatic control over a running migration.
+// It allows you to trigger force shutdown and check migration status.
+type MigrationController struct {
+	shutdownCancel context.CancelFunc
+	shutdownCtx    context.Context
+	done           chan struct{}
+	result         *Result
+	err            error
+}
+
+// Shutdown triggers a force shutdown of the migration.
+// It checkpoints the database and saves the current state to YAML with "suspended" status.
+// This is safe to call multiple times or after the migration has completed.
+func (mc *MigrationController) Shutdown() {
+	if mc.shutdownCancel != nil {
+		mc.shutdownCancel()
+	}
+}
+
+// Done returns a channel that is closed when the migration completes or is shutdown.
+func (mc *MigrationController) Done() <-chan struct{} {
+	return mc.done
+}
+
+// Wait blocks until the migration completes or is shutdown, then returns the result and error.
+func (mc *MigrationController) Wait() (Result, error) {
+	<-mc.done
+	if mc.result != nil {
+		return *mc.result, mc.err
+	}
+	return Result{}, mc.err
 }
 
 // SetRootFolders assigns the source and destination root folders that will seed the migration queues.
@@ -63,15 +107,89 @@ func (c *Config) SetRootFolders(src, dst fsservices.Folder) error {
 
 	c.Source.Root = normalizedSrc
 	c.Destination.Root = normalizedDst
+
+	// Update config YAML if it exists
+	if c.YAMLConfig != nil && c.ConfigPath != "" {
+		UpdateConfigFromRoots(c.YAMLConfig, normalizedSrc, normalizedDst)
+		if err := SaveMigrationConfig(c.ConfigPath, c.YAMLConfig); err != nil {
+			// Log error but don't fail the operation
+			fmt.Printf("Warning: failed to update config YAML: %v\n", err)
+		}
+	}
+
 	return nil
 }
 
+// StartMigration starts a migration asynchronously and returns a MigrationController
+// that allows programmatic shutdown. Use this when you need to control the migration
+// lifecycle or run migrations in the background.
+//
+// Example:
+//
+//	controller := migration.StartMigration(cfg)
+//	defer controller.Shutdown()
+//
+//	// Later, trigger shutdown programmatically:
+//	controller.Shutdown()
+//
+//	// Wait for completion:
+//	result, err := controller.Wait()
+func StartMigration(cfg Config) *MigrationController {
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	controller := &MigrationController{
+		shutdownCancel: shutdownCancel,
+		shutdownCtx:    shutdownCtx,
+		done:           done,
+	}
+
+	// Run migration in goroutine
+	go func() {
+		defer close(done)
+		// Pass the shutdown context to LetsMigrate
+		cfgCopy := cfg
+		cfgCopy.ShutdownContext = shutdownCtx
+		result, err := letsMigrateWithContext(cfgCopy)
+		controller.result = &result
+		controller.err = err
+	}()
+
+	return controller
+}
+
 // LetsMigrate executes setup, traversal, and verification using the supplied configuration.
+// This is the synchronous version - it blocks until the migration completes or is shutdown.
+// For programmatic shutdown control, use StartMigration instead.
 func LetsMigrate(cfg Config) (Result, error) {
+	// Create shutdown context if not provided
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+	defer shutdownCancel()
+
+	// Start signal handler in background goroutine
+	go HandleShutdownSignals(shutdownCancel)
+
+	cfg.ShutdownContext = shutdownCtx
+	return letsMigrateWithContext(cfg)
+}
+
+// letsMigrateWithContext is the internal implementation that accepts a shutdown context.
+func letsMigrateWithContext(cfg Config) (Result, error) {
 	var (
 		database *db.DB
 		err      error
 	)
+
+	// Use provided shutdown context, or create one if not provided
+	shutdownCtx := cfg.ShutdownContext
+	var shutdownCancel context.CancelFunc
+	if shutdownCtx == nil {
+		shutdownCtx, shutdownCancel = context.WithCancel(context.Background())
+		defer shutdownCancel()
+
+		// Start signal handler in background goroutine
+		go HandleShutdownSignals(shutdownCancel)
+	}
 
 	var wasFresh bool
 	if cfg.DatabaseInstance != nil {
@@ -127,6 +245,56 @@ func LetsMigrate(cfg Config) (Result, error) {
 		return Result{}, fmt.Errorf("destination root: %w", err)
 	}
 
+	// Determine config path
+	configPath := cfg.Database.ConfigPath
+	if configPath == "" {
+		configPath = ConfigPathFromDatabasePath(cfg.Database.Path)
+	}
+
+	// Load or create migration config YAML
+	var yamlCfg *MigrationConfigYAML
+	if wasFresh {
+		// Create new config
+		yamlCfg, err = NewMigrationConfigYAML(cfg, status)
+		if err != nil {
+			return Result{}, fmt.Errorf("failed to create migration config: %w", err)
+		}
+		// Update with root info
+		UpdateConfigFromRoots(yamlCfg, srcRoot, dstRoot)
+		// Save initial config
+		if err := SaveMigrationConfig(configPath, yamlCfg); err != nil {
+			return Result{}, fmt.Errorf("failed to save migration config: %w", err)
+		}
+	} else {
+		// Try to load existing config
+		loadedCfg, loadErr := LoadMigrationConfig(configPath)
+		if loadErr != nil {
+			// If config doesn't exist, create a new one
+			yamlCfg, err = NewMigrationConfigYAML(cfg, status)
+			if err != nil {
+				return Result{}, fmt.Errorf("failed to create migration config: %w", err)
+			}
+			UpdateConfigFromRoots(yamlCfg, srcRoot, dstRoot)
+			if err := SaveMigrationConfig(configPath, yamlCfg); err != nil {
+				return Result{}, fmt.Errorf("failed to save migration config: %w", err)
+			}
+		} else {
+			yamlCfg = loadedCfg
+			// Update with current root info
+			UpdateConfigFromRoots(yamlCfg, srcRoot, dstRoot)
+			// Update status (preserves "suspended" status if set)
+			UpdateConfigFromStatus(yamlCfg, status, 0, 0)
+			if err := SaveMigrationConfig(configPath, yamlCfg); err != nil {
+				return Result{}, fmt.Errorf("failed to save migration config: %w", err)
+			}
+
+			// If status was "suspended", indicate resume from suspension
+			if yamlCfg.State.Status == "suspended" {
+				fmt.Println("Resuming from suspended migration state...")
+			}
+		}
+	}
+
 	result := Result{RootsSeeded: cfg.SeedRoots}
 
 	// Decide whether to run a fresh migration (seed + traversal) or resume from
@@ -144,6 +312,13 @@ func LetsMigrate(cfg Config) (Result, error) {
 			}
 			fmt.Printf("Root tasks seeded (src:%d dst:%d)\n", summary.SrcRoots, summary.DstRoots)
 			result.RootSummary = summary
+
+			// Update config: Roots seeded milestone
+			if yamlCfg != nil && configPath != "" {
+				UpdateConfigFromRoots(yamlCfg, srcRoot, dstRoot)
+				yamlCfg.State.Status = "seeded"
+				_ = SaveMigrationConfig(configPath, yamlCfg)
+			}
 		}
 		runtime, runErr = RunMigration(MigrationConfig{
 			Database:        database,
@@ -160,12 +335,19 @@ func LetsMigrate(cfg Config) (Result, error) {
 			SkipListener:    cfg.SkipListener,
 			StartupDelay:    cfg.StartupDelay,
 			ProgressTick:    cfg.ProgressTick,
+			ConfigPath:      configPath,
+			YAMLConfig:      yamlCfg,
+			ShutdownContext: shutdownCtx,
 		})
 
 	case status.HasPending():
-		// Resume from an in-progress migration. Root seeding is assumed to have
-		// been done previously and is skipped here.
-		fmt.Println("Resuming migration from existing database state...")
+		// Resume from an in-progress migration (including suspended state).
+		// Root seeding is assumed to have been done previously and is skipped here.
+		if yamlCfg != nil && yamlCfg.State.Status == "suspended" {
+			fmt.Println("Resuming suspended migration from database state...")
+		} else {
+			fmt.Println("Resuming migration from existing database state...")
+		}
 		runtime, runErr = RunMigration(MigrationConfig{
 			Database:        database,
 			SrcAdapter:      cfg.Source.Adapter,
@@ -182,6 +364,9 @@ func LetsMigrate(cfg Config) (Result, error) {
 			StartupDelay:    cfg.StartupDelay,
 			ProgressTick:    cfg.ProgressTick,
 			ResumeStatus:    &status,
+			ConfigPath:      configPath,
+			YAMLConfig:      yamlCfg,
+			ShutdownContext: shutdownCtx,
 		})
 
 	default:
@@ -192,6 +377,24 @@ func LetsMigrate(cfg Config) (Result, error) {
 	}
 
 	result.Runtime = runtime
+
+	// Check if migration was suspended by force shutdown
+	isShutdown := runErr != nil && runErr.Error() == "migration suspended by force shutdown"
+	if isShutdown {
+		// Force shutdown occurred: ensure database checkpoint and flush logs
+		if err := database.Checkpoint(); err != nil {
+			fmt.Printf("Warning: failed to checkpoint database after shutdown: %v\n", err)
+		}
+
+		// Flush log service if available
+		if logservice.LS != nil {
+			logservice.LS.Close()
+		}
+
+		// Don't run verification on shutdown - just return with suspended state
+		fmt.Println("\nMigration suspended by force shutdown. State saved for resumption.")
+		return result, nil
+	}
 
 	// Verify migration before closing database - verification needs database access
 	// Note: We run verification even if migration had errors, to provide full diagnostic info

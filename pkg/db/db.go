@@ -70,6 +70,23 @@ func (db *DB) RegisterTable(def TableDef) error {
 	return nil
 }
 
+// Checkpoint checkpoints the SQLite WAL file and truncates it.
+// This ensures all changes in the WAL are written to the main database file.
+// Should be called before closing the database connection for force shutdown.
+func (db *DB) Checkpoint() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	// PRAGMA wal_checkpoint(TRUNCATE) checkpoints the WAL and truncates it
+	// Returns: busy, log, checkpointed (three integers)
+	// We don't need to check the return values - the checkpoint either succeeds or fails
+	_, err := db.conn.ExecContext(db.ctx, "PRAGMA wal_checkpoint(TRUNCATE);")
+	if err != nil {
+		return fmt.Errorf("failed to checkpoint WAL: %w", err)
+	}
+	return nil
+}
+
 // Close gracefully closes the DB connection.
 func (db *DB) Close() error {
 	db.mu.Lock()

@@ -16,6 +16,8 @@ type DatabaseConfig struct {
 	Path string
 	// RemoveExisting deletes the file if it already exists before creating a new database.
 	RemoveExisting bool
+	// ConfigPath is the path to the migration config YAML file. If empty, defaults to {Path}.yaml
+	ConfigPath string
 }
 
 // SetupDatabase removes any existing database (when configured), creates a fresh SQLite

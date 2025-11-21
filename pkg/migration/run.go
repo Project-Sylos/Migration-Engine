@@ -4,7 +4,9 @@
 package migration
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -36,6 +38,13 @@ type MigrationConfig struct {
 
 	// Resume state: if provided, migration will resume from existing state instead of starting fresh
 	ResumeStatus *MigrationStatus
+
+	// Config YAML management
+	ConfigPath string
+	YAMLConfig *MigrationConfigYAML
+
+	// Shutdown context: if provided, migration will check for cancellation and perform force shutdown
+	ShutdownContext context.Context
 }
 
 // RuntimeStats captures high-level metrics collected after a migration run.
@@ -96,10 +105,10 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	coordinator := queue.NewQueueCoordinator(cfg.CoordinatorLead)
 
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
-	srcQueue.Initialize(cfg.Database, "src_nodes", cfg.SrcAdapter, nil)
+	srcQueue.InitializeWithContext(cfg.Database, "src_nodes", cfg.SrcAdapter, nil, cfg.ShutdownContext)
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
-	dstQueue.Initialize(cfg.Database, "dst_nodes", cfg.DstAdapter, srcQueue)
+	dstQueue.InitializeWithContext(cfg.Database, "dst_nodes", cfg.DstAdapter, srcQueue, cfg.ShutdownContext)
 
 	// Initialize queues: either resume from existing state or seed fresh root tasks
 	if cfg.ResumeStatus != nil && cfg.ResumeStatus.HasPending() {
@@ -114,16 +123,84 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		}
 	}
 
+	// Update config: Traversal started
+	if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
+		status, statusErr := InspectMigrationStatus(cfg.Database)
+		if statusErr == nil {
+			srcStats := srcQueue.Stats()
+			dstStats := dstQueue.Stats()
+			UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
+			cfg.YAMLConfig.State.Status = "running"
+			_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
+		}
+	}
+
 	progressTicker := time.NewTicker(cfg.ProgressTick)
 	defer progressTicker.Stop()
 
 	start := time.Now()
 
+	// Track last known rounds to detect actual advancement
+	lastSrcRound := -1
+	lastDstRound := -1
+	tickCount := 0
+
 	for {
+		// Check for force shutdown (context cancellation)
+		if cfg.ShutdownContext != nil {
+			select {
+			case <-cfg.ShutdownContext.Done():
+				// Force shutdown: pause queues, checkpoint DB, and save suspended state
+				// Pause queues to stop new task leasing (workers will exit via shutdown context)
+				srcQueue.Pause()
+				dstQueue.Pause()
+
+				// Give workers a moment to finish current tasks (they check shutdown context in their loop)
+				// This is non-blocking - workers will exit when they check context in next iteration
+				time.Sleep(200 * time.Millisecond)
+
+				srcStats := srcQueue.Stats()
+				dstStats := dstQueue.Stats()
+
+				// Checkpoint database to ensure WAL is flushed
+				if err := cfg.Database.Checkpoint(); err != nil {
+					fmt.Printf("Warning: failed to checkpoint database during shutdown: %v\n", err)
+				}
+
+				// Update YAML config with suspended status and current state
+				if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
+					status, statusErr := InspectMigrationStatus(cfg.Database)
+					if statusErr == nil {
+						SetSuspendedStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
+						_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
+					}
+				}
+
+				return RuntimeStats{
+					Duration: time.Since(start),
+					Src:      srcStats,
+					Dst:      dstStats,
+				}, errors.New("migration suspended by force shutdown")
+			default:
+				// Continue normal execution
+			}
+		}
+
 		if srcQueue.IsExhausted() && dstQueue.IsExhausted() {
 			srcStats := srcQueue.Stats()
 			dstStats := dstQueue.Stats()
 			fmt.Println("\nMigration complete!")
+
+			// Update config YAML with final state
+			if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
+				status, statusErr := InspectMigrationStatus(cfg.Database)
+				if statusErr == nil {
+					UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
+					// Save final config
+					_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
+				}
+			}
+
 			return RuntimeStats{
 				Duration: time.Since(start),
 				Src:      srcStats,
@@ -138,6 +215,27 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			fmt.Printf("\r  Src: Round %d (Pending:%d InProgress:%d Workers:%d) | Dst: Round %d (Pending:%d InProgress:%d Workers:%d)   ",
 				srcStats.Round, srcStats.Pending, srcStats.InProgress, srcStats.Workers,
 				dstStats.Round, dstStats.Pending, dstStats.InProgress, dstStats.Workers)
+
+			// Update config YAML when rounds actually advance (milestone detection)
+			roundAdvanced := false
+			if srcStats.Round != lastSrcRound || dstStats.Round != lastDstRound {
+				roundAdvanced = true
+				lastSrcRound = srcStats.Round
+				lastDstRound = dstStats.Round
+			}
+
+			tickCount++
+			// Update config on round advancement or periodically (every 10 ticks)
+			shouldUpdate := roundAdvanced || (tickCount%10 == 0)
+
+			if cfg.YAMLConfig != nil && cfg.ConfigPath != "" && shouldUpdate {
+				status, statusErr := InspectMigrationStatus(cfg.Database)
+				if statusErr == nil {
+					UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
+					// Save config (ignore errors to avoid disrupting migration)
+					_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
+				}
+			}
 		default:
 			time.Sleep(100 * time.Millisecond)
 		}

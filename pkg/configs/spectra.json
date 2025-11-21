@@ -1,6 +1,6 @@
 {
   "seed": {
-    "max_depth": 4,
+    "max_depth": 6,
     "min_folders": 4,
     "max_folders": 6,
     "min_files": 5,

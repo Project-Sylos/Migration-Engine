@@ -4,6 +4,7 @@
 package queue
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -34,9 +35,11 @@ type TraversalWorker struct {
 	queueName   string            // "src" or "dst" for logging
 	isDst       bool              // true if this is a destination worker (performs comparison)
 	coordinator *QueueCoordinator // Shared coordinator for round synchronization
+	shutdownCtx context.Context   // Context for shutdown signaling (optional)
 }
 
 // NewTraversalWorker creates a worker that executes traversal tasks.
+// shutdownCtx is optional - if provided, the worker will check for cancellation and exit on shutdown.
 func NewTraversalWorker(
 	id string,
 	queue *Queue,
@@ -45,6 +48,7 @@ func NewTraversalWorker(
 	tableName string,
 	queueName string,
 	coordinator *QueueCoordinator,
+	shutdownCtx context.Context,
 ) *TraversalWorker {
 	return &TraversalWorker{
 		id:          id,
@@ -55,6 +59,7 @@ func NewTraversalWorker(
 		queueName:   queueName,
 		isDst:       queueName == "dst",
 		coordinator: coordinator,
+		shutdownCtx: shutdownCtx,
 	}
 }
 
@@ -68,7 +73,21 @@ func (w *TraversalWorker) Run() {
 	}
 
 	for {
-		// Check lifecycle state first
+		// Check for shutdown first (force exit)
+		if w.shutdownCtx != nil {
+			select {
+			case <-w.shutdownCtx.Done():
+				// Shutdown triggered - exit immediately
+				if logservice.LS != nil {
+					_ = logservice.LS.Log("info", "Worker exiting - shutdown requested", "worker", w.id, w.queueName)
+				}
+				return
+			default:
+				// Continue normal execution
+			}
+		}
+
+		// Check lifecycle state
 		if w.queue.IsPaused() {
 			// Queue is paused, sleep and continue polling
 			time.Sleep(100 * time.Millisecond)
@@ -91,7 +110,7 @@ func (w *TraversalWorker) Run() {
 			continue
 		}
 
-		// Execute the task
+		// Execute the task (check for shutdown during execution if needed)
 		err := w.execute(task)
 		if err != nil {
 			// Task failed, let queue handle retry logic
