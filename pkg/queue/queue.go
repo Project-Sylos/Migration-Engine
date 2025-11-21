@@ -4,6 +4,7 @@
 package queue
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -40,7 +41,8 @@ type Queue struct {
 	coordinator *QueueCoordinator    // Shared coordinator for round synchronization
 	roundQueues map[int]*RoundQueue  // Round-indexed queues (pending/successful per round)
 	// Round-based statistics for completion detection
-	roundStats map[int]*RoundStats // Per-round statistics (key: round number, value: stats for that round)
+	roundStats  map[int]*RoundStats // Per-round statistics (key: round number, value: stats for that round)
+	shutdownCtx context.Context     // Context for shutdown signaling (optional)
 }
 
 // NewQueue creates a new Queue instance.
@@ -61,11 +63,21 @@ func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCo
 // Initialize sets up the queue with database, context, and filesystem adapter references.
 // Creates and starts workers immediately - they'll poll for tasks autonomously.
 // For dst queues, srcQueue should be provided for fast in-memory expected children lookups.
+// shutdownCtx is optional - if provided, workers will check for cancellation and exit on shutdown.
 func (q *Queue) Initialize(database *db.DB, tableName string, adapter fsservices.FSAdapter, srcQueue *Queue) {
+	q.InitializeWithContext(database, tableName, adapter, srcQueue, nil)
+}
+
+// InitializeWithContext sets up the queue with database, context, and filesystem adapter references.
+// Creates and starts workers immediately - they'll poll for tasks autonomously.
+// For dst queues, srcQueue should be provided for fast in-memory expected children lookups.
+// shutdownCtx is optional - if provided, workers will check for cancellation and exit on shutdown.
+func (q *Queue) InitializeWithContext(database *db.DB, tableName string, adapter fsservices.FSAdapter, srcQueue *Queue, shutdownCtx context.Context) {
 	q.mu.Lock()
 	q.database = database
 	q.tableName = tableName
 	q.srcQueue = srcQueue
+	q.shutdownCtx = shutdownCtx
 	workerCount := cap(q.workers) // Get the worker count we preallocated for
 	q.mu.Unlock()
 
@@ -79,6 +91,7 @@ func (q *Queue) Initialize(database *db.DB, tableName string, adapter fsservices
 			tableName,
 			q.name,
 			q.coordinator,
+			shutdownCtx,
 		)
 		q.AddWorker(worker)
 		go worker.Run()
@@ -88,6 +101,14 @@ func (q *Queue) Initialize(database *db.DB, tableName string, adapter fsservices
 	if logservice.LS != nil {
 		_ = logservice.LS.Log("info", fmt.Sprintf("%s queue initialized", strings.ToUpper(q.name)), "queue", q.name, q.name)
 	}
+}
+
+// SetShutdownContext sets the shutdown context for the queue.
+// This can be called before or after Initialize, and will affect all workers.
+func (q *Queue) SetShutdownContext(ctx context.Context) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.shutdownCtx = ctx
 }
 
 // Name returns the queue's name.

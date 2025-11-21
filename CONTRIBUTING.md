@@ -23,10 +23,7 @@ By submitting code, documentation, or any other material to this repository (via
    You are the original author of your contribution, or you have the legal right to contribute it under the same license.
    You retain the copyright to your own work.
 
-3. **Grant of License:**
-   You grant the project maintainers and downstream users a perpetual, worldwide, non-exclusive, royalty-free license to use, modify, and distribute your contribution under the project’s license.
-
-4. **No Warranty:**
+3. **No Warranty:**
    Contributions are provided “as-is” without warranties or conditions of any kind.
 
 ---
@@ -42,5 +39,6 @@ By submitting code, documentation, or any other material to this repository (via
 
 ## Attribution
 
-All accepted contributions will be credited in the project history and contributor listings.
-If you prefer not to be listed, please mention this in your pull request.
+We love our contributors!!!
+All accepted contributions will be **credited** in the project history and contributor listings.
+If you prefer not to be listed, please mention this in your pull request. 

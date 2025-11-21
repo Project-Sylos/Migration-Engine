@@ -62,7 +62,58 @@ The Migration Engine (ME) serializes traversal data to a local database after ea
 
 The Node Migration Engine operates in two passes:
 
-1. **Discovery Phase** – Traverses both node trees to identify what exists, what’s missing, and what conflicts may occur.
+1. **Discovery Phase** – Traverses both node trees to identify what exists, what's missing, and what conflicts may occur.
 2. **Execution Phase** – After user review and approval, performs the actual creation or transfer of missing nodes.
 
 This design gives users complete visibility and control before any data movement occurs.
+
+---
+
+## Migration State Persistence
+
+The Migration Engine includes a comprehensive YAML-based configuration system that automatically saves migration state at critical milestones, enabling pause and resume functionality.
+
+### Automatic State Tracking
+
+Migration state is automatically persisted to a YAML config file (default: `{database_path}.yaml`) at key points:
+
+- **Root Selection** - When source and destination roots are set
+- **Roots Seeded** - After root tasks are seeded into the database
+- **Traversal Started** - When queues are initialized and ready
+- **Round Advancement** - When source or destination rounds advance during traversal
+- **Traversal Complete** - When migration finishes
+
+### Serialization and Deserialization
+
+You can save and load migration sessions from YAML files:
+
+**Save (Serialization):**
+```go
+yamlCfg, err := migration.NewMigrationConfigYAML(cfg, status)
+err = migration.SaveMigrationConfig("migration.yaml", yamlCfg)
+```
+
+**Load (Deserialization):**
+```go
+// Load YAML config for inspection
+yamlCfg, err := migration.LoadMigrationConfig("migration.yaml")
+
+// Or reconstruct full config for resuming
+cfg, err := migration.LoadMigrationConfigFromYAML("migration.yaml", adapterFactory)
+result, err := migration.LetsMigrate(cfg) // Resume migration
+```
+
+The YAML config stores:
+- Migration metadata (ID, timestamps)
+- Current state (status, last rounds/levels)
+- Service configurations (source, destination, embedded service configs)
+- Migration options (workers, retries, etc.)
+- Logging and database settings
+
+This enables:
+- **Pause and Resume** - Stop a migration and resume later from the exact checkpoint
+- **State Inspection** - Review migration progress without running
+- **Configuration Portability** - Move migration configs between environments
+- **Audit Trail** - Track when migrations were created, modified, and completed
+
+See `pkg/migration/README.md` for detailed documentation on the configuration system.
