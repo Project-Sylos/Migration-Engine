@@ -22,12 +22,12 @@ type MigrationConfigYAML struct {
 	Metadata         MetadataConfig         `yaml:"metadata"`
 	State            StateConfig            `yaml:"state"`
 	Services         ServicesConfig         `yaml:"services"`
-	ServiceConfigs   map[string]interface{} `yaml:"service_configs,omitempty"`
+	ServiceConfigs   map[string]any         `yaml:"service_configs,omitempty"`
 	MigrationOptions MigrationOptionsConfig `yaml:"migration_options"`
 	Logging          LoggingConfig          `yaml:"logging"`
 	Database         DatabaseConfigYAML     `yaml:"database"`
 	Verification     VerifyOptions          `yaml:"verification"`
-	Extensions       map[string]interface{} `yaml:"extensions,omitempty"`
+	Extensions       map[string]any         `yaml:"extensions,omitempty"`
 }
 
 // MetadataConfig contains migration metadata.
@@ -121,7 +121,7 @@ func LoadMigrationConfig(path string) (*MigrationConfigYAML, error) {
 // The adapterFactory parameter is used to create FSAdapter instances.
 // Example usage:
 //
-//	factory := func(serviceType string, serviceCfg ServiceConfigYAML, serviceConfigs map[string]interface{}) (fsservices.FSAdapter, error) {
+//	factory := func(serviceType string, serviceCfg ServiceConfigYAML, serviceConfigs map[string]any) (fsservices.FSAdapter, error) {
 //	    // Your adapter creation logic here
 //	}
 //	cfg, err := LoadMigrationConfigFromYAML("migration.yaml", factory)
@@ -166,12 +166,14 @@ func SaveMigrationConfig(path string, cfg *MigrationConfigYAML) error {
 // ConfigPathFromDatabasePath returns the config YAML path for a given database path.
 // Default strategy: {database_path}.yaml
 func ConfigPathFromDatabasePath(dbPath string) string {
-	return dbPath + ".yaml"
+	base := dbPath
+	base = strings.TrimSuffix(base, ".db")
+	return base + ".yaml"
 }
 
 // AdapterFactory is a function type that creates FSAdapter instances from service configuration.
 // This allows callers to provide their own adapter creation logic (e.g., for Spectra, LocalFS, etc.)
-type AdapterFactory func(serviceType string, serviceCfg ServiceConfigYAML, serviceConfigs map[string]interface{}) (fsservices.FSAdapter, error)
+type AdapterFactory func(serviceType string, serviceCfg ServiceConfigYAML, serviceConfigs map[string]any) (fsservices.FSAdapter, error)
 
 // ToMigrationConfig reconstructs a migration.Config from a MigrationConfigYAML.
 // The adapterFactory parameter is used to create FSAdapter instances from the service configuration.
@@ -257,7 +259,7 @@ func yamlFolderToFolder(yamlRoot *RootFolderYAML, rootID, rootPath string) fsser
 
 // defaultAdapterFactory provides a basic adapter factory that supports common service types.
 // For Spectra and other complex services, callers should provide their own factory.
-func defaultAdapterFactory(serviceType string, serviceCfg ServiceConfigYAML, serviceConfigs map[string]interface{}) (fsservices.FSAdapter, error) {
+func defaultAdapterFactory(serviceType string, serviceCfg ServiceConfigYAML, serviceConfigs map[string]any) (fsservices.FSAdapter, error) {
 	switch strings.ToLower(serviceType) {
 	case "spectra":
 		// For Spectra, we need the Spectra SDK which may not be available in this package
@@ -316,7 +318,7 @@ func NewMigrationConfigYAML(cfg Config, status MigrationStatus) (*MigrationConfi
 			RemoveExisting: cfg.Database.RemoveExisting,
 		},
 		Verification: cfg.Verification,
-		Extensions:   make(map[string]interface{}),
+		Extensions:   make(map[string]any),
 	}
 
 	// Detect same service
@@ -459,7 +461,7 @@ func folderToYAML(folder fsservices.Folder) *RootFolderYAML {
 }
 
 func embedServiceConfigs(yamlCfg *MigrationConfigYAML, cfg Config) error {
-	yamlCfg.ServiceConfigs = make(map[string]interface{})
+	yamlCfg.ServiceConfigs = make(map[string]any)
 
 	// Check if Spectra is used
 	srcIsSpectra := isSpectraAdapter(cfg.Source.Adapter)
@@ -478,14 +480,14 @@ func embedServiceConfigs(yamlCfg *MigrationConfigYAML, cfg Config) error {
 			}
 			if readErr != nil {
 				// If we can't read the file, create a minimal config
-				yamlCfg.ServiceConfigs["spectra"] = map[string]interface{}{
+				yamlCfg.ServiceConfigs["spectra"] = map[string]any{
 					"note": "spectra config file not found, using defaults",
 				}
 				return nil
 			}
 		}
 
-		var spectraData map[string]interface{}
+		var spectraData map[string]any
 		if jsonErr := json.Unmarshal(data, &spectraData); jsonErr != nil {
 			return fmt.Errorf("failed to parse spectra config: %w", jsonErr)
 		}

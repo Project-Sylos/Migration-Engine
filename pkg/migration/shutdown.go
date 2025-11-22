@@ -5,13 +5,16 @@ package migration
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 // HandleShutdownSignals sets up signal handlers for SIGINT (Ctrl+C) and SIGTERM.
 // When either signal is received, it cancels the provided context.
+// If shutdown doesn't complete within 10 seconds, it hard-kills the process.
 // This function should be called in a goroutine at the start of the migration.
 // On Windows, SIGINT is supported but SIGTERM may not be available.
 func HandleShutdownSignals(cancel context.CancelFunc) {
@@ -23,7 +26,20 @@ func HandleShutdownSignals(cancel context.CancelFunc) {
 	signals := []os.Signal{os.Interrupt, syscall.SIGTERM}
 	signal.Notify(sigChan, signals...)
 
-	// Wait for signal and cancel context when received
-	<-sigChan
-	cancel()
+	if sig := <-sigChan; sig != nil {
+		fmt.Printf("\n⚠️  Shutdown signal received (%v). Initiating graceful shutdown...\n", sig)
+		fmt.Println("   (Press Ctrl+C again to force exit if needed)")
+		cancel()
+	}
+
+	select {
+	case sig := <-sigChan:
+		if sig != nil {
+			fmt.Println("\n⚠️  Second interrupt received. Forcing immediate exit...")
+			os.Exit(1)
+		}
+	case <-time.After(10 * time.Second):
+		fmt.Println("\n❌ Shutdown timeout reached (10 seconds). Forcing exit to prevent hang...")
+		os.Exit(1)
+	}
 }

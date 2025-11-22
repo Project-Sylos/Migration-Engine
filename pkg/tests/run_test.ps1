@@ -16,8 +16,8 @@ Write-Host ""
 # Run the test
 $startTime = Get-Date
 
-# Execute Spectra test runner
-go run pkg/tests/spectra/setup.go pkg/tests/spectra/test_runner.go pkg/tests/spectra/verify.go
+# Execute normal test runner
+go run pkg/tests/normal/main.go
 
 $exitCode = $LASTEXITCODE
 

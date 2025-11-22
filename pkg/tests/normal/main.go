@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
+	"github.com/Project-Sylos/Migration-Engine/pkg/tests/shared"
 )
 
 func main() {
@@ -25,7 +26,8 @@ func main() {
 func runTest() error {
 	fmt.Println("📋 Phase 1: Setup")
 	fmt.Println("================")
-	cfg, err := setupTest()
+	// Clean both Spectra DB and migration DB for fresh test
+	cfg, err := shared.SetupTest(true, true)
 	if err != nil {
 		return fmt.Errorf("setup failed: %w", err)
 	}
@@ -41,7 +43,7 @@ func runTest() error {
 
 	fmt.Println("✓ Phase 3: Verification")
 	fmt.Println("========================")
-	printVerification(result)
+	shared.PrintVerification(result)
 
 	return nil
 }

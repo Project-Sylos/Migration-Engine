@@ -302,13 +302,12 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	var runtime RuntimeStats
 	var runErr error
 
-	switch {
-	case status.IsEmpty():
-		// Fresh run: optionally seed roots, then run normal traversal.
+	// Helper function to run fresh migration
+	runFreshMigration := func() (RuntimeStats, error) {
 		if cfg.SeedRoots {
 			summary, err := SeedRootTasks(database, srcRoot, dstRoot)
 			if err != nil {
-				return Result{}, err
+				return RuntimeStats{}, err
 			}
 			fmt.Printf("Root tasks seeded (src:%d dst:%d)\n", summary.SrcRoots, summary.DstRoots)
 			result.RootSummary = summary
@@ -320,7 +319,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 				_ = SaveMigrationConfig(configPath, yamlCfg)
 			}
 		}
-		runtime, runErr = RunMigration(MigrationConfig{
+		return RunMigration(MigrationConfig{
 			Database:        database,
 			SrcAdapter:      cfg.Source.Adapter,
 			DstAdapter:      cfg.Destination.Adapter,
@@ -339,35 +338,63 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 			YAMLConfig:      yamlCfg,
 			ShutdownContext: shutdownCtx,
 		})
+	}
+
+	switch {
+	case status.IsEmpty():
+		// Fresh run: optionally seed roots, then run normal traversal.
+		runtime, runErr = runFreshMigration()
 
 	case status.HasPending():
 		// Resume from an in-progress migration (including suspended state).
 		// Root seeding is assumed to have been done previously and is skipped here.
-		if yamlCfg != nil && yamlCfg.State.Status == "suspended" {
-			fmt.Println("Resuming suspended migration from database state...")
+
+		// Validate that root nodes still exist in the filesystem before resuming.
+		// If they don't exist (e.g., Spectra DB was reset), we can't safely resume
+		// because the migration DB contains stale node IDs.
+		if err := validateRootNodesExist(cfg.Source.Adapter, cfg.Destination.Adapter, srcRoot, dstRoot); err != nil {
+			fmt.Printf("⚠️  Warning: Root nodes validation failed during resume: %v\n", err)
+			fmt.Println("   This likely means the filesystem state was reset (e.g., Spectra DB cleared).")
+			fmt.Println("   Treating as fresh start instead of resume to avoid 'node not found' errors.")
+			fmt.Println()
+
+			// Update YAML to reflect fresh start
+			if yamlCfg != nil {
+				yamlCfg.State.Status = "running"
+				UpdateConfigFromRoots(yamlCfg, srcRoot, dstRoot)
+				_ = SaveMigrationConfig(configPath, yamlCfg)
+			}
+
+			// Treat as fresh start instead of resume
+			runtime, runErr = runFreshMigration()
 		} else {
-			fmt.Println("Resuming migration from existing database state...")
+			// Root nodes exist - safe to resume
+			if yamlCfg != nil && yamlCfg.State.Status == "suspended" {
+				fmt.Println("Resuming suspended migration from database state...")
+			} else {
+				fmt.Println("Resuming migration from existing database state...")
+			}
+			runtime, runErr = RunMigration(MigrationConfig{
+				Database:        database,
+				SrcAdapter:      cfg.Source.Adapter,
+				DstAdapter:      cfg.Destination.Adapter,
+				SrcRoot:         srcRoot,
+				DstRoot:         dstRoot,
+				SrcServiceName:  cfg.Source.Name,
+				WorkerCount:     cfg.WorkerCount,
+				MaxRetries:      cfg.MaxRetries,
+				CoordinatorLead: cfg.CoordinatorLead,
+				LogAddress:      cfg.LogAddress,
+				LogLevel:        cfg.LogLevel,
+				SkipListener:    cfg.SkipListener,
+				StartupDelay:    cfg.StartupDelay,
+				ProgressTick:    cfg.ProgressTick,
+				ResumeStatus:    &status,
+				ConfigPath:      configPath,
+				YAMLConfig:      yamlCfg,
+				ShutdownContext: shutdownCtx,
+			})
 		}
-		runtime, runErr = RunMigration(MigrationConfig{
-			Database:        database,
-			SrcAdapter:      cfg.Source.Adapter,
-			DstAdapter:      cfg.Destination.Adapter,
-			SrcRoot:         srcRoot,
-			DstRoot:         dstRoot,
-			SrcServiceName:  cfg.Source.Name,
-			WorkerCount:     cfg.WorkerCount,
-			MaxRetries:      cfg.MaxRetries,
-			CoordinatorLead: cfg.CoordinatorLead,
-			LogAddress:      cfg.LogAddress,
-			LogLevel:        cfg.LogLevel,
-			SkipListener:    cfg.SkipListener,
-			StartupDelay:    cfg.StartupDelay,
-			ProgressTick:    cfg.ProgressTick,
-			ResumeStatus:    &status,
-			ConfigPath:      configPath,
-			YAMLConfig:      yamlCfg,
-			ShutdownContext: shutdownCtx,
-		})
 
 	default:
 		// Completed (or failed-only) migration with no pending work. For now we
@@ -382,14 +409,41 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	isShutdown := runErr != nil && runErr.Error() == "migration suspended by force shutdown"
 	if isShutdown {
 		// Force shutdown occurred: ensure database checkpoint and flush logs
-		if err := database.Checkpoint(); err != nil {
-			fmt.Printf("Warning: failed to checkpoint database after shutdown: %v\n", err)
+		// Use timeout to prevent hanging
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+
+		// Checkpoint database (with timeout)
+		checkpointDone := make(chan error, 1)
+		go func() {
+			checkpointDone <- database.Checkpoint()
+		}()
+		select {
+		case err := <-checkpointDone:
+			if err != nil {
+				fmt.Printf("Warning: failed to checkpoint database after shutdown: %v\n", err)
+			}
+		case <-cleanupCtx.Done():
+			fmt.Printf("⚠️  Database checkpoint timeout after shutdown - skipping\n")
 		}
 
-		// Flush log service if available
+		// Flush log service if available (with timeout)
 		if logservice.LS != nil {
-			logservice.LS.Close()
+			flushDone := make(chan struct{}, 1)
+			go func() {
+				logservice.LS.Close()
+				flushDone <- struct{}{}
+			}()
+			select {
+			case <-flushDone:
+				// Log flush completed
+			case <-cleanupCtx.Done():
+				fmt.Printf("⚠️  Log service flush timeout - skipping\n")
+			}
 		}
+
+		// Close Spectra adapters to ensure proper cleanup (only close once if they share the same SDK instance)
+		closeSpectraAdapters(cfg.Source.Adapter, cfg.Destination.Adapter, cleanupCtx)
 
 		// Don't run verification on shutdown - just return with suspended state
 		fmt.Println("\nMigration suspended by force shutdown. State saved for resumption.")
@@ -441,4 +495,23 @@ func normalizeRootFolder(folder fsservices.Folder) (fsservices.Folder, error) {
 	}
 
 	return folder, nil
+}
+
+// validateRootNodesExist checks if the root nodes still exist in the filesystem adapters.
+// This is critical for resumption - if nodes don't exist (e.g., Spectra DB was reset),
+// resuming would cause "node not found" errors because the migration DB has stale node IDs.
+func validateRootNodesExist(srcAdapter, dstAdapter fsservices.FSAdapter, srcRoot, dstRoot fsservices.Folder) error {
+	// Try to list children of the source root - if it doesn't exist, this will fail
+	_, err := srcAdapter.ListChildren(srcRoot.Id)
+	if err != nil {
+		return fmt.Errorf("source root node '%s' does not exist in filesystem: %w", srcRoot.Id, err)
+	}
+
+	// Try to list children of the destination root - if it doesn't exist, this will fail
+	_, err = dstAdapter.ListChildren(dstRoot.Id)
+	if err != nil {
+		return fmt.Errorf("destination root node '%s' does not exist in filesystem: %w", dstRoot.Id, err)
+	}
+
+	return nil
 }
