@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
@@ -15,6 +16,94 @@ import (
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
 )
+
+// isPortInUse checks if a UDP port is already in use by attempting to bind to it.
+// Returns true if the port is already in use, false otherwise.
+func isPortInUse(addr string) bool {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return false
+	}
+
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return true // Port is in use if we can't bind to it
+	}
+	conn.Close()
+	return false // Port is available
+}
+
+// closeSpectraAdapters closes SpectraFS adapters, ensuring the underlying SDK instance
+// is only closed once even if multiple adapters share the same instance.
+func closeSpectraAdapters(srcAdapter, dstAdapter fsservices.FSAdapter, ctx context.Context) {
+	var srcFS, dstFS *fsservices.SpectraFS
+	var ok bool
+
+	// Check if adapters are SpectraFS instances
+	if srcAdapter != nil {
+		srcFS, ok = srcAdapter.(*fsservices.SpectraFS)
+		if !ok {
+			srcFS = nil
+		}
+	}
+	if dstAdapter != nil {
+		dstFS, ok = dstAdapter.(*fsservices.SpectraFS)
+		if !ok {
+			dstFS = nil
+		}
+	}
+
+	// If both are SpectraFS, check if they share the same SDK instance
+	if srcFS != nil && dstFS != nil {
+		if srcFS.GetSDKInstance() == dstFS.GetSDKInstance() {
+			// Same instance - only close once
+			closeDone := make(chan error, 1)
+			go func() {
+				closeDone <- srcFS.Close()
+			}()
+			select {
+			case err := <-closeDone:
+				if err != nil {
+					fmt.Printf("Warning: failed to close Spectra SDK instance: %v\n", err)
+				}
+			case <-ctx.Done():
+				fmt.Printf("⚠️  Spectra close timeout - skipping\n")
+			}
+			return
+		}
+	}
+
+	// Different instances or only one is SpectraFS - close each separately
+	if srcFS != nil {
+		closeDone := make(chan error, 1)
+		go func() {
+			closeDone <- srcFS.Close()
+		}()
+		select {
+		case err := <-closeDone:
+			if err != nil {
+				fmt.Printf("Warning: failed to close Spectra source adapter: %v\n", err)
+			}
+		case <-ctx.Done():
+			fmt.Printf("⚠️  Spectra source close timeout - skipping\n")
+		}
+	}
+
+	if dstFS != nil {
+		closeDone := make(chan error, 1)
+		go func() {
+			closeDone <- dstFS.Close()
+		}()
+		select {
+		case err := <-closeDone:
+			if err != nil {
+				fmt.Printf("Warning: failed to close Spectra destination adapter: %v\n", err)
+			}
+		case <-ctx.Done():
+			fmt.Printf("⚠️  Spectra destination close timeout - skipping\n")
+		}
+	}
+}
 
 // MigrationConfig encapsulates the inputs required to execute a traversal migration.
 type MigrationConfig struct {
@@ -89,10 +178,16 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	}
 
 	if cfg.LogAddress != "" && !cfg.SkipListener {
-		if err := logservice.StartListener(cfg.LogAddress); err != nil {
-			fmt.Printf("Warning: failed to start log listener at %s: %v\n", cfg.LogAddress, err)
+		// Check if port is already in use (from previous process)
+		// This prevents spawning multiple terminal windows across separate test runs
+		if !isPortInUse(cfg.LogAddress) {
+			if err := logservice.StartListener(cfg.LogAddress); err != nil {
+				fmt.Printf("Warning: failed to start log listener at %s: %v\n", cfg.LogAddress, err)
+			} else {
+				time.Sleep(cfg.StartupDelay)
+			}
 		}
-		time.Sleep(cfg.StartupDelay)
+		// If port is in use, listener is already running from previous process - skip spawning
 	}
 
 	// Initialize logger if not already initialized (logger should be managed at a higher level)
@@ -151,28 +246,68 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			select {
 			case <-cfg.ShutdownContext.Done():
 				// Force shutdown: pause queues, checkpoint DB, and save suspended state
+				// Use timeout context to prevent hanging on cleanup operations
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 8*time.Second)
+				defer cleanupCancel()
+
 				// Pause queues to stop new task leasing (workers will exit via shutdown context)
 				srcQueue.Pause()
 				dstQueue.Pause()
 
 				// Give workers a moment to finish current tasks (they check shutdown context in their loop)
 				// This is non-blocking - workers will exit when they check context in next iteration
-				time.Sleep(200 * time.Millisecond)
+				select {
+				case <-time.After(200 * time.Millisecond):
+					// Continue with cleanup
+				case <-cleanupCtx.Done():
+					// Timeout - skip cleanup and exit immediately
+					fmt.Printf("⚠️  Cleanup timeout - exiting immediately to prevent hang\n")
+					return RuntimeStats{
+						Duration: time.Since(start),
+						Src:      srcQueue.Stats(),
+						Dst:      dstQueue.Stats(),
+					}, errors.New("migration suspended by force shutdown (cleanup timeout)")
+				}
 
 				srcStats := srcQueue.Stats()
 				dstStats := dstQueue.Stats()
 
-				// Checkpoint database to ensure WAL is flushed
-				if err := cfg.Database.Checkpoint(); err != nil {
-					fmt.Printf("Warning: failed to checkpoint database during shutdown: %v\n", err)
+				// Checkpoint database to ensure WAL is flushed (with timeout)
+				checkpointDone := make(chan error, 1)
+				go func() {
+					checkpointDone <- cfg.Database.Checkpoint()
+				}()
+				select {
+				case err := <-checkpointDone:
+					if err != nil {
+						fmt.Printf("Warning: failed to checkpoint database during shutdown: %v\n", err)
+					}
+				case <-cleanupCtx.Done():
+					fmt.Printf("⚠️  Database checkpoint timeout - skipping checkpoint\n")
 				}
 
-				// Update YAML config with suspended status and current state
+				// Close Spectra adapters to ensure proper cleanup (only close once if they share the same SDK instance)
+				closeSpectraAdapters(cfg.SrcAdapter, cfg.DstAdapter, cleanupCtx)
+
+				// Update YAML config with suspended status and current state (with timeout)
 				if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-					status, statusErr := InspectMigrationStatus(cfg.Database)
-					if statusErr == nil {
-						SetSuspendedStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
-						_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
+					yamlDone := make(chan error, 1)
+					go func() {
+						status, statusErr := InspectMigrationStatus(cfg.Database)
+						if statusErr == nil {
+							SetSuspendedStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
+							yamlDone <- SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
+						} else {
+							yamlDone <- statusErr
+						}
+					}()
+					select {
+					case err := <-yamlDone:
+						if err != nil {
+							fmt.Printf("Warning: failed to save YAML config during shutdown: %v\n", err)
+						}
+					case <-cleanupCtx.Done():
+						fmt.Printf("⚠️  YAML save timeout - skipping config save\n")
 					}
 				}
 
@@ -267,7 +402,7 @@ func initializeQueuesFromFresh(cfg MigrationConfig, srcQueue *queue.Queue, dstQu
 	}
 
 	// Wait for SRC to complete round 0, then seed DST root with expected children
-	if err := waitForSrcRoundAdvance(srcQueue, 0, cfg.ProgressTick); err != nil {
+	if err := waitForSrcRoundAdvance(cfg.ShutdownContext, srcQueue, 0, cfg.ProgressTick); err != nil {
 		return err
 	}
 
@@ -404,7 +539,7 @@ func initializeQueuesFromResume(cfg MigrationConfig, srcQueue *queue.Queue, dstQ
 		// discoveries before we reconstruct dst tasks, otherwise they'll be seeded with empty
 		// expectations and immediately mark every child as NotOnSrc.
 		if srcQueue.Round() <= minPendingDepthDst {
-			if err := waitForSrcRoundAdvance(srcQueue, minPendingDepthDst, cfg.ProgressTick); err != nil {
+			if err := waitForSrcRoundAdvance(cfg.ShutdownContext, srcQueue, minPendingDepthDst, cfg.ProgressTick); err != nil {
 				return err
 			}
 		}
@@ -798,15 +933,18 @@ func queryMaxDepth(database *db.DB, table string) (int, error) {
 	return int(maxDepth.Int64), nil
 }
 
-func waitForSrcRoundAdvance(srcQueue *queue.Queue, round int, pollInterval time.Duration) error {
-	timeout := time.After(2 * time.Minute)
+func waitForSrcRoundAdvance(ctx context.Context, srcQueue *queue.Queue, round int, pollInterval time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-timeout:
-			return fmt.Errorf("timed out waiting for source queue to advance beyond round %d", round)
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-ticker.C:
 			if srcQueue.IsExhausted() {
 				return fmt.Errorf("source queue exhausted before completing round %d", round)

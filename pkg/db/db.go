@@ -121,7 +121,7 @@ func (db *DB) Write(table string, args ...any) error {
 		}
 	}()
 
-	query := "INSERT INTO " + table + " VALUES " + buildPlaceholderGroup(colCount)
+	query := "INSERT OR IGNORE INTO " + table + " VALUES " + buildPlaceholderGroup(colCount)
 
 	res, err := tx.ExecContext(db.ctx, query, args...)
 	if err != nil {
@@ -131,7 +131,7 @@ func (db *DB) Write(table string, args ...any) error {
 	}
 
 	if n, _ := res.RowsAffected(); n == 0 {
-		fmt.Printf("[DB WARN] Insert into %s affected 0 rows (query may have been ignored)\nQuery: %s\nArgs: %v\n", table, query, args)
+		// fmt.Printf("[DB WARN] Insert into %s affected 0 rows (query may have been ignored)\nQuery: %s\nArgs: %v\n", table, query, args)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -208,7 +208,7 @@ func (db *DB) BulkWrite(table string, rows [][]any) error {
 				groups = append(groups, group)
 			}
 
-			query := fmt.Sprintf("INSERT INTO %s VALUES %s", table, strings.Join(groups, ", "))
+			query := fmt.Sprintf("INSERT OR IGNORE INTO %s VALUES %s", table, strings.Join(groups, ", "))
 
 			// Flatten [][]any into []any for Exec()
 			allArgs := make([]any, 0, len(chunk)*colCount)
@@ -225,8 +225,8 @@ func (db *DB) BulkWrite(table string, rows [][]any) error {
 
 			if n, _ := res.RowsAffected(); n == 0 {
 				// print out the query and args it was trying to do for debugging purposes
-				fmt.Printf("[DB DEBUG] Query: %s\nArgs: %v\n", query, allArgs)
-				fmt.Printf("[DB WARN] Bulk insert into %s affected 0 rows (possible duplicates)\n", table)
+				// fmt.Printf("[DB DEBUG] Query: %s\nArgs: %v\n", query, allArgs)
+				// fmt.Printf("[DB WARN] Bulk insert into %s affected 0 rows (possible duplicates)\n", table)
 			}
 
 			if err := tx.Commit(); err != nil {

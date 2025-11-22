@@ -1,7 +1,7 @@
 // Copyright 2025 Sylos contributors
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
-package main
+package shared
 
 import (
 	"fmt"
@@ -13,21 +13,51 @@ import (
 	"github.com/Project-Sylos/Spectra/sdk"
 )
 
-// setupTest assembles the Spectra-backed migration configuration.
-func setupTest() (migration.Config, error) {
+// setupSpectraFS creates a SpectraFS instance, handling DB cleanup appropriately.
+// Since each test run is a separate process, we can't rely on in-memory state.
+// Instead, we check if the DB file exists and only clean it if explicitly requested.
+// The SDK should load existing data from the DB file if it exists.
+func setupSpectraFS(configPath string, cleanDB bool) (*sdk.SpectraFS, error) {
+	// Check if DB file exists
+	dbExists := false
+	if _, err := os.Stat("./spectra.db"); err == nil {
+		dbExists = true
+	}
+
+	// Clean DB only if explicitly requested
+	if cleanDB && dbExists {
+		fmt.Println("Cleaning up previous Spectra state...")
+		if err := os.Remove("./spectra.db"); err != nil {
+			return nil, fmt.Errorf("failed to remove existing Spectra DB: %w", err)
+		}
+		// Also remove WAL and SHM files if they exist
+		os.Remove("./spectra.db-wal")
+		os.Remove("./spectra.db-shm")
+	}
+
+	// Create new SpectraFS instance
+	// The SDK should load existing data from the DB file if it exists (and wasn't cleaned)
+	fs, err := sdk.New(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize Spectra: %w", err)
+	}
+
+	return fs, nil
+}
+
+// SetupTest assembles the Spectra-backed migration configuration.
+// cleanSpectraDB controls whether to delete the existing Spectra DB (use false for resumption tests).
+// removeMigrationDB controls whether to remove the migration database (use false for resumption tests).
+func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, error) {
 	fmt.Println("Loading Spectra configuration...")
 
-	// Clean up any previous Spectra state
-	if _, err := os.Stat("./spectra.db"); err == nil {
-		os.Remove("./spectra.db")
-	}
-
-	spectraFS, err := sdk.New("pkg/configs/spectra.json")
+	// Create SpectraFS instance (SDK should load existing DB data if file exists)
+	spectraFS, err := setupSpectraFS("pkg/configs/spectra.json", cleanSpectraDB)
 	if err != nil {
-		return migration.Config{}, fmt.Errorf("failed to initialize Spectra: %w", err)
+		return migration.Config{}, err
 	}
 
-	srcRoot, dstRoot, err := loadSpectraRoots(spectraFS)
+	srcRoot, dstRoot, err := LoadSpectraRoots(spectraFS)
 	if err != nil {
 		return migration.Config{}, err
 	}
@@ -45,7 +75,7 @@ func setupTest() (migration.Config, error) {
 	cfg := migration.Config{
 		Database: migration.DatabaseConfig{
 			Path:           "pkg/tests/migration_test.db",
-			RemoveExisting: true,
+			RemoveExisting: removeMigrationDB,
 		},
 		Source: migration.Service{
 			Name:    "Spectra-Primary",
@@ -72,8 +102,8 @@ func setupTest() (migration.Config, error) {
 	return cfg, nil
 }
 
-// loadSpectraRoots fetches the Spectra root nodes and maps them to fsservices.Folder structures.
-func loadSpectraRoots(spectraFS *sdk.SpectraFS) (fsservices.Folder, fsservices.Folder, error) {
+// LoadSpectraRoots fetches the Spectra root nodes and maps them to fsservices.Folder structures.
+func LoadSpectraRoots(spectraFS *sdk.SpectraFS) (fsservices.Folder, fsservices.Folder, error) {
 	// Get root nodes from Spectra using request structs
 	srcRoot, err := spectraFS.GetNode(&sdk.GetNodeRequest{
 		ID: "root",

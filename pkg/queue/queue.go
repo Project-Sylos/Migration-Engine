@@ -199,6 +199,22 @@ func (q *Queue) WaitForCoordinatorGate(reason string) {
 	}
 
 	for !canProceed() {
+		if q.shutdownCtx != nil {
+			select {
+			case <-q.shutdownCtx.Done():
+				if logservice.LS != nil {
+					_ = logservice.LS.Log(
+						"debug",
+						fmt.Sprintf("%s queue aborting %s due to shutdown", strings.ToUpper(q.name), reason),
+						"queue",
+						q.name,
+						q.name,
+					)
+				}
+				return
+			default:
+			}
+		}
 		time.Sleep(50 * time.Millisecond)
 	}
 

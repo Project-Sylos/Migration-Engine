@@ -264,3 +264,20 @@ func (s *SpectraFS) UploadFile(parentId string, content io.Reader) (File, error)
 func (s *SpectraFS) NormalizePath(path string) string {
 	return NormalizeLocationPath(path)
 }
+
+// Close closes the underlying Spectra SDK instance.
+// This should be called during graceful shutdown to ensure proper cleanup.
+// Note: Multiple SpectraFS adapters may share the same SDK instance, so Close()
+// should only be called once per SDK instance to avoid panics.
+func (s *SpectraFS) Close() error {
+	if s.fs != nil {
+		return s.fs.Close()
+	}
+	return nil
+}
+
+// GetSDKInstance returns the underlying Spectra SDK instance.
+// This is used to check if multiple adapters share the same instance.
+func (s *SpectraFS) GetSDKInstance() *sdk.SpectraFS {
+	return s.fs
+}

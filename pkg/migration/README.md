@@ -125,11 +125,11 @@ To resume a migration, you need to reconstruct a `migration.Config` from the YAM
 
 ```go
 // Define your adapter factory
-factory := func(serviceType string, serviceCfg migration.ServiceConfigYAML, serviceConfigs map[string]interface{}) (fsservices.FSAdapter, error) {
+factory := func(serviceType string, serviceCfg migration.ServiceConfigYAML, serviceConfigs map[string]any) (fsservices.FSAdapter, error) {
     switch strings.ToLower(serviceType) {
     case "spectra":
         // Extract spectra config
-        spectraData, ok := serviceConfigs["spectra"].(map[string]interface{})
+        spectraData, ok := serviceConfigs["spectra"].(map[string]any)
         if !ok {
             return nil, fmt.Errorf("spectra config not found")
         }
