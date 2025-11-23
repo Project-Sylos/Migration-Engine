@@ -16,14 +16,17 @@ echo ""
 # Clean up existing test databases
 echo -e "${YELLOW}Cleaning up test databases...${NC}"
 rm -f pkg/tests/migration_test.db
+rm -f pkg/tests/migration_test.db-wal
+rm -f pkg/tests/migration_test.db-shm
+rm -f pkg/tests/migration_test.yaml
 echo -e "${GREEN}Cleanup complete${NC}"
 echo ""
 
 # Run the test
 startTime=$(date +%s)
 
-# Navigate to tests/main directory and run test runner
-go run pkg/tests/spectra/setup.go pkg/tests/spectra/test_runner.go pkg/tests/spectra/verify.go
+# Run the Go-based normal test runner
+go run pkg/tests/normal/main.go
 exitCode=$?
 
 endTime=$(date +%s)

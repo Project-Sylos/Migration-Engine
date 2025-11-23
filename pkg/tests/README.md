@@ -1,190 +1,91 @@
 # Migration Engine Tests
 
-This directory contains integration tests for the Sylos Migration Engine.
+This package houses scenario-level integration tests for the Sylos Migration Engine. Each test spins up the Spectra simulator, seeds migration state, and runs the real coordinator/workers so that pause/resume behavior can be validated end-to-end.
 
-## Test Structure
-
-The tests are organized into subdirectories:
+## Layout
 
 ```
 pkg/tests/
-├── shared/                      # Shared test utilities (package shared)
-│   ├── setup.go                # Builds migration configuration
-│   └── verify.go               # Report formatting
-├── normal/                     # Normal migration test (package main)
-│   └── main.go                 # Runs a complete migration end-to-end
-├── resumption/                 # Resumption test (package main)
-│   └── main.go                 # Tests shutdown and resume functionality
-├── run_test.ps1               # PowerShell runner for normal test
-├── run_resumption_test.ps1    # PowerShell runner for resumption test
-├── run_test.sh                # Bash runner for normal test
+├── shared/                     # Shared test utilities (package shared)
+│   ├── setup.go               # Builds migration configs and Spectra adapters
+│   └── verify.go              # Pretty-printer for migration.Result
+├── normal/                     # Normal migration happy-path runner (package main)
+│   └── main.go
+├── resumption/                 # Suspension + resumption runner (package main)
+│   └── main.go
+├── migration_test.db.yaml      # Sample state file produced by resumption test
+├── run_test.ps1                # Windows runner for normal test
+├── run_resumption_test.ps1     # Windows runner that kills then resumes
+├── run_test.sh                 # Linux/macOS runner for the normal test
 └── README.md                   # This file
 ```
 
-### Shared Package (`shared/`)
+### Shared Utilities (`shared/`)
 
-Contains common test utilities used by all test types:
-- **SetupTest()**: Builds a Spectra-backed migration configuration
-- **LoadSpectraRoots()**: Fetches root nodes from Spectra simulator
-- **PrintVerification()**: Formats and prints verification results
+`SetupTest(cleanSpectraDB, removeMigrationDB)` wires together a Spectra-backed migration config. Cleanup flags control whether `spectra.db` (plus WAL/SHM) or `pkg/tests/migration_test.db*` are removed before the test starts, allowing the resumption test to keep on-disk state between phases. The helper internally:
+
+- Loads Spectra roots via `LoadSpectraRoots`, mapping them into `fsservices.Folder` values
+- Builds `SpectraFS` adapters for source and destination (pointing at the same Spectra instance)
+- Sets migration defaults such as worker counts, queue coordinator lead, log listener address, and verification options
+
+`PrintVerification` renders the verification summary from `migration.Result` so that pass/fail conditions are human-readable in CI logs.
 
 ### Normal Test (`normal/`)
 
-Runs a complete migration from start to finish:
-1. Sets up Spectra configuration
-2. Runs full migration
-3. Verifies results
+`pkg/tests/normal/main.go` drives a fresh migration start to finish:
+
+1. **Setup** – calls `shared.SetupTest(true, true)` to guarantee a clean Spectra DB and migration DB.
+2. **Execution** – invokes `migration.LetsMigrate(cfg)` and waits for completion.
+3. **Verification** – prints traversal counts and failures via `shared.PrintVerification`.
+
+This test exercises the happy-path traversal, queue coordination, verification, and log listener plumbing without any artificial shutdowns.
 
 ### Resumption Test (`resumption/`)
 
-Tests shutdown and resume functionality:
-1. Starts a migration
-2. Gets killed mid-execution (external)
-3. Verifies shutdown state is saved
-4. Resumes from suspended state
-5. Completes migration and verifies results
+`pkg/tests/resumption/main.go` focuses on force-shutdown and resume:
 
-## Running Tests
+- The default mode (`runInitialTest`) starts a migration via `migration.StartMigration`, lets workers make progress, then expects an external killswitch. When the process receives SIGINT/Stop-Process, the controller should surface `migration suspended by force shutdown`, confirming that DB checkpoints, YAML state, and Spectra adapters were closed cleanly.
+- The `-resume` flag (`runResumeTest`) skips cleanup by calling `shared.SetupTest(false, false)`, then reruns `migration.LetsMigrate`. The migration should detect the `suspended` status in `migration_test.db.yaml`, reload the database, and finish the remaining work.
 
-### Normal Test (Windows)
+### Runner Scripts
 
-```powershell
-./run_test.ps1
-```
+- `run_test.ps1` – convenience wrapper for Windows; cleans previous DB artifacts and runs the normal test.
+- `run_test.sh` – bash equivalent for Linux/macOS environments; run via `./run_test.sh` (or `go run pkg/tests/normal/main.go` directly if preferred).
+- `run_resumption_test.ps1` – orchestrates the two-phase shutdown test:
+  1. Launches the resumption runner (initial phase), waits ~10 seconds, then sends SIGINT/KILL to simulate an operator flipping the killswitch.
+  2. Verifies YAML/DB artifacts exist.
+  3. Re-runs the same binary with `-resume` so the migration resumes from disk.
+  4. Cleans up artifacts only after a successful resume to preserve evidence on failure.
 
-### Normal Test (Linux/macOS)
+## Test Methodology
 
-```bash
-./run_test.sh
-```
+These runners validate the following behaviors:
 
-### Resumption Test (Windows)
-
-```powershell
-./run_resumption_test.ps1
-```
-
-This test will:
-1. Start a migration and let it run for ~5 seconds
-2. Kill the migration process (simulates Ctrl+C)
-3. Verify shutdown state was saved (YAML + DB checkpoint)
-4. Resume the migration automatically
-5. Verify it completes successfully
-
-## Test Phases
-
-### Normal Test Phases
-
-1. **Setup**: Loads Spectra configuration and builds migration config
-2. **Migration**: Runs `migration.LetsMigrate(cfg)` to completion
-3. **Verification**: Prints statistics and validates results
-
-### Resumption Test Phases
-
-1. **Phase 1 - Initial Run & Kill**:
-   - Starts migration using `migration.StartMigration()`
-   - Waits for progress
-   - Kills the process externally
-   - Verifies YAML and DB files exist
-
-2. **Phase 2 - Resume**:
-   - Starts migration again with same config (but `RemoveExisting=false`)
-   - `migration.LetsMigrate()` automatically detects suspended state
-   - Resumes from checkpoint
-   - Completes migration
-   - Verifies final state
-
-## Test Validation
-
-The tests validate:
-- ✓ Database schema creation and table registration
-- ✓ Spectra filesystem integration
-- ✓ Queue coordination and round advancement
-- ✓ Worker task processing (configurable worker count per queue)
-- ✓ BFS traversal correctness
-- ✓ Data integrity and completeness
-- ✓ No pending or failed traversals
-- ✓ **Shutdown and resumption** (resumption test only)
+- SQLite schema initialization, WAL checkpointing, and YAML state persistence
+- Spectra simulator fidelity (seed data preserved across process restarts)
+- Queue/coordinator orchestration, including worker shutdown when `ShutdownContext` is cancelled
+- BFS traversal correctness under configurable worker counts and retry policy
+- Log listener fan-out (port reuse guards prevent duplicate listeners)
+- Forced shutdown safety: DB checkpoints, YAML `suspended` status, Spectra adapter closing, and subsequent resume correctness
 
 ## Expected Output
 
-### Normal Test
-
-```
-=== Spectra Migration Test Runner ===
-
-📋 Phase 1: Setup
-================
-Loading Spectra configuration...
-
-🚀 Phase 2: Migration
-=====================
-Root tasks seeded (src: 1 dst: 1)
-  Src: Round 0 (Pending:1 InProgress:1 Workers:10) | Dst: Round 0 (Pending:0 InProgress:0 Workers:10)
-  ...
-
-Migration complete!
-
-✓ Phase 3: Verification
-========================
-Nodes discovered: src=XX, dst=XX
-Traversal status:
-  Src: XX Successful, 0 Pending, 0 Failed
-  Dst: XX Successful, 0 Pending, 0 Failed
-
-✓ All verification checks passed!
-✓ Successfully migrated XX nodes
-
-✅ TEST PASSED!
-```
-
-### Resumption Test
-
-```
-=== Phase 1: Starting Migration (will be killed) ===
-Migration started (PID: XXXX)
-Waiting for migration to progress...
-⏹️  Killing migration mid-execution (sending SIGINT)...
-Migration process terminated.
-
-✓ YAML config file exists (suspended state saved)
-✓ Database file exists (checkpoint saved)
-
-=== Phase 2: Resuming Migration ===
-✓ Config loaded
-✓ Will resume from existing database state
-
-🔄 Phase 2: Resuming Migration
-===============================
-Resuming suspended migration from database state...
-  ...
-
-Migration complete!
-
-✓ Phase 3: Verification
-========================
-...
-
-✅ TEST PASSED - Migration successfully resumed and completed!
-```
+Both runners print phase banners (Setup → Migration → Verification plus Resume phases) and end with either `✅ TEST PASSED!` or a detailed failure reason. See the Windows PowerShell scripts for concrete examples of the log streams that CI should capture.
 
 ## Cleanup
 
-Test databases are automatically cleaned up by the runner scripts. To manually clean:
+The PowerShell runners remove `pkg/tests/migration_test.db*` and `pkg/tests/migration_test.yaml` during setup (and after success for the resumption test). For manual cleanup:
 
 ```powershell
 Remove-Item pkg\tests\migration_test.db*
 Remove-Item pkg\tests\migration_test.yaml -ErrorAction SilentlyContinue
+Remove-Item spectra.db* -ErrorAction SilentlyContinue  # only if you want to reseed Spectra
 ```
 
 ## Troubleshooting
 
-**"Config file not found"**: Ensure `pkg/configs/spectra.json` exists
-
-**"Root tasks not seeded"**: Confirm that the Spectra simulator contains the expected root nodes and that `migration.LetsMigrate` succeeded in seeding them
-
-**"Migration timeout"**: Check the log service window for worker errors
-
-**Workers not processing**: Verify that `migration.LetsMigrate` seeded the queues (look for the "Root tasks seeded" log)
-
-**"Resumption test not suspending"**: Ensure the process is killed externally (the PowerShell script handles this). If migration completes too quickly, the kill may happen after completion.
+- **"Config file not found"** – ensure `pkg/configs/spectra.json` exists and points at a running Spectra instance.
+- **"Root tasks not seeded"** – Spectra seed data might be missing; rerun with `cleanSpectraDB=true`.
+- **"Migration timeout" or idle workers** – inspect the log listener terminal for queue/worker errors.
+- **"Resumption test not suspending"** – confirm the external kill happened before the migration finished; adjust the sleep in `run_resumption_test.ps1` if needed.
+- **Missing Spectra nodes after resume** – check that the Spectra SDK process flushed WAL files (look for `spectra.db-wal` lingering); rerun with additional logging if killswitch timing is suspicious.
