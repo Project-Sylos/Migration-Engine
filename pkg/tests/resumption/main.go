@@ -56,33 +56,31 @@ func runInitialTest() error {
 	// Wait for migration to complete or be killed
 	// In normal test, this would be killed externally (via signal or Stop-Job)
 	// But we'll also check if it completes normally
-	select {
-	case <-controller.Done():
-		// Migration completed or was killed
-		result, err := controller.Wait()
+	<-controller.Done()
+	// Migration completed or was killed
+	result, err := controller.Wait()
 
-		// Check if it was a clean shutdown
-		if err != nil && err.Error() == "migration suspended by force shutdown" {
-			fmt.Println()
-			fmt.Println("✓ Migration was cleanly suspended")
-			fmt.Printf("  Progress: SRC Round %d, DST Round %d\n",
-				result.Runtime.Src.Round, result.Runtime.Dst.Round)
-			fmt.Println("  State saved for resumption")
-			return nil // This is expected when killed
-		}
-
-		if err != nil {
-			return fmt.Errorf("migration failed: %w", err)
-		}
-
-		// Migration completed normally (shouldn't happen in test, but handle it)
+	// Check if it was a clean shutdown
+	if err != nil && err.Error() == "migration suspended by force shutdown" {
 		fmt.Println()
-		fmt.Println("⚠️  Migration completed normally (wasn't killed)")
-		fmt.Println("✓ Phase 3: Verification")
-		fmt.Println("========================")
-		shared.PrintVerification(result)
-		return nil
+		fmt.Println("✓ Migration was cleanly suspended")
+		fmt.Printf("  Progress: SRC Round %d, DST Round %d\n",
+			result.Runtime.Src.Round, result.Runtime.Dst.Round)
+		fmt.Println("  State saved for resumption")
+		return nil // This is expected when killed
 	}
+
+	if err != nil {
+		return fmt.Errorf("migration failed: %w", err)
+	}
+
+	// Migration completed normally (shouldn't happen in test, but handle it)
+	fmt.Println()
+	fmt.Println("⚠️  Migration completed normally (wasn't killed)")
+	fmt.Println("✓ Phase 3: Verification")
+	fmt.Println("========================")
+	shared.PrintVerification(result)
+	return nil
 }
 
 // runResumeTest resumes the migration from the suspended state.
