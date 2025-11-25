@@ -45,3 +45,4 @@ __pycache__/
 # ignore logs
 *logs.txt
 *.log
+pkg/tests/migration_test.yaml
