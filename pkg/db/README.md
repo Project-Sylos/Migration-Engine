@@ -1,45 +1,294 @@
-# Database Package Notes
+# Database Package
 
 ## Overview
 
-The local database instance in Sylos acts as the central ledger for the migration process. Its exact schema will evolve as the project matures, but it currently serves several key purposes:
-
-* **Configuration Data** – Stores migration settings, service connection info, and other environment-level configuration details.
-* **Node Table** – Tracks every file and folder discovered during traversal, including path, identifier, parent identifier, traversal status, and related metadata.
-* **Audit Logs** – Contains structured logs of all application events, including configuration changes and mid-migration debug output. These logs are SQL-queryable, making them useful for debugging, scripting, and automation.
-* **Performance Metrics** – Records performance snapshots and health statistics for analytical and reporting purposes.
-
-## Why SQLite?
-
-Sylos uses **SQLite** with WAL (Write-Ahead Logging) mode as its local database engine. There are several reasons for this choice:
-
-1. **Open Source and Ubiquitous** – SQLite is free, open-source, and widely supported. It's battle-tested and reliable.
-2. **Local-Only Operation** – SQLite runs entirely on the user's machine. It never phones home, which is essential for protecting sensitive migration data.
-3. **WAL Mode for Concurrency** – SQLite's WAL mode allows concurrent reads and writes safely, which is essential for the queue system's parallel workers.
-4. **Lightweight and Zero-Configuration** – Unlike MongoDB or PostgreSQL, SQLite requires no background daemons, Docker containers, or servers. It's a zero-dependency, file-based database that fits seamlessly into Sylos' self-contained design.
-5. **Immediate Durability** – With WAL mode and `PRAGMA synchronous = NORMAL`, SQLite provides a good balance between performance and durability, ensuring data is safely persisted without significant performance overhead.
-6. **Simple and Reliable** – SQLite is elegant, fast enough for our use case, and developer-friendly. It provides all the features we need without unnecessary complexity.
+The database package provides a unified interface for storing and retrieving migration data using **BadgerDB**, a fast, embedded key-value store. All node metadata, traversal state, and logs are stored directly in BadgerDB using a structured key format.
 
 ---
 
-## Database Operations
+## Why BadgerDB?
 
-The database package provides a simple, direct interface for database operations:
+BadgerDB is an embedded key-value store written in Go, designed for high performance and reliability:
 
-### Core Operations
+1. **High Performance** – BadgerDB is optimized for fast writes and reads, making it ideal for the queue system's high-throughput operations.
+2. **Embedded** – No external dependencies or services required; runs entirely within the application process.
+3. **ACID Transactions** – Provides transactional guarantees for data consistency.
+4. **Efficient Iteration** – Supports prefix-based iteration for efficient querying of related data.
+5. **Crash Resilience** – Data is persisted to disk, enabling recovery after crashes.
+6. **Simple API** – Clean, straightforward API that fits well with Go's concurrency model.
 
-* **`Write(table, args...)`** – Performs immediate INSERT operations into the specified table. No buffering for node data.
-* **`Query(query, args...)`** – Executes SQL queries directly against the database. No special flushing needed.
-* **`RegisterTable(def)`** – Registers a table schema and creates the table if it doesn't exist.
-* **`Close()`** – Cleanly closes the database connection.
+---
 
-### Log Buffering
+## Key Structure
 
-While most database operations are immediate, **logs are an exception**. The package includes a lightweight `LogBuffer` that:
+BadgerDB uses structured keys to organize data:
 
-* Batches log entries for efficient bulk inserts
-* Flushes automatically every N entries or every time interval
-* Runs asynchronously in a background goroutine
-* Gracefully stops and flushes remaining entries on shutdown
+### Node Keys
 
-This specialized buffering improves log write performance without adding complexity to the general database layer. The log buffer is managed by the log service and is transparent to other components.
+**Format**: `{queueType}:{level:08d}:{traversal_status}:{copy_status}:{path_hash}`
+
+- **`queueType`**: `"src"` or `"dst"`
+- **`level`**: BFS depth level (zero-padded to 8 digits)
+- **`traversal_status`**: `"pending"`, `"successful"`, `"failed"`, or `"not_on_src"` (dst only)
+- **`copy_status`**: `"pending"`, `"successful"`, or `"failed"` (src only, empty for dst)
+- **`path_hash`**: SHA256 hash of the normalized path (first 16 bytes, hex-encoded)
+
+**Examples**:
+- `src:00000000:pending:pending:abc123...` - Source root node, pending traversal and copy
+- `dst:00000001:successful::def456...` - Destination node at level 1, successfully traversed
+- `src:00000002:successful:successful:ghi789...` - Source node at level 2, traversal and copy complete
+
+### Log Keys
+
+**Format**: `log:{level}:{uuid}`
+
+- **`level`**: Log level (`"trace"`, `"debug"`, `"info"`, `"warning"`, `"error"`, `"critical"`)
+- **`uuid`**: Unique identifier for the log entry (UUID v4)
+
+**Examples**:
+- `log:info:550e8400-e29b-41d4-a716-446655440000`
+- `log:error:6ba7b810-9dad-11d1-80b4-00c04fd430c8`
+
+### Index Keys
+
+**Format**: `{queueType}:children:{parent_path_hash}:{child_path_hash}`
+
+Used for efficient parent→child relationship lookups. The value is empty (the key encodes the relationship).
+
+---
+
+## Core Operations
+
+### Opening a Database
+
+```go
+import "github.com/Project-Sylos/Migration-Engine/pkg/db"
+
+opts := db.DefaultOptions()
+opts.Dir = "/path/to/badger/directory"
+
+database, err := db.Open(opts)
+if err != nil {
+    return err
+}
+defer database.Close()
+```
+
+### Reading Data
+
+```go
+// Get a single value
+value, err := database.Get([]byte("key"))
+
+// Iterate keys with a prefix
+err := database.IterateKeys(db.IteratorOptions{
+    Prefix: []byte("src:00000000:"),
+}, func(key []byte) error {
+    // Process key
+    return nil
+})
+
+// Iterate key-value pairs
+err := database.IterateKeyValues(db.IteratorOptions{
+    Prefix: []byte("log:info:"),
+}, func(key []byte, value []byte) error {
+    // Process key-value pair
+    return nil
+})
+```
+
+### Writing Data
+
+```go
+// Single write
+err := database.Set([]byte("key"), []byte("value"))
+
+// Transactional write
+err := database.Update(func(txn *badger.Txn) error {
+    if err := txn.Set([]byte("key1"), []byte("value1")); err != nil {
+        return err
+    }
+    if err := txn.Set([]byte("key2"), []byte("value2")); err != nil {
+        return err
+    }
+    return nil
+})
+```
+
+### Node State Operations
+
+The package provides high-level operations for working with node states:
+
+```go
+// Insert a node with its index entry
+key := db.KeySrc(0, db.TraversalStatusPending, db.CopyStatusPending, "/root")
+state := &db.NodeState{
+    ID:         "node-id",
+    ParentID:   "",
+    ParentPath: "",
+    Name:       "root",
+    Path:       "/root",
+    Type:       "folder",
+    Depth:      0,
+}
+err := db.InsertNodeWithIndex(database, key, state, db.IndexPrefixSrcChildren)
+
+// Update node status
+newState, err := db.UpdateNodeStatus(database, "src", 0, 
+    db.TraversalStatusPending, db.TraversalStatusSuccessful, 
+    db.CopyStatusPending, "/root")
+
+// Fetch children by parent path
+children, err := db.FetchChildrenByParentPath(database, db.IndexPrefixSrcChildren,
+    "/root", []string{"src"}, 0)
+```
+
+---
+
+## Log Storage
+
+Logs are stored with keys in the format `log:{level}:{uuid}`. The `LogBuffer` automatically batches log writes for performance:
+
+```go
+import "github.com/Project-Sylos/Migration-Engine/pkg/db"
+
+// Create log buffer
+logBuffer := db.NewLogBuffer(database, 500, 2*time.Second)
+
+// Add log entry
+entry := db.LogEntry{
+    ID:        db.GenerateLogID(), // UUID
+    Timestamp: time.Now().Format(time.RFC3339Nano),
+    Level:     "info",
+    Entity:    "worker",
+    EntityID:  "worker-1",
+    Message:   "Task completed",
+    Queue:     "src",
+}
+logBuffer.Add(entry)
+
+// Stop buffer (flushes remaining entries)
+logBuffer.Stop()
+```
+
+---
+
+## Key Generation Helpers
+
+The package provides helper functions for generating keys:
+
+```go
+// Node keys
+key := db.KeySrc(level, traversalStatus, copyStatus, path)
+key := db.KeyDst(level, traversalStatus, copyStatus, path)
+
+// Prefixes for iteration
+prefix := db.PrefixForStatus("src", 0, db.TraversalStatusPending)
+prefix := db.PrefixForLevel("src", 0)
+prefix := db.PrefixForAllLevels("src")
+
+// Log keys
+logKey := db.KeyLog("info", logID)
+logPrefix := db.PrefixLogByLevel("info")
+allLogsPrefix := db.PrefixLogAll()
+```
+
+---
+
+## Constants
+
+### Traversal Status
+
+- `db.TraversalStatusPending` - Node is pending traversal
+- `db.TraversalStatusSuccessful` - Node was successfully traversed
+- `db.TraversalStatusFailed` - Node traversal failed
+- `db.TraversalStatusNotOnSrc` - Node exists in destination but not in source (dst only)
+
+### Copy Status
+
+- `db.CopyStatusPending` - Copy operation is pending
+- `db.CopyStatusSuccessful` - Copy operation completed successfully
+- `db.CopyStatusFailed` - Copy operation failed
+
+### Index Prefixes
+
+- `db.IndexPrefixSrcChildren` - Index prefix for source node children
+- `db.IndexPrefixDstChildren` - Index prefix for destination node children
+
+---
+
+## Performance Considerations
+
+### Batch Operations
+
+For high-throughput scenarios, use batch operations:
+
+```go
+// Batch insert nodes
+ops := []db.InsertOperation{
+    {QueueType: "src", Level: 0, TraversalStatus: db.TraversalStatusPending, 
+     CopyStatus: db.CopyStatusPending, State: state1, IndexPrefix: db.IndexPrefixSrcChildren},
+    {QueueType: "src", Level: 0, TraversalStatus: db.TraversalStatusPending,
+     CopyStatus: db.CopyStatusPending, State: state2, IndexPrefix: db.IndexPrefixSrcChildren},
+}
+err := db.BatchInsertNodes(database, ops)
+
+// Batch update node status
+results, err := db.BatchUpdateNodeStatus(database, "src", 0,
+    db.TraversalStatusPending, db.TraversalStatusSuccessful,
+    db.CopyStatusPending, []string{"/path1", "/path2"})
+```
+
+### Iteration Performance
+
+When iterating large datasets, use appropriate prefixes to limit scope:
+
+```go
+// Efficient: Iterate only pending nodes at level 0
+prefix := db.PrefixForStatus("src", 0, db.TraversalStatusPending)
+err := database.IterateNodeStates(db.IteratorOptions{Prefix: prefix}, ...)
+
+// Less efficient: Iterate all nodes then filter
+prefix := db.PrefixForAllLevels("src")
+err := database.IterateNodeStates(db.IteratorOptions{Prefix: prefix}, ...)
+```
+
+---
+
+## Thread Safety
+
+BadgerDB operations are safe for concurrent use:
+
+- **Read operations** (`View`, `Get`, `Iterate*`) can run concurrently
+- **Write operations** (`Update`, `Set`, `Delete`) are serialized by BadgerDB
+- **Transactions** provide isolation between concurrent operations
+
+---
+
+## Error Handling
+
+All database operations return errors that should be checked:
+
+```go
+value, err := database.Get(key)
+if err == badger.ErrKeyNotFound {
+    // Key doesn't exist
+} else if err != nil {
+    // Other error
+    return err
+}
+```
+
+---
+
+## Summary
+
+The database package provides:
+- ✅ **BadgerDB Integration** - Fast, embedded key-value store
+- ✅ **Structured Keys** - Organized key format for nodes and logs
+- ✅ **High-Level Operations** - Convenient functions for common operations
+- ✅ **Batch Support** - Efficient batch operations for high throughput
+- ✅ **Thread Safety** - Safe for concurrent use
+- ✅ **Crash Resilience** - Data persisted to disk
+
+This design enables the migration engine to efficiently store and query traversal state, node metadata, and logs with excellent performance characteristics.

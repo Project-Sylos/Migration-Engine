@@ -2,14 +2,22 @@
 # Copyright 2025 Sylos contributors
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+Clear-Host
+
 Write-Host "=== Sylos Migration Test Runner ===" -ForegroundColor Cyan
 Write-Host ""
 
 # Clean up existing test databases
 Write-Host "Cleaning up test databases..." -ForegroundColor Yellow
-Remove-Item -Path "pkg\tests\migration_test.db" -ErrorAction SilentlyContinue
-Remove-Item -Path "pkg\tests\migration_test.db-wal" -ErrorAction SilentlyContinue
-Remove-Item -Path "pkg\tests\migration_test.db-shm" -ErrorAction SilentlyContinue
+# Remove the /badger folder if it exists
+if (Test-Path "pkg\tests\badger") {
+    Write-Host "Removing pkg\tests\badger folder..." -ForegroundColor Yellow
+    Remove-Item -Path "pkg\tests\badger" -Recurse -Force -ErrorAction SilentlyContinue
+}
+# Remove the migration_test.yaml file if it exists
+Remove-Item -Path "pkg\tests\migration_test.yaml" -ErrorAction SilentlyContinue
+# remove the spectra.db file if it exists
+Remove-Item -Path "spectra.db" -ErrorAction SilentlyContinue
 Write-Host "Cleanup complete" -ForegroundColor Green
 Write-Host ""
 

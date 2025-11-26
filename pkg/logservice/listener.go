@@ -105,7 +105,24 @@ func getSpawnAbsPath() (string, error) {
 	return spawnPath, nil
 }
 
+// clearConsole runs a clear screen command appropriate to the OS.
+// Returns any error encountered.
+func clearConsole() error {
+	switch runtime.GOOS {
+	case "windows":
+		// Use the absolute path to cmd.exe in System32 for reliability
+		cmd := exec.Command("C:\\Windows\\System32\\cmd.exe", "/C", "cls")
+		return cmd.Run()
+	case "darwin", "linux":
+		cmd := exec.Command("clear")
+		return cmd.Run()
+	default:
+		return nil
+	}
+}
+
 // RunListener is the actual listener loop (called when --listen flag is passed).
+// If a log with Message == "<<CLEAR_SCREEN>>" is received, clears the console.
 func RunListener(addr string) error {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -129,6 +146,14 @@ func RunListener(addr string) error {
 		var pkt LogPacket
 		if err := json.Unmarshal(buf[:n], &pkt); err != nil {
 			fmt.Printf("[LogService] Invalid packet: %v\n", err)
+			continue
+		}
+
+		// If specific log message received, clear console.
+		if pkt.Message == "<<CLEAR_SCREEN>>" {
+			if err := clearConsole(); err != nil {
+				fmt.Printf("[LogService] Failed to clear console: %v\n", err)
+			}
 			continue
 		}
 

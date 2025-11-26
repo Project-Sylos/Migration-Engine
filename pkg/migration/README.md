@@ -57,7 +57,7 @@ result, err := migration.LetsMigrate(cfg)
 ```
 
 This function:
-1. Sets up or opens the database
+1. Sets up or opens the BadgerDB database
 2. Inspects existing migration state
 3. Decides whether to run fresh or resume
 4. Executes traversal
@@ -74,16 +74,16 @@ The migration package includes a comprehensive YAML-based configuration system t
 
 The config YAML is automatically saved at critical milestones:
 - **Root Selection** - When `SetRootFolders()` is called
-- **Roots Seeded** - After root tasks are seeded into the database
+- **Roots Seeded** - After root tasks are seeded into BadgerDB
 - **Traversal Started** - When queues are initialized and ready
 - **Round Advancement** - When source or destination rounds advance
 - **Traversal Complete** - When migration finishes
 
 ### Config File Location
 
-By default, the config YAML is stored alongside the database file:
-- Database: `migration.db`
-- Config: `migration.db.yaml`
+By default, the config YAML is stored alongside the database directory:
+- Database: `migration.badger/`
+- Config: `migration.badger.yaml`
 
 You can specify a custom path via `DatabaseConfig.ConfigPath`.
 
@@ -179,7 +179,7 @@ The YAML config includes:
 - **Service Configs** - Embedded service-specific configs (e.g., spectra.json)
 - **Migration Options** - Worker count, retries, coordinator lead, etc.
 - **Logging** - Log service address, port, and level
-- **Database** - Database path and settings
+- **Database** - BadgerDB directory path and settings
 - **Verification** - Verification options
 - **Extensions** - Unstructured fields for future extensions
 
@@ -200,7 +200,7 @@ The YAML config includes:
 ```go
 cfg := migration.Config{
     Database: migration.DatabaseConfig{
-        Path: "migration.db",
+        Path: "migration.badger",
     },
     Source:      sourceService,
     Destination: destinationService,
@@ -213,13 +213,13 @@ result, err := migration.LetsMigrate(cfg)
 
 ### 2. Resume Migration
 
-When you open an existing database, `LetsMigrate` automatically detects pending work and resumes:
+When you open an existing BadgerDB database, `LetsMigrate` automatically detects pending work and resumes:
 
 ```go
 // Same config, but database already exists with state
 cfg := migration.Config{
     Database: migration.DatabaseConfig{
-        Path: "migration.db", // Existing database
+        Path: "migration.badger", // Existing database
     },
     // ... same config
 }
@@ -266,10 +266,10 @@ type MigrationStatus struct {
 
 ### InspectMigrationStatus
 
-Query the current migration state:
+Query the current migration state from BadgerDB:
 
 ```go
-status, err := migration.InspectMigrationStatus(database)
+status, err := migration.InspectMigrationStatus(badgerDB)
 if status.HasPending() {
     fmt.Println("Migration has pending work")
 }
@@ -291,7 +291,7 @@ verifyOpts := migration.VerifyOptions{
     AllowNotOnSrc: true,
 }
 
-report, err := migration.VerifyMigration(database, verifyOpts)
+report, err := migration.VerifyMigration(badgerDB, verifyOpts)
 if report.Success(verifyOpts) {
     fmt.Println("Migration verified successfully")
 }
@@ -303,23 +303,23 @@ if report.Success(verifyOpts) {
 
 ### SetupDatabase
 
-Creates a new database and registers required tables:
+Creates a new BadgerDB database:
 
 ```go
 db, wasFresh, err := migration.SetupDatabase(migration.DatabaseConfig{
-    Path:           "migration.db",
+    Path:           "migration.badger",
     RemoveExisting: false,
 })
 ```
 
 ### DatabaseConfig
 
-Configures database behavior:
+Configures BadgerDB behavior:
 
 ```go
 type DatabaseConfig struct {
-    Path           string // SQLite database file path
-    RemoveExisting bool   // Delete existing file before creating
+    Path           string // BadgerDB directory path
+    RemoveExisting bool   // Delete existing directory before creating
     ConfigPath     string // Optional: custom YAML config path
 }
 ```
@@ -370,4 +370,3 @@ See the main package (`main.go`) and test packages for complete examples of:
 - Creating service adapters
 - Handling migration results
 - Resuming from saved state
-

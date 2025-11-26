@@ -47,14 +47,14 @@ $process.EnableRaisingEvents = $true
 # Capture output
 $outputBuilder = New-Object System.Text.StringBuilder
 $errorBuilder = New-Object System.Text.StringBuilder
-$outputEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
+Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
     $Event.SourceEventArgs.Data | ForEach-Object {
         [void]$Event.MessageData.AppendLine($_)
         Write-Host $_ -ForegroundColor Gray
     }
 } -MessageData $outputBuilder
 
-$errorEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action {
+Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action {
     $Event.SourceEventArgs.Data | ForEach-Object {
         [void]$Event.MessageData.AppendLine($_)
         Write-Host $_ -ForegroundColor DarkGray

@@ -6,6 +6,7 @@ package migration
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
@@ -23,7 +24,7 @@ type Service struct {
 // Config aggregates all of the knobs required to run the migration engine once.
 type Config struct {
 	Database         DatabaseConfig
-	DatabaseInstance *db.DB
+	DatabaseInstance *db.DB // BadgerDB instance
 	CloseDatabase    bool
 
 	Source      Service
@@ -176,7 +177,7 @@ func LetsMigrate(cfg Config) (Result, error) {
 // letsMigrateWithContext is the internal implementation that accepts a shutdown context.
 func letsMigrateWithContext(cfg Config) (Result, error) {
 	var (
-		database *db.DB
+		badgerDB *db.DB
 		err      error
 	)
 
@@ -193,32 +194,19 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 
 	var wasFresh bool
 	if cfg.DatabaseInstance != nil {
-		database = cfg.DatabaseInstance
-		wasFresh = false // Existing database instance - always check status and validate schema
+		badgerDB = cfg.DatabaseInstance
+		wasFresh = false // Existing database instance
 	} else {
 		var setupErr error
-		database, wasFresh, setupErr = SetupDatabase(cfg.Database)
+		badgerDB, wasFresh, setupErr = SetupDatabase(cfg.Database)
 		if setupErr != nil {
 			return Result{}, setupErr
 		}
 		cfg.CloseDatabase = true
-		// Fresh database - no need to validate schema since we just registered the tables
 	}
-
-	// Validate core schema for any caller-supplied database instance. This is
-	// intentionally strict to avoid resuming or running against a modified or
-	// incompatible DB file. Databases created via SetupDatabase are assumed to
-	// have the correct schema because we just registered the tables.
-	// Skip validation for fresh databases since we just created them correctly.
-	if cfg.DatabaseInstance != nil {
-		if err := database.ValidateCoreSchema(); err != nil {
-			return Result{}, fmt.Errorf("database schema invalid: %w", err)
-		}
-	}
-	// Note: Fresh databases (wasFresh=true) don't need validation since we just registered the tables
 
 	// Only inspect migration status if this isn't a fresh database.
-	// If we just created it (RemoveExisting=true or file didn't exist), skip the check.
+	// If we just created it (RemoveExisting=true or directory didn't exist), skip the check.
 	var status MigrationStatus
 	if wasFresh {
 		// Fresh database - no need to check, it's definitely empty
@@ -226,7 +214,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	} else {
 		// Existing database - inspect to decide between fresh run and resume
 		var inspectErr error
-		status, inspectErr = InspectMigrationStatus(database)
+		status, inspectErr = InspectMigrationStatus(badgerDB)
 		if inspectErr != nil {
 			return Result{}, fmt.Errorf("failed to inspect migration status: %w", inspectErr)
 		}
@@ -302,14 +290,23 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	var runtime RuntimeStats
 	var runErr error
 
+	badgerDir := cfg.Database.Path
+	if badgerDir == "" {
+		badgerDir = "migration.badger"
+	}
+	if abs, err := filepath.Abs(badgerDir); err == nil {
+		badgerDir = abs
+	}
+
 	// Helper function to run fresh migration
 	runFreshMigration := func() (RuntimeStats, error) {
 		if cfg.SeedRoots {
-			summary, err := SeedRootTasks(database, srcRoot, dstRoot)
+			// Seed root tasks to BadgerDB
+			summary, err := SeedRootTasks(srcRoot, dstRoot, badgerDB)
 			if err != nil {
+				fmt.Printf("Warning: failed to seed root tasks: %v\n", err)
 				return RuntimeStats{}, err
 			}
-			fmt.Printf("Root tasks seeded (src:%d dst:%d)\n", summary.SrcRoots, summary.DstRoots)
 			result.RootSummary = summary
 
 			// Update config: Roots seeded milestone
@@ -320,7 +317,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 			}
 		}
 		return RunMigration(MigrationConfig{
-			Database:        database,
+			BadgerDir:       badgerDir,
 			SrcAdapter:      cfg.Source.Adapter,
 			DstAdapter:      cfg.Destination.Adapter,
 			SrcRoot:         srcRoot,
@@ -375,7 +372,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 				fmt.Println("Resuming migration from existing database state...")
 			}
 			runtime, runErr = RunMigration(MigrationConfig{
-				Database:        database,
+				BadgerDir:       badgerDir,
 				SrcAdapter:      cfg.Source.Adapter,
 				DstAdapter:      cfg.Destination.Adapter,
 				SrcRoot:         srcRoot,
@@ -408,24 +405,12 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	// Check if migration was suspended by force shutdown
 	isShutdown := runErr != nil && runErr.Error() == "migration suspended by force shutdown"
 	if isShutdown {
-		// Force shutdown occurred: ensure database checkpoint and flush logs
+		// Force shutdown occurred: flush logs
 		// Use timeout to prevent hanging
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
 
-		// Checkpoint database (with timeout)
-		checkpointDone := make(chan error, 1)
-		go func() {
-			checkpointDone <- database.Checkpoint()
-		}()
-		select {
-		case err := <-checkpointDone:
-			if err != nil {
-				fmt.Printf("Warning: failed to checkpoint database after shutdown: %v\n", err)
-			}
-		case <-cleanupCtx.Done():
-			fmt.Printf("⚠️  Database checkpoint timeout after shutdown - skipping\n")
-		}
+		// BadgerDB doesn't need checkpointing - data is already persisted
 
 		// Flush log service if available (with timeout)
 		if logservice.LS != nil {
@@ -452,7 +437,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 
 	// Verify migration before closing database - verification needs database access
 	// Note: We run verification even if migration had errors, to provide full diagnostic info
-	report, verifyErr := VerifyMigration(database, cfg.Verification)
+	report, verifyErr := VerifyMigration(badgerDB, cfg.Verification)
 	result.Verification = report
 
 	// Note: We do NOT close the log service here - it's a global singleton that should
@@ -464,7 +449,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 
 	// Close database after verification and log service are done (allows verification and log flushing to access DB)
 	if cfg.CloseDatabase {
-		defer database.Close()
+		defer badgerDB.Close()
 	}
 
 	// Return migration error if it occurred (verification ran for diagnostics)
@@ -474,6 +459,10 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 
 	if verifyErr != nil {
 		return result, verifyErr
+	}
+
+	if !result.Verification.Success(cfg.Verification) {
+		return result, fmt.Errorf("migration failed: verification checks failed")
 	}
 
 	return result, nil

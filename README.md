@@ -14,7 +14,7 @@ Each traversal operation is isolated into discrete, non-recursive **tasks** so t
 
 1. **List Children**
    From the current node, list immediate children only (no recursion).
-   Identify each child’s type—whether it can contain further nodes (*recursive nodes*) or represents a terminal node.
+   Identify each child's type—whether it can contain further nodes (*recursive nodes*) or represents a terminal node.
 
 2. **Apply Filters**
    Run each child through the configured filter rules using its ID, path, and context.
@@ -22,23 +22,23 @@ Each traversal operation is isolated into discrete, non-recursive **tasks** so t
    This keeps each task stateless and lightweight.
 
 3. **Record Results**
-   Children that pass filtering are written immediately to the database (write-ahead log).
-   Task propagation between queues happens entirely in-memory via the RoundQueue system for deterministic coordination.
+   Children that pass filtering are batched through per-queue buffers and flushed to BadgerDB before the next leasing pass.
+   This guarantees deterministic visibility without keeping additional in-memory round queues.
 
 ---
 
 ## Why BFS Instead of DFS?
 
-Depth-First Search (DFS) is memory-efficient, but it’s less suited to managing two trees in parallel.
+Depth-First Search (DFS) is memory-efficient, but it's less suited to managing two trees in parallel.
 BFS, while it requires storing all nodes at the current level, provides better control, checkpointing, and fault recovery.
-The Migration Engine (ME) serializes traversal data to a local database after each round, keeping memory use bounded while preserving full traversal context.
+The Migration Engine (ME) serializes traversal data to BadgerDB after each round, keeping memory use bounded while preserving full traversal context.
 
 ### Two Possible Strategies
 
 #### 1. Coupled DFS-Style Traversal
 
 * The source and destination trees are traversed simultaneously.
-* Each source node’s children are compared directly with the destination’s corresponding node.
+* Each source node's children are compared directly with the destination's corresponding node.
 * Throughput is limited by the slower of the two systems (e.g., 1000 nodes/s source vs 10 nodes/s destination).
 * Harder to resume after interruptions because state exists only in memory.
 * Example of this pattern: **Rclone**.
@@ -53,7 +53,7 @@ The Migration Engine (ME) serializes traversal data to a local database after ea
 * When the destination processes its corresponding level, it compares existing nodes against the expected list from the source.
 * Extra items in the destination are logged but not traversed further.
 * The destination can run as fast as possible while staying coordinated with the source.
-* Because each round is batched and stored, the system can resume exactly where it left off after a crash.
+* Because each round is batched and stored in BadgerDB, the system can resume exactly where it left off after a crash.
 * This maximizes both safety and throughput.
 
 ---
@@ -78,7 +78,7 @@ The Migration Engine includes a comprehensive YAML-based configuration system th
 Migration state is automatically persisted to a YAML config file (default: `{database_path}.yaml`) at key points:
 
 - **Root Selection** - When source and destination roots are set
-- **Roots Seeded** - After root tasks are seeded into the database
+- **Roots Seeded** - After root tasks are seeded into BadgerDB
 - **Traversal Started** - When queues are initialized and ready
 - **Round Advancement** - When source or destination rounds advance during traversal
 - **Traversal Complete** - When migration finishes

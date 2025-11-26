@@ -36,11 +36,8 @@ go.work.sum
 __pycache__/
 *.pyc
 
-# ignore db files
-*.db
-*.db-wal
-*.db-shm
-*.db-journal
+# ignore badger files
+pkg/tests/badger/*
 
 # ignore logs
 *logs.txt

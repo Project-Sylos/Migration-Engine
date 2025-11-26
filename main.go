@@ -284,9 +284,7 @@ func printResult(result migration.Result) {
 	fmt.Println()
 	fmt.Println("=== Migration Summary ===")
 	fmt.Printf("Duration: %s\n", result.Runtime.Duration)
-	if result.RootsSeeded {
-		fmt.Printf("Root tasks seeded: src=%d dst=%d\n", result.RootSummary.SrcRoots, result.RootSummary.DstRoots)
-	} else {
+	if !result.RootsSeeded {
 		fmt.Println("Root task seeding skipped (assumed pre-seeded)")
 	}
 	fmt.Printf("Final src queue round: %d\n", result.Runtime.Src.Round)

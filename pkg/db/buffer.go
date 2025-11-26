@@ -4,29 +4,17 @@
 package db
 
 import (
-	"context"
-	"database/sql"
 	"fmt"
 	"sync"
 	"time"
-)
 
-// LogEntry represents a single log record to be buffered.
-type LogEntry struct {
-	ID        string
-	Timestamp time.Time
-	Level     string
-	Entity    string
-	EntityID  string
-	Details   any
-	Message   string
-	Queue     any
-}
+	"github.com/dgraph-io/badger/v4"
+)
 
 // LogBuffer is a lightweight buffer specifically for log entries.
 // It batches log inserts for improved performance while keeping the implementation simple.
 type LogBuffer struct {
-	db          *sql.DB
+	db          *DB
 	mu          sync.Mutex
 	entries     []LogEntry
 	batchSize   int
@@ -36,7 +24,7 @@ type LogBuffer struct {
 }
 
 // NewLogBuffer creates a new log buffer that will flush every N entries or every interval.
-func NewLogBuffer(db *sql.DB, batchSize int, flushInterval time.Duration) *LogBuffer {
+func NewLogBuffer(db *DB, batchSize int, flushInterval time.Duration) *LogBuffer {
 	lb := &LogBuffer{
 		db:          db,
 		entries:     make([]LogEntry, 0, batchSize),
@@ -63,7 +51,7 @@ func (lb *LogBuffer) Add(entry LogEntry) {
 	}
 }
 
-// Flush writes all buffered entries to the database.
+// Flush writes all buffered entries to BadgerDB in a single transaction.
 func (lb *LogBuffer) Flush() {
 	lb.mu.Lock()
 	if len(lb.entries) == 0 {
@@ -76,39 +64,30 @@ func (lb *LogBuffer) Flush() {
 	lb.entries = make([]LogEntry, 0, lb.batchSize)
 	lb.mu.Unlock()
 
-	// Execute batch insert
-	ctx := context.Background()
-	tx, err := lb.db.BeginTx(ctx, nil)
-	if err != nil {
-		fmt.Println("Error beginning transaction:", err)
-		return // Silently fail - logs are not critical
-	}
+	// Execute batch insert to BadgerDB in a single transaction
+	err := lb.db.Update(func(txn *badger.Txn) error {
+		for _, entry := range batch {
+			// Generate key: log:{level}:{uuid}
+			key := KeyLog(entry.Level, entry.ID)
 
-	stmt, err := tx.PrepareContext(ctx,
-		"INSERT INTO logs (id, timestamp, level, entity, entity_id, details, message, queue) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-	if err != nil {
-		_ = tx.Rollback()
-		return
-	}
-	defer stmt.Close()
+			// Serialize entry
+			value, err := SerializeLogEntry(entry)
+			if err != nil {
+				return fmt.Errorf("failed to serialize log entry: %w", err)
+			}
 
-	for _, entry := range batch {
-		_, err := stmt.ExecContext(ctx,
-			entry.ID,
-			entry.Timestamp,
-			entry.Level,
-			entry.Entity,
-			entry.EntityID,
-			entry.Details,
-			entry.Message,
-			entry.Queue)
-		if err != nil {
-			_ = tx.Rollback()
-			return
+			// Write to BadgerDB
+			if err := txn.Set(key, value); err != nil {
+				return fmt.Errorf("failed to set log entry: %w", err)
+			}
 		}
-	}
+		return nil
+	})
 
-	_ = tx.Commit()
+	if err != nil {
+		// Silently fail - logs are not critical
+		fmt.Printf("Error flushing log buffer: %v\n", err)
+	}
 }
 
 // flushLoop runs in a goroutine and periodically flushes the buffer.

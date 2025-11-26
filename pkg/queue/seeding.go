@@ -11,47 +11,54 @@ import (
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 )
 
-// SeedRootTask inserts the initial root folder task into the database to kickstart traversal.
-// For src_nodes: sets traversal_status='Pending' and copy_status='Pending'
-// For dst_nodes: sets traversal_status='Pending'
-func SeedRootTask(database *db.DB, tableName string, rootFolder fsservices.Folder) error {
-	if tableName == "src_nodes" {
-		// Source nodes have both traversal_status and copy_status
-		err := database.Write(
-			tableName,
-			rootFolder.Id,           // id
-			rootFolder.ParentId,     // parent_id (empty for root)
-			rootFolder.DisplayName,  // name
-			rootFolder.LocationPath, // path
-			"",                      // ParentPatharent_path
-			rootFolder.Type,         // type
-			0,                       // depth_level (root is always 0)
-			nil,                     // size (folders have no size)
-			rootFolder.LastUpdated,  // last_updated
-			"Pending",               // traversal_status
-			"Pending",               // copy_status
-		)
-		if err != nil {
-			return fmt.Errorf("failed to seed root task for %s: %w", tableName, err)
-		}
-	} else {
-		// Destination nodes only have traversal_status
-		err := database.Write(
-			tableName,
-			rootFolder.Id,           // id
-			rootFolder.ParentId,     // parent_id (empty for root)
-			rootFolder.DisplayName,  // name
-			rootFolder.LocationPath, // path
-			"",                      // parent_path
-			rootFolder.Type,         // type
-			0,                       // depth_level (root is always 0)
-			nil,                     // size (folders have no size)
-			rootFolder.LastUpdated,  // last_updated
-			"Pending",               // traversal_status
-		)
-		if err != nil {
-			return fmt.Errorf("failed to seed root task for %s: %w", tableName, err)
-		}
+// SeedRootTask inserts the initial root folder task into BadgerDB to kickstart traversal.
+// For src: sets traversal_status='Pending' and copy_status='Pending'
+// For dst: sets traversal_status='Pending'
+func SeedRootTask(queueType string, rootFolder fsservices.Folder, badgerDB *db.DB) error {
+	if badgerDB == nil {
+		return fmt.Errorf("badgerDB cannot be nil")
+	}
+
+	// Create NodeState from root folder
+	state := &db.NodeState{
+		ID:         rootFolder.Id,
+		ParentID:   rootFolder.ParentId,
+		ParentPath: "", // Root has no parent
+		Name:       rootFolder.DisplayName,
+		Path:       fsservices.NormalizeLocationPath(rootFolder.LocationPath),
+		Type:       rootFolder.Type,
+		Size:       0, // Folders have no size
+		MTime:      rootFolder.LastUpdated,
+		Depth:      0, // Root is always depth 0
+		CopyNeeded: false,
+		Status:     "Pending",
+	}
+
+	// Determine copy status
+	copyStatus := db.CopyStatusPending
+	if queueType == "dst" {
+		copyStatus = "" // DST nodes don't use copy_status
+	}
+
+	// Use BatchInsertNodes to write to BadgerDB
+	indexPrefix := db.IndexPrefixSrcChildren
+	if queueType == "dst" {
+		indexPrefix = db.IndexPrefixDstChildren
+	}
+
+	ops := []db.InsertOperation{
+		{
+			QueueType:       queueType,
+			Level:           0,
+			TraversalStatus: db.TraversalStatusPending,
+			CopyStatus:      copyStatus,
+			State:           state,
+			IndexPrefix:     indexPrefix,
+		},
+	}
+
+	if err := db.BatchInsertNodes(badgerDB, ops); err != nil {
+		return fmt.Errorf("failed to seed root task to BadgerDB for %s: %w", queueType, err)
 	}
 
 	if logservice.LS != nil {
@@ -59,7 +66,7 @@ func SeedRootTask(database *db.DB, tableName string, rootFolder fsservices.Folde
 			"info",
 			fmt.Sprintf("Seeded root task: %s (path: %s)", rootFolder.DisplayName, rootFolder.LocationPath),
 			"seeding",
-			tableName,
+			queueType,
 		)
 	}
 
@@ -67,12 +74,13 @@ func SeedRootTask(database *db.DB, tableName string, rootFolder fsservices.Folde
 }
 
 // SeedRootTasks is a convenience function to seed both src and dst root tasks at once.
-func SeedRootTasks(database *db.DB, srcRoot fsservices.Folder, dstRoot fsservices.Folder) error {
-	if err := SeedRootTask(database, "src_nodes", srcRoot); err != nil {
+// Writes root tasks to BadgerDB.
+func SeedRootTasks(srcRoot fsservices.Folder, dstRoot fsservices.Folder, badgerDB *db.DB) error {
+	if err := SeedRootTask("src", srcRoot, badgerDB); err != nil {
 		return fmt.Errorf("failed to seed src root: %w", err)
 	}
 
-	if err := SeedRootTask(database, "dst_nodes", dstRoot); err != nil {
+	if err := SeedRootTask("dst", dstRoot, badgerDB); err != nil {
 		return fmt.Errorf("failed to seed dst root: %w", err)
 	}
 

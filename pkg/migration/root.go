@@ -17,37 +17,35 @@ type RootSeedSummary struct {
 	DstRoots int
 }
 
-// SeedRootTasks inserts the supplied source and destination root folders into the database.
+// SeedRootTasks inserts the supplied source and destination root folders into BadgerDB.
 // The folders should already contain root-relative metadata (LocationPath="/", DepthLevel=0).
-func SeedRootTasks(database *db.DB, srcRoot fsservices.Folder, dstRoot fsservices.Folder) (RootSeedSummary, error) {
-	if database == nil {
-		return RootSeedSummary{}, fmt.Errorf("database cannot be nil")
+func SeedRootTasks(srcRoot fsservices.Folder, dstRoot fsservices.Folder, badgerDB *db.DB) (RootSeedSummary, error) {
+	if badgerDB == nil {
+		return RootSeedSummary{}, fmt.Errorf("badgerDB cannot be nil")
 	}
 
 	if srcRoot.Id == "" || dstRoot.Id == "" {
 		return RootSeedSummary{}, fmt.Errorf("source and destination root folders must have an Id")
 	}
 
-	if err := queue.SeedRootTasks(database, srcRoot, dstRoot); err != nil {
+	if err := queue.SeedRootTasks(srcRoot, dstRoot, badgerDB); err != nil {
 		return RootSeedSummary{}, fmt.Errorf("failed to seed root tasks: %w", err)
 	}
 
 	var summary RootSeedSummary
 
-	rows, err := database.Query("SELECT COUNT(*) FROM src_nodes WHERE depth_level = 0")
-	if err == nil && rows != nil {
-		if rows.Next() {
-			_ = rows.Scan(&summary.SrcRoots)
-		}
-		rows.Close()
+	// Count root tasks from BadgerDB
+	srcPrefix := db.PrefixForStatus("src", 0, db.TraversalStatusPending)
+	dstPrefix := db.PrefixForStatus("dst", 0, db.TraversalStatusPending)
+
+	srcCount, err := badgerDB.CountByPrefix(srcPrefix)
+	if err == nil {
+		summary.SrcRoots = srcCount
 	}
 
-	rows, err = database.Query("SELECT COUNT(*) FROM dst_nodes WHERE depth_level = 0")
-	if err == nil && rows != nil {
-		if rows.Next() {
-			_ = rows.Scan(&summary.DstRoots)
-		}
-		rows.Close()
+	dstCount, err := badgerDB.CountByPrefix(dstPrefix)
+	if err == nil {
+		summary.DstRoots = dstCount
 	}
 
 	return summary, nil
