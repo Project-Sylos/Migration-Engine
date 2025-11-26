@@ -32,12 +32,16 @@ func InitGlobalLogger(dbInstance *db.DB, addr, level string) error {
 		return fmt.Errorf("failed to send test log: %w", err)
 	}
 
+	if err := LS.ClearConsole(); err != nil {
+		return fmt.Errorf("failed to send clear console log: %w", err)
+	}
+
 	return nil
 }
 
 // Sender transmits logs over UDP and writes them to the database.
 type Sender struct {
-	DB         *db.DB        // database handle for persistence
+	DB         *db.DB        // BadgerDB handle for persistence
 	logBuffer  *db.LogBuffer // buffered log writer
 	Addr       string        // e.g. "127.0.0.1:1997"
 	Level      string        // threshold for UDP output
@@ -70,6 +74,7 @@ func getLevelIndex(level string) int {
 }
 
 // NewSender initializes a new dual-channel sender.
+// dbInstance should be a BadgerDB instance.
 func NewSender(dbInstance *db.DB, addr, level string) (*Sender, error) {
 	conn, err := net.Dial("udp", addr)
 	if err != nil {
@@ -82,7 +87,7 @@ func NewSender(dbInstance *db.DB, addr, level string) (*Sender, error) {
 	buf := new(bytes.Buffer)
 
 	// Create a log buffer that flushes every 500 entries or every 2 seconds
-	logBuffer := db.NewLogBuffer(dbInstance.Conn(), 500, 2*time.Second)
+	logBuffer := db.NewLogBuffer(dbInstance, 500, 2*time.Second)
 
 	return &Sender{
 		DB:         dbInstance,
@@ -108,10 +113,10 @@ func (s *Sender) Log(level, message, entity, entityID string, queues ...string) 
 	}
 
 	// --- DB write (always, buffered) ---
-	id := fmt.Sprintf("%d", timestamp.UnixNano()) // basic unique ID for now
+	id := db.GenerateLogID() // Generate UUID for log entry
 	s.logBuffer.Add(db.LogEntry{
 		ID:        id,
-		Timestamp: timestamp,
+		Timestamp: timestamp.Format(time.RFC3339Nano), // ISO8601 format
 		Level:     level,
 		Entity:    entity,
 		EntityID:  entityID,
@@ -138,6 +143,29 @@ func (s *Sender) Log(level, message, entity, entityID string, queues ...string) 
 	s.tmp.Entity = entity
 	s.tmp.EntityID = entityID
 	s.tmp.Queue = queue
+
+	s.buf.Reset()
+	if err := s.enc.Encode(&s.tmp); err != nil {
+		return err
+	}
+
+	_, err := s.conn.Write(s.buf.Bytes())
+	return err
+}
+
+// ClearConsole sends a log with the message "<<CLEAR_SCREEN>>" to instruct the listener to clear its console.
+// Does NOT write to the DB log table (no persistence); only sends to UDP listener(s).
+func (s *Sender) ClearConsole() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Build special log packet (with only what the listener expects).
+	s.tmp.Timestamp = time.Now()
+	s.tmp.Level = "info"
+	s.tmp.Message = "<<CLEAR_SCREEN>>"
+	s.tmp.Entity = ""
+	s.tmp.EntityID = ""
+	s.tmp.Queue = ""
 
 	s.buf.Reset()
 	if err := s.enc.Encode(&s.tmp); err != nil {

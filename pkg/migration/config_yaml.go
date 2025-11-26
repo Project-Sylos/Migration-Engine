@@ -163,11 +163,11 @@ func SaveMigrationConfig(path string, cfg *MigrationConfigYAML) error {
 	return nil
 }
 
-// ConfigPathFromDatabasePath returns the config YAML path for a given database path.
-// Default strategy: {database_path}.yaml
-func ConfigPathFromDatabasePath(dbPath string) string {
-	base := dbPath
-	base = strings.TrimSuffix(base, ".db")
+// ConfigPathFromDatabasePath returns the config YAML path for a given database directory.
+// Default strategy: {database_dir}.yaml
+func ConfigPathFromDatabasePath(dbDir string) string {
+	base := dbDir
+	base = strings.TrimSuffix(base, ".badger")
 	return base + ".yaml"
 }
 
@@ -204,7 +204,7 @@ func (yamlCfg *MigrationConfigYAML) ToMigrationConfig(adapterFactory AdapterFact
 
 	cfg := Config{
 		Database: DatabaseConfig{
-			Path:           yamlCfg.Database.Path,
+			Path:            yamlCfg.Database.Path,
 			RemoveExisting: yamlCfg.Database.RemoveExisting,
 			ConfigPath:     "", // Will be set by caller if needed
 		},
@@ -314,7 +314,7 @@ func NewMigrationConfigYAML(cfg Config, status MigrationStatus) (*MigrationConfi
 			Level:   cfg.LogLevel,
 		},
 		Database: DatabaseConfigYAML{
-			Path:           cfg.Database.Path,
+			Path:            cfg.Database.Path,
 			RemoveExisting: cfg.Database.RemoveExisting,
 		},
 		Verification: cfg.Verification,

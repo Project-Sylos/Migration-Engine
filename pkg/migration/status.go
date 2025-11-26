@@ -47,75 +47,154 @@ func (s MigrationStatus) IsComplete() bool {
 	return !s.HasPending() && !s.HasFailures()
 }
 
-// InspectMigrationStatus inspects the node tables and returns a MigrationStatus.
-// Callers should validate schema beforehand (e.g. via db.ValidateCoreSchema).
-func InspectMigrationStatus(database *db.DB) (MigrationStatus, error) {
-	if database == nil {
-		return MigrationStatus{}, fmt.Errorf("database cannot be nil")
+// InspectMigrationStatus inspects the BadgerDB node data and returns a MigrationStatus.
+func InspectMigrationStatus(badgerDB *db.DB) (MigrationStatus, error) {
+	if badgerDB == nil {
+		return MigrationStatus{}, fmt.Errorf("badgerDB cannot be nil")
 	}
 
 	status := MigrationStatus{}
 
-	if err := singleCount(database, "SELECT COUNT(*) FROM src_nodes", &status.SrcTotal); err != nil {
-		return MigrationStatus{}, err
+	// Count all src nodes
+	srcPrefix := db.PrefixForAllLevels("src")
+	srcTotal, err := badgerDB.CountByPrefix(srcPrefix)
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("failed to count src nodes: %w", err)
 	}
-	if err := singleCount(database, "SELECT COUNT(*) FROM dst_nodes", &status.DstTotal); err != nil {
-		return MigrationStatus{}, err
+	status.SrcTotal = srcTotal
+
+	// Count all dst nodes
+	dstPrefix := db.PrefixForAllLevels("dst")
+	dstTotal, err := badgerDB.CountByPrefix(dstPrefix)
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("failed to count dst nodes: %w", err)
+	}
+	status.DstTotal = dstTotal
+
+	// Count pending src nodes
+	srcPendingPrefix := db.PrefixForAllLevels("src")
+	var srcPendingCount int
+	err = badgerDB.IterateKeys(db.IteratorOptions{
+		Prefix: srcPendingPrefix,
+	}, func(key []byte) error {
+		keyStr := string(key)
+		// Check if key contains pending status
+		parts := splitKeyParts(keyStr)
+		if len(parts) >= 3 && parts[2] == db.TraversalStatusPending {
+			srcPendingCount++
+		}
+		return nil
+	})
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("failed to count pending src nodes: %w", err)
+	}
+	status.SrcPending = srcPendingCount
+
+	// Count pending dst nodes
+	dstPendingPrefix := db.PrefixForAllLevels("dst")
+	var dstPendingCount int
+	err = badgerDB.IterateKeys(db.IteratorOptions{
+		Prefix: dstPendingPrefix,
+	}, func(key []byte) error {
+		keyStr := string(key)
+		parts := splitKeyParts(keyStr)
+		if len(parts) >= 3 && parts[2] == db.TraversalStatusPending {
+			dstPendingCount++
+		}
+		return nil
+	})
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("failed to count pending dst nodes: %w", err)
+	}
+	status.DstPending = dstPendingCount
+
+	// Count failed src nodes
+	var srcFailedCount int
+	err = badgerDB.IterateKeys(db.IteratorOptions{
+		Prefix: srcPrefix,
+	}, func(key []byte) error {
+		keyStr := string(key)
+		parts := splitKeyParts(keyStr)
+		if len(parts) >= 3 && parts[2] == db.TraversalStatusFailed {
+			srcFailedCount++
+		}
+		return nil
+	})
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("failed to count failed src nodes: %w", err)
+	}
+	status.SrcFailed = srcFailedCount
+
+	// Count failed dst nodes
+	var dstFailedCount int
+	err = badgerDB.IterateKeys(db.IteratorOptions{
+		Prefix: dstPrefix,
+	}, func(key []byte) error {
+		keyStr := string(key)
+		parts := splitKeyParts(keyStr)
+		if len(parts) >= 3 && parts[2] == db.TraversalStatusFailed {
+			dstFailedCount++
+		}
+		return nil
+	})
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("failed to count failed dst nodes: %w", err)
+	}
+	status.DstFailed = dstFailedCount
+
+	// Find minimum pending depth for src
+	var minSrcDepth *int
+	err = badgerDB.IterateNodeStates(db.IteratorOptions{
+		Prefix: srcPrefix,
+	}, func(key []byte, state *db.NodeState) error {
+		keyStr := string(key)
+		parts := splitKeyParts(keyStr)
+		if len(parts) >= 3 && parts[2] == db.TraversalStatusPending {
+			if minSrcDepth == nil || state.Depth < *minSrcDepth {
+				d := state.Depth
+				minSrcDepth = &d
+			}
+		}
+		return nil
+	})
+	if err == nil && minSrcDepth != nil {
+		status.MinPendingDepthSrc = minSrcDepth
 	}
 
-	// When counting Pending, if 'initial' is true, only count those where depth_level != 0.
-	srcPendingQuery := "SELECT COUNT(*) FROM src_nodes WHERE traversal_status = 'Pending'"
-	dstPendingQuery := "SELECT COUNT(*) FROM dst_nodes WHERE traversal_status = 'Pending'"
-
-	if err := singleCount(database, srcPendingQuery, &status.SrcPending); err != nil {
-		return MigrationStatus{}, err
-	}
-	if err := singleCount(database, dstPendingQuery, &status.DstPending); err != nil {
-		return MigrationStatus{}, err
-	}
-
-	if err := singleCount(database, "SELECT COUNT(*) FROM src_nodes WHERE traversal_status = 'Failed'", &status.SrcFailed); err != nil {
-		return MigrationStatus{}, err
-	}
-	if err := singleCount(database, "SELECT COUNT(*) FROM dst_nodes WHERE traversal_status = 'Failed'", &status.DstFailed); err != nil {
-		return MigrationStatus{}, err
-	}
-
-	if depth, ok, err := singleMinInt(database, "SELECT MIN(depth_level) FROM src_nodes WHERE traversal_status = 'Pending'"); err != nil {
-		return MigrationStatus{}, err
-	} else if ok {
-		status.MinPendingDepthSrc = &depth
-	}
-
-	if depth, ok, err := singleMinInt(database, "SELECT MIN(depth_level) FROM dst_nodes WHERE traversal_status = 'Pending'"); err != nil {
-		return MigrationStatus{}, err
-	} else if ok {
-		status.MinPendingDepthDst = &depth
+	// Find minimum pending depth for dst
+	var minDstDepth *int
+	err = badgerDB.IterateNodeStates(db.IteratorOptions{
+		Prefix: dstPrefix,
+	}, func(key []byte, state *db.NodeState) error {
+		keyStr := string(key)
+		parts := splitKeyParts(keyStr)
+		if len(parts) >= 3 && parts[2] == db.TraversalStatusPending {
+			if minDstDepth == nil || state.Depth < *minDstDepth {
+				d := state.Depth
+				minDstDepth = &d
+			}
+		}
+		return nil
+	})
+	if err == nil && minDstDepth != nil {
+		status.MinPendingDepthDst = minDstDepth
 	}
 
 	return status, nil
 }
 
-// singleMinInt runs a MIN() query that may return NULL.
-// It returns (value, true, nil) when a non-null value exists,
-// (0, false, nil) when the result is NULL, or an error.
-func singleMinInt(database *db.DB, query string, args ...any) (int, bool, error) {
-	rows, err := database.Query(query, args...)
-	if err != nil {
-		return 0, false, err
+// splitKeyParts splits a BadgerDB key by colons.
+func splitKeyParts(key string) []string {
+	var parts []string
+	lastIdx := 0
+	for i, r := range key {
+		if r == ':' {
+			parts = append(parts, key[lastIdx:i])
+			lastIdx = i + 1
+		}
 	}
-	defer rows.Close()
-
-	if !rows.Next() {
-		return 0, false, nil
+	if lastIdx < len(key) {
+		parts = append(parts, key[lastIdx:])
 	}
-
-	var value *int
-	if err := rows.Scan(&value); err != nil {
-		return 0, false, err
-	}
-	if value == nil {
-		return 0, false, nil
-	}
-	return *value, true, nil
+	return parts
 }

@@ -1,6 +1,6 @@
 # Log Service Package
 
-The **Log Service** package provides asynchronous, dual-channel logging for the migration engine. It combines **real-time UDP logging** for live monitoring with **SQLite persistence** for audit trails and analysis.
+The **Log Service** package provides asynchronous, dual-channel logging for the migration engine. It combines **real-time UDP logging** for live monitoring with **BadgerDB persistence** for audit trails and analysis.
 
 ---
 
@@ -9,11 +9,11 @@ The **Log Service** package provides asynchronous, dual-channel logging for the 
 The log service uses a two-channel approach:
 
 1. **UDP Channel**: Real-time log streaming to a listener terminal (optional, filtered by log level)
-2. **Database Channel**: Persistent storage in SQLite via a buffered writer (all logs, always enabled)
+2. **Database Channel**: Persistent storage in BadgerDB via a buffered writer (all logs, always enabled)
 
 This design provides:
 - **Low-latency monitoring**: UDP logs appear instantly in a separate terminal
-- **Complete audit trail**: All logs are persisted to the database for later analysis
+- **Complete audit trail**: All logs are persisted to BadgerDB for later analysis
 - **Performance**: Buffered database writes minimize I/O overhead
 - **Flexibility**: UDP threshold can be adjusted to control real-time verbosity
 
@@ -28,13 +28,13 @@ Application Code
     ↓
 LogService.Sender
     ├─→ UDP Socket (filtered by level) ──→ Listener Terminal
-    └─→ LogBuffer ──→ SQLite Database
+    └─→ LogBuffer ──→ BadgerDB
 ```
 
 ### Components
 
 - **`Sender`**: Transmits logs over UDP and queues them for database writes
-- **`LogBuffer`**: Batches log entries and flushes to SQLite periodically
+- **`LogBuffer`**: Batches log entries and flushes to BadgerDB periodically
 - **`RunListener`**: UDP listener that displays logs in real-time
 - **`StartListener`**: Spawns a new terminal window running the listener
 
@@ -56,13 +56,13 @@ if err := logservice.StartListener("127.0.0.1:8081"); err != nil {
 time.Sleep(2 * time.Second) // Give listener time to start
 
 // Initialize global logger
-if err := logservice.InitGlobalLogger(database, "127.0.0.1:8081", "info"); err != nil {
+if err := logservice.InitGlobalLogger(badgerDB, "127.0.0.1:8081", "info"); err != nil {
     return fmt.Errorf("failed to initialize logger: %w", err)
 }
 ```
 
 **Parameters:**
-- `database`: SQLite database instance (for persistence)
+- `badgerDB`: BadgerDB instance (for persistence)
 - `"127.0.0.1:8081"`: UDP address for real-time logging
 - `"info"`: Minimum log level for UDP output (trace/debug/info/warning/error/critical)
 
@@ -108,7 +108,7 @@ Log levels are ordered by priority:
 
 **UDP Filtering:**
 - Only logs at or above the threshold level are sent over UDP
-- All logs are always written to the database regardless of level
+- All logs are always written to BadgerDB regardless of level
 
 **Example:**
 - Threshold: `"info"` → UDP receives: `info`, `warning`, `error`, `critical`
@@ -168,11 +168,11 @@ if err := logservice.RunListener("127.0.0.1:8081"); err != nil {
 
 ---
 
-## Database Persistence
+## BadgerDB Persistence
 
 ### Log Buffer
 
-All logs are written to the SQLite `logs` table via a buffered writer (`db.LogBuffer`):
+All logs are written to BadgerDB via a buffered writer (`db.LogBuffer`):
 
 **Buffer Configuration:**
 - **Batch Size**: 500 entries (configurable)
@@ -184,42 +184,61 @@ All logs are written to the SQLite `logs` table via a buffered writer (`db.LogBu
 - Improves performance during high-volume logging
 - Ensures no logs are lost (flushes on shutdown)
 
-### Schema
+### Key Format
 
-The `logs` table structure:
+Logs are stored in BadgerDB with keys in the format: `log:{level}:{uuid}`
 
-```sql
-CREATE TABLE logs (
-    id VARCHAR PRIMARY KEY,
-    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    level VARCHAR NOT NULL CHECK(level IN ('trace', 'debug', 'info', 'warning', 'error', 'critical')),
-    entity VARCHAR DEFAULT NULL,
-    entity_id VARCHAR DEFAULT NULL,
-    details VARCHAR DEFAULT NULL,
-    message VARCHAR NOT NULL,
-    queue VARCHAR DEFAULT NULL
-)
+**Examples:**
+- `log:info:550e8400-e29b-41d4-a716-446655440000`
+- `log:error:6ba7b810-9dad-11d1-80b4-00c04fd430c8`
+
+Each log entry is stored as JSON with the following structure:
+
+```json
+{
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "timestamp": "2025-01-03T15:30:22.123456789Z",
+    "level": "info",
+    "entity": "worker",
+    "entity_id": "worker-1",
+    "details": null,
+    "message": "Worker started",
+    "queue": "src"
+}
 ```
 
 ### Querying Logs
 
-Query logs directly from SQLite:
+Query logs from BadgerDB using prefix iteration:
 
-```sql
--- Get all error logs
-SELECT * FROM logs WHERE level = 'error' ORDER BY timestamp DESC;
+```go
+import "github.com/Project-Sylos/Migration-Engine/pkg/db"
 
--- Get logs from a specific worker
-SELECT * FROM logs WHERE entity = 'worker' AND entity_id = 'worker-1';
+// Get all error logs
+prefix := db.PrefixLogByLevel("error")
+err := badgerDB.IterateKeyValues(db.IteratorOptions{
+    Prefix: prefix,
+}, func(key []byte, value []byte) error {
+    entry, err := db.DeserializeLogEntry(value)
+    if err != nil {
+        return err
+    }
+    fmt.Printf("Error: %s\n", entry.Message)
+    return nil
+})
 
--- Get logs for a specific queue
-SELECT * FROM logs WHERE queue = 'src' ORDER BY timestamp;
-
--- Get recent critical errors
-SELECT * FROM logs 
-WHERE level = 'critical' 
-ORDER BY timestamp DESC 
-LIMIT 10;
+// Get all logs
+prefix = db.PrefixLogAll()
+err = badgerDB.IterateKeyValues(db.IteratorOptions{
+    Prefix: prefix,
+}, func(key []byte, value []byte) error {
+    entry, err := db.DeserializeLogEntry(value)
+    if err != nil {
+        return err
+    }
+    fmt.Printf("[%s] %s: %s\n", entry.Level, entry.Entity, entry.Message)
+    return nil
+})
 ```
 
 ---
@@ -339,7 +358,7 @@ defer func() {
 ```
 
 This ensures:
-- All buffered logs are flushed to the database
+- All buffered logs are flushed to BadgerDB
 - UDP connection is closed cleanly
 - Background goroutines are stopped
 
@@ -360,12 +379,12 @@ Potential enhancements:
 ## Summary
 
 The log service provides:
-- ✅ **Dual-Channel Logging**: UDP for real-time + SQLite for persistence
+- ✅ **Dual-Channel Logging**: UDP for real-time + BadgerDB for persistence
 - ✅ **Performance**: Buffered database writes minimize I/O overhead
 - ✅ **Flexibility**: Configurable log level thresholds for UDP
 - ✅ **Thread Safety**: Safe for concurrent use from multiple goroutines
 - ✅ **Integration**: Seamlessly integrated throughout the migration engine
-- ✅ **Queryability**: SQLite logs enable powerful analysis and debugging
+- ✅ **Queryability**: BadgerDB logs enable powerful analysis and debugging
 - ✅ **Zero Configuration**: Automatic terminal spawning on startup
 
 This logging system enables both real-time monitoring during execution and comprehensive post-mortem analysis of migration runs.

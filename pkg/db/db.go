@@ -4,354 +4,199 @@
 package db
 
 import (
-	"context"
-	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
-	"sync"
 
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/dgraph-io/badger/v4"
 )
 
-// TableDef is implemented by every table definition struct in tables.go.
-type TableDef interface {
-	Name() string
-	Schema() string
-}
-
-// DB acts as the root database manager and table registry.
+// DB wraps BadgerDB instance with lifecycle management.
 type DB struct {
-	conn   *sql.DB
-	ctx    context.Context
-	cancel context.CancelFunc
-	mu     sync.Mutex
-	tables map[string]TableDef
+	db     *badger.DB
+	dbPath string
 }
 
-// NewDB opens a new DB connection and prepares the registry.
-func NewDB(dbPath string) (*DB, error) {
-	conn, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		return nil, err
+// Options for BadgerDB initialization
+type Options struct {
+	// Path is the path where BadgerDB will store its data.
+	// If empty, a temporary directory will be created.
+	Path string
+	// ValueLogFileSize is the size of the value log file in bytes.
+	// Default: 1GB
+	ValueLogFileSize int64
+}
+
+// DefaultOptions returns default options for BadgerDB.
+func DefaultOptions() Options {
+	return Options{
+		ValueLogFileSize: 1 << 30, // 1GB
+	}
+}
+
+// Open creates and opens a new BadgerDB instance.
+// The database will be created at the specified directory.
+// Call Close() when done to ensure proper cleanup.
+func Open(opts Options) (*DB, error) {
+	dbPath := opts.Path
+	if dbPath == "" {
+		// Create temporary directory
+		tmpDir, err := os.MkdirTemp("", "sylos-badger-*")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create temp directory: %w", err)
+		}
+		dbPath = tmpDir
+	} else {
+		// Ensure directory exists
+		if err := os.MkdirAll(dbPath, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create badger directory: %w", err)
+		}
 	}
 
-	// SQLite WAL mode configuration for concurrent reads + writes
-	conn.Exec("PRAGMA journal_mode = WAL;")
-	conn.Exec("PRAGMA synchronous = NORMAL;")
-	conn.Exec("PRAGMA temp_store = MEMORY;")
-	conn.Exec("PRAGMA foreign_keys = ON;")
+	badgerOpts := badger.DefaultOptions(dbPath)
+	badgerOpts.Logger = nil // Disable Badger's default logging (we'll use our own)
 
-	// Set the maximum number of open connections to 1
-	conn.SetMaxOpenConns(1)
-	// Set the maximum number of idle connections to 1
-	conn.SetMaxIdleConns(1)
+	// Set value log file size if specified
+	if opts.ValueLogFileSize > 0 {
+		badgerOpts.ValueLogFileSize = opts.ValueLogFileSize
+	}
+
+	badgerDB, err := badger.Open(badgerOpts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open badger db: %w", err)
+	}
 
 	return &DB{
-		conn:   conn,
-		ctx:    context.Background(),
-		cancel: func() {},
-		tables: make(map[string]TableDef),
+		db:     badgerDB,
+		dbPath: dbPath,
 	}, nil
 }
 
-// RegisterTable registers a schema object (e.g. LogsTable{}) and creates the table if needed.
-func (db *DB) RegisterTable(def TableDef) error {
-	name := def.Name()
-	schema := def.Schema()
-
-	if err := db.CreateTable(name, schema); err != nil {
-		return err
-	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	db.tables[name] = def
-	return nil
+// GetDB returns the underlying BadgerDB instance for direct operations.
+func (db *DB) GetDB() *badger.DB {
+	return db.db
 }
 
-// Checkpoint checkpoints the SQLite WAL file and truncates it.
-// This ensures all changes in the WAL are written to the main database file.
-// Should be called before closing the database connection for force shutdown.
-func (db *DB) Checkpoint() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	// PRAGMA wal_checkpoint(TRUNCATE) checkpoints the WAL and truncates it
-	// Returns: busy, log, checkpointed (three integers)
-	// We don't need to check the return values - the checkpoint either succeeds or fails
-	_, err := db.conn.ExecContext(db.ctx, "PRAGMA wal_checkpoint(TRUNCATE);")
-	if err != nil {
-		return fmt.Errorf("failed to checkpoint WAL: %w", err)
-	}
-	return nil
-}
-
-// Close gracefully closes the DB connection.
+// Close closes the BadgerDB instance.
+// This does NOT delete the database directory.
 func (db *DB) Close() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.conn.Close()
-}
-
-// Query executes a SQL query and returns rows.
-func (db *DB) Query(query string, args ...any) (*sql.Rows, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.conn.QueryContext(db.ctx, query, args...)
-}
-
-// Write performs a direct INSERT into the specified table.
-func (db *DB) Write(table string, args ...any) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	colCount := len(args)
-
-	// Begin transaction
-	tx, err := db.conn.BeginTx(db.ctx, nil)
-	if err != nil {
-		fmt.Printf("[DB ERROR] Failed to begin transaction: %v\n", err)
-		return err
-	}
-	defer func() {
-		if p := recover(); p != nil {
-			_ = tx.Rollback()
-			panic(p)
-		}
-	}()
-
-	query := "INSERT OR IGNORE INTO " + table + " VALUES " + buildPlaceholderGroup(colCount)
-
-	res, err := tx.ExecContext(db.ctx, query, args...)
-	if err != nil {
-		_ = tx.Rollback()
-		fmt.Printf("[DB ERROR] Failed to insert into %s: %v\nQuery: %s\nArgs: %v\n", table, err, query, args)
-		return err
-	}
-
-	if n, _ := res.RowsAffected(); n == 0 {
-		// fmt.Printf("[DB WARN] Insert into %s affected 0 rows (query may have been ignored)\nQuery: %s\nArgs: %v\n", table, query, args)
-	}
-
-	if err := tx.Commit(); err != nil {
-		fmt.Printf("[DB ERROR] Failed to commit transaction for insert into %s: %v\n", table, err)
-		return err
-	}
-
-	return nil
-}
-
-// BulkWrite inserts multiple rows into a table in batched statements to respect SQLite's
-// maximum variable limit. Each inner slice in rows is a full row of column values.
-func (db *DB) BulkWrite(table string, rows [][]any) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if len(rows) == 0 {
+	if db.db == nil {
 		return nil
 	}
+	return db.db.Close()
+}
 
-	colCount := len(rows[0])
-	for i, row := range rows {
-		if len(row) != colCount {
-			return fmt.Errorf("[DB ERROR] BulkWrite: row %d has %d columns, expected %d", i, len(row), colCount)
+// Cleanup closes the database and deletes the entire database directory.
+// This should be called after ETL #2 completes to remove ephemeral data.
+func (db *DB) Cleanup() error {
+	if db.db != nil {
+		if err := db.db.Close(); err != nil {
+			return fmt.Errorf("failed to close badger db: %w", err)
+		}
+		db.db = nil
+	}
+
+	if db.dbPath != "" {
+		if err := os.RemoveAll(db.dbPath); err != nil {
+			return fmt.Errorf("failed to remove badger directory: %w", err)
 		}
 	}
 
-	// SQLite has a default maximum of 999 variables per statement. To avoid
-	// "too many SQL variables" errors, we cap the number of rows per statement
-	// both by a hard row limit and by the variable limit.
-	// This obviously slows down pure performance in terms of DB writes...
-	// but it's necessary for SQLite to actually write our data successfully.
-	const (
-		sqliteMaxVariables = 999
-		maxRowsPerBatch    = 100
-	)
+	return nil
+}
 
-	maxByVars := sqliteMaxVariables / colCount
-	if maxByVars <= 0 {
-		maxByVars = 1
-	}
-	batchSize := maxByVars
-	if batchSize > maxRowsPerBatch {
-		batchSize = maxRowsPerBatch
-	}
+// Path returns the path to the BadgerDB directory.
+func (db *DB) Path() string {
+	return db.dbPath
+}
 
-	// Process rows in batches.
-	for start := 0; start < len(rows); start += batchSize {
-		end := start + batchSize
-		if end > len(rows) {
-			end = len(rows)
-		}
-		chunk := rows[start:end]
+// Update executes a read-write transaction.
+func (db *DB) Update(fn func(*badger.Txn) error) error {
+	return db.db.Update(fn)
+}
 
-		// Begin transaction for this chunk
-		tx, err := db.conn.BeginTx(db.ctx, nil)
+// View executes a read-only transaction.
+func (db *DB) View(fn func(*badger.Txn) error) error {
+	return db.db.View(fn)
+}
+
+// Get retrieves a value by key.
+func (db *DB) Get(key []byte) ([]byte, error) {
+	var value []byte
+	err := db.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(key)
 		if err != nil {
-			fmt.Printf("[DB ERROR] Failed to begin transaction: %v\n", err)
 			return err
 		}
-
-		func() {
-			defer func() {
-				if p := recover(); p != nil {
-					_ = tx.Rollback()
-					panic(p)
-				}
-			}()
-
-			// Build "(?, ?, ?), (?, ?, ?), ..." placeholder string for this chunk
-			group := buildPlaceholderGroup(colCount)
-			var groups []string
-			for range chunk {
-				groups = append(groups, group)
-			}
-
-			query := fmt.Sprintf("INSERT OR IGNORE INTO %s VALUES %s", table, strings.Join(groups, ", "))
-
-			// Flatten [][]any into []any for Exec()
-			allArgs := make([]any, 0, len(chunk)*colCount)
-			for _, row := range chunk {
-				allArgs = append(allArgs, row...)
-			}
-
-			res, err := tx.ExecContext(db.ctx, query, allArgs...)
-			if err != nil {
-				_ = tx.Rollback()
-				fmt.Printf("[DB ERROR] Bulk insert into %s failed: %v\nQuery: %s\nArgs len: %d\n", table, err, query, len(allArgs))
-				return
-			}
-
-			if n, _ := res.RowsAffected(); n == 0 {
-				// print out the query and args it was trying to do for debugging purposes
-				// fmt.Printf("[DB DEBUG] Query: %s\nArgs: %v\n", query, allArgs)
-				// fmt.Printf("[DB WARN] Bulk insert into %s affected 0 rows (possible duplicates)\n", table)
-			}
-
-			if err := tx.Commit(); err != nil {
-				fmt.Printf("[DB ERROR] Failed to commit transaction for bulk insert into %s: %v\n", table, err)
-			}
-		}()
-	}
-
-	return nil
+		return item.Value(func(val []byte) error {
+			value = make([]byte, len(val))
+			copy(value, val)
+			return nil
+		})
+	})
+	return value, err
 }
 
-// buildPlaceholderGroup creates "(?, ?, ?)" etc.
-func buildPlaceholderGroup(n int) string {
-	if n <= 0 {
-		return "()"
-	}
-	s := "("
-	for i := 0; i < n; i++ {
-		if i > 0 {
-			s += ", "
+// Set stores a key-value pair.
+func (db *DB) Set(key, value []byte) error {
+	return db.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(key, value)
+	})
+}
+
+// Delete removes a key from the database.
+func (db *DB) Delete(key []byte) error {
+	return db.db.Update(func(txn *badger.Txn) error {
+		return txn.Delete(key)
+	})
+}
+
+// DeletePrefix deletes all keys with the given prefix.
+// This is used during pruning operations.
+func (db *DB) DeletePrefix(prefix []byte) error {
+	return db.db.Update(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = prefix
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			key := item.Key()
+			if err := txn.Delete(key); err != nil {
+				return err
+			}
 		}
-		s += "?"
-	}
-	s += ")"
-	return s
+		return nil
+	})
 }
 
-// CreateTable ensures a table exists.
-func (db *DB) CreateTable(name, schema string) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	query := "CREATE TABLE IF NOT EXISTS " + name + " (" + schema + ")"
-	_, err := db.conn.ExecContext(db.ctx, query)
-	return err
-}
-
-// Conn returns the underlying sql.DB connection for advanced usage.
-func (db *DB) Conn() *sql.DB {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.conn
-}
-
-// ValidateCoreSchema verifies that the core tables (src_nodes, dst_nodes, logs)
-// exist and have the expected columns, in the expected order, matching tables.go.
-// This is intentionally strict to avoid resuming on incompatible or modified DBs.
-func (db *DB) ValidateCoreSchema() error {
-	tables := []TableDef{
-		SrcNodesTable{},
-		DstNodesTable{},
-		LogsTable{},
-	}
-
-	for _, def := range tables {
-		cols := extractColumnNames(def.Schema())
-		if len(cols) == 0 {
-			return fmt.Errorf("schema validation: could not extract columns for table %s", def.Name())
+// Exists checks if a key exists in the database.
+func (db *DB) Exists(key []byte) (bool, error) {
+	var exists bool
+	err := db.db.View(func(txn *badger.Txn) error {
+		_, err := txn.Get(key)
+		if err == badger.ErrKeyNotFound {
+			exists = false
+			return nil
 		}
-		if err := db.validateTableColumns(def.Name(), cols); err != nil {
+		if err != nil {
 			return err
 		}
-	}
-	return nil
+		exists = true
+		return nil
+	})
+	return exists, err
 }
 
-// extractColumnNames parses a table schema definition and returns the ordered
-// list of column names. It assumes a simple "name TYPE ..." format per line,
-// matching the style used in tables.go, and ignores empty lines and comments.
-func extractColumnNames(schema string) []string {
-	var cols []string
-	lines := strings.Split(schema, "\n")
-	for _, raw := range lines {
-		line := strings.TrimSpace(raw)
-		if line == "" {
-			continue
-		}
-		// Trim trailing comma, if present.
-		line = strings.TrimSuffix(line, ",")
-		// Ignore lines that don't look like column definitions (e.g., constraints),
-		// which in our current schemas always start with an identifier.
-		parts := strings.Fields(line)
-		if len(parts) == 0 {
-			continue
-		}
-		name := parts[0]
-		cols = append(cols, name)
+// IsTemporary returns true if the database was created in a temporary directory.
+func (db *DB) IsTemporary() bool {
+	if db.dbPath == "" {
+		return false
 	}
-	return cols
-}
-
-// validateTableColumns introspects a table and ensures its columns match the expected
-// names and ordering exactly.
-func (db *DB) validateTableColumns(table string, expected []string) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	rows, err := db.conn.QueryContext(db.ctx, "PRAGMA table_info("+table+")")
-	if err != nil {
-		return fmt.Errorf("schema validation: failed to inspect table %s: %w", table, err)
-	}
-	defer rows.Close()
-
-	var actual []string
-	for rows.Next() {
-		var cid int
-		var name, ctype string
-		var notnull, pk int
-		var dflt sql.NullString
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			return fmt.Errorf("schema validation: failed to read column metadata for table %s: %w", table, err)
-		}
-		actual = append(actual, name)
-	}
-
-	if len(actual) == 0 {
-		return fmt.Errorf("schema validation: table %s does not exist or has no columns", table)
-	}
-	if len(actual) != len(expected) {
-		return fmt.Errorf("schema validation: table %s has %d columns, expected %d", table, len(actual), len(expected))
-	}
-	for i, name := range expected {
-		if actual[i] != name {
-			return fmt.Errorf("schema validation: table %s column %d is %q, expected %q", table, i, actual[i], name)
-		}
-	}
-	return nil
+	// Check if path contains "temp" (typical for os.MkdirTemp)
+	return filepath.Base(filepath.Dir(db.dbPath)) == "temp" ||
+		filepath.Base(db.dbPath) == "temp" ||
+		strings.HasPrefix(db.dbPath, os.TempDir())
 }
