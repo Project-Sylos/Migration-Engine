@@ -9,77 +9,107 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/dgraph-io/badger/v4"
+	bolt "go.etcd.io/bbolt"
 )
 
-// DB wraps BadgerDB instance with lifecycle management.
+// DB wraps BoltDB instance with lifecycle management.
 type DB struct {
-	db     *badger.DB
+	db     *bolt.DB
 	dbPath string
 }
 
-// Options for BadgerDB initialization
+// Options for BoltDB initialization
 type Options struct {
-	// Path is the path where BadgerDB will store its data.
+	// Path is the path where BoltDB will store its data.
 	// If empty, a temporary directory will be created.
 	Path string
-	// ValueLogFileSize is the size of the value log file in bytes.
-	// Default: 1GB
-	ValueLogFileSize int64
 }
 
-// DefaultOptions returns default options for BadgerDB.
+// DefaultOptions returns default options for BoltDB.
 func DefaultOptions() Options {
-	return Options{
-		ValueLogFileSize: 1 << 30, // 1GB
-	}
+	return Options{}
 }
 
-// Open creates and opens a new BadgerDB instance.
-// The database will be created at the specified directory.
+// Open creates and opens a new BoltDB instance.
+// The database will be created at the specified path.
 // Call Close() when done to ensure proper cleanup.
 func Open(opts Options) (*DB, error) {
 	dbPath := opts.Path
 	if dbPath == "" {
 		// Create temporary directory
-		tmpDir, err := os.MkdirTemp("", "sylos-badger-*")
+		tmpDir, err := os.MkdirTemp("", "sylos-bolt-*")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create temp directory: %w", err)
 		}
-		dbPath = tmpDir
+		dbPath = filepath.Join(tmpDir, "migration.db")
 	} else {
 		// Ensure directory exists
-		if err := os.MkdirAll(dbPath, 0755); err != nil {
-			return nil, fmt.Errorf("failed to create badger directory: %w", err)
+		dir := filepath.Dir(dbPath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create bolt directory: %w", err)
 		}
 	}
 
-	badgerOpts := badger.DefaultOptions(dbPath)
-	badgerOpts.Logger = nil // Disable Badger's default logging (we'll use our own)
-
-	// Set value log file size if specified
-	if opts.ValueLogFileSize > 0 {
-		badgerOpts.ValueLogFileSize = opts.ValueLogFileSize
-	}
-
-	badgerDB, err := badger.Open(badgerOpts)
+	// Open Bolt database
+	boltDB, err := bolt.Open(dbPath, 0600, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open badger db: %w", err)
+		return nil, fmt.Errorf("failed to open bolt db: %w", err)
 	}
 
-	return &DB{
-		db:     badgerDB,
+	database := &DB{
+		db:     boltDB,
 		dbPath: dbPath,
-	}, nil
+	}
+
+	// Initialize bucket structure
+	if err := database.initializeBuckets(); err != nil {
+		boltDB.Close()
+		return nil, fmt.Errorf("failed to initialize buckets: %w", err)
+	}
+
+	return database, nil
 }
 
-// GetDB returns the underlying BadgerDB instance for direct operations.
-func (db *DB) GetDB() *badger.DB {
+// initializeBuckets creates the core bucket structure for migration data.
+// This is called once when the database is first opened.
+func (db *DB) initializeBuckets() error {
+	return db.Update(func(tx *bolt.Tx) error {
+		// Create top-level buckets
+		for _, topLevel := range []string{"SRC", "DST", "LOGS"} {
+			bucket, err := tx.CreateBucketIfNotExists([]byte(topLevel))
+			if err != nil {
+				return fmt.Errorf("failed to create %s bucket: %w", topLevel, err)
+			}
+
+			// For SRC and DST, create sub-buckets
+			if topLevel == "SRC" || topLevel == "DST" {
+				// Create nodes bucket
+				if _, err := bucket.CreateBucketIfNotExists([]byte("nodes")); err != nil {
+					return fmt.Errorf("failed to create %s/nodes bucket: %w", topLevel, err)
+				}
+
+				// Create children bucket
+				if _, err := bucket.CreateBucketIfNotExists([]byte("children")); err != nil {
+					return fmt.Errorf("failed to create %s/children bucket: %w", topLevel, err)
+				}
+
+				// Create levels bucket (individual level buckets created on demand)
+				if _, err := bucket.CreateBucketIfNotExists([]byte("levels")); err != nil {
+					return fmt.Errorf("failed to create %s/levels bucket: %w", topLevel, err)
+				}
+			}
+		}
+		return nil
+	})
+}
+
+// GetDB returns the underlying BoltDB instance for direct operations.
+func (db *DB) GetDB() *bolt.DB {
 	return db.db
 }
 
-// Close closes the BadgerDB instance.
-// This does NOT delete the database directory.
+// Close closes the BoltDB instance.
+// This does NOT delete the database file.
 func (db *DB) Close() error {
 	if db.db == nil {
 		return nil
@@ -87,104 +117,90 @@ func (db *DB) Close() error {
 	return db.db.Close()
 }
 
-// Cleanup closes the database and deletes the entire database directory.
+// Cleanup closes the database and deletes the entire database file.
 // This should be called after ETL #2 completes to remove ephemeral data.
 func (db *DB) Cleanup() error {
 	if db.db != nil {
 		if err := db.db.Close(); err != nil {
-			return fmt.Errorf("failed to close badger db: %w", err)
+			return fmt.Errorf("failed to close bolt db: %w", err)
 		}
 		db.db = nil
 	}
 
 	if db.dbPath != "" {
-		if err := os.RemoveAll(db.dbPath); err != nil {
-			return fmt.Errorf("failed to remove badger directory: %w", err)
+		if err := os.Remove(db.dbPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to remove bolt database: %w", err)
 		}
 	}
 
 	return nil
 }
 
-// Path returns the path to the BadgerDB directory.
+// Path returns the path to the BoltDB file.
 func (db *DB) Path() string {
 	return db.dbPath
 }
 
 // Update executes a read-write transaction.
-func (db *DB) Update(fn func(*badger.Txn) error) error {
+func (db *DB) Update(fn func(*bolt.Tx) error) error {
 	return db.db.Update(fn)
 }
 
 // View executes a read-only transaction.
-func (db *DB) View(fn func(*badger.Txn) error) error {
+func (db *DB) View(fn func(*bolt.Tx) error) error {
 	return db.db.View(fn)
 }
 
-// Get retrieves a value by key.
-func (db *DB) Get(key []byte) ([]byte, error) {
+// Get retrieves a value by key from a bucket path.
+// bucketPath should be like []string{"SRC", "nodes"}.
+func (db *DB) Get(bucketPath []string, key []byte) ([]byte, error) {
 	var value []byte
-	err := db.db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get(key)
-		if err != nil {
-			return err
+	err := db.View(func(tx *bolt.Tx) error {
+		bucket := getBucket(tx, bucketPath)
+		if bucket == nil {
+			return fmt.Errorf("bucket not found: %v", bucketPath)
 		}
-		return item.Value(func(val []byte) error {
+		val := bucket.Get(key)
+		if val != nil {
 			value = make([]byte, len(val))
 			copy(value, val)
-			return nil
-		})
+		}
+		return nil
 	})
 	return value, err
 }
 
-// Set stores a key-value pair.
-func (db *DB) Set(key, value []byte) error {
-	return db.db.Update(func(txn *badger.Txn) error {
-		return txn.Set(key, value)
-	})
-}
-
-// Delete removes a key from the database.
-func (db *DB) Delete(key []byte) error {
-	return db.db.Update(func(txn *badger.Txn) error {
-		return txn.Delete(key)
-	})
-}
-
-// DeletePrefix deletes all keys with the given prefix.
-// This is used during pruning operations.
-func (db *DB) DeletePrefix(prefix []byte) error {
-	return db.db.Update(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.Prefix = prefix
-		it := txn.NewIterator(opts)
-		defer it.Close()
-
-		for it.Rewind(); it.Valid(); it.Next() {
-			item := it.Item()
-			key := item.Key()
-			if err := txn.Delete(key); err != nil {
-				return err
-			}
+// Set stores a key-value pair in a bucket.
+func (db *DB) Set(bucketPath []string, key, value []byte) error {
+	return db.Update(func(tx *bolt.Tx) error {
+		bucket := getBucket(tx, bucketPath)
+		if bucket == nil {
+			return fmt.Errorf("bucket not found: %v", bucketPath)
 		}
-		return nil
+		return bucket.Put(key, value)
 	})
 }
 
-// Exists checks if a key exists in the database.
-func (db *DB) Exists(key []byte) (bool, error) {
+// Delete removes a key from a bucket.
+func (db *DB) Delete(bucketPath []string, key []byte) error {
+	return db.Update(func(tx *bolt.Tx) error {
+		bucket := getBucket(tx, bucketPath)
+		if bucket == nil {
+			return fmt.Errorf("bucket not found: %v", bucketPath)
+		}
+		return bucket.Delete(key)
+	})
+}
+
+// Exists checks if a key exists in a bucket.
+func (db *DB) Exists(bucketPath []string, key []byte) (bool, error) {
 	var exists bool
-	err := db.db.View(func(txn *badger.Txn) error {
-		_, err := txn.Get(key)
-		if err == badger.ErrKeyNotFound {
-			exists = false
-			return nil
+	err := db.View(func(tx *bolt.Tx) error {
+		bucket := getBucket(tx, bucketPath)
+		if bucket == nil {
+			return fmt.Errorf("bucket not found: %v", bucketPath)
 		}
-		if err != nil {
-			return err
-		}
-		exists = true
+		exists = bucket.Get(key) != nil
 		return nil
 	})
 	return exists, err
@@ -195,8 +211,49 @@ func (db *DB) IsTemporary() bool {
 	if db.dbPath == "" {
 		return false
 	}
-	// Check if path contains "temp" (typical for os.MkdirTemp)
-	return filepath.Base(filepath.Dir(db.dbPath)) == "temp" ||
-		filepath.Base(db.dbPath) == "temp" ||
-		strings.HasPrefix(db.dbPath, os.TempDir())
+	return strings.Contains(db.dbPath, os.TempDir()) ||
+		strings.Contains(filepath.Base(filepath.Dir(db.dbPath)), "sylos-bolt-")
+}
+
+// getBucket navigates to a nested bucket given a path.
+// Returns nil if any bucket in the path doesn't exist.
+func getBucket(tx *bolt.Tx, bucketPath []string) *bolt.Bucket {
+	if len(bucketPath) == 0 {
+		return nil
+	}
+
+	bucket := tx.Bucket([]byte(bucketPath[0]))
+	if bucket == nil {
+		return nil
+	}
+
+	for i := 1; i < len(bucketPath); i++ {
+		bucket = bucket.Bucket([]byte(bucketPath[i]))
+		if bucket == nil {
+			return nil
+		}
+	}
+
+	return bucket
+}
+
+// getOrCreateBucket navigates to a nested bucket, creating buckets as needed.
+func getOrCreateBucket(tx *bolt.Tx, bucketPath []string) (*bolt.Bucket, error) {
+	if len(bucketPath) == 0 {
+		return nil, fmt.Errorf("empty bucket path")
+	}
+
+	bucket, err := tx.CreateBucketIfNotExists([]byte(bucketPath[0]))
+	if err != nil {
+		return nil, err
+	}
+
+	for i := 1; i < len(bucketPath); i++ {
+		bucket, err = bucket.CreateBucketIfNotExists([]byte(bucketPath[i]))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return bucket, nil
 }

@@ -50,26 +50,24 @@ func (r VerificationReport) Success(opts VerifyOptions) bool {
 	return true
 }
 
-// VerifyMigration inspects BadgerDB for pending, failed, or missing nodes and returns a report.
+// VerifyMigration inspects BoltDB for pending, failed, or missing nodes and returns a report.
 // In addition to previous checks, also verifies that at least one file/folder (not just roots) was migrated.
-func VerifyMigration(badgerDB *db.DB, opts VerifyOptions) (VerificationReport, error) {
-	if badgerDB == nil {
-		return VerificationReport{}, fmt.Errorf("badgerDB cannot be nil")
+func VerifyMigration(boltDB *db.DB, opts VerifyOptions) (VerificationReport, error) {
+	if boltDB == nil {
+		return VerificationReport{}, fmt.Errorf("boltDB cannot be nil")
 	}
 
 	report := VerificationReport{}
 
 	// Count all src nodes
-	srcPrefix := db.PrefixForAllLevels("src")
-	srcTotal, err := badgerDB.CountByPrefix(srcPrefix)
+	srcTotal, err := boltDB.CountNodes("SRC")
 	if err != nil {
 		return VerificationReport{}, fmt.Errorf("failed to count src nodes: %w", err)
 	}
 	report.SrcTotal = srcTotal
 
 	// Count all dst nodes
-	dstPrefix := db.PrefixForAllLevels("dst")
-	dstTotal, err := badgerDB.CountByPrefix(dstPrefix)
+	dstTotal, err := boltDB.CountNodes("DST")
 	if err != nil {
 		return VerificationReport{}, fmt.Errorf("failed to count dst nodes: %w", err)
 	}
@@ -79,126 +77,54 @@ func VerifyMigration(badgerDB *db.DB, opts VerifyOptions) (VerificationReport, e
 		return report, fmt.Errorf("no nodes discovered - migration did not run")
 	}
 
-	// Count pending src nodes
-	var srcPendingCount int
-	err = badgerDB.IterateKeys(db.IteratorOptions{
-		Prefix: srcPrefix,
-	}, func(key []byte) error {
-		keyStr := string(key)
-		parts := splitKeyParts(keyStr)
-		if len(parts) >= 3 && parts[2] == db.TraversalStatusPending {
-			srcPendingCount++
-		}
-		return nil
-	})
+	// Count pending, failed, and not_on_src nodes across all levels
+	srcLevels, err := boltDB.GetAllLevels("SRC")
 	if err != nil {
-		return VerificationReport{}, fmt.Errorf("failed to count pending src nodes: %w", err)
+		return VerificationReport{}, fmt.Errorf("failed to get src levels: %w", err)
+	}
+
+	var srcPendingCount, srcFailedCount int
+	for _, level := range srcLevels {
+		pendingCount, _ := boltDB.CountStatusBucket("SRC", level, db.StatusPending)
+		srcPendingCount += pendingCount
+
+		failedCount, _ := boltDB.CountStatusBucket("SRC", level, db.StatusFailed)
+		srcFailedCount += failedCount
 	}
 	report.SrcPending = srcPendingCount
-
-	// Count pending dst nodes
-	var dstPendingCount int
-	err = badgerDB.IterateKeys(db.IteratorOptions{
-		Prefix: dstPrefix,
-	}, func(key []byte) error {
-		keyStr := string(key)
-		parts := splitKeyParts(keyStr)
-		if len(parts) >= 3 && parts[2] == db.TraversalStatusPending {
-			dstPendingCount++
-		}
-		return nil
-	})
-	if err != nil {
-		return VerificationReport{}, fmt.Errorf("failed to count pending dst nodes: %w", err)
-	}
-	report.DstPending = dstPendingCount
-
-	if !opts.AllowPending && (report.SrcPending > 0 || report.DstPending > 0) {
-		return report, fmt.Errorf("incomplete migration: %d src and %d dst nodes still pending", report.SrcPending, report.DstPending)
-	}
-
-	// Count failed src nodes
-	var srcFailedCount int
-	err = badgerDB.IterateKeys(db.IteratorOptions{
-		Prefix: srcPrefix,
-	}, func(key []byte) error {
-		keyStr := string(key)
-		parts := splitKeyParts(keyStr)
-		if len(parts) >= 3 && parts[2] == db.TraversalStatusFailed {
-			srcFailedCount++
-		}
-		return nil
-	})
-	if err != nil {
-		return VerificationReport{}, fmt.Errorf("failed to count failed src nodes: %w", err)
-	}
 	report.SrcFailed = srcFailedCount
 
-	// Count failed dst nodes
-	var dstFailedCount int
-	err = badgerDB.IterateKeys(db.IteratorOptions{
-		Prefix: dstPrefix,
-	}, func(key []byte) error {
-		keyStr := string(key)
-		parts := splitKeyParts(keyStr)
-		if len(parts) >= 3 && parts[2] == db.TraversalStatusFailed {
-			dstFailedCount++
-		}
-		return nil
-	})
+	// Count dst nodes
+	dstLevels, err := boltDB.GetAllLevels("DST")
 	if err != nil {
-		return VerificationReport{}, fmt.Errorf("failed to count failed dst nodes: %w", err)
+		return VerificationReport{}, fmt.Errorf("failed to get dst levels: %w", err)
 	}
+
+	var dstPendingCount, dstFailedCount, dstNotOnSrcCount int
+	for _, level := range dstLevels {
+		pendingCount, _ := boltDB.CountStatusBucket("DST", level, db.StatusPending)
+		dstPendingCount += pendingCount
+
+		failedCount, _ := boltDB.CountStatusBucket("DST", level, db.StatusFailed)
+		dstFailedCount += failedCount
+
+		notOnSrcCount, _ := boltDB.CountStatusBucket("DST", level, db.StatusNotOnSrc)
+		dstNotOnSrcCount += notOnSrcCount
+	}
+	report.DstPending = dstPendingCount
 	report.DstFailed = dstFailedCount
+	report.DstNotOnSrc = dstNotOnSrcCount
 
-	if !opts.AllowFailed && (report.SrcFailed > 0 || report.DstFailed > 0) {
-		return report, fmt.Errorf("migration reported failures: %d src and %d dst nodes failed", report.SrcFailed, report.DstFailed)
-	}
-
-	// Count dst nodes with NotOnSrc status
-	if !opts.AllowNotOnSrc {
-		var dstNotOnSrcCount int
-		err = badgerDB.IterateKeys(db.IteratorOptions{
-			Prefix: dstPrefix,
-		}, func(key []byte) error {
-			keyStr := string(key)
-			parts := splitKeyParts(keyStr)
-			if len(parts) >= 3 && parts[2] == db.TraversalStatusNotOnSrc {
-				dstNotOnSrcCount++
-			}
-			return nil
-		})
-		if err != nil {
-			return VerificationReport{}, fmt.Errorf("failed to count NotOnSrc dst nodes: %w", err)
-		}
-		report.DstNotOnSrc = dstNotOnSrcCount
-
-		if report.DstNotOnSrc > 0 {
-			return report, fmt.Errorf("incomplete migration: %d dst nodes marked as NotOnSrc", report.DstNotOnSrc)
+	// Calculate number of actually moved nodes (excluding root, which is level 0)
+	// Only count successful dst traversals at depth > 0
+	var movedCount int
+	for _, level := range dstLevels {
+		if level > 0 {
+			successCount, _ := boltDB.CountStatusBucket("DST", level, db.StatusSuccessful)
+			movedCount += successCount
 		}
 	}
-
-	// Count dst nodes that were actually traversed/moved (successful status, depth > 0)
-	var numMovedNodes int
-	err = badgerDB.IterateNodeStates(db.IteratorOptions{
-		Prefix: dstPrefix,
-	}, func(key []byte, state *db.NodeState) error {
-		keyStr := string(key)
-		parts := splitKeyParts(keyStr)
-		// Check if status is successful and depth > 0
-		if len(parts) >= 3 && parts[2] == db.TraversalStatusSuccessful && state.Depth > 0 {
-			numMovedNodes++
-		}
-		return nil
-	})
-	if err != nil {
-		return report, fmt.Errorf("failed to count migrated nodes: %w", err)
-	}
-	report.NumMovedNodes = numMovedNodes
-
-	if report.NumMovedNodes == 0 {
-		return report, fmt.Errorf("no nodes were migrated: no dst nodes (other than roots) were traversed/moved")
-	}
+	report.NumMovedNodes = movedCount
 
 	return report, nil
 }

@@ -2,58 +2,114 @@
 
 ## Overview
 
-The database package provides a unified interface for storing and retrieving migration data using **BadgerDB**, a fast, embedded key-value store. All node metadata, traversal state, and logs are stored directly in BadgerDB using a structured key format.
+The database package provides a unified interface for storing and retrieving migration data using **BoltDB**, a fast, embedded key-value store. All node metadata, traversal state, and logs are stored using a structured bucket hierarchy.
 
 ---
 
-## Why BadgerDB?
+## Why BoltDB?
 
-BadgerDB is an embedded key-value store written in Go, designed for high performance and reliability:
+BoltDB is an embedded key-value store written in Go, designed for simplicity and reliability:
 
-1. **High Performance** – BadgerDB is optimized for fast writes and reads, making it ideal for the queue system's high-throughput operations.
-2. **Embedded** – No external dependencies or services required; runs entirely within the application process.
-3. **ACID Transactions** – Provides transactional guarantees for data consistency.
-4. **Efficient Iteration** – Supports prefix-based iteration for efficient querying of related data.
-5. **Crash Resilience** – Data is persisted to disk, enabling recovery after crashes.
-6. **Simple API** – Clean, straightforward API that fits well with Go's concurrency model.
+1. **Single-Writer Architecture** – One writer guarantees consistency; no race conditions
+2. **Bucket Hierarchies** – Natural support for organizing data by structure
+3. **Atomic Transactions** – Single B-tree provides ACID guarantees with simple transaction semantics
+4. **Predictable Performance** – No background compaction; deterministic read/write behavior
+5. **Embedded** – No external dependencies or services required; runs entirely within the application
+6. **Crash Resilience** – Data is persisted to disk with automatic recovery
+7. **Simple API** – Clean, straightforward API that fits well with Go's concurrency model
 
 ---
 
-## Key Structure
+## Bucket Structure
 
-BadgerDB uses structured keys to organize data:
+BoltDB uses nested buckets to organize data hierarchically:
 
-### Node Keys
+### Top-Level Buckets
 
-**Format**: `{queueType}:{level:08d}:{traversal_status}:{copy_status}:{path_hash}`
+```
+/SRC     → Source queue data
+/DST     → Destination queue data
+/LOGS    → Log entries organized by level
+```
 
-- **`queueType`**: `"src"` or `"dst"`
-- **`level`**: BFS depth level (zero-padded to 8 digits)
-- **`traversal_status`**: `"pending"`, `"successful"`, `"failed"`, or `"not_on_src"` (dst only)
-- **`copy_status`**: `"pending"`, `"successful"`, or `"failed"` (src only, empty for dst)
-- **`path_hash`**: SHA256 hash of the normalized path (first 16 bytes, hex-encoded)
+### Node Storage (`/SRC` and `/DST`)
 
-**Examples**:
-- `src:00000000:pending:pending:abc123...` - Source root node, pending traversal and copy
-- `dst:00000001:successful::def456...` - Destination node at level 1, successfully traversed
-- `src:00000002:successful:successful:ghi789...` - Source node at level 2, traversal and copy complete
+Each queue type has three main sub-buckets:
 
-### Log Keys
+#### 1. Nodes Bucket (`/nodes`)
 
-**Format**: `log:{level}:{uuid}`
+**Path**: `/SRC/nodes/` or `/DST/nodes/`
 
-- **`level`**: Log level (`"trace"`, `"debug"`, `"info"`, `"warning"`, `"error"`, `"critical"`)
-- **`uuid`**: Unique identifier for the log entry (UUID v4)
+Stores the canonical node data. Key is the path hash, value is NodeState JSON.
 
-**Examples**:
-- `log:info:550e8400-e29b-41d4-a716-446655440000`
-- `log:error:6ba7b810-9dad-11d1-80b4-00c04fd430c8`
+```
+pathHash → NodeState JSON
+{
+  "id": "node-uuid",
+  "parent_id": "parent-uuid",
+  "parent_path": "/parent",
+  "name": "folder-name",
+  "path": "/parent/folder-name",
+  "type": "folder",
+  "depth": 1,
+  "traversal_status": "successful",
+  ...
+}
+```
 
-### Index Keys
+#### 2. Children Bucket (`/children`)
 
-**Format**: `{queueType}:children:{parent_path_hash}:{child_path_hash}`
+**Path**: `/SRC/children/` or `/DST/children/`
 
-Used for efficient parent→child relationship lookups. The value is empty (the key encodes the relationship).
+Stores parent-child relationships. Key is parent path hash, value is array of child path hashes.
+
+```
+parentPathHash → []childPathHash JSON
+["abc123", "def456", "ghi789"]
+```
+
+#### 3. Levels Bucket (`/levels`)
+
+**Path**: `/SRC/levels/` or `/DST/levels/`
+
+Organized by BFS depth level, with status sub-buckets:
+
+```
+/levels
+  /00000000              → Level 0 (root)
+    /pending             → pathHash: empty
+    /successful          → pathHash: empty
+    /failed              → pathHash: empty
+  /00000001              → Level 1
+    /pending
+    /successful
+    /failed
+  /00000002              → Level 2
+    ...
+```
+
+For DST queue, there's an additional status:
+```
+  /not_on_src            → Items in DST but not in SRC
+```
+
+**Status buckets are membership sets**: The presence of a pathHash in a bucket means that node has that status. The value is empty; only the key matters.
+
+### Log Storage (`/LOGS`)
+
+Logs are organized by level in sub-buckets:
+
+```
+/LOGS
+  /trace     → uuid: LogEntry JSON
+  /debug     → uuid: LogEntry JSON
+  /info      → uuid: LogEntry JSON
+  /warning   → uuid: LogEntry JSON
+  /error     → uuid: LogEntry JSON
+  /critical  → uuid: LogEntry JSON
+```
+
+Each log entry is keyed by its UUID within the appropriate level bucket.
 
 ---
 
@@ -65,7 +121,7 @@ Used for efficient parent→child relationship lookups. The value is empty (the 
 import "github.com/Project-Sylos/Migration-Engine/pkg/db"
 
 opts := db.DefaultOptions()
-opts.Dir = "/path/to/badger/directory"
+opts.Path = "/path/to/migration.db"
 
 database, err := db.Open(opts)
 if err != nil {
@@ -74,90 +130,75 @@ if err != nil {
 defer database.Close()
 ```
 
-### Reading Data
-
-```go
-// Get a single value
-value, err := database.Get([]byte("key"))
-
-// Iterate keys with a prefix
-err := database.IterateKeys(db.IteratorOptions{
-    Prefix: []byte("src:00000000:"),
-}, func(key []byte) error {
-    // Process key
-    return nil
-})
-
-// Iterate key-value pairs
-err := database.IterateKeyValues(db.IteratorOptions{
-    Prefix: []byte("log:info:"),
-}, func(key []byte, value []byte) error {
-    // Process key-value pair
-    return nil
-})
-```
-
-### Writing Data
-
-```go
-// Single write
-err := database.Set([]byte("key"), []byte("value"))
-
-// Transactional write
-err := database.Update(func(txn *badger.Txn) error {
-    if err := txn.Set([]byte("key1"), []byte("value1")); err != nil {
-        return err
-    }
-    if err := txn.Set([]byte("key2"), []byte("value2")); err != nil {
-        return err
-    }
-    return nil
-})
-```
-
 ### Node State Operations
 
-The package provides high-level operations for working with node states:
-
 ```go
-// Insert a node with its index entry
-key := db.KeySrc(0, db.TraversalStatusPending, db.CopyStatusPending, "/root")
+// Insert a node (creates entry in nodes, status, and children buckets)
 state := &db.NodeState{
     ID:         "node-id",
-    ParentID:   "",
-    ParentPath: "",
-    Name:       "root",
-    Path:       "/root",
+    ParentID:   "parent-id",
+    ParentPath: "/parent",
+    Name:       "child",
+    Path:       "/parent/child",
     Type:       "folder",
-    Depth:      0,
+    Depth:      1,
 }
-err := db.InsertNodeWithIndex(database, key, state, db.IndexPrefixSrcChildren)
+err := db.InsertNodeWithIndex(database, "SRC", 1, db.StatusPending, state)
 
-// Update node status
-newState, err := db.UpdateNodeStatus(database, "src", 0, 
-    db.TraversalStatusPending, db.TraversalStatusSuccessful, 
-    db.CopyStatusPending, "/root")
+// Update node status (moves between status buckets)
+updatedState, err := db.UpdateNodeStatus(database, "SRC", 1, 
+    db.StatusPending, db.StatusSuccessful, "/parent/child")
 
-// Fetch children by parent path
-children, err := db.FetchChildrenByParentPath(database, db.IndexPrefixSrcChildren,
-    "/root", []string{"src"}, 0)
+// Get node state
+state, err := db.GetNodeStateByPath(database, "SRC", "/parent/child")
+
+// Get children of a node
+children, err := db.GetChildrenStates(database, "SRC", "/parent")
 ```
 
----
-
-## Log Storage
-
-Logs are stored with keys in the format `log:{level}:{uuid}`. The `LogBuffer` automatically batches log writes for performance:
+### Iteration
 
 ```go
-import "github.com/Project-Sylos/Migration-Engine/pkg/db"
+// Iterate over all nodes in a status bucket
+err := database.IterateStatusBucket("SRC", 1, db.StatusPending, 
+    db.IteratorOptions{Limit: 100}, 
+    func(pathHash []byte) error {
+        // Process each pending node at level 1
+        return nil
+    })
 
-// Create log buffer
-logBuffer := db.NewLogBuffer(database, 500, 2*time.Second)
+// Count nodes in a status bucket
+count, err := database.CountStatusBucket("SRC", 1, db.StatusPending)
 
-// Add log entry
+// Get all levels that exist
+levels, err := database.GetAllLevels("SRC")
+
+// Find minimum level with pending work
+minLevel, err := database.FindMinPendingLevel("SRC")
+```
+
+### Batch Operations
+
+```go
+// Batch insert multiple nodes
+ops := []db.InsertOperation{
+    {QueueType: "SRC", Level: 1, Status: db.StatusPending, State: state1},
+    {QueueType: "SRC", Level: 1, Status: db.StatusPending, State: state2},
+}
+err := db.BatchInsertNodes(database, ops)
+
+// Batch update node statuses
+results, err := db.BatchUpdateNodeStatus(database, "SRC", 1,
+    db.StatusPending, db.StatusSuccessful, 
+    []string{"/path1", "/path2"})
+```
+
+### Log Operations
+
+```go
+// Insert a log entry (automatically goes to correct level bucket)
 entry := db.LogEntry{
-    ID:        db.GenerateLogID(), // UUID
+    ID:        db.GenerateLogID(),
     Timestamp: time.Now().Format(time.RFC3339Nano),
     Level:     "info",
     Entity:    "worker",
@@ -165,117 +206,147 @@ entry := db.LogEntry{
     Message:   "Task completed",
     Queue:     "src",
 }
-logBuffer.Add(entry)
+err := db.InsertLogEntry(database, entry)
 
-// Stop buffer (flushes remaining entries)
-logBuffer.Stop()
+// Get logs by level
+infoLogs, err := db.GetLogsByLevel(database, "info")
+errorLogs, err := db.GetLogsByLevel(database, "error")
+
+// Get all logs
+allLogs, err := db.GetAllLogs(database)
+```
+
+### Buffered Writes
+
+For high-throughput scenarios, use write buffers:
+
+```go
+// Create write buffer (batches writes every 1000 items or 3 seconds)
+writeBuffer := db.NewWriteBuffer(database, 1000, 3*time.Second)
+
+// Add operations
+writeBuffer.Add(db.WriteItem{
+    Type:      "insert",
+    QueueType: "SRC",
+    Level:     1,
+    Status:    db.StatusPending,
+    State:     nodeState,
+})
+
+// Explicit flush (also auto-flushes on timer/size)
+err := writeBuffer.Flush()
+
+// Stop buffer (flushes remaining items)
+writeBuffer.Stop()
 ```
 
 ---
 
-## Key Generation Helpers
-
-The package provides helper functions for generating keys:
+## Bucket Helper Functions
 
 ```go
-// Node keys
-key := db.KeySrc(level, traversalStatus, copyStatus, path)
-key := db.KeyDst(level, traversalStatus, copyStatus, path)
+// Get bucket paths
+nodesPath := db.GetNodesBucketPath("SRC")        // ["SRC", "nodes"]
+childrenPath := db.GetChildrenBucketPath("SRC")  // ["SRC", "children"]
+levelPath := db.GetLevelBucketPath("SRC", 1)     // ["SRC", "levels", "00000001"]
+statusPath := db.GetStatusBucketPath("SRC", 1, db.StatusPending)
+// ["SRC", "levels", "00000001", "pending"]
 
-// Prefixes for iteration
-prefix := db.PrefixForStatus("src", 0, db.TraversalStatusPending)
-prefix := db.PrefixForLevel("src", 0)
-prefix := db.PrefixForAllLevels("src")
+// Create level bucket with all status sub-buckets
+err := db.EnsureLevelBucket(tx, "SRC", 1)
 
-// Log keys
-logKey := db.KeyLog("info", logID)
-logPrefix := db.PrefixLogByLevel("info")
-allLogsPrefix := db.PrefixLogAll()
+// Get bucket within transaction
+nodesBucket := db.GetNodesBucket(tx, "SRC")
+statusBucket := db.GetStatusBucket(tx, "SRC", 1, db.StatusPending)
 ```
 
 ---
 
 ## Constants
 
-### Traversal Status
+### Status Constants
 
-- `db.TraversalStatusPending` - Node is pending traversal
-- `db.TraversalStatusSuccessful` - Node was successfully traversed
-- `db.TraversalStatusFailed` - Node traversal failed
-- `db.TraversalStatusNotOnSrc` - Node exists in destination but not in source (dst only)
+```go
+const (
+    StatusPending    = "pending"
+    StatusSuccessful = "successful"
+    StatusFailed     = "failed"
+    StatusNotOnSrc   = "not_on_src"  // DST only
+)
+```
 
-### Copy Status
+### Bucket Names
 
-- `db.CopyStatusPending` - Copy operation is pending
-- `db.CopyStatusSuccessful` - Copy operation completed successfully
-- `db.CopyStatusFailed` - Copy operation failed
-
-### Index Prefixes
-
-- `db.IndexPrefixSrcChildren` - Index prefix for source node children
-- `db.IndexPrefixDstChildren` - Index prefix for destination node children
+```go
+const (
+    BucketSrc  = "SRC"
+    BucketDst  = "DST"
+    BucketLogs = "LOGS"
+)
+```
 
 ---
 
 ## Performance Considerations
 
-### Batch Operations
+### Status Transitions
 
-For high-throughput scenarios, use batch operations:
+BoltDB makes status transitions atomic and race-free:
 
 ```go
-// Batch insert nodes
-ops := []db.InsertOperation{
-    {QueueType: "src", Level: 0, TraversalStatus: db.TraversalStatusPending, 
-     CopyStatus: db.CopyStatusPending, State: state1, IndexPrefix: db.IndexPrefixSrcChildren},
-    {QueueType: "src", Level: 0, TraversalStatus: db.TraversalStatusPending,
-     CopyStatus: db.CopyStatusPending, State: state2, IndexPrefix: db.IndexPrefixSrcChildren},
-}
-err := db.BatchInsertNodes(database, ops)
-
-// Batch update node status
-results, err := db.BatchUpdateNodeStatus(database, "src", 0,
-    db.TraversalStatusPending, db.TraversalStatusSuccessful,
-    db.CopyStatusPending, []string{"/path1", "/path2"})
+// Atomic within single transaction:
+// 1. Update NodeState in /nodes bucket
+// 2. Remove from old status bucket
+// 3. Add to new status bucket
+// All three operations succeed or all fail
 ```
 
-### Iteration Performance
+### Batch Operations
 
-When iterating large datasets, use appropriate prefixes to limit scope:
+Always use batch operations when inserting multiple nodes:
 
 ```go
-// Efficient: Iterate only pending nodes at level 0
-prefix := db.PrefixForStatus("src", 0, db.TraversalStatusPending)
-err := database.IterateNodeStates(db.IteratorOptions{Prefix: prefix}, ...)
+// Good: Single transaction for 100 nodes
+ops := make([]db.InsertOperation, 100)
+err := db.BatchInsertNodes(database, ops)
 
-// Less efficient: Iterate all nodes then filter
-prefix := db.PrefixForAllLevels("src")
-err := database.IterateNodeStates(db.IteratorOptions{Prefix: prefix}, ...)
+// Bad: 100 separate transactions
+for _, state := range states {
+    db.InsertNodeWithIndex(database, "SRC", 1, db.StatusPending, state)
+}
+```
+
+### Write Buffers
+
+Use WriteBuffer for queue operations to batch database writes:
+
+```go
+// Batches ~1000 operations into single transaction
+buffer := db.NewWriteBuffer(database, 1000, 3*time.Second)
 ```
 
 ---
 
 ## Thread Safety
 
-BadgerDB operations are safe for concurrent use:
+BoltDB operations are safe for concurrent use:
 
-- **Read operations** (`View`, `Get`, `Iterate*`) can run concurrently
-- **Write operations** (`Update`, `Set`, `Delete`) are serialized by BadgerDB
-- **Transactions** provide isolation between concurrent operations
+- **Read transactions** (`View`) can run concurrently
+- **Write transactions** (`Update`) are serialized by BoltDB
+- Single-writer model eliminates MVCC race conditions
+- Reads see consistent snapshot within transaction
 
 ---
 
 ## Error Handling
 
-All database operations return errors that should be checked:
-
 ```go
-value, err := database.Get(key)
-if err == badger.ErrKeyNotFound {
-    // Key doesn't exist
-} else if err != nil {
-    // Other error
-    return err
+state, err := database.GetNodeStateByPath("SRC", "/path")
+if err != nil {
+    return err  // Database error
+}
+if state == nil {
+    // Node not found (not an error)
 }
 ```
 
@@ -284,11 +355,12 @@ if err == badger.ErrKeyNotFound {
 ## Summary
 
 The database package provides:
-- ✅ **BadgerDB Integration** - Fast, embedded key-value store
-- ✅ **Structured Keys** - Organized key format for nodes and logs
+- ✅ **BoltDB Integration** - Simple, reliable embedded database
+- ✅ **Bucket Hierarchies** - Natural structure, not key encoding
+- ✅ **Status Transitions** - Atomic, race-free status changes
 - ✅ **High-Level Operations** - Convenient functions for common operations
-- ✅ **Batch Support** - Efficient batch operations for high throughput
-- ✅ **Thread Safety** - Safe for concurrent use
-- ✅ **Crash Resilience** - Data persisted to disk
+- ✅ **Batch Support** - Efficient bulk operations
+- ✅ **Thread Safety** - Safe for concurrent reads, serialized writes
+- ✅ **Crash Resilience** - ACID transactions with automatic recovery
 
-This design enables the migration engine to efficiently store and query traversal state, node metadata, and logs with excellent performance characteristics.
+This design provides a clean, predictable storage layer for the migration engine's BFS traversal with guaranteed consistency and atomic operations.

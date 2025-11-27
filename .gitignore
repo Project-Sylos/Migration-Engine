@@ -36,10 +36,8 @@ go.work.sum
 __pycache__/
 *.pyc
 
-# ignore badger files
-pkg/tests/badger/*
-
-# ignore logs
+# ignore logs and misc files
 *logs.txt
 *.log
-pkg/tests/migration_test.yaml
+*.yaml
+*.db

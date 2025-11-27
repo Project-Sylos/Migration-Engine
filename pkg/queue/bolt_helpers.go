@@ -8,7 +8,7 @@ import (
 	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 )
 
-// taskToNodeState converts a TaskBase to a NodeState for BadgerDB storage.
+// taskToNodeState converts a TaskBase to a NodeState for BoltDB storage.
 func taskToNodeState(task *TaskBase) *db.NodeState {
 	var id, parentID, name, path, parentPath, nodeType string
 	var size int64
@@ -91,22 +91,10 @@ func nodeStateToTask(state *db.NodeState, taskType string) *TaskBase {
 	return task
 }
 
-// getQueueType returns "src" or "dst" based on queue name.
+// getQueueType returns "SRC" or "DST" based on queue name (matches Bolt bucket names).
 func getQueueType(queueName string) string {
 	if queueName == "dst" {
-		return "dst"
+		return "DST"
 	}
-	return "src"
-}
-
-// getChildrenIndexPrefix returns the BadgerDB index prefix for children lookup.
-func getChildrenIndexPrefix(queueName string) string {
-	switch queueName {
-	case "src":
-		return db.IndexPrefixSrcChildren
-	case "dst":
-		return db.IndexPrefixDstChildren
-	default:
-		return ""
-	}
+	return "SRC"
 }

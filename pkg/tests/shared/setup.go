@@ -74,7 +74,7 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 
 	cfg := migration.Config{
 		Database: migration.DatabaseConfig{
-			Path:           "pkg/tests/badger",
+			Path:           "pkg/tests/bolt.db",
 			RemoveExisting: removeMigrationDB,
 		},
 		Source: migration.Service{

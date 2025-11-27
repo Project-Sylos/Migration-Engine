@@ -47,154 +47,85 @@ func (s MigrationStatus) IsComplete() bool {
 	return !s.HasPending() && !s.HasFailures()
 }
 
-// InspectMigrationStatus inspects the BadgerDB node data and returns a MigrationStatus.
-func InspectMigrationStatus(badgerDB *db.DB) (MigrationStatus, error) {
-	if badgerDB == nil {
-		return MigrationStatus{}, fmt.Errorf("badgerDB cannot be nil")
+// InspectMigrationStatus inspects the BoltDB node data and returns a MigrationStatus.
+func InspectMigrationStatus(boltDB *db.DB) (MigrationStatus, error) {
+	if boltDB == nil {
+		return MigrationStatus{}, fmt.Errorf("boltDB cannot be nil")
 	}
 
 	status := MigrationStatus{}
 
 	// Count all src nodes
-	srcPrefix := db.PrefixForAllLevels("src")
-	srcTotal, err := badgerDB.CountByPrefix(srcPrefix)
+	srcTotal, err := boltDB.CountNodes("SRC")
 	if err != nil {
 		return MigrationStatus{}, fmt.Errorf("failed to count src nodes: %w", err)
 	}
 	status.SrcTotal = srcTotal
 
 	// Count all dst nodes
-	dstPrefix := db.PrefixForAllLevels("dst")
-	dstTotal, err := badgerDB.CountByPrefix(dstPrefix)
+	dstTotal, err := boltDB.CountNodes("DST")
 	if err != nil {
 		return MigrationStatus{}, fmt.Errorf("failed to count dst nodes: %w", err)
 	}
 	status.DstTotal = dstTotal
 
-	// Count pending src nodes
-	srcPendingPrefix := db.PrefixForAllLevels("src")
-	var srcPendingCount int
-	err = badgerDB.IterateKeys(db.IteratorOptions{
-		Prefix: srcPendingPrefix,
-	}, func(key []byte) error {
-		keyStr := string(key)
-		// Check if key contains pending status
-		parts := splitKeyParts(keyStr)
-		if len(parts) >= 3 && parts[2] == db.TraversalStatusPending {
-			srcPendingCount++
-		}
-		return nil
-	})
+	// Count pending and failed nodes for src across all levels
+	srcLevels, err := boltDB.GetAllLevels("SRC")
 	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to count pending src nodes: %w", err)
+		return MigrationStatus{}, fmt.Errorf("failed to get src levels: %w", err)
 	}
-	status.SrcPending = srcPendingCount
 
-	// Count pending dst nodes
-	dstPendingPrefix := db.PrefixForAllLevels("dst")
-	var dstPendingCount int
-	err = badgerDB.IterateKeys(db.IteratorOptions{
-		Prefix: dstPendingPrefix,
-	}, func(key []byte) error {
-		keyStr := string(key)
-		parts := splitKeyParts(keyStr)
-		if len(parts) >= 3 && parts[2] == db.TraversalStatusPending {
-			dstPendingCount++
-		}
-		return nil
-	})
-	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to count pending dst nodes: %w", err)
-	}
-	status.DstPending = dstPendingCount
-
-	// Count failed src nodes
-	var srcFailedCount int
-	err = badgerDB.IterateKeys(db.IteratorOptions{
-		Prefix: srcPrefix,
-	}, func(key []byte) error {
-		keyStr := string(key)
-		parts := splitKeyParts(keyStr)
-		if len(parts) >= 3 && parts[2] == db.TraversalStatusFailed {
-			srcFailedCount++
-		}
-		return nil
-	})
-	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to count failed src nodes: %w", err)
-	}
-	status.SrcFailed = srcFailedCount
-
-	// Count failed dst nodes
-	var dstFailedCount int
-	err = badgerDB.IterateKeys(db.IteratorOptions{
-		Prefix: dstPrefix,
-	}, func(key []byte) error {
-		keyStr := string(key)
-		parts := splitKeyParts(keyStr)
-		if len(parts) >= 3 && parts[2] == db.TraversalStatusFailed {
-			dstFailedCount++
-		}
-		return nil
-	})
-	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to count failed dst nodes: %w", err)
-	}
-	status.DstFailed = dstFailedCount
-
-	// Find minimum pending depth for src
+	var srcPendingCount, srcFailedCount int
 	var minSrcDepth *int
-	err = badgerDB.IterateNodeStates(db.IteratorOptions{
-		Prefix: srcPrefix,
-	}, func(key []byte, state *db.NodeState) error {
-		keyStr := string(key)
-		parts := splitKeyParts(keyStr)
-		if len(parts) >= 3 && parts[2] == db.TraversalStatusPending {
-			if minSrcDepth == nil || state.Depth < *minSrcDepth {
-				d := state.Depth
+
+	for _, level := range srcLevels {
+		pendingCount, err := boltDB.CountStatusBucket("SRC", level, db.StatusPending)
+		if err == nil {
+			srcPendingCount += pendingCount
+			if pendingCount > 0 && (minSrcDepth == nil || level < *minSrcDepth) {
+				d := level
 				minSrcDepth = &d
 			}
 		}
-		return nil
-	})
-	if err == nil && minSrcDepth != nil {
-		status.MinPendingDepthSrc = minSrcDepth
+
+		failedCount, err := boltDB.CountStatusBucket("SRC", level, db.StatusFailed)
+		if err == nil {
+			srcFailedCount += failedCount
+		}
 	}
 
-	// Find minimum pending depth for dst
+	status.SrcPending = srcPendingCount
+	status.SrcFailed = srcFailedCount
+	status.MinPendingDepthSrc = minSrcDepth
+
+	// Count pending and failed nodes for dst across all levels
+	dstLevels, err := boltDB.GetAllLevels("DST")
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("failed to get dst levels: %w", err)
+	}
+
+	var dstPendingCount, dstFailedCount int
 	var minDstDepth *int
-	err = badgerDB.IterateNodeStates(db.IteratorOptions{
-		Prefix: dstPrefix,
-	}, func(key []byte, state *db.NodeState) error {
-		keyStr := string(key)
-		parts := splitKeyParts(keyStr)
-		if len(parts) >= 3 && parts[2] == db.TraversalStatusPending {
-			if minDstDepth == nil || state.Depth < *minDstDepth {
-				d := state.Depth
+
+	for _, level := range dstLevels {
+		pendingCount, err := boltDB.CountStatusBucket("DST", level, db.StatusPending)
+		if err == nil {
+			dstPendingCount += pendingCount
+			if pendingCount > 0 && (minDstDepth == nil || level < *minDstDepth) {
+				d := level
 				minDstDepth = &d
 			}
 		}
-		return nil
-	})
-	if err == nil && minDstDepth != nil {
-		status.MinPendingDepthDst = minDstDepth
-	}
 
-	return status, nil
-}
-
-// splitKeyParts splits a BadgerDB key by colons.
-func splitKeyParts(key string) []string {
-	var parts []string
-	lastIdx := 0
-	for i, r := range key {
-		if r == ':' {
-			parts = append(parts, key[lastIdx:i])
-			lastIdx = i + 1
+		failedCount, err := boltDB.CountStatusBucket("DST", level, db.StatusFailed)
+		if err == nil {
+			dstFailedCount += failedCount
 		}
 	}
-	if lastIdx < len(key) {
-		parts = append(parts, key[lastIdx:])
-	}
-	return parts
+
+	status.DstPending = dstPendingCount
+	status.DstFailed = dstFailedCount
+	status.MinPendingDepthDst = minDstDepth
+
+	return status, nil
 }

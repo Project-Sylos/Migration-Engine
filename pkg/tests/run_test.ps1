@@ -9,15 +9,19 @@ Write-Host ""
 
 # Clean up existing test databases
 Write-Host "Cleaning up test databases..." -ForegroundColor Yellow
-# Remove the /badger folder if it exists
-if (Test-Path "pkg\tests\badger") {
-    Write-Host "Removing pkg\tests\badger folder..." -ForegroundColor Yellow
-    Remove-Item -Path "pkg\tests\badger" -Recurse -Force -ErrorAction SilentlyContinue
+
+# Remove the BoltDB file if it exists
+if (Test-Path "pkg\tests\bolt.db") {
+    Write-Host "Removing pkg\tests\bolt.db file..." -ForegroundColor Yellow
+    Remove-Item -Path "pkg\tests\bolt.db" -Force -ErrorAction SilentlyContinue
 }
-# Remove the migration_test.yaml file if it exists
-Remove-Item -Path "pkg\tests\migration_test.yaml" -ErrorAction SilentlyContinue
-# remove the spectra.db file if it exists
+
+# Remove the migration config YAML file if it exists
+Remove-Item -Path "pkg\tests\bolt.yaml" -ErrorAction SilentlyContinue
+
+# Remove the spectra.db file if it exists
 Remove-Item -Path "spectra.db" -ErrorAction SilentlyContinue
+
 Write-Host "Cleanup complete" -ForegroundColor Green
 Write-Host ""
 
