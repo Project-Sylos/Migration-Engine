@@ -17,33 +17,30 @@ type RootSeedSummary struct {
 	DstRoots int
 }
 
-// SeedRootTasks inserts the supplied source and destination root folders into BadgerDB.
+// SeedRootTasks inserts the supplied source and destination root folders into BoltDB.
 // The folders should already contain root-relative metadata (LocationPath="/", DepthLevel=0).
-func SeedRootTasks(srcRoot fsservices.Folder, dstRoot fsservices.Folder, badgerDB *db.DB) (RootSeedSummary, error) {
-	if badgerDB == nil {
-		return RootSeedSummary{}, fmt.Errorf("badgerDB cannot be nil")
+func SeedRootTasks(srcRoot fsservices.Folder, dstRoot fsservices.Folder, boltDB *db.DB) (RootSeedSummary, error) {
+	if boltDB == nil {
+		return RootSeedSummary{}, fmt.Errorf("boltDB cannot be nil")
 	}
 
 	if srcRoot.Id == "" || dstRoot.Id == "" {
 		return RootSeedSummary{}, fmt.Errorf("source and destination root folders must have an Id")
 	}
 
-	if err := queue.SeedRootTasks(srcRoot, dstRoot, badgerDB); err != nil {
+	if err := queue.SeedRootTasks(srcRoot, dstRoot, boltDB); err != nil {
 		return RootSeedSummary{}, fmt.Errorf("failed to seed root tasks: %w", err)
 	}
 
 	var summary RootSeedSummary
 
-	// Count root tasks from BadgerDB
-	srcPrefix := db.PrefixForStatus("src", 0, db.TraversalStatusPending)
-	dstPrefix := db.PrefixForStatus("dst", 0, db.TraversalStatusPending)
-
-	srcCount, err := badgerDB.CountByPrefix(srcPrefix)
+	// Count root tasks from BoltDB
+	srcCount, err := boltDB.CountByPrefix("SRC", 0, db.StatusPending)
 	if err == nil {
 		summary.SrcRoots = srcCount
 	}
 
-	dstCount, err := badgerDB.CountByPrefix(dstPrefix)
+	dstCount, err := boltDB.CountByPrefix("DST", 0, db.StatusPending)
 	if err == nil {
 		summary.DstRoots = dstCount
 	}

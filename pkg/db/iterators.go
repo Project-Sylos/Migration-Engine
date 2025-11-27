@@ -6,40 +6,36 @@ package db
 import (
 	"fmt"
 
-	"github.com/dgraph-io/badger/v4"
+	bolt "go.etcd.io/bbolt"
 )
 
-// IteratorOptions configures how keys are iterated.
+// IteratorOptions configures how items are iterated.
 type IteratorOptions struct {
-	// Prefix restricts iteration to keys with this prefix
-	Prefix []byte
 	// Limit is the maximum number of items to return (0 = no limit)
 	Limit int
-	// Reverse iterates in reverse order
-	Reverse bool
 }
 
-// IterateKeys iterates over keys matching the options and calls fn for each key.
-// If fn returns an error, iteration stops and that error is returned.
-func (db *DB) IterateKeys(opts IteratorOptions, fn func(key []byte) error) error {
-	return db.View(func(txn *badger.Txn) error {
-		badgerOpts := badger.DefaultIteratorOptions
-		badgerOpts.Prefix = opts.Prefix
-		badgerOpts.Reverse = opts.Reverse
+// IterateStatusBucket iterates over all path hashes in a status bucket.
+// The callback receives the pathHash for each item in the status bucket.
+func (db *DB) IterateStatusBucket(queueType string, level int, status string, opts IteratorOptions, fn func(pathHash []byte) error) error {
+	return db.View(func(tx *bolt.Tx) error {
+		bucket := GetStatusBucket(tx, queueType, level, status)
+		if bucket == nil {
+			// Bucket doesn't exist yet, that's okay (no items)
+			return nil
+		}
 
-		it := txn.NewIterator(badgerOpts)
-		defer it.Close()
-
+		cursor := bucket.Cursor()
 		count := 0
-		for it.Rewind(); it.Valid(); it.Next() {
+
+		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
 			if opts.Limit > 0 && count >= opts.Limit {
 				break
 			}
 
-			item := it.Item()
-			key := item.Key()
-			keyCopy := make([]byte, len(key))
-			copy(keyCopy, key)
+			// Make a copy of the key to pass to callback
+			keyCopy := make([]byte, len(k))
+			copy(keyCopy, k)
 
 			if err := fn(keyCopy); err != nil {
 				return err
@@ -52,33 +48,34 @@ func (db *DB) IterateKeys(opts IteratorOptions, fn func(key []byte) error) error
 	})
 }
 
-// IterateKeyValues iterates over key-value pairs matching the options and calls fn for each pair.
-func (db *DB) IterateKeyValues(opts IteratorOptions, fn func(key []byte, value []byte) error) error {
-	return db.View(func(txn *badger.Txn) error {
-		badgerOpts := badger.DefaultIteratorOptions
-		badgerOpts.Prefix = opts.Prefix
-		badgerOpts.Reverse = opts.Reverse
+// IterateNodeStates iterates over all nodes in the nodes bucket.
+// The callback receives the pathHash and NodeState for each node.
+func (db *DB) IterateNodeStates(queueType string, opts IteratorOptions, fn func(pathHash []byte, state *NodeState) error) error {
+	return db.View(func(tx *bolt.Tx) error {
+		bucket := GetNodesBucket(tx, queueType)
+		if bucket == nil {
+			return fmt.Errorf("nodes bucket not found for %s", queueType)
+		}
 
-		it := txn.NewIterator(badgerOpts)
-		defer it.Close()
-
+		cursor := bucket.Cursor()
 		count := 0
-		for it.Rewind(); it.Valid(); it.Next() {
+
+		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
 			if opts.Limit > 0 && count >= opts.Limit {
 				break
 			}
 
-			item := it.Item()
-			key := item.Key()
-			keyCopy := make([]byte, len(key))
-			copy(keyCopy, key)
-
-			err := item.Value(func(val []byte) error {
-				valueCopy := make([]byte, len(val))
-				copy(valueCopy, val)
-				return fn(keyCopy, valueCopy)
-			})
+			// Deserialize node state
+			ns, err := DeserializeNodeState(v)
 			if err != nil {
+				return fmt.Errorf("failed to deserialize node state: %w", err)
+			}
+
+			// Make a copy of the key
+			keyCopy := make([]byte, len(k))
+			copy(keyCopy, k)
+
+			if err := fn(keyCopy, ns); err != nil {
 				return err
 			}
 
@@ -89,70 +86,214 @@ func (db *DB) IterateKeyValues(opts IteratorOptions, fn func(key []byte, value [
 	})
 }
 
-// IterateNodeStates iterates over NodeStates matching the options and calls fn for each state.
-func (db *DB) IterateNodeStates(opts IteratorOptions, fn func(key []byte, state *NodeState) error) error {
-	return db.IterateKeyValues(opts, func(key []byte, value []byte) error {
-		state, err := DeserializeNodeState(value)
-		if err != nil {
-			return fmt.Errorf("failed to deserialize node state at key %s: %w", string(key), err)
+// IterateLevel iterates over all status buckets at a specific level.
+// For each status bucket, it calls the callback with the status name and bucket.
+func (db *DB) IterateLevel(queueType string, level int, fn func(status string, bucket *bolt.Bucket) error) error {
+	return db.View(func(tx *bolt.Tx) error {
+		levelBucket := getBucket(tx, GetLevelBucketPath(queueType, level))
+		if levelBucket == nil {
+			// Level doesn't exist yet, that's okay
+			return nil
 		}
-		return fn(key, state)
+
+		cursor := levelBucket.Cursor()
+
+		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+			statusBucket := levelBucket.Bucket(k)
+			if statusBucket == nil {
+				continue // Not a bucket, skip
+			}
+
+			status := string(k)
+			if err := fn(status, statusBucket); err != nil {
+				return err
+			}
+		}
+
+		return nil
 	})
 }
 
-// BatchFetchByPrefix fetches a batch of nodes matching the given prefix.
-// Returns up to batchSize nodes.
-func BatchFetchByPrefix(db *DB, prefix []byte, batchSize int) ([]*NodeState, error) {
-	var results []*NodeState
+// CountStatusBucket returns the number of items in a status bucket.
+func (db *DB) CountStatusBucket(queueType string, level int, status string) (int, error) {
+	count := 0
 
-	opts := IteratorOptions{
-		Prefix: prefix,
-		Limit:  batchSize,
+	err := db.View(func(tx *bolt.Tx) error {
+		bucket := GetStatusBucket(tx, queueType, level, status)
+		if bucket == nil {
+			return nil // Bucket doesn't exist, count is 0
+		}
+
+		cursor := bucket.Cursor()
+		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+			count++
+		}
+
+		return nil
+	})
+
+	return count, err
+}
+
+// CountNodes returns the total number of nodes in the nodes bucket.
+func (db *DB) CountNodes(queueType string) (int, error) {
+	count := 0
+
+	err := db.View(func(tx *bolt.Tx) error {
+		bucket := GetNodesBucket(tx, queueType)
+		if bucket == nil {
+			return nil
+		}
+
+		cursor := bucket.Cursor()
+		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+			count++
+		}
+
+		return nil
+	})
+
+	return count, err
+}
+
+// GetAllLevels returns all level numbers that exist for a queue type.
+func (db *DB) GetAllLevels(queueType string) ([]int, error) {
+	var levels []int
+
+	err := db.View(func(tx *bolt.Tx) error {
+		levelsBucket := getBucket(tx, []string{queueType, SubBucketLevels})
+		if levelsBucket == nil {
+			return nil // No levels yet
+		}
+
+		cursor := levelsBucket.Cursor()
+		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+			levelBucket := levelsBucket.Bucket(k)
+			if levelBucket == nil {
+				continue // Not a bucket
+			}
+
+			levelNum, err := ParseLevel(string(k))
+			if err != nil {
+				continue // Skip invalid level names
+			}
+
+			levels = append(levels, levelNum)
+		}
+
+		return nil
+	})
+
+	return levels, err
+}
+
+// FindMinPendingLevel finds the minimum level that has pending items.
+// Returns -1 if no pending items exist.
+func (db *DB) FindMinPendingLevel(queueType string) (int, error) {
+	levels, err := db.GetAllLevels(queueType)
+	if err != nil {
+		return -1, err
 	}
 
-	err := db.IterateNodeStates(opts, func(key []byte, state *NodeState) error {
-		results = append(results, state)
+	minLevel := -1
+
+	for _, level := range levels {
+		count, err := db.CountStatusBucket(queueType, level, StatusPending)
+		if err != nil {
+			continue
+		}
+
+		if count > 0 {
+			if minLevel == -1 || level < minLevel {
+				minLevel = level
+			}
+		}
+	}
+
+	return minLevel, nil
+}
+
+// LeaseTasksFromStatus retrieves up to limit path hashes from a status bucket.
+// This is used for worker task leasing.
+func (db *DB) LeaseTasksFromStatus(queueType string, level int, status string, limit int) ([][]byte, error) {
+	var pathHashes [][]byte
+
+	err := db.View(func(tx *bolt.Tx) error {
+		bucket := GetStatusBucket(tx, queueType, level, status)
+		if bucket == nil {
+			return nil // No items in this status
+		}
+
+		cursor := bucket.Cursor()
+		count := 0
+
+		for k, _ := cursor.First(); k != nil && count < limit; k, _ = cursor.Next() {
+			keyCopy := make([]byte, len(k))
+			copy(keyCopy, k)
+			pathHashes = append(pathHashes, keyCopy)
+			count++
+		}
+
+		return nil
+	})
+
+	return pathHashes, err
+}
+
+// BatchFetchWithKeys fetches up to limit NodeStates from a status bucket with their keys.
+// This is used for task leasing in the queue system.
+type FetchResult struct {
+	Key   string // Key for deduplication tracking
+	State *NodeState
+}
+
+func BatchFetchWithKeys(db *DB, queueType string, level int, status string, limit int) ([]FetchResult, error) {
+	var results []FetchResult
+
+	err := db.View(func(tx *bolt.Tx) error {
+		statusBucket := GetStatusBucket(tx, queueType, level, status)
+		if statusBucket == nil {
+			return nil // No items in this status
+		}
+
+		nodesBucket := GetNodesBucket(tx, queueType)
+		if nodesBucket == nil {
+			return fmt.Errorf("nodes bucket not found for %s", queueType)
+		}
+
+		cursor := statusBucket.Cursor()
+		count := 0
+
+		for pathHash, _ := cursor.First(); pathHash != nil && count < limit; pathHash, _ = cursor.Next() {
+			// Get the node state from nodes bucket
+			nodeData := nodesBucket.Get(pathHash)
+			if nodeData == nil {
+				continue // Node was deleted
+			}
+
+			state, err := DeserializeNodeState(nodeData)
+			if err != nil {
+				continue // Skip invalid entries
+			}
+
+			// Use path hash as key for deduplication
+			keyStr := string(pathHash)
+
+			results = append(results, FetchResult{
+				Key:   keyStr,
+				State: state,
+			})
+			count++
+		}
+
 		return nil
 	})
 
 	return results, err
 }
 
-// CountByPrefix counts the number of keys with the given prefix.
-func (db *DB) CountByPrefix(prefix []byte) (int, error) {
-	count := 0
-	err := db.IterateKeys(IteratorOptions{Prefix: prefix}, func(key []byte) error {
-		count++
-		return nil
-	})
-	return count, err
-}
-
-// FetchByParentPaths fetches all NodeStates where parent_path is in the provided list.
-// This is used for DST task packaging - finding src children for dst parent nodes.
-// Uses the secondary index for efficient O(k) lookup per parent.
-//
-// parentPaths should be normalized paths (ParentPath) of the parent nodes.
-// primaryPrefixes should be prefixes to search (e.g., ["src:visited", "src:processing"]).
-// Returns a map of parent_path -> []NodeState (children of that parent).
-func FetchByParentPaths(db *DB, indexPrefix string, parentPaths []string, primaryPrefixes []string, level int) (map[string][]*NodeState, error) {
-	results := make(map[string][]*NodeState)
-
-	// For each parent path, fetch its children using the index
-	for _, parentPath := range parentPaths {
-		children, err := FetchChildrenByParentPath(db, indexPrefix, parentPath, primaryPrefixes, level)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch children for parent %s: %w", parentPath, err)
-		}
-
-		// Convert map to slice
-		childrenList := make([]*NodeState, 0, len(children))
-		for _, child := range children {
-			childrenList = append(childrenList, child)
-		}
-
-		results[parentPath] = childrenList
-	}
-
-	return results, nil
+// CountByPrefix counts nodes at a specific level and status.
+// This is a compatibility wrapper for the old prefix-based counting.
+func (db *DB) CountByPrefix(queueType string, level int, status string) (int, error) {
+	return db.CountStatusBucket(queueType, level, status)
 }

@@ -22,7 +22,7 @@ Each traversal operation is isolated into discrete, non-recursive **tasks** so t
    This keeps each task stateless and lightweight.
 
 3. **Record Results**
-   Children that pass filtering are batched through per-queue buffers and flushed to BadgerDB before the next leasing pass.
+   Children that pass filtering are batched through per-queue buffers and flushed to BoltDB before the next leasing pass.
    This guarantees deterministic visibility without keeping additional in-memory round queues.
 
 ---
@@ -31,7 +31,7 @@ Each traversal operation is isolated into discrete, non-recursive **tasks** so t
 
 Depth-First Search (DFS) is memory-efficient, but it's less suited to managing two trees in parallel.
 BFS, while it requires storing all nodes at the current level, provides better control, checkpointing, and fault recovery.
-The Migration Engine (ME) serializes traversal data to BadgerDB after each round, keeping memory use bounded while preserving full traversal context.
+The Migration Engine (ME) serializes traversal data to BoltDB after each round, keeping memory use bounded while preserving full traversal context.
 
 ### Two Possible Strategies
 
@@ -53,7 +53,7 @@ The Migration Engine (ME) serializes traversal data to BadgerDB after each round
 * When the destination processes its corresponding level, it compares existing nodes against the expected list from the source.
 * Extra items in the destination are logged but not traversed further.
 * The destination can run as fast as possible while staying coordinated with the source.
-* Because each round is batched and stored in BadgerDB, the system can resume exactly where it left off after a crash.
+* Because each round is batched and stored in BoltDB, the system can resume exactly where it left off after a crash.
 * This maximizes both safety and throughput.
 
 ---
@@ -78,7 +78,7 @@ The Migration Engine includes a comprehensive YAML-based configuration system th
 Migration state is automatically persisted to a YAML config file (default: `{database_path}.yaml`) at key points:
 
 - **Root Selection** - When source and destination roots are set
-- **Roots Seeded** - After root tasks are seeded into BadgerDB
+- **Roots Seeded** - After root tasks are seeded into BoltDB
 - **Traversal Started** - When queues are initialized and ready
 - **Round Advancement** - When source or destination rounds advance during traversal
 - **Traversal Complete** - When migration finishes
@@ -117,3 +117,73 @@ This enables:
 - **Audit Trail** - Track when migrations were created, modified, and completed
 
 See `pkg/migration/README.md` for detailed documentation on the configuration system.
+
+---
+
+## Storage Architecture: BoltDB
+
+The Migration Engine uses **BoltDB** as its operational database for storing traversal state, node metadata, and logs.
+
+### Why BoltDB?
+
+BoltDB was chosen for its simplicity, reliability, and perfect fit with the BFS traversal model:
+
+1. **Single-Writer Model** - Guarantees consistent reads immediately after writes; eliminates race conditions
+2. **Bucket Hierarchies** - Natural support for organizing data by structure (SRC/DST, levels, status)
+3. **Atomic Consistency** - Single B-tree ensures all-or-nothing transaction semantics
+4. **Simple Transactions** - Clean, predictable transaction model
+5. **Embedded** - No external dependencies or services required
+6. **Crash Resilience** - ACID transactions with automatic recovery
+
+### Bucket Structure
+
+```
+/SRC
+  /nodes                  → pathHash: NodeState JSON (canonical data)
+  /children               → parentHash: []childHash JSON (tree relationships)
+  /levels
+    /00000000
+      /pending            → pathHash: empty (membership set)
+      /successful         → pathHash: empty
+      /failed             → pathHash: empty
+    /00000001/...
+
+/DST
+  /nodes
+  /children
+  /levels
+    /00000000
+      /pending
+      /successful
+      /failed
+      /not_on_src       → pathHash: empty (DST-specific status)
+    /00000001/...
+
+/LOGS
+  /trace                 → uuid: LogEntry JSON
+  /debug                 → uuid: LogEntry JSON
+  /info                  → uuid: LogEntry JSON
+  /warning               → uuid: LogEntry JSON
+  /error                 → uuid: LogEntry JSON
+  /critical              → uuid: LogEntry JSON
+```
+
+### Key Design Principles
+
+1. **Separation of Concerns**
+   - Node data lives in `/nodes` (single source of truth)
+   - Status membership tracked in `/levels/{level}/{status}` buckets
+   - Tree relationships in `/children` buckets
+
+2. **Status Transitions are Simple**
+   ```go
+   bucket.Delete(pathHash)  // Remove from /pending
+   bucket.Put(pathHash, []) // Add to /successful
+   ```
+
+3. **No Key Encoding**
+   - Structure is explicit in buckets, not encoded in key names
+   - Path hashes are simple lookup keys
+   - Hierarchy is natural and navigable
+
+See `pkg/db/README.md` for detailed documentation on the database layer.

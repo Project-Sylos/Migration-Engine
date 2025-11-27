@@ -41,7 +41,7 @@ func InitGlobalLogger(dbInstance *db.DB, addr, level string) error {
 
 // Sender transmits logs over UDP and writes them to the database.
 type Sender struct {
-	DB         *db.DB        // BadgerDB handle for persistence
+	DB         *db.DB        // BoltDB handle for persistence
 	logBuffer  *db.LogBuffer // buffered log writer
 	Addr       string        // e.g. "127.0.0.1:1997"
 	Level      string        // threshold for UDP output
@@ -74,7 +74,7 @@ func getLevelIndex(level string) int {
 }
 
 // NewSender initializes a new dual-channel sender.
-// dbInstance should be a BadgerDB instance.
+// dbInstance should be a BoltDB instance.
 func NewSender(dbInstance *db.DB, addr, level string) (*Sender, error) {
 	conn, err := net.Dial("udp", addr)
 	if err != nil {
@@ -120,7 +120,6 @@ func (s *Sender) Log(level, message, entity, entityID string, queues ...string) 
 		Level:     level,
 		Entity:    entity,
 		EntityID:  entityID,
-		Details:   nil,
 		Message:   message,
 		Queue:     queue,
 	})

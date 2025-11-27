@@ -15,7 +15,7 @@ echo ""
 
 # Clean up existing test databases
 echo -e "${YELLOW}Cleaning up test databases...${NC}"
-rm -f pkg/tests/badger/*
+rm -f pkg/tests/bolt.db pkg/tests/bolt.yaml
 rm -f pkg/tests/migration_test.yaml
 echo -e "${GREEN}Cleanup complete${NC}"
 echo ""

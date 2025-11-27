@@ -106,8 +106,12 @@ func closeSpectraAdapters(srcAdapter, dstAdapter fsservices.FSAdapter, ctx conte
 
 // MigrationConfig encapsulates the inputs required to execute a traversal migration.
 type MigrationConfig struct {
-	// BadgerDir is the directory where BadgerDB will store its data.
-	BadgerDir string
+	// BoltPath is the file path where BoltDB will store its data.
+	// This is only used if BoltDB is not provided.
+	BoltPath string
+	// BoltDB is the BoltDB instance to use. If provided, BoltPath is ignored.
+	// If not provided, a new instance will be opened using BoltPath.
+	BoltDB *db.DB
 
 	SrcAdapter     fsservices.FSAdapter
 	DstAdapter     fsservices.FSAdapter
@@ -145,8 +149,8 @@ type RuntimeStats struct {
 
 // RunMigration orchestrates queue setup, logging, task seeding, and completion monitoring.
 func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
-	if cfg.BadgerDir == "" {
-		return RuntimeStats{}, fmt.Errorf("BadgerDir cannot be empty")
+	if cfg.BoltDB == nil && cfg.BoltPath == "" {
+		return RuntimeStats{}, fmt.Errorf("either BoltDB or BoltPath must be provided")
 	}
 	if cfg.SrcAdapter == nil || cfg.DstAdapter == nil {
 		return RuntimeStats{}, fmt.Errorf("source and destination adapters must be provided")
@@ -192,34 +196,43 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 	coordinator := queue.NewQueueCoordinator(cfg.CoordinatorLead)
 
-	// Create BadgerDB instance for operational queue storage
-	badgerOpts := db.DefaultOptions()
-	badgerOpts.Path = cfg.BadgerDir
-
-	badgerDB, err := db.Open(badgerOpts)
-	if err != nil {
-		return RuntimeStats{}, fmt.Errorf("failed to open BadgerDB: %w", err)
+	// BoltDB instance should be passed in via MigrationConfig.BoltDB
+	// If not provided, open a new one (for backward compatibility with tests)
+	var boltDB *db.DB
+	var err error
+	if cfg.BoltDB != nil {
+		boltDB = cfg.BoltDB
+	} else {
+		// Fallback: open BoltDB if not provided (shouldn't happen in normal flow)
+		boltOpts := db.DefaultOptions()
+		boltOpts.Path = cfg.BoltPath
+		boltDB, err = db.Open(boltOpts)
+		if err != nil {
+			return RuntimeStats{}, fmt.Errorf("failed to open BoltDB: %w", err)
+		}
+		// Only defer close if we opened it here
+		defer func() {
+			if err := boltDB.Close(); err != nil {
+				fmt.Printf("Warning: failed to close BoltDB: %v\n", err)
+			}
+		}()
 	}
-	defer func() {
-		// Note: BadgerDB persists data permanently
-		// This defer is just for safety in case of early errors
-	}()
 
-	// BadgerDB is now the primary and only database
+	// BoltDB is now the primary and only database
 
 	// Initialize logger if not already initialized (logger should be managed at a higher level)
 	if cfg.LogAddress != "" && logservice.LS == nil {
-		if err := logservice.InitGlobalLogger(badgerDB, cfg.LogAddress, cfg.LogLevel); err != nil {
+		if err := logservice.InitGlobalLogger(boltDB, cfg.LogAddress, cfg.LogLevel); err != nil {
 			return RuntimeStats{}, fmt.Errorf("failed to initialize global logger: %w", err)
 		}
 	}
 
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
-	srcQueue.InitializeWithContext(badgerDB, cfg.SrcAdapter, nil, cfg.ShutdownContext)
+	srcQueue.InitializeWithContext(boltDB, cfg.SrcAdapter, nil, cfg.ShutdownContext)
 	defer srcQueue.Close()
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
-	dstQueue.InitializeWithContext(badgerDB, cfg.DstAdapter, srcQueue, cfg.ShutdownContext)
+	dstQueue.InitializeWithContext(boltDB, cfg.DstAdapter, srcQueue, cfg.ShutdownContext)
 	defer dstQueue.Close()
 
 	// Initialize queues from YAML config state
@@ -229,7 +242,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 	// Update config: Traversal started
 	if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-		status, statusErr := InspectMigrationStatus(badgerDB)
+		status, statusErr := InspectMigrationStatus(boltDB)
 		if statusErr == nil {
 			srcStats := srcQueue.Stats()
 			dstStats := dstQueue.Stats()
@@ -281,7 +294,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				srcStats := srcQueue.Stats()
 				dstStats := dstQueue.Stats()
 
-				// BadgerDB doesn't need checkpointing - data is already persisted
+				// BoltDB doesn't need checkpointing - data is already persisted
 
 				// Close Spectra adapters to ensure proper cleanup (only close once if they share the same SDK instance)
 				closeSpectraAdapters(cfg.SrcAdapter, cfg.DstAdapter, cleanupCtx)
@@ -290,7 +303,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
 					yamlDone := make(chan error, 1)
 					go func() {
-						status, statusErr := InspectMigrationStatus(badgerDB)
+						status, statusErr := InspectMigrationStatus(boltDB)
 						if statusErr == nil {
 							SetSuspendedStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
 							yamlDone <- SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
@@ -325,7 +338,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 			// Update config YAML with final state
 			if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-				status, statusErr := InspectMigrationStatus(badgerDB)
+				status, statusErr := InspectMigrationStatus(boltDB)
 				if statusErr == nil {
 					UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
 					// Save final config
@@ -378,7 +391,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			shouldUpdate := roundAdvanced || (tickCount%10 == 0)
 
 			if cfg.YAMLConfig != nil && cfg.ConfigPath != "" && shouldUpdate {
-				status, statusErr := InspectMigrationStatus(badgerDB)
+				status, statusErr := InspectMigrationStatus(boltDB)
 				if statusErr == nil {
 					UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
 					// Save config (ignore errors to avoid disrupting migration)
@@ -405,7 +418,7 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 		dstRound = *cfg.YAMLConfig.State.LastRoundDst
 	}
 
-	// BadgerDB is now the primary database - no SQLite seeding needed
+	// BoltDB is now the primary database - no SQLite seeding needed
 
 	// Set queue rounds
 	srcQueue.SetRound(srcRound)
@@ -427,7 +440,7 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 		coordinator.UpdateDstCompleted()
 	}
 
-	// Pull tasks from Badger into queue buffers (blocks on coordinator internally)
+	// Pull tasks from BoltDB into queue buffers (blocks on coordinator internally)
 	srcQueue.PullTasks(true)
 	dstQueue.PullTasks(true)
 

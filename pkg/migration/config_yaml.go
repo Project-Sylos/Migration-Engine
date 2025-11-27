@@ -167,7 +167,7 @@ func SaveMigrationConfig(path string, cfg *MigrationConfigYAML) error {
 // Default strategy: {database_dir}.yaml
 func ConfigPathFromDatabasePath(dbDir string) string {
 	base := dbDir
-	base = strings.TrimSuffix(base, ".badger")
+	base = strings.TrimSuffix(base, ".db")
 	return base + ".yaml"
 }
 

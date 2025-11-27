@@ -24,7 +24,7 @@ type Service struct {
 // Config aggregates all of the knobs required to run the migration engine once.
 type Config struct {
 	Database         DatabaseConfig
-	DatabaseInstance *db.DB // BadgerDB instance
+	DatabaseInstance *db.DB // BoltDB instance
 	CloseDatabase    bool
 
 	Source      Service
@@ -177,8 +177,8 @@ func LetsMigrate(cfg Config) (Result, error) {
 // letsMigrateWithContext is the internal implementation that accepts a shutdown context.
 func letsMigrateWithContext(cfg Config) (Result, error) {
 	var (
-		badgerDB *db.DB
-		err      error
+		boltDB *db.DB
+		err    error
 	)
 
 	// Use provided shutdown context, or create one if not provided
@@ -194,11 +194,11 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 
 	var wasFresh bool
 	if cfg.DatabaseInstance != nil {
-		badgerDB = cfg.DatabaseInstance
+		boltDB = cfg.DatabaseInstance
 		wasFresh = false // Existing database instance
 	} else {
 		var setupErr error
-		badgerDB, wasFresh, setupErr = SetupDatabase(cfg.Database)
+		boltDB, wasFresh, setupErr = SetupDatabase(cfg.Database)
 		if setupErr != nil {
 			return Result{}, setupErr
 		}
@@ -214,7 +214,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	} else {
 		// Existing database - inspect to decide between fresh run and resume
 		var inspectErr error
-		status, inspectErr = InspectMigrationStatus(badgerDB)
+		status, inspectErr = InspectMigrationStatus(boltDB)
 		if inspectErr != nil {
 			return Result{}, fmt.Errorf("failed to inspect migration status: %w", inspectErr)
 		}
@@ -290,19 +290,19 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	var runtime RuntimeStats
 	var runErr error
 
-	badgerDir := cfg.Database.Path
-	if badgerDir == "" {
-		badgerDir = "migration.badger"
+	boltPath := cfg.Database.Path
+	if boltPath == "" {
+		boltPath = "migration.db"
 	}
-	if abs, err := filepath.Abs(badgerDir); err == nil {
-		badgerDir = abs
+	if abs, err := filepath.Abs(boltPath); err == nil {
+		boltPath = abs
 	}
 
 	// Helper function to run fresh migration
 	runFreshMigration := func() (RuntimeStats, error) {
 		if cfg.SeedRoots {
-			// Seed root tasks to BadgerDB
-			summary, err := SeedRootTasks(srcRoot, dstRoot, badgerDB)
+			// Seed root tasks to BoltDB
+			summary, err := SeedRootTasks(srcRoot, dstRoot, boltDB)
 			if err != nil {
 				fmt.Printf("Warning: failed to seed root tasks: %v\n", err)
 				return RuntimeStats{}, err
@@ -317,7 +317,8 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 			}
 		}
 		return RunMigration(MigrationConfig{
-			BadgerDir:       badgerDir,
+			BoltDB:          boltDB,
+			BoltPath:        boltPath,
 			SrcAdapter:      cfg.Source.Adapter,
 			DstAdapter:      cfg.Destination.Adapter,
 			SrcRoot:         srcRoot,
@@ -372,7 +373,8 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 				fmt.Println("Resuming migration from existing database state...")
 			}
 			runtime, runErr = RunMigration(MigrationConfig{
-				BadgerDir:       badgerDir,
+				BoltDB:          boltDB,
+				BoltPath:        boltPath,
 				SrcAdapter:      cfg.Source.Adapter,
 				DstAdapter:      cfg.Destination.Adapter,
 				SrcRoot:         srcRoot,
@@ -410,7 +412,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
 
-		// BadgerDB doesn't need checkpointing - data is already persisted
+		// BoltDB doesn't need checkpointing - data is already persisted
 
 		// Flush log service if available (with timeout)
 		if logservice.LS != nil {
@@ -437,7 +439,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 
 	// Verify migration before closing database - verification needs database access
 	// Note: We run verification even if migration had errors, to provide full diagnostic info
-	report, verifyErr := VerifyMigration(badgerDB, cfg.Verification)
+	report, verifyErr := VerifyMigration(boltDB, cfg.Verification)
 	result.Verification = report
 
 	// Note: We do NOT close the log service here - it's a global singleton that should
@@ -449,7 +451,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 
 	// Close database after verification and log service are done (allows verification and log flushing to access DB)
 	if cfg.CloseDatabase {
-		defer badgerDB.Close()
+		defer boltDB.Close()
 	}
 
 	// Return migration error if it occurred (verification ran for diagnostics)

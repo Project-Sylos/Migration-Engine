@@ -11,12 +11,12 @@ import (
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 )
 
-// SeedRootTask inserts the initial root folder task into BadgerDB to kickstart traversal.
+// SeedRootTask inserts the initial root folder task into BoltDB to kickstart traversal.
 // For src: sets traversal_status='Pending' and copy_status='Pending'
 // For dst: sets traversal_status='Pending'
-func SeedRootTask(queueType string, rootFolder fsservices.Folder, badgerDB *db.DB) error {
-	if badgerDB == nil {
-		return fmt.Errorf("badgerDB cannot be nil")
+func SeedRootTask(queueType string, rootFolder fsservices.Folder, boltDB *db.DB) error {
+	if boltDB == nil {
+		return fmt.Errorf("boltDB cannot be nil")
 	}
 
 	// Create NodeState from root folder
@@ -34,31 +34,21 @@ func SeedRootTask(queueType string, rootFolder fsservices.Folder, badgerDB *db.D
 		Status:     "Pending",
 	}
 
-	// Determine copy status
-	copyStatus := db.CopyStatusPending
-	if queueType == "dst" {
-		copyStatus = "" // DST nodes don't use copy_status
-	}
+	// Populate traversal status in the NodeState metadata
+	state.TraversalStatus = db.StatusPending
 
-	// Use BatchInsertNodes to write to BadgerDB
-	indexPrefix := db.IndexPrefixSrcChildren
-	if queueType == "dst" {
-		indexPrefix = db.IndexPrefixDstChildren
-	}
-
+	// Use BatchInsertNodes to write to BoltDB
 	ops := []db.InsertOperation{
 		{
-			QueueType:       queueType,
-			Level:           0,
-			TraversalStatus: db.TraversalStatusPending,
-			CopyStatus:      copyStatus,
-			State:           state,
-			IndexPrefix:     indexPrefix,
+			QueueType: queueType,
+			Level:     0,
+			Status:    db.StatusPending,
+			State:     state,
 		},
 	}
 
-	if err := db.BatchInsertNodes(badgerDB, ops); err != nil {
-		return fmt.Errorf("failed to seed root task to BadgerDB for %s: %w", queueType, err)
+	if err := db.BatchInsertNodes(boltDB, ops); err != nil {
+		return fmt.Errorf("failed to seed root task to BoltDB for %s: %w", queueType, err)
 	}
 
 	if logservice.LS != nil {
@@ -74,13 +64,13 @@ func SeedRootTask(queueType string, rootFolder fsservices.Folder, badgerDB *db.D
 }
 
 // SeedRootTasks is a convenience function to seed both src and dst root tasks at once.
-// Writes root tasks to BadgerDB.
-func SeedRootTasks(srcRoot fsservices.Folder, dstRoot fsservices.Folder, badgerDB *db.DB) error {
-	if err := SeedRootTask("src", srcRoot, badgerDB); err != nil {
+// Writes root tasks to BoltDB.
+func SeedRootTasks(srcRoot fsservices.Folder, dstRoot fsservices.Folder, boltDB *db.DB) error {
+	if err := SeedRootTask("SRC", srcRoot, boltDB); err != nil {
 		return fmt.Errorf("failed to seed src root: %w", err)
 	}
 
-	if err := SeedRootTask("dst", dstRoot, badgerDB); err != nil {
+	if err := SeedRootTask("DST", dstRoot, boltDB); err != nil {
 		return fmt.Errorf("failed to seed dst root: %w", err)
 	}
 

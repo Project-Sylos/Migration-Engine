@@ -57,7 +57,7 @@ result, err := migration.LetsMigrate(cfg)
 ```
 
 This function:
-1. Sets up or opens the BadgerDB database
+1. Sets up or opens the BoltDB database
 2. Inspects existing migration state
 3. Decides whether to run fresh or resume
 4. Executes traversal
@@ -74,16 +74,16 @@ The migration package includes a comprehensive YAML-based configuration system t
 
 The config YAML is automatically saved at critical milestones:
 - **Root Selection** - When `SetRootFolders()` is called
-- **Roots Seeded** - After root tasks are seeded into BadgerDB
+- **Roots Seeded** - After root tasks are seeded into BoltDB
 - **Traversal Started** - When queues are initialized and ready
 - **Round Advancement** - When source or destination rounds advance
 - **Traversal Complete** - When migration finishes
 
 ### Config File Location
 
-By default, the config YAML is stored alongside the database directory:
-- Database: `migration.badger/`
-- Config: `migration.badger.yaml`
+By default, the config YAML is stored alongside the database file:
+- Database: `migration.db`
+- Config: `migration.db.yaml`
 
 You can specify a custom path via `DatabaseConfig.ConfigPath`.
 
@@ -128,32 +128,12 @@ To resume a migration, you need to reconstruct a `migration.Config` from the YAM
 factory := func(serviceType string, serviceCfg migration.ServiceConfigYAML, serviceConfigs map[string]any) (fsservices.FSAdapter, error) {
     switch strings.ToLower(serviceType) {
     case "spectra":
-        // Extract spectra config
-        spectraData, ok := serviceConfigs["spectra"].(map[string]any)
-        if !ok {
-            return nil, fmt.Errorf("spectra config not found")
-        }
-        
-        // Create SpectraFS instance
-        configPath := "pkg/configs/spectra.json"
+        // Extract spectra config and create adapter
         spectraFS, err := sdk.New(configPath)
         if err != nil {
             return nil, err
         }
-        
-        rootID := serviceCfg.RootID
-        if rootID == "" {
-            rootID = "root"
-        }
-        
-        // Extract world from service name or config
-        world := "primary"
-        if strings.Contains(serviceCfg.Name, "S1") {
-            world = "s1"
-        }
-        
         return fsservices.NewSpectraFS(spectraFS, rootID, world)
-        
     default:
         return nil, fmt.Errorf("unsupported service type: %s", serviceType)
     }
@@ -179,7 +159,7 @@ The YAML config includes:
 - **Service Configs** - Embedded service-specific configs (e.g., spectra.json)
 - **Migration Options** - Worker count, retries, coordinator lead, etc.
 - **Logging** - Log service address, port, and level
-- **Database** - BadgerDB directory path and settings
+- **Database** - BoltDB file path and settings
 - **Verification** - Verification options
 - **Extensions** - Unstructured fields for future extensions
 
@@ -200,7 +180,7 @@ The YAML config includes:
 ```go
 cfg := migration.Config{
     Database: migration.DatabaseConfig{
-        Path: "migration.badger",
+        Path: "migration.db",
     },
     Source:      sourceService,
     Destination: destinationService,
@@ -213,13 +193,13 @@ result, err := migration.LetsMigrate(cfg)
 
 ### 2. Resume Migration
 
-When you open an existing BadgerDB database, `LetsMigrate` automatically detects pending work and resumes:
+When you open an existing BoltDB database, `LetsMigrate` automatically detects pending work and resumes:
 
 ```go
 // Same config, but database already exists with state
 cfg := migration.Config{
     Database: migration.DatabaseConfig{
-        Path: "migration.badger", // Existing database
+        Path: "migration.db", // Existing database
     },
     // ... same config
 }
@@ -266,10 +246,10 @@ type MigrationStatus struct {
 
 ### InspectMigrationStatus
 
-Query the current migration state from BadgerDB:
+Query the current migration state from BoltDB:
 
 ```go
-status, err := migration.InspectMigrationStatus(badgerDB)
+status, err := migration.InspectMigrationStatus(boltDB)
 if status.HasPending() {
     fmt.Println("Migration has pending work")
 }
@@ -277,6 +257,11 @@ if status.IsComplete() {
     fmt.Println("Migration is complete")
 }
 ```
+
+The status inspection queries BoltDB bucket counts:
+- Iterates all levels for each queue
+- Counts nodes in each status bucket (pending, successful, failed)
+- Finds minimum pending level
 
 ---
 
@@ -291,11 +276,16 @@ verifyOpts := migration.VerifyOptions{
     AllowNotOnSrc: true,
 }
 
-report, err := migration.VerifyMigration(badgerDB, verifyOpts)
+report, err := migration.VerifyMigration(boltDB, verifyOpts)
 if report.Success(verifyOpts) {
     fmt.Println("Migration verified successfully")
 }
 ```
+
+Verification queries BoltDB to count:
+- Total nodes in each queue
+- Nodes in each status across all levels
+- Nodes successfully moved (excluding root level)
 
 ---
 
@@ -303,26 +293,28 @@ if report.Success(verifyOpts) {
 
 ### SetupDatabase
 
-Creates a new BadgerDB database:
+Creates a new BoltDB database:
 
 ```go
 db, wasFresh, err := migration.SetupDatabase(migration.DatabaseConfig{
-    Path:           "migration.badger",
+    Path:           "migration.db",
     RemoveExisting: false,
 })
 ```
 
 ### DatabaseConfig
 
-Configures BadgerDB behavior:
+Configures BoltDB behavior:
 
 ```go
 type DatabaseConfig struct {
-    Path           string // BadgerDB directory path
-    RemoveExisting bool   // Delete existing directory before creating
+    Path           string // BoltDB file path
+    RemoveExisting bool   // Delete existing file before creating
     ConfigPath     string // Optional: custom YAML config path
 }
 ```
+
+**Note:** BoltDB uses a single file for the entire database, making cleanup straightforward.
 
 ---
 
@@ -360,6 +352,16 @@ if err != nil {
 4. **Use verification** - Always verify migration results before considering it complete
 5. **Save configs explicitly** - For important migrations, save configs at key points
 6. **Provide proper AdapterFactory** - When loading from YAML, ensure your factory handles all service types
+
+---
+
+## BoltDB Benefits for Migration
+
+1. **Atomic Resumption** - Bucket structure naturally represents current state
+2. **Race-Free Operations** - Single-writer guarantees consistent status transitions
+3. **Predictable Queries** - Counting and iteration are deterministic
+4. **Simple Cleanup** - Just delete the single database file
+5. **Crash Resilience** - ACID transactions guarantee consistency
 
 ---
 

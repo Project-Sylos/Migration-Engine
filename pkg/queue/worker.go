@@ -24,12 +24,12 @@ type Worker interface {
 // TraversalWorker
 // ============================================================================
 
-// TraversalWorker executes traversal tasks by listing children and recording them to BadgerDB.
+// TraversalWorker executes traversal tasks by listing children and recording them to BoltDB.
 // Each worker runs independently in its own goroutine, continuously polling the queue for work.
 type TraversalWorker struct {
 	id          string
 	queue       *Queue
-	badgerDB    *db.DB
+	boltDB      *db.DB
 	fsAdapter   fsservices.FSAdapter
 	queueName   string            // "src" or "dst" for logging
 	isDst       bool              // true if this is a destination worker (performs comparison)
@@ -42,7 +42,7 @@ type TraversalWorker struct {
 func NewTraversalWorker(
 	id string,
 	queue *Queue,
-	badgerInstance *db.DB,
+	boltInstance *db.DB,
 	adapter fsservices.FSAdapter,
 	queueName string,
 	coordinator *QueueCoordinator,
@@ -51,7 +51,7 @@ func NewTraversalWorker(
 	return &TraversalWorker{
 		id:          id,
 		queue:       queue,
-		badgerDB:    badgerInstance,
+		boltDB:      boltInstance,
 		fsAdapter:   adapter,
 		queueName:   queueName,
 		isDst:       queueName == "dst",
@@ -186,6 +186,15 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 		}
 	}
 
+	// if we discovered anything list out the items in a logger log
+	if logservice.LS != nil {
+		totalChildren := len(task.DiscoveredChildren)
+		if totalChildren > 0 {
+			childLog := fmt.Sprintf("Discovered %d total children", totalChildren)
+			_ = logservice.LS.Log("info", childLog, "worker", w.id, "queue", w.queueName)
+		}
+	}
+
 	return nil
 }
 
@@ -229,22 +238,11 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsse
 			// Folder exists on both: compare timestamps to determine status
 			status := compareTimestamps(expectedFolder.LastUpdated, actualFolder.LastUpdated)
 
-			if status == "Pending" && w.queue != nil {
-				normalizedPath := fsservices.NormalizeLocationPath(expectedFolder.LocationPath)
-				nextRound := task.Round + 1
-				w.queue.enqueueCopyUpdate("src", nextRound, db.TraversalStatusSuccessful, db.CopyStatusSuccessful, db.CopyStatusPending, normalizedPath)
-			}
+			// TODO: During copy phase, update NodeState.CopyStatus for pending folders
 
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				Folder: actualFolder,
 				Status: status,
-				IsFile: false,
-			})
-		} else {
-			// Folder missing from dst: mark as "Missing"
-			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
-				Folder: expectedFolder,
-				Status: "Missing",
 				IsFile: false,
 			})
 		}
@@ -269,11 +267,7 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsse
 			// Files don't need traversal, but we still compare to determine if copy is needed
 			status := compareTimestamps(expectedFile.LastUpdated, actualFile.LastUpdated)
 
-			if status == "Pending" && w.queue != nil {
-				normalizedPath := fsservices.NormalizeLocationPath(expectedFile.LocationPath)
-				nextRound := task.Round + 1
-				w.queue.enqueueCopyUpdate("src", nextRound, db.TraversalStatusSuccessful, db.CopyStatusSuccessful, db.CopyStatusPending, normalizedPath)
-			}
+			// TODO: During copy phase, update NodeState.CopyStatus for pending files
 
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				File:   actualFile,
