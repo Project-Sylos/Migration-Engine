@@ -169,26 +169,23 @@ Queues call `WaitForCoordinatorGate(reason)` right after seeding and whenever th
 
 ---
 
-## Write Buffering
+## Direct Writes
 
-For performance, the queue uses a `WriteBuffer` that batches operations:
+The queue writes directly to BoltDB when tasks complete or fail:
 
 ```go
-// Buffer batches ~1000 operations or flushes every 3 seconds
-writeBuffer := db.NewWriteBuffer(database, 1000, 3*time.Second)
-
-// Add operations (inserts, status updates)
-writeBuffer.Add(db.WriteItem{
-    Type:      "insert",
-    QueueType: "SRC",
-    Level:     nextRound,
-    Status:    db.StatusPending,
-    State:     childState,
+// On task completion, writes are atomic:
+// 1. Update parent status: pending → successful
+// 2. Insert all discovered children
+err := database.Update(func(tx *bolt.Tx) error {
+    // Both operations in single transaction
+    updateNodeStatusInTx(tx, queueType, level, oldStatus, newStatus, path)
+    batchInsertNodesInTx(tx, childOperations)
+    return nil
 })
-
-// Explicit flush (also auto-flushes)
-writeBuffer.Flush()
 ```
+
+This ensures immediate consistency without buffering delays.
 
 **Order of operations:**
 1. Status updates processed first (parent transitions)
