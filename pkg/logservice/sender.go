@@ -176,6 +176,7 @@ func (s *Sender) ClearConsole() error {
 }
 
 // Close terminates the UDP connection and stops the log buffer.
+// The log buffer Stop() has its own timeout to prevent blocking.
 func (s *Sender) Close() error {
 	if s.logBuffer != nil {
 		s.logBuffer.Stop()

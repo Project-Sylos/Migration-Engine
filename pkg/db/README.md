@@ -218,26 +218,28 @@ allLogs, err := db.GetAllLogs(database)
 
 ### Buffered Writes
 
-For high-throughput scenarios, use write buffers:
+For high-throughput scenarios, use batch operations within a single transaction:
 
 ```go
-// Create write buffer (batches writes every 1000 items or 3 seconds)
-writeBuffer := db.NewWriteBuffer(database, 1000, 3*time.Second)
+// Batch insert multiple nodes atomically
+ops := []db.InsertOperation{
+    {
+        QueueType: "SRC",
+        Level:     1,
+        Status:    db.StatusPending,
+        State:     nodeState1,
+    },
+    {
+        QueueType: "SRC",
+        Level:     1,
+        Status:    db.StatusPending,
+        State:     nodeState2,
+    },
+}
 
-// Add operations
-writeBuffer.Add(db.WriteItem{
-    Type:      "insert",
-    QueueType: "SRC",
-    Level:     1,
-    Status:    db.StatusPending,
-    State:     nodeState,
+err := database.Update(func(tx *bolt.Tx) error {
+    return db.batchInsertNodesInTx(tx, ops)
 })
-
-// Explicit flush (also auto-flushes on timer/size)
-err := writeBuffer.Flush()
-
-// Stop buffer (flushes remaining items)
-writeBuffer.Stop()
 ```
 
 ---
@@ -316,14 +318,9 @@ for _, state := range states {
 }
 ```
 
-### Write Buffers
+### Direct Writes
 
-Use WriteBuffer for queue operations to batch database writes:
-
-```go
-// Batches ~1000 operations into single transaction
-buffer := db.NewWriteBuffer(database, 1000, 3*time.Second)
-```
+The queue system writes directly to BoltDB for immediate consistency. BoltDB's single-writer model already serializes writes, so no additional buffering is needed.
 
 ---
 

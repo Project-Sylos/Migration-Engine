@@ -5,109 +5,161 @@ package queue
 
 import (
 	"sync"
+
+	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 )
 
-// QueueCoordinator manages explicit inter-queue round coordination between src and dst queues.
-// It ensures bounded concurrency by limiting how far ahead src can be relative to dst.
+// YAMLUpdateCallback is a function that updates the YAML config file when rounds advance.
+// It's called from a background goroutine to avoid blocking.
+type YAMLUpdateCallback func(srcRound, dstRound int)
+
+// QueueCoordinator manages round advancement gates for dual-BFS traversal.
+// It enforces the invariant: "DST cannot advance to round N until SRC has completed rounds N and N+1."
+// This is a simple gate - queues manage themselves, coordinator only controls when DST can advance.
 type QueueCoordinator struct {
 	mu           sync.RWMutex
-	srcRound     int
-	srcCompleted bool
-	dstRound     int
-	dstCompleted bool
-	maxLead      int // Maximum rounds src can be ahead of dst
+	srcRound     int                // Current SRC round
+	srcDone      bool               // SRC has completed traversal
+	dstRound     int                // Current DST round
+	dstDone      bool               // DST has completed traversal
+	yamlUpdateCB YAMLUpdateCallback // Optional callback for YAML updates on round advance
 }
 
-// NewQueueCoordinator creates a new coordinator with the specified maximum lead.
-// maxLead determines how many rounds ahead src can be before it must wait for dst.
-func NewQueueCoordinator(maxLead int) *QueueCoordinator {
+// NewQueueCoordinator creates a new coordinator.
+func NewQueueCoordinator() *QueueCoordinator {
 	return &QueueCoordinator{
-		srcRound:     0,
-		srcCompleted: false,
-		dstRound:     0,
-		dstCompleted: false,
-		maxLead:      maxLead,
+		srcRound: 0,
+		srcDone:  false,
+		dstRound: 0,
+		dstDone:  false,
 	}
 }
 
-// CanSrcAdvance returns true if src can advance to the next round.
-// Src can advance if it's not more than maxLead rounds ahead of dst.
-// If dst has completed early (no more folders to traverse), src should continue
-// traversing its own tree until it also completes.
-func (c *QueueCoordinator) CanSrcAdvance() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	// If dst has completed, allow src to continue (dst finished early but that's valid)
-	if c.dstCompleted {
-		return true
-	}
-	// Otherwise, enforce maxLead constraint
-	return (c.srcRound - c.dstRound) < c.maxLead
+// SetYAMLUpdateCallback sets a callback function that will be invoked (in a background goroutine)
+// whenever a round advances. This allows automatic YAML config updates.
+func (c *QueueCoordinator) SetYAMLUpdateCallback(cb YAMLUpdateCallback) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.yamlUpdateCB = cb
 }
 
-// CanDstAdvance returns true if dst can advance to the next round.
-// Dst on round N can only advance to round N+1 if src is at least on round N+3.
-// This ensures that when dst completes round N and needs to query src's successful tasks
-// from round N+1, those tasks are guaranteed to exist because src round N+1 completed
-// when src advanced to round N+2, and src is now at least on round N+3.
-func (c *QueueCoordinator) CanDstAdvance() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return (c.dstRound+3 <= c.srcRound || c.srcCompleted) && !c.dstCompleted
-}
-
-// UpdateSrcRound atomically updates the src round counter.
+// UpdateSrcRound updates SRC's current round.
 func (c *QueueCoordinator) UpdateSrcRound(round int) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	oldRound := c.srcRound
 	c.srcRound = round
+	cb := c.yamlUpdateCB
+	c.mu.Unlock()
+
+	// If round changed and we have a callback, update YAML in background
+	if oldRound != round && cb != nil {
+		go func() {
+			c.mu.RLock()
+			srcR := c.srcRound
+			dstR := c.dstRound
+			c.mu.RUnlock()
+			cb(srcR, dstR)
+		}()
+	}
 }
 
-// UpdateDstRound atomically updates the dst round counter.
+// UpdateDstRound updates DST's current round.
 func (c *QueueCoordinator) UpdateDstRound(round int) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	oldRound := c.dstRound
 	c.dstRound = round
+	cb := c.yamlUpdateCB
+	c.mu.Unlock()
+
+	// If round changed and we have a callback, update YAML in background
+	if oldRound != round && cb != nil {
+		go func() {
+			c.mu.RLock()
+			srcR := c.srcRound
+			dstR := c.dstRound
+			c.mu.RUnlock()
+			cb(srcR, dstR)
+		}()
+	}
 }
 
-// GetSrcRound returns the current src round.
+// GetSrcRound returns SRC's current round.
 func (c *QueueCoordinator) GetSrcRound() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.srcRound
 }
 
-// GetDstRound returns the current dst round.
+// GetDstRound returns DST's current round.
 func (c *QueueCoordinator) GetDstRound() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.dstRound
 }
 
-// UpdateSrcCompleted atomically updates the src completed flag.
-func (c *QueueCoordinator) UpdateSrcCompleted() {
+// MarkSrcCompleted marks SRC as completed.
+func (c *QueueCoordinator) MarkSrcCompleted() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.srcCompleted = true
+	c.srcDone = true
+	c.mu.Unlock()
+	// Log outside of lock to avoid deadlock
+	if logservice.LS != nil {
+		_ = logservice.LS.Log("debug",
+			"Coordinator: SRC marked as completed",
+			"coordinator", "mark", "coordinator")
+	}
 }
 
-// UpdateDstCompleted atomically updates the dst completed flag.
-func (c *QueueCoordinator) UpdateDstCompleted() {
+// MarkDstCompleted marks DST as completed.
+func (c *QueueCoordinator) MarkDstCompleted() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.dstCompleted = true
+	c.dstDone = true
+	c.mu.Unlock()
+	// Log outside of lock to avoid deadlock
+	if logservice.LS != nil {
+		_ = logservice.LS.Log("debug",
+			"Coordinator: DST marked as completed",
+			"coordinator", "mark", "coordinator")
+	}
 }
 
-// IsDstCompleted returns true if dst has completed.
-func (c *QueueCoordinator) IsDstCompleted() bool {
+// IsCompleted returns true if the specified queue ("src", "dst", or "both") has completed traversal.
+func (c *QueueCoordinator) IsCompleted(queueType string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.dstCompleted
+	switch queueType {
+	case "src":
+		return c.srcDone
+	case "dst":
+		return c.dstDone
+	case "both":
+		return c.srcDone && c.dstDone
+	default:
+		return false
+	}
 }
 
-// IsSrcCompleted returns true if src has completed.
-func (c *QueueCoordinator) IsSrcCompleted() bool {
+// CanDstStartRound returns true if DST can start processing the specified round.
+// DST can start round N if:
+//   - SRC has completed traversal entirely (DST can proceed freely), OR
+//   - SRC has completed rounds N and N+1 (SRC is at round N+2 or higher)
+//
+// Note: Since DST can now freely advance to a round and then pause, the check is N+2
+// (if DST wants to start round 4, SRC needs to have completed rounds 4 and 5, so SRC >= 6).
+// Once SRC is completed, DST can proceed at full speed with no restrictions.
+func (c *QueueCoordinator) CanDstStartRound(targetRound int) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.srcCompleted
+
+	// If SRC is done, DST can always proceed at full speed (unless DST is also done)
+	// This allows DST to catch up and finish as quickly as possible once SRC completes
+	if c.srcDone {
+		return !c.dstDone
+	}
+
+	// DST can start round N if SRC has completed rounds N and N+1
+	// SRC completes round N when it advances to N+1, completes round N+1 when it advances to N+2
+	// So DST can start round N if SRC is at round N+2 or higher
+	requiredSrcRound := targetRound + 2
+	return c.srcRound >= requiredSrcRound && !c.dstDone
 }

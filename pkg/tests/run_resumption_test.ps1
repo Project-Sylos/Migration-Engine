@@ -15,10 +15,8 @@ Write-Host ""
 # The DB will persist between Phase 1 (kill) and Phase 2 (resume)
 # Final cleanup happens at the end after verification
 Write-Host "Cleaning up test databases for fresh test run..." -ForegroundColor Yellow
-Remove-Item -Path "pkg\tests\migration_test.db" -ErrorAction SilentlyContinue
-Remove-Item -Path "pkg\tests\migration_test.db-wal" -ErrorAction SilentlyContinue
-Remove-Item -Path "pkg\tests\migration_test.db-shm" -ErrorAction SilentlyContinue
-Remove-Item -Path "pkg\tests\migration_test.yaml" -ErrorAction SilentlyContinue
+Remove-Item -Path "pkg\tests\bolt.db" -ErrorAction SilentlyContinue
+Remove-Item -Path "pkg\tests\bolt.yaml" -ErrorAction SilentlyContinue
 Write-Host "Cleanup complete" -ForegroundColor Green
 Write-Host ""
 
@@ -109,11 +107,11 @@ Write-Host "Phase 1 Duration: $($phase1Duration.TotalSeconds) seconds" -Foregrou
 Write-Host ""
 
 # Verify shutdown state was saved
-if (Test-Path "pkg\tests\migration_test.yaml") {
+if (Test-Path "pkg\tests\bolt.yaml") {
     Write-Host "YAML config file exists (suspended state saved)" -ForegroundColor Green
     
     # Read YAML to check status
-    $yamlContent = Get-Content "pkg\tests\migration_test.yaml" -Raw
+    $yamlContent = Get-Content "pkg\tests\bolt.yaml" -Raw
     if ($yamlContent -match 'state:\s*\r?\n\s*status\s*:\s*(suspended|running)') {
         Write-Host "Migration state indicates suspension or ready to resume" -ForegroundColor Green
     } else {
@@ -124,7 +122,7 @@ if (Test-Path "pkg\tests\migration_test.yaml") {
     exit 1
 }
 
-if (Test-Path "pkg\tests\migration_test.db") {
+if (Test-Path "pkg\tests\bolt.db") {
     Write-Host "Database file exists (checkpoint saved)" -ForegroundColor Green
 } else {
     Write-Host "Database file not found!" -ForegroundColor Red
@@ -160,8 +158,8 @@ if ($exitCode -eq 0) {
     Write-Host "TEST PASSED - Migration successfully resumed and completed!" -ForegroundColor Green
     
     # Verify final state
-    if (Test-Path "pkg\tests\migration_test.yaml") {
-        $finalYaml = Get-Content "pkg\tests\migration_test.yaml" -Raw
+    if (Test-Path "pkg\tests\bolt.yaml") {
+        $finalYaml = Get-Content "pkg\tests\bolt.yaml" -Raw
         if ($finalYaml -match 'status:\s*completed') {
             Write-Host "Final YAML status is 'completed'" -ForegroundColor Green
         } else {
@@ -172,10 +170,8 @@ if ($exitCode -eq 0) {
     # Clean up test databases after successful test completion
     Write-Host ""
     Write-Host "Cleaning up test databases after successful test..." -ForegroundColor Yellow
-    Remove-Item -Path "pkg\tests\migration_test.db" -ErrorAction SilentlyContinue
-    Remove-Item -Path "pkg\tests\migration_test.db-wal" -ErrorAction SilentlyContinue
-    Remove-Item -Path "pkg\tests\migration_test.db-shm" -ErrorAction SilentlyContinue
-    Remove-Item -Path "pkg\tests\migration_test.yaml" -ErrorAction SilentlyContinue
+    Remove-Item -Path "pkg\tests\bolt.db" -ErrorAction SilentlyContinue
+    Remove-Item -Path "pkg\tests\bolt.yaml" -ErrorAction SilentlyContinue
     Write-Host "Cleanup complete" -ForegroundColor Green
 } else {
     Write-Host "TEST FAILED - Migration resumption did not complete successfully" -ForegroundColor Red

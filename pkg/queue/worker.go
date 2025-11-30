@@ -31,10 +31,9 @@ type TraversalWorker struct {
 	queue       *Queue
 	boltDB      *db.DB
 	fsAdapter   fsservices.FSAdapter
-	queueName   string            // "src" or "dst" for logging
-	isDst       bool              // true if this is a destination worker (performs comparison)
-	coordinator *QueueCoordinator // Shared coordinator for round synchronization
-	shutdownCtx context.Context   // Context for shutdown signaling (optional)
+	queueName   string          // "src" or "dst" for logging
+	isDst       bool            // true if this is a destination worker (performs comparison)
+	shutdownCtx context.Context // Context for shutdown signaling (optional)
 }
 
 // NewTraversalWorker creates a worker that executes traversal tasks.
@@ -45,7 +44,6 @@ func NewTraversalWorker(
 	boltInstance *db.DB,
 	adapter fsservices.FSAdapter,
 	queueName string,
-	coordinator *QueueCoordinator,
 	shutdownCtx context.Context,
 ) *TraversalWorker {
 	return &TraversalWorker{
@@ -55,7 +53,6 @@ func NewTraversalWorker(
 		fsAdapter:   adapter,
 		queueName:   queueName,
 		isDst:       queueName == "dst",
-		coordinator: coordinator,
 		shutdownCtx: shutdownCtx,
 	}
 }
@@ -111,9 +108,16 @@ func (w *TraversalWorker) Run() {
 		err := w.execute(task)
 		if err != nil {
 			// Task failed, let queue handle retry logic
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("debug",
+					fmt.Sprintf("Worker task execution failed: path=%s round=%d error=%v",
+						task.LocationPath(), task.Round, err),
+					"worker", w.id, w.queueName)
+			}
 			willRetry := w.queue.Fail(task)
 			w.logError(task, err, willRetry)
 		} else {
+			// Task succeeded
 			w.queue.Complete(task)
 		}
 	}
@@ -132,6 +136,12 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 	// List children using the filesystem adapter
 	result, err := w.fsAdapter.ListChildren(folder.Id)
 	if err != nil {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("error",
+				fmt.Sprintf("Failed to list children: path=%s folderId=%s error=%v",
+					folder.LocationPath, folder.Id, err),
+				"worker", w.id, w.queueName)
+		}
 		return fmt.Errorf("failed to list children of %s: %w", folder.LocationPath, err)
 	}
 
@@ -183,15 +193,6 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 				Status: "Successful", // Files are immediately successful (no traversal needed)
 				IsFile: true,
 			})
-		}
-	}
-
-	// if we discovered anything list out the items in a logger log
-	if logservice.LS != nil {
-		totalChildren := len(task.DiscoveredChildren)
-		if totalChildren > 0 {
-			childLog := fmt.Sprintf("Discovered %d total children", totalChildren)
-			_ = logservice.LS.Log("info", childLog, "worker", w.id, "queue", w.queueName)
 		}
 	}
 

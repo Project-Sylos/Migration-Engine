@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
@@ -16,245 +15,165 @@ import (
 	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
 )
 
-// isPortInUse checks if a UDP port is already in use by attempting to bind to it.
-// Returns true if the port is already in use, false otherwise.
-func isPortInUse(addr string) bool {
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return false
-	}
-
-	conn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return true // Port is in use if we can't bind to it
-	}
-	conn.Close()
-	return false // Port is available
-}
-
-// closeSpectraAdapters closes SpectraFS adapters, ensuring the underlying SDK instance
-// is only closed once even if multiple adapters share the same instance.
-func closeSpectraAdapters(srcAdapter, dstAdapter fsservices.FSAdapter, ctx context.Context) {
-	var srcFS, dstFS *fsservices.SpectraFS
-	var ok bool
-
-	// Check if adapters are SpectraFS instances
-	if srcAdapter != nil {
-		srcFS, ok = srcAdapter.(*fsservices.SpectraFS)
-		if !ok {
-			srcFS = nil
-		}
-	}
-	if dstAdapter != nil {
-		dstFS, ok = dstAdapter.(*fsservices.SpectraFS)
-		if !ok {
-			dstFS = nil
-		}
-	}
-
-	// If both are SpectraFS, check if they share the same SDK instance
-	if srcFS != nil && dstFS != nil {
-		if srcFS.GetSDKInstance() == dstFS.GetSDKInstance() {
-			// Same instance - only close once
-			closeDone := make(chan error, 1)
-			go func() {
-				closeDone <- srcFS.Close()
-			}()
-			select {
-			case err := <-closeDone:
-				if err != nil {
-					fmt.Printf("Warning: failed to close Spectra SDK instance: %v\n", err)
-				}
-			case <-ctx.Done():
-				fmt.Printf("⚠️  Spectra close timeout - skipping\n")
-			}
-			return
-		}
-	}
-
-	// Different instances or only one is SpectraFS - close each separately
-	if srcFS != nil {
-		closeDone := make(chan error, 1)
-		go func() {
-			closeDone <- srcFS.Close()
-		}()
-		select {
-		case err := <-closeDone:
-			if err != nil {
-				fmt.Printf("Warning: failed to close Spectra source adapter: %v\n", err)
-			}
-		case <-ctx.Done():
-			fmt.Printf("⚠️  Spectra source close timeout - skipping\n")
-		}
-	}
-
-	if dstFS != nil {
-		closeDone := make(chan error, 1)
-		go func() {
-			closeDone <- dstFS.Close()
-		}()
-		select {
-		case err := <-closeDone:
-			if err != nil {
-				fmt.Printf("Warning: failed to close Spectra destination adapter: %v\n", err)
-			}
-		case <-ctx.Done():
-			fmt.Printf("⚠️  Spectra destination close timeout - skipping\n")
-		}
-	}
-}
-
-// MigrationConfig encapsulates the inputs required to execute a traversal migration.
+// MigrationConfig is the configuration passed to RunMigration.
 type MigrationConfig struct {
-	// BoltPath is the file path where BoltDB will store its data.
-	// This is only used if BoltDB is not provided.
-	BoltPath string
-	// BoltDB is the BoltDB instance to use. If provided, BoltPath is ignored.
-	// If not provided, a new instance will be opened using BoltPath.
-	BoltDB *db.DB
-
-	SrcAdapter     fsservices.FSAdapter
-	DstAdapter     fsservices.FSAdapter
-	SrcRoot        fsservices.Folder
-	DstRoot        fsservices.Folder
-	SrcServiceName string
-
+	BoltDB          *db.DB
+	BoltPath        string
+	SrcAdapter      fsservices.FSAdapter
+	DstAdapter      fsservices.FSAdapter
+	SrcRoot         fsservices.Folder
+	DstRoot         fsservices.Folder
+	SrcServiceName  string
 	WorkerCount     int
 	MaxRetries      int
 	CoordinatorLead int
-
-	LogAddress   string
-	LogLevel     string
-	SkipListener bool
-	StartupDelay time.Duration
-	ProgressTick time.Duration
-
-	// Resume state: if provided, migration will resume from existing state instead of starting fresh
-	ResumeStatus *MigrationStatus
-
-	// Config YAML management
-	ConfigPath string
-	YAMLConfig *MigrationConfigYAML
-
-	// Shutdown context: if provided, migration will check for cancellation and perform force shutdown
+	LogAddress      string
+	LogLevel        string
+	SkipListener    bool
+	StartupDelay    time.Duration
+	ProgressTick    time.Duration
+	ResumeStatus    *MigrationStatus
+	ConfigPath      string
+	YAMLConfig      *MigrationConfigYAML
 	ShutdownContext context.Context
 }
 
-// RuntimeStats captures high-level metrics collected after a migration run.
+// RuntimeStats captures execution statistics at the end of a migration run.
 type RuntimeStats struct {
 	Duration time.Duration
 	Src      queue.QueueStats
 	Dst      queue.QueueStats
 }
 
-// RunMigration orchestrates queue setup, logging, task seeding, and completion monitoring.
+// getQueueStats builds QueueStats from coordinator and queue queries (non-blocking)
+func getQueueStats(coordinator *queue.QueueCoordinator, boltDB *db.DB) (queue.QueueStats, queue.QueueStats) {
+	srcRound := coordinator.GetSrcRound()
+	dstRound := coordinator.GetDstRound()
+
+	// Get pending counts from DB for current round (non-blocking, uses View transaction)
+	srcPending := 0
+	dstPending := 0
+	if boltDB != nil {
+		srcPendingCount, _ := boltDB.CountByPrefix("SRC", srcRound, db.StatusPending)
+		srcPending = srcPendingCount
+		dstPendingCount, _ := boltDB.CountByPrefix("DST", dstRound, db.StatusPending)
+		dstPending = dstPendingCount
+	}
+
+	return queue.QueueStats{
+			Name:    "src",
+			Round:   srcRound,
+			Pending: srcPending,
+		}, queue.QueueStats{
+			Name:    "dst",
+			Round:   dstRound,
+			Pending: dstPending,
+		}
+}
+
+// RunMigration executes the migration traversal using the provided configuration.
 func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
-	if cfg.BoltDB == nil && cfg.BoltPath == "" {
-		return RuntimeStats{}, fmt.Errorf("either BoltDB or BoltPath must be provided")
+	if cfg.BoltDB == nil {
+		return RuntimeStats{}, fmt.Errorf("boltDB cannot be nil")
 	}
 	if cfg.SrcAdapter == nil || cfg.DstAdapter == nil {
 		return RuntimeStats{}, fmt.Errorf("source and destination adapters must be provided")
 	}
-	if cfg.SrcRoot.Id == "" || cfg.DstRoot.Id == "" {
-		return RuntimeStats{}, fmt.Errorf("source and destination root folders must include an Id")
-	}
 
-	if cfg.WorkerCount <= 0 {
-		cfg.WorkerCount = 10
-	}
-	if cfg.MaxRetries <= 0 {
-		cfg.MaxRetries = 3
-	}
-	if cfg.CoordinatorLead <= 0 {
-		cfg.CoordinatorLead = 3
-	}
-	if cfg.SrcServiceName == "" {
-		cfg.SrcServiceName = "Source"
-	}
-	if cfg.LogLevel == "" {
-		cfg.LogLevel = "info"
-	}
-	if cfg.StartupDelay == 0 {
-		cfg.StartupDelay = 2 * time.Second
-	}
-	if cfg.ProgressTick == 0 {
-		cfg.ProgressTick = 500 * time.Millisecond
-	}
+	boltDB := cfg.BoltDB
 
-	if cfg.LogAddress != "" && !cfg.SkipListener {
-		// Check if port is already in use (from previous process)
-		// This prevents spawning multiple terminal windows across separate test runs
-		if !isPortInUse(cfg.LogAddress) {
-			if err := logservice.StartListener(cfg.LogAddress); err != nil {
-				fmt.Printf("Warning: failed to start log listener at %s: %v\n", cfg.LogAddress, err)
-			} else {
-				time.Sleep(cfg.StartupDelay)
+	// Initialize log service and start listener
+	if !cfg.SkipListener && cfg.LogAddress != "" {
+		// Start listener terminal FIRST so it's ready before we send logs
+		if err := logservice.StartListener(cfg.LogAddress); err != nil {
+			// Non-fatal: continue without listener
+			// Don't return error - migration can still proceed
+		} else {
+			// Give the listener terminal time to start up before sending logs
+			// Use StartupDelay if provided, otherwise default to 500ms
+			startupDelay := cfg.StartupDelay
+			if startupDelay <= 0 {
+				startupDelay = 500 * time.Millisecond
 			}
+			time.Sleep(startupDelay)
 		}
-		// If port is in use, listener is already running from previous process - skip spawning
-	}
-
-	coordinator := queue.NewQueueCoordinator(cfg.CoordinatorLead)
-
-	// BoltDB instance should be passed in via MigrationConfig.BoltDB
-	// If not provided, open a new one (for backward compatibility with tests)
-	var boltDB *db.DB
-	var err error
-	if cfg.BoltDB != nil {
-		boltDB = cfg.BoltDB
-	} else {
-		// Fallback: open BoltDB if not provided (shouldn't happen in normal flow)
-		boltOpts := db.DefaultOptions()
-		boltOpts.Path = cfg.BoltPath
-		boltDB, err = db.Open(boltOpts)
-		if err != nil {
-			return RuntimeStats{}, fmt.Errorf("failed to open BoltDB: %w", err)
-		}
-		// Only defer close if we opened it here
-		defer func() {
-			if err := boltDB.Close(); err != nil {
-				fmt.Printf("Warning: failed to close BoltDB: %v\n", err)
-			}
-		}()
-	}
-
-	// BoltDB is now the primary and only database
-
-	// Initialize logger if not already initialized (logger should be managed at a higher level)
-	if cfg.LogAddress != "" && logservice.LS == nil {
+		// Now initialize logger (which sends test log)
 		if err := logservice.InitGlobalLogger(boltDB, cfg.LogAddress, cfg.LogLevel); err != nil {
-			return RuntimeStats{}, fmt.Errorf("failed to initialize global logger: %w", err)
+			return RuntimeStats{}, fmt.Errorf("failed to initialize logger: %w", err)
 		}
 	}
 
+	// Create coordinator for round advancement gates
+	coordinator := queue.NewQueueCoordinator()
+
+	// Set up YAML update callback for automatic config updates on round advance
+	if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
+		coordinator.SetYAMLUpdateCallback(func(srcRound, dstRound int) {
+			// Thread-safe YAML update in background goroutine
+			go func() {
+				status, err := InspectMigrationStatus(boltDB)
+				if err == nil {
+					UpdateConfigFromStatus(cfg.YAMLConfig, status, srcRound, dstRound)
+					_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
+				}
+			}()
+		})
+	}
+
+	// Create queues
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
 	srcQueue.InitializeWithContext(boltDB, cfg.SrcAdapter, nil, cfg.ShutdownContext)
-	defer srcQueue.Close()
+	// Note: Queues clean themselves up when they complete (Run() exits when state=QueueStateCompleted)
+	// We only need to explicitly close for forced shutdowns, which is handled via Pause() + shutdown context
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
 	dstQueue.InitializeWithContext(boltDB, cfg.DstAdapter, srcQueue, cfg.ShutdownContext)
-	defer dstQueue.Close()
+	// Note: Queues clean themselves up when they complete (Run() exits when state=QueueStateCompleted)
+	// We only need to explicitly close for forced shutdowns, which is handled via Pause() + shutdown context
 
 	// Initialize queues from YAML config state
 	if err := initializeQueues(cfg, srcQueue, dstQueue, coordinator); err != nil {
 		return RuntimeStats{}, err
 	}
 
+	// Give queues a moment to start their Run() goroutines
+	time.Sleep(100 * time.Millisecond)
+
+	// Set up stats channels for UDP logging (after queues are running)
+	srcStatsChan := make(chan queue.QueueStats, 10)
+	dstStatsChan := make(chan queue.QueueStats, 10)
+	srcQueue.SetStatsChannel(srcStatsChan)
+	dstQueue.SetStatsChannel(dstStatsChan)
+
+	// Start stats consumer goroutine for progress updates (fmt output, not log service)
+	go func() {
+		for {
+			select {
+			case srcStats := <-srcStatsChan:
+				fmt.Printf("\r  SRC: Round %d (Pending:%d InProgress:%d)   ", srcStats.Round, srcStats.Pending, srcStats.InProgress)
+			case dstStats := <-dstStatsChan:
+				fmt.Printf("\r  DST: Round %d (Pending:%d InProgress:%d)   ", dstStats.Round, dstStats.Pending, dstStats.InProgress)
+			}
+		}
+	}()
+
 	// Update config: Traversal started
 	if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
 		status, statusErr := InspectMigrationStatus(boltDB)
 		if statusErr == nil {
-			srcStats := srcQueue.Stats()
-			dstStats := dstQueue.Stats()
-			UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
+			UpdateConfigFromStatus(cfg.YAMLConfig, status, coordinator.GetSrcRound(), coordinator.GetDstRound())
 			cfg.YAMLConfig.State.Status = "running"
 			_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
 		}
 	}
 
-	progressTicker := time.NewTicker(cfg.ProgressTick)
+	// Ensure ProgressTick is positive (default to 1 second if not set)
+	progressTick := cfg.ProgressTick
+	if progressTick <= 0 {
+		progressTick = 1 * time.Second
+	}
+	progressTicker := time.NewTicker(progressTick)
 	defer progressTicker.Stop()
-
 	start := time.Now()
 
 	// Track last known rounds to detect actual advancement
@@ -284,15 +203,16 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				case <-cleanupCtx.Done():
 					// Timeout - skip cleanup and exit immediately
 					fmt.Printf("⚠️  Cleanup timeout - exiting immediately to prevent hang\n")
+					srcStats, dstStats := getQueueStats(coordinator, boltDB)
 					return RuntimeStats{
 						Duration: time.Since(start),
-						Src:      srcQueue.Stats(),
-						Dst:      dstQueue.Stats(),
+						Src:      srcStats,
+						Dst:      dstStats,
 					}, errors.New("migration suspended by force shutdown (cleanup timeout)")
 				}
 
-				srcStats := srcQueue.Stats()
-				dstStats := dstQueue.Stats()
+				// Get stats directly (non-blocking)
+				srcStats, dstStats := getQueueStats(coordinator, boltDB)
 
 				// BoltDB doesn't need checkpointing - data is already persisted
 
@@ -331,21 +251,106 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			}
 		}
 
-		if srcQueue.IsExhausted() && dstQueue.IsExhausted() {
-			srcStats := srcQueue.Stats()
-			dstStats := dstQueue.Stats()
+		// Check exhaustion status from coordinator (source of truth)
+		// Queues call MarkSrcCompleted()/MarkDstCompleted() on coordinator when done
+		bothCompleted := coordinator.IsCompleted("both")
+
+		if bothCompleted {
+			fmt.Printf("[DEBUG] bothCompleted detected - starting shutdown\n")
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("debug",
+					"Migration loop: Both queues completed, exiting migration",
+					"migration", "run", "run")
+			}
+
+			// Get stats directly (non-blocking)
+			srcStats, dstStats := getQueueStats(coordinator, boltDB)
+			fmt.Printf("[DEBUG] Got stats - src round %d, dst round %d\n", srcStats.Round, dstStats.Round)
+
 			fmt.Println("\nMigration complete!")
 
-			// Update config YAML with final state
+			// Update config YAML with final state (fire-and-forget to avoid blocking)
 			if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-				status, statusErr := InspectMigrationStatus(boltDB)
-				if statusErr == nil {
-					UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
-					// Save final config
-					_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
+				// Fire-and-forget - don't block completion on config save
+				go func() {
+					// Use a context with timeout to prevent indefinite blocking
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+
+					done := make(chan error, 1)
+					go func() {
+						if logservice.LS != nil {
+							_ = logservice.LS.Log("debug", "Starting YAML config save...", "migration", "run", "run")
+						}
+						status, statusErr := InspectMigrationStatus(boltDB)
+						if statusErr != nil {
+							if logservice.LS != nil {
+								_ = logservice.LS.Log("warning", fmt.Sprintf("InspectMigrationStatus error: %v", statusErr), "migration", "run", "run")
+							}
+							done <- statusErr
+							return
+						}
+						if logservice.LS != nil {
+							_ = logservice.LS.Log("debug", "InspectMigrationStatus completed", "migration", "run", "run")
+						}
+						UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
+						done <- SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
+					}()
+
+					select {
+					case err := <-done:
+						if err != nil {
+							if logservice.LS != nil {
+								_ = logservice.LS.Log("warning", fmt.Sprintf("Config save failed: %v", err), "migration", "run", "run")
+							}
+						} else {
+							if logservice.LS != nil {
+								_ = logservice.LS.Log("debug", "YAML config save completed", "migration", "run", "run")
+							}
+						}
+					case <-ctx.Done():
+						if logservice.LS != nil {
+							_ = logservice.LS.Log("warning", "Config save timeout (fire-and-forget)", "migration", "run", "run")
+						}
+					}
+				}()
+			}
+
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("debug", "About to return from RunMigration", "migration", "run", "run")
+			}
+
+			// Stop progress ticker to prevent any more ticks
+			fmt.Printf("[DEBUG] Stopping progress ticker\n")
+			progressTicker.Stop()
+			fmt.Printf("[DEBUG] Progress ticker stopped\n")
+
+			// Close log service before returning (flush logs) - with timeout to prevent hanging
+			if logservice.LS != nil {
+				fmt.Printf("[DEBUG] Starting log service close (with 1s timeout)\n")
+				// Use a timeout context to prevent indefinite blocking
+				closeCtx, closeCancel := context.WithTimeout(context.Background(), 1*time.Second)
+				defer closeCancel()
+
+				closeDone := make(chan struct{}, 1)
+				go func() {
+					fmt.Printf("[DEBUG] Calling logservice.LS.Close() in goroutine\n")
+					_ = logservice.LS.Close()
+					fmt.Printf("[DEBUG] logservice.LS.Close() returned\n")
+					closeDone <- struct{}{}
+				}()
+
+				select {
+				case <-closeDone:
+					fmt.Printf("[DEBUG] Log service closed successfully\n")
+				case <-closeCtx.Done():
+					fmt.Printf("[DEBUG] Log service close timeout (1s) - continuing anyway\n")
+					// Timeout - log service close is taking too long, continue anyway
+					// (flushes should only take a few ms, so 1s timeout is generous)
 				}
 			}
 
+			fmt.Printf("[DEBUG] About to return from RunMigration - 1\n")
 			return RuntimeStats{
 				Duration: time.Since(start),
 				Src:      srcStats,
@@ -355,8 +360,74 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 		select {
 		case <-progressTicker.C:
-			srcStats := srcQueue.Stats()
-			dstStats := dstQueue.Stats()
+			// Re-check exhaustion from coordinator (queues might have completed during tick)
+			if coordinator.IsCompleted("both") {
+				// Get stats directly (non-blocking)
+				srcStats, dstStats := getQueueStats(coordinator, boltDB)
+				fmt.Println("\nMigration complete!")
+
+				// Update config YAML with final state (fire-and-forget to avoid blocking)
+				if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
+					// Fire-and-forget - don't block completion on config save
+					go func() {
+						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+						defer cancel()
+
+						done := make(chan error, 1)
+						go func() {
+							status, statusErr := InspectMigrationStatus(boltDB)
+							if statusErr == nil {
+								UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
+								done <- SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
+							} else {
+								done <- statusErr
+							}
+						}()
+
+						select {
+						case <-done:
+							// Config saved (ignore errors)
+						case <-ctx.Done():
+							// Timeout - fire and forget
+						}
+					}()
+				}
+
+				// Stop progress ticker to prevent any more ticks
+				progressTicker.Stop()
+
+				// Close log service before returning (flush logs) - with timeout to prevent hanging
+				if logservice.LS != nil {
+					// Use a timeout context to prevent indefinite blocking
+					closeCtx, closeCancel := context.WithTimeout(context.Background(), 1*time.Second)
+					defer closeCancel()
+
+					closeDone := make(chan struct{}, 1)
+					go func() {
+						_ = logservice.LS.Close()
+						closeDone <- struct{}{}
+					}()
+
+					select {
+					case <-closeDone:
+					case <-closeCtx.Done():
+						// Timeout - log service close is taking too long, continue anyway
+						// (flushes should only take a few ms, so 1s timeout is generous)
+					}
+				}
+
+				fmt.Printf("[DEBUG] Ticker: About to return from RunMigration - 2\n")
+				return RuntimeStats{
+					Duration: time.Since(start),
+					Src:      srcStats,
+					Dst:      dstStats,
+				}, nil
+			}
+
+			// Get stats directly (non-blocking queries)
+			srcStats, dstStats := getQueueStats(coordinator, boltDB)
+
+			// Get round stats (this should be safe as it only reads)
 			srcRoundStats := srcQueue.RoundStats(srcStats.Round)
 			dstRoundStats := dstQueue.RoundStats(dstStats.Round)
 
@@ -375,8 +446,8 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			}
 
 			fmt.Printf("\r  Src: Round %d (Pending:%d InProgress:%d Workers:%d Expected:%d Completed:%d) | Dst: Round %d (Pending:%d InProgress:%d Workers:%d Expected:%d Completed:%d)   ",
-				srcStats.Round, srcStats.Pending, srcStats.InProgress, srcStats.Workers, srcExpected, srcCompleted,
-				dstStats.Round, dstStats.Pending, dstStats.InProgress, dstStats.Workers, dstExpected, dstCompleted)
+				srcStats.Round, srcStats.Pending, 0, srcQueue.WorkerCount(), srcExpected, srcCompleted,
+				dstStats.Round, dstStats.Pending, 0, dstQueue.WorkerCount(), dstExpected, dstCompleted)
 
 			// Update config YAML when rounds actually advance (milestone detection)
 			roundAdvanced := false
@@ -398,15 +469,19 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 					_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
 				}
 			}
+
 		default:
+			// Debug: Log when taking default case
+			if bothCompleted {
+				fmt.Printf("[DEBUG] Main loop: Select default case (bothCompleted=true) - sleeping 100ms\n")
+			}
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
 }
 
 // initializeQueues sets up src/dst queues from YAML config state.
-// Reads last_round_src/dst from config, sets queue rounds, calls PullTasks.
-// PullTasks blocks on coordinator gate internally, so no extra coordination needed.
+// Reads last_round_src/dst from config, sets queue rounds.
 func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queue.Queue, coordinator *queue.QueueCoordinator) error {
 	// Parse state from YAML config
 	srcRound := 0
@@ -433,16 +508,17 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 	}
 
 	// Update coordinator state
-	coordinator.UpdateSrcRound(srcRound)
-	if dstRound >= 0 {
-		coordinator.UpdateDstRound(dstRound)
-	} else {
-		coordinator.UpdateDstCompleted()
+	if coordinator != nil {
+		coordinator.UpdateSrcRound(srcRound)
+		if dstRound >= 0 {
+			coordinator.UpdateDstRound(dstRound)
+		} else {
+			coordinator.MarkDstCompleted()
+		}
 	}
 
-	// Pull tasks from BoltDB into queue buffers (blocks on coordinator internally)
-	srcQueue.PullTasks(true)
-	dstQueue.PullTasks(true)
+	// Don't pull tasks here - let Run() handle the initial pull
+	// DST will check coordinator when it needs to advance
 
 	if logservice.LS != nil {
 		_ = logservice.LS.Log("info",
@@ -453,4 +529,80 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 	}
 
 	return nil
+}
+
+// closeSpectraAdapters closes Spectra adapters if they are SpectraFS instances.
+// Handles shared SDK instances by only closing once.
+func closeSpectraAdapters(srcAdapter, dstAdapter fsservices.FSAdapter, ctx context.Context) {
+	// Check if adapters are Spectra instances
+	srcSpectra, srcIsSpectra := srcAdapter.(*fsservices.SpectraFS)
+	dstSpectra, dstIsSpectra := dstAdapter.(*fsservices.SpectraFS)
+
+	if srcIsSpectra && dstIsSpectra {
+		// Both are Spectra - check if they share the same SDK instance
+		if srcSpectra != nil && dstSpectra != nil && srcSpectra.GetSDKInstance() == dstSpectra.GetSDKInstance() {
+			// Same SDK - only close once
+			done := make(chan struct{}, 1)
+			go func() {
+				if srcSpectra.GetSDKInstance() != nil {
+					_ = srcSpectra.Close()
+				}
+				done <- struct{}{}
+			}()
+			select {
+			case <-done:
+			case <-ctx.Done():
+				// Timeout - skip
+			}
+		} else {
+			// Different SDK instances - close both
+			done := make(chan struct{}, 2)
+			go func() {
+				if srcSpectra != nil {
+					_ = srcSpectra.Close()
+				}
+				done <- struct{}{}
+			}()
+			go func() {
+				if dstSpectra != nil {
+					_ = dstSpectra.Close()
+				}
+				done <- struct{}{}
+			}()
+			// Wait for both or timeout
+			completed := 0
+			for completed < 2 {
+				select {
+				case <-done:
+					completed++
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	} else {
+		// Close individually if they're Spectra
+		if srcIsSpectra && srcSpectra != nil {
+			done := make(chan struct{}, 1)
+			go func() {
+				_ = srcSpectra.Close()
+				done <- struct{}{}
+			}()
+			select {
+			case <-done:
+			case <-ctx.Done():
+			}
+		}
+		if dstIsSpectra && dstSpectra != nil {
+			done := make(chan struct{}, 1)
+			go func() {
+				_ = dstSpectra.Close()
+				done <- struct{}{}
+			}()
+			select {
+			case <-done:
+			case <-ctx.Done():
+			}
+		}
+	}
 }
