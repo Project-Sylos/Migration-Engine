@@ -41,3 +41,6 @@ __pycache__/
 *.log
 *.yaml
 *.db
+
+# spectra config
+pkg/configs/spectra.json
