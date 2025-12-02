@@ -6,6 +6,8 @@ package db
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -235,26 +237,108 @@ type InsertOperation struct {
 	State     *NodeState
 }
 
+// computeBatchInsertStatsDeltas analyzes insert operations and computes stats deltas.
+// Returns a map of bucket path (as string) -> delta count.
+// Simply counts all inserts and groups by bucket - one update per bucket.
+func computeBatchInsertStatsDeltas(tx *bolt.Tx, ops []InsertOperation) map[string]int64 {
+	deltas := make(map[string]int64)
+
+	// Group by bucket path and count
+	nodesCounts := make(map[string]int64)    // queueType -> count
+	statusCounts := make(map[string]int64)   // "queueType/level/status" -> count
+	childrenCounts := make(map[string]int64) // queueType -> count of new parent entries
+
+	for _, op := range ops {
+		if op.State == nil {
+			continue
+		}
+
+		pathHash := []byte(HashPath(op.State.Path))
+		parentHash := []byte(HashPath(op.State.ParentPath))
+
+		// Check if node already exists - only count new nodes
+		nodesBucket := GetNodesBucket(tx, op.QueueType)
+		if nodesBucket != nil && nodesBucket.Get(pathHash) == nil {
+			nodesCounts[op.QueueType]++
+		}
+
+		// Check if status entry already exists - only count new entries
+		statusBucket := GetStatusBucket(tx, op.QueueType, op.Level, op.Status)
+		if statusBucket == nil || statusBucket.Get(pathHash) == nil {
+			statusKey := fmt.Sprintf("%s/%d/%s", op.QueueType, op.Level, op.Status)
+			statusCounts[statusKey]++
+		}
+
+		// Check if children entry needs to be created
+		if op.State.ParentPath != "" {
+			childrenBucket := GetChildrenBucket(tx, op.QueueType)
+			if childrenBucket != nil && childrenBucket.Get(parentHash) == nil {
+				childrenCounts[op.QueueType]++
+			}
+		}
+	}
+
+	// Convert to bucket path strings
+	for queueType, count := range nodesCounts {
+		path := strings.Join(GetNodesBucketPath(queueType), "/")
+		deltas[path] += count
+	}
+
+	for statusKey, count := range statusCounts {
+		parts := strings.Split(statusKey, "/")
+		if len(parts) == 3 {
+			queueType := parts[0]
+			level, _ := strconv.Atoi(parts[1])
+			status := parts[2]
+			path := strings.Join(GetStatusBucketPath(queueType, level, status), "/")
+			deltas[path] += count
+		}
+	}
+
+	for queueType, count := range childrenCounts {
+		path := strings.Join(GetChildrenBucketPath(queueType), "/")
+		deltas[path] += count
+	}
+
+	return deltas
+}
+
 func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 	if len(ops) == 0 {
 		return nil
 	}
 
 	return db.Update(func(tx *bolt.Tx) error {
+		// Ensure stats bucket exists
+		if _, err := getStatsBucket(tx); err != nil {
+			return fmt.Errorf("failed to get stats bucket: %w", err)
+		}
+
+		// Compute stats deltas BEFORE executing writes (check what exists first)
+		statsDeltas := computeBatchInsertStatsDeltas(tx, ops)
+
+		// Execute all inserts
+		var nodesBucket *bolt.Bucket
+		var currentQueueType string
+
 		for _, op := range ops {
 			pathHash := []byte(HashPath(op.State.Path))
 			parentHash := []byte(HashPath(op.State.ParentPath))
 
-			// 1. Insert into nodes bucket
-			nodesBucket := GetNodesBucket(tx, op.QueueType)
-			if nodesBucket == nil {
-				return fmt.Errorf("nodes bucket not found for %s", op.QueueType)
+			// Get or cache nodes bucket
+			if currentQueueType != op.QueueType {
+				nodesBucket = GetNodesBucket(tx, op.QueueType)
+				if nodesBucket == nil {
+					return fmt.Errorf("nodes bucket not found for %s", op.QueueType)
+				}
+				currentQueueType = op.QueueType
 			}
 
 			if op.State.TraversalStatus == "" {
 				op.State.TraversalStatus = op.Status
 			}
 
+			// 1. Insert into nodes bucket
 			nodeData, err := op.State.Serialize()
 			if err != nil {
 				return fmt.Errorf("failed to serialize node: %w", err)
@@ -301,6 +385,15 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 					childrenData, _ := json.Marshal(children)
 					childrenBucket.Put(parentHash, childrenData)
 				}
+			}
+		}
+
+		// Apply all stats updates in one batch
+		for bucketPathStr, delta := range statsDeltas {
+			// Convert string path back to []string for updateBucketStats
+			bucketPath := strings.Split(bucketPathStr, "/")
+			if err := updateBucketStats(tx, bucketPath, delta); err != nil {
+				return fmt.Errorf("failed to update stats for %s: %w", bucketPathStr, err)
 			}
 		}
 
