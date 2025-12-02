@@ -61,12 +61,17 @@ func UpdateNodeStatusInTx(tx *bolt.Tx, queueType string, level int, oldStatus, n
 		return fmt.Errorf("failed to add to new status bucket: %w", err)
 	}
 
+	// Stats updates are handled by batch processing in output buffer flush
 	return nil
 }
 
 // BatchInsertNodesInTx inserts multiple nodes within an existing transaction.
 // This is used by queue.Complete() to insert discovered children atomically.
+// Stats updates are handled separately by batch processing in output buffer flush.
 func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation) error {
+	var nodesBucket *bolt.Bucket
+	var currentQueueType string
+
 	for _, op := range operations {
 		if op.State == nil {
 			continue
@@ -80,12 +85,16 @@ func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation) error {
 		pathHash := []byte(HashPath(op.State.Path))
 		parentHash := []byte(HashPath(op.State.ParentPath))
 
-		// 1. Insert into nodes bucket
-		nodesBucket := GetNodesBucket(tx, op.QueueType)
-		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found for %s", op.QueueType)
+		// Get or cache nodes bucket
+		if currentQueueType != op.QueueType {
+			nodesBucket = GetNodesBucket(tx, op.QueueType)
+			if nodesBucket == nil {
+				return fmt.Errorf("nodes bucket not found for %s", op.QueueType)
+			}
+			currentQueueType = op.QueueType
 		}
 
+		// 1. Insert into nodes bucket
 		nodeData, err := op.State.Serialize()
 		if err != nil {
 			return fmt.Errorf("failed to serialize node state: %w", err)

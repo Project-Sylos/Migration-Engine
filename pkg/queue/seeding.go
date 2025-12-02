@@ -14,9 +14,16 @@ import (
 // SeedRootTask inserts the initial root folder task into BoltDB to kickstart traversal.
 // For src: sets traversal_status='Pending' and copy_status='Pending'
 // For dst: sets traversal_status='Pending'
+// Ensures stats bucket exists and is updated with root task counts.
 func SeedRootTask(queueType string, rootFolder fsservices.Folder, boltDB *db.DB) error {
 	if boltDB == nil {
 		return fmt.Errorf("boltDB cannot be nil")
+	}
+
+	// Ensure stats bucket exists before seeding
+	// This is critical because root seeding happens before queues are initialized
+	if err := boltDB.EnsureStatsBucket(); err != nil {
+		return fmt.Errorf("failed to ensure stats bucket exists: %w", err)
 	}
 
 	// Create NodeState from root folder
@@ -38,6 +45,7 @@ func SeedRootTask(queueType string, rootFolder fsservices.Folder, boltDB *db.DB)
 	state.TraversalStatus = db.StatusPending
 
 	// Use BatchInsertNodes to write to BoltDB
+	// BatchInsertNodes now updates stats automatically
 	ops := []db.InsertOperation{
 		{
 			QueueType: queueType,
