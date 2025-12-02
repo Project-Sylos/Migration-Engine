@@ -405,8 +405,6 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 
 	result.Runtime = runtime
 
-	fmt.Printf("[DEBUG] RunMigration returned - runtime duration: %v, error: %v\n", runtime.Duration, runErr)
-
 	// Check if migration was suspended by force shutdown
 	isShutdown := runErr != nil && runErr.Error() == "migration suspended by force shutdown"
 	if isShutdown {
@@ -443,15 +441,12 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	// Verify migration before closing database - verification needs database access
 	// Note: We run verification even if migration had errors, to provide full diagnostic info
 	// Wrap in timeout to prevent hanging if database operations block
-	fmt.Printf("[DEBUG] Starting verification (with 10s timeout)\n")
 	verifyDone := make(chan struct {
 		report VerificationReport
 		err    error
 	}, 1)
 	go func() {
-		fmt.Printf("[DEBUG] VerifyMigration goroutine started\n")
 		report, err := VerifyMigration(boltDB, cfg.Verification)
-		fmt.Printf("[DEBUG] VerifyMigration returned - error: %v\n", err)
 		verifyDone <- struct {
 			report VerificationReport
 			err    error
@@ -462,19 +457,17 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	var verifyErr error
 	select {
 	case result := <-verifyDone:
-		fmt.Printf("[DEBUG] Verification completed\n")
+		fmt.Printf("[] Verification completed\n")
 		report = result.report
 		verifyErr = result.err
 	case <-time.After(10 * time.Second):
 		// Timeout - return empty report with error
-		fmt.Printf("[DEBUG] Verification timeout after 10 seconds\n")
 		verifyErr = fmt.Errorf("verification timeout after 10 seconds")
 		report = VerificationReport{}
 		fmt.Printf("⚠️  Verification timeout - skipping verification checks\n")
 	}
 
 	result.Verification = report
-	fmt.Printf("[DEBUG] Verification report assigned to result\n")
 
 	// Note: We do NOT close the log service here - it's a global singleton that should
 	// be managed at the application level (e.g., in the API that calls LetsMigrate).
@@ -484,24 +477,19 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	// 3. Verification or other code needs to log after migration completes
 
 	// Close database after verification and log service are done (allows verification and log flushing to access DB)
-	fmt.Printf("[DEBUG] Checking if database should be closed (CloseDatabase=%v)\n", cfg.CloseDatabase)
 	if cfg.CloseDatabase {
-		fmt.Printf("[DEBUG] Setting defer for boltDB.Close()\n")
 		defer boltDB.Close()
 	}
 
 	// Return migration error if it occurred (verification ran for diagnostics)
 	if runErr != nil {
-		fmt.Printf("[DEBUG] Returning with runErr: %v\n", runErr)
 		return result, runErr
 	}
 
 	if verifyErr != nil {
-		fmt.Printf("[DEBUG] Returning with verifyErr: %v\n", verifyErr)
 		return result, verifyErr
 	}
 
-	fmt.Printf("[DEBUG] Checking verification success\n")
 	if !result.Verification.Success(cfg.Verification) {
 		// Build detailed error message showing what failed
 		report := result.Verification
@@ -526,11 +514,9 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 			errMsg += "  ❌ No nodes were actually migrated\n"
 		}
 
-		fmt.Printf("[DEBUG] Verification failed, returning error\n")
 		return result, errors.New(errMsg)
 	}
 
-	fmt.Printf("[DEBUG] Migration completed successfully, returning result\n")
 	return result, nil
 }
 

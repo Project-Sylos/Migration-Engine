@@ -52,6 +52,7 @@ type Queue struct {
 	boltDB             *db.DB               // BoltDB for operational queue storage
 	srcQueue           *Queue               // For dst queue: reference to src queue for BoltDB lookups
 	coordinator        *QueueCoordinator    // Coordinator for round advancement gates (DST only)
+	outputBuffer       *db.OutputBuffer     // Buffer for batched write operations
 	// Round-based statistics for completion detection
 	roundStats  map[int]*RoundStats // Per-round statistics (key: round number, value: stats for that round)
 	shutdownCtx context.Context     // Context for shutdown signaling (optional)
@@ -90,6 +91,10 @@ func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter fsservices.FS
 	q.shutdownCtx = shutdownCtx
 	workerCount := cap(q.workers) // Get the worker count we preallocated for
 	q.mu.Unlock()
+
+	// Initialize output buffer for batched writes
+	// Default: 1000 operations or 1 second interval
+	q.outputBuffer = db.NewOutputBuffer(boltInstance, 1000, 1*time.Second)
 
 	// Create and start workers - they manage themselves
 	for i := 0; i < workerCount; i++ {
@@ -166,15 +171,25 @@ func (q *Queue) IsPaused() bool {
 // Pause pauses the queue (workers will not lease new tasks).
 func (q *Queue) Pause() {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	q.state = QueueStatePaused
+	outputBuffer := q.outputBuffer
+	q.mu.Unlock()
+	// Pause buffer (which will force-flush before pausing)
+	if outputBuffer != nil {
+		outputBuffer.Pause()
+	}
 }
 
 // Resume resumes the queue after a pause.
 func (q *Queue) Resume() {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	q.state = QueueStateRunning
+	outputBuffer := q.outputBuffer
+	q.mu.Unlock()
+	// Resume buffer
+	if outputBuffer != nil {
+		outputBuffer.Resume()
+	}
 }
 
 // Add enqueues a task into the in-memory buffer only (no database writes).
@@ -275,17 +290,12 @@ func (q *Queue) checkRoundComplete(currentRound int) bool {
 		return false
 	}
 
-	// Verify we're still on the same round
-	if q.round != currentRound {
-		q.mu.RUnlock()
-		return false // Round already advanced
-	}
-
 	// Quick check: if we have tasks in progress or in buffer, round isn't complete
 	inProgressCount := len(q.inProgress)
 	pendingBuffCount := len(q.pendingBuff)
 	lastPullWasPartial := q.lastPullWasPartial
 	boltDB := q.boltDB
+	outputBuffer := q.outputBuffer
 	q.mu.RUnlock()
 
 	// Fast path: If we have tasks in progress or in buffer, round isn't complete
@@ -300,7 +310,10 @@ func (q *Queue) checkRoundComplete(currentRound int) bool {
 	}
 
 	// At this point, in-memory state suggests completion, but we need to verify with the DB
-	// No buffer to flush - all writes are direct/synchronous now
+	// CRITICAL: Force-flush buffer before querying DB to ensure all writes are persisted
+	if outputBuffer != nil {
+		outputBuffer.Flush()
+	}
 
 	// Now query the database as the authoritative source
 	if boltDB == nil {
@@ -311,19 +324,20 @@ func (q *Queue) checkRoundComplete(currentRound int) bool {
 
 	// Check if there are any pending items in the current round's status bucket
 	// The DB is the source of truth - if there are pending items here, we're not done
-	pendingCount, err := boltDB.CountStatusBucket(queueType, currentRound, db.StatusPending)
+	// Use HasStatusBucketItems for O(1) check instead of counting all items
+	hasPending, err := boltDB.HasStatusBucketItems(queueType, currentRound, db.StatusPending)
 	if err != nil {
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to count pending items in DB during round completion check: %v", err), "queue", q.name, q.name)
+			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to check pending items in DB during round completion check: %v", err), "queue", q.name, q.name)
 		}
 		// If we can't query, assume not complete to be safe
 		return false
 	}
 
-	// Round is complete only if DB confirms no pending items
-	if pendingCount > 0 {
+	// If DB shows pending tasks, we need to pull them
+	if hasPending {
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug", fmt.Sprintf("Round %d completion check: DB shows %d pending items (in-memory was empty)", currentRound, pendingCount), "queue", q.name, q.name)
+			_ = logservice.LS.Log("debug", fmt.Sprintf("Round %d completion check: DB shows pending items (in-memory was empty), pulling tasks", currentRound), "queue", q.name, q.name)
 		}
 		return false
 	}
@@ -332,42 +346,108 @@ func (q *Queue) checkRoundComplete(currentRound int) bool {
 	return true
 }
 
-// checkAndAdvanceRoundIfComplete checks if the current round is complete after a task finishes.
-// This should be called after removing a task from inProgress to catch completion immediately.
-// This is a lightweight check that only triggers the full check if conditions look right.
-func (q *Queue) checkAndAdvanceRoundIfComplete() {
-	q.mu.RLock()
-	currentRound := q.round
-	state := q.state
+// TaskExecutionResult represents the result of a task execution.
+type TaskExecutionResult string
 
-	// Only check if queue is in a state where it can complete
-	if state != QueueStateRunning && state != QueueStateWaiting {
-		q.mu.RUnlock()
+const (
+	TaskExecutionResultSuccessful TaskExecutionResult = "successful"
+	TaskExecutionResultFailed     TaskExecutionResult = "failed"
+)
+
+// ReportTaskResult reports the result of a task execution and handles post-processing.
+// This is the event-driven entry point that replaces separate Complete()/Fail() calls.
+// After processing the result, it checks if we need to pull more tasks or advance rounds.
+func (q *Queue) ReportTaskResult(task *TaskBase, result TaskExecutionResult) {
+	switch result {
+	case TaskExecutionResultSuccessful:
+		q.completeTask(task)
+	case TaskExecutionResultFailed:
+		q.failTask(task)
+	default:
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("error",
+				fmt.Sprintf("ReportTaskResult called with unknown result: %s", result),
+				"queue", q.name, q.name)
+		}
 		return
 	}
 
-	// Quick check: if we still have in-progress or pending tasks, we're not done
+	// Event-driven post-processing: check if we need to pull tasks or advance round
+	q.mu.RLock()
+	pendingCount := len(q.pendingBuff)
 	inProgressCount := len(q.inProgress)
-	pendingBuffCount := len(q.pendingBuff)
+	lastPullWasPartial := q.lastPullWasPartial
+	currentRound := q.round
+	state := q.state
 	q.mu.RUnlock()
 
-	// Only proceed with full check if we have no in-progress or pending tasks
-	if inProgressCount > 0 || pendingBuffCount > 0 {
-		return // Still have work to do, no need to check
+	// Only process if queue is running
+	if state != QueueStateRunning && state != QueueStateWaiting {
+		return
 	}
 
-	// Use the existing checkRoundComplete which does the full check (including DB query and lastPullWasPartial)
-	if q.checkRoundComplete(currentRound) {
-		q.markRoundComplete()
+	// Check if we need to pull more tasks (if count is below threshold and last pull wasn't partial)
+	if pendingCount <= q.pullLowWM && !lastPullWasPartial {
+		q.pullTasksIfNeeded(false)
+		// After pulling, re-check counts - they may have changed
+		q.mu.RLock()
+		pendingCount = len(q.pendingBuff)
+		inProgressCount = len(q.inProgress)
+		lastPullWasPartial = q.lastPullWasPartial
+		q.mu.RUnlock()
+	}
+
+	// Check if round is complete (inProgress + pendingBuff == 0 AND lastPullWasPartial == true)
+	// CRITICAL: Only check if we truly have no work left
+	if inProgressCount == 0 && pendingCount == 0 && lastPullWasPartial {
+		// CRITICAL: Flush buffer BEFORE checking round completion to ensure all child inserts are persisted
+		// This prevents race conditions where children are in buffer but not yet in DB
+		q.mu.RLock()
+		outputBuffer := q.outputBuffer
+		checkRound := q.round // Verify round hasn't changed
+		q.mu.RUnlock()
+
+		// Double-check: if round changed, don't proceed (another goroutine advanced it)
+		if checkRound != currentRound {
+			return
+		}
+
+		if outputBuffer != nil {
+			outputBuffer.Flush()
+		}
+
+		// checkRoundComplete will also flush and check DB
+		// If it finds pending items, it returns false and we should pull them
+		roundComplete := q.checkRoundComplete(currentRound)
+
+		// Double-check round hasn't changed (another goroutine might have advanced it)
+		q.mu.RLock()
+		stillSameRound := q.round == currentRound
+		q.mu.RUnlock()
+
+		if !stillSameRound {
+			return // Round already advanced by another goroutine
+		}
+
+		if roundComplete {
+			q.advanceToNextRound()
+		} else {
+			// checkRoundComplete found pending items in DB but didn't pull them
+			// We need to pull them now - these are tasks that were just inserted by completed tasks
+			// Force pull to get these newly-inserted tasks
+			q.pullTasksIfNeeded(true)
+		}
 	}
 }
 
-// Complete marks a task as successfully completed and propagates children to the next round.
-// Complete marks a task as successfully completed.
-// It removes the task from the queue, writes discovered children directly to BoltDB,
-// updates the parent node status to "successful traversal", increments the completed count,
-// and checks if the round is complete.
+// Complete is a public wrapper for backward compatibility.
+// New code should use ReportTaskResult instead.
 func (q *Queue) Complete(task *TaskBase) {
+	q.ReportTaskResult(task, TaskExecutionResultSuccessful)
+}
+
+// completeTask is the internal implementation for successful task completion.
+func (q *Queue) completeTask(task *TaskBase) {
 	currentRound := task.Round
 
 	if q.boltDB == nil {
@@ -544,30 +624,16 @@ func (q *Queue) Complete(task *TaskBase) {
 		}
 	}
 
-	// Write directly to database in a single transaction
-	if q.boltDB != nil {
-		// Update parent status and insert children in separate transactions (atomicity at transaction level)
-		// First update parent status
-		_, err := db.UpdateNodeStatus(q.boltDB, queueType, currentRound, db.StatusPending, db.StatusSuccessful, path)
-		if err != nil {
-			if logservice.LS != nil {
-				_ = logservice.LS.Log("error", fmt.Sprintf("Failed to update parent node status: %v", err), "queue", q.name, q.name)
-			}
-		}
+	// Write to buffer instead of directly to database
+	if q.outputBuffer != nil {
+		// Add parent status update to buffer
+		q.outputBuffer.AddStatusUpdate(queueType, currentRound, db.StatusPending, db.StatusSuccessful, path)
 
-		// Then insert children
+		// Add child inserts to buffer
 		if len(childNodesToInsert) > 0 {
-			if err := db.BatchInsertNodes(q.boltDB, childNodesToInsert); err != nil {
-				if logservice.LS != nil {
-					_ = logservice.LS.Log("error", fmt.Sprintf("Failed to insert children: %v", err), "queue", q.name, q.name)
-				}
-			}
+			q.outputBuffer.AddBatchInsert(childNodesToInsert)
 		}
 	}
-
-	// Check if round is complete after removing from inProgress and queuing writes
-	// This catches completion immediately after the last task finishes
-	q.checkAndAdvanceRoundIfComplete()
 }
 
 func childResultToNodeState(child ChildResult, parentPath string, depth int) *db.NodeState {
@@ -646,9 +712,16 @@ func (q *Queue) pullTasks(force bool) {
 	// Don't pull if queue is completed (prevents deadlock on coordinator gate)
 	q.mu.RLock()
 	isCompleted := q.state == QueueStateCompleted
+	outputBuffer := q.outputBuffer
 	q.mu.RUnlock()
 	if isCompleted {
 		return
+	}
+
+	// CRITICAL: Force-flush buffer before pulling tasks to ensure we don't pull tasks
+	// that are waiting in the buffer to be written
+	if outputBuffer != nil {
+		outputBuffer.Flush()
 	}
 
 	queueType := getQueueType(q.name)
@@ -680,9 +753,12 @@ func (q *Queue) pullTasks(force bool) {
 		return
 	}
 
+	// Track if this is the first pull for the round (before we potentially set it to false)
+	wasFirstPullForRound := q.firstPullForRound
+
 	// Check coordinator gate ONLY on first pull of the round (DST only)
 	// This prevents pulling tasks for a round that hasn't been approved yet
-	if q.name == "dst" && q.coordinator != nil && q.firstPullForRound {
+	if q.name == "dst" && q.coordinator != nil {
 		currentRound := q.round
 		canStartRound := q.coordinator.CanDstStartRound(currentRound)
 		if !canStartRound {
@@ -717,6 +793,26 @@ func (q *Queue) pullTasks(force bool) {
 			_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to fetch batch from BoltDB: %v", err), "queue", q.name, q.name)
 		}
 		// On error, don't change lastPullWasPartial - keep existing state
+		return
+	}
+
+	// we've exhausted max depth - mark queue as completed
+	if wasFirstPullForRound && len(batch) == 0 {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("info",
+				fmt.Sprintf("First pull for round %d returned empty batch - traversal complete (max depth exhausted)", currentRound),
+				"queue", q.name, q.name)
+		}
+		q.state = QueueStateCompleted
+		// Update coordinator
+		if q.coordinator != nil {
+			switch q.name {
+			case "src":
+				q.coordinator.MarkSrcCompleted()
+			case "dst":
+				q.coordinator.MarkDstCompleted()
+			}
+		}
 		return
 	}
 
@@ -799,10 +895,21 @@ func (q *Queue) dequeuePendingLocked() *TaskBase {
 	return nil
 }
 
-// Fail handles a failed task. If retry limit is not exceeded, re-queues the task.
-// Otherwise, marks it as failed and drops it from memory (DB write already happened).
-// Also checks for round completion when all tasks are exhausted (succeeded or failed).
+// Fail is a public wrapper for backward compatibility.
+// New code should use ReportTaskResult instead.
+// Returns true if the task will be retried, false if max retries exceeded.
 func (q *Queue) Fail(task *TaskBase) bool {
+	q.ReportTaskResult(task, TaskExecutionResultFailed)
+	// Check if task was retried by checking if it's still in pending
+	q.mu.RLock()
+	path := task.LocationPath()
+	_, willRetry := q.pendingSet[path]
+	q.mu.RUnlock()
+	return willRetry
+}
+
+// failTask is the internal implementation for failed task handling.
+func (q *Queue) failTask(task *TaskBase) {
 	currentRound := task.Round
 	path := task.LocationPath() // Use path (not ID) to match Lease() and Complete()
 
@@ -830,8 +937,7 @@ func (q *Queue) Fail(task *TaskBase) bool {
 					path, currentRound, task.Attempts, q.maxRetries),
 				"queue", q.name, q.name)
 		}
-		q.pullTasksIfNeeded(false)
-		return true // Will retry
+		return // Will retry - ReportTaskResult will handle pulling tasks
 	}
 
 	// Max retries reached - task is truly done
@@ -852,26 +958,14 @@ func (q *Queue) Fail(task *TaskBase) bool {
 	roundStats := q.getOrCreateRoundStats(currentRound)
 	roundStats.Completed++
 
-	// Check if we should look for completion after removing this task
 	q.mu.Unlock()
 
 	// Update traversal status to failed so leasing stops retrying this node.
 	state := taskToNodeState(task)
-	if state != nil && q.boltDB != nil {
+	if state != nil && q.outputBuffer != nil {
 		queueType := getQueueType(q.name)
-		_, err := db.UpdateNodeStatus(q.boltDB, queueType, currentRound, db.StatusPending, db.StatusFailed, state.Path)
-		if err != nil {
-			if logservice.LS != nil {
-				_ = logservice.LS.Log("error", fmt.Sprintf("Failed to update node status to failed: %v", err), "queue", q.name, q.name)
-			}
-		}
+		q.outputBuffer.AddStatusUpdate(queueType, currentRound, db.StatusPending, db.StatusFailed, state.Path)
 	}
-
-	// Check if round is complete after removing from inProgress and updating status
-	// This catches completion immediately after the last task finishes
-	q.checkAndAdvanceRoundIfComplete()
-
-	return false // Will not retry
 }
 
 // InProgressCount returns the number of tasks currently being executed.
@@ -1044,17 +1138,16 @@ func (q *Queue) AddWorker(worker Worker) {
 // Stops stats publishing loop and ensures clean shutdown.
 // If the queue is already completed, this is a no-op (queues clean themselves up on completion).
 func (q *Queue) Close() {
-	fmt.Printf("[DEBUG] Queue.Close() called for %s queue\n", q.name)
 
 	// Quick check - if already completed, nothing to do (queues clean themselves up)
 	q.mu.RLock()
 	state := q.state
 	hasStatsTick := q.statsTick != nil
+	outputBuffer := q.outputBuffer
 	q.mu.RUnlock()
 
 	if state == QueueStateCompleted {
-		fmt.Printf("[DEBUG] Queue.Close() skipping - %s queue already completed (workers and Run() already exited)\n", q.name)
-		// Still need to clean up stats ticker if it exists
+		// Still need to clean up stats ticker and buffer if they exist
 		if hasStatsTick {
 			// Try to stop it, but don't block if we can't get the lock
 			done := make(chan struct{}, 1)
@@ -1070,28 +1163,33 @@ func (q *Queue) Close() {
 			}()
 			select {
 			case <-done:
-				fmt.Printf("[DEBUG] Queue.Close() cleaned up stats ticker for completed %s queue\n", q.name)
 			case <-time.After(500 * time.Millisecond):
-				fmt.Printf("[DEBUG] Queue.Close() timeout cleaning stats ticker for %s queue - continuing anyway\n", q.name)
 			}
+		}
+		// Ensure buffer is stopped
+		if outputBuffer != nil {
+			outputBuffer.Stop()
 		}
 		return
 	}
 
 	// Queue not completed - acquire lock normally (should be quick since workers/Run() should have exited)
-	fmt.Printf("[DEBUG] Queue.Close() acquiring lock for %s queue (state=%s)\n", q.name, state)
 	q.mu.Lock()
-	fmt.Printf("[DEBUG] Queue.Close() acquired lock for %s queue\n", q.name)
 	if q.statsTick != nil {
 		q.statsTick.Stop()
 		q.statsTick = nil
 	}
 	q.statsChan = nil
+	closeOutputBuffer := q.outputBuffer
 	if q.state != QueueStateCompleted && q.state != QueueStateStopped {
 		q.state = QueueStateStopped
 	}
 	q.mu.Unlock()
-	fmt.Printf("[DEBUG] Queue.Close() completed for %s queue\n", q.name)
+
+	// Ensure buffer is stopped and flushed
+	if closeOutputBuffer != nil {
+		closeOutputBuffer.Stop()
+	}
 }
 
 // WorkerCount returns the number of workers associated with this queue.
@@ -1150,22 +1248,6 @@ func (q *Queue) Run() {
 				q.mu.Lock()
 				if q.state != QueueStateWaiting {
 					q.state = QueueStateWaiting
-					if logservice.LS != nil {
-						q.coordinator.mu.RLock()
-						srcRound := q.coordinator.srcRound
-						srcDone := q.coordinator.srcDone
-						q.coordinator.mu.RUnlock()
-						if srcDone {
-							_ = logservice.LS.Log("debug",
-								fmt.Sprintf("DST waiting to start round %d (SRC completed, should proceed)", currentRound),
-								"queue", q.name, q.name)
-						} else {
-							_ = logservice.LS.Log("debug",
-								fmt.Sprintf("DST waiting to start round %d (srcRound=%d, need src>=%d)",
-									currentRound, srcRound, currentRound+2),
-								"queue", q.name, q.name)
-						}
-					}
 				}
 				q.mu.Unlock()
 				time.Sleep(50 * time.Millisecond)
@@ -1176,19 +1258,24 @@ func (q *Queue) Run() {
 			q.mu.Lock()
 			if q.state == QueueStateWaiting {
 				q.state = QueueStateRunning
-				if logservice.LS != nil {
-					q.coordinator.mu.RLock()
-					srcRound := q.coordinator.srcRound
-					q.coordinator.mu.RUnlock()
-					_ = logservice.LS.Log("debug",
-						fmt.Sprintf("DST can start round %d (srcRound=%d)", currentRound, srcRound),
-						"queue", q.name, q.name)
-				}
 			}
 			q.mu.Unlock()
 		}
 
-		// INNER LOOP: Process tasks for current round until round is complete
+		// Event-driven: Workers will call ReportTaskResult which handles:
+		// - Pulling more tasks when needed
+		// - Advancing rounds when complete
+		// We just need to ensure initial tasks are pulled for this round
+		q.mu.RLock()
+		needsInitialPull := q.firstPullForRound && q.state == QueueStateRunning
+		q.mu.RUnlock()
+
+		if needsInitialPull {
+			q.pullTasksIfNeeded(true)
+		}
+
+		// Wait for round to complete (event-driven by ReportTaskResult)
+		// Check periodically if we should advance or if queue is done
 		for {
 			// Check for shutdown
 			if q.shutdownCtx != nil {
@@ -1209,31 +1296,20 @@ func (q *Queue) Run() {
 				continue
 			}
 
-			// If stopped or completed, exit inner loop
+			// If stopped or completed, exit
 			if innerState == QueueStateStopped || innerState == QueueStateCompleted {
 				return
 			}
 
-			// Pull tasks for current round
-			q.pullTasks(true)
-
-			// Check if round is complete
-			if q.checkRoundComplete(currentRound) {
-				// Round complete - exit inner loop, advance round in outer loop
-				q.markRoundComplete()
-				break
+			// Round advancement is handled by ReportTaskResult, so we just wait
+			// Check periodically if round advanced (for outer loop to continue)
+			if q.getRound() != currentRound {
+				break // Round advanced, continue outer loop
 			}
 
-			// Sleep briefly before checking again
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
-}
-
-// markRoundComplete marks the current round as complete and automatically advances to next round.
-func (q *Queue) markRoundComplete() {
-	// Auto-advance to next round
-	q.advanceToNextRound()
 }
 
 // advanceToNextRound advances the queue to the next round and cleans up old round queues.
@@ -1241,6 +1317,13 @@ func (q *Queue) markRoundComplete() {
 func (q *Queue) advanceToNextRound() {
 	// No gating here - rounds advance freely
 	// Gating only happens when STARTING a round (checked in Run() outer loop)
+
+	q.mu.RLock()
+	outputBuffer := q.outputBuffer
+	q.mu.RUnlock()
+	if outputBuffer != nil {
+		outputBuffer.Flush()
+	}
 
 	q.mu.Lock()
 	// Ensure state is running if it was waiting
@@ -1267,145 +1350,16 @@ func (q *Queue) advanceToNextRound() {
 		}
 	}
 
-	// No buffer to flush - all writes are direct/synchronous now
-
-	// Check if the new round has no tasks (max depth reached)
-	// NOTE: This check happens immediately after advancing, but children from the previous round
-	// should have already been inserted synchronously in Complete() before this was called.
-	// However, we need to be careful - if no children were inserted (e.g., all were "Successful"
-	// or "NotOnSrc" for DST), then this round will legitimately have no tasks.
-	hasTasks := false
-	if q.boltDB != nil {
-		queueType := getQueueType(q.name)
-		count, err := q.boltDB.CountByPrefix(queueType, newRound, db.StatusPending)
-		if err == nil && count > 0 {
-			hasTasks = true
-		} else {
-			// Debug: Log when we find no tasks in a new round
-			q.mu.RLock()
-			expectedCount := 0
-			if stats := q.roundStats[newRound]; stats != nil {
-				expectedCount = stats.Expected
-			}
-			q.mu.RUnlock()
-			if logservice.LS != nil {
-				_ = logservice.LS.Log("debug",
-					fmt.Sprintf("Round %d: No pending tasks found after advancing (count=%d, err=%v). Expected count from stats: %d",
-						newRound, count, err, expectedCount),
-					"queue", q.name, q.name)
-			}
-		}
-	}
-
-	q.mu.Lock()
-	inProgressCount := len(q.inProgress)
-	currentState := q.state
-	q.mu.Unlock()
-
-	// Allow completion if state is Running or Waiting (but not Paused or Stopped)
-	// Waiting state can occur when DST completes all work but is waiting to start next round
-	canComplete := (currentState == QueueStateRunning || currentState == QueueStateWaiting) && !hasTasks && inProgressCount == 0
-
-	if canComplete {
-		// Potential completion detected - give any in-flight Complete() calls a moment to finish
-		// Since writes are now synchronous, we just need a brief pause for in-flight operations
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug",
-				fmt.Sprintf("Round %d: No tasks detected, doing final re-check", newRound),
-				"queue", q.name, q.name)
-		}
-
-		// Give any in-flight Complete() calls a moment to finish their synchronous writes
-		time.Sleep(100 * time.Millisecond)
-
-		// Re-check task count after final flush
-		queueType := getQueueType(q.name)
-		finalCount, err := q.boltDB.CountByPrefix(queueType, newRound, db.StatusPending)
-
-		// Debug logging
-		if logservice.LS != nil {
-			q.mu.RLock()
-			state := q.state
-			q.mu.RUnlock()
-			_ = logservice.LS.Log("debug",
-				fmt.Sprintf("Completion check after flush for round %d: finalCount=%d state=%s", newRound, finalCount, state),
-				"queue", q.name, q.name)
-		}
-
-		if err == nil && finalCount > 0 {
-			// Tasks appeared after flush - continue processing
-			// Check queue state before pulling to avoid deadlock if state changed
-			q.mu.RLock()
-			state := q.state
-			q.mu.RUnlock()
-			if state == QueueStateRunning || state == QueueStateWaiting {
-				// Allow pulling even in Waiting state - tasks need to be processed
-				q.pullTasks(true) // Pull the newly discovered tasks
-			}
-			return
-		}
-
-		// Still no tasks after final flush - mark as completed
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug",
-				fmt.Sprintf("No tasks found after flush for round %d - marking queue as completed", newRound),
-				"queue", q.name, q.name)
-		}
-
-		q.mu.Lock()
-		q.state = QueueStateCompleted
-		// Get round stats while we have the lock
-		roundStats := q.roundStats[newRound]
-		q.mu.Unlock()
-
-		// Stats publishing removed - queries are done directly from run.go
-
-		// Coordinator updates and logging don't need the queue lock - do them after releasing it
-		// This prevents blocking Close() calls
-		switch q.name {
-		case "dst":
-			// Mark DST as completed in coordinator
-			if q.coordinator != nil {
-				q.coordinator.MarkDstCompleted()
-			}
-			// log round stats
-			if roundStats != nil {
-				_ = logservice.LS.Log("info",
-					fmt.Sprintf("Round %d stats: Expected=%d Completed=%d", newRound, roundStats.Expected, roundStats.Completed),
-					"queue", q.name, q.name)
-			}
-		case "src":
-			// Mark SRC as completed - coordinator will allow DST to proceed
-			if q.coordinator != nil {
-				q.coordinator.MarkSrcCompleted()
-				if logservice.LS != nil {
-					_ = logservice.LS.Log("info",
-						"SRC traversal complete - DST can now proceed",
-						"queue", q.name, q.name)
-				}
-			}
-
-			// log round stats
-			if roundStats != nil {
-				_ = logservice.LS.Log("info",
-					fmt.Sprintf("Round %d stats: Expected=%d Completed=%d", newRound, roundStats.Expected, roundStats.Completed),
-					"queue", q.name, q.name)
-			}
-		}
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("info",
-				fmt.Sprintf("Advanced to round %d with no tasks - traversal complete", newRound),
-				"queue",
-				q.name,
-				q.name)
-		}
-		return
-	}
-
 	if logservice.LS != nil {
 		_ = logservice.LS.Log("info", fmt.Sprintf("Advanced to round %d", newRound), "queue", q.name, q.name)
 	}
 
-	// Pull tasks for the new round (will flush buffer again and load tasks into memory)
+	// Pull tasks for the new round
+	// pullTasks() will flush buffer first, then pull tasks
+	// Round completion will be detected naturally by checkRoundComplete() when:
+	// - inProgress == 0
+	// - pendingBuff == 0
+	// - lastPullWasPartial == true
+	// Then it will flush buffer and check DB for the current level
 	q.pullTasksIfNeeded(true)
 }
