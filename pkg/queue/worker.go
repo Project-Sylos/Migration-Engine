@@ -114,11 +114,17 @@ func (w *TraversalWorker) Run() {
 						task.LocationPath(), task.Round, err),
 					"worker", w.id, w.queueName)
 			}
-			willRetry := w.queue.Fail(task)
+			// Report failure - queue will handle retry logic
+			w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
+			// Check if task was retried for logging
+			w.queue.mu.RLock()
+			path := task.LocationPath()
+			_, willRetry := w.queue.pendingSet[path]
+			w.queue.mu.RUnlock()
 			w.logError(task, err, willRetry)
 		} else {
 			// Task succeeded
-			w.queue.Complete(task)
+			w.queue.ReportTaskResult(task, TaskExecutionResultSuccessful)
 		}
 	}
 }
