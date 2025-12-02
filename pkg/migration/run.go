@@ -146,13 +146,63 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	dstQueue.SetStatsChannel(dstStatsChan)
 
 	// Start stats consumer goroutine for progress updates (fmt output, not log service)
+	// Accumulate stats from both channels and print them together
 	go func() {
+		var lastSrcStats *queue.QueueStats
+		var lastDstStats *queue.QueueStats
+
 		for {
 			select {
 			case srcStats := <-srcStatsChan:
-				fmt.Printf("\r  SRC: Round %d (Pending:%d InProgress:%d)   ", srcStats.Round, srcStats.Pending, srcStats.InProgress)
+				lastSrcStats = &srcStats
+				if lastDstStats != nil {
+					// Get round stats for full format
+					srcRoundStats := srcQueue.RoundStats(lastSrcStats.Round)
+					dstRoundStats := dstQueue.RoundStats(lastDstStats.Round)
+
+					srcExpected := 0
+					srcCompleted := 0
+					if srcRoundStats != nil {
+						srcExpected = srcRoundStats.Expected
+						srcCompleted = srcRoundStats.Completed
+					}
+
+					dstExpected := 0
+					dstCompleted := 0
+					if dstRoundStats != nil {
+						dstExpected = dstRoundStats.Expected
+						dstCompleted = dstRoundStats.Completed
+					}
+
+					fmt.Printf("\r  Src: Round %d (Pending:%d InProgress:%d Workers:%d Expected:%d Completed:%d) | Dst: Round %d (Pending:%d InProgress:%d Workers:%d Expected:%d Completed:%d)   ",
+						lastSrcStats.Round, lastSrcStats.Pending, lastSrcStats.InProgress, lastSrcStats.Workers, srcExpected, srcCompleted,
+						lastDstStats.Round, lastDstStats.Pending, lastDstStats.InProgress, lastDstStats.Workers, dstExpected, dstCompleted)
+				}
 			case dstStats := <-dstStatsChan:
-				fmt.Printf("\r  DST: Round %d (Pending:%d InProgress:%d)   ", dstStats.Round, dstStats.Pending, dstStats.InProgress)
+				lastDstStats = &dstStats
+				if lastSrcStats != nil {
+					// Get round stats for full format
+					srcRoundStats := srcQueue.RoundStats(lastSrcStats.Round)
+					dstRoundStats := dstQueue.RoundStats(lastDstStats.Round)
+
+					srcExpected := 0
+					srcCompleted := 0
+					if srcRoundStats != nil {
+						srcExpected = srcRoundStats.Expected
+						srcCompleted = srcRoundStats.Completed
+					}
+
+					dstExpected := 0
+					dstCompleted := 0
+					if dstRoundStats != nil {
+						dstExpected = dstRoundStats.Expected
+						dstCompleted = dstRoundStats.Completed
+					}
+
+					fmt.Printf("\r  Src: Round %d (Pending:%d InProgress:%d Workers:%d Expected:%d Completed:%d) | Dst: Round %d (Pending:%d InProgress:%d Workers:%d Expected:%d Completed:%d)   ",
+						lastSrcStats.Round, lastSrcStats.Pending, lastSrcStats.InProgress, lastSrcStats.Workers, srcExpected, srcCompleted,
+						lastDstStats.Round, lastDstStats.Pending, lastDstStats.InProgress, lastDstStats.Workers, dstExpected, dstCompleted)
+				}
 			}
 		}
 	}()
@@ -256,7 +306,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		bothCompleted := coordinator.IsCompleted("both")
 
 		if bothCompleted {
-			fmt.Printf("[DEBUG] bothCompleted detected - starting shutdown\n")
 			if logservice.LS != nil {
 				_ = logservice.LS.Log("debug",
 					"Migration loop: Both queues completed, exiting migration",
@@ -265,7 +314,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 			// Get stats directly (non-blocking)
 			srcStats, dstStats := getQueueStats(coordinator, boltDB)
-			fmt.Printf("[DEBUG] Got stats - src round %d, dst round %d\n", srcStats.Round, dstStats.Round)
 
 			fmt.Println("\nMigration complete!")
 
@@ -321,36 +369,28 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			}
 
 			// Stop progress ticker to prevent any more ticks
-			fmt.Printf("[DEBUG] Stopping progress ticker\n")
 			progressTicker.Stop()
-			fmt.Printf("[DEBUG] Progress ticker stopped\n")
 
 			// Close log service before returning (flush logs) - with timeout to prevent hanging
 			if logservice.LS != nil {
-				fmt.Printf("[DEBUG] Starting log service close (with 1s timeout)\n")
 				// Use a timeout context to prevent indefinite blocking
 				closeCtx, closeCancel := context.WithTimeout(context.Background(), 1*time.Second)
 				defer closeCancel()
 
 				closeDone := make(chan struct{}, 1)
 				go func() {
-					fmt.Printf("[DEBUG] Calling logservice.LS.Close() in goroutine\n")
 					_ = logservice.LS.Close()
-					fmt.Printf("[DEBUG] logservice.LS.Close() returned\n")
 					closeDone <- struct{}{}
 				}()
 
 				select {
 				case <-closeDone:
-					fmt.Printf("[DEBUG] Log service closed successfully\n")
 				case <-closeCtx.Done():
-					fmt.Printf("[DEBUG] Log service close timeout (1s) - continuing anyway\n")
 					// Timeout - log service close is taking too long, continue anyway
 					// (flushes should only take a few ms, so 1s timeout is generous)
 				}
 			}
 
-			fmt.Printf("[DEBUG] About to return from RunMigration - 1\n")
 			return RuntimeStats{
 				Duration: time.Since(start),
 				Src:      srcStats,
@@ -416,7 +456,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 					}
 				}
 
-				fmt.Printf("[DEBUG] Ticker: About to return from RunMigration - 2\n")
 				return RuntimeStats{
 					Duration: time.Since(start),
 					Src:      srcStats,
@@ -427,27 +466,8 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			// Get stats directly (non-blocking queries)
 			srcStats, dstStats := getQueueStats(coordinator, boltDB)
 
-			// Get round stats (this should be safe as it only reads)
-			srcRoundStats := srcQueue.RoundStats(srcStats.Round)
-			dstRoundStats := dstQueue.RoundStats(dstStats.Round)
-
-			srcExpected := 0
-			srcCompleted := 0
-			if srcRoundStats != nil {
-				srcExpected = srcRoundStats.Expected
-				srcCompleted = srcRoundStats.Completed
-			}
-
-			dstExpected := 0
-			dstCompleted := 0
-			if dstRoundStats != nil {
-				dstExpected = dstRoundStats.Expected
-				dstCompleted = dstRoundStats.Completed
-			}
-
-			fmt.Printf("\r  Src: Round %d (Pending:%d InProgress:%d Workers:%d Expected:%d Completed:%d) | Dst: Round %d (Pending:%d InProgress:%d Workers:%d Expected:%d Completed:%d)   ",
-				srcStats.Round, srcStats.Pending, 0, srcQueue.WorkerCount(), srcExpected, srcCompleted,
-				dstStats.Round, dstStats.Pending, 0, dstQueue.WorkerCount(), dstExpected, dstCompleted)
+			// Stats are printed via the channel listener goroutine, not here
+			// This section only updates config YAML
 
 			// Update config YAML when rounds actually advance (milestone detection)
 			roundAdvanced := false
@@ -473,7 +493,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		default:
 			// Debug: Log when taking default case
 			if bothCompleted {
-				fmt.Printf("[DEBUG] Main loop: Select default case (bothCompleted=true) - sleeping 100ms\n")
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
