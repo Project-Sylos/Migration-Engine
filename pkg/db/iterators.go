@@ -114,6 +114,38 @@ func (db *DB) IterateLevel(queueType string, level int, fn func(status string, b
 	})
 }
 
+// HasItems checks if a bucket (specified by bucket path) has any items.
+// Returns true if the bucket exists and has at least one item, false otherwise.
+// This is O(1) - it only checks for the first key without counting all items.
+func (db *DB) HasItems(bucketPath []string) (bool, error) {
+	hasItems := false
+
+	err := db.View(func(tx *bolt.Tx) error {
+		bucket := getBucket(tx, bucketPath)
+		if bucket == nil {
+			// Bucket doesn't exist, no items
+			return nil
+		}
+
+		// Just check if there's at least one key - O(1) operation
+		cursor := bucket.Cursor()
+		key, _ := cursor.First()
+		hasItems = (key != nil)
+
+		return nil
+	})
+
+	return hasItems, err
+}
+
+// HasStatusBucketItems checks if a status bucket has any items.
+// Returns true if the bucket exists and has at least one item, false otherwise.
+// This is O(1) - it only checks for the first key without counting all items.
+func (db *DB) HasStatusBucketItems(queueType string, level int, status string) (bool, error) {
+	bucketPath := GetStatusBucketPath(queueType, level, status)
+	return db.HasItems(bucketPath)
+}
+
 // CountStatusBucket returns the number of items in a status bucket.
 func (db *DB) CountStatusBucket(queueType string, level int, status string) (int, error) {
 	count := 0
