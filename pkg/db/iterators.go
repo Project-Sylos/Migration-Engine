@@ -147,7 +147,23 @@ func (db *DB) HasStatusBucketItems(queueType string, level int, status string) (
 }
 
 // CountStatusBucket returns the number of items in a status bucket.
+// Uses stats bucket for O(1) lookup. Falls back to cursor scan if stats unavailable.
 func (db *DB) CountStatusBucket(queueType string, level int, status string) (int, error) {
+	// Try stats first (fast path)
+	bucketPath := GetStatusBucketPath(queueType, level, status)
+	count, err := db.GetBucketCount(bucketPath)
+	if err == nil {
+		// Stats available - return count
+		return int(count), nil
+	}
+
+	// Fallback to cursor scan (slow path, but safe)
+	return db.countStatusBucketSlow(queueType, level, status)
+}
+
+// countStatusBucketSlow performs a full cursor scan of a status bucket.
+// This is the fallback method when stats are unavailable.
+func (db *DB) countStatusBucketSlow(queueType string, level int, status string) (int, error) {
 	count := 0
 
 	err := db.View(func(tx *bolt.Tx) error {
@@ -168,7 +184,23 @@ func (db *DB) CountStatusBucket(queueType string, level int, status string) (int
 }
 
 // CountNodes returns the total number of nodes in the nodes bucket.
+// Uses stats bucket for O(1) lookup. Falls back to cursor scan if stats unavailable.
 func (db *DB) CountNodes(queueType string) (int, error) {
+	// Try stats first (fast path)
+	bucketPath := GetNodesBucketPath(queueType)
+	count, err := db.GetBucketCount(bucketPath)
+	if err == nil {
+		// Stats available - return count
+		return int(count), nil
+	}
+
+	// Fallback to cursor scan (slow path, but safe)
+	return db.countNodesSlow(queueType)
+}
+
+// countNodesSlow performs a full cursor scan of the nodes bucket.
+// This is the fallback method when stats are unavailable.
+func (db *DB) countNodesSlow(queueType string) (int, error) {
 	count := 0
 
 	err := db.View(func(tx *bolt.Tx) error {

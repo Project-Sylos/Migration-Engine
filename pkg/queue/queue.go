@@ -768,14 +768,6 @@ func (q *Queue) pullTasks(force bool) {
 		}
 		// Gate passed - mark that we've done the first pull for this round
 		q.firstPullForRound = false
-		if logservice.LS != nil {
-			q.coordinator.mu.RLock()
-			srcRound := q.coordinator.srcRound
-			q.coordinator.mu.RUnlock()
-			_ = logservice.LS.Log("debug",
-				fmt.Sprintf("DST can pull first tasks for round %d (srcRound=%d)", currentRound, srcRound),
-				"queue", q.name, q.name)
-		}
 	}
 
 	q.pulling = true
