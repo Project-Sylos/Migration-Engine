@@ -5,6 +5,8 @@ package db
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -272,11 +274,30 @@ func (ob *OutputBuffer) Flush() {
 
 	// Execute all operations in a single transaction
 	err := ob.db.Update(func(tx *bolt.Tx) error {
+		// Ensure stats bucket exists
+		if _, err := getStatsBucket(tx); err != nil {
+			return fmt.Errorf("failed to get stats bucket: %w", err)
+		}
+
+		// Compute stats deltas BEFORE executing writes (check what exists first)
+		statsDeltas := computeStatsDeltas(tx, batch)
+
+		// Execute all data operations
 		for _, op := range batch {
 			if err := op.Execute(tx); err != nil {
 				return fmt.Errorf("failed to execute operation: %w", err)
 			}
 		}
+
+		// Apply all stats updates in one batch
+		for bucketPathStr, delta := range statsDeltas {
+			// Convert string path back to []string for updateBucketStats
+			bucketPath := strings.Split(bucketPathStr, "/")
+			if err := updateBucketStats(tx, bucketPath, delta); err != nil {
+				return fmt.Errorf("failed to update stats for %s: %w", bucketPathStr, err)
+			}
+		}
+
 		return nil
 	})
 
@@ -323,6 +344,73 @@ func (ob *OutputBuffer) Resume() {
 	ob.mu.Lock()
 	ob.paused = false
 	ob.mu.Unlock()
+}
+
+// computeStatsDeltas analyzes all operations and computes stats deltas in batch.
+// Returns a map of bucket path (as string) -> delta count.
+// Groups operations by type and computes deltas efficiently.
+func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int64 {
+	deltas := make(map[string]int64)
+
+	// Collect all status updates first - group by old status and new status
+	oldStatusCounts := make(map[string]int64) // "queueType/level/status" -> count
+	newStatusCounts := make(map[string]int64) // "queueType/level/status" -> count
+
+	for _, op := range operations {
+		switch v := op.(type) {
+		case *StatusUpdateOperation:
+			// Check if old status bucket has this entry
+			pathHash := []byte(HashPath(v.Path))
+			oldBucket := GetStatusBucket(tx, v.QueueType, v.Level, v.OldStatus)
+			if oldBucket != nil && oldBucket.Get(pathHash) != nil {
+				oldKey := fmt.Sprintf("%s/%d/%s", v.QueueType, v.Level, v.OldStatus)
+				oldStatusCounts[oldKey]++
+			}
+
+			// Check if new status bucket already has this entry
+			newBucket := GetStatusBucket(tx, v.QueueType, v.Level, v.NewStatus)
+			if newBucket == nil || newBucket.Get(pathHash) == nil {
+				newKey := fmt.Sprintf("%s/%d/%s", v.QueueType, v.Level, v.NewStatus)
+				newStatusCounts[newKey]++
+			}
+
+		case *BatchInsertOperation:
+			// Batch insert: compute deltas for all inserts
+			insertDeltas := computeBatchInsertStatsDeltas(tx, v.Operations)
+			for path, delta := range insertDeltas {
+				deltas[path] += delta
+			}
+
+		case *CopyStatusOperation:
+			// Copy status updates don't change bucket counts, just node metadata
+			// No stats updates needed
+		}
+	}
+
+	// Convert status update counts to bucket paths and apply deltas
+	for statusKey, count := range oldStatusCounts {
+		parts := strings.Split(statusKey, "/")
+		if len(parts) == 3 {
+			queueType := parts[0]
+			level, _ := strconv.Atoi(parts[1])
+			status := parts[2]
+			path := strings.Join(GetStatusBucketPath(queueType, level, status), "/")
+			deltas[path] -= count // Subtract from old status
+		}
+	}
+
+	for statusKey, count := range newStatusCounts {
+		parts := strings.Split(statusKey, "/")
+		if len(parts) == 3 {
+			queueType := parts[0]
+			level, _ := strconv.Atoi(parts[1])
+			status := parts[2]
+			path := strings.Join(GetStatusBucketPath(queueType, level, status), "/")
+			deltas[path] += count // Add to new status
+		}
+	}
+
+	return deltas
 }
 
 // Stop gracefully stops the output buffer and flushes remaining operations.

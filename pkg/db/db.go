@@ -99,6 +99,12 @@ func (db *DB) initializeBuckets() error {
 				}
 			}
 		}
+
+		// Initialize stats bucket
+		if err := initializeStatsBucket(tx); err != nil {
+			return fmt.Errorf("failed to initialize stats bucket: %w", err)
+		}
+
 		return nil
 	})
 }
