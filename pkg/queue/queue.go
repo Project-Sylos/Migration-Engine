@@ -44,7 +44,7 @@ type Queue struct {
 	leasedKeys         map[string]struct{}  // Path hashes already pulled/leased - prevents duplicate pulls from stale views
 	pulling            bool                 // Indicates a pull operation is active
 	pullLowWM          int                  // Low watermark threshold for pulling more work
-	lastPullWasPartial bool                 // True if last pull returned < batch size (signals round end)
+	lastPullWasPartial bool                 // True if last pull returned fewer tasks than requested (partial batch)
 	firstPullForRound  bool                 // True if we haven't done the first pull for the current round yet (used for DST gate check)
 	maxRetries         int                  // Maximum retry attempts per task
 	round              int                  // Current BFS round/depth level
@@ -250,7 +250,7 @@ func (q *Queue) Lease() *TaskBase {
 		return nil
 	}
 
-	q.pullTasksIfNeeded(false)
+	q.PullTasksIfNeeded(false)
 
 	for attempt := 0; attempt < 2; attempt++ {
 		q.mu.Lock()
@@ -271,79 +271,121 @@ func (q *Queue) Lease() *TaskBase {
 		q.mu.Unlock()
 
 		// Check if we need to pull more tasks (only if buffer is low and last pull wasn't partial)
-		q.pullTasksIfNeeded(false)
+		q.PullTasksIfNeeded(false)
 
 	}
 
 	return nil
 }
 
-// checkRoundComplete checks if the specified round is complete (no pending tasks and no in-progress tasks).
-// This function uses the database as the authoritative source of truth.
-// It will flush buffered writes before checking to ensure all data is persisted.
-// Returns true if the round should be marked complete. Thread-safe.
-func (q *Queue) checkRoundComplete(currentRound int) bool {
-	q.mu.RLock()
-	// Check if queue is still running
-	if q.state != QueueStateRunning {
+// CompletionCheckOptions configures what actions to take during completion checks.
+type CompletionCheckOptions struct {
+	CheckRoundComplete     bool // Check if current round is complete
+	CheckDstComplete       bool // Check if DST queue is complete (DST only)
+	AdvanceRoundIfComplete bool // Advance to next round if current round is complete
+	MarkDstCompleteIfDone  bool // Mark DST as complete if done (DST only)
+	RequireFirstPull       bool // Only mark DST complete on first pull (DST only)
+	FlushBuffer            bool // Flush buffer before checking DB
+}
+
+// checkCompletion performs completion checks based on the provided options.
+// Returns true if queue was marked as completed, false otherwise.
+// Thread-safe - caller must NOT hold the mutex when calling this.
+func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) bool {
+	// For DST completion check
+	if opts.CheckDstComplete && opts.MarkDstCompleteIfDone {
+		if q.name != "dst" || q.coordinator == nil {
+			return false
+		}
+
+		q.mu.RLock()
+		inProgressCount := len(q.inProgress)
+		pendingBuffCount := len(q.pendingBuff)
+		wasFirstPull := q.firstPullForRound
+		queueState := q.state
+		boltDB := q.boltDB
 		q.mu.RUnlock()
-		return false
-	}
 
-	// Quick check: if we have tasks in progress or in buffer, round isn't complete
-	inProgressCount := len(q.inProgress)
-	pendingBuffCount := len(q.pendingBuff)
-	lastPullWasPartial := q.lastPullWasPartial
-	boltDB := q.boltDB
-	outputBuffer := q.outputBuffer
-	q.mu.RUnlock()
-
-	// Fast path: If we have tasks in progress or in buffer, round isn't complete
-	if inProgressCount > 0 || pendingBuffCount > 0 {
-		return false
-	}
-
-	// If last pull was NOT partial (full batch), there might be more tasks in BoltDB
-	// We still need to check the DB to be sure, but this is a hint we're not done
-	if !lastPullWasPartial {
-		return false
-	}
-
-	// At this point, in-memory state suggests completion, but we need to verify with the DB
-	// CRITICAL: Force-flush buffer before querying DB to ensure all writes are persisted
-	if outputBuffer != nil {
-		outputBuffer.Flush()
-	}
-
-	// Now query the database as the authoritative source
-	if boltDB == nil {
-		return false
-	}
-
-	queueType := getQueueType(q.name)
-
-	// Check if there are any pending items in the current round's status bucket
-	// The DB is the source of truth - if there are pending items here, we're not done
-	// Use HasStatusBucketItems for O(1) check instead of counting all items
-	hasPending, err := boltDB.HasStatusBucketItems(queueType, currentRound, db.StatusPending)
-	if err != nil {
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to check pending items in DB during round completion check: %v", err), "queue", q.name, q.name)
+		// If we have tasks in progress or in buffer, we're definitely not done
+		if inProgressCount > 0 || pendingBuffCount > 0 {
+			return false
 		}
-		// If we can't query, assume not complete to be safe
-		return false
-	}
 
-	// If DB shows pending tasks, we need to pull them
-	if hasPending {
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug", fmt.Sprintf("Round %d completion check: DB shows pending items (in-memory was empty), pulling tasks", currentRound), "queue", q.name, q.name)
+		// If requireFirstPull is true, only mark complete on first pull
+		if opts.RequireFirstPull && !wasFirstPull {
+			return false
 		}
+
+		// No in-memory tasks - check DB for pending tasks in current round
+		if boltDB == nil {
+			return false
+		}
+
+		hasPending, err := boltDB.HasStatusBucketItems("DST", currentRound, db.StatusPending)
+		if err != nil {
+			return false
+		}
+
+		if !hasPending {
+			// No pending tasks in current round - traversal is complete
+			q.mu.Lock()
+			if queueState == QueueStateRunning || queueState == QueueStateWaiting {
+				if logservice.LS != nil {
+					_ = logservice.LS.Log("info",
+						fmt.Sprintf("No pending tasks found for round %d - traversal complete", currentRound),
+						"queue", q.name, q.name)
+				}
+				q.state = QueueStateCompleted
+				if q.coordinator != nil {
+					q.coordinator.MarkDstCompleted()
+				}
+			}
+			q.mu.Unlock()
+			return true
+		}
+
 		return false
 	}
 
-	// DB confirms no pending items - round is truly complete
-	return true
+	// For round completion check
+	if opts.CheckRoundComplete {
+		q.mu.RLock()
+		if q.state != QueueStateRunning {
+			q.mu.RUnlock()
+			return false
+		}
+
+		inProgressCount := len(q.inProgress)
+		pendingBuffCount := len(q.pendingBuff)
+		lastPullWasPartial := q.lastPullWasPartial
+		outputBuffer := q.outputBuffer
+		q.mu.RUnlock()
+
+		// Fast path: If we have tasks in progress or in buffer, round isn't complete
+		if inProgressCount > 0 || pendingBuffCount > 0 {
+			return false
+		}
+
+		// If last pull was NOT partial (got full batch), there might be more tasks
+		if !lastPullWasPartial {
+			return false
+		}
+
+		// Flush buffer before advancing to ensure all writes are persisted
+		if opts.FlushBuffer && outputBuffer != nil {
+			outputBuffer.Flush()
+		}
+
+		// Round is complete (no in-progress, no pending, and last pull was partial)
+		// Advance round if requested
+		if opts.AdvanceRoundIfComplete {
+			q.advanceToNextRound()
+		}
+
+		return true
+	}
+
+	return false
 }
 
 // TaskExecutionResult represents the result of a task execution.
@@ -372,12 +414,10 @@ func (q *Queue) ReportTaskResult(task *TaskBase, result TaskExecutionResult) {
 		return
 	}
 
-	// Event-driven post-processing: check if we need to pull tasks or advance round
+	// Event-driven post-processing: check if we need to pull more tasks
 	q.mu.RLock()
 	pendingCount := len(q.pendingBuff)
-	inProgressCount := len(q.inProgress)
 	lastPullWasPartial := q.lastPullWasPartial
-	currentRound := q.round
 	state := q.state
 	q.mu.RUnlock()
 
@@ -388,55 +428,7 @@ func (q *Queue) ReportTaskResult(task *TaskBase, result TaskExecutionResult) {
 
 	// Check if we need to pull more tasks (if count is below threshold and last pull wasn't partial)
 	if pendingCount <= q.pullLowWM && !lastPullWasPartial {
-		q.pullTasksIfNeeded(false)
-		// After pulling, re-check counts - they may have changed
-		q.mu.RLock()
-		pendingCount = len(q.pendingBuff)
-		inProgressCount = len(q.inProgress)
-		lastPullWasPartial = q.lastPullWasPartial
-		q.mu.RUnlock()
-	}
-
-	// Check if round is complete (inProgress + pendingBuff == 0 AND lastPullWasPartial == true)
-	// CRITICAL: Only check if we truly have no work left
-	if inProgressCount == 0 && pendingCount == 0 && lastPullWasPartial {
-		// CRITICAL: Flush buffer BEFORE checking round completion to ensure all child inserts are persisted
-		// This prevents race conditions where children are in buffer but not yet in DB
-		q.mu.RLock()
-		outputBuffer := q.outputBuffer
-		checkRound := q.round // Verify round hasn't changed
-		q.mu.RUnlock()
-
-		// Double-check: if round changed, don't proceed (another goroutine advanced it)
-		if checkRound != currentRound {
-			return
-		}
-
-		if outputBuffer != nil {
-			outputBuffer.Flush()
-		}
-
-		// checkRoundComplete will also flush and check DB
-		// If it finds pending items, it returns false and we should pull them
-		roundComplete := q.checkRoundComplete(currentRound)
-
-		// Double-check round hasn't changed (another goroutine might have advanced it)
-		q.mu.RLock()
-		stillSameRound := q.round == currentRound
-		q.mu.RUnlock()
-
-		if !stillSameRound {
-			return // Round already advanced by another goroutine
-		}
-
-		if roundComplete {
-			q.advanceToNextRound()
-		} else {
-			// checkRoundComplete found pending items in DB but didn't pull them
-			// We need to pull them now - these are tasks that were just inserted by completed tasks
-			// Force pull to get these newly-inserted tasks
-			q.pullTasksIfNeeded(true)
-		}
+		q.PullTasksIfNeeded(false)
 	}
 }
 
@@ -577,12 +569,6 @@ func (q *Queue) completeTask(task *TaskBase) {
 					f := child.Folder
 					f.DepthLevel = nextRound
 					childFolders = append(childFolders, f)
-				} else {
-					if logservice.LS != nil {
-						_ = logservice.LS.Log("debug",
-							fmt.Sprintf("DST: Skipping folder %s at round %d - status is %s (not Pending)", child.Folder.LocationPath, nextRound, child.Status),
-							"queue", q.name, q.name)
-					}
 				}
 			}
 		}
@@ -670,12 +656,7 @@ func childResultToNodeState(child ChildResult, parentPath string, depth int) *db
 	}
 }
 
-// PullTasks forces a pull from BoltDB to refill the in-memory buffer.
-func (q *Queue) PullTasks(force bool) {
-	q.pullTasks(force)
-}
-
-func (q *Queue) pullTasksIfNeeded(force bool) {
+func (q *Queue) PullTasksIfNeeded(force bool) {
 	if q.boltDB == nil {
 		return
 	}
@@ -688,37 +669,58 @@ func (q *Queue) pullTasksIfNeeded(force bool) {
 	}
 	q.mu.RUnlock()
 
+	// Note: firstPullForRound will be set to false in PullTasks() after successful pull
+	// We don't set it here because we need to know if it was the first pull when checking completion
+
 	if force {
-		q.pullTasks(true)
+		q.PullTasks(true)
 		return
 	}
 
 	q.mu.RLock()
 	// Only pull if: queue is running, buffer is low, not already pulling, and last pull wasn't partial
-	// If last pull was partial, we've exhausted this round - don't pull again until round advances
+	// If last pull was partial, we might have exhausted this round - don't pull again until round advances
 	lastPullWasPartial := q.lastPullWasPartial
 	needPull := q.state == QueueStateRunning && len(q.pendingBuff) <= q.pullLowWM && !q.pulling && !lastPullWasPartial
 	q.mu.RUnlock()
 	if needPull {
-		q.pullTasks(false)
+		q.PullTasks(false)
 	}
 }
 
-func (q *Queue) pullTasks(force bool) {
+func (q *Queue) PullTasks(force bool) {
 	if q.boltDB == nil {
 		return
 	}
 
-	// Don't pull if queue is completed (prevents deadlock on coordinator gate)
-	q.mu.RLock()
-	isCompleted := q.state == QueueStateCompleted
-	outputBuffer := q.outputBuffer
-	q.mu.RUnlock()
-	if isCompleted {
+	// Check pulling flag FIRST before any other logic
+	// This prevents multiple threads from executing pull logic concurrently
+	q.mu.Lock()
+	if q.pulling {
+		q.mu.Unlock()
 		return
 	}
 
-	// CRITICAL: Force-flush buffer before pulling tasks to ensure we don't pull tasks
+	// Don't pull if queue is completed (prevents deadlock on coordinator gate)
+	if q.state == QueueStateCompleted {
+		q.mu.Unlock()
+		return
+	}
+
+	// Set pulling flag early and defer clearing it
+	// This ensures only one thread can execute the pull logic at a time
+	q.pulling = true
+	outputBuffer := q.outputBuffer
+	q.mu.Unlock()
+
+	// Always clear pulling flag when done
+	defer func() {
+		q.mu.Lock()
+		q.pulling = false
+		q.mu.Unlock()
+	}()
+
+	// Force-flush buffer before pulling tasks to ensure we don't pull tasks
 	// that are waiting in the buffer to be written
 	if outputBuffer != nil {
 		outputBuffer.Flush()
@@ -733,7 +735,6 @@ func (q *Queue) pullTasks(force bool) {
 	q.mu.Lock()
 	queueState := q.state
 	pendingCount := len(q.pendingBuff)
-	isPulling := q.pulling
 
 	if !force {
 		// Only pull if queue is running (not paused or completed)
@@ -748,44 +749,69 @@ func (q *Queue) pullTasks(force bool) {
 			return
 		}
 	}
-	if isPulling {
-		q.mu.Unlock()
-		return
-	}
 
 	// Track if this is the first pull for the round (before we potentially set it to false)
 	wasFirstPullForRound := q.firstPullForRound
+	currentRound := q.round
 
-	// Check coordinator gate ONLY on first pull of the round (DST only)
-	// This prevents pulling tasks for a round that hasn't been approved yet
-	if q.name == "dst" && q.coordinator != nil {
-		currentRound := q.round
+	// For DST: Check if there are any pending tasks in current round BEFORE checking coordinator gate
+	// This allows us to exit early if there's no work, avoiding unnecessary waiting at the gate
+	// Skip this check for round 0 (bootstrap round) - we need to process at least one round before checking completion
+	if q.name == "dst" && q.coordinator != nil && currentRound > 0 {
+		q.mu.Unlock()
+
+		// Check if DST is complete (requires first pull to avoid false positives)
+		if q.checkCompletion(currentRound, CompletionCheckOptions{
+			CheckDstComplete:      true,
+			MarkDstCompleteIfDone: true,
+			RequireFirstPull:      true,
+			FlushBuffer:           true,
+		}) {
+			return
+		}
+
+		// There are tasks (in-memory or in DB) - check coordinator gate
+		q.mu.Lock()
 		canStartRound := q.coordinator.CanDstStartRound(currentRound)
 		if !canStartRound {
-			// Can't start this round yet - don't pull tasks
+			// Can't start this round yet - wait for coordinator gate
 			q.mu.Unlock()
 			return
 		}
-		// Gate passed - mark that we've done the first pull for this round
-		q.firstPullForRound = false
+		// Gate passed - we'll mark firstPullForRound = false only after actually fetching tasks
+	} else if q.name == "dst" && q.coordinator != nil && currentRound == 0 {
+		// For round 0, just check the coordinator gate (no completion check)
+		q.mu.Unlock()
+		q.mu.Lock()
+		canStartRound := q.coordinator.CanDstStartRound(currentRound)
+		if !canStartRound {
+			// Can't start this round yet - wait for coordinator gate
+			q.mu.Unlock()
+			return
+		}
+		// Gate passed - we'll mark firstPullForRound = false only after actually fetching tasks
 	}
 
-	q.pulling = true
-	currentRound := q.round
 	q.mu.Unlock()
 
 	batch, err := db.BatchFetchWithKeys(q.boltDB, queueType, currentRound, db.StatusPending, defaultLeaseBatchSize)
 
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.pulling = false
 
 	if err != nil {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to fetch batch from BoltDB: %v", err), "queue", q.name, q.name)
 		}
 		// On error, don't change lastPullWasPartial - keep existing state
+		// Also don't set firstPullForRound = false since pull failed
 		return
+	}
+
+	// Pull was successful - set firstPullForRound = false only if we actually fetched tasks
+	// This ensures we only mark completion on the actual first pull that fetched tasks
+	if wasFirstPullForRound && len(batch) > 0 {
+		q.firstPullForRound = false
 	}
 
 	// we've exhausted max depth - mark queue as completed
@@ -841,9 +867,8 @@ func (q *Queue) pullTasks(force bool) {
 		}
 	}
 
-	// Track if this was a partial pull (< batch size) - signals round is ending
-	// Empty batch (no more tasks) also counts as partial pull
-	// For round 0 with only root task(s), this will be true (e.g., 1 < 1000)
+	// Track if this pull was partial (fewer tasks than requested)
+	// This signals we might have exhausted the current round
 	q.lastPullWasPartial = len(batch) < defaultLeaseBatchSize
 
 }
@@ -1236,7 +1261,8 @@ func (q *Queue) Run() {
 			canStartRound := q.coordinator.CanDstStartRound(currentRound)
 
 			if !canStartRound {
-				// Red light - cannot start this round yet, wait and poll
+
+				// Still waiting - set state and sleep
 				q.mu.Lock()
 				if q.state != QueueStateWaiting {
 					q.state = QueueStateWaiting
@@ -1255,16 +1281,9 @@ func (q *Queue) Run() {
 		}
 
 		// Event-driven: Workers will call ReportTaskResult which handles:
-		// - Pulling more tasks when needed
+		// - Pulling more tasks when needed (when buffer is low)
 		// - Advancing rounds when complete
-		// We just need to ensure initial tasks are pulled for this round
-		q.mu.RLock()
-		needsInitialPull := q.firstPullForRound && q.state == QueueStateRunning
-		q.mu.RUnlock()
-
-		if needsInitialPull {
-			q.pullTasksIfNeeded(true)
-		}
+		// No need to pull tasks here - ReportTaskResult handles it
 
 		// Wait for round to complete (event-driven by ReportTaskResult)
 		// Check periodically if we should advance or if queue is done
@@ -1293,8 +1312,38 @@ func (q *Queue) Run() {
 				return
 			}
 
-			// Round advancement is handled by ReportTaskResult, so we just wait
 			// Check periodically if round advanced (for outer loop to continue)
+			if q.getRound() != currentRound {
+				break // Round advanced, continue outer loop
+			}
+
+			// Periodic completion check: check if round is complete or queue is done
+			// This replaces event-driven checks from ReportTaskResult to avoid race conditions
+			q.mu.RLock()
+			pendingCount := len(q.pendingBuff)
+			inProgressCount := len(q.inProgress)
+			lastPullWasPartial := q.lastPullWasPartial
+			state := q.state
+			q.mu.RUnlock()
+
+			// Only check if queue is running
+			if state == QueueStateRunning || state == QueueStateWaiting {
+
+				// Check if round is complete (inProgress + pendingBuff == 0 AND lastPullWasPartial == true)
+				// Only check if we truly have no work left
+				if inProgressCount == 0 && pendingCount == 0 && lastPullWasPartial {
+					q.mu.RLock()
+					roundToCheck := q.round
+					q.mu.RUnlock()
+					q.checkCompletion(roundToCheck, CompletionCheckOptions{
+						CheckRoundComplete:     true,
+						AdvanceRoundIfComplete: true,
+						FlushBuffer:            true,
+					})
+				}
+			}
+
+			// After checking completion, re-check if round advanced (it might have advanced)
 			if q.getRound() != currentRound {
 				break // Round advanced, continue outer loop
 			}
@@ -1348,10 +1397,10 @@ func (q *Queue) advanceToNextRound() {
 
 	// Pull tasks for the new round
 	// pullTasks() will flush buffer first, then pull tasks
-	// Round completion will be detected naturally by checkRoundComplete() when:
+	// Round completion will be detected naturally by checkCompletion() when:
 	// - inProgress == 0
 	// - pendingBuff == 0
 	// - lastPullWasPartial == true
-	// Then it will flush buffer and check DB for the current level
-	q.pullTasksIfNeeded(true)
+	// Then it will flush buffer and advance to next round
+	q.PullTasksIfNeeded(true)
 }

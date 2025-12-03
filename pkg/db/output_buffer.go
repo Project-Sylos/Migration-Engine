@@ -259,10 +259,14 @@ func (ob *OutputBuffer) mergeBatchInsert(newBatch *BatchInsertOperation) {
 
 // Flush writes all buffered operations to BoltDB in a single transaction.
 // This is synchronous and blocks until the flush completes.
+// Holds the lock during the entire transaction to prevent other goroutines
+// from adding operations to the buffer while the transaction is executing.
+// This ensures atomicity: either all operations in the snapshot are written, or none are.
 func (ob *OutputBuffer) Flush() {
 	ob.mu.Lock()
+	defer ob.mu.Unlock()
+
 	if len(ob.operations) == 0 {
-		ob.mu.Unlock()
 		return
 	}
 
@@ -270,9 +274,9 @@ func (ob *OutputBuffer) Flush() {
 	batch := make([]WriteOperation, len(ob.operations))
 	copy(batch, ob.operations)
 	ob.operations = make([]WriteOperation, 0, ob.batchSize)
-	ob.mu.Unlock()
 
 	// Execute all operations in a single transaction
+	// Lock is held during transaction to prevent concurrent additions to buffer
 	err := ob.db.Update(func(tx *bolt.Tx) error {
 		// Ensure stats bucket exists
 		if _, err := getStatsBucket(tx); err != nil {

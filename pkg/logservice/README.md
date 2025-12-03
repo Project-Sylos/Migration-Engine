@@ -38,6 +38,8 @@ LogService (LS)
 
 ## Initialization
 
+### Global Logger (Recommended)
+
 ```go
 import (
     "github.com/Project-Sylos/Migration-Engine/pkg/logservice"
@@ -47,6 +49,9 @@ import (
 if err := logservice.InitGlobalLogger(boltDB, "127.0.0.1:8081", "info"); err != nil {
     return err
 }
+
+// Use global logger
+logservice.LS.Log("info", "Migration started", "migration", "main", "src")
 ```
 
 **Parameters**:
@@ -58,6 +63,21 @@ if err := logservice.InitGlobalLogger(boltDB, "127.0.0.1:8081", "info"); err != 
 - All logs are persisted to BoltDB regardless of level
 - Only logs >= `minLevel` are sent via UDP
 - If UDP fails, logging continues (non-blocking)
+- Sends a test log and clears console on initialization
+
+### Manual Sender Creation
+
+```go
+// Create sender manually (if not using global logger)
+sender, err := logservice.NewSender(boltDB, "127.0.0.1:8081", "info")
+if err != nil {
+    return err
+}
+defer sender.Close()
+
+// Use sender
+sender.Log("info", "Message", "entity", "id", "queue")
+```
 
 ---
 
@@ -178,8 +198,20 @@ infoLogs, err := db.GetLogsByLevel(boltDB, "info")
 
 ### Protocol
 
-UDP packets are sent in JSON format:
+UDP packets are sent in JSON format using the `LogPacket` structure:
 
+```go
+type LogPacket struct {
+    Timestamp time.Time `json:"timestamp"`
+    Level     string    `json:"level"`
+    Message   string    `json:"message"`
+    Entity    string    `json:"entity,omitempty"`
+    EntityID  string    `json:"entity_id,omitempty"`
+    Queue     string    `json:"queue,omitempty"`
+}
+```
+
+**Example JSON:**
 ```json
 {
   "timestamp": "2024-01-15T10:30:45.123456Z",
@@ -204,30 +236,72 @@ logservice.LS.Log("error", "Error message", ...)    // ✅ Sent via UDP
 
 **Note**: All logs are still persisted to BoltDB regardless of UDP filtering.
 
-### UDP Listener Example
+### Starting a Listener
 
-Simple UDP listener for monitoring:
+The logservice package provides utilities to start UDP listeners:
+
+#### Automatic Terminal Spawn
+
+Spawns a new terminal window with a listener (cross-platform):
 
 ```go
-package main
-
-import (
-    "fmt"
-    "net"
-)
-
-func main() {
-    addr, _ := net.ResolveUDPAddr("udp", ":8081")
-    conn, _ := net.ListenUDP("udp", addr)
-    defer conn.Close()
-
-    buffer := make([]byte, 4096)
-    for {
-        n, _, _ := conn.ReadFromUDP(buffer)
-        fmt.Printf("LOG: %s\n", string(buffer[:n]))
-    }
+// Spawns a new terminal window running the listener
+err := logservice.StartListener("127.0.0.1:8081")
+if err != nil {
+    return err
 }
 ```
+
+**Platform Support:**
+- **Windows**: Opens new `cmd.exe` window
+- **macOS**: Opens new Terminal.app window
+- **Linux**: Tries `x-terminal-emulator`, `gnome-terminal`, or `xterm`
+
+#### Manual Listener
+
+Run the listener programmatically:
+
+```go
+// Run listener in current process
+err := logservice.RunListener("127.0.0.1:8081")
+if err != nil {
+    return err
+}
+```
+
+**Listener Features:**
+- Displays logs in format: `[timestamp] [level] message [queue]`
+- Automatically clears console when `<<CLEAR_SCREEN>>` message is received
+- Handles malformed packets gracefully
+
+#### Standalone Listener Program
+
+Run the listener as a standalone program:
+
+```bash
+# From pkg/logservice/main directory
+go run spawn.go 127.0.0.1:8081
+```
+
+Or use the spawned terminal window (automatically opened by `StartListener`).
+
+---
+
+## Console Control
+
+### Clear Console
+
+Send a special message to clear the listener's console:
+
+```go
+// Clear console (UDP only, not persisted to DB)
+err := logservice.LS.ClearConsole()
+if err != nil {
+    return err
+}
+```
+
+This sends a `<<CLEAR_SCREEN>>` message that the listener recognizes and uses to clear its display.
 
 ---
 
@@ -241,9 +315,10 @@ if logservice.LS != nil {
 ```
 
 **Shutdown behavior**:
-- All buffered logs are flushed to BoltDB
+- All buffered logs are flushed to BoltDB (with 2-second timeout)
 - UDP connection is closed gracefully
 - No logs are lost
+- Log buffer stops its flush loop
 
 ---
 
@@ -289,6 +364,28 @@ if err != nil {
 
 ---
 
+## Architecture Details
+
+### Log Buffer Configuration
+
+The log buffer is configured with:
+- **Batch Size**: 500 entries (flushes when reached)
+- **Flush Interval**: 2 seconds (periodic flush)
+- **Timeout**: 2 seconds (for graceful shutdown)
+
+These values are hardcoded in `NewSender()` but can be adjusted if needed.
+
+### Port Reuse
+
+The listener does not enforce port exclusivity. Multiple listeners can bind to the same UDP address, which allows:
+- Multiple monitoring tools to receive logs simultaneously
+- Redundant listeners for reliability
+- Development scenarios with multiple test instances
+
+**Note**: For production, ensure only one listener is running per address to avoid confusion.
+
+---
+
 ## Summary
 
 The log service provides:
@@ -297,5 +394,8 @@ The log service provides:
 - ✅ **Level Filtering**: UDP respects minimum level
 - ✅ **Complete Audit Trail**: All logs persisted regardless of level
 - ✅ **Queryability**: BoltDB logs organized by level for analysis
+- ✅ **Cross-Platform Listener**: Automatic terminal spawning on Windows, macOS, and Linux
+- ✅ **Console Control**: Clear console functionality for clean displays
+- ✅ **Global Logger**: Convenient singleton pattern for application-wide logging
 
 This design ensures comprehensive logging without impacting migration performance.

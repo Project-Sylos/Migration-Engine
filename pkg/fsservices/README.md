@@ -60,6 +60,22 @@ Both `Folder` and `File` structures contain:
 - **`DepthLevel`**: BFS depth level (0 = root)
 - **`Type`**: Node type (`"folder"` or `"file"`)
 
+#### Node Interface
+
+Both `Folder` and `File` implement the `Node` interface:
+
+```go
+type Node interface {
+    ID() string
+    Name() string
+    Path() string
+    ParentID() string
+    NodeType() string
+}
+```
+
+This allows polymorphic handling of files and folders.
+
 #### ListResult
 
 Returned by `ListChildren()`:
@@ -69,6 +85,63 @@ type ListResult struct {
     Folders []Folder
     Files   []File
 }
+```
+
+#### ListPager and Pagination
+
+For processing large directories in fixed-size pages, use `ListPager`:
+
+```go
+// Create a pager from a ListResult
+result, err := adapter.ListChildren(nodeIdentifier)
+pager := fsservices.NewListPager(result, 100) // 100 items per page
+
+// Iterate through pages
+for {
+    page, hasMore := pager.Next()
+    if !hasMore {
+        break
+    }
+    
+    // Process this page
+    for _, folder := range page.Folders {
+        // Process folder
+    }
+    for _, file := range page.Files {
+        // Process file
+    }
+    
+    fmt.Printf("Page %d: %d items (Total: %d, HasMore: %v)\n",
+        page.Page, len(page.Folders)+len(page.Files), page.Total, page.HasMore)
+}
+```
+
+**ListPage Structure:**
+```go
+type ListPage struct {
+    Folders  []Folder
+    Files    []File
+    Total    int  // Total number of children across all pages
+    Page     int  // 0-based page index
+    PageSize int  // Requested maximum number of children per page
+    HasMore  bool // Whether more pages exist
+}
+```
+
+**Note:** `ListPager` provides in-memory pagination over a full `ListResult`. For cloud services with native pagination, adapters can implement their own pagers (e.g., `SpectraFS.NewChildrenPager()`).
+
+#### Path Normalization Helpers
+
+Utility functions for consistent path handling:
+
+```go
+// NormalizeLocationPath - Ensures paths use forward slashes, are rooted, and cleaned
+normalized := fsservices.NormalizeLocationPath("folder\\subfolder") // Returns "/folder/subfolder"
+normalized := fsservices.NormalizeLocationPath("") // Returns "/"
+
+// NormalizeParentPath - Normalizes parent paths but preserves empty strings (for root nodes)
+parentPath := fsservices.NormalizeParentPath("/parent") // Returns "/parent"
+parentPath := fsservices.NormalizeParentPath("") // Returns "" (for root)
 ```
 
 ---
@@ -147,6 +220,28 @@ for _, file := range result.Files {
 - `identifier` parameters are **Spectra node IDs** (e.g., `"abc-123-def"`)
 - `LocationPath` in returned structures is the **relative path** from the Spectra root
 - Node IDs are opaque identifiers managed by Spectra
+
+**Additional Methods:**
+
+```go
+// Create a pager for children (convenience wrapper)
+pager, err := spectraFS.NewChildrenPager("node-id", 100)
+if err != nil {
+    return err
+}
+
+// Get the underlying SDK instance (for checking shared instances)
+sdkInstance := spectraFS.GetSDKInstance()
+
+// Close the adapter (closes underlying SDK instance)
+// Note: Only close once per SDK instance if multiple adapters share it
+err := spectraFS.Close()
+```
+
+**SDK Instance Management:**
+- Multiple `SpectraFS` adapters can share the same SDK instance
+- `GetSDKInstance()` allows checking if adapters share an instance
+- `Close()` should only be called once per SDK instance to avoid panics
 
 ---
 
@@ -349,13 +444,28 @@ Errors are logged via the global log service if available, and propagated to cal
 
 ---
 
+## Constants
+
+```go
+const (
+    NodeTypeFile   = "file"
+    NodeTypeFolder = "folder"
+)
+```
+
+These constants are used in the `Type` field of `Folder` and `File` structures.
+
+---
+
 ## Summary
 
 The filesystem services package provides:
 - ✅ **Unified Interface**: Single API for multiple storage backends
-- ✅ **Type Safety**: Consistent `Folder` and `File` structures
-- ✅ **Path Abstraction**: Handles path differences between backends
+- ✅ **Type Safety**: Consistent `Folder` and `File` structures with `Node` interface
+- ✅ **Path Abstraction**: Handles path differences between backends with normalization helpers
+- ✅ **Pagination Support**: `ListPager` for processing large directories in pages
 - ✅ **Extensibility**: Easy to add new storage backends
 - ✅ **Integration**: Seamlessly integrates with queue system and workers
+- ✅ **World Isolation**: SpectraFS supports multi-tenant scenarios via world filtering
 
 This abstraction enables the migration engine to work with any filesystem type while keeping the core traversal logic backend-agnostic.

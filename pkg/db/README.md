@@ -30,6 +30,7 @@ BoltDB uses nested buckets to organize data hierarchically:
 /SRC     → Source queue data
 /DST     → Destination queue data
 /LOGS    → Log entries organized by level
+/STATS   → Bucket count statistics (O(1) lookups)
 ```
 
 ### Node Storage (`/SRC` and `/DST`)
@@ -111,6 +112,23 @@ Logs are organized by level in sub-buckets:
 
 Each log entry is keyed by its UUID within the appropriate level bucket.
 
+### Statistics Bucket (`/STATS`)
+
+**Path**: `/STATS/`
+
+Stores count statistics for all buckets to enable O(1) count lookups without scanning:
+
+```
+/STATS
+  "SRC/nodes"                    → int64 (8-byte big-endian)
+  "SRC/children"                 → int64
+  "SRC/levels/00000001/pending"  → int64
+  "DST/levels/00000002/successful" → int64
+  "LOGS"                         → int64
+```
+
+Statistics are automatically maintained during writes via `OutputBuffer` and can be manually synchronized using `SyncCounts()`.
+
 ---
 
 ## Core Operations
@@ -128,6 +146,16 @@ if err != nil {
     return err
 }
 defer database.Close()
+```
+
+**Note:** The database automatically initializes the bucket structure on first open, including the stats bucket for O(1) count operations.
+
+### Path Hashing
+
+Paths are hashed using SHA256 (first 16 bytes, 32 hex characters) for consistent key generation:
+
+```go
+pathHash := db.HashPath("/parent/child") // Returns 32-character hex string
 ```
 
 ### Node State Operations
@@ -167,20 +195,36 @@ err := database.IterateStatusBucket("SRC", 1, db.StatusPending,
         return nil
     })
 
-// Count nodes in a status bucket
+// Count nodes in a status bucket (uses stats bucket for O(1) lookup)
 count, err := database.CountStatusBucket("SRC", 1, db.StatusPending)
+
+// Count total nodes (uses stats bucket)
+totalNodes, err := database.CountNodes("SRC")
+
+// Check if bucket has items (O(1) using stats)
+hasItems, err := database.HasStatusBucketItems("SRC", 1, db.StatusPending)
 
 // Get all levels that exist
 levels, err := database.GetAllLevels("SRC")
 
 // Find minimum level with pending work
 minLevel, err := database.FindMinPendingLevel("SRC")
+
+// Lease tasks from status bucket (for worker task distribution)
+pathHashes, err := database.LeaseTasksFromStatus("SRC", 1, db.StatusPending, 1000)
+
+// Batch fetch with keys (for task leasing with deduplication)
+results, err := db.BatchFetchWithKeys(database, "SRC", 1, db.StatusPending, 100)
+for _, result := range results {
+    // result.Key is the path hash string
+    // result.State is the NodeState
+}
 ```
 
 ### Batch Operations
 
 ```go
-// Batch insert multiple nodes
+// Batch insert multiple nodes (automatically updates stats)
 ops := []db.InsertOperation{
     {QueueType: "SRC", Level: 1, Status: db.StatusPending, State: state1},
     {QueueType: "SRC", Level: 1, Status: db.StatusPending, State: state2},
@@ -190,6 +234,11 @@ err := db.BatchInsertNodes(database, ops)
 // Batch update node statuses
 results, err := db.BatchUpdateNodeStatus(database, "SRC", 1,
     db.StatusPending, db.StatusSuccessful, 
+    []string{"/path1", "/path2"})
+
+// Batch update copy status
+copyResults, err := db.BatchUpdateNodeCopyStatus(database, "SRC", 1,
+    db.StatusSuccessful, db.CopyStatusPending,
     []string{"/path1", "/path2"})
 ```
 
@@ -208,39 +257,119 @@ entry := db.LogEntry{
 }
 err := db.InsertLogEntry(database, entry)
 
+// Get log entry by ID and level
+logEntry, err := db.GetLogEntry(database, "info", entry.ID)
+
 // Get logs by level
 infoLogs, err := db.GetLogsByLevel(database, "info")
 errorLogs, err := db.GetLogsByLevel(database, "error")
 
-// Get all logs
+// Get all logs across all levels
 allLogs, err := db.GetAllLogs(database)
+```
+
+### Copy Status Operations
+
+```go
+// Update copy status (for future copy phase)
+updatedState, err := db.UpdateNodeCopyStatus(database, "SRC", 1,
+    db.StatusSuccessful, db.CopyStatusPending, "/path/to/node")
+
+// Batch update copy status
+results, err := db.BatchUpdateNodeCopyStatus(database, "SRC", 1,
+    db.StatusSuccessful, db.CopyStatusPending,
+    []string{"/path1", "/path2"})
 ```
 
 ### Buffered Writes
 
-For high-throughput scenarios, use batch operations within a single transaction:
+The package provides two buffering systems for high-throughput scenarios:
+
+#### OutputBuffer
+
+Batches write operations (status updates, inserts, copy status) with automatic coalescing and stats updates:
 
 ```go
-// Batch insert multiple nodes atomically
-ops := []db.InsertOperation{
-    {
-        QueueType: "SRC",
-        Level:     1,
-        Status:    db.StatusPending,
-        State:     nodeState1,
-    },
-    {
-        QueueType: "SRC",
-        Level:     1,
-        Status:    db.StatusPending,
-        State:     nodeState2,
-    },
-}
+// Create output buffer
+outputBuffer := db.NewOutputBuffer(database, 500, 2*time.Second)
+defer outputBuffer.Stop()
 
+// Add status update (coalesces duplicates - last write wins)
+outputBuffer.AddStatusUpdate("SRC", 1, db.StatusPending, db.StatusSuccessful, "/path/to/node")
+
+// Add batch insert (merges with existing batch inserts)
+ops := []db.InsertOperation{
+    {QueueType: "SRC", Level: 1, Status: db.StatusPending, State: state1},
+    {QueueType: "SRC", Level: 1, Status: db.StatusPending, State: state2},
+}
+outputBuffer.AddBatchInsert(ops)
+
+// Add copy status update
+outputBuffer.AddCopyStatusUpdate("SRC", 1, db.StatusSuccessful, "/path/to/node", db.CopyStatusPending)
+
+// Force flush (or wait for automatic flush on batch size or interval)
+outputBuffer.Flush()
+
+// Pause/resume for controlled flushing
+outputBuffer.Pause()
+// ... do work ...
+outputBuffer.Resume()
+```
+
+**Features:**
+- Automatic coalescing of duplicate operations (last write wins)
+- Batch merging for insert operations
+- Automatic stats updates
+- Time-based and size-based flush triggers
+- Thread-safe
+
+#### LogBuffer
+
+Batches log entries for efficient persistence:
+
+```go
+// Create log buffer
+logBuffer := db.NewLogBuffer(database, 500, 2*time.Second)
+defer logBuffer.Stop()
+
+// Add log entry (automatically flushed when batch size reached)
+entry := db.LogEntry{
+    ID:        db.GenerateLogID(),
+    Timestamp: time.Now().Format(time.RFC3339Nano),
+    Level:     "info",
+    Entity:    "worker",
+    EntityID:  "worker-1",
+    Message:   "Task completed",
+    Queue:     "src",
+}
+logBuffer.Add(entry)
+
+// Force flush
+logBuffer.Flush()
+```
+
+### Direct Write Operations
+
+For immediate writes within transactions, use direct write functions:
+
+```go
+// Update node status within existing transaction
 err := database.Update(func(tx *bolt.Tx) error {
-    return db.batchInsertNodesInTx(tx, ops)
+    return db.UpdateNodeStatusInTx(tx, "SRC", 1, 
+        db.StatusPending, db.StatusSuccessful, "/path/to/node")
+})
+
+// Batch insert nodes within existing transaction
+ops := []db.InsertOperation{
+    {QueueType: "SRC", Level: 1, Status: db.StatusPending, State: state1},
+    {QueueType: "SRC", Level: 1, Status: db.StatusPending, State: state2},
+}
+err := database.Update(func(tx *bolt.Tx) error {
+    return db.BatchInsertNodesInTx(tx, ops)
 })
 ```
+
+**Note:** Direct writes do not automatically update stats. Use `OutputBuffer` for automatic stats maintenance, or manually update stats after direct writes.
 
 ---
 
@@ -318,9 +447,62 @@ for _, state := range states {
 }
 ```
 
+### Statistics Bucket (O(1) Counts)
+
+The stats bucket enables O(1) count lookups without scanning buckets:
+
+```go
+// Fast: Uses stats bucket (O(1))
+count, err := database.CountStatusBucket("SRC", 1, db.StatusPending)
+
+// Slow: Falls back to cursor scan if stats unavailable (O(n))
+count, err := database.CountStatusBucket("SRC", 1, db.StatusPending)
+```
+
+**Stats Maintenance:**
+- Automatically updated by `OutputBuffer` during writes
+- Can be manually synchronized: `database.SyncCounts()`
+- Useful for recovery or correcting drift
+
+### Buffered Writes
+
+Use `OutputBuffer` for high-throughput scenarios:
+
+```go
+// Good: Batched writes with coalescing
+outputBuffer := db.NewOutputBuffer(database, 500, 2*time.Second)
+outputBuffer.AddStatusUpdate(...)
+outputBuffer.AddBatchInsert(...)
+// Automatically flushes on batch size or interval
+
+// Bad: Many individual transactions
+for _, op := range operations {
+    db.UpdateNodeStatus(...) // Each is a separate transaction
+}
+```
+
+**Benefits:**
+- Reduces transaction overhead
+- Automatic operation coalescing (duplicate elimination)
+- Automatic stats updates
+- Configurable flush triggers (size and time)
+
 ### Direct Writes
 
-The queue system writes directly to BoltDB for immediate consistency. BoltDB's single-writer model already serializes writes, so no additional buffering is needed.
+For immediate consistency, use direct write functions within transactions:
+
+```go
+// Direct write within transaction (immediate consistency)
+err := database.Update(func(tx *bolt.Tx) error {
+    return db.UpdateNodeStatusInTx(tx, "SRC", 1, 
+        db.StatusPending, db.StatusSuccessful, "/path")
+})
+```
+
+**Use Cases:**
+- When immediate visibility is required
+- Within existing transactions
+- For critical operations that can't be buffered
 
 ---
 
@@ -349,6 +531,36 @@ if state == nil {
 
 ---
 
+## Statistics Management
+
+The stats bucket provides O(1) count lookups for all buckets:
+
+```go
+// Get count for any bucket path
+count, err := database.GetBucketCount([]string{"SRC", "nodes"})
+count, err := database.GetBucketCount([]string{"SRC", "levels", "00000001", "pending"})
+
+// Check if bucket has items
+hasItems, err := database.HasBucketItems([]string{"SRC", "nodes"})
+
+// Manually synchronize all stats (useful for recovery)
+err := database.SyncCounts()
+
+// Ensure stats bucket exists
+err := database.EnsureStatsBucket()
+```
+
+**Stats are automatically maintained by:**
+- `OutputBuffer` - Updates stats during buffered writes
+- `BatchInsertNodes` - Updates stats during batch inserts
+
+**Manual sync is useful for:**
+- Recovery after crashes
+- Correcting drift
+- Initial stats population
+
+---
+
 ## Summary
 
 The database package provides:
@@ -356,8 +568,12 @@ The database package provides:
 - ✅ **Bucket Hierarchies** - Natural structure, not key encoding
 - ✅ **Status Transitions** - Atomic, race-free status changes
 - ✅ **High-Level Operations** - Convenient functions for common operations
-- ✅ **Batch Support** - Efficient bulk operations
+- ✅ **Batch Support** - Efficient bulk operations with automatic stats
+- ✅ **Buffered Writes** - `OutputBuffer` and `LogBuffer` for high throughput
+- ✅ **O(1) Statistics** - Stats bucket for fast count lookups
+- ✅ **Path Hashing** - Consistent key generation from paths
+- ✅ **Task Leasing** - Efficient task distribution for workers
 - ✅ **Thread Safety** - Safe for concurrent reads, serialized writes
 - ✅ **Crash Resilience** - ACID transactions with automatic recovery
 
-This design provides a clean, predictable storage layer for the migration engine's BFS traversal with guaranteed consistency and atomic operations.
+This design provides a clean, predictable storage layer for the migration engine's BFS traversal with guaranteed consistency, atomic operations, and high performance through intelligent buffering and statistics.

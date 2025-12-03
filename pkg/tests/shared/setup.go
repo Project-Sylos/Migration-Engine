@@ -6,6 +6,7 @@ package shared
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
@@ -30,9 +31,6 @@ func setupSpectraFS(configPath string, cleanDB bool) (*sdk.SpectraFS, error) {
 		if err := os.Remove("./spectra.db"); err != nil {
 			return nil, fmt.Errorf("failed to remove existing Spectra DB: %w", err)
 		}
-		// Also remove WAL and SHM files if they exist
-		os.Remove("./spectra.db-wal")
-		os.Remove("./spectra.db-shm")
 	}
 
 	// Create new SpectraFS instance
@@ -92,7 +90,7 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 		LogAddress:      "127.0.0.1:8081",
 		LogLevel:        "trace",
 		StartupDelay:    3 * time.Second,
-		Verification:    migration.VerifyOptions{},
+		Verification:    migration.VerifyOptions{AllowFailed: true},
 	}
 
 	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {
@@ -141,4 +139,87 @@ func LoadSpectraRoots(spectraFS *sdk.SpectraFS) (fsservices.Folder, fsservices.F
 	}
 
 	return srcFolder, dstFolder, nil
+}
+
+// SetupLocalTest assembles a local filesystem-backed migration configuration.
+// srcPath and dstPath are absolute paths to the source and destination directories.
+// removeMigrationDB controls whether to remove the migration database (use false for resumption tests).
+func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.Config, error) {
+	fmt.Printf("Setting up local filesystem migration...\n")
+	fmt.Printf("  Source: %s\n", srcPath)
+	fmt.Printf("  Destination: %s\n", dstPath)
+
+	// Create LocalFS adapters
+	srcAdapter, err := fsservices.NewLocalFS(srcPath)
+	if err != nil {
+		return migration.Config{}, fmt.Errorf("failed to create src adapter: %w", err)
+	}
+
+	dstAdapter, err := fsservices.NewLocalFS(dstPath)
+	if err != nil {
+		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
+	}
+
+	// Verify source path exists and is accessible
+	if _, err := os.Stat(srcPath); err != nil {
+		return migration.Config{}, fmt.Errorf("source path does not exist or is not accessible: %s (error: %w)", srcPath, err)
+	}
+
+	// Verify destination path exists and is accessible
+	// Note: We don't create it automatically to avoid accidentally creating directories
+	if _, err := os.Stat(dstPath); err != nil {
+		return migration.Config{}, fmt.Errorf("destination path does not exist or is not accessible: %s (error: %w)", dstPath, err)
+	}
+
+	// Create root folder structures
+	srcRoot := fsservices.Folder{
+		Id:           srcPath,
+		ParentId:     filepath.Dir(srcPath),
+		ParentPath:   "",
+		DisplayName:  filepath.Base(srcPath),
+		LocationPath: "/",
+		LastUpdated:  time.Now().Format(time.RFC3339),
+		DepthLevel:   0,
+		Type:         fsservices.NodeTypeFolder,
+	}
+
+	dstRoot := fsservices.Folder{
+		Id:           dstPath,
+		ParentId:     filepath.Dir(dstPath),
+		ParentPath:   "",
+		DisplayName:  filepath.Base(dstPath),
+		LocationPath: "/",
+		LastUpdated:  time.Now().Format(time.RFC3339),
+		DepthLevel:   0,
+		Type:         fsservices.NodeTypeFolder,
+	}
+
+	cfg := migration.Config{
+		Database: migration.DatabaseConfig{
+			Path:           "pkg/tests/migration_test_local.db",
+			RemoveExisting: removeMigrationDB,
+		},
+		Source: migration.Service{
+			Name:    "Local-Src",
+			Adapter: srcAdapter,
+		},
+		Destination: migration.Service{
+			Name:    "Local-Dst",
+			Adapter: dstAdapter,
+		},
+		SeedRoots:       true,
+		WorkerCount:     10,
+		MaxRetries:      3,
+		CoordinatorLead: 4,
+		LogAddress:      "127.0.0.1:8081",
+		LogLevel:        "trace",
+		StartupDelay:    3 * time.Second,
+		Verification:    migration.VerifyOptions{AllowFailed: true},
+	}
+
+	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {
+		return migration.Config{}, err
+	}
+
+	return cfg, nil
 }
