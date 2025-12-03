@@ -1,5 +1,7 @@
 github.com/Project-Sylos/Spectra v0.2.55 h1:c7AAJH7J5S801x94UgQVGXXoAFxPjdrDunaQe92LX+g=
 github.com/Project-Sylos/Spectra v0.2.55/go.mod h1:qahyZ3SAqBesMk6DSjOWdSUGzmgp+/B+NgaSE4HTrOg=
+github.com/Project-Sylos/Sylos-FS v0.1.0 h1:zMHhDZOK3Ld6lOYhWEW7opi7UhvNlU4bC0lj/KEidGI=
+github.com/Project-Sylos/Sylos-FS v0.1.0/go.mod h1:x7yJar9BtrmiLx/BF/2lTsnHfYSwSKi05NLnC3TOy0Q=
 github.com/creack/pty v1.1.9/go.mod h1:oKZEueFk5CKHvIhNR5MUki03XCEU+Q6VDXinZuGJ33E=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=

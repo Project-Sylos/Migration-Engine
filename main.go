@@ -11,9 +11,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Spectra/sdk"
+	"github.com/Project-Sylos/Sylos-FS/pkg/fs"
+	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
 type folderConfig struct {
@@ -74,15 +75,15 @@ func (f *adapterFactory) spectraInstance(path string) (*sdk.SpectraFS, error) {
 	return fs, nil
 }
 
-func (f *folderConfig) toFolder(defaultName string) (fsservices.Folder, bool, error) {
+func (f *folderConfig) toFolder(defaultName string) (types.Folder, bool, error) {
 	if f == nil {
-		return fsservices.Folder{}, false, nil
+		return types.Folder{}, false, nil
 	}
 	if f.Id == "" {
-		return fsservices.Folder{}, false, nil
+		return types.Folder{}, false, nil
 	}
 
-	folder := fsservices.Folder{
+	folder := types.Folder{
 		Id:           f.Id,
 		ParentId:     f.ParentId,
 		ParentPath:   f.ParentPath,
@@ -100,7 +101,7 @@ func (f *folderConfig) toFolder(defaultName string) (fsservices.Folder, bool, er
 		folder.LocationPath = "/"
 	}
 	if folder.Type == "" {
-		folder.Type = fsservices.NodeTypeFolder
+		folder.Type = types.NodeTypeFolder
 	}
 	if folder.LastUpdated == "" {
 		folder.LastUpdated = time.Now().UTC().Format(time.RFC3339)
@@ -109,14 +110,14 @@ func (f *folderConfig) toFolder(defaultName string) (fsservices.Folder, bool, er
 	return folder, true, nil
 }
 
-func (f *adapterFactory) buildService(cfg adapterConfig) (migration.Service, fsservices.Folder, error) {
-	var folder fsservices.Folder
+func (f *adapterFactory) buildService(cfg adapterConfig) (migration.Service, types.Folder, error) {
+	var folder types.Folder
 	var hasFolder bool
 	var err error
 	if cfg.Root.Id != "" {
 		folder, hasFolder, err = cfg.Root.toFolder(cfg.Root.Id)
 		if err != nil {
-			return migration.Service{}, fsservices.Folder{}, err
+			return migration.Service{}, types.Folder{}, err
 		}
 	}
 
@@ -129,7 +130,7 @@ func (f *adapterFactory) buildService(cfg adapterConfig) (migration.Service, fss
 
 		spectraFS, err := f.spectraInstance(configPath)
 		if err != nil {
-			return migration.Service{}, fsservices.Folder{}, fmt.Errorf("spectra init failed: %w", err)
+			return migration.Service{}, types.Folder{}, fmt.Errorf("spectra init failed: %w", err)
 		}
 
 		rootID := cfg.RootID
@@ -146,21 +147,21 @@ func (f *adapterFactory) buildService(cfg adapterConfig) (migration.Service, fss
 			world = "primary"
 		}
 
-		adapter, err := fsservices.NewSpectraFS(spectraFS, rootID, world)
+		adapter, err := fs.NewSpectraFS(spectraFS, rootID, world)
 		if err != nil {
-			return migration.Service{}, fsservices.Folder{}, fmt.Errorf("spectra adapter: %w", err)
+			return migration.Service{}, types.Folder{}, fmt.Errorf("spectra adapter: %w", err)
 		}
 
 		if !hasFolder {
 			node, err := spectraFS.GetNode(&sdk.GetNodeRequest{ID: rootID})
 			if err != nil {
-				return migration.Service{}, fsservices.Folder{}, fmt.Errorf("spectra get node %s: %w", rootID, err)
+				return migration.Service{}, types.Folder{}, fmt.Errorf("spectra get node %s: %w", rootID, err)
 			}
-			if node.Type != fsservices.NodeTypeFolder {
-				return migration.Service{}, fsservices.Folder{}, fmt.Errorf("spectra node %s is not a folder", rootID)
+			if node.Type != types.NodeTypeFolder {
+				return migration.Service{}, types.Folder{}, fmt.Errorf("spectra node %s is not a folder", rootID)
 			}
 
-			folder = fsservices.Folder{
+			folder = types.Folder{
 				Id:           node.ID,
 				DisplayName:  node.Name,
 				LocationPath: "/",
@@ -168,7 +169,7 @@ func (f *adapterFactory) buildService(cfg adapterConfig) (migration.Service, fss
 				ParentId:     "",
 				ParentPath:   "",
 				DepthLevel:   0,
-				Type:         fsservices.NodeTypeFolder,
+				Type:         types.NodeTypeFolder,
 			}
 		}
 
@@ -179,7 +180,7 @@ func (f *adapterFactory) buildService(cfg adapterConfig) (migration.Service, fss
 
 		return migration.Service{Name: name, Adapter: adapter}, folder, nil
 	default:
-		return migration.Service{}, fsservices.Folder{}, fmt.Errorf("unsupported adapter type %q", cfg.Type)
+		return migration.Service{}, types.Folder{}, fmt.Errorf("unsupported adapter type %q", cfg.Type)
 	}
 }
 

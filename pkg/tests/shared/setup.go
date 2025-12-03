@@ -9,9 +9,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Spectra/sdk"
+	"github.com/Project-Sylos/Sylos-FS/pkg/fs"
+	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
 // setupSpectraFS creates a SpectraFS instance, handling DB cleanup appropriately.
@@ -60,12 +61,12 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 		return migration.Config{}, err
 	}
 
-	srcAdapter, err := fsservices.NewSpectraFS(spectraFS, srcRoot.Id, "primary")
+	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.Id, "primary")
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create src adapter: %w", err)
 	}
 
-	dstAdapter, err := fsservices.NewSpectraFS(spectraFS, dstRoot.Id, "s1")
+	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.Id, "s1")
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
 	}
@@ -100,42 +101,42 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 	return cfg, nil
 }
 
-// LoadSpectraRoots fetches the Spectra root nodes and maps them to fsservices.Folder structures.
-func LoadSpectraRoots(spectraFS *sdk.SpectraFS) (fsservices.Folder, fsservices.Folder, error) {
+// LoadSpectraRoots fetches the Spectra root nodes and maps them to types.Folder structures.
+func LoadSpectraRoots(spectraFS *sdk.SpectraFS) (types.Folder, types.Folder, error) {
 	// Get root nodes from Spectra using request structs
 	srcRoot, err := spectraFS.GetNode(&sdk.GetNodeRequest{
 		ID: "root",
 	})
 	if err != nil {
-		return fsservices.Folder{}, fsservices.Folder{}, fmt.Errorf("failed to get src root from Spectra: %w", err)
+		return types.Folder{}, types.Folder{}, fmt.Errorf("failed to get src root from Spectra: %w", err)
 	}
 
 	dstRoot, err := spectraFS.GetNode(&sdk.GetNodeRequest{
 		ID: "root",
 	})
 	if err != nil {
-		return fsservices.Folder{}, fsservices.Folder{}, fmt.Errorf("failed to get dst root from Spectra: %w", err)
+		return types.Folder{}, types.Folder{}, fmt.Errorf("failed to get dst root from Spectra: %w", err)
 	}
 
 	// Create folder structs
-	srcFolder := fsservices.Folder{
+	srcFolder := types.Folder{
 		Id:           srcRoot.ID,
 		ParentId:     "",
 		DisplayName:  srcRoot.Name,
 		LocationPath: "/",
 		LastUpdated:  srcRoot.LastUpdated.Format(time.RFC3339),
 		ParentPath:   "",
-		Type:         fsservices.NodeTypeFolder,
+		Type:         types.NodeTypeFolder,
 	}
 
-	dstFolder := fsservices.Folder{
+	dstFolder := types.Folder{
 		Id:           dstRoot.ID,
 		ParentId:     "",
 		DisplayName:  dstRoot.Name,
 		LocationPath: "/",
 		LastUpdated:  dstRoot.LastUpdated.Format(time.RFC3339),
 		ParentPath:   "",
-		Type:         fsservices.NodeTypeFolder,
+		Type:         types.NodeTypeFolder,
 	}
 
 	return srcFolder, dstFolder, nil
@@ -150,12 +151,12 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 	fmt.Printf("  Destination: %s\n", dstPath)
 
 	// Create LocalFS adapters
-	srcAdapter, err := fsservices.NewLocalFS(srcPath)
+	srcAdapter, err := fs.NewLocalFS(srcPath)
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create src adapter: %w", err)
 	}
 
-	dstAdapter, err := fsservices.NewLocalFS(dstPath)
+	dstAdapter, err := fs.NewLocalFS(dstPath)
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
 	}
@@ -172,7 +173,7 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 	}
 
 	// Create root folder structures
-	srcRoot := fsservices.Folder{
+	srcRoot := types.Folder{
 		Id:           srcPath,
 		ParentId:     filepath.Dir(srcPath),
 		ParentPath:   "",
@@ -180,10 +181,10 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 		LocationPath: "/",
 		LastUpdated:  time.Now().Format(time.RFC3339),
 		DepthLevel:   0,
-		Type:         fsservices.NodeTypeFolder,
+		Type:         types.NodeTypeFolder,
 	}
 
-	dstRoot := fsservices.Folder{
+	dstRoot := types.Folder{
 		Id:           dstPath,
 		ParentId:     filepath.Dir(dstPath),
 		ParentPath:   "",
@@ -191,7 +192,7 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 		LocationPath: "/",
 		LastUpdated:  time.Now().Format(time.RFC3339),
 		DepthLevel:   0,
-		Type:         fsservices.NodeTypeFolder,
+		Type:         types.NodeTypeFolder,
 	}
 
 	cfg := migration.Config{

@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
+	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
 // Worker represents a concurrent task executor.
@@ -30,7 +30,7 @@ type TraversalWorker struct {
 	id          string
 	queue       *Queue
 	boltDB      *db.DB
-	fsAdapter   fsservices.FSAdapter
+	fsAdapter   types.FSAdapter
 	queueName   string          // "src" or "dst" for logging
 	isDst       bool            // true if this is a destination worker (performs comparison)
 	shutdownCtx context.Context // Context for shutdown signaling (optional)
@@ -42,7 +42,7 @@ func NewTraversalWorker(
 	id string,
 	queue *Queue,
 	boltInstance *db.DB,
-	adapter fsservices.FSAdapter,
+	adapter types.FSAdapter,
 	queueName string,
 	shutdownCtx context.Context,
 ) *TraversalWorker {
@@ -154,12 +154,12 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 	// Wrap result in a pager so we can process children in fixed-size pages.
 	// This mimics real cloud SDK pagination behavior and keeps per-page work bounded.
 	const pageSize = 100
-	pager := fsservices.NewListPager(result, pageSize)
+	pager := types.NewListPager(result, pageSize)
 
 	// Check if this is a dst task with expected children (comparison mode)
 	if w.isDst {
 		// Aggregate all pages into a single ListResult for comparison.
-		aggregated := fsservices.ListResult{}
+		aggregated := types.ListResult{}
 		for {
 			page, ok := pager.Next()
 			if !ok {
@@ -207,7 +207,7 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 
 // executeDstComparison performs comparison between expected (src) and actual (dst) children.
 // It populates task.DiscoveredChildren with comparison results.
-func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsservices.ListResult) error {
+func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult types.ListResult) error {
 	// Extract expected children from task (populated by queue)
 	expectedFolders := task.ExpectedFolders
 	expectedFiles := task.ExpectedFiles
@@ -215,26 +215,26 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult fsse
 	task.DiscoveredChildren = make([]ChildResult, 0)
 
 	// Build maps for quick lookup
-	actualFolderMap := make(map[string]fsservices.Folder)
+	actualFolderMap := make(map[string]types.Folder)
 	for _, f := range actualResult.Folders {
 		// Override adapter-provided depth with BFS depth based on current round.
 		f.DepthLevel = task.Round + 1
 		actualFolderMap[f.LocationPath] = f
 	}
 
-	actualFileMap := make(map[string]fsservices.File)
+	actualFileMap := make(map[string]types.File)
 	for _, f := range actualResult.Files {
 		// Override adapter-provided depth with BFS depth based on current round.
 		f.DepthLevel = task.Round + 1
 		actualFileMap[f.LocationPath] = f
 	}
 
-	expectedFolderMap := make(map[string]fsservices.Folder)
+	expectedFolderMap := make(map[string]types.Folder)
 	for _, f := range expectedFolders {
 		expectedFolderMap[f.LocationPath] = f
 	}
 
-	expectedFileMap := make(map[string]fsservices.File)
+	expectedFileMap := make(map[string]types.File)
 	for _, f := range expectedFiles {
 		expectedFileMap[f.LocationPath] = f
 	}

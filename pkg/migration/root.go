@@ -7,8 +7,8 @@ import (
 	"fmt"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
+	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
 // RootSeedSummary captures verification details after root task seeding.
@@ -19,7 +19,7 @@ type RootSeedSummary struct {
 
 // SeedRootTasks inserts the supplied source and destination root folders into BoltDB.
 // The folders should already contain root-relative metadata (LocationPath="/", DepthLevel=0).
-func SeedRootTasks(srcRoot fsservices.Folder, dstRoot fsservices.Folder, boltDB *db.DB) (RootSeedSummary, error) {
+func SeedRootTasks(srcRoot types.Folder, dstRoot types.Folder, boltDB *db.DB) (RootSeedSummary, error) {
 	if boltDB == nil {
 		return RootSeedSummary{}, fmt.Errorf("boltDB cannot be nil")
 	}

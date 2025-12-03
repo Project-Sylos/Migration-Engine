@@ -7,17 +7,17 @@ import (
 	"fmt"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
+	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
 // LoadRootFolders returns root folder rows (depth_level=0) with traversal_status='Pending' from BoltDB.
-func LoadRootFolders(boltDB *db.DB, queueType string) ([]fsservices.Folder, error) {
+func LoadRootFolders(boltDB *db.DB, queueType string) ([]types.Folder, error) {
 	if boltDB == nil {
 		return nil, fmt.Errorf("boltDB cannot be nil")
 	}
 
 	// Iterate all pending nodes at level 0
-	var folders []fsservices.Folder
+	var folders []types.Folder
 
 	err := boltDB.IterateStatusBucket(queueType, 0, db.StatusPending, db.IteratorOptions{}, func(pathHash []byte) error {
 		// Get the node state from nodes bucket
@@ -27,13 +27,13 @@ func LoadRootFolders(boltDB *db.DB, queueType string) ([]fsservices.Folder, erro
 		}
 
 		// Filter for folders only
-		if state.Type == fsservices.NodeTypeFolder {
-			folder := fsservices.Folder{
+		if state.Type == types.NodeTypeFolder {
+			folder := types.Folder{
 				Id:           state.ID,
 				ParentId:     state.ParentID,
-				ParentPath:   fsservices.NormalizeParentPath(state.ParentPath),
+				ParentPath:   types.NormalizeParentPath(state.ParentPath),
 				DisplayName:  state.Name,
-				LocationPath: fsservices.NormalizeLocationPath(state.Path),
+				LocationPath: types.NormalizeLocationPath(state.Path),
 				LastUpdated:  state.MTime,
 				DepthLevel:   state.Depth,
 				Type:         state.Type,
@@ -47,12 +47,12 @@ func LoadRootFolders(boltDB *db.DB, queueType string) ([]fsservices.Folder, erro
 }
 
 // LoadPendingFolders returns all folder rows with traversal_status='Pending' from BoltDB.
-func LoadPendingFolders(boltDB *db.DB, queueType string) ([]fsservices.Folder, error) {
+func LoadPendingFolders(boltDB *db.DB, queueType string) ([]types.Folder, error) {
 	if boltDB == nil {
 		return nil, fmt.Errorf("boltDB cannot be nil")
 	}
 
-	var folders []fsservices.Folder
+	var folders []types.Folder
 
 	// Get all levels
 	levels, err := boltDB.GetAllLevels(queueType)
@@ -70,13 +70,13 @@ func LoadPendingFolders(boltDB *db.DB, queueType string) ([]fsservices.Folder, e
 			}
 
 			// Filter for folders only
-			if state.Type == fsservices.NodeTypeFolder {
-				folder := fsservices.Folder{
+			if state.Type == types.NodeTypeFolder {
+				folder := types.Folder{
 					Id:           state.ID,
 					ParentId:     state.ParentID,
-					ParentPath:   fsservices.NormalizeParentPath(state.ParentPath),
+					ParentPath:   types.NormalizeParentPath(state.ParentPath),
 					DisplayName:  state.Name,
-					LocationPath: fsservices.NormalizeLocationPath(state.Path),
+					LocationPath: types.NormalizeLocationPath(state.Path),
 					LastUpdated:  state.MTime,
 					DepthLevel:   state.Depth,
 					Type:         state.Type,
@@ -96,12 +96,12 @@ func LoadPendingFolders(boltDB *db.DB, queueType string) ([]fsservices.Folder, e
 // LoadExpectedChildren returns the expected folders and files for a destination folder path based on src nodes in BoltDB.
 // Uses the children index for O(k) lookup where k = number of children.
 // dstLevel is the level of the DST task; SRC children will be at dstLevel+1.
-func LoadExpectedChildren(boltDB *db.DB, parentPath string, dstLevel int) ([]fsservices.Folder, []fsservices.File, error) {
+func LoadExpectedChildren(boltDB *db.DB, parentPath string, dstLevel int) ([]types.Folder, []types.File, error) {
 	if boltDB == nil {
 		return nil, nil, fmt.Errorf("boltDB cannot be nil")
 	}
 
-	normalizedParent := fsservices.NormalizeLocationPath(parentPath)
+	normalizedParent := types.NormalizeLocationPath(parentPath)
 
 	// Use the children index for efficient O(k) lookup
 	children, err := db.GetChildrenStates(boltDB, "SRC", normalizedParent)
@@ -109,29 +109,29 @@ func LoadExpectedChildren(boltDB *db.DB, parentPath string, dstLevel int) ([]fss
 		return nil, nil, fmt.Errorf("failed to fetch children from index: %w", err)
 	}
 
-	var folders []fsservices.Folder
-	var files []fsservices.File
+	var folders []types.Folder
+	var files []types.File
 
 	for _, state := range children {
 		switch state.Type {
-		case fsservices.NodeTypeFolder:
-			folders = append(folders, fsservices.Folder{
+		case types.NodeTypeFolder:
+			folders = append(folders, types.Folder{
 				Id:           state.ID,
 				ParentId:     state.ParentID,
-				ParentPath:   fsservices.NormalizeParentPath(state.ParentPath),
+				ParentPath:   types.NormalizeParentPath(state.ParentPath),
 				DisplayName:  state.Name,
-				LocationPath: fsservices.NormalizeLocationPath(state.Path),
+				LocationPath: types.NormalizeLocationPath(state.Path),
 				LastUpdated:  state.MTime,
 				DepthLevel:   state.Depth,
 				Type:         state.Type,
 			})
-		case fsservices.NodeTypeFile:
-			files = append(files, fsservices.File{
+		case types.NodeTypeFile:
+			files = append(files, types.File{
 				Id:           state.ID,
 				ParentId:     state.ParentID,
-				ParentPath:   fsservices.NormalizeParentPath(state.ParentPath),
+				ParentPath:   types.NormalizeParentPath(state.ParentPath),
 				DisplayName:  state.Name,
-				LocationPath: fsservices.NormalizeLocationPath(state.Path),
+				LocationPath: types.NormalizeLocationPath(state.Path),
 				LastUpdated:  state.MTime,
 				DepthLevel:   state.Depth,
 				Size:         state.Size,

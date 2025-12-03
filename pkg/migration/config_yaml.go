@@ -13,7 +13,8 @@ import (
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/configs"
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
+	"github.com/Project-Sylos/Sylos-FS/pkg/fs"
+	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 	"gopkg.in/yaml.v3"
 )
 
@@ -121,7 +122,7 @@ func LoadMigrationConfig(path string) (*MigrationConfigYAML, error) {
 // The adapterFactory parameter is used to create FSAdapter instances.
 // Example usage:
 //
-//	factory := func(serviceType string, serviceCfg ServiceConfigYAML, serviceConfigs map[string]any) (fsservices.FSAdapter, error) {
+//	factory := func(serviceType string, serviceCfg ServiceConfigYAML, serviceConfigs map[string]any) (types.FSAdapter, error) {
 //	    // Your adapter creation logic here
 //	}
 //	cfg, err := LoadMigrationConfigFromYAML("migration.yaml", factory)
@@ -173,7 +174,7 @@ func ConfigPathFromDatabasePath(dbDir string) string {
 
 // AdapterFactory is a function type that creates FSAdapter instances from service configuration.
 // This allows callers to provide their own adapter creation logic (e.g., for Spectra, LocalFS, etc.)
-type AdapterFactory func(serviceType string, serviceCfg ServiceConfigYAML, serviceConfigs map[string]any) (fsservices.FSAdapter, error)
+type AdapterFactory func(serviceType string, serviceCfg ServiceConfigYAML, serviceConfigs map[string]any) (types.FSAdapter, error)
 
 // ToMigrationConfig reconstructs a migration.Config from a MigrationConfigYAML.
 // The adapterFactory parameter is used to create FSAdapter instances from the service configuration.
@@ -204,7 +205,7 @@ func (yamlCfg *MigrationConfigYAML) ToMigrationConfig(adapterFactory AdapterFact
 
 	cfg := Config{
 		Database: DatabaseConfig{
-			Path:            yamlCfg.Database.Path,
+			Path:           yamlCfg.Database.Path,
 			RemoveExisting: yamlCfg.Database.RemoveExisting,
 			ConfigPath:     "", // Will be set by caller if needed
 		},
@@ -233,10 +234,10 @@ func (yamlCfg *MigrationConfigYAML) ToMigrationConfig(adapterFactory AdapterFact
 	return cfg, nil
 }
 
-// yamlFolderToFolder converts a RootFolderYAML to fsservices.Folder.
-func yamlFolderToFolder(yamlRoot *RootFolderYAML, rootID, rootPath string) fsservices.Folder {
+// yamlFolderToFolder converts a RootFolderYAML to types.Folder.
+func yamlFolderToFolder(yamlRoot *RootFolderYAML, rootID, rootPath string) types.Folder {
 	if yamlRoot != nil {
-		return fsservices.Folder{
+		return types.Folder{
 			Id:           yamlRoot.Id,
 			ParentId:     yamlRoot.ParentId,
 			ParentPath:   yamlRoot.ParentPath,
@@ -249,17 +250,17 @@ func yamlFolderToFolder(yamlRoot *RootFolderYAML, rootID, rootPath string) fsser
 	}
 
 	// Fallback to rootID and rootPath if yamlRoot is nil
-	return fsservices.Folder{
+	return types.Folder{
 		Id:           rootID,
 		LocationPath: rootPath,
-		Type:         fsservices.NodeTypeFolder,
+		Type:         types.NodeTypeFolder,
 		DepthLevel:   0,
 	}
 }
 
 // defaultAdapterFactory provides a basic adapter factory that supports common service types.
 // For Spectra and other complex services, callers should provide their own factory.
-func defaultAdapterFactory(serviceType string, serviceCfg ServiceConfigYAML, serviceConfigs map[string]any) (fsservices.FSAdapter, error) {
+func defaultAdapterFactory(serviceType string, serviceCfg ServiceConfigYAML, serviceConfigs map[string]any) (types.FSAdapter, error) {
 	switch strings.ToLower(serviceType) {
 	case "spectra":
 		// For Spectra, we need the Spectra SDK which may not be available in this package
@@ -314,7 +315,7 @@ func NewMigrationConfigYAML(cfg Config, status MigrationStatus) (*MigrationConfi
 			Level:   cfg.LogLevel,
 		},
 		Database: DatabaseConfigYAML{
-			Path:            cfg.Database.Path,
+			Path:           cfg.Database.Path,
 			RemoveExisting: cfg.Database.RemoveExisting,
 		},
 		Verification: cfg.Verification,
@@ -389,7 +390,7 @@ func SetSuspendedStatus(yamlCfg *MigrationConfigYAML, status MigrationStatus, sr
 }
 
 // UpdateConfigFromRoots updates the config YAML when roots are set.
-func UpdateConfigFromRoots(yamlCfg *MigrationConfigYAML, srcRoot, dstRoot fsservices.Folder) {
+func UpdateConfigFromRoots(yamlCfg *MigrationConfigYAML, srcRoot, dstRoot types.Folder) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	yamlCfg.Metadata.LastModified = now
 
@@ -404,19 +405,19 @@ func UpdateConfigFromRoots(yamlCfg *MigrationConfigYAML, srcRoot, dstRoot fsserv
 
 // Helper functions
 
-func detectServiceType(adapter fsservices.FSAdapter) string {
+func detectServiceType(adapter types.FSAdapter) string {
 	if adapter == nil {
 		return "unknown"
 	}
 
 	// Type assertion to detect Spectra
-	if _, ok := adapter.(*fsservices.SpectraFS); ok {
+	if _, ok := adapter.(*fs.SpectraFS); ok {
 		return "spectra"
 	}
 
 	// Type assertion to detect LocalFS (if it exists)
 	adapterType := reflect.TypeOf(adapter).String()
-	if adapterType == "*fsservices.LocalFS" {
+	if adapterType == "*fs.LocalFS" {
 		return "local"
 	}
 
@@ -424,14 +425,14 @@ func detectServiceType(adapter fsservices.FSAdapter) string {
 	return adapterType
 }
 
-func isSameService(srcAdapter, dstAdapter fsservices.FSAdapter) bool {
+func isSameService(srcAdapter, dstAdapter types.FSAdapter) bool {
 	if srcAdapter == nil || dstAdapter == nil {
 		return false
 	}
 
 	// Check if both are SpectraFS
-	_, srcOk := srcAdapter.(*fsservices.SpectraFS)
-	_, dstOk := dstAdapter.(*fsservices.SpectraFS)
+	_, srcOk := srcAdapter.(*fs.SpectraFS)
+	_, dstOk := dstAdapter.(*fs.SpectraFS)
 
 	if srcOk && dstOk {
 		// For Spectra, check if they share the same instance
@@ -447,7 +448,7 @@ func isSameService(srcAdapter, dstAdapter fsservices.FSAdapter) bool {
 	return false
 }
 
-func folderToYAML(folder fsservices.Folder) *RootFolderYAML {
+func folderToYAML(folder types.Folder) *RootFolderYAML {
 	return &RootFolderYAML{
 		Id:           folder.Id,
 		ParentId:     folder.ParentId,
@@ -498,11 +499,11 @@ func embedServiceConfigs(yamlCfg *MigrationConfigYAML, cfg Config) error {
 	return nil
 }
 
-func isSpectraAdapter(adapter fsservices.FSAdapter) bool {
+func isSpectraAdapter(adapter types.FSAdapter) bool {
 	if adapter == nil {
 		return false
 	}
-	_, ok := adapter.(*fsservices.SpectraFS)
+	_, ok := adapter.(*fs.SpectraFS)
 	return ok
 }
 

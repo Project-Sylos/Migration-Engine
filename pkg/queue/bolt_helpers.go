@@ -5,7 +5,7 @@ package queue
 
 import (
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
+	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
 // taskToNodeState converts a TaskBase to a NodeState for BoltDB storage.
@@ -19,9 +19,9 @@ func taskToNodeState(task *TaskBase) *db.NodeState {
 		id = folder.Id
 		parentID = folder.ParentId
 		name = folder.DisplayName
-		path = fsservices.NormalizeLocationPath(folder.LocationPath)
-		parentPath = fsservices.NormalizeParentPath(folder.ParentPath)
-		nodeType = fsservices.NodeTypeFolder
+		path = types.NormalizeLocationPath(folder.LocationPath)
+		parentPath = types.NormalizeParentPath(folder.ParentPath)
+		nodeType = types.NodeTypeFolder
 		size = 0
 		mtime = folder.LastUpdated
 	} else if task.IsFile() {
@@ -29,9 +29,9 @@ func taskToNodeState(task *TaskBase) *db.NodeState {
 		id = file.Id
 		parentID = file.ParentId
 		name = file.DisplayName
-		path = fsservices.NormalizeLocationPath(file.LocationPath)
-		parentPath = fsservices.NormalizeParentPath(file.ParentPath)
-		nodeType = fsservices.NodeTypeFile
+		path = types.NormalizeLocationPath(file.LocationPath)
+		parentPath = types.NormalizeParentPath(file.ParentPath)
+		nodeType = types.NodeTypeFile
 		size = file.Size
 		mtime = file.LastUpdated
 	} else {
@@ -63,8 +63,8 @@ func nodeStateToTask(state *db.NodeState, taskType string) *TaskBase {
 	}
 
 	switch state.Type {
-	case fsservices.NodeTypeFolder:
-		task.Folder = fsservices.Folder{
+	case types.NodeTypeFolder:
+		task.Folder = types.Folder{
 			Id:           state.ID,
 			ParentId:     state.ParentID,
 			ParentPath:   state.ParentPath,
@@ -74,8 +74,8 @@ func nodeStateToTask(state *db.NodeState, taskType string) *TaskBase {
 			DepthLevel:   state.Depth,
 			Type:         state.Type,
 		}
-	case fsservices.NodeTypeFile:
-		task.File = fsservices.File{
+	case types.NodeTypeFile:
+		task.File = types.File{
 			Id:           state.ID,
 			ParentId:     state.ParentID,
 			ParentPath:   state.ParentPath,

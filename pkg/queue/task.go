@@ -3,7 +3,7 @@
 
 package queue
 
-import "github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
+import "github.com/Project-Sylos/Sylos-FS/pkg/types"
 
 // Task types
 const (
@@ -17,24 +17,24 @@ const (
 // Workers lease tasks, mark them Locked, and attempt execution.
 // Tasks are identified by absolute paths (Id) but reconciled by root-relative paths (LocationPath).
 type TaskBase struct {
-	Type               string              // Task type: "src-traversal", "dst-traversal", "upload", etc.
-	Folder             fsservices.Folder   // Folder to process (if applicable)
-	File               fsservices.File     // File to process (if applicable)
-	Locked             bool                // Whether this task is currently leased by a worker
-	Attempts           int                 // Number of execution attempts
-	Status             string              // Execution result: "successful", "failed"
-	ExpectedFolders    []fsservices.Folder // Expected folders (dst tasks only)
-	ExpectedFiles      []fsservices.File   // Expected files (dst tasks only)
-	DiscoveredChildren []ChildResult       // Children discovered during execution
-	Round              int                 // The round this task belongs to (for buffer coordination)
+	Type               string         // Task type: "src-traversal", "dst-traversal", "upload", etc.
+	Folder             types.Folder   // Folder to process (if applicable)
+	File               types.File     // File to process (if applicable)
+	Locked             bool           // Whether this task is currently leased by a worker
+	Attempts           int            // Number of execution attempts
+	Status             string         // Execution result: "successful", "failed"
+	ExpectedFolders    []types.Folder // Expected folders (dst tasks only)
+	ExpectedFiles      []types.File   // Expected files (dst tasks only)
+	DiscoveredChildren []ChildResult  // Children discovered during execution
+	Round              int            // The round this task belongs to (for buffer coordination)
 }
 
 // ChildResult represents a discovered child node with its traversal status.
 type ChildResult struct {
-	Folder fsservices.Folder // Folder info (if folder)
-	File   fsservices.File   // File info (if file)
-	Status string            // "pending", "successful", "missing", "not_on_src"
-	IsFile bool              // true if this is a file, false if folder
+	Folder types.Folder // Folder info (if folder)
+	File   types.File   // File info (if file)
+	Status string       // "pending", "successful", "missing", "not_on_src"
+	IsFile bool         // true if this is a file, false if folder
 }
 
 // Identifier returns the unique identifier for this task (absolute path).
@@ -68,7 +68,7 @@ type UploadTask struct {
 	TaskBase
 	SrcId  string // Source file identifier
 	DstId  string // Destination parent folder identifier
-	DstCtx fsservices.ServiceContext
+	DstCtx types.ServiceContext
 }
 
 // CopyTask represents a generic copy operation.
@@ -76,7 +76,7 @@ type CopyTask struct {
 	TaskBase
 	SrcId  string
 	DstId  string
-	DstCtx fsservices.ServiceContext
+	DstCtx types.ServiceContext
 }
 
 // TaskResult represents the outcome of a task execution.
