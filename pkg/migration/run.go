@@ -10,19 +10,20 @@ import (
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
+	"github.com/Project-Sylos/Sylos-FS/pkg/fs"
+	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
 // MigrationConfig is the configuration passed to RunMigration.
 type MigrationConfig struct {
 	BoltDB          *db.DB
 	BoltPath        string
-	SrcAdapter      fsservices.FSAdapter
-	DstAdapter      fsservices.FSAdapter
-	SrcRoot         fsservices.Folder
-	DstRoot         fsservices.Folder
+	SrcAdapter      types.FSAdapter
+	DstAdapter      types.FSAdapter
+	SrcRoot         types.Folder
+	DstRoot         types.Folder
 	SrcServiceName  string
 	WorkerCount     int
 	MaxRetries      int
@@ -552,10 +553,10 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 
 // closeSpectraAdapters closes Spectra adapters if they are SpectraFS instances.
 // Handles shared SDK instances by only closing once.
-func closeSpectraAdapters(srcAdapter, dstAdapter fsservices.FSAdapter, ctx context.Context) {
+func closeSpectraAdapters(srcAdapter, dstAdapter types.FSAdapter, ctx context.Context) {
 	// Check if adapters are Spectra instances
-	srcSpectra, srcIsSpectra := srcAdapter.(*fsservices.SpectraFS)
-	dstSpectra, dstIsSpectra := dstAdapter.(*fsservices.SpectraFS)
+	srcSpectra, srcIsSpectra := srcAdapter.(*fs.SpectraFS)
+	dstSpectra, dstIsSpectra := dstAdapter.(*fs.SpectraFS)
 
 	if srcIsSpectra && dstIsSpectra {
 		// Both are Spectra - check if they share the same SDK instance

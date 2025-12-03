@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
+	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
 // QueueState represents the lifecycle state of a queue.
@@ -84,7 +84,7 @@ func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCo
 // Creates and starts workers immediately - they'll poll for tasks autonomously.
 // For dst queues, srcQueue should be provided for BoltDB expected children lookups.
 // shutdownCtx is optional - if provided, workers will check for cancellation and exit on shutdown.
-func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter fsservices.FSAdapter, srcQueue *Queue, shutdownCtx context.Context) {
+func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter types.FSAdapter, srcQueue *Queue, shutdownCtx context.Context) {
 	q.mu.Lock()
 	q.boltDB = boltInstance
 	q.srcQueue = srcQueue
@@ -123,7 +123,7 @@ func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter fsservices.FS
 }
 
 // Initialize is a convenience wrapper that calls InitializeWithContext with nil shutdown context.
-func (q *Queue) Initialize(boltInstance *db.DB, adapter fsservices.FSAdapter, srcQueue *Queue) {
+func (q *Queue) Initialize(boltInstance *db.DB, adapter types.FSAdapter, srcQueue *Queue) {
 	q.InitializeWithContext(boltInstance, adapter, srcQueue, nil)
 }
 
@@ -481,7 +481,7 @@ func (q *Queue) completeTask(task *TaskBase) {
 	// This early check helps catch completion as soon as possible
 
 	// Prepare child nodes for insertion
-	parentPath := fsservices.NormalizeLocationPath(task.LocationPath())
+	parentPath := types.NormalizeLocationPath(task.LocationPath())
 	var childNodesToInsert []db.InsertOperation
 
 	// Log folder discovery with details
@@ -558,7 +558,7 @@ func (q *Queue) completeTask(task *TaskBase) {
 
 	// 3. Handle DST queue special case: create tasks with ExpectedFolders/ExpectedFiles
 	if q.name == "dst" && q.srcQueue != nil {
-		var childFolders []fsservices.Folder
+		var childFolders []types.Folder
 		totalFolders := 0
 		pendingFolders := 0
 		for _, child := range task.DiscoveredChildren {
@@ -630,8 +630,8 @@ func childResultToNodeState(child ChildResult, parentPath string, depth int) *db
 			ParentID:   file.ParentId,
 			ParentPath: parentPath,
 			Name:       file.DisplayName,
-			Path:       fsservices.NormalizeLocationPath(file.LocationPath),
-			Type:       fsservices.NodeTypeFile,
+			Path:       types.NormalizeLocationPath(file.LocationPath),
+			Type:       types.NodeTypeFile,
 			Size:       file.Size,
 			MTime:      file.LastUpdated,
 			Depth:      depth,
@@ -646,8 +646,8 @@ func childResultToNodeState(child ChildResult, parentPath string, depth int) *db
 		ParentID:   folder.ParentId,
 		ParentPath: parentPath,
 		Name:       folder.DisplayName,
-		Path:       fsservices.NormalizeLocationPath(folder.LocationPath),
-		Type:       fsservices.NodeTypeFolder,
+		Path:       types.NormalizeLocationPath(folder.LocationPath),
+		Type:       types.NodeTypeFolder,
 		Size:       0,
 		MTime:      folder.LastUpdated,
 		Depth:      depth,

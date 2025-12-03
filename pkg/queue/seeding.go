@@ -7,15 +7,15 @@ import (
 	"fmt"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
+	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
 // SeedRootTask inserts the initial root folder task into BoltDB to kickstart traversal.
 // For src: sets traversal_status='Pending' and copy_status='Pending'
 // For dst: sets traversal_status='Pending'
 // Ensures stats bucket exists and is updated with root task counts.
-func SeedRootTask(queueType string, rootFolder fsservices.Folder, boltDB *db.DB) error {
+func SeedRootTask(queueType string, rootFolder types.Folder, boltDB *db.DB) error {
 	if boltDB == nil {
 		return fmt.Errorf("boltDB cannot be nil")
 	}
@@ -32,7 +32,7 @@ func SeedRootTask(queueType string, rootFolder fsservices.Folder, boltDB *db.DB)
 		ParentID:   rootFolder.ParentId,
 		ParentPath: "", // Root has no parent
 		Name:       rootFolder.DisplayName,
-		Path:       fsservices.NormalizeLocationPath(rootFolder.LocationPath),
+		Path:       types.NormalizeLocationPath(rootFolder.LocationPath),
 		Type:       rootFolder.Type,
 		Size:       0, // Folders have no size
 		MTime:      rootFolder.LastUpdated,
@@ -73,7 +73,7 @@ func SeedRootTask(queueType string, rootFolder fsservices.Folder, boltDB *db.DB)
 
 // SeedRootTasks is a convenience function to seed both src and dst root tasks at once.
 // Writes root tasks to BoltDB.
-func SeedRootTasks(srcRoot fsservices.Folder, dstRoot fsservices.Folder, boltDB *db.DB) error {
+func SeedRootTasks(srcRoot types.Folder, dstRoot types.Folder, boltDB *db.DB) error {
 	if err := SeedRootTask("SRC", srcRoot, boltDB); err != nil {
 		return fmt.Errorf("failed to seed src root: %w", err)
 	}

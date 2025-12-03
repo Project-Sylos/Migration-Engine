@@ -11,15 +11,15 @@ import (
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
+	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
 // Service defines a single filesystem service participating in a migration.
 type Service struct {
 	Name    string
-	Adapter fsservices.FSAdapter
-	Root    fsservices.Folder
+	Adapter types.FSAdapter
+	Root    types.Folder
 }
 
 // Config aggregates all of the knobs required to run the migration engine once.
@@ -97,7 +97,7 @@ func (mc *MigrationController) Wait() (Result, error) {
 
 // SetRootFolders assigns the source and destination root folders that will seed the migration queues.
 // It normalizes required defaults (location path, type, display name) and validates identifiers.
-func (c *Config) SetRootFolders(src, dst fsservices.Folder) error {
+func (c *Config) SetRootFolders(src, dst types.Folder) error {
 	normalizedSrc, err := normalizeRootFolder(src)
 	if err != nil {
 		return fmt.Errorf("source root: %w", err)
@@ -520,9 +520,9 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	return result, nil
 }
 
-func normalizeRootFolder(folder fsservices.Folder) (fsservices.Folder, error) {
+func normalizeRootFolder(folder types.Folder) (types.Folder, error) {
 	if folder.Id == "" {
-		return fsservices.Folder{}, fmt.Errorf("folder ID cannot be empty")
+		return types.Folder{}, fmt.Errorf("folder ID cannot be empty")
 	}
 
 	if folder.DisplayName == "" {
@@ -532,7 +532,7 @@ func normalizeRootFolder(folder fsservices.Folder) (fsservices.Folder, error) {
 		folder.LocationPath = "/"
 	}
 	if folder.Type == "" {
-		folder.Type = fsservices.NodeTypeFolder
+		folder.Type = types.NodeTypeFolder
 	}
 
 	return folder, nil
@@ -541,7 +541,7 @@ func normalizeRootFolder(folder fsservices.Folder) (fsservices.Folder, error) {
 // validateRootNodesExist checks if the root nodes still exist in the filesystem adapters.
 // This is critical for resumption - if nodes don't exist (e.g., Spectra DB was reset),
 // resuming would cause "node not found" errors because the migration DB has stale node IDs.
-func validateRootNodesExist(srcAdapter, dstAdapter fsservices.FSAdapter, srcRoot, dstRoot fsservices.Folder) error {
+func validateRootNodesExist(srcAdapter, dstAdapter types.FSAdapter, srcRoot, dstRoot types.Folder) error {
 	// Try to list children of the source root - if it doesn't exist, this will fail
 	_, err := srcAdapter.ListChildren(srcRoot.Id)
 	if err != nil {
