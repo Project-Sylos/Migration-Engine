@@ -12,7 +12,7 @@ The queue layer drives source/destination traversal using BoltDB as the operatio
    - Copy-status updates when dst determines src is newer.
    - Child inserts for the next BFS level.
 3. **Atomic writes** ensure all BoltDB operations are immediately visible. Tasks are pulled in batches from status buckets, and all writes are atomic within transactions.
-4. **Coordinator gating** enforces the lead window. Both queues call `WaitForCoordinatorGate` when bootstrapping and whenever `advanceToNextRound` runs, ensuring dst only proceeds when src is sufficiently ahead (or already done).
+4. **Coordinator gating** enforces the lead window. DST queues check the coordinator gate at the start of each round iteration in the `Run()` loop, ensuring dst only proceeds when src is sufficiently ahead (or already done). Gating happens when STARTING a round, not when advancing.
 
 The result is predictable, race-free traversal with BoltDB serving as the single source of truth.
 
@@ -102,14 +102,20 @@ All writes are:
 ## Worker Workflow
 
 ```go
-task := w.queue.Lease()        // reads from status buckets
-err := w.execute(task)         // list children / compare timestamps
+task := w.queue.Lease()                    // reads from status buckets
+err := w.execute(task)                     // list children / compare timestamps
 if err != nil {
-    w.queue.Fail(task)         // requeue or drop based on retry budget
+    w.queue.ReportTaskResult(task, Failed)  // requeue or drop based on retry budget
 } else {
-    w.queue.Complete(task)     // atomic writes: inserts + status updates
+    w.queue.ReportTaskResult(task, Successful)  // atomic writes: inserts + status updates
 }
 ```
+
+**Task Lifecycle:**
+- Tasks are pulled from BoltDB and added to `pendingBuff`
+- When leased, tasks move from `pendingBuff` to `inProgress`
+- On completion/failure, tasks are removed from `inProgress` and results are written to BoltDB
+- `ReportTaskResult()` handles both success and failure cases, and triggers task pulling when the buffer is low
 
 Destination workers compute comparison results and store them in the NodeState metadata (TraversalStatus field).
 
@@ -151,9 +157,23 @@ Queues call `WaitForCoordinatorGate(reason)` right after seeding and whenever th
 
 ## Retry & State
 
-* `queue.Fail` writes directly to BoltDB so failed tasks return to pending status immediately (or are marked failed after max retries).
-* `QueueState` (`Running`, `Paused`, `Completed`) retains its prior meaning. Workers observe these states before leasing.
+* `ReportTaskResult()` handles both successful and failed task completion, writing directly to BoltDB. Failed tasks return to pending status immediately (or are marked failed after max retries).
+* `QueueState` (`Running`, `Paused`, `Completed`, `Waiting`) controls queue behavior. Workers observe these states before leasing.
 * Stats (`queue.Stats`) use in-memory counters (pending buffer, in-progress map) for fast reads without database queries.
+
+## Completion Checking
+
+Completion checks are performed by the `Run()` polling loop, not event-driven from task completion. This avoids race conditions where multiple workers complete tasks simultaneously.
+
+**Centralized Logic:**
+- `checkCompletion()` is a unified method that handles both round completion and DST queue completion
+- Uses `CompletionCheckOptions` to configure behavior (flush buffer, advance round, mark DST complete, etc.)
+- All completion checks force-flush the output buffer before querying the database to ensure writes are persisted
+
+**DST Completion:**
+- DST queues check for completion at multiple points: before pulling tasks (for rounds > 0), after getting coordinator gate approval, and periodically in the polling loop
+- Round 0 is skipped for DST completion checks (bootstrap round)
+- Uses `RequireFirstPull` flag to prevent false positives on the first pull attempt
 
 ---
 
@@ -198,13 +218,25 @@ This ensures readers never see inconsistent state (e.g., parent updated but chil
 
 ## Round Advancement
 
-When a round completes (no pending tasks, no in-progress tasks):
+Round advancement is controlled by the `Run()` polling loop, which checks for completion every 100ms. This polling-based approach avoids race conditions that can occur with event-driven completion checks.
 
-1. Check if next round has tasks: `count, _ := db.CountStatusBucket(queueType, nextRound, db.StatusPending)`
-2. If no tasks, mark queue as completed
-3. Otherwise, advance to next round
-4. Wait for coordinator gate before pulling new tasks
-5. Pull tasks from new round's pending bucket
+**Completion Detection:**
+- The `Run()` loop periodically checks if a round is complete using the condition: `inProgress == 0 && pendingBuff == 0 && lastPullWasPartial == true`
+- `lastPullWasPartial` is set when a pull operation returns fewer tasks than requested (`len(batch) < defaultLeaseBatchSize`), indicating the round may be exhausted
+- When these conditions are met, the loop calls `checkCompletion()` which:
+  1. Force-flushes the output buffer to ensure all writes are persisted
+  2. Verifies the round is truly complete (no in-progress, no pending, last pull was partial)
+  3. Advances to the next round if complete
+  4. Pulls tasks from the new round's pending bucket
+
+**Buffer Flushing:**
+- Before any completion check queries the database, the output buffer is force-flushed to ensure all pending writes (status updates, child inserts) are persisted
+- This prevents false positives where tasks exist in the buffer but haven't been written to the database yet
+
+**Coordinator Gating:**
+- DST queues check the coordinator gate at the start of each round iteration (before pulling tasks)
+- SRC queues advance freely without gating
+- Gating only happens when STARTING a round, not when advancing
 
 ---
 

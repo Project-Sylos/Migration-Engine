@@ -50,7 +50,7 @@ type Service struct {
 
 ### LetsMigrate
 
-The main entry point for executing a migration:
+The main entry point for executing a migration (synchronous):
 
 ```go
 result, err := migration.LetsMigrate(cfg)
@@ -63,6 +63,33 @@ This function:
 4. Executes traversal
 5. Runs verification
 6. Returns results
+
+**Note:** This function blocks until the migration completes or is shutdown. It automatically handles SIGINT/SIGTERM signals for graceful shutdown.
+
+### StartMigration
+
+For programmatic control over a running migration:
+
+```go
+controller := migration.StartMigration(cfg)
+
+// Later, trigger shutdown programmatically:
+controller.Shutdown()
+
+// Wait for completion:
+result, err := controller.Wait()
+```
+
+**MigrationController** provides:
+- `Shutdown()` - Triggers force shutdown, checkpoints DB, saves YAML with "suspended" status
+- `Wait()` - Blocks until migration completes, returns result and error
+- `Result()` - Returns the migration result (nil if not complete)
+- `Error()` - Returns any error that occurred
+
+**Use Cases:**
+- Programmatic shutdown control
+- Integration with external orchestration systems
+- Testing scenarios requiring controlled shutdown
 
 ---
 

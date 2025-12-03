@@ -221,6 +221,80 @@ func (db *DB) IsTemporary() bool {
 		strings.Contains(filepath.Base(filepath.Dir(db.dbPath)), "sylos-bolt-")
 }
 
+// ValidateCoreSchema validates that all buckets have the correct structure.
+// This checks bucket hierarchy and required sub-buckets but does not validate
+// the contents of buckets (e.g., individual entries) as that would be too expensive.
+// Returns an error if any structural issues are found.
+func (db *DB) ValidateCoreSchema() error {
+	return db.View(func(tx *bolt.Tx) error {
+		// Validate top-level buckets
+		requiredTopLevel := []string{BucketSrc, BucketDst, BucketLogs, StatsBucketName}
+		for _, name := range requiredTopLevel {
+			if tx.Bucket([]byte(name)) == nil {
+				return fmt.Errorf("missing top-level bucket: %s", name)
+			}
+		}
+
+		// Validate SRC and DST structure
+		for _, queueType := range []string{BucketSrc, BucketDst} {
+			topBucket := tx.Bucket([]byte(queueType))
+			if topBucket == nil {
+				return fmt.Errorf("missing top-level bucket: %s", queueType)
+			}
+
+			// Validate required sub-buckets: nodes, children, levels
+			requiredSubBuckets := []string{SubBucketNodes, SubBucketChildren, SubBucketLevels}
+			for _, subName := range requiredSubBuckets {
+				if topBucket.Bucket([]byte(subName)) == nil {
+					return fmt.Errorf("missing %s/%s bucket", queueType, subName)
+				}
+			}
+
+			// Validate all level buckets have correct status sub-buckets
+			levelsBucket := topBucket.Bucket([]byte(SubBucketLevels))
+			if levelsBucket == nil {
+				return fmt.Errorf("missing %s/%s bucket", queueType, SubBucketLevels)
+			}
+
+			// Iterate through all level buckets
+			cursor := levelsBucket.Cursor()
+			for levelKey, _ := cursor.First(); levelKey != nil; levelKey, _ = cursor.Next() {
+				levelBucket := levelsBucket.Bucket(levelKey)
+				if levelBucket == nil {
+					// Skip non-bucket entries (shouldn't happen, but be defensive)
+					continue
+				}
+
+				// Required status buckets for all queues
+				requiredStatuses := []string{StatusPending, StatusSuccessful, StatusFailed}
+				if queueType == BucketDst {
+					// DST also needs not_on_src
+					requiredStatuses = append(requiredStatuses, StatusNotOnSrc)
+				}
+
+				// Validate each status bucket exists
+				for _, status := range requiredStatuses {
+					if levelBucket.Bucket([]byte(status)) == nil {
+						return fmt.Errorf("missing status bucket %s/%s/%s/%s", queueType, SubBucketLevels, string(levelKey), status)
+					}
+				}
+			}
+		}
+
+		// Validate LOGS bucket structure
+		logsBucket := tx.Bucket([]byte(BucketLogs))
+		if logsBucket == nil {
+			return fmt.Errorf("missing top-level bucket: %s", BucketLogs)
+		}
+
+		// Note: Log level buckets (trace, debug, info, warning, error, critical) are created
+		// on demand when log entries are written, so we don't validate their existence here.
+		// This allows for empty log databases and is consistent with the on-demand creation pattern.
+
+		return nil
+	})
+}
+
 // getBucket navigates to a nested bucket given a path.
 // Returns nil if any bucket in the path doesn't exist.
 func getBucket(tx *bolt.Tx, bucketPath []string) *bolt.Bucket {

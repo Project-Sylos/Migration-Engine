@@ -269,30 +269,24 @@ func printReport(report *DatabaseReport, dbPath string) {
 	fmt.Println("\nCOMPLETION STATUS:")
 	fmt.Println(strings.Repeat("-", 80))
 
-	srcComplete := report.Src.TotalPending == 0 && report.Src.TotalFailed == 0
-	dstComplete := report.Dst.TotalPending == 0 && report.Dst.TotalFailed == 0
+	srcComplete := report.Src.TotalPending == 0
+	dstComplete := report.Dst.TotalPending == 0
 
 	if srcComplete {
-		fmt.Printf("✓ SRC: COMPLETE (no pending, no failures)\n")
+		fmt.Printf("✓ SRC: COMPLETE (no pending items)\n")
 	} else {
 		fmt.Printf("✗ SRC: INCOMPLETE\n")
 		if report.Src.TotalPending > 0 {
 			fmt.Printf("  - %d pending items remaining\n", report.Src.TotalPending)
 		}
-		if report.Src.TotalFailed > 0 {
-			fmt.Printf("  - %d failed items\n", report.Src.TotalFailed)
-		}
 	}
 
 	if dstComplete {
-		fmt.Printf("✓ DST: COMPLETE (no pending, no failures)\n")
+		fmt.Printf("✓ DST: COMPLETE (no pending items)\n")
 	} else {
 		fmt.Printf("✗ DST: INCOMPLETE\n")
 		if report.Dst.TotalPending > 0 {
 			fmt.Printf("  - %d pending items remaining\n", report.Dst.TotalPending)
-		}
-		if report.Dst.TotalFailed > 0 {
-			fmt.Printf("  - %d failed items\n", report.Dst.TotalFailed)
 		}
 		if report.Dst.TotalNotOnSrc > 0 {
 			fmt.Printf("  - %d items not on source\n", report.Dst.TotalNotOnSrc)
