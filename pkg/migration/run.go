@@ -140,6 +140,15 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	// Give queues a moment to start their Run() goroutines
 	time.Sleep(100 * time.Millisecond)
 
+	// Create observer for BoltDB stats publishing (200ms update interval)
+	observer := queue.NewQueueObserver(boltDB, 200*time.Millisecond)
+	observer.Start()      // Start observer loop immediately
+	defer observer.Stop() // Ensure observer is stopped on exit
+
+	// Register queues with observer (observer will poll queues directly)
+	srcQueue.SetObserver(observer)
+	dstQueue.SetObserver(observer)
+
 	// Set up stats channels for UDP logging (after queues are running)
 	srcStatsChan := make(chan queue.QueueStats, 10)
 	dstStatsChan := make(chan queue.QueueStats, 10)

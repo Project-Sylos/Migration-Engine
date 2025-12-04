@@ -146,11 +146,20 @@ func getBucketCount(tx *bolt.Tx, bucketPath []string) (int64, error) {
 	return count, nil
 }
 
-// initializeStatsBucket creates the stats bucket if it doesn't exist.
+// initializeStatsBucket creates the stats bucket and queue-stats sub-bucket if they don't exist.
 // Called during database initialization.
 func initializeStatsBucket(tx *bolt.Tx) error {
-	_, err := getStatsBucket(tx)
-	return err
+	statsBucket, err := getStatsBucket(tx)
+	if err != nil {
+		return err
+	}
+
+	// Create queue-stats sub-bucket for queue statistics
+	if _, err := statsBucket.CreateBucketIfNotExists([]byte("queue-stats")); err != nil {
+		return fmt.Errorf("failed to create queue-stats bucket: %w", err)
+	}
+
+	return nil
 }
 
 // EnsureStatsBucket ensures the stats bucket exists.
@@ -158,6 +167,11 @@ func initializeStatsBucket(tx *bolt.Tx) error {
 func (db *DB) EnsureStatsBucket() error {
 	return db.Update(func(tx *bolt.Tx) error {
 		_, err := getStatsBucket(tx)
+		if err != nil {
+			return err
+		}
+		// Also ensure queue-stats bucket exists
+		_, err = GetOrCreateQueueStatsBucket(tx)
 		return err
 	})
 }
@@ -306,4 +320,46 @@ func (db *DB) SyncCounts() error {
 
 		return nil
 	})
+}
+
+// GetQueueStats retrieves queue statistics from the queue-stats bucket.
+// Returns the JSON-encoded stats for the specified queue key (e.g., "src-traversal", "dst-traversal").
+// Returns nil if the stats don't exist.
+func (db *DB) GetQueueStats(queueKey string) ([]byte, error) {
+	var stats []byte
+	err := db.View(func(tx *bolt.Tx) error {
+		queueStatsBucket := GetQueueStatsBucket(tx)
+		if queueStatsBucket == nil {
+			return nil // Bucket doesn't exist, return nil stats
+		}
+
+		value := queueStatsBucket.Get([]byte(queueKey))
+		if value != nil {
+			stats = make([]byte, len(value))
+			copy(stats, value)
+		}
+		return nil
+	})
+	return stats, err
+}
+
+// GetAllQueueStats retrieves all queue statistics from the queue-stats bucket.
+// Returns a map of queue key -> JSON-encoded stats.
+func (db *DB) GetAllQueueStats() (map[string][]byte, error) {
+	allStats := make(map[string][]byte)
+	err := db.View(func(tx *bolt.Tx) error {
+		queueStatsBucket := GetQueueStatsBucket(tx)
+		if queueStatsBucket == nil {
+			return nil // Bucket doesn't exist, return empty map
+		}
+
+		cursor := queueStatsBucket.Cursor()
+		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+			stats := make([]byte, len(value))
+			copy(stats, value)
+			allStats[string(key)] = stats
+		}
+		return nil
+	})
+	return allStats, err
 }
