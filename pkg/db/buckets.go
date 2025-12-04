@@ -93,6 +93,12 @@ func GetLogsBucketPath() []string {
 	return []string{BucketLogs}
 }
 
+// GetQueueStatsBucketPath returns the bucket path for queue statistics.
+// Returns: ["STATS", "queue-stats"]
+func GetQueueStatsBucketPath() []string {
+	return []string{StatsBucketName, "queue-stats"}
+}
+
 // EnsureLevelBucket creates a level bucket and its status sub-buckets if they don't exist.
 func EnsureLevelBucket(tx *bolt.Tx, queueType string, level int) error {
 	// Navigate to the levels bucket
@@ -155,4 +161,14 @@ func GetOrCreateStatusBucket(tx *bolt.Tx, queueType string, level int, status st
 // GetLogsBucket returns the logs bucket.
 func GetLogsBucket(tx *bolt.Tx) *bolt.Bucket {
 	return tx.Bucket([]byte(BucketLogs))
+}
+
+// GetQueueStatsBucket returns the queue-stats bucket.
+func GetQueueStatsBucket(tx *bolt.Tx) *bolt.Bucket {
+	return getBucket(tx, GetQueueStatsBucketPath())
+}
+
+// GetOrCreateQueueStatsBucket returns or creates the queue-stats bucket.
+func GetOrCreateQueueStatsBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
+	return getOrCreateBucket(tx, GetQueueStatsBucketPath())
 }

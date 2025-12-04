@@ -59,24 +59,32 @@ type Queue struct {
 	// Stats publishing for UDP logging
 	statsChan chan QueueStats // Channel for publishing stats (optional, set via SetStatsChannel)
 	statsTick *time.Ticker    // Ticker for periodic stats publishing (optional)
+	// Task execution time tracking
+	executionTimeDeltas []time.Duration // Buffer of task execution times (lease to complete/fail)
+	avgExecutionTime    time.Duration   // Average execution time (calculated periodically)
+	lastAvgTime         time.Time       // Last time average was calculated
+	avgInterval         time.Duration   // Interval for calculating averages
 }
 
 // NewQueue creates a new Queue instance.
 func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCoordinator) *Queue {
 	return &Queue{
-		name:              name,
-		state:             QueueStateRunning,
-		inProgress:        make(map[string]*TaskBase),
-		pendingBuff:       make([]*TaskBase, 0, defaultLeaseBatchSize),
-		pendingSet:        make(map[string]struct{}),
-		leasedKeys:        make(map[string]struct{}),
-		pullLowWM:         defaultLeaseLowWatermark,
-		maxRetries:        maxRetries,
-		round:             0,
-		workers:           make([]Worker, 0, workerCount),
-		roundStats:        make(map[int]*RoundStats),
-		coordinator:       coordinator,
-		firstPullForRound: true, // Start with true so first pull checks gate
+		name:                name,
+		state:               QueueStateRunning,
+		inProgress:          make(map[string]*TaskBase),
+		pendingBuff:         make([]*TaskBase, 0, defaultLeaseBatchSize),
+		pendingSet:          make(map[string]struct{}),
+		leasedKeys:          make(map[string]struct{}),
+		pullLowWM:           defaultLeaseLowWatermark,
+		maxRetries:          maxRetries,
+		round:               0,
+		workers:             make([]Worker, 0, workerCount),
+		roundStats:          make(map[int]*RoundStats),
+		coordinator:         coordinator,
+		firstPullForRound:   true,                          // Start with true so first pull checks gate
+		executionTimeDeltas: make([]time.Duration, 0, 100), // Buffer capacity 100
+		avgInterval:         5 * time.Second,               // Calculate average every 5 seconds
+		lastAvgTime:         time.Now(),
 	}
 }
 
@@ -264,6 +272,7 @@ func (q *Queue) Lease() *TaskBase {
 		if task != nil {
 			path := task.LocationPath()
 			task.Locked = true
+			task.LeaseTime = time.Now() // Record lease time for execution tracking
 			q.inProgress[path] = task
 			q.mu.Unlock()
 			return task
@@ -400,11 +409,17 @@ const (
 // This is the event-driven entry point that replaces separate Complete()/Fail() calls.
 // After processing the result, it checks if we need to pull more tasks or advance rounds.
 func (q *Queue) ReportTaskResult(task *TaskBase, result TaskExecutionResult) {
+	// Calculate execution time delta (lease to complete/fail)
+	var executionDelta time.Duration
+	if !task.LeaseTime.IsZero() {
+		executionDelta = time.Since(task.LeaseTime)
+	}
+
 	switch result {
 	case TaskExecutionResultSuccessful:
-		q.completeTask(task)
+		q.completeTask(task, executionDelta)
 	case TaskExecutionResultFailed:
-		q.failTask(task)
+		q.failTask(task, executionDelta)
 	default:
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("error",
@@ -439,7 +454,9 @@ func (q *Queue) Complete(task *TaskBase) {
 }
 
 // completeTask is the internal implementation for successful task completion.
-func (q *Queue) completeTask(task *TaskBase) {
+func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
+	// Record execution time delta
+	q.recordExecutionTime(executionDelta)
 	currentRound := task.Round
 
 	if q.boltDB == nil {
@@ -926,7 +943,9 @@ func (q *Queue) Fail(task *TaskBase) bool {
 }
 
 // failTask is the internal implementation for failed task handling.
-func (q *Queue) failTask(task *TaskBase) {
+func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
+	// Record execution time delta (even for failures)
+	q.recordExecutionTime(executionDelta)
 	currentRound := task.Round
 	path := task.LocationPath() // Use path (not ID) to match Lease() and Complete()
 
@@ -1036,6 +1055,14 @@ func (q *Queue) SetStatsChannel(ch chan QueueStats) {
 	}
 }
 
+// SetObserver registers this queue with an observer for BoltDB stats publishing.
+// The observer will poll this queue directly for statistics.
+func (q *Queue) SetObserver(observer *QueueObserver) {
+	if observer != nil {
+		observer.RegisterQueue(q.name, q)
+	}
+}
+
 // publishStatsLoop periodically publishes queue statistics to the stats channel.
 // Exits when the queue is completed/stopped or the channel/ticker is cleared.
 func (q *Queue) publishStatsLoop() {
@@ -1064,14 +1091,16 @@ func (q *Queue) publishStatsLoop() {
 		q.mu.RUnlock()
 
 		// Check if channel/ticker were cleared
-		if chanRef == nil || tickRef == nil {
+		if tickRef == nil {
 			return
 		}
 
-		// Non-blocking send (don't block if receiver isn't ready)
-		select {
-		case chanRef <- stats:
-		default:
+		// Send to stats channel (non-blocking)
+		if chanRef != nil {
+			select {
+			case chanRef <- stats:
+			default:
+			}
 		}
 	}
 }
@@ -1214,6 +1243,76 @@ func (q *Queue) WorkerCount() int {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return len(q.workers)
+}
+
+// recordExecutionTime adds an execution time delta to the buffer and periodically calculates averages.
+func (q *Queue) recordExecutionTime(delta time.Duration) {
+	if delta <= 0 {
+		return // Skip invalid deltas
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	// Add to buffer (max 100 items)
+	if len(q.executionTimeDeltas) >= 100 {
+		// Remove oldest item (FIFO)
+		q.executionTimeDeltas = q.executionTimeDeltas[1:]
+	}
+	q.executionTimeDeltas = append(q.executionTimeDeltas, delta)
+
+	// Check if it's time to calculate average
+	now := time.Now()
+	if now.Sub(q.lastAvgTime) >= q.avgInterval {
+		q.calculateAverageLocked()
+		q.lastAvgTime = now
+	}
+}
+
+// calculateAverageLocked calculates the average execution time and clears the buffer.
+// Must be called with q.mu.Lock() held.
+func (q *Queue) calculateAverageLocked() {
+	if len(q.executionTimeDeltas) == 0 {
+		q.avgExecutionTime = 0
+		return
+	}
+
+	var sum time.Duration
+	for _, delta := range q.executionTimeDeltas {
+		sum += delta
+	}
+	q.avgExecutionTime = sum / time.Duration(len(q.executionTimeDeltas))
+
+	// Clear buffer after calculating average
+	q.executionTimeDeltas = q.executionTimeDeltas[:0]
+}
+
+// GetAverageExecutionTime returns the current average task execution time.
+func (q *Queue) GetAverageExecutionTime() time.Duration {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.avgExecutionTime
+}
+
+// GetExecutionTimeBufferSize returns the current size of the execution time buffer.
+func (q *Queue) GetExecutionTimeBufferSize() int {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return len(q.executionTimeDeltas)
+}
+
+// GetTotalCompleted returns the total number of completed tasks across all rounds.
+func (q *Queue) GetTotalCompleted() int {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+
+	total := 0
+	for _, roundStats := range q.roundStats {
+		if roundStats != nil {
+			total += roundStats.Completed
+		}
+	}
+	return total
 }
 
 // Run is the main queue coordination loop. It has an outer loop for rounds and an inner loop

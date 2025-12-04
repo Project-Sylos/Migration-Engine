@@ -3,7 +3,11 @@
 
 package queue
 
-import "github.com/Project-Sylos/Sylos-FS/pkg/types"
+import (
+	"time"
+
+	"github.com/Project-Sylos/Sylos-FS/pkg/types"
+)
 
 // Task types
 const (
@@ -27,6 +31,7 @@ type TaskBase struct {
 	ExpectedFiles      []types.File   // Expected files (dst tasks only)
 	DiscoveredChildren []ChildResult  // Children discovered during execution
 	Round              int            // The round this task belongs to (for buffer coordination)
+	LeaseTime          time.Time      // Time when task was leased (for execution time tracking)
 }
 
 // ChildResult represents a discovered child node with its traversal status.
