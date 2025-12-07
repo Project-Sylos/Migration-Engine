@@ -41,16 +41,18 @@ const (
 
 // Bucket path constants
 const (
-	BucketSrc  = "SRC"
-	BucketDst  = "DST"
-	BucketLogs = "LOGS"
+	TraversalDataBucket = "Traversal-Data" // Root bucket for all traversal-related data
+	BucketSrc           = "SRC"
+	BucketDst           = "DST"
+	BucketLogs          = "LOGS" // Separate island, not under Traversal-Data
 )
 
 // Sub-bucket names
 const (
-	SubBucketNodes    = "nodes"
-	SubBucketChildren = "children"
-	SubBucketLevels   = "levels"
+	SubBucketNodes        = "nodes"
+	SubBucketChildren     = "children"
+	SubBucketLevels       = "levels"
+	SubBucketStatusLookup = "status-lookup"
 )
 
 // FormatLevel formats a level number as an 8-digit zero-padded string.
@@ -64,27 +66,33 @@ func ParseLevel(levelStr string) (int, error) {
 }
 
 // GetNodesBucketPath returns the bucket path for the nodes bucket.
-// Returns: ["SRC", "nodes"] or ["DST", "nodes"]
+// Returns: ["Traversal-Data", "SRC", "nodes"] or ["Traversal-Data", "DST", "nodes"]
 func GetNodesBucketPath(queueType string) []string {
-	return []string{queueType, SubBucketNodes}
+	return []string{TraversalDataBucket, queueType, SubBucketNodes}
 }
 
 // GetChildrenBucketPath returns the bucket path for the children bucket.
-// Returns: ["SRC", "children"] or ["DST", "children"]
+// Returns: ["Traversal-Data", "SRC", "children"] or ["Traversal-Data", "DST", "children"]
 func GetChildrenBucketPath(queueType string) []string {
-	return []string{queueType, SubBucketChildren}
+	return []string{TraversalDataBucket, queueType, SubBucketChildren}
 }
 
 // GetLevelBucketPath returns the bucket path for a specific level.
-// Returns: ["SRC", "levels", "00000001"] or ["DST", "levels", "00000001"]
+// Returns: ["Traversal-Data", "SRC", "levels", "00000001"] or ["Traversal-Data", "DST", "levels", "00000001"]
 func GetLevelBucketPath(queueType string, level int) []string {
-	return []string{queueType, SubBucketLevels, FormatLevel(level)}
+	return []string{TraversalDataBucket, queueType, SubBucketLevels, FormatLevel(level)}
 }
 
 // GetStatusBucketPath returns the bucket path for a specific status at a level.
-// Returns: ["SRC", "levels", "00000001", "pending"]
+// Returns: ["Traversal-Data", "SRC", "levels", "00000001", "pending"]
 func GetStatusBucketPath(queueType string, level int, status string) []string {
-	return []string{queueType, SubBucketLevels, FormatLevel(level), status}
+	return []string{TraversalDataBucket, queueType, SubBucketLevels, FormatLevel(level), status}
+}
+
+// GetStatusLookupBucketPath returns the bucket path for the status-lookup index at a level.
+// Returns: ["Traversal-Data", "SRC", "levels", "00000001", "status-lookup"]
+func GetStatusLookupBucketPath(queueType string, level int) []string {
+	return []string{TraversalDataBucket, queueType, SubBucketLevels, FormatLevel(level), SubBucketStatusLookup}
 }
 
 // GetLogsBucketPath returns the bucket path for logs.
@@ -94,17 +102,22 @@ func GetLogsBucketPath() []string {
 }
 
 // GetQueueStatsBucketPath returns the bucket path for queue statistics.
-// Returns: ["STATS", "queue-stats"]
+// Returns: ["Traversal-Data", "STATS", "queue-stats"]
 func GetQueueStatsBucketPath() []string {
-	return []string{StatsBucketName, "queue-stats"}
+	return []string{TraversalDataBucket, StatsBucketName, "queue-stats"}
 }
 
 // EnsureLevelBucket creates a level bucket and its status sub-buckets if they don't exist.
 func EnsureLevelBucket(tx *bolt.Tx, queueType string, level int) error {
-	// Navigate to the levels bucket
-	topBucket := tx.Bucket([]byte(queueType))
+	// Navigate through Traversal-Data -> queueType -> levels
+	traversalBucket := tx.Bucket([]byte(TraversalDataBucket))
+	if traversalBucket == nil {
+		return fmt.Errorf("Traversal-Data bucket not found")
+	}
+
+	topBucket := traversalBucket.Bucket([]byte(queueType))
 	if topBucket == nil {
-		return fmt.Errorf("top-level bucket %s not found", queueType)
+		return fmt.Errorf("queue bucket %s not found in Traversal-Data", queueType)
 	}
 
 	levelsBucket := topBucket.Bucket([]byte(SubBucketLevels))
@@ -129,6 +142,13 @@ func EnsureLevelBucket(tx *bolt.Tx, queueType string, level int) error {
 		if _, err := levelBucket.CreateBucketIfNotExists([]byte(status)); err != nil {
 			return fmt.Errorf("failed to create status bucket %s: %w", status, err)
 		}
+	}
+
+	// Create status-lookup bucket (regular bucket, not nested bucket)
+	// This stores pathHash -> status string mappings
+	lookupPath := GetStatusLookupBucketPath(queueType, level)
+	if _, err := getOrCreateBucket(tx, lookupPath); err != nil {
+		return fmt.Errorf("failed to create status-lookup bucket: %w", err)
 	}
 
 	return nil
@@ -171,4 +191,30 @@ func GetQueueStatsBucket(tx *bolt.Tx) *bolt.Bucket {
 // GetOrCreateQueueStatsBucket returns or creates the queue-stats bucket.
 func GetOrCreateQueueStatsBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
 	return getOrCreateBucket(tx, GetQueueStatsBucketPath())
+}
+
+// GetStatusLookupBucket returns the status-lookup bucket for a specific level.
+// This bucket stores pathHash -> status string mappings.
+func GetStatusLookupBucket(tx *bolt.Tx, queueType string, level int) *bolt.Bucket {
+	return getBucket(tx, GetStatusLookupBucketPath(queueType, level))
+}
+
+// GetOrCreateStatusLookupBucket returns or creates the status-lookup bucket for a specific level.
+// This bucket stores pathHash -> status string mappings.
+func GetOrCreateStatusLookupBucket(tx *bolt.Tx, queueType string, level int) (*bolt.Bucket, error) {
+	// Ensure the level bucket exists first
+	if err := EnsureLevelBucket(tx, queueType, level); err != nil {
+		return nil, err
+	}
+	return getOrCreateBucket(tx, GetStatusLookupBucketPath(queueType, level))
+}
+
+// UpdateStatusLookup updates the status-lookup index for a pathHash at a given level.
+// This should be called whenever a node's status changes.
+func UpdateStatusLookup(tx *bolt.Tx, queueType string, level int, pathHash []byte, status string) error {
+	lookupBucket, err := GetOrCreateStatusLookupBucket(tx, queueType, level)
+	if err != nil {
+		return fmt.Errorf("failed to get status-lookup bucket: %w", err)
+	}
+	return lookupBucket.Put(pathHash, []byte(status))
 }

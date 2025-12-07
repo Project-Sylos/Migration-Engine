@@ -49,7 +49,12 @@ func InsertNodeWithIndex(db *DB, queueType string, level int, status string, sta
 			return fmt.Errorf("failed to add to status bucket: %w", err)
 		}
 
-		// 3. Update parent's children list in children bucket
+		// 3. Update status-lookup index
+		if err := UpdateStatusLookup(tx, queueType, level, pathHash, status); err != nil {
+			return fmt.Errorf("failed to update status-lookup: %w", err)
+		}
+
+		// 4. Update parent's children list in children bucket
 		if state.ParentPath != "" {
 			childrenBucket := GetChildrenBucket(tx, queueType)
 			if childrenBucket == nil {
@@ -113,7 +118,13 @@ func DeleteNodeWithIndex(db *DB, queueType string, level int, status string, sta
 			statusBucket.Delete(pathHash) // Ignore errors
 		}
 
-		// 3. Remove from parent's children list
+		// 3. Remove from status-lookup index
+		lookupBucket := GetStatusLookupBucket(tx, queueType, level)
+		if lookupBucket != nil {
+			lookupBucket.Delete(pathHash) // Ignore errors
+		}
+
+		// 4. Remove from parent's children list
 		if state.ParentPath != "" {
 			childrenBucket := GetChildrenBucket(tx, queueType)
 			if childrenBucket != nil {
@@ -358,7 +369,12 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 				return fmt.Errorf("failed to add to status bucket: %w", err)
 			}
 
-			// 3. Update children index
+			// 3. Update status-lookup index
+			if err := UpdateStatusLookup(tx, op.QueueType, op.Level, pathHash, op.Status); err != nil {
+				return fmt.Errorf("failed to update status-lookup: %w", err)
+			}
+
+			// 4. Update children index
 			if op.State.ParentPath != "" {
 				childrenBucket := GetChildrenBucket(tx, op.QueueType)
 				if childrenBucket == nil {

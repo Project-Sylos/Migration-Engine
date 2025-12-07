@@ -61,6 +61,11 @@ func UpdateNodeStatusInTx(tx *bolt.Tx, queueType string, level int, oldStatus, n
 		return fmt.Errorf("failed to add to new status bucket: %w", err)
 	}
 
+	// Update status-lookup index
+	if err := UpdateStatusLookup(tx, queueType, level, pathHash, newStatus); err != nil {
+		return fmt.Errorf("failed to update status-lookup: %w", err)
+	}
+
 	// Stats updates are handled by batch processing in output buffer flush
 	return nil
 }
@@ -114,7 +119,12 @@ func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation) error {
 			return fmt.Errorf("failed to add to status bucket: %w", err)
 		}
 
-		// 3. Update children index
+		// 3. Update status-lookup index
+		if err := UpdateStatusLookup(tx, op.QueueType, op.Level, pathHash, op.Status); err != nil {
+			return fmt.Errorf("failed to update status-lookup: %w", err)
+		}
+
+		// 4. Update children index
 		if op.State.ParentPath != "" {
 			childrenBucket := GetChildrenBucket(tx, op.QueueType)
 			if childrenBucket == nil {

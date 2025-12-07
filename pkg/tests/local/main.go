@@ -76,6 +76,7 @@ func runTest() error {
 
 	fmt.Println("🚀 Phase 2: Migration")
 	fmt.Println("=====================")
+	// Note: In ModeStandalone, ME will close the DB automatically
 	result, err := migration.LetsMigrate(cfg)
 	if err != nil {
 		return fmt.Errorf("migration failed: %w", err)
@@ -86,5 +87,6 @@ func runTest() error {
 	fmt.Println("========================")
 	shared.PrintVerification(result)
 
+	// DB is already closed by ME in ModeStandalone mode
 	return nil
 }

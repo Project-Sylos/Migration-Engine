@@ -18,6 +18,17 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Migration status constants
+const (
+	StatusTraversalPending   = "traversal-pending"    // Traversal is in progress with pending work
+	StatusTraversalFailed    = "traversal-failed"     // Traversal phase failed
+	StatusAwaitingPathReview = "awaiting-path-review" // Traversal complete, ready for user review
+	StatusCopySuccessful     = "copy-successful"      // Copy phase completed successfully
+	StatusCopyFailed         = "copy-failed"          // Copy phase failed
+	StatusSuspended          = "suspended"            // Migration suspended (can be resumed)
+	StatusSeeded             = "seeded"               // Roots have been seeded (transitional state)
+)
+
 // MigrationConfigYAML represents the complete migration configuration stored in YAML format.
 type MigrationConfigYAML struct {
 	Metadata         MetadataConfig         `yaml:"metadata"`
@@ -40,7 +51,7 @@ type MetadataConfig struct {
 
 // StateConfig tracks the current migration state.
 type StateConfig struct {
-	Status       string `yaml:"status"` // running, paused, suspended, completed, failed
+	Status       string `yaml:"status"` // traversal-pending, traversal-failed, awaiting-path-review, copy-successful, copy-failed, suspended, seeded
 	LastLevelSrc *int   `yaml:"last_level_src,omitempty"`
 	LastLevelDst *int   `yaml:"last_level_dst,omitempty"`
 	LastRoundSrc *int   `yaml:"last_round_src,omitempty"`
@@ -285,7 +296,7 @@ func NewMigrationConfigYAML(cfg Config, status MigrationStatus) (*MigrationConfi
 			LastModified: now,
 		},
 		State: StateConfig{
-			Status: "running",
+			Status: StatusTraversalPending,
 		},
 		Services: ServicesConfig{
 			Source: ServiceConfigYAML{
@@ -362,13 +373,13 @@ func UpdateConfigFromStatus(yamlCfg *MigrationConfigYAML, status MigrationStatus
 	yamlCfg.State.LastLevelDst = &dstRound
 
 	// Update status (only if not already set to "suspended" by force shutdown)
-	if yamlCfg.State.Status != "suspended" {
+	if yamlCfg.State.Status != StatusSuspended {
 		if status.IsComplete() {
-			yamlCfg.State.Status = "completed"
+			yamlCfg.State.Status = StatusAwaitingPathReview
 		} else if status.HasPending() {
-			yamlCfg.State.Status = "running"
+			yamlCfg.State.Status = StatusTraversalPending
 		} else if status.HasFailures() {
-			yamlCfg.State.Status = "failed"
+			yamlCfg.State.Status = StatusTraversalFailed
 		}
 	}
 }
@@ -386,7 +397,7 @@ func SetSuspendedStatus(yamlCfg *MigrationConfigYAML, status MigrationStatus, sr
 	yamlCfg.State.LastLevelDst = &dstRound
 
 	// Set status to suspended
-	yamlCfg.State.Status = "suspended"
+	yamlCfg.State.Status = StatusSuspended
 }
 
 // UpdateConfigFromRoots updates the config YAML when roots are set.

@@ -34,9 +34,11 @@ func removeBoltDatabase(path string) error {
 	return nil
 }
 
-// SetupDatabase removes any existing database (when configured), creates a fresh BoltDB
-// instance, and prepares it for use by the migration engine.
+// SetupDatabase is a helper function for the API/caller to open a BoltDB instance.
+// The Migration Engine does NOT call this - it requires the DB to be passed in via Config.DatabaseInstance.
+// This function is provided for convenience when the API needs to open the database.
 // Returns the database and a boolean indicating whether this is a fresh database (true = fresh).
+// The caller is responsible for closing the database when done.
 func SetupDatabase(cfg DatabaseConfig) (*db.DB, bool, error) {
 	if cfg.Path == "" {
 		return nil, false, fmt.Errorf("database path cannot be empty")

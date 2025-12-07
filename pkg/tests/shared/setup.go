@@ -71,7 +71,18 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
 	}
 
+	// Open database - tests own the lifecycle
+	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
+		Path:           "pkg/tests/bolt.db",
+		RemoveExisting: removeMigrationDB,
+	})
+	if err != nil {
+		return migration.Config{}, fmt.Errorf("failed to open database: %w", err)
+	}
+
 	cfg := migration.Config{
+		DatabaseInstance: dbInstance,               // Tests provide DB instance
+		Runtime:          migration.ModeStandalone, // Tests use standalone mode (ME closes DB)
 		Database: migration.DatabaseConfig{
 			Path:           "pkg/tests/bolt.db",
 			RemoveExisting: removeMigrationDB,
@@ -195,7 +206,18 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 		Type:         types.NodeTypeFolder,
 	}
 
+	// Open database - tests own the lifecycle
+	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
+		Path:           "pkg/tests/migration_test_local.db",
+		RemoveExisting: removeMigrationDB,
+	})
+	if err != nil {
+		return migration.Config{}, fmt.Errorf("failed to open database: %w", err)
+	}
+
 	cfg := migration.Config{
+		DatabaseInstance: dbInstance,               // Tests provide DB instance
+		Runtime:          migration.ModeStandalone, // Tests use standalone mode (ME closes DB)
 		Database: migration.DatabaseConfig{
 			Path:           "pkg/tests/migration_test_local.db",
 			RemoveExisting: removeMigrationDB,

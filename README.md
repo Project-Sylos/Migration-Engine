@@ -137,28 +137,39 @@ BoltDB was chosen for its simplicity, reliability, and perfect fit with the BFS 
 
 ### Bucket Structure
 
+The database is partitioned into two main areas:
+
+**Traversal-Data** (all traversal-related data):
 ```
-/SRC
-  /nodes                  → pathHash: NodeState JSON (canonical data)
-  /children               → parentHash: []childHash JSON (tree relationships)
-  /levels
-    /00000000
-      /pending            → pathHash: empty (membership set)
-      /successful         → pathHash: empty
-      /failed             → pathHash: empty
-    /00000001/...
+/Traversal-Data
+  /SRC
+    /nodes                  → pathHash: NodeState JSON (canonical data)
+    /children               → parentHash: []childHash JSON (tree relationships)
+    /levels
+      /00000000
+        /pending            → pathHash: empty (membership set)
+        /successful         → pathHash: empty
+        /failed             → pathHash: empty
+        /status-lookup      → pathHash: status string (reverse index)
+      /00000001/...
+  /DST
+    /nodes
+    /children
+    /levels
+      /00000000
+        /pending
+        /successful
+        /failed
+        /not_on_src         → pathHash: empty (DST-specific status)
+        /status-lookup      → pathHash: status string (reverse index)
+      /00000001/...
+  /STATS
+    /totals                → bucketPath: int64 (bucket count statistics)
+    /queue-stats           → queueKey: QueueObserverMetrics JSON (queue metrics)
+```
 
-/DST
-  /nodes
-  /children
-  /levels
-    /00000000
-      /pending
-      /successful
-      /failed
-      /not_on_src       → pathHash: empty (DST-specific status)
-    /00000001/...
-
+**LOGS** (separate island, not under Traversal-Data):
+```
 /LOGS
   /trace                 → uuid: LogEntry JSON
   /debug                 → uuid: LogEntry JSON
@@ -168,20 +179,32 @@ BoltDB was chosen for its simplicity, reliability, and perfect fit with the BFS 
   /critical              → uuid: LogEntry JSON
 ```
 
+This partitioning separates traversal operations (discovery/scanning phase) from future copy operations, allowing the copy phase to have its own data structure under a separate root bucket.
+
 ### Key Design Principles
 
 1. **Separation of Concerns**
    - Node data lives in `/nodes` (single source of truth)
    - Status membership tracked in `/levels/{level}/{status}` buckets
+   - Status-lookup index in `/levels/{level}/status-lookup` provides reverse lookup (pathHash → status)
    - Tree relationships in `/children` buckets
 
-2. **Status Transitions are Simple**
+2. **Status Transitions are Atomic**
+   Status transitions update multiple buckets atomically:
    ```go
-   bucket.Delete(pathHash)  // Remove from /pending
-   bucket.Put(pathHash, []) // Add to /successful
+   // 1. Update NodeState in /nodes bucket
+   // 2. Remove from old status bucket
+   // 3. Add to new status bucket
+   // 4. Update status-lookup index
    ```
 
-3. **No Key Encoding**
+3. **Status-Lookup Index**
+   - Each level has a `status-lookup` bucket that maps `pathHash → status string`
+   - Provides O(1) lookup to find which status bucket a node belongs to
+   - Automatically maintained on every insert and status update
+   - Enables efficient queries without scanning all status buckets
+
+4. **No Key Encoding**
    - Structure is explicit in buckets, not encoded in key names
    - Path hashes are simple lookup keys
    - Hierarchy is natural and navigable

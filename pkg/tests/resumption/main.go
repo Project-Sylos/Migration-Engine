@@ -51,6 +51,7 @@ func runInitialTest() error {
 	fmt.Println()
 
 	// Use StartMigration for async execution so we can be killed
+	// Note: In ModeStandalone, ME will close the DB automatically when done
 	controller := migration.StartMigration(cfg)
 
 	// Wait for migration to complete or be killed
@@ -104,6 +105,7 @@ func runResumeTest() error {
 	fmt.Println("===============================")
 
 	// LetsMigrate will automatically detect and resume from suspended state
+	// Note: In ModeStandalone, ME will close the DB automatically
 	result, err := migration.LetsMigrate(cfg)
 	if err != nil {
 		return fmt.Errorf("migration resumption failed: %w", err)
@@ -117,5 +119,6 @@ func runResumeTest() error {
 	fmt.Println("========================")
 	shared.PrintVerification(result)
 
+	// DB is already closed by ME in ModeStandalone mode
 	return nil
 }
