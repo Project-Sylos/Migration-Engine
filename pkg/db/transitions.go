@@ -66,6 +66,11 @@ func UpdateNodeStatus(db *DB, queueType string, level int, oldStatus, newStatus,
 			return fmt.Errorf("failed to add to new status bucket: %w", err)
 		}
 
+		// Update status-lookup index
+		if err := UpdateStatusLookup(tx, queueType, level, pathHash, newStatus); err != nil {
+			return fmt.Errorf("failed to update status-lookup: %w", err)
+		}
+
 		return nil
 	})
 
@@ -227,6 +232,11 @@ func BatchUpdateNodeStatus(db *DB, queueType string, level int, oldStatus, newSt
 
 			if err := newBucket.Put(pathHash, []byte{}); err != nil {
 				return fmt.Errorf("failed to add to new status bucket: %w", err)
+			}
+
+			// Update status-lookup index
+			if err := UpdateStatusLookup(tx, queueType, level, pathHash, newStatus); err != nil {
+				return fmt.Errorf("failed to update status-lookup: %w", err)
 			}
 
 			results[path] = ns

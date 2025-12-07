@@ -26,12 +26,18 @@ BoltDB uses nested buckets to organize data hierarchically:
 
 ### Top-Level Buckets
 
+The database is partitioned into two main areas:
+
 ```
-/SRC     → Source queue data
-/DST     → Destination queue data
-/LOGS    → Log entries organized by level
-/STATS   → Bucket count statistics (O(1) lookups)
+/Traversal-Data  → Root bucket for all traversal-related data
+  /SRC           → Source queue data
+  /DST           → Destination queue data
+  /STATS         → Bucket count statistics and queue metrics (O(1) lookups)
+
+/LOGS            → Log entries organized by level (separate island)
 ```
+
+This partitioning separates traversal operations (discovery/scanning phase) from future copy operations, allowing the copy phase to have its own data structure under a separate root bucket.
 
 ### Node Storage (`/SRC` and `/DST`)
 
@@ -39,7 +45,7 @@ Each queue type has three main sub-buckets:
 
 #### 1. Nodes Bucket (`/nodes`)
 
-**Path**: `/SRC/nodes/` or `/DST/nodes/`
+**Path**: `/Traversal-Data/SRC/nodes/` or `/Traversal-Data/DST/nodes/`
 
 Stores the canonical node data. Key is the path hash, value is NodeState JSON.
 
@@ -60,7 +66,7 @@ pathHash → NodeState JSON
 
 #### 2. Children Bucket (`/children`)
 
-**Path**: `/SRC/children/` or `/DST/children/`
+**Path**: `/Traversal-Data/SRC/children/` or `/Traversal-Data/DST/children/`
 
 Stores parent-child relationships. Key is parent path hash, value is array of child path hashes.
 
@@ -71,30 +77,38 @@ parentPathHash → []childPathHash JSON
 
 #### 3. Levels Bucket (`/levels`)
 
-**Path**: `/SRC/levels/` or `/DST/levels/`
+**Path**: `/Traversal-Data/SRC/levels/` or `/Traversal-Data/DST/levels/`
 
-Organized by BFS depth level, with status sub-buckets:
+Organized by BFS depth level, with status sub-buckets and a status-lookup index:
 
 ```
 /levels
   /00000000              → Level 0 (root)
-    /pending             → pathHash: empty
-    /successful          → pathHash: empty
-    /failed              → pathHash: empty
+    /pending             → pathHash: empty (membership set)
+    /successful          → pathHash: empty (membership set)
+    /failed              → pathHash: empty (membership set)
+    /status-lookup       → pathHash: status string (reverse index)
   /00000001              → Level 1
     /pending
     /successful
     /failed
+    /status-lookup
   /00000002              → Level 2
     ...
 ```
 
 For DST queue, there's an additional status:
 ```
-  /not_on_src            → Items in DST but not in SRC
+  /not_on_src            → pathHash: empty (membership set)
 ```
 
 **Status buckets are membership sets**: The presence of a pathHash in a bucket means that node has that status. The value is empty; only the key matters.
+
+**Status-lookup index**: The `status-lookup` bucket provides a reverse index mapping `pathHash → status string`. This enables O(1) lookup to determine which status bucket a node belongs to without scanning all status buckets. The index is automatically maintained:
+- Created when a level bucket is first created
+- Updated on every node insert (with initial status)
+- Updated on every status transition (pending → successful, etc.)
+- Removed when a node is deleted
 
 ### Log Storage (`/LOGS`)
 
@@ -114,20 +128,34 @@ Each log entry is keyed by its UUID within the appropriate level bucket.
 
 ### Statistics Bucket (`/STATS`)
 
-**Path**: `/STATS/`
+**Path**: `/Traversal-Data/STATS/`
 
-Stores count statistics for all buckets to enable O(1) count lookups without scanning:
+Stores count statistics for all buckets and queue performance metrics:
 
 ```
 /STATS
-  "SRC/nodes"                    → int64 (8-byte big-endian)
-  "SRC/children"                 → int64
-  "SRC/levels/00000001/pending"  → int64
-  "DST/levels/00000002/successful" → int64
-  "LOGS"                         → int64
+  /totals                → bucketPath: int64 (8-byte big-endian)
+    "SRC/nodes"                    → int64
+    "SRC/children"                 → int64
+    "SRC/levels/00000001/pending"  → int64
+    "DST/levels/00000002/successful" → int64
+    "LOGS"                         → int64
+  /queue-stats           → queueKey: QueueObserverMetrics JSON
+    "src-traversal"      → QueueObserverMetrics JSON
+    "dst-traversal"      → QueueObserverMetrics JSON
+    "copy"               → QueueObserverMetrics JSON (future)
 ```
 
-Statistics are automatically maintained during writes via `OutputBuffer` and can be manually synchronized using `SyncCounts()`.
+**Totals sub-bucket**: Stores count statistics for all buckets to enable O(1) count lookups without scanning. Statistics are automatically maintained during writes via `OutputBuffer` and can be manually synchronized using `SyncCounts()`.
+
+**Queue-stats sub-bucket**: Stores real-time queue performance metrics published by the `QueueObserver`:
+- Queue statistics (pending, in-progress, workers, round, etc.)
+- Average task execution time
+- Tasks per second (calculated from last poll)
+- Total completed tasks
+- Last poll timestamp
+
+Metrics are updated every 200ms (configurable) during active migrations, allowing external APIs to poll for real-time performance data.
 
 ---
 
@@ -161,7 +189,7 @@ pathHash := db.HashPath("/parent/child") // Returns 32-character hex string
 ### Node State Operations
 
 ```go
-// Insert a node (creates entry in nodes, status, and children buckets)
+// Insert a node (creates entry in nodes, status, status-lookup, and children buckets)
 state := &db.NodeState{
     ID:         "node-id",
     ParentID:   "parent-id",
@@ -171,9 +199,19 @@ state := &db.NodeState{
     Type:       "folder",
     Depth:      1,
 }
+// This automatically:
+// 1. Inserts into /nodes bucket
+// 2. Adds to status bucket (/levels/{level}/{status})
+// 3. Updates status-lookup index (/levels/{level}/status-lookup)
+// 4. Updates parent's children list
 err := db.InsertNodeWithIndex(database, "SRC", 1, db.StatusPending, state)
 
-// Update node status (moves between status buckets)
+// Update node status (moves between status buckets and updates status-lookup)
+// This automatically:
+// 1. Updates NodeState in /nodes bucket
+// 2. Removes from old status bucket
+// 3. Adds to new status bucket
+// 4. Updates status-lookup index
 updatedState, err := db.UpdateNodeStatus(database, "SRC", 1, 
     db.StatusPending, db.StatusSuccessful, "/parent/child")
 
@@ -182,6 +220,11 @@ state, err := db.GetNodeStateByPath(database, "SRC", "/parent/child")
 
 // Get children of a node
 children, err := db.GetChildrenStates(database, "SRC", "/parent")
+
+// Query status-lookup index (find which status bucket a node belongs to)
+lookupBucket := db.GetStatusLookupBucket(tx, "SRC", 1)
+statusBytes := lookupBucket.Get(pathHash)
+status := string(statusBytes) // "pending", "successful", "failed", etc.
 ```
 
 ### Iteration
@@ -382,13 +425,19 @@ childrenPath := db.GetChildrenBucketPath("SRC")  // ["SRC", "children"]
 levelPath := db.GetLevelBucketPath("SRC", 1)     // ["SRC", "levels", "00000001"]
 statusPath := db.GetStatusBucketPath("SRC", 1, db.StatusPending)
 // ["SRC", "levels", "00000001", "pending"]
+lookupPath := db.GetStatusLookupBucketPath("SRC", 1)
+// ["SRC", "levels", "00000001", "status-lookup"]
 
-// Create level bucket with all status sub-buckets
+// Create level bucket with all status sub-buckets and status-lookup index
 err := db.EnsureLevelBucket(tx, "SRC", 1)
 
 // Get bucket within transaction
 nodesBucket := db.GetNodesBucket(tx, "SRC")
 statusBucket := db.GetStatusBucket(tx, "SRC", 1, db.StatusPending)
+lookupBucket := db.GetStatusLookupBucket(tx, "SRC", 1)
+
+// Update status-lookup index (automatically called by insert/update functions)
+err := db.UpdateStatusLookup(tx, "SRC", 1, pathHash, db.StatusSuccessful)
 ```
 
 ---
@@ -429,7 +478,8 @@ BoltDB makes status transitions atomic and race-free:
 // 1. Update NodeState in /nodes bucket
 // 2. Remove from old status bucket
 // 3. Add to new status bucket
-// All three operations succeed or all fail
+// 4. Update status-lookup index
+// All four operations succeed or all fail
 ```
 
 ### Batch Operations
@@ -533,10 +583,10 @@ if state == nil {
 
 ## Statistics Management
 
-The stats bucket provides O(1) count lookups for all buckets:
+The stats bucket provides O(1) count lookups for all buckets and queue performance metrics:
 
 ```go
-// Get count for any bucket path
+// Get count for any bucket path (from /STATS/totals)
 count, err := database.GetBucketCount([]string{"SRC", "nodes"})
 count, err := database.GetBucketCount([]string{"SRC", "levels", "00000001", "pending"})
 
@@ -548,11 +598,22 @@ err := database.SyncCounts()
 
 // Ensure stats bucket exists
 err := database.EnsureStatsBucket()
+
+// Get queue statistics (from /STATS/queue-stats)
+srcStats, err := db.GetQueueStats(database, "src-traversal")
+allStats, err := db.GetAllQueueStats(database)
+// Returns QueueObserverMetrics with:
+// - QueueStats (pending, in-progress, workers, round, etc.)
+// - AverageExecutionTime
+// - TasksPerSecond
+// - TotalCompleted
+// - LastPollTime
 ```
 
 **Stats are automatically maintained by:**
 - `OutputBuffer` - Updates stats during buffered writes
 - `BatchInsertNodes` - Updates stats during batch inserts
+- `QueueObserver` - Publishes queue metrics to `/STATS/queue-stats` every 200ms
 
 **Manual sync is useful for:**
 - Recovery after crashes
@@ -566,11 +627,13 @@ err := database.EnsureStatsBucket()
 The database package provides:
 - ✅ **BoltDB Integration** - Simple, reliable embedded database
 - ✅ **Bucket Hierarchies** - Natural structure, not key encoding
-- ✅ **Status Transitions** - Atomic, race-free status changes
+- ✅ **Status Transitions** - Atomic, race-free status changes with status-lookup index
+- ✅ **Status-Lookup Index** - O(1) reverse lookup to find node status without scanning
 - ✅ **High-Level Operations** - Convenient functions for common operations
 - ✅ **Batch Support** - Efficient bulk operations with automatic stats
 - ✅ **Buffered Writes** - `OutputBuffer` and `LogBuffer` for high throughput
-- ✅ **O(1) Statistics** - Stats bucket for fast count lookups
+- ✅ **O(1) Statistics** - Stats bucket for fast count lookups and queue metrics
+- ✅ **Queue Observability** - Real-time queue performance metrics in `/STATS/queue-stats`
 - ✅ **Path Hashing** - Consistent key generation from paths
 - ✅ **Task Leasing** - Efficient task distribution for workers
 - ✅ **Thread Safety** - Safe for concurrent reads, serialized writes

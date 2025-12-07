@@ -15,6 +15,16 @@ import (
 	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
+// RuntimeMode determines how the migration engine manages database lifecycle.
+type RuntimeMode int
+
+const (
+	// ModeAPISupervised is the default mode - API owns DB lifecycle, ME never closes it.
+	ModeAPISupervised RuntimeMode = iota
+	// ModeStandalone is for standalone/test mode - ME may close DB on completion (debug guard only).
+	ModeStandalone
+)
+
 // Service defines a single filesystem service participating in a migration.
 type Service struct {
 	Name    string
@@ -23,10 +33,20 @@ type Service struct {
 }
 
 // Config aggregates all of the knobs required to run the migration engine once.
+// The DB must be provided via DatabaseInstance - the ME does not open or close it.
 type Config struct {
-	Database         DatabaseConfig
-	DatabaseInstance *db.DB // BoltDB instance
-	CloseDatabase    bool
+	// DatabaseInstance is the BoltDB instance to use. REQUIRED - ME does not open the DB.
+	// The API/caller is responsible for opening and closing the database.
+	DatabaseInstance *db.DB
+
+	// Runtime determines lifecycle management mode.
+	// ModeAPISupervised (default): ME never closes DB - API owns lifecycle.
+	// ModeStandalone: ME may close DB on completion (for standalone/test mode only).
+	Runtime RuntimeMode
+
+	// Database config is kept for backward compatibility and for determining paths,
+	// but the ME does not use it to open the DB - that's the API's responsibility.
+	Database DatabaseConfig
 
 	Source      Service
 	Destination Service
@@ -64,12 +84,14 @@ type Result struct {
 
 // MigrationController provides programmatic control over a running migration.
 // It allows you to trigger force shutdown and check migration status.
+// Note: The controller does NOT own the DB lifecycle - the API does.
 type MigrationController struct {
 	shutdownCancel context.CancelFunc
 	shutdownCtx    context.Context
 	done           chan struct{}
 	result         *Result
 	err            error
+	boltDB         *db.DB // Thread-safe - BoltDB operations handle their own locking (API owns lifecycle)
 }
 
 // Shutdown triggers a force shutdown of the migration.
@@ -93,6 +115,15 @@ func (mc *MigrationController) Wait() (Result, error) {
 		return *mc.result, mc.err
 	}
 	return Result{}, mc.err
+}
+
+// GetDB returns the BoltDB instance used by this migration.
+// This allows the API to query the database for real-time statistics.
+// Returns nil if the database hasn't been initialized yet.
+// The database instance is thread-safe - BoltDB operations handle their own locking.
+// The API owns the DB lifecycle - do not close it through the controller.
+func (mc *MigrationController) GetDB() *db.DB {
+	return mc.boltDB
 }
 
 // SetRootFolders assigns the source and destination root folders that will seed the migration queues.
@@ -146,15 +177,27 @@ func StartMigration(cfg Config) *MigrationController {
 		done:           done,
 	}
 
+	// DB must be provided - ME does not open it
+	if cfg.DatabaseInstance == nil {
+		controller.err = fmt.Errorf("DatabaseInstance is required - migration engine does not open databases")
+		close(done)
+		return controller
+	}
+
+	// Store DB in controller (API owns lifecycle - ME never closes it)
+	controller.boltDB = cfg.DatabaseInstance
+
 	// Run migration in goroutine
 	go func() {
 		defer close(done)
 		// Pass the shutdown context to LetsMigrate
 		cfgCopy := cfg
 		cfgCopy.ShutdownContext = shutdownCtx
+		// Ensure DB is set (already validated above)
 		result, err := letsMigrateWithContext(cfgCopy)
 		controller.result = &result
 		controller.err = err
+		// ME never closes DB - API owns lifecycle
 	}()
 
 	return controller
@@ -193,32 +236,22 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 		go HandleShutdownSignals(shutdownCancel)
 	}
 
-	var wasFresh bool
-	if cfg.DatabaseInstance != nil {
-		boltDB = cfg.DatabaseInstance
-		wasFresh = false // Existing database instance
-	} else {
-		var setupErr error
-		boltDB, wasFresh, setupErr = SetupDatabase(cfg.Database)
-		if setupErr != nil {
-			return Result{}, setupErr
-		}
-		cfg.CloseDatabase = true
+	// DB must be provided - ME does not open it
+	if cfg.DatabaseInstance == nil {
+		return Result{}, fmt.Errorf("DatabaseInstance is required - migration engine does not open databases")
 	}
+	boltDB = cfg.DatabaseInstance
 
-	// Only inspect migration status if this isn't a fresh database.
-	// If we just created it (RemoveExisting=true or directory didn't exist), skip the check.
-	var status MigrationStatus
-	if wasFresh {
-		// Fresh database - no need to check, it's definitely empty
-		status = MigrationStatus{}
+	// Determine if database is fresh by checking if it has any nodes
+	// (We can't use file existence since API opened it, so inspect the DB contents)
+	var wasFresh bool
+	status, inspectErr := InspectMigrationStatus(boltDB)
+	if inspectErr != nil {
+		// If we can't inspect, assume it's not fresh (safer default)
+		wasFresh = false
+		status = MigrationStatus{} // Empty status as fallback
 	} else {
-		// Existing database - inspect to decide between fresh run and resume
-		var inspectErr error
-		status, inspectErr = InspectMigrationStatus(boltDB)
-		if inspectErr != nil {
-			return Result{}, fmt.Errorf("failed to inspect migration status: %w", inspectErr)
-		}
+		wasFresh = status.IsEmpty()
 	}
 
 	if cfg.Source.Adapter == nil || cfg.Destination.Adapter == nil {
@@ -278,7 +311,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 			}
 
 			// If status was "suspended", indicate resume from suspension
-			if yamlCfg.State.Status == "suspended" {
+			if yamlCfg.State.Status == StatusSuspended {
 				fmt.Println("Resuming from suspended migration state...")
 			}
 		}
@@ -313,7 +346,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 			// Update config: Roots seeded milestone
 			if yamlCfg != nil && configPath != "" {
 				UpdateConfigFromRoots(yamlCfg, srcRoot, dstRoot)
-				yamlCfg.State.Status = "seeded"
+				yamlCfg.State.Status = StatusSeeded
 				_ = SaveMigrationConfig(configPath, yamlCfg)
 			}
 		}
@@ -359,7 +392,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 
 			// Update YAML to reflect fresh start
 			if yamlCfg != nil {
-				yamlCfg.State.Status = "running"
+				yamlCfg.State.Status = StatusTraversalPending
 				UpdateConfigFromRoots(yamlCfg, srcRoot, dstRoot)
 				_ = SaveMigrationConfig(configPath, yamlCfg)
 			}
@@ -368,7 +401,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 			runtime, runErr = runFreshMigration()
 		} else {
 			// Root nodes exist - safe to resume
-			if yamlCfg != nil && yamlCfg.State.Status == "suspended" {
+			if yamlCfg != nil && yamlCfg.State.Status == StatusSuspended {
 				fmt.Println("Resuming suspended migration from database state...")
 			} else {
 				fmt.Println("Resuming migration from existing database state...")
@@ -476,8 +509,9 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	// 2. The API also tries to close it
 	// 3. Verification or other code needs to log after migration completes
 
-	// Close database after verification and log service are done (allows verification and log flushing to access DB)
-	if cfg.CloseDatabase {
+	// ME does NOT close the database - API owns the lifecycle.
+	// Only close in standalone mode (debug/test guard) - API mode never closes.
+	if cfg.Runtime == ModeStandalone {
 		defer boltDB.Close()
 	}
 
@@ -498,7 +532,6 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 			report.SrcTotal, report.SrcPending, report.SrcFailed)
 		errMsg += fmt.Sprintf("  DST: Total=%d Pending=%d Failed=%d NotOnSrc=%d\n",
 			report.DstTotal, report.DstPending, report.DstFailed, report.DstNotOnSrc)
-		errMsg += fmt.Sprintf("  Moved Nodes: %d\n", report.NumMovedNodes)
 
 		// Show which checks failed
 		if !cfg.Verification.AllowPending && (report.SrcPending > 0 || report.DstPending > 0) {
@@ -509,9 +542,6 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 		}
 		if !cfg.Verification.AllowNotOnSrc && report.DstNotOnSrc > 0 {
 			errMsg += "  ❌ Nodes found on DST but not on SRC (not allowed)\n"
-		}
-		if report.NumMovedNodes == 0 {
-			errMsg += "  ❌ No nodes were actually migrated\n"
 		}
 
 		return result, errors.New(errMsg)

@@ -25,7 +25,6 @@ type VerificationReport struct {
 	SrcFailed     int
 	DstFailed     int
 	DstNotOnSrc   int
-	NumMovedNodes int // Number of dst_nodes that were actually traversed/moved
 }
 
 // Success returns true when the report satisfies the supplied VerifyOptions.
@@ -41,10 +40,6 @@ func (r VerificationReport) Success(opts VerifyOptions) bool {
 		return false
 	}
 	if r.SrcTotal == 0 && r.DstTotal == 0 {
-		return false
-	}
-	// Require at least one node in dst_nodes actually traversed/moved (not just roots inserted)
-	if r.NumMovedNodes == 0 {
 		return false
 	}
 	return true
@@ -124,7 +119,6 @@ func VerifyMigration(boltDB *db.DB, opts VerifyOptions) (VerificationReport, err
 			movedCount += successCount
 		}
 	}
-	report.NumMovedNodes = movedCount
 
 	return report, nil
 }

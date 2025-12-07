@@ -44,7 +44,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
 		os.Exit(1)
 	}
-	defer boltDB.Close()
 
 	// Generate report using stats bucket
 	report, err := inspectDatabase(boltDB)

@@ -225,7 +225,7 @@ func (db *DB) GetAllLevels(queueType string) ([]int, error) {
 	var levels []int
 
 	err := db.View(func(tx *bolt.Tx) error {
-		levelsBucket := getBucket(tx, []string{queueType, SubBucketLevels})
+		levelsBucket := getBucket(tx, []string{TraversalDataBucket, queueType, SubBucketLevels})
 		if levelsBucket == nil {
 			return nil // No levels yet
 		}

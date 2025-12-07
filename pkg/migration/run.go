@@ -83,22 +83,27 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 	boltDB := cfg.BoltDB
 
-	// Initialize log service and start listener
-	if !cfg.SkipListener && cfg.LogAddress != "" {
-		// Start listener terminal FIRST so it's ready before we send logs
-		if err := logservice.StartListener(cfg.LogAddress); err != nil {
-			// Non-fatal: continue without listener
-			// Don't return error - migration can still proceed
-		} else {
-			// Give the listener terminal time to start up before sending logs
-			// Use StartupDelay if provided, otherwise default to 500ms
-			startupDelay := cfg.StartupDelay
-			if startupDelay <= 0 {
-				startupDelay = 500 * time.Millisecond
+	// Initialize log service (always initialize, even if listener is skipped)
+	// The logger will still send to UDP and write to DB, we just skip starting the listener terminal
+	if cfg.LogAddress != "" {
+		// Start listener terminal ONLY if not skipped
+		if !cfg.SkipListener {
+			// Start listener terminal FIRST so it's ready before we send logs
+			if err := logservice.StartListener(cfg.LogAddress); err != nil {
+				// Non-fatal: continue without listener
+				// Don't return error - migration can still proceed
+			} else {
+				// Give the listener terminal time to start up before sending logs
+				// Use StartupDelay if provided, otherwise default to 500ms
+				startupDelay := cfg.StartupDelay
+				if startupDelay <= 0 {
+					startupDelay = 500 * time.Millisecond
+				}
+				time.Sleep(startupDelay)
 			}
-			time.Sleep(startupDelay)
 		}
-		// Now initialize logger (which sends test log)
+		// Always initialize logger (sends to UDP and writes to DB)
+		// SkipListener only affects whether we start the listener terminal window
 		if err := logservice.InitGlobalLogger(boltDB, cfg.LogAddress, cfg.LogLevel); err != nil {
 			return RuntimeStats{}, fmt.Errorf("failed to initialize logger: %w", err)
 		}
@@ -222,7 +227,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		status, statusErr := InspectMigrationStatus(boltDB)
 		if statusErr == nil {
 			UpdateConfigFromStatus(cfg.YAMLConfig, status, coordinator.GetSrcRound(), coordinator.GetDstRound())
-			cfg.YAMLConfig.State.Status = "running"
+			cfg.YAMLConfig.State.Status = StatusTraversalPending
 			_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
 		}
 	}
