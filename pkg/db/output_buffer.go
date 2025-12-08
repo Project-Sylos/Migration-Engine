@@ -4,6 +4,7 @@
 package db
 
 import (
+	"encoding/binary"
 	"fmt"
 	"strconv"
 	"strings"
@@ -103,6 +104,97 @@ func (op *CopyStatusOperation) Execute(tx *bolt.Tx) error {
 	return nil
 }
 
+// ExclusionUpdateOperation represents an exclusion state update for a node.
+type ExclusionUpdateOperation struct {
+	QueueType         string
+	Path              string
+	InheritedExcluded bool
+}
+
+// Key returns the path hash as the unique key for this operation.
+func (op *ExclusionUpdateOperation) Key() string {
+	return HashPath(op.Path)
+}
+
+// Execute performs the exclusion state update within a transaction.
+func (op *ExclusionUpdateOperation) Execute(tx *bolt.Tx) error {
+	pathHash := []byte(HashPath(op.Path))
+	nodesBucket := GetNodesBucket(tx, op.QueueType)
+	if nodesBucket == nil {
+		return fmt.Errorf("nodes bucket not found for %s", op.QueueType)
+	}
+
+	nodeData := nodesBucket.Get(pathHash)
+	if nodeData == nil {
+		return fmt.Errorf("node not found: %s", op.Path)
+	}
+
+	ns, err := DeserializeNodeState(nodeData)
+	if err != nil {
+		return fmt.Errorf("failed to deserialize node state: %w", err)
+	}
+
+	ns.InheritedExcluded = op.InheritedExcluded
+
+	updatedData, err := ns.Serialize()
+	if err != nil {
+		return fmt.Errorf("failed to serialize node state: %w", err)
+	}
+
+	if err := nodesBucket.Put(pathHash, updatedData); err != nil {
+		return fmt.Errorf("failed to update node: %w", err)
+	}
+
+	return nil
+}
+
+// ExclusionHoldingRemoveOperation represents removal of a path hash from exclusion-holding bucket.
+type ExclusionHoldingRemoveOperation struct {
+	QueueType string
+	PathHash  string
+}
+
+// Key returns the path hash as the unique key for this operation.
+func (op *ExclusionHoldingRemoveOperation) Key() string {
+	return op.PathHash
+}
+
+// Execute performs the removal from exclusion-holding bucket within a transaction.
+func (op *ExclusionHoldingRemoveOperation) Execute(tx *bolt.Tx) error {
+	holdingBucket := GetExclusionHoldingBucket(tx, op.QueueType)
+	if holdingBucket == nil {
+		return nil // Bucket doesn't exist, nothing to remove
+	}
+
+	return holdingBucket.Delete([]byte(op.PathHash))
+}
+
+// ExclusionHoldingAddOperation represents addition of a path hash to exclusion-holding bucket.
+type ExclusionHoldingAddOperation struct {
+	QueueType string
+	PathHash  string
+	Depth     int
+}
+
+// Key returns a unique key for this operation.
+func (op *ExclusionHoldingAddOperation) Key() string {
+	return fmt.Sprintf("exclusion-add-%s-%s", op.QueueType, op.PathHash)
+}
+
+// Execute performs the addition to exclusion-holding bucket within a transaction.
+func (op *ExclusionHoldingAddOperation) Execute(tx *bolt.Tx) error {
+	holdingBucket, err := GetOrCreateExclusionHoldingBucket(tx, op.QueueType)
+	if err != nil {
+		return err
+	}
+
+	// Encode depth level as 8 bytes, big-endian
+	depthBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(depthBytes, uint64(op.Depth))
+
+	return holdingBucket.Put([]byte(op.PathHash), depthBytes)
+}
+
 // OutputBuffer batches write operations for efficient database writes.
 // It supports three flush triggers: forced, size threshold, and time-based.
 type OutputBuffer struct {
@@ -168,6 +260,35 @@ func (ob *OutputBuffer) AddCopyStatusUpdate(queueType string, level int, status,
 	ob.Add(op)
 }
 
+// AddExclusionUpdate adds an exclusion state update operation to the buffer.
+func (ob *OutputBuffer) AddExclusionUpdate(queueType string, path string, inheritedExcluded bool) {
+	op := &ExclusionUpdateOperation{
+		QueueType:         queueType,
+		Path:              path,
+		InheritedExcluded: inheritedExcluded,
+	}
+	ob.Add(op)
+}
+
+// AddExclusionHoldingRemove adds a removal from exclusion-holding bucket operation to the buffer.
+func (ob *OutputBuffer) AddExclusionHoldingRemove(queueType string, pathHash string) {
+	op := &ExclusionHoldingRemoveOperation{
+		QueueType: queueType,
+		PathHash:  pathHash,
+	}
+	ob.Add(op)
+}
+
+// AddExclusionHoldingAdd adds an addition to exclusion-holding bucket operation to the buffer.
+func (ob *OutputBuffer) AddExclusionHoldingAdd(queueType string, pathHash string, depth int) {
+	op := &ExclusionHoldingAddOperation{
+		QueueType: queueType,
+		PathHash:  pathHash,
+		Depth:     depth,
+	}
+	ob.Add(op)
+}
+
 // Add adds a write operation to the buffer. If batch size is reached, it triggers a flush.
 func (ob *OutputBuffer) Add(op WriteOperation) {
 	ob.mu.Lock()
@@ -187,6 +308,22 @@ func (ob *OutputBuffer) Add(op WriteOperation) {
 		// Remove any existing copy status update for the same path
 		for i := len(ob.operations) - 1; i >= 0; i-- {
 			if existing, ok := ob.operations[i].(*CopyStatusOperation); ok && existing.Key() == key {
+				ob.operations = append(ob.operations[:i], ob.operations[i+1:]...)
+				break
+			}
+		}
+	} else if _, ok := op.(*ExclusionUpdateOperation); ok {
+		// Remove any existing exclusion update for the same path
+		for i := len(ob.operations) - 1; i >= 0; i-- {
+			if existing, ok := ob.operations[i].(*ExclusionUpdateOperation); ok && existing.Key() == key {
+				ob.operations = append(ob.operations[:i], ob.operations[i+1:]...)
+				break
+			}
+		}
+	} else if _, ok := op.(*ExclusionHoldingRemoveOperation); ok {
+		// Remove any existing exclusion-holding add for the same pathHash (can't add and remove same key)
+		for i := len(ob.operations) - 1; i >= 0; i-- {
+			if existing, ok := ob.operations[i].(*ExclusionHoldingAddOperation); ok && existing.PathHash == op.(*ExclusionHoldingRemoveOperation).PathHash {
 				ob.operations = append(ob.operations[:i], ob.operations[i+1:]...)
 				break
 			}
@@ -387,6 +524,14 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 
 		case *CopyStatusOperation:
 			// Copy status updates don't change bucket counts, just node metadata
+			// No stats updates needed
+
+		case *ExclusionUpdateOperation:
+			// Exclusion updates don't change bucket counts, just node metadata
+			// No stats updates needed
+
+		case *ExclusionHoldingRemoveOperation, *ExclusionHoldingAddOperation:
+			// Exclusion-holding bucket operations don't affect stats
 			// No stats updates needed
 		}
 	}

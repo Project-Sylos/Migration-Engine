@@ -11,19 +11,21 @@ import (
 // NodeState represents the state of a node stored in BoltDB.
 // This is used during traversal and copy phases.
 type NodeState struct {
-	ID              string `json:"id"`
-	ParentID        string `json:"parent_id"`
-	ParentPath      string `json:"parent_path"` // Parent's relative path (for querying children)
-	Name            string `json:"name"`
-	Path            string `json:"path"` // Relative to root (normalized, used for cross-service matching)
-	Type            string `json:"type"` // "file" or "folder"
-	Size            int64  `json:"size,omitempty"`
-	MTime           string `json:"mtime"` // Last modified time
-	Depth           int    `json:"depth"`
-	CopyNeeded      bool   `json:"copy_needed"`      // Set during traversal if copy is required
-	TraversalStatus string `json:"traversal_status"` // "pending", "successful", "failed", "not_on_src"
-	CopyStatus      string `json:"copy_status"`      // "pending", "successful", "failed" (for future copy phase)
-	Status          string `json:"status,omitempty"` // Legacy: Comparison status for dst nodes
+	ID                string `json:"id"`
+	ParentID          string `json:"parent_id"`
+	ParentPath        string `json:"parent_path"` // Parent's relative path (for querying children)
+	Name              string `json:"name"`
+	Path              string `json:"path"` // Relative to root (normalized, used for cross-service matching)
+	Type              string `json:"type"` // "file" or "folder"
+	Size              int64  `json:"size,omitempty"`
+	MTime             string `json:"mtime"` // Last modified time
+	Depth             int    `json:"depth"`
+	CopyNeeded        bool   `json:"copy_needed"`        // Set during traversal if copy is required
+	TraversalStatus   string `json:"traversal_status"`   // "pending", "successful", "failed", "not_on_src"
+	CopyStatus        string `json:"copy_status"`        // "pending", "successful", "failed" (for future copy phase)
+	Status            string `json:"status,omitempty"`   // Legacy: Comparison status for dst nodes
+	ExplicitExcluded  bool   `json:"explicit_excluded"`  // Set by API, not modified by engine
+	InheritedExcluded bool   `json:"inherited_excluded"` // Set by exclusion sweep engine
 }
 
 // Serialize converts NodeState to bytes for storage in BoltDB.

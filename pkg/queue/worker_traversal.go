@@ -13,17 +13,6 @@ import (
 	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
-// Worker represents a concurrent task executor.
-// Each worker independently polls its queue for work, leases tasks,
-// executes them, and reports results back to the queue and database.
-type Worker interface {
-	Run() // Main execution loop - polls queue and processes tasks
-}
-
-// ============================================================================
-// TraversalWorker
-// ============================================================================
-
 // TraversalWorker executes traversal tasks by listing children and recording them to BoltDB.
 // Each worker runs independently in its own goroutine, continuously polling the queue for work.
 type TraversalWorker struct {
@@ -102,6 +91,28 @@ func (w *TraversalWorker) Run() {
 			// No work available, sleep briefly before checking again
 			time.Sleep(50 * time.Millisecond)
 			continue
+		}
+
+		// For retry sweep mode, check if task is excluded (O(1) check)
+		w.queue.mu.RLock()
+		mode := w.queue.mode
+		boltDB := w.queue.boltDB
+		w.queue.mu.RUnlock()
+		if mode == QueueModeRetry && boltDB != nil {
+			pathHash := db.HashPath(task.LocationPath())
+			queueType := getQueueType(w.queueName)
+			excluded, err := db.CheckExclusionHoldingEntry(boltDB, queueType, pathHash)
+			if err == nil && excluded {
+				// Skip excluded nodes during retry sweep
+				if logservice.LS != nil {
+					_ = logservice.LS.Log("debug",
+						fmt.Sprintf("Skipping excluded node in retry sweep: path=%s", task.LocationPath()),
+						"worker", w.id, w.queueName)
+				}
+				// Mark as successful (skipped, not failed)
+				w.queue.ReportTaskResult(task, TaskExecutionResultSuccessful)
+				continue
+			}
 		}
 
 		// Execute the task (check for shutdown during execution if needed)
