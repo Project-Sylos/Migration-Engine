@@ -13,6 +13,7 @@ import (
 const (
 	TaskTypeSrcTraversal = "src-traversal"
 	TaskTypeDstTraversal = "dst-traversal"
+	TaskTypeExclusion    = "exclusion"
 	TaskTypeUpload       = "upload"
 	TaskTypeCopy         = "copy"
 )
@@ -32,6 +33,7 @@ type TaskBase struct {
 	DiscoveredChildren []ChildResult  // Children discovered during execution
 	Round              int            // The round this task belongs to (for buffer coordination)
 	LeaseTime          time.Time      // Time when task was leased (for execution time tracking)
+	ExclusionMode      string         // Exclusion mode: "exclude" or "unexclude" (exclusion tasks only)
 }
 
 // ChildResult represents a discovered child node with its traversal status.

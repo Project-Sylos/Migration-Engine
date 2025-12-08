@@ -15,6 +15,13 @@ import (
 	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
+// Worker represents a concurrent task executor.
+// Each worker independently polls its queue for work, leases tasks,
+// executes them, and reports results back to the queue and database.
+type Worker interface {
+	Run() // Main execution loop - polls queue and processes tasks
+}
+
 // QueueState represents the lifecycle state of a queue.
 type QueueState string
 
@@ -24,6 +31,15 @@ const (
 	QueueStateStopped   QueueState = "stopped"   // Queue is stopped
 	QueueStateWaiting   QueueState = "waiting"   // Queue is waiting for coordinator to allow advancement (DST only)
 	QueueStateCompleted QueueState = "completed" // Traversal complete (max depth reached)
+)
+
+// QueueMode represents the operation mode of a queue.
+type QueueMode string
+
+const (
+	QueueModeTraversal QueueMode = "traversal" // Normal BFS traversal
+	QueueModeExclusion QueueMode = "exclusion" // Exclusion propagation sweep
+	QueueModeRetry     QueueMode = "retry"     // Retry failed tasks sweep
 )
 
 const (
@@ -36,6 +52,7 @@ const (
 // All operational state lives in BoltDB, flushed via per-queue buffers.
 type Queue struct {
 	name               string               // Queue name ("src" or "dst")
+	mode               QueueMode            // Operation mode (traversal/exclusion/retry)
 	mu                 sync.RWMutex         // Protects all internal state
 	state              QueueState           // Lifecycle state (running/paused/stopped/completed/waiting)
 	inProgress         map[string]*TaskBase // Tasks currently being executed (keyed by path)
@@ -64,12 +81,15 @@ type Queue struct {
 	avgExecutionTime    time.Duration   // Average execution time (calculated periodically)
 	lastAvgTime         time.Time       // Last time average was calculated
 	avgInterval         time.Duration   // Interval for calculating averages
+	// Retry sweep specific fields
+	maxKnownDepth int // Maximum known depth from previous traversal (for retry sweep)
 }
 
 // NewQueue creates a new Queue instance.
 func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCoordinator) *Queue {
 	return &Queue{
 		name:                name,
+		mode:                QueueModeTraversal, // Default to traversal mode
 		state:               QueueStateRunning,
 		inProgress:          make(map[string]*TaskBase),
 		pendingBuff:         make([]*TaskBase, 0, defaultLeaseBatchSize),
@@ -85,7 +105,49 @@ func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCo
 		executionTimeDeltas: make([]time.Duration, 0, 100), // Buffer capacity 100
 		avgInterval:         5 * time.Second,               // Calculate average every 5 seconds
 		lastAvgTime:         time.Now(),
+		maxKnownDepth:       -1, // -1 means not set yet
 	}
+}
+
+// SetMode sets the queue operation mode.
+func (q *Queue) SetMode(mode QueueMode) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.mode = mode
+}
+
+// GetMode returns the current queue mode (implements worker.QueueAccessor).
+func (q *Queue) GetMode() string {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return string(q.mode)
+}
+
+// GetBoltDB returns the BoltDB instance (implements worker.QueueAccessor).
+func (q *Queue) GetBoltDB() interface{} {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.boltDB
+}
+
+// GetOutputBuffer returns the output buffer (implements worker.QueueAccessor).
+func (q *Queue) GetOutputBuffer() interface{} {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.outputBuffer
+}
+
+// GetPendingSet returns a copy of the pending set (implements worker.QueueAccessor).
+// This is thread-safe but returns a snapshot.
+func (q *Queue) GetPendingSet() map[string]struct{} {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	// Return a copy to avoid race conditions
+	result := make(map[string]struct{})
+	for k, v := range q.pendingSet {
+		result[k] = v
+	}
+	return result
 }
 
 // InitializeWithContext sets up the queue with BoltDB, context, and filesystem adapter references.
@@ -105,17 +167,34 @@ func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter types.FSAdapt
 	q.outputBuffer = db.NewOutputBuffer(boltInstance, 1000, 1*time.Second)
 
 	// Create and start workers - they manage themselves
+	// Worker type depends on queue mode
+	q.mu.RLock()
+	mode := q.mode
+	q.mu.RUnlock()
+
 	for i := 0; i < workerCount; i++ {
-		worker := NewTraversalWorker(
-			fmt.Sprintf("%s-worker-%d", q.name, i),
-			q,
-			boltInstance,
-			adapter,
-			q.name,
-			shutdownCtx,
-		)
-		q.AddWorker(worker)
-		go worker.Run()
+		var w Worker
+		if mode == QueueModeExclusion {
+			w = NewExclusionWorker(
+				fmt.Sprintf("%s-exclusion-worker-%d", q.name, i),
+				q,
+				boltInstance,
+				q.name,
+				shutdownCtx,
+			)
+		} else {
+			// Traversal or retry mode use traversal workers
+			w = NewTraversalWorker(
+				fmt.Sprintf("%s-worker-%d", q.name, i),
+				q,
+				boltInstance,
+				adapter,
+				q.name,
+				shutdownCtx,
+			)
+		}
+		q.AddWorker(w)
+		go w.Run()
 	}
 
 	// Coordinator handles round advancement gates for DST
@@ -463,6 +542,12 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		return
 	}
 
+	// Handle exclusion tasks differently
+	if task.Type == TaskTypeExclusion {
+		q.completeExclusionTask(task)
+		return
+	}
+
 	// Convert task to NodeState for BoltDB
 	state := taskToNodeState(task)
 	if state == nil {
@@ -629,6 +714,31 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 	}
 }
 
+// completeExclusionTask handles completion of exclusion tasks.
+// Workers have already done the DB operations, so this just updates queue state.
+func (q *Queue) completeExclusionTask(task *TaskBase) {
+	currentRound := task.Round
+	path := task.LocationPath()
+	pathHash := db.HashPath(path)
+
+	q.mu.Lock()
+	// Remove from in-progress
+	delete(q.inProgress, path)
+	delete(q.leasedKeys, pathHash)
+	task.Locked = false
+	task.Status = "successful"
+
+	roundStats := q.getOrCreateRoundStats(currentRound)
+	roundStats.Completed++
+	q.mu.Unlock()
+
+	// Workers have already:
+	// 1. Read children from children bucket
+	// 2. Written children to exclusion-holding bucket
+	// 3. Queued exclusion update via output buffer
+	// Queue just needs to track completion stats
+}
+
 func childResultToNodeState(child ChildResult, parentPath string, depth int) *db.NodeState {
 	if child.IsFile {
 		file := child.File
@@ -680,7 +790,7 @@ func (q *Queue) PullTasksIfNeeded(force bool) {
 	// We don't set it here because we need to know if it was the first pull when checking completion
 
 	if force {
-		q.PullTasks(true)
+		q.pullTasksForMode(true)
 		return
 	}
 
@@ -691,222 +801,30 @@ func (q *Queue) PullTasksIfNeeded(force bool) {
 	needPull := q.state == QueueStateRunning && len(q.pendingBuff) <= q.pullLowWM && !q.pulling && !lastPullWasPartial
 	q.mu.RUnlock()
 	if needPull {
-		q.PullTasks(false)
+		q.pullTasksForMode(false)
 	}
 }
 
-func (q *Queue) PullTasks(force bool) {
-	if q.boltDB == nil {
-		return
+// pullTasksForMode selects the appropriate pull method based on queue mode.
+func (q *Queue) pullTasksForMode(force bool) {
+	q.mu.RLock()
+	mode := q.mode
+	q.mu.RUnlock()
+
+	switch mode {
+	case QueueModeExclusion:
+		q.PullExclusionTasks(force)
+	case QueueModeRetry:
+		q.PullRetryTasks(force)
+	default: // QueueModeTraversal
+		q.PullTraversalTasks(force)
 	}
-
-	// Check pulling flag FIRST before any other logic
-	// This prevents multiple threads from executing pull logic concurrently
-	q.mu.Lock()
-	if q.pulling {
-		q.mu.Unlock()
-		return
-	}
-
-	// Don't pull if queue is completed (prevents deadlock on coordinator gate)
-	if q.state == QueueStateCompleted {
-		q.mu.Unlock()
-		return
-	}
-
-	// Set pulling flag early and defer clearing it
-	// This ensures only one thread can execute the pull logic at a time
-	q.pulling = true
-	outputBuffer := q.outputBuffer
-	q.mu.Unlock()
-
-	// Always clear pulling flag when done
-	defer func() {
-		q.mu.Lock()
-		q.pulling = false
-		q.mu.Unlock()
-	}()
-
-	// Force-flush buffer before pulling tasks to ensure we don't pull tasks
-	// that are waiting in the buffer to be written
-	if outputBuffer != nil {
-		outputBuffer.Flush()
-	}
-
-	queueType := getQueueType(q.name)
-	taskType := TaskTypeSrcTraversal
-	if q.name == "dst" {
-		taskType = TaskTypeDstTraversal
-	}
-
-	q.mu.Lock()
-	queueState := q.state
-	pendingCount := len(q.pendingBuff)
-
-	if !force {
-		// Only pull if queue is running (not paused or completed)
-		if queueState != QueueStateRunning || pendingCount > q.pullLowWM {
-			q.mu.Unlock()
-			return
-		}
-	} else {
-		// Even when forcing, don't pull if paused
-		if queueState == QueueStatePaused {
-			q.mu.Unlock()
-			return
-		}
-	}
-
-	// Track if this is the first pull for the round (before we potentially set it to false)
-	wasFirstPullForRound := q.firstPullForRound
-	currentRound := q.round
-
-	// For DST: Check if there are any pending tasks in current round BEFORE checking coordinator gate
-	// This allows us to exit early if there's no work, avoiding unnecessary waiting at the gate
-	// Skip this check for round 0 (bootstrap round) - we need to process at least one round before checking completion
-	if q.name == "dst" && q.coordinator != nil && currentRound > 0 {
-		q.mu.Unlock()
-
-		// Check if DST is complete (requires first pull to avoid false positives)
-		if q.checkCompletion(currentRound, CompletionCheckOptions{
-			CheckDstComplete:      true,
-			MarkDstCompleteIfDone: true,
-			RequireFirstPull:      true,
-			FlushBuffer:           true,
-		}) {
-			return
-		}
-
-		// There are tasks (in-memory or in DB) - check coordinator gate
-		q.mu.Lock()
-		canStartRound := q.coordinator.CanDstStartRound(currentRound)
-		if !canStartRound {
-			// Can't start this round yet - wait for coordinator gate
-			q.mu.Unlock()
-			return
-		}
-		// Gate passed - we'll mark firstPullForRound = false only after actually fetching tasks
-	} else if q.name == "dst" && q.coordinator != nil && currentRound == 0 {
-		// For round 0, just check the coordinator gate (no completion check)
-		q.mu.Unlock()
-		q.mu.Lock()
-		canStartRound := q.coordinator.CanDstStartRound(currentRound)
-		if !canStartRound {
-			// Can't start this round yet - wait for coordinator gate
-			q.mu.Unlock()
-			return
-		}
-		// Gate passed - we'll mark firstPullForRound = false only after actually fetching tasks
-	}
-
-	q.mu.Unlock()
-
-	batch, err := db.BatchFetchWithKeys(q.boltDB, queueType, currentRound, db.StatusPending, defaultLeaseBatchSize)
-
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	if err != nil {
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to fetch batch from BoltDB: %v", err), "queue", q.name, q.name)
-		}
-		// On error, don't change lastPullWasPartial - keep existing state
-		// Also don't set firstPullForRound = false since pull failed
-		return
-	}
-
-	// Pull was successful - set firstPullForRound = false only if we actually fetched tasks
-	// This ensures we only mark completion on the actual first pull that fetched tasks
-	if wasFirstPullForRound && len(batch) > 0 {
-		q.firstPullForRound = false
-	}
-
-	// we've exhausted max depth - mark queue as completed
-	if wasFirstPullForRound && len(batch) == 0 {
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("info",
-				fmt.Sprintf("First pull for round %d returned empty batch - traversal complete (max depth exhausted)", currentRound),
-				"queue", q.name, q.name)
-		}
-		q.state = QueueStateCompleted
-		// Update coordinator
-		if q.coordinator != nil {
-			switch q.name {
-			case "src":
-				q.coordinator.MarkSrcCompleted()
-			case "dst":
-				q.coordinator.MarkDstCompleted()
-			}
-		}
-		return
-	}
-
-	// Batch-load expected children for DST tasks
-	var expectedFoldersMap map[string][]types.Folder
-	var expectedFilesMap map[string][]types.File
-	if q.name == "dst" {
-		// First pass: collect all valid (not already leased) folder tasks and their parent paths
-		var parentPaths []string
-		for _, item := range batch {
-			// Skip path hashes we've already leased (prevents duplicate pulls from stale views)
-			if _, exists := q.leasedKeys[item.Key]; exists {
-				continue
-			}
-
-			task := nodeStateToTask(item.State, taskType)
-			if task.IsFolder() {
-				parentPaths = append(parentPaths, task.Folder.LocationPath)
-			}
-		}
-
-		// Batch-load expected children for all folder tasks in one DB operation
-		if len(parentPaths) > 0 {
-			var err error
-			expectedFoldersMap, expectedFilesMap, err = BatchLoadExpectedChildren(q.boltDB, parentPaths)
-			if err != nil {
-				if logservice.LS != nil {
-					_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to batch load expected children: %v", err), "queue", q.name, q.name)
-				}
-				// Continue anyway - tasks will have empty expected children
-				expectedFoldersMap = make(map[string][]types.Folder)
-				expectedFilesMap = make(map[string][]types.File)
-			}
-		}
-	}
-
-	added := 0
-	for _, item := range batch {
-		// Skip path hashes we've already leased (prevents duplicate pulls from stale views)
-		if _, exists := q.leasedKeys[item.Key]; exists {
-			continue
-		}
-
-		// Mark this path hash as leased
-		q.leasedKeys[item.Key] = struct{}{}
-
-		task := nodeStateToTask(item.State, taskType)
-
-		// For DST folder tasks, populate ExpectedFolders/ExpectedFiles from batch-loaded results
-		if q.name == "dst" && task.IsFolder() {
-			parentPath := task.Folder.LocationPath
-			expectedFolders := expectedFoldersMap[parentPath]
-			expectedFiles := expectedFilesMap[parentPath]
-			task.ExpectedFolders = expectedFolders
-			task.ExpectedFiles = expectedFiles
-		}
-
-		beforeCount := len(q.pendingBuff)
-		q.enqueuePendingLocked(task)
-		if len(q.pendingBuff) > beforeCount {
-			added++
-		}
-	}
-
-	// Track if this pull was partial (fewer tasks than requested)
-	// This signals we might have exhausted the current round
-	q.lastPullWasPartial = len(batch) < defaultLeaseBatchSize
-
 }
+
+// Pull methods are now organized in separate files:
+// - PullTraversalTasks: mode_traversal.go
+// - PullExclusionTasks: mode_exclusion.go
+// - PullRetryTasks: mode_retry.go
 
 func (q *Queue) enqueuePendingLocked(task *TaskBase) {
 	if task == nil {
@@ -1372,9 +1290,14 @@ func (q *Queue) Run() {
 		// Get current round
 		currentRound := q.getRound()
 
+		q.mu.RLock()
+		mode := q.mode
+		q.mu.RUnlock()
+
 		// GATE CHECK: Can we start processing this round? (DST only - SRC has no gates)
+		// Exclusion mode has no coordinator gating (single queue operation)
 		// This check happens IMMEDIATELY at the start of each iteration, before any task processing.
-		if q.name == "dst" && q.coordinator != nil {
+		if q.name == "dst" && q.coordinator != nil && mode != QueueModeExclusion {
 			canStartRound := q.coordinator.CanDstStartRound(currentRound)
 
 			if !canStartRound {
@@ -1513,7 +1436,7 @@ func (q *Queue) advanceToNextRound() {
 	}
 
 	// Pull tasks for the new round
-	// pullTasks() will flush buffer first, then pull tasks
+	// pullTasksForMode() will flush buffer first, then pull tasks
 	// Round completion will be detected naturally by checkCompletion() when:
 	// - inProgress == 0
 	// - pendingBuff == 0
