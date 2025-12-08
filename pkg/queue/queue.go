@@ -573,7 +573,8 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		}
 	}
 
-	// 3. Handle DST queue special case: create tasks with ExpectedFolders/ExpectedFiles
+	// 3. Handle DST queue special case: create tasks for child folders
+	// Note: ExpectedFolders/ExpectedFiles will be loaded later during PullTasks() batch loading
 	if q.name == "dst" && q.srcQueue != nil {
 		var childFolders []types.Folder
 		totalFolders := 0
@@ -591,22 +592,11 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		}
 
 		for _, childFolder := range childFolders {
-			childPath := childFolder.LocationPath
-			expectedFolders, expectedFiles, err := LoadExpectedChildren(q.boltDB, childPath, nextRound)
-			if err != nil {
-				if logservice.LS != nil {
-					_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to load expected children for %s at level %d: %v", childPath, nextRound, err), "queue", q.name, q.name)
-				}
-				continue
-			}
-
-			// Create task state for DST child
+			// Create task state for DST child (without ExpectedFolders/ExpectedFiles - loaded in PullTasks)
 			taskState := taskToNodeState(&TaskBase{
-				Type:            TaskTypeDstTraversal,
-				Folder:          childFolder,
-				ExpectedFolders: expectedFolders,
-				ExpectedFiles:   expectedFiles,
-				Round:           nextRound,
+				Type:   TaskTypeDstTraversal,
+				Folder: childFolder,
+				Round:  nextRound,
 			})
 			if taskState != nil {
 				// Populate traversal status in the NodeState metadata
@@ -851,6 +841,39 @@ func (q *Queue) PullTasks(force bool) {
 		return
 	}
 
+	// Batch-load expected children for DST tasks
+	var expectedFoldersMap map[string][]types.Folder
+	var expectedFilesMap map[string][]types.File
+	if q.name == "dst" {
+		// First pass: collect all valid (not already leased) folder tasks and their parent paths
+		var parentPaths []string
+		for _, item := range batch {
+			// Skip path hashes we've already leased (prevents duplicate pulls from stale views)
+			if _, exists := q.leasedKeys[item.Key]; exists {
+				continue
+			}
+
+			task := nodeStateToTask(item.State, taskType)
+			if task.IsFolder() {
+				parentPaths = append(parentPaths, task.Folder.LocationPath)
+			}
+		}
+
+		// Batch-load expected children for all folder tasks in one DB operation
+		if len(parentPaths) > 0 {
+			var err error
+			expectedFoldersMap, expectedFilesMap, err = BatchLoadExpectedChildren(q.boltDB, parentPaths)
+			if err != nil {
+				if logservice.LS != nil {
+					_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to batch load expected children: %v", err), "queue", q.name, q.name)
+				}
+				// Continue anyway - tasks will have empty expected children
+				expectedFoldersMap = make(map[string][]types.Folder)
+				expectedFilesMap = make(map[string][]types.File)
+			}
+		}
+	}
+
 	added := 0
 	for _, item := range batch {
 		// Skip path hashes we've already leased (prevents duplicate pulls from stale views)
@@ -863,18 +886,13 @@ func (q *Queue) PullTasks(force bool) {
 
 		task := nodeStateToTask(item.State, taskType)
 
-		// For DST tasks, populate ExpectedFolders/ExpectedFiles from SRC using the children index
+		// For DST folder tasks, populate ExpectedFolders/ExpectedFiles from batch-loaded results
 		if q.name == "dst" && task.IsFolder() {
-			expectedFolders, expectedFiles, err := LoadExpectedChildren(q.boltDB, task.Folder.LocationPath, currentRound)
-			if err != nil {
-				if logservice.LS != nil {
-					_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to load expected children for %s at level %d: %v", task.Folder.LocationPath, currentRound, err), "queue", q.name, q.name)
-				}
-				// Continue anyway - empty expected children will mark everything as NotOnSrc
-			} else {
-				task.ExpectedFolders = expectedFolders
-				task.ExpectedFiles = expectedFiles
-			}
+			parentPath := task.Folder.LocationPath
+			expectedFolders := expectedFoldersMap[parentPath]
+			expectedFiles := expectedFilesMap[parentPath]
+			task.ExpectedFolders = expectedFolders
+			task.ExpectedFiles = expectedFiles
 		}
 
 		beforeCount := len(q.pendingBuff)
