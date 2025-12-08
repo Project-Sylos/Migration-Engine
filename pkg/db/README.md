@@ -420,13 +420,13 @@ err := database.Update(func(tx *bolt.Tx) error {
 
 ```go
 // Get bucket paths
-nodesPath := db.GetNodesBucketPath("SRC")        // ["SRC", "nodes"]
-childrenPath := db.GetChildrenBucketPath("SRC")  // ["SRC", "children"]
-levelPath := db.GetLevelBucketPath("SRC", 1)     // ["SRC", "levels", "00000001"]
+nodesPath := db.GetNodesBucketPath("SRC")        // ["Traversal-Data", "SRC", "nodes"]
+childrenPath := db.GetChildrenBucketPath("SRC")  // ["Traversal-Data", "SRC", "children"]
+levelPath := db.GetLevelBucketPath("SRC", 1)     // ["Traversal-Data", "SRC", "levels", "00000001"]
 statusPath := db.GetStatusBucketPath("SRC", 1, db.StatusPending)
-// ["SRC", "levels", "00000001", "pending"]
+// ["Traversal-Data", "SRC", "levels", "00000001", "pending"]
 lookupPath := db.GetStatusLookupBucketPath("SRC", 1)
-// ["SRC", "levels", "00000001", "status-lookup"]
+// ["Traversal-Data", "SRC", "levels", "00000001", "status-lookup"]
 
 // Create level bucket with all status sub-buckets and status-lookup index
 err := db.EnsureLevelBucket(tx, "SRC", 1)

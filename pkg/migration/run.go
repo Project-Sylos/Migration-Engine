@@ -321,10 +321,15 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		bothCompleted := coordinator.IsCompleted("both")
 
 		if bothCompleted {
-			if logservice.LS != nil {
-				_ = logservice.LS.Log("debug",
-					"Migration loop: Both queues completed, exiting migration",
-					"migration", "run", "run")
+
+			// Ensure exclusion-holding buckets exist for exclusion intent queuing
+			if err := db.EnsureExclusionHoldingBuckets(boltDB); err != nil {
+				if logservice.LS != nil {
+					_ = logservice.LS.Log("warning",
+						fmt.Sprintf("Failed to ensure exclusion-holding buckets: %v", err),
+						"migration", "run", "run")
+				}
+				// Non-fatal - continue with completion
 			}
 
 			// Get stats directly (non-blocking)
@@ -342,9 +347,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 					done := make(chan error, 1)
 					go func() {
-						if logservice.LS != nil {
-							_ = logservice.LS.Log("debug", "Starting YAML config save...", "migration", "run", "run")
-						}
 						status, statusErr := InspectMigrationStatus(boltDB)
 						if statusErr != nil {
 							if logservice.LS != nil {
@@ -352,9 +354,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 							}
 							done <- statusErr
 							return
-						}
-						if logservice.LS != nil {
-							_ = logservice.LS.Log("debug", "InspectMigrationStatus completed", "migration", "run", "run")
 						}
 						UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
 						done <- SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
@@ -366,10 +365,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 							if logservice.LS != nil {
 								_ = logservice.LS.Log("warning", fmt.Sprintf("Config save failed: %v", err), "migration", "run", "run")
 							}
-						} else {
-							if logservice.LS != nil {
-								_ = logservice.LS.Log("debug", "YAML config save completed", "migration", "run", "run")
-							}
 						}
 					case <-ctx.Done():
 						if logservice.LS != nil {
@@ -377,10 +372,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 						}
 					}
 				}()
-			}
-
-			if logservice.LS != nil {
-				_ = logservice.LS.Log("debug", "About to return from RunMigration", "migration", "run", "run")
 			}
 
 			// Stop progress ticker to prevent any more ticks
@@ -417,6 +408,16 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		case <-progressTicker.C:
 			// Re-check exhaustion from coordinator (queues might have completed during tick)
 			if coordinator.IsCompleted("both") {
+				// Ensure exclusion-holding buckets exist for exclusion intent queuing
+				if err := db.EnsureExclusionHoldingBuckets(boltDB); err != nil {
+					if logservice.LS != nil {
+						_ = logservice.LS.Log("warning",
+							fmt.Sprintf("Failed to ensure exclusion-holding buckets: %v", err),
+							"migration", "run", "run")
+					}
+					// Non-fatal - continue with completion
+				}
+
 				// Get stats directly (non-blocking)
 				srcStats, dstStats := getQueueStats(coordinator, boltDB)
 				fmt.Println("\nMigration complete!")

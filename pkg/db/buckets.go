@@ -49,10 +49,11 @@ const (
 
 // Sub-bucket names
 const (
-	SubBucketNodes        = "nodes"
-	SubBucketChildren     = "children"
-	SubBucketLevels       = "levels"
-	SubBucketStatusLookup = "status-lookup"
+	SubBucketNodes            = "nodes"
+	SubBucketChildren         = "children"
+	SubBucketLevels           = "levels"
+	SubBucketStatusLookup     = "status-lookup"
+	SubBucketExclusionHolding = "exclusion-holding"
 )
 
 // FormatLevel formats a level number as an 8-digit zero-padded string.
@@ -105,6 +106,12 @@ func GetLogsBucketPath() []string {
 // Returns: ["Traversal-Data", "STATS", "queue-stats"]
 func GetQueueStatsBucketPath() []string {
 	return []string{TraversalDataBucket, StatsBucketName, "queue-stats"}
+}
+
+// GetExclusionHoldingBucketPath returns the bucket path for the exclusion-holding bucket.
+// Returns: ["Traversal-Data", "SRC", "exclusion-holding"] or ["Traversal-Data", "DST", "exclusion-holding"]
+func GetExclusionHoldingBucketPath(queueType string) []string {
+	return []string{TraversalDataBucket, queueType, SubBucketExclusionHolding}
 }
 
 // EnsureLevelBucket creates a level bucket and its status sub-buckets if they don't exist.
@@ -217,4 +224,18 @@ func UpdateStatusLookup(tx *bolt.Tx, queueType string, level int, pathHash []byt
 		return fmt.Errorf("failed to get status-lookup bucket: %w", err)
 	}
 	return lookupBucket.Put(pathHash, []byte(status))
+}
+
+// GetExclusionHoldingBucket returns the exclusion-holding bucket for a queue type.
+// This bucket stores path hash keys with their depth level as values.
+// Key: path hash (string), Value: depth level (int, stored as bytes)
+func GetExclusionHoldingBucket(tx *bolt.Tx, queueType string) *bolt.Bucket {
+	return getBucket(tx, GetExclusionHoldingBucketPath(queueType))
+}
+
+// GetOrCreateExclusionHoldingBucket returns or creates the exclusion-holding bucket for a queue type.
+// This bucket stores path hash keys with their depth level as values.
+// Key: path hash (string), Value: depth level (int, stored as bytes)
+func GetOrCreateExclusionHoldingBucket(tx *bolt.Tx, queueType string) (*bolt.Bucket, error) {
+	return getOrCreateBucket(tx, GetExclusionHoldingBucketPath(queueType))
 }
