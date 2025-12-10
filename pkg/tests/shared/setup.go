@@ -128,7 +128,7 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 		LogAddress:      "127.0.0.1:8081",
 		LogLevel:        "trace",
 		StartupDelay:    3 * time.Second,
-		Verification:    migration.VerifyOptions{AllowFailed: true},
+		Verification:    migration.VerifyOptions{},
 	}
 
 	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {
@@ -263,7 +263,7 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 		LogAddress:      "127.0.0.1:8081",
 		LogLevel:        "trace",
 		StartupDelay:    3 * time.Second,
-		Verification:    migration.VerifyOptions{AllowFailed: true},
+		Verification:    migration.VerifyOptions{},
 	}
 
 	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {

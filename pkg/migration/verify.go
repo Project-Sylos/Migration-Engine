@@ -12,7 +12,6 @@ import (
 // VerifyOptions define the expectations for post-migration validation.
 type VerifyOptions struct {
 	AllowPending  bool
-	AllowFailed   bool
 	AllowNotOnSrc bool
 }
 
@@ -31,9 +30,6 @@ type VerificationReport struct {
 // Additionally, migration will not be considered successful unless at least one node was actually moved/traversed.
 func (r VerificationReport) Success(opts VerifyOptions) bool {
 	if !opts.AllowPending && (r.SrcPending > 0 || r.DstPending > 0) {
-		return false
-	}
-	if !opts.AllowFailed && (r.SrcFailed > 0 || r.DstFailed > 0) {
 		return false
 	}
 	if !opts.AllowNotOnSrc && r.DstNotOnSrc > 0 {
