@@ -49,11 +49,12 @@ const (
 
 // Sub-bucket names
 const (
-	SubBucketNodes            = "nodes"
-	SubBucketChildren         = "children"
-	SubBucketLevels           = "levels"
-	SubBucketStatusLookup     = "status-lookup"
-	SubBucketExclusionHolding = "exclusion-holding"
+	SubBucketNodes              = "nodes"
+	SubBucketChildren           = "children"
+	SubBucketLevels             = "levels"
+	SubBucketStatusLookup       = "status-lookup"
+	SubBucketExclusionHolding   = "exclusion-holding"
+	SubBucketUnexclusionHolding = "unexclusion-holding"
 )
 
 // FormatLevel formats a level number as an 8-digit zero-padded string.
@@ -112,6 +113,12 @@ func GetQueueStatsBucketPath() []string {
 // Returns: ["Traversal-Data", "SRC", "exclusion-holding"] or ["Traversal-Data", "DST", "exclusion-holding"]
 func GetExclusionHoldingBucketPath(queueType string) []string {
 	return []string{TraversalDataBucket, queueType, SubBucketExclusionHolding}
+}
+
+// GetUnexclusionHoldingBucketPath returns the bucket path for the unexclusion-holding bucket.
+// Returns: ["Traversal-Data", "SRC", "unexclusion-holding"] or ["Traversal-Data", "DST", "unexclusion-holding"]
+func GetUnexclusionHoldingBucketPath(queueType string) []string {
+	return []string{TraversalDataBucket, queueType, SubBucketUnexclusionHolding}
 }
 
 // EnsureLevelBucket creates a level bucket and its status sub-buckets if they don't exist.
@@ -238,4 +245,44 @@ func GetExclusionHoldingBucket(tx *bolt.Tx, queueType string) *bolt.Bucket {
 // Key: path hash (string), Value: depth level (int, stored as bytes)
 func GetOrCreateExclusionHoldingBucket(tx *bolt.Tx, queueType string) (*bolt.Bucket, error) {
 	return getOrCreateBucket(tx, GetExclusionHoldingBucketPath(queueType))
+}
+
+// GetUnexclusionHoldingBucket returns the unexclusion-holding bucket for a queue type.
+// This bucket stores path hash keys with their depth level as values.
+// Key: path hash (string), Value: depth level (int, stored as bytes)
+func GetUnexclusionHoldingBucket(tx *bolt.Tx, queueType string) *bolt.Bucket {
+	return getBucket(tx, GetUnexclusionHoldingBucketPath(queueType))
+}
+
+// GetOrCreateUnexclusionHoldingBucket returns or creates the unexclusion-holding bucket for a queue type.
+// This bucket stores path hash keys with their depth level as values.
+// Key: path hash (string), Value: depth level (int, stored as bytes)
+func GetOrCreateUnexclusionHoldingBucket(tx *bolt.Tx, queueType string) (*bolt.Bucket, error) {
+	return getOrCreateBucket(tx, GetUnexclusionHoldingBucketPath(queueType))
+}
+
+// GetHoldingBucket returns the appropriate holding bucket based on mode.
+// mode should be "exclude" or "unexclude"
+func GetHoldingBucket(tx *bolt.Tx, queueType string, mode string) *bolt.Bucket {
+	switch mode {
+	case "exclude":
+		return GetExclusionHoldingBucket(tx, queueType)
+	case "unexclude":
+		return GetUnexclusionHoldingBucket(tx, queueType)
+	default:
+		return nil
+	}
+}
+
+// GetOrCreateHoldingBucket returns or creates the appropriate holding bucket based on mode.
+// mode should be "exclude" or "unexclude"
+func GetOrCreateHoldingBucket(tx *bolt.Tx, queueType string, mode string) (*bolt.Bucket, error) {
+	switch mode {
+	case "exclude":
+		return GetOrCreateExclusionHoldingBucket(tx, queueType)
+	case "unexclude":
+		return GetOrCreateUnexclusionHoldingBucket(tx, queueType)
+	default:
+		return nil, fmt.Errorf("invalid exclusion mode: %s", mode)
+	}
 }

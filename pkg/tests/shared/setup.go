@@ -4,6 +4,7 @@
 package shared
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,21 +16,46 @@ import (
 	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
-// setupSpectraFS creates a SpectraFS instance, handling DB cleanup appropriately.
+// SetupSpectraFS creates a SpectraFS instance, handling DB cleanup appropriately.
 // Since each test run is a separate process, we can't rely on in-memory state.
-// Instead, we check if the DB file exists and only clean it if explicitly requested.
+// Instead, we check if the DB file exists (from the config) and only clean it if explicitly requested.
 // The SDK should load existing data from the DB file if it exists.
-func setupSpectraFS(configPath string, cleanDB bool) (*sdk.SpectraFS, error) {
+// The configPath should point to a JSON config file that contains the db_path.
+func SetupSpectraFS(configPath string, cleanDB bool) (*sdk.SpectraFS, error) {
+	// Read config to get the actual DB path
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	// Parse config to get db_path (simple JSON parsing)
+	var config struct {
+		Seed struct {
+			DBPath string `json:"db_path"`
+		} `json:"seed"`
+	}
+	if err := json.Unmarshal(configData, &config); err != nil {
+		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	// Resolve DB path relative to config file location
+	configDir := filepath.Dir(configPath)
+	dbPath := config.Seed.DBPath
+	if !filepath.IsAbs(dbPath) {
+		// If relative, resolve relative to config file directory
+		dbPath = filepath.Join(configDir, dbPath)
+	}
+
 	// Check if DB file exists
 	dbExists := false
-	if _, err := os.Stat("./spectra.db"); err == nil {
+	if _, err := os.Stat(dbPath); err == nil {
 		dbExists = true
 	}
 
 	// Clean DB only if explicitly requested
 	if cleanDB && dbExists {
 		fmt.Println("Cleaning up previous Spectra state...")
-		if err := os.Remove("./spectra.db"); err != nil {
+		if err := os.Remove(dbPath); err != nil {
 			return nil, fmt.Errorf("failed to remove existing Spectra DB: %w", err)
 		}
 	}
@@ -51,7 +77,7 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 	fmt.Println("Loading Spectra configuration...")
 
 	// Create SpectraFS instance (SDK should load existing DB data if file exists)
-	spectraFS, err := setupSpectraFS("pkg/configs/spectra.json", cleanSpectraDB)
+	spectraFS, err := SetupSpectraFS("pkg/configs/spectra.json", cleanSpectraDB)
 	if err != nil {
 		return migration.Config{}, err
 	}

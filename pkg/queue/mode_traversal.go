@@ -12,36 +12,32 @@ import (
 )
 
 // PullTraversalTasks pulls traversal tasks from BoltDB for the current round.
+// Uses getter/setter methods - no direct mutex access.
 func (q *Queue) PullTraversalTasks(force bool) {
-	if q.boltDB == nil {
+	boltDB := q.getBoltDB()
+	if boltDB == nil {
 		return
 	}
 
 	// Check pulling flag FIRST before any other logic
 	// This prevents multiple threads from executing pull logic concurrently
-	q.mu.Lock()
-	if q.pulling {
-		q.mu.Unlock()
+	if q.getPulling() {
 		return
 	}
 
 	// Don't pull if queue is completed (prevents deadlock on coordinator gate)
-	if q.state == QueueStateCompleted {
-		q.mu.Unlock()
+	if q.getState() == QueueStateCompleted {
 		return
 	}
 
 	// Set pulling flag early and defer clearing it
 	// This ensures only one thread can execute the pull logic at a time
-	q.pulling = true
-	outputBuffer := q.outputBuffer
-	q.mu.Unlock()
+	q.setPulling(true)
+	outputBuffer := q.getOutputBuffer()
 
 	// Always clear pulling flag when done
 	defer func() {
-		q.mu.Lock()
-		q.pulling = false
-		q.mu.Unlock()
+		q.setPulling(false)
 	}()
 
 	// Force-flush buffer before pulling tasks to ensure we don't pull tasks
@@ -56,34 +52,30 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		taskType = TaskTypeDstTraversal
 	}
 
-	q.mu.Lock()
-	queueState := q.state
-	pendingCount := len(q.pendingBuff)
+	// Get state snapshot
+	snapshot := q.getStateSnapshot()
 
 	if !force {
 		// Only pull if queue is running (not paused or completed)
-		if queueState != QueueStateRunning || pendingCount > q.pullLowWM {
-			q.mu.Unlock()
+		if snapshot.State != QueueStateRunning || snapshot.PendingCount > snapshot.PullLowWM {
 			return
 		}
 	} else {
 		// Even when forcing, don't pull if paused
-		if queueState == QueueStatePaused {
-			q.mu.Unlock()
+		if snapshot.State == QueueStatePaused {
 			return
 		}
 	}
 
 	// Track if this is the first pull for the round (before we potentially set it to false)
-	wasFirstPullForRound := q.firstPullForRound
-	currentRound := q.round
+	wasFirstPullForRound := snapshot.FirstPullForRound
+	currentRound := snapshot.Round
+	coordinator := q.getCoordinator()
 
 	// For DST: Check if there are any pending tasks in current round BEFORE checking coordinator gate
 	// This allows us to exit early if there's no work, avoiding unnecessary waiting at the gate
 	// Skip this check for round 0 (bootstrap round) - we need to process at least one round before checking completion
-	if q.name == "dst" && q.coordinator != nil && currentRound > 0 {
-		q.mu.Unlock()
-
+	if q.name == "dst" && coordinator != nil && currentRound > 0 {
 		// Check if DST is complete (requires first pull to avoid false positives)
 		if q.checkCompletion(currentRound, CompletionCheckOptions{
 			CheckDstComplete:      true,
@@ -95,33 +87,23 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		}
 
 		// There are tasks (in-memory or in DB) - check coordinator gate
-		q.mu.Lock()
-		canStartRound := q.coordinator.CanDstStartRound(currentRound)
+		canStartRound := coordinator.CanDstStartRound(currentRound)
 		if !canStartRound {
 			// Can't start this round yet - wait for coordinator gate
-			q.mu.Unlock()
 			return
 		}
 		// Gate passed - we'll mark firstPullForRound = false only after actually fetching tasks
-	} else if q.name == "dst" && q.coordinator != nil && currentRound == 0 {
+	} else if q.name == "dst" && coordinator != nil && currentRound == 0 {
 		// For round 0, just check the coordinator gate (no completion check)
-		q.mu.Unlock()
-		q.mu.Lock()
-		canStartRound := q.coordinator.CanDstStartRound(currentRound)
+		canStartRound := coordinator.CanDstStartRound(currentRound)
 		if !canStartRound {
 			// Can't start this round yet - wait for coordinator gate
-			q.mu.Unlock()
 			return
 		}
 		// Gate passed - we'll mark firstPullForRound = false only after actually fetching tasks
 	}
 
-	q.mu.Unlock()
-
-	batch, err := db.BatchFetchWithKeys(q.boltDB, queueType, currentRound, db.StatusPending, defaultLeaseBatchSize)
-
-	q.mu.Lock()
-	defer q.mu.Unlock()
+	batch, err := db.BatchFetchWithKeys(boltDB, queueType, currentRound, db.StatusPending, defaultLeaseBatchSize)
 
 	if err != nil {
 		if logservice.LS != nil {
@@ -135,7 +117,7 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	// Pull was successful - set firstPullForRound = false only if we actually fetched tasks
 	// This ensures we only mark completion on the actual first pull that fetched tasks
 	if wasFirstPullForRound && len(batch) > 0 {
-		q.firstPullForRound = false
+		q.setFirstPullForRound(false)
 	}
 
 	// we've exhausted max depth - mark queue as completed
@@ -145,14 +127,14 @@ func (q *Queue) PullTraversalTasks(force bool) {
 				fmt.Sprintf("First pull for round %d returned empty batch - traversal complete (max depth exhausted)", currentRound),
 				"queue", q.name, q.name)
 		}
-		q.state = QueueStateCompleted
+		q.setState(QueueStateCompleted)
 		// Update coordinator
-		if q.coordinator != nil {
+		if coordinator != nil {
 			switch q.name {
 			case "src":
-				q.coordinator.MarkSrcCompleted()
+				coordinator.MarkSrcCompleted()
 			case "dst":
-				q.coordinator.MarkDstCompleted()
+				coordinator.MarkDstCompleted()
 			}
 		}
 		return
@@ -166,7 +148,7 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		var parentPaths []string
 		for _, item := range batch {
 			// Skip path hashes we've already leased (prevents duplicate pulls from stale views)
-			if _, exists := q.leasedKeys[item.Key]; exists {
+			if q.isLeased(item.Key) {
 				continue
 			}
 
@@ -179,7 +161,7 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		// Batch-load expected children for all folder tasks in one DB operation
 		if len(parentPaths) > 0 {
 			var err error
-			expectedFoldersMap, expectedFilesMap, err = BatchLoadExpectedChildren(q.boltDB, parentPaths)
+			expectedFoldersMap, expectedFilesMap, err = BatchLoadExpectedChildren(boltDB, parentPaths)
 			if err != nil {
 				if logservice.LS != nil {
 					_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to batch load expected children: %v", err), "queue", q.name, q.name)
@@ -191,15 +173,14 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		}
 	}
 
-	added := 0
 	for _, item := range batch {
 		// Skip path hashes we've already leased (prevents duplicate pulls from stale views)
-		if _, exists := q.leasedKeys[item.Key]; exists {
+		if q.isLeased(item.Key) {
 			continue
 		}
 
 		// Mark this path hash as leased
-		q.leasedKeys[item.Key] = struct{}{}
+		q.addLeasedKey(item.Key)
 
 		task := nodeStateToTask(item.State, taskType)
 
@@ -212,14 +193,11 @@ func (q *Queue) PullTraversalTasks(force bool) {
 			task.ExpectedFiles = expectedFiles
 		}
 
-		beforeCount := len(q.pendingBuff)
-		q.enqueuePendingLocked(task)
-		if len(q.pendingBuff) > beforeCount {
-			added++
-		}
+		// Enqueue task
+		q.enqueuePending(task)
 	}
 
 	// Track if this pull was partial (fewer tasks than requested)
 	// This signals we might have exhausted the current round
-	q.lastPullWasPartial = len(batch) < defaultLeaseBatchSize
+	q.setLastPullWasPartial(len(batch) < defaultLeaseBatchSize)
 }

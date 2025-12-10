@@ -11,12 +11,15 @@ import (
 	"strings"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"github.com/Project-Sylos/Migration-Engine/pkg/tests/shared"
+	"github.com/Project-Sylos/Spectra/sdk"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <path-to-bolt.db>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s <path-to-bolt.db> [spectra-config-path]\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Example: %s pkg/tests/bolt.db\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Example: %s pkg/tests/bolt.db pkg/configs/spectra.json\n", os.Args[0])
 		os.Exit(1)
 	}
 
@@ -55,6 +58,15 @@ func main() {
 
 	// Print formatted report
 	printReport(report, dbPath)
+
+	// If Spectra config path provided, compare counts
+	if len(os.Args) >= 3 {
+		spectraConfigPath := os.Args[2]
+		if err := compareWithSpectra(boltDB, spectraConfigPath); err != nil {
+			fmt.Fprintf(os.Stderr, "\n⚠️  Warning: Failed to compare with Spectra: %v\n", err)
+			// Don't exit with error, just warn
+		}
+	}
 }
 
 type LevelStatus struct {
@@ -273,6 +285,103 @@ func printReport(report *DatabaseReport, dbPath string) {
 	}
 
 	fmt.Println(strings.Repeat("=", 80))
+}
+
+// compareWithSpectra compares the SRC node count in BoltDB with the Spectra node count.
+func compareWithSpectra(boltDB *db.DB, spectraConfigPath string) error {
+	fmt.Println()
+	fmt.Println(strings.Repeat("=", 80))
+	fmt.Println("SPECTRA COMPARISON")
+	fmt.Println(strings.Repeat("=", 80))
+
+	// Setup Spectra
+	spectraFS, err := shared.SetupSpectraFS(spectraConfigPath, false)
+	if err != nil {
+		return fmt.Errorf("failed to setup Spectra: %w", err)
+	}
+
+	// Count Spectra nodes
+	spectraCount, err := countSpectraNodes(spectraFS)
+	if err != nil {
+		return fmt.Errorf("failed to count Spectra nodes: %w", err)
+	}
+
+	// Count SRC nodes
+	srcCount, err := boltDB.CountNodes("SRC")
+	if err != nil {
+		return fmt.Errorf("failed to count SRC nodes: %w", err)
+	}
+
+	// Print comparison
+	fmt.Printf("Spectra DB node count: %d\n", spectraCount)
+	fmt.Printf("BoltDB SRC node count: %d\n", srcCount)
+
+	if srcCount == spectraCount {
+		fmt.Printf("✅ Counts match perfectly!\n")
+	} else {
+		diff := srcCount - spectraCount
+		fmt.Printf("⚠️  MISMATCH: Difference of %d nodes\n", diff)
+		if diff > 0 {
+			fmt.Printf("   BoltDB has %d more nodes than Spectra\n", diff)
+		} else {
+			fmt.Printf("   BoltDB has %d fewer nodes than Spectra\n", -diff)
+		}
+	}
+
+	fmt.Println(strings.Repeat("=", 80))
+	return nil
+}
+
+// countSpectraNodes counts all nodes in the Spectra database using DFS traversal.
+func countSpectraNodes(spectraFS *sdk.SpectraFS) (int, error) {
+	count := 0
+	visited := make(map[string]bool)
+
+	var dfs func(nodeID string) error
+	dfs = func(nodeID string) error {
+		if visited[nodeID] {
+			return nil
+		}
+		visited[nodeID] = true
+		count++
+
+		// Get node
+		node, err := spectraFS.GetNode(&sdk.GetNodeRequest{ID: nodeID})
+		if err != nil {
+			return fmt.Errorf("failed to get node %s: %w", nodeID, err)
+		}
+
+		// If folder, recurse into children
+		if node.Type == "folder" {
+			children, err := spectraFS.ListChildren(&sdk.ListChildrenRequest{ParentID: nodeID})
+			if err != nil {
+				return fmt.Errorf("failed to list children of %s: %w", nodeID, err)
+			}
+
+			// Process folders
+			for _, folder := range children.Folders {
+				if err := dfs(folder.ID); err != nil {
+					return err
+				}
+			}
+
+			// Process files
+			for _, file := range children.Files {
+				if err := dfs(file.ID); err != nil {
+					return err
+				}
+			}
+		}
+
+		return nil
+	}
+
+	// Start from root
+	if err := dfs("root"); err != nil {
+		return 0, err
+	}
+
+	return count, nil
 }
 
 func printQueueReport(qr *QueueReport) {

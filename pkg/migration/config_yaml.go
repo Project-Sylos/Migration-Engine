@@ -4,6 +4,7 @@
 package migration
 
 import (
+	"slices"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -18,15 +19,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Migration status constants
+// Migration checkpoint status constants
+// These represent the current phase/checkpoint of the migration workflow.
 const (
-	StatusTraversalPending   = "traversal-pending"    // Traversal is in progress with pending work
-	StatusTraversalFailed    = "traversal-failed"     // Traversal phase failed
-	StatusAwaitingPathReview = "awaiting-path-review" // Traversal complete, ready for user review
-	StatusCopySuccessful     = "copy-successful"      // Copy phase completed successfully
-	StatusCopyFailed         = "copy-failed"          // Copy phase failed
-	StatusSuspended          = "suspended"            // Migration suspended (can be resumed)
-	StatusSeeded             = "seeded"               // Roots have been seeded (transitional state)
+	StatusRootsSet            = "Roots-Set"             // User has set root folders and services (initial state)
+	StatusFiltersSet          = "Filters-Set"           // Filters configured, ready for traversal (also used for retry)
+	StatusTraversalInProgress = "Traversal-In-Progress" // Traversal is currently running
+	StatusAwaitingPathReview  = "Awaiting-Path-Review"  // Traversal complete, awaiting user review
+	StatusCopyInProgress      = "Copy-In-Progress"      // Copy phase is currently running
+	StatusComplete            = "Complete"              // Migration completed successfully
+	StatusSuspended           = "Suspended"             // Migration suspended (can be resumed)
 )
 
 // MigrationConfigYAML represents the complete migration configuration stored in YAML format.
@@ -49,13 +51,16 @@ type MetadataConfig struct {
 	LastModified string `yaml:"last_modified"`
 }
 
-// StateConfig tracks the current migration state.
+// StateConfig tracks the current migration checkpoint state.
 type StateConfig struct {
-	Status       string `yaml:"status"` // traversal-pending, traversal-failed, awaiting-path-review, copy-successful, copy-failed, suspended, seeded
+	Status       string `yaml:"status"` // Roots-Set, Filters-Set, Traversal-In-Progress, Awaiting-Path-Review, Copy-In-Progress, Complete, Suspended
 	LastLevelSrc *int   `yaml:"last_level_src,omitempty"`
 	LastLevelDst *int   `yaml:"last_level_dst,omitempty"`
 	LastRoundSrc *int   `yaml:"last_round_src,omitempty"`
 	LastRoundDst *int   `yaml:"last_round_dst,omitempty"`
+	// Retry metadata (only set when Status = Filters-Set for retry)
+	IsRetrySweep  *bool `yaml:"is_retry_sweep,omitempty"`  // True if this Filters-Set state is for a retry sweep
+	MaxKnownDepth *int  `yaml:"max_known_depth,omitempty"` // Max depth for retry sweep (if IsRetrySweep is true)
 }
 
 // ServicesConfig contains source and destination service information.
@@ -296,7 +301,7 @@ func NewMigrationConfigYAML(cfg Config, status MigrationStatus) (*MigrationConfi
 			LastModified: now,
 		},
 		State: StateConfig{
-			Status: StatusTraversalPending,
+			Status: StatusRootsSet, // Initial state when migration is first created
 		},
 		Services: ServicesConfig{
 			Source: ServiceConfigYAML{
@@ -372,15 +377,14 @@ func UpdateConfigFromStatus(yamlCfg *MigrationConfigYAML, status MigrationStatus
 	yamlCfg.State.LastRoundDst = &dstRound
 	yamlCfg.State.LastLevelDst = &dstRound
 
-	// Update status (only if not already set to "suspended" by force shutdown)
-	if yamlCfg.State.Status != StatusSuspended {
+	// Auto-transition to Awaiting-Path-Review only if traversal is in progress and completes successfully
+	// All other state transitions should be managed by the API
+	if yamlCfg.State.Status != StatusSuspended && yamlCfg.State.Status == StatusTraversalInProgress {
 		if status.IsComplete() {
 			yamlCfg.State.Status = StatusAwaitingPathReview
-		} else if status.HasPending() {
-			yamlCfg.State.Status = StatusTraversalPending
-		} else if status.HasFailures() {
-			yamlCfg.State.Status = StatusTraversalFailed
 		}
+		// Note: If traversal fails or has pending work, status remains Traversal-In-Progress
+		// The API should handle error states and decide when to transition
 	}
 }
 
@@ -398,6 +402,106 @@ func SetSuspendedStatus(yamlCfg *MigrationConfigYAML, status MigrationStatus, sr
 
 	// Set status to suspended
 	yamlCfg.State.Status = StatusSuspended
+}
+
+// SetStatusRootsSet sets the migration status to "Roots-Set".
+// Called when user sets root folders and services.
+func SetStatusRootsSet(yamlCfg *MigrationConfigYAML) {
+	if yamlCfg == nil {
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	yamlCfg.Metadata.LastModified = now
+	yamlCfg.State.Status = StatusRootsSet
+	// Clear retry metadata when roots are reset
+	yamlCfg.State.IsRetrySweep = nil
+	yamlCfg.State.MaxKnownDepth = nil
+}
+
+// SetStatusFiltersSet sets the migration status to "Filters-Set".
+// Called when filters are configured (or skipped), ready for traversal.
+// If isRetry is true, also sets retry metadata for retry sweep.
+func SetStatusFiltersSet(yamlCfg *MigrationConfigYAML, isRetry bool, maxKnownDepth int) {
+	if yamlCfg == nil {
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	yamlCfg.Metadata.LastModified = now
+	yamlCfg.State.Status = StatusFiltersSet
+	if isRetry {
+		isRetryVal := true
+		yamlCfg.State.IsRetrySweep = &isRetryVal
+		if maxKnownDepth >= 0 {
+			yamlCfg.State.MaxKnownDepth = &maxKnownDepth
+		}
+	} else {
+		// Clear retry metadata for normal traversal
+		yamlCfg.State.IsRetrySweep = nil
+		yamlCfg.State.MaxKnownDepth = nil
+	}
+}
+
+// SetStatusTraversalInProgress sets the migration status to "Traversal-In-Progress".
+// Called when traversal starts.
+func SetStatusTraversalInProgress(yamlCfg *MigrationConfigYAML) {
+	if yamlCfg == nil {
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	yamlCfg.Metadata.LastModified = now
+	yamlCfg.State.Status = StatusTraversalInProgress
+}
+
+// SetStatusAwaitingPathReview sets the migration status to "Awaiting-Path-Review".
+// Called when traversal completes successfully.
+func SetStatusAwaitingPathReview(yamlCfg *MigrationConfigYAML) {
+	if yamlCfg == nil {
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	yamlCfg.Metadata.LastModified = now
+	yamlCfg.State.Status = StatusAwaitingPathReview
+}
+
+// SetStatusCopyInProgress sets the migration status to "Copy-In-Progress".
+// Called when copy phase starts.
+func SetStatusCopyInProgress(yamlCfg *MigrationConfigYAML) {
+	if yamlCfg == nil {
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	yamlCfg.Metadata.LastModified = now
+	yamlCfg.State.Status = StatusCopyInProgress
+}
+
+// SetStatusComplete sets the migration status to "Complete".
+// Called when copy phase completes successfully.
+func SetStatusComplete(yamlCfg *MigrationConfigYAML) {
+	if yamlCfg == nil {
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	yamlCfg.Metadata.LastModified = now
+	yamlCfg.State.Status = StatusComplete
+}
+
+// IsValidCheckpointStatus returns true if the given status string is a valid checkpoint state.
+func IsValidCheckpointStatus(status string) bool {
+	return slices.Contains([]string{StatusRootsSet, StatusFiltersSet, StatusTraversalInProgress, StatusAwaitingPathReview, StatusCopyInProgress, StatusComplete, StatusSuspended}, status)
+}
+
+// IsRetrySweepEnabled returns true if the migration is configured for a retry sweep.
+// This checks the StateConfig.IsRetrySweep flag, which is only set when Status = Filters-Set.
+func (s StateConfig) IsRetrySweepEnabled() bool {
+	return s.IsRetrySweep != nil && *s.IsRetrySweep
+}
+
+// GetRetryMaxKnownDepth returns the max known depth for retry sweeps, or -1 if not set.
+func (s StateConfig) GetRetryMaxKnownDepth() int {
+	if s.MaxKnownDepth == nil {
+		return -1
+	}
+	return *s.MaxKnownDepth
 }
 
 // UpdateConfigFromRoots updates the config YAML when roots are set.

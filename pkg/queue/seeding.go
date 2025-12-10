@@ -27,12 +27,13 @@ func SeedRootTask(queueType string, rootFolder types.Folder, boltDB *db.DB) erro
 	}
 
 	// Create NodeState from root folder
+	// This ensures consistent hashing and API queries that expect root to be at "/".
 	state := &db.NodeState{
 		ID:         rootFolder.Id,
 		ParentID:   rootFolder.ParentId,
 		ParentPath: "", // Root has no parent
 		Name:       rootFolder.DisplayName,
-		Path:       types.NormalizeLocationPath(rootFolder.LocationPath),
+		Path:       "/", // Root is always "/" (normalized), regardless of actual folder path
 		Type:       rootFolder.Type,
 		Size:       0, // Folders have no size
 		MTime:      rootFolder.LastUpdated,

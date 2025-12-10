@@ -116,6 +116,15 @@ func (q *Queue) SetMode(mode QueueMode) {
 	q.mode = mode
 }
 
+// SetMaxKnownDepth sets the maximum known depth for retry sweeps.
+// Only applicable when mode is QueueModeRetry.
+// Set to -1 to auto-detect from database, or a non-negative value to use a specific depth.
+func (q *Queue) SetMaxKnownDepth(depth int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.maxKnownDepth = depth
+}
+
 // GetMode returns the current queue mode (implements worker.QueueAccessor).
 func (q *Queue) GetMode() string {
 	q.mu.RLock()
@@ -1432,7 +1441,14 @@ func (q *Queue) advanceToNextRound() {
 	}
 
 	if logservice.LS != nil {
-		_ = logservice.LS.Log("info", fmt.Sprintf("Advanced to round %d", newRound), "queue", q.name, q.name)
+		q.mu.RLock()
+		mode := q.mode
+		q.mu.RUnlock()
+		if mode == QueueModeExclusion {
+			_ = logservice.LS.Log("info", fmt.Sprintf("Advanced to round %d (exclusion mode)", newRound), "queue", q.name, q.name)
+		} else {
+			_ = logservice.LS.Log("info", fmt.Sprintf("Advanced to round %d", newRound), "queue", q.name, q.name)
+		}
 	}
 
 	// Pull tasks for the new round

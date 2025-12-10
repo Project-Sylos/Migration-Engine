@@ -107,6 +107,12 @@ func (db *DB) initializeBuckets() error {
 			if _, err := queueBucket.CreateBucketIfNotExists([]byte("exclusion-holding")); err != nil {
 				return fmt.Errorf("failed to create Traversal-Data/%s/exclusion-holding bucket: %w", queueType, err)
 			}
+
+			// Create unexclusion-holding bucket (regular bucket, not nested)
+			// This stores path hash -> depth level mappings for unexclusion intent queuing
+			if _, err := queueBucket.CreateBucketIfNotExists([]byte("unexclusion-holding")); err != nil {
+				return fmt.Errorf("failed to create Traversal-Data/%s/unexclusion-holding bucket: %w", queueType, err)
+			}
 		}
 
 		// Create LOGS bucket as separate top-level (its own island)
