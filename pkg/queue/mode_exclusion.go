@@ -13,31 +13,28 @@ import (
 
 // PullExclusionTasks pulls exclusion tasks from the exclusion-holding bucket for the current round.
 // Scans the bucket O(n) and filters by current round level. Breaks when finding first node with level > current round.
+// Uses getter/setter methods - no direct mutex access.
 func (q *Queue) PullExclusionTasks(force bool) {
-	if q.boltDB == nil {
+	boltDB := q.getBoltDB()
+	if boltDB == nil {
 		return
 	}
 
 	// Check pulling flag FIRST before any other logic
-	q.mu.Lock()
-	if q.pulling {
-		q.mu.Unlock()
+	if q.getPulling() {
 		return
 	}
 
-	if q.state == QueueStateCompleted {
-		q.mu.Unlock()
+	if q.getState() == QueueStateCompleted {
 		return
 	}
 
-	q.pulling = true
-	outputBuffer := q.outputBuffer
-	q.mu.Unlock()
+	// Set pulling flag and get output buffer
+	q.setPulling(true)
+	outputBuffer := q.getOutputBuffer()
 
 	defer func() {
-		q.mu.Lock()
-		q.pulling = false
-		q.mu.Unlock()
+		q.setPulling(false)
 	}()
 
 	// Force-flush buffer before pulling tasks
@@ -47,25 +44,21 @@ func (q *Queue) PullExclusionTasks(force bool) {
 
 	queueType := getQueueType(q.name)
 
-	q.mu.Lock()
-	queueState := q.state
-	pendingCount := len(q.pendingBuff)
-	currentRound := q.round
-	wasFirstPullForRound := q.firstPullForRound
-	q.mu.Unlock()
+	// Get state snapshot
+	snapshot := q.getStateSnapshot()
 
 	if !force {
-		if queueState != QueueStateRunning || pendingCount > q.pullLowWM {
+		if snapshot.State != QueueStateRunning || snapshot.PendingCount > snapshot.PullLowWM {
 			return
 		}
 	} else {
-		if queueState == QueueStatePaused {
+		if snapshot.State == QueueStatePaused {
 			return
 		}
 	}
 
 	// Scan exclusion-holding bucket for current round
-	entries, hasHigherLevels, err := db.ScanExclusionHoldingBucketByLevel(q.boltDB, queueType, currentRound, defaultLeaseBatchSize)
+	entries, hasHigherLevels, err := db.ScanExclusionHoldingBucketByLevel(boltDB, queueType, snapshot.Round, defaultLeaseBatchSize)
 	if err != nil {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to scan exclusion-holding bucket: %v", err), "queue", q.name, q.name)
@@ -73,29 +66,30 @@ func (q *Queue) PullExclusionTasks(force bool) {
 		return
 	}
 
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	// Set firstPullForRound = false if we got tasks
-	if wasFirstPullForRound && len(entries) > 0 {
-		q.firstPullForRound = false
+	// Debug: Log pull stats
+	if logservice.LS != nil {
+		_ = logservice.LS.Log("debug", fmt.Sprintf("PullExclusionTasks: Round %d, found %d entries, hasHigherLevels=%v", snapshot.Round, len(entries), hasHigherLevels), "queue", q.name, q.name)
 	}
 
-	// Check if exclusion-holding bucket is empty (no entries found and no higher levels)
-	if wasFirstPullForRound && len(entries) == 0 && !hasHigherLevels {
+	// Set firstPullForRound = false if we got tasks
+	if snapshot.FirstPullForRound && len(entries) > 0 {
+		q.setFirstPullForRound(false)
+	}
+
+	// Check if both holding buckets are empty (no entries found and no higher levels)
+	if snapshot.FirstPullForRound && len(entries) == 0 && !hasHigherLevels {
+		// Flush output buffer before completing to ensure all file exclusion updates are written
+		outputBuffer := q.getOutputBuffer()
+		if outputBuffer != nil {
+			outputBuffer.Flush()
+		}
+
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("info",
-				"Exclusion-holding bucket is empty - exclusion sweep complete",
+				"Both exclusion and unexclusion holding buckets are empty - exclusion sweep complete",
 				"queue", q.name, q.name)
 		}
-		q.state = QueueStateCompleted
-		q.mu.Unlock()
-		// Clear exclusion-holding bucket after completion
-		if err := db.ClearExclusionHoldingBucket(q.boltDB, queueType); err != nil {
-			if logservice.LS != nil {
-				_ = logservice.LS.Log("warning", fmt.Sprintf("Failed to clear exclusion-holding bucket: %v", err), "queue", q.name, q.name)
-			}
-		}
+		q.setState(QueueStateCompleted)
 		return
 	}
 
@@ -104,25 +98,28 @@ func (q *Queue) PullExclusionTasks(force bool) {
 	if len(entries) == 0 && hasHigherLevels {
 		// No tasks for this round, but more work in future rounds
 		// Set lastPullWasPartial to trigger round advancement
-		q.lastPullWasPartial = true
+		q.setLastPullWasPartial(true)
 		return
 	}
 
-	added := 0
-	// Pop entries from exclusion-holding bucket as we pull them
-	pathHashesToRemove := make([]string, 0, len(entries))
+	// Pop entries from holding buckets as we pull them
+	type entryToRemove struct {
+		pathHash string
+		mode     string
+	}
+	pathHashesToRemove := make([]entryToRemove, 0, len(entries))
 
 	for _, entry := range entries {
 		// Skip path hashes we've already leased
-		if _, exists := q.leasedKeys[entry.PathHash]; exists {
+		if q.isLeased(entry.PathHash) {
 			continue
 		}
 
 		// Mark as leased
-		q.leasedKeys[entry.PathHash] = struct{}{}
+		q.addLeasedKey(entry.PathHash)
 
 		// Get node state to determine exclusion mode
-		nodeState, err := db.GetNodeState(q.boltDB, queueType, []byte(entry.PathHash))
+		nodeState, err := db.GetNodeState(boltDB, queueType, []byte(entry.PathHash))
 		if err != nil || nodeState == nil {
 			if logservice.LS != nil {
 				_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to get node state for exclusion task %s: %v", entry.PathHash, err), "queue", q.name, q.name)
@@ -130,17 +127,22 @@ func (q *Queue) PullExclusionTasks(force bool) {
 			continue
 		}
 
-		// Determine exclusion mode based on explicit_excluded flag
-		// If explicitly excluded, mode is "exclude", otherwise "unexclude"
-		exclusionMode := "exclude"
-		if !nodeState.ExplicitExcluded {
-			exclusionMode = "unexclude"
+		// Use the mode from the entry (which bucket it came from)
+		// Entry.Mode is set by ScanExclusionHoldingBucketByLevel based on which bucket the entry was found in
+		exclusionMode := entry.Mode
+		if exclusionMode == "" {
+			// Fallback: determine mode based on explicit_excluded flag
+			if nodeState.ExplicitExcluded {
+				exclusionMode = "exclude"
+			} else {
+				exclusionMode = "unexclude"
+			}
 		}
 
 		// Convert to task
 		task := &TaskBase{
 			Type:          TaskTypeExclusion,
-			Round:         currentRound,
+			Round:         snapshot.Round,
 			ExclusionMode: exclusionMode,
 		}
 
@@ -169,29 +171,32 @@ func (q *Queue) PullExclusionTasks(force bool) {
 			}
 		}
 
-		beforeCount := len(q.pendingBuff)
-		q.enqueuePendingLocked(task)
-		if len(q.pendingBuff) > beforeCount {
-			added++
-			// Track path hashes to remove from exclusion-holding bucket
-			pathHashesToRemove = append(pathHashesToRemove, entry.PathHash)
+		// Enqueue task and track if it was added
+		_, _, wasAdded := q.getPendingCountAndEnqueue(task)
+		if wasAdded {
+			// Track path hashes to remove from appropriate holding bucket (with mode)
+			pathHashesToRemove = append(pathHashesToRemove, entryToRemove{
+				pathHash: entry.PathHash,
+				mode:     exclusionMode,
+			})
 		}
 	}
 
-	// Pop entries from exclusion-holding bucket
-	q.mu.Unlock()
+	// Pop entries from appropriate holding buckets (outside lock)
 	if len(pathHashesToRemove) > 0 {
-		for _, pathHash := range pathHashesToRemove {
-			if err := db.RemoveExclusionHoldingEntry(q.boltDB, queueType, pathHash); err != nil {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("debug", fmt.Sprintf("Removing %d entries from holding buckets (Round %d)", len(pathHashesToRemove), snapshot.Round), "queue", q.name, q.name)
+		}
+		for _, entryToRemove := range pathHashesToRemove {
+			if err := db.RemoveHoldingEntry(boltDB, queueType, entryToRemove.pathHash, entryToRemove.mode); err != nil {
 				if logservice.LS != nil {
-					_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to remove exclusion-holding entry %s: %v", pathHash, err), "queue", q.name, q.name)
+					_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to remove holding entry %s from %s bucket: %v", entryToRemove.pathHash, entryToRemove.mode, err), "queue", q.name, q.name)
 				}
 			}
 		}
 	}
-	q.mu.Lock()
 
 	// Set lastPullWasPartial: true if we found fewer entries than limit OR if there are higher levels
 	// If hasHigherLevels is true, we know there are more tasks in future rounds
-	q.lastPullWasPartial = len(entries) < defaultLeaseBatchSize || hasHigherLevels
+	q.setLastPullWasPartial(len(entries) < defaultLeaseBatchSize || hasHigherLevels)
 }

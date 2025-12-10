@@ -1,0 +1,201 @@
+// Copyright 2025 Sylos contributors
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+package main
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"os"
+	"time"
+
+	bolt "go.etcd.io/bbolt"
+
+	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
+	"github.com/Project-Sylos/Migration-Engine/pkg/tests/shared"
+	"github.com/Project-Sylos/Sylos-FS/pkg/fs"
+)
+
+func main() {
+	fmt.Println("=== Exclusion Sweep Test Runner ===")
+	fmt.Println()
+
+	if err := runTest(); err != nil {
+		fmt.Printf("\n❌ TEST FAILED: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("\n✅ TEST PASSED!")
+}
+
+func runTest() error {
+	fmt.Println("📋 Phase 1: Setup")
+	fmt.Println("================")
+
+	// Load pre-configured test database (should be copied by PowerShell script)
+	// Path is relative to where the script is run from (project root)
+	dbPath := "pkg/tests/exclusion_sweep/exclusion_sweep_test.db"
+	boltDB, _, err := migration.SetupDatabase(migration.DatabaseConfig{
+		Path:           dbPath,
+		RemoveExisting: false, // Use existing pre-configured DB
+	})
+	if err != nil {
+		return fmt.Errorf("failed to open database: %w", err)
+	}
+	defer boltDB.Close()
+
+	// Load Spectra configuration (test-specific config pointing to test directory's spectra.db)
+	spectraFS, err := shared.SetupSpectraFS("pkg/tests/exclusion_sweep/spectra.json", false)
+	if err != nil {
+		return fmt.Errorf("failed to setup Spectra: %w", err)
+	}
+
+	srcRoot, dstRoot, err := shared.LoadSpectraRoots(spectraFS)
+	if err != nil {
+		return fmt.Errorf("failed to load Spectra roots: %w", err)
+	}
+
+	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.Id, "primary")
+	if err != nil {
+		return fmt.Errorf("failed to create src adapter: %w", err)
+	}
+
+	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.Id, "s1")
+	if err != nil {
+		return fmt.Errorf("failed to create dst adapter: %w", err)
+	}
+
+	// Cache total node count from stats bucket (O(1) lookup)
+	nodesBucketPath := []string{"Traversal-Data", "SRC", "nodes"}
+	totalNodesBefore, err := boltDB.GetBucketCount(nodesBucketPath)
+	if err != nil {
+		// Fallback to slow count if stats unavailable
+		totalNodesBeforeInt, err2 := boltDB.CountNodes("SRC")
+		if err2 != nil {
+			return fmt.Errorf("failed to count total nodes: %w (stats error: %v)", err2, err)
+		}
+		totalNodesBefore = int64(totalNodesBeforeInt)
+	}
+
+	excludedNodesBefore, err := shared.CountExcludedNodes(boltDB, "SRC")
+	if err != nil {
+		return fmt.Errorf("failed to count excluded nodes: %w", err)
+	}
+	fmt.Printf("Total nodes (from stats): %d\n", totalNodesBefore)
+	fmt.Printf("Excluded nodes before exclusion: %d\n", excludedNodesBefore)
+
+	fmt.Println("\n📋 Phase 2: Select and Mark Node as Excluded")
+	fmt.Println("==============================================")
+
+	// Get root path (should be "/")
+	rootPath := "/"
+
+	// Pick a random top-level child
+	selectedChild, err := shared.PickRandomTopLevelChild(boltDB, "SRC", rootPath)
+	if err != nil {
+		return fmt.Errorf("failed to pick random child: %w", err)
+	}
+
+	fmt.Printf("Selected node: %s (depth: %d, type: %s)\n", selectedChild.Path, selectedChild.Depth, selectedChild.Type)
+
+	// Count subtree that will be excluded
+	subtreeStats, err := shared.CountSubtree(boltDB, "SRC", selectedChild.Path)
+	if err != nil {
+		return fmt.Errorf("failed to count subtree: %w", err)
+	}
+	fmt.Printf("Subtree to exclude: %d nodes (%d folders, %d files), max depth: %d\n",
+		subtreeStats.TotalNodes, subtreeStats.TotalFolders, subtreeStats.TotalFiles, subtreeStats.MaxDepth)
+
+	// Mark the selected node as excluded
+	fmt.Printf("Marking node as excluded...\n")
+	if err := shared.MarkNodeAsExcluded(boltDB, "SRC", selectedChild.Path); err != nil {
+		return fmt.Errorf("failed to mark node as excluded: %w", err)
+	}
+
+	// Add to exclusion-holding bucket (simulating what the API would do)
+	// Get child depth and add to exclusion-holding bucket
+	if err := addToExclusionHolding(boltDB, "SRC", selectedChild.Path, selectedChild.Depth); err != nil {
+		return fmt.Errorf("failed to add to exclusion-holding bucket: %w", err)
+	}
+
+	fmt.Println("\n🚀 Phase 3: Run Exclusion Sweep")
+	fmt.Println("=================================")
+
+	// Run exclusion sweep
+	sweepConfig := migration.SweepConfig{
+		BoltDB:          boltDB,
+		SrcAdapter:      srcAdapter,
+		DstAdapter:      dstAdapter,
+		WorkerCount:     10,
+		MaxRetries:      3,
+		LogAddress:      "127.0.0.1:8083",
+		LogLevel:        "debug",
+		SkipListener:    false,
+		StartupDelay:    3 * time.Second,
+		ProgressTick:    2 * time.Second,
+		ShutdownContext: context.Background(),
+	}
+
+	stats, err := migration.RunExclusionSweep(sweepConfig)
+	if err != nil {
+		return fmt.Errorf("exclusion sweep failed: %w", err)
+	}
+
+	fmt.Printf("Exclusion sweep completed in %v\n", stats.Duration)
+	fmt.Printf("  SRC: Round=%d Pending=%d InProgress=%d TotalTracked=%d\n",
+		stats.Src.Round, stats.Src.Pending, stats.Src.InProgress, stats.Src.TotalTracked)
+	fmt.Printf("  DST: Round=%d Pending=%d InProgress=%d TotalTracked=%d\n",
+		stats.Dst.Round, stats.Dst.Pending, stats.Dst.InProgress, stats.Dst.TotalTracked)
+
+	fmt.Println("\n✓ Phase 4: Verification")
+	fmt.Println("========================")
+
+	// Count excluded nodes after exclusion sweep
+	excludedNodesAfter, err := shared.CountExcludedNodes(boltDB, "SRC")
+	if err != nil {
+		return fmt.Errorf("failed to count excluded nodes after sweep: %w", err)
+	}
+	fmt.Printf("Excluded nodes after exclusion sweep: %d\n", excludedNodesAfter)
+
+	// Expected excluded count = original excluded + subtree size (all nodes in subtree should be excluded)
+	expectedExcluded := excludedNodesBefore + subtreeStats.TotalNodes
+	if excludedNodesAfter != expectedExcluded {
+		return fmt.Errorf("excluded count mismatch: expected %d (original %d + subtree %d), got %d",
+			expectedExcluded, excludedNodesBefore, subtreeStats.TotalNodes, excludedNodesAfter)
+	}
+
+	// Verify that the selected node and all its descendants are excluded (explicitly or inherited)
+	excludedInSubtree, err := shared.CountExcludedInSubtree(boltDB, "SRC", selectedChild.Path)
+	if err != nil {
+		return fmt.Errorf("failed to count excluded nodes in subtree: %w", err)
+	}
+
+	if excludedInSubtree != subtreeStats.TotalNodes {
+		return fmt.Errorf("subtree exclusion mismatch: expected %d excluded nodes in subtree, got %d",
+			subtreeStats.TotalNodes, excludedInSubtree)
+	}
+
+	fmt.Printf("✅ Excluded count matches expected: %d (original %d + excluded subtree %d)\n",
+		expectedExcluded, excludedNodesBefore, subtreeStats.TotalNodes)
+	fmt.Printf("✅ All %d nodes in excluded subtree are excluded (explicitly or inherited)\n", excludedInSubtree)
+
+	return nil
+}
+
+// addToExclusionHolding adds a node to the exclusion-holding bucket.
+func addToExclusionHolding(boltDB *db.DB, queueType string, nodePath string, depth int) error {
+	pathHash := []byte(db.HashPath(nodePath))
+	depthBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(depthBytes, uint64(depth))
+
+	return boltDB.Update(func(tx *bolt.Tx) error {
+		bucket, err := db.GetOrCreateExclusionHoldingBucket(tx, queueType)
+		if err != nil {
+			return fmt.Errorf("failed to get exclusion-holding bucket: %w", err)
+		}
+
+		return bucket.Put(pathHash, depthBytes)
+	})
+}

@@ -12,19 +12,19 @@ import (
 
 // PullRetryTasks pulls retry tasks from failed/pending status buckets.
 // Checks maxKnownDepth and scans all known levels up to maxKnownDepth, then uses normal traversal logic for deeper levels.
+// Uses getter/setter methods - no direct mutex access.
 func (q *Queue) PullRetryTasks(force bool) {
-	if q.boltDB == nil {
+	boltDB := q.getBoltDB()
+	if boltDB == nil {
 		return
 	}
 
-	q.mu.Lock()
-	currentRound := q.round
-	maxKnownDepth := q.maxKnownDepth
-	q.mu.Unlock()
+	currentRound := q.getRound()
+	maxKnownDepth := q.getMaxKnownDepth()
 
 	// If maxKnownDepth is not set, try to compute it from existing levels
 	if maxKnownDepth == -1 {
-		levels, err := q.boltDB.GetAllLevels(getQueueType(q.name))
+		levels, err := boltDB.GetAllLevels(getQueueType(q.name))
 		if err == nil && len(levels) > 0 {
 			maxKnownDepth = 0
 			for _, level := range levels {
@@ -32,9 +32,7 @@ func (q *Queue) PullRetryTasks(force bool) {
 					maxKnownDepth = level
 				}
 			}
-			q.mu.Lock()
-			q.maxKnownDepth = maxKnownDepth
-			q.mu.Unlock()
+			q.setMaxKnownDepth(maxKnownDepth)
 		}
 	}
 
@@ -44,7 +42,7 @@ func (q *Queue) PullRetryTasks(force bool) {
 		// Round advancement will handle moving through all levels
 		// Pull from current round with failed status (retry failed tasks)
 		queueType := getQueueType(q.name)
-		batch, err := db.BatchFetchWithKeys(q.boltDB, queueType, currentRound, db.StatusFailed, defaultLeaseBatchSize)
+		batch, err := db.BatchFetchWithKeys(boltDB, queueType, currentRound, db.StatusFailed, defaultLeaseBatchSize)
 		if err != nil {
 			if logservice.LS != nil {
 				_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to fetch retry batch from BoltDB: %v", err), "queue", q.name, q.name)
@@ -53,7 +51,7 @@ func (q *Queue) PullRetryTasks(force bool) {
 		}
 
 		// Also pull pending tasks from current round (in case some were marked pending)
-		pendingBatch, err := db.BatchFetchWithKeys(q.boltDB, queueType, currentRound, db.StatusPending, defaultLeaseBatchSize)
+		pendingBatch, err := db.BatchFetchWithKeys(boltDB, queueType, currentRound, db.StatusPending, defaultLeaseBatchSize)
 		if err == nil {
 			// Merge batches (avoid duplicates)
 			batchMap := make(map[string]db.FetchResult)
@@ -67,38 +65,33 @@ func (q *Queue) PullRetryTasks(force bool) {
 			}
 		}
 
-		q.mu.Lock()
-		defer q.mu.Unlock()
-
 		taskType := TaskTypeSrcTraversal
 		if q.name == "dst" {
 			taskType = TaskTypeDstTraversal
 		}
 
-		added := 0
 		for _, item := range batch {
-			if _, exists := q.leasedKeys[item.Key]; exists {
+			// Skip path hashes we've already leased
+			if q.isLeased(item.Key) {
 				continue
 			}
 
-			q.leasedKeys[item.Key] = struct{}{}
+			// Mark as leased
+			q.addLeasedKey(item.Key)
 
 			task := nodeStateToTask(item.State, taskType)
-			beforeCount := len(q.pendingBuff)
-			q.enqueuePendingLocked(task)
-			if len(q.pendingBuff) > beforeCount {
-				added++
-			}
+			// Enqueue task
+			q.enqueuePending(task)
 		}
 
-		q.lastPullWasPartial = len(batch) < defaultLeaseBatchSize
+		q.setLastPullWasPartial(len(batch) < defaultLeaseBatchSize)
 
 		// Check if we've exhausted all known levels
 		if len(batch) == 0 && currentRound >= maxKnownDepth {
 			// Check if there are any more failed/pending tasks in deeper levels
 			// If not, retry sweep is complete
 			// For now, advance and let normal logic handle deeper discovery
-			q.lastPullWasPartial = true
+			q.setLastPullWasPartial(true)
 		}
 
 		return

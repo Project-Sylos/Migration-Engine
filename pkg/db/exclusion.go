@@ -10,7 +10,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// EnsureExclusionHoldingBuckets ensures that the exclusion-holding buckets exist for both SRC and DST.
+// EnsureExclusionHoldingBuckets ensures that the exclusion-holding and unexclusion-holding buckets exist for both SRC and DST.
 // This should be called when traversal completes to ensure the buckets are ready for exclusion intent queuing.
 // The buckets are created during DB initialization, but this provides a safety check.
 func EnsureExclusionHoldingBuckets(db *DB) error {
@@ -30,57 +30,67 @@ func EnsureExclusionHoldingBuckets(db *DB) error {
 			if _, err := queueBucket.CreateBucketIfNotExists([]byte(SubBucketExclusionHolding)); err != nil {
 				return fmt.Errorf("failed to create exclusion-holding bucket for %s: %w", queueType, err)
 			}
+
+			// Create unexclusion-holding bucket if it doesn't exist
+			if _, err := queueBucket.CreateBucketIfNotExists([]byte(SubBucketUnexclusionHolding)); err != nil {
+				return fmt.Errorf("failed to create unexclusion-holding bucket for %s: %w", queueType, err)
+			}
 		}
 
 		return nil
 	})
 }
 
-// ExclusionEntry represents an entry in the exclusion-holding bucket.
+// ExclusionEntry represents an entry in the exclusion-holding or unexclusion-holding bucket.
 type ExclusionEntry struct {
 	PathHash string // Path hash (key)
 	Depth    int    // Depth level (value)
+	Mode     string // "exclude" or "unexclude" - indicates which bucket this came from
 }
 
-// ScanExclusionHoldingBucketByLevel scans the exclusion-holding bucket and returns entries matching the specified level.
+// ScanExclusionHoldingBucketByLevel scans both exclusion-holding and unexclusion-holding buckets and returns entries matching the specified level.
 // Returns entries for the current level, and true if any entries were found with level > currentLevel.
-// Scans entire bucket O(n) but only collects entries matching currentLevel up to limit.
+// Scans entire buckets O(n) but only collects entries matching currentLevel up to limit.
 func ScanExclusionHoldingBucketByLevel(db *DB, queueType string, currentLevel int, limit int) ([]ExclusionEntry, bool, error) {
 	var entries []ExclusionEntry
 	var hasHigherLevels bool
 
 	err := db.View(func(tx *bolt.Tx) error {
-		holdingBucket := GetExclusionHoldingBucket(tx, queueType)
-		if holdingBucket == nil {
-			return nil // Bucket doesn't exist, no entries
-		}
-
-		cursor := holdingBucket.Cursor()
-		entriesCollected := 0
-
-		// Scan entire bucket O(n)
-		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
-			if len(v) != 8 {
-				continue // Skip invalid entries
+		// Scan both exclusion and unexclusion buckets
+		for _, mode := range []string{"exclude", "unexclude"} {
+			holdingBucket := GetHoldingBucket(tx, queueType, mode)
+			if holdingBucket == nil {
+				continue // Bucket doesn't exist, skip
 			}
 
-			// Decode depth level (int64 stored as 8 bytes, big-endian)
-			depth := int(binary.BigEndian.Uint64(v))
+			cursor := holdingBucket.Cursor()
+			entriesCollected := 0
 
-			if depth == currentLevel {
-				if entriesCollected < limit {
-					entries = append(entries, ExclusionEntry{
-						PathHash: string(k),
-						Depth:    depth,
-					})
-					entriesCollected++
+			// Scan entire bucket O(n)
+			for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+				if len(v) != 8 {
+					continue // Skip invalid entries
 				}
-				// Continue scanning to check for higher levels
-			} else if depth > currentLevel {
-				hasHigherLevels = true
-				// Continue scanning - may have more entries at current level
+
+				// Decode depth level (int64 stored as 8 bytes, big-endian)
+				depth := int(binary.BigEndian.Uint64(v))
+
+				if depth == currentLevel {
+					if entriesCollected < limit {
+						entries = append(entries, ExclusionEntry{
+							PathHash: string(k),
+							Depth:    depth,
+							Mode:     mode,
+						})
+						entriesCollected++
+					}
+					// Continue scanning to check for higher levels
+				} else if depth > currentLevel {
+					hasHigherLevels = true
+					// Continue scanning - may have more entries at current level
+				}
+				// Skip entries with depth < currentLevel (already processed in earlier rounds)
 			}
-			// Skip entries with depth < currentLevel (already processed in earlier rounds)
 		}
 
 		return nil
@@ -89,10 +99,10 @@ func ScanExclusionHoldingBucketByLevel(db *DB, queueType string, currentLevel in
 	return entries, hasHigherLevels, err
 }
 
-// AddExclusionHoldingEntry adds a path hash to the exclusion-holding bucket with its depth level.
-func AddExclusionHoldingEntry(db *DB, queueType string, pathHash string, depth int) error {
+// AddHoldingEntry adds a path hash to the appropriate holding bucket (exclusion or unexclusion) with its depth level.
+func AddHoldingEntry(db *DB, queueType string, pathHash string, depth int, mode string) error {
 	return db.Update(func(tx *bolt.Tx) error {
-		holdingBucket, err := GetOrCreateExclusionHoldingBucket(tx, queueType)
+		holdingBucket, err := GetOrCreateHoldingBucket(tx, queueType, mode)
 		if err != nil {
 			return err
 		}
@@ -105,10 +115,16 @@ func AddExclusionHoldingEntry(db *DB, queueType string, pathHash string, depth i
 	})
 }
 
-// RemoveExclusionHoldingEntry removes a path hash from the exclusion-holding bucket.
-func RemoveExclusionHoldingEntry(db *DB, queueType string, pathHash string) error {
+// AddExclusionHoldingEntry adds a path hash to the exclusion-holding bucket with its depth level.
+// Deprecated: Use AddHoldingEntry with mode "exclude" instead.
+func AddExclusionHoldingEntry(db *DB, queueType string, pathHash string, depth int) error {
+	return AddHoldingEntry(db, queueType, pathHash, depth, "exclude")
+}
+
+// RemoveHoldingEntry removes a path hash from the appropriate holding bucket (exclusion or unexclusion).
+func RemoveHoldingEntry(db *DB, queueType string, pathHash string, mode string) error {
 	return db.Update(func(tx *bolt.Tx) error {
-		holdingBucket := GetExclusionHoldingBucket(tx, queueType)
+		holdingBucket := GetHoldingBucket(tx, queueType, mode)
 		if holdingBucket == nil {
 			return nil // Bucket doesn't exist, nothing to remove
 		}
@@ -117,27 +133,52 @@ func RemoveExclusionHoldingEntry(db *DB, queueType string, pathHash string) erro
 	})
 }
 
-// CheckExclusionHoldingEntry checks if a path hash exists in the exclusion-holding bucket (O(1) lookup).
-func CheckExclusionHoldingEntry(db *DB, queueType string, pathHash string) (bool, error) {
+// RemoveExclusionHoldingEntry removes a path hash from the exclusion-holding bucket.
+// Deprecated: Use RemoveHoldingEntry with mode "exclude" instead.
+func RemoveExclusionHoldingEntry(db *DB, queueType string, pathHash string) error {
+	return RemoveHoldingEntry(db, queueType, pathHash, "exclude")
+}
+
+// CheckHoldingEntry checks if a path hash exists in either holding bucket (O(1) lookup).
+// Returns (exists, mode) where mode is "exclude", "unexclude", or "" if not found.
+func CheckHoldingEntry(db *DB, queueType string, pathHash string) (bool, string, error) {
 	var exists bool
+	var mode string
 
 	err := db.View(func(tx *bolt.Tx) error {
-		holdingBucket := GetExclusionHoldingBucket(tx, queueType)
-		if holdingBucket == nil {
-			return nil // Bucket doesn't exist, entry doesn't exist
+		// Check exclusion bucket first
+		exclusionBucket := GetExclusionHoldingBucket(tx, queueType)
+		if exclusionBucket != nil && exclusionBucket.Get([]byte(pathHash)) != nil {
+			exists = true
+			mode = "exclude"
+			return nil
 		}
 
-		exists = holdingBucket.Get([]byte(pathHash)) != nil
+		// Check unexclusion bucket
+		unexclusionBucket := GetUnexclusionHoldingBucket(tx, queueType)
+		if unexclusionBucket != nil && unexclusionBucket.Get([]byte(pathHash)) != nil {
+			exists = true
+			mode = "unexclude"
+			return nil
+		}
+
 		return nil
 	})
 
-	return exists, err
+	return exists, mode, err
 }
 
-// ClearExclusionHoldingBucket removes all entries from the exclusion-holding bucket.
-func ClearExclusionHoldingBucket(db *DB, queueType string) error {
+// CheckExclusionHoldingEntry checks if a path hash exists in the exclusion-holding bucket (O(1) lookup).
+// Deprecated: Use CheckHoldingEntry instead.
+func CheckExclusionHoldingEntry(db *DB, queueType string, pathHash string) (bool, error) {
+	exists, mode, err := CheckHoldingEntry(db, queueType, pathHash)
+	return exists && mode == "exclude", err
+}
+
+// ClearHoldingBucket removes all entries from the specified holding bucket.
+func ClearHoldingBucket(db *DB, queueType string, mode string) error {
 	return db.Update(func(tx *bolt.Tx) error {
-		holdingBucket := GetExclusionHoldingBucket(tx, queueType)
+		holdingBucket := GetHoldingBucket(tx, queueType, mode)
 		if holdingBucket == nil {
 			return nil // Bucket doesn't exist, nothing to clear
 		}
@@ -153,12 +194,18 @@ func ClearExclusionHoldingBucket(db *DB, queueType string) error {
 	})
 }
 
-// CountExclusionHoldingEntries returns the number of entries in the exclusion-holding bucket.
-func CountExclusionHoldingEntries(db *DB, queueType string) (int, error) {
+// ClearExclusionHoldingBucket removes all entries from the exclusion-holding bucket.
+// Deprecated: Use ClearHoldingBucket with mode "exclude" instead.
+func ClearExclusionHoldingBucket(db *DB, queueType string) error {
+	return ClearHoldingBucket(db, queueType, "exclude")
+}
+
+// CountHoldingEntries returns the number of entries in the specified holding bucket.
+func CountHoldingEntries(db *DB, queueType string, mode string) (int, error) {
 	var count int
 
 	err := db.View(func(tx *bolt.Tx) error {
-		holdingBucket := GetExclusionHoldingBucket(tx, queueType)
+		holdingBucket := GetHoldingBucket(tx, queueType, mode)
 		if holdingBucket == nil {
 			return nil // Bucket doesn't exist, count is 0
 		}
@@ -172,4 +219,10 @@ func CountExclusionHoldingEntries(db *DB, queueType string) (int, error) {
 	})
 
 	return count, err
+}
+
+// CountExclusionHoldingEntries returns the number of entries in the exclusion-holding bucket.
+// Deprecated: Use CountHoldingEntries with mode "exclude" instead.
+func CountExclusionHoldingEntries(db *DB, queueType string) (int, error) {
+	return CountHoldingEntries(db, queueType, "exclude")
 }

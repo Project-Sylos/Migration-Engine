@@ -227,7 +227,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		status, statusErr := InspectMigrationStatus(boltDB)
 		if statusErr == nil {
 			UpdateConfigFromStatus(cfg.YAMLConfig, status, coordinator.GetSrcRound(), coordinator.GetDstRound())
-			cfg.YAMLConfig.State.Status = StatusTraversalPending
+			SetStatusTraversalInProgress(cfg.YAMLConfig)
 			_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
 		}
 	}

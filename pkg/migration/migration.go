@@ -346,7 +346,8 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 			// Update config: Roots seeded milestone
 			if yamlCfg != nil && configPath != "" {
 				UpdateConfigFromRoots(yamlCfg, srcRoot, dstRoot)
-				yamlCfg.State.Status = StatusSeeded
+				// Set status to Roots-Set when roots are seeded
+				SetStatusRootsSet(yamlCfg)
 				_ = SaveMigrationConfig(configPath, yamlCfg)
 			}
 		}
@@ -392,8 +393,8 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 
 			// Update YAML to reflect fresh start
 			if yamlCfg != nil {
-				yamlCfg.State.Status = StatusTraversalPending
 				UpdateConfigFromRoots(yamlCfg, srcRoot, dstRoot)
+				SetStatusRootsSet(yamlCfg)
 				_ = SaveMigrationConfig(configPath, yamlCfg)
 			}
 
@@ -558,9 +559,9 @@ func normalizeRootFolder(folder types.Folder) (types.Folder, error) {
 	if folder.DisplayName == "" {
 		folder.DisplayName = folder.Id
 	}
-	if folder.LocationPath == "" {
-		folder.LocationPath = "/"
-	}
+	// The actual folder path doesn't matter - the root node is always stored at "/".
+	// Child paths will be relative to this root (e.g., "/child", "/child/grandchild").
+	folder.LocationPath = "/"
 	if folder.Type == "" {
 		folder.Type = types.NodeTypeFolder
 	}

@@ -1,0 +1,19 @@
+{
+  "seed": {
+    "max_depth": 4,
+    "min_folders": 4,
+    "max_folders": 8,
+    "min_files": 10,
+    "max_files": 20,
+    "seed": 0,
+    "db_path": "pkg/tests/unexclusion_sweep/spectra.db"
+  },
+  "api": {
+    "host": "localhost",
+    "port": 8086
+  },
+  "secondary_tables": {
+    "s1": 0.9
+  }
+}
+
