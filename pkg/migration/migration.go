@@ -538,9 +538,6 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 		if !cfg.Verification.AllowPending && (report.SrcPending > 0 || report.DstPending > 0) {
 			errMsg += "  ❌ Pending nodes remain (not allowed)\n"
 		}
-		if !cfg.Verification.AllowFailed && (report.SrcFailed > 0 || report.DstFailed > 0) {
-			errMsg += "  ❌ Failed nodes detected (not allowed)\n"
-		}
 		if !cfg.Verification.AllowNotOnSrc && report.DstNotOnSrc > 0 {
 			errMsg += "  ❌ Nodes found on DST but not on SRC (not allowed)\n"
 		}

@@ -349,6 +349,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 					go func() {
 						status, statusErr := InspectMigrationStatus(boltDB)
 						if statusErr != nil {
+							fmt.Printf("ERROR: Failed to inspect migration status for YAML update: %v\n", statusErr)
 							if logservice.LS != nil {
 								_ = logservice.LS.Log("warning", fmt.Sprintf("InspectMigrationStatus error: %v", statusErr), "migration", "run", "run")
 							}
@@ -362,11 +363,13 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 					select {
 					case err := <-done:
 						if err != nil {
+							fmt.Printf("ERROR: Failed to save migration config YAML: %v\n", err)
 							if logservice.LS != nil {
 								_ = logservice.LS.Log("warning", fmt.Sprintf("Config save failed: %v", err), "migration", "run", "run")
 							}
 						}
 					case <-ctx.Done():
+						fmt.Printf("ERROR: Config save timeout (5s) - YAML status may not be updated from Traversal-In-Progress\n")
 						if logservice.LS != nil {
 							_ = logservice.LS.Log("warning", "Config save timeout (fire-and-forget)", "migration", "run", "run")
 						}
@@ -432,19 +435,22 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 						done := make(chan error, 1)
 						go func() {
 							status, statusErr := InspectMigrationStatus(boltDB)
-							if statusErr == nil {
-								UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
-								done <- SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
-							} else {
+							if statusErr != nil {
+								fmt.Printf("ERROR: Failed to inspect migration status for YAML update (ticker path): %v\n", statusErr)
 								done <- statusErr
+								return
 							}
+							UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
+							done <- SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
 						}()
 
 						select {
-						case <-done:
-							// Config saved (ignore errors)
+						case err := <-done:
+							if err != nil {
+								fmt.Printf("ERROR: Failed to save migration config YAML (ticker path): %v\n", err)
+							}
 						case <-ctx.Done():
-							// Timeout - fire and forget
+							fmt.Printf("ERROR: Config save timeout (5s) - YAML status may not be updated from Traversal-In-Progress (ticker path)\n")
 						}
 					}()
 				}
