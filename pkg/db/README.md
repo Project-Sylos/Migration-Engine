@@ -47,19 +47,20 @@ Each queue type has three main sub-buckets:
 
 **Path**: `/Traversal-Data/SRC/nodes/` or `/Traversal-Data/DST/nodes/`
 
-Stores the canonical node data. Key is the path hash, value is NodeState JSON.
+Stores the canonical node data. Key is the ULID, value is NodeState JSON.
 
 ```
-pathHash → NodeState JSON
+ULID → NodeState JSON
 {
-  "id": "node-uuid",
-  "parent_id": "parent-uuid",
+  "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",  // ULID (used as key)
+  "parent_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",  // Parent's ULID
   "parent_path": "/parent",
   "name": "folder-name",
   "path": "/parent/folder-name",
   "type": "folder",
   "depth": 1,
   "traversal_status": "successful",
+  "src_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",  // For DST nodes: corresponding SRC node ULID
   ...
 }
 ```
@@ -68,11 +69,11 @@ pathHash → NodeState JSON
 
 **Path**: `/Traversal-Data/SRC/children/` or `/Traversal-Data/DST/children/`
 
-Stores parent-child relationships. Key is parent path hash, value is array of child path hashes.
+Stores parent-child relationships. Key is parent ULID, value is array of child ULIDs.
 
 ```
-parentPathHash → []childPathHash JSON
-["abc123", "def456", "ghi789"]
+parentULID → []childULID JSON
+["01ARZ3NDEKTSV4RRFFQ69G5FAV", "01ARZ3NDEKTSV4RRFFQ69G5FAW", "01ARZ3NDEKTSV4RRFFQ69G5FAX"]
 ```
 
 #### 3. Levels Bucket (`/levels`)
@@ -84,10 +85,10 @@ Organized by BFS depth level, with status sub-buckets and a status-lookup index:
 ```
 /levels
   /00000000              → Level 0 (root)
-    /pending             → pathHash: empty (membership set)
-    /successful          → pathHash: empty (membership set)
-    /failed              → pathHash: empty (membership set)
-    /status-lookup       → pathHash: status string (reverse index)
+    /pending             → ULID: empty (membership set)
+    /successful          → ULID: empty (membership set)
+    /failed              → ULID: empty (membership set)
+    /status-lookup       → ULID: status string (reverse index)
   /00000001              → Level 1
     /pending
     /successful
@@ -99,12 +100,12 @@ Organized by BFS depth level, with status sub-buckets and a status-lookup index:
 
 For DST queue, there's an additional status:
 ```
-  /not_on_src            → pathHash: empty (membership set)
+  /not_on_src            → ULID: empty (membership set)
 ```
 
-**Status buckets are membership sets**: The presence of a pathHash in a bucket means that node has that status. The value is empty; only the key matters.
+**Status buckets are membership sets**: The presence of a ULID in a bucket means that node has that status. The value is empty; only the key matters.
 
-**Status-lookup index**: The `status-lookup` bucket provides a reverse index mapping `pathHash → status string`. This enables O(1) lookup to determine which status bucket a node belongs to without scanning all status buckets. The index is automatically maintained:
+**Status-lookup index**: The `status-lookup` bucket provides a reverse index mapping `ULID → status string`. This enables O(1) lookup to determine which status bucket a node belongs to without scanning all status buckets. The index is automatically maintained:
 - Created when a level bucket is first created
 - Updated on every node insert (with initial status)
 - Updated on every status transition (pending → successful, etc.)
@@ -178,21 +179,27 @@ defer database.Close()
 
 **Note:** The database automatically initializes the bucket structure on first open, including the stats bucket for O(1) count operations.
 
-### Path Hashing
+### ULID-Based Keys
 
-Paths are hashed using SHA256 (first 16 bytes, 32 hex characters) for consistent key generation:
+All internal operations use ULID (Universally Unique Lexicographically Sortable Identifier) for keys. ULIDs provide:
+- Unique identifiers without path dependencies
+- Lexicographically sortable (useful for ordering)
+- 26 characters (more compact than UUIDs)
+- Time-ordered (first 48 bits encode timestamp)
 
 ```go
-pathHash := db.HashPath("/parent/child") // Returns 32-character hex string
+nodeID := db.GenerateNodeID() // Returns ULID string (e.g., "01ARZ3NDEKTSV4RRFFQ69G5FAV")
 ```
+
+**Note**: The `HashPath` function still exists for backward compatibility with test utilities, but is not used for internal operations.
 
 ### Node State Operations
 
 ```go
 // Insert a node (creates entry in nodes, status, status-lookup, and children buckets)
 state := &db.NodeState{
-    ID:         "node-id",
-    ParentID:   "parent-id",
+    ID:         "01ARZ3NDEKTSV4RRFFQ69G5FAV",  // ULID
+    ParentID:   "01ARZ3NDEKTSV4RRFFQ69G5FAW",  // Parent's ULID
     ParentPath: "/parent",
     Name:       "child",
     Path:       "/parent/child",
@@ -200,7 +207,7 @@ state := &db.NodeState{
     Depth:      1,
 }
 // This automatically:
-// 1. Inserts into /nodes bucket
+// 1. Inserts into /nodes bucket (keyed by ULID)
 // 2. Adds to status bucket (/levels/{level}/{status})
 // 3. Updates status-lookup index (/levels/{level}/status-lookup)
 // 4. Updates parent's children list
@@ -212,18 +219,21 @@ err := db.InsertNodeWithIndex(database, "SRC", 1, db.StatusPending, state)
 // 2. Removes from old status bucket
 // 3. Adds to new status bucket
 // 4. Updates status-lookup index
-updatedState, err := db.UpdateNodeStatus(database, "SRC", 1, 
-    db.StatusPending, db.StatusSuccessful, "/parent/child")
+nodeID := "01ARZ3NDEKTSV4RRFFQ69G5FAV"  // ULID of the node
+updatedState, err := db.UpdateNodeStatusByID(database, "SRC", 1, 
+    db.StatusPending, db.StatusSuccessful, nodeID)
 
-// Get node state
-state, err := db.GetNodeStateByPath(database, "SRC", "/parent/child")
+// Get node state by ULID
+state, err := db.GetNodeState(database, "SRC", nodeID)
 
-// Get children of a node
-children, err := db.GetChildrenStates(database, "SRC", "/parent")
+// Get children of a node by parent ULID
+parentID := "01ARZ3NDEKTSV4RRFFQ69G5FAW"  // Parent's ULID
+children, err := db.GetChildrenStatesByParentID(database, "SRC", parentID)
 
 // Query status-lookup index (find which status bucket a node belongs to)
 lookupBucket := db.GetStatusLookupBucket(tx, "SRC", 1)
-statusBytes := lookupBucket.Get(pathHash)
+nodeIDBytes := []byte(nodeID)  // Convert ULID string to bytes
+statusBytes := lookupBucket.Get(nodeIDBytes)
 status := string(statusBytes) // "pending", "successful", "failed", etc.
 ```
 
@@ -233,8 +243,9 @@ status := string(statusBytes) // "pending", "successful", "failed", etc.
 // Iterate over all nodes in a status bucket
 err := database.IterateStatusBucket("SRC", 1, db.StatusPending, 
     db.IteratorOptions{Limit: 100}, 
-    func(pathHash []byte) error {
+    func(nodeIDBytes []byte) error {
         // Process each pending node at level 1
+        // nodeIDBytes contains the ULID of the node
         return nil
     })
 
@@ -254,12 +265,12 @@ levels, err := database.GetAllLevels("SRC")
 minLevel, err := database.FindMinPendingLevel("SRC")
 
 // Lease tasks from status bucket (for worker task distribution)
-pathHashes, err := database.LeaseTasksFromStatus("SRC", 1, db.StatusPending, 1000)
+nodeIDs, err := database.LeaseTasksFromStatus("SRC", 1, db.StatusPending, 1000)
 
 // Batch fetch with keys (for task leasing with deduplication)
 results, err := db.BatchFetchWithKeys(database, "SRC", 1, db.StatusPending, 100)
 for _, result := range results {
-    // result.Key is the path hash string
+    // result.Key is the ULID string
     // result.State is the NodeState
 }
 ```
@@ -437,7 +448,9 @@ statusBucket := db.GetStatusBucket(tx, "SRC", 1, db.StatusPending)
 lookupBucket := db.GetStatusLookupBucket(tx, "SRC", 1)
 
 // Update status-lookup index (automatically called by insert/update functions)
-err := db.UpdateStatusLookup(tx, "SRC", 1, pathHash, db.StatusSuccessful)
+nodeID := "01ARZ3NDEKTSV4RRFFQ69G5FAV"  // ULID
+nodeIDBytes := []byte(nodeID)
+err := db.UpdateStatusLookup(tx, "SRC", 1, nodeIDBytes, db.StatusSuccessful)
 ```
 
 ---
@@ -634,7 +647,7 @@ The database package provides:
 - ✅ **Buffered Writes** - `OutputBuffer` and `LogBuffer` for high throughput
 - ✅ **O(1) Statistics** - Stats bucket for fast count lookups and queue metrics
 - ✅ **Queue Observability** - Real-time queue performance metrics in `/STATS/queue-stats`
-- ✅ **Path Hashing** - Consistent key generation from paths
+- ✅ **ULID-Based Keys** - Unique, sortable identifiers for all internal operations
 - ✅ **Task Leasing** - Efficient task distribution for workers
 - ✅ **Thread Safety** - Safe for concurrent reads, serialized writes
 - ✅ **Crash Resilience** - ACID transactions with automatic recovery

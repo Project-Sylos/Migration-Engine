@@ -115,12 +115,6 @@ func AddHoldingEntry(db *DB, queueType string, nodeID string, depth int, mode st
 	})
 }
 
-// AddExclusionHoldingEntry adds a ULID to the exclusion-holding bucket with its depth level.
-// Deprecated: Use AddHoldingEntry with mode "exclude" instead.
-func AddExclusionHoldingEntry(db *DB, queueType string, nodeID string, depth int) error {
-	return AddHoldingEntry(db, queueType, nodeID, depth, "exclude")
-}
-
 // RemoveHoldingEntry removes a ULID from the appropriate holding bucket (exclusion or unexclusion).
 func RemoveHoldingEntry(db *DB, queueType string, nodeID string, mode string) error {
 	return db.Update(func(tx *bolt.Tx) error {
@@ -131,12 +125,6 @@ func RemoveHoldingEntry(db *DB, queueType string, nodeID string, mode string) er
 
 		return holdingBucket.Delete([]byte(nodeID))
 	})
-}
-
-// RemoveExclusionHoldingEntry removes a ULID from the exclusion-holding bucket.
-// Deprecated: Use RemoveHoldingEntry with mode "exclude" instead.
-func RemoveExclusionHoldingEntry(db *DB, queueType string, nodeID string) error {
-	return RemoveHoldingEntry(db, queueType, nodeID, "exclude")
 }
 
 // CheckHoldingEntry checks if a ULID exists in either holding bucket (O(1) lookup).
@@ -168,13 +156,6 @@ func CheckHoldingEntry(db *DB, queueType string, nodeID string) (bool, string, e
 	return exists, mode, err
 }
 
-// CheckExclusionHoldingEntry checks if a ULID exists in the exclusion-holding bucket (O(1) lookup).
-// Deprecated: Use CheckHoldingEntry instead.
-func CheckExclusionHoldingEntry(db *DB, queueType string, nodeID string) (bool, error) {
-	exists, mode, err := CheckHoldingEntry(db, queueType, nodeID)
-	return exists && mode == "exclude", err
-}
-
 // ClearHoldingBucket removes all entries from the specified holding bucket.
 func ClearHoldingBucket(db *DB, queueType string, mode string) error {
 	return db.Update(func(tx *bolt.Tx) error {
@@ -192,12 +173,6 @@ func ClearHoldingBucket(db *DB, queueType string, mode string) error {
 
 		return nil
 	})
-}
-
-// ClearExclusionHoldingBucket removes all entries from the exclusion-holding bucket.
-// Deprecated: Use ClearHoldingBucket with mode "exclude" instead.
-func ClearExclusionHoldingBucket(db *DB, queueType string) error {
-	return ClearHoldingBucket(db, queueType, "exclude")
 }
 
 // CountHoldingEntries returns the number of entries in the specified holding bucket.
@@ -219,10 +194,4 @@ func CountHoldingEntries(db *DB, queueType string, mode string) (int, error) {
 	})
 
 	return count, err
-}
-
-// CountExclusionHoldingEntries returns the number of entries in the exclusion-holding bucket.
-// Deprecated: Use CountHoldingEntries with mode "exclude" instead.
-func CountExclusionHoldingEntries(db *DB, queueType string) (int, error) {
-	return CountHoldingEntries(db, queueType, "exclude")
 }

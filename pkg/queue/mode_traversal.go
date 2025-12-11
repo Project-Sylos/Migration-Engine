@@ -138,6 +138,7 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	// Batch-load expected children for DST tasks
 	var expectedFoldersMap map[string][]types.Folder
 	var expectedFilesMap map[string][]types.File
+	var srcIDMap map[string]map[string]string // DST ULID -> (Type+Name -> SRC node ID)
 	if q.name == "dst" {
 		// First pass: collect all valid (not already leased) folder tasks and their DST parent ULIDs
 		var dstParentIDs []string
@@ -156,10 +157,10 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		}
 
 		// Batch-load expected children for all folder tasks in one DB operation
-		// Uses join-lookup to find corresponding SRC parents, then loads their children
+		// Uses SrcID from DST NodeState to find corresponding SRC parents, then loads their children
 		if len(dstParentIDs) > 0 {
 			var err error
-			expectedFoldersMap, expectedFilesMap, err = BatchLoadExpectedChildrenByDSTIDs(boltDB, dstParentIDs, dstIDToPath)
+			expectedFoldersMap, expectedFilesMap, srcIDMap, err = BatchLoadExpectedChildrenByDSTIDs(boltDB, dstParentIDs, dstIDToPath)
 			if err != nil {
 				if logservice.LS != nil {
 					_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to batch load expected children: %v", err), "queue", q.name, q.name)
@@ -167,7 +168,10 @@ func (q *Queue) PullTraversalTasks(force bool) {
 				// Continue anyway - tasks will have empty expected children
 				expectedFoldersMap = make(map[string][]types.Folder)
 				expectedFilesMap = make(map[string][]types.File)
+				srcIDMap = make(map[string]map[string]string)
 			}
+		} else {
+			srcIDMap = make(map[string]map[string]string)
 		}
 	}
 
@@ -181,8 +185,12 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		q.addLeasedKey(item.Key)
 
 		task := nodeStateToTask(item.State, taskType)
+		// Ensure task has the ULID from the database
+		if task != nil && task.ID == "" {
+			task.ID = item.State.ID
+		}
 
-		// For DST folder tasks, populate ExpectedFolders/ExpectedFiles from batch-loaded results
+		// For DST folder tasks, populate ExpectedFolders/ExpectedFiles and SRC ID map from batch-loaded results
 		if q.name == "dst" && task.IsFolder() {
 			// Use DST ULID to look up expected children
 			dstID := item.State.ID
@@ -190,6 +198,9 @@ func (q *Queue) PullTraversalTasks(force bool) {
 			expectedFiles := expectedFilesMap[dstID]
 			task.ExpectedFolders = expectedFolders
 			task.ExpectedFiles = expectedFiles
+			if srcIDMap != nil {
+				task.ExpectedSrcIDMap = srcIDMap[dstID]
+			}
 		}
 
 		// Enqueue task

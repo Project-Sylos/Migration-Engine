@@ -14,6 +14,32 @@ import (
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 )
 
+// findNodeByPath is a test utility helper that finds a node by its path.
+// This iterates through all nodes to find a match - only for test utilities.
+func findNodeByPath(boltDB *db.DB, queueType string, path string) (*db.NodeState, error) {
+	var found *db.NodeState
+	err := boltDB.View(func(tx *bolt.Tx) error {
+		nodesBucket := db.GetNodesBucket(tx, queueType)
+		if nodesBucket == nil {
+			return fmt.Errorf("nodes bucket not found")
+		}
+
+		cursor := nodesBucket.Cursor()
+		for nodeIDBytes, nodeData := cursor.First(); nodeIDBytes != nil; nodeIDBytes, nodeData = cursor.Next() {
+			nodeState, err := db.DeserializeNodeState(nodeData)
+			if err != nil {
+				continue
+			}
+			if nodeState.Path == path {
+				found = nodeState
+				return nil
+			}
+		}
+		return fmt.Errorf("node not found: %s", path)
+	})
+	return found, err
+}
+
 // SubtreeStats contains statistics about a subtree.
 type SubtreeStats struct {
 	TotalNodes   int
@@ -26,35 +52,22 @@ type SubtreeStats struct {
 // Returns the total count of nodes (including the root node).
 func CountSubtree(boltDB *db.DB, queueType string, rootPath string) (SubtreeStats, error) {
 	stats := SubtreeStats{}
-	visited := make(map[string]bool)
+	visited := make(map[string]bool) // Track by ULID
 
-	var dfs func(path string, depth int) error
-	dfs = func(path string, depth int) error {
-		pathHash := db.HashPath(path)
-		if visited[pathHash] {
+	var dfs func(nodeID string, depth int) error
+	dfs = func(nodeID string, depth int) error {
+		if visited[nodeID] {
 			return nil // Already counted
 		}
-		visited[pathHash] = true
+		visited[nodeID] = true
 
-		// Get node state
-		var nodeState *db.NodeState
-		err := boltDB.View(func(tx *bolt.Tx) error {
-			nodesBucket := db.GetNodesBucket(tx, queueType)
-			if nodesBucket == nil {
-				return fmt.Errorf("nodes bucket not found")
-			}
-
-			nodeData := nodesBucket.Get([]byte(pathHash))
-			if nodeData == nil {
-				return fmt.Errorf("node not found: %s", path)
-			}
-
-			var err error
-			nodeState, err = db.DeserializeNodeState(nodeData)
-			return err
-		})
+		// Get node state by ULID
+		nodeState, err := db.GetNodeState(boltDB, queueType, nodeID)
 		if err != nil {
-			return fmt.Errorf("failed to get node state for %s: %w", path, err)
+			return fmt.Errorf("failed to get node state for %s: %w", nodeID, err)
+		}
+		if nodeState == nil {
+			return fmt.Errorf("node not found: %s", nodeID)
 		}
 
 		// Count this node
@@ -70,13 +83,13 @@ func CountSubtree(boltDB *db.DB, queueType string, rootPath string) (SubtreeStat
 
 		// Recurse into children (if folder)
 		if nodeState.Type == "folder" {
-			children, err := db.GetChildrenStates(boltDB, queueType, path)
+			childIDs, err := db.GetChildrenIDsByParentID(boltDB, queueType, nodeState.ID)
 			if err != nil {
-				return fmt.Errorf("failed to get children for %s: %w", path, err)
+				return fmt.Errorf("failed to get children for %s: %w", nodeID, err)
 			}
 
-			for _, child := range children {
-				if err := dfs(child.Path, depth+1); err != nil {
+			for _, childID := range childIDs {
+				if err := dfs(childID, depth+1); err != nil {
 					return err
 				}
 			}
@@ -85,7 +98,13 @@ func CountSubtree(boltDB *db.DB, queueType string, rootPath string) (SubtreeStat
 		return nil
 	}
 
-	if err := dfs(rootPath, 0); err != nil {
+	// Find root node by path
+	rootNode, err := findNodeByPath(boltDB, queueType, rootPath)
+	if err != nil {
+		return stats, fmt.Errorf("failed to find root node: %w", err)
+	}
+
+	if err := dfs(rootNode.ID, 0); err != nil {
 		return stats, err
 	}
 
@@ -100,33 +119,20 @@ func DeleteSubtree(boltDB *db.DB, queueType string, rootPath string) error {
 	var nodesToDelete []*db.NodeState
 
 	// First pass: collect all nodes in subtree
-	var dfsCollect func(path string) error
-	dfsCollect = func(path string) error {
-		pathHash := db.HashPath(path)
-		if visited[pathHash] {
+	var dfsCollect func(nodeID string) error
+	dfsCollect = func(nodeID string) error {
+		if visited[nodeID] {
 			return nil // Already collected
 		}
-		visited[pathHash] = true
+		visited[nodeID] = true
 
-		// Get node state
-		var nodeState *db.NodeState
-		err := boltDB.View(func(tx *bolt.Tx) error {
-			nodesBucket := db.GetNodesBucket(tx, queueType)
-			if nodesBucket == nil {
-				return fmt.Errorf("nodes bucket not found")
-			}
-
-			nodeData := nodesBucket.Get([]byte(pathHash))
-			if nodeData == nil {
-				return fmt.Errorf("node not found: %s", path)
-			}
-
-			var err2 error
-			nodeState, err2 = db.DeserializeNodeState(nodeData)
-			return err2
-		})
+		// Get node state by ULID
+		nodeState, err := db.GetNodeState(boltDB, queueType, nodeID)
 		if err != nil {
-			return fmt.Errorf("failed to get node state for %s: %w", path, err)
+			return fmt.Errorf("failed to get node state for %s: %w", nodeID, err)
+		}
+		if nodeState == nil {
+			return fmt.Errorf("node not found: %s", nodeID)
 		}
 
 		// Collect this node
@@ -134,13 +140,13 @@ func DeleteSubtree(boltDB *db.DB, queueType string, rootPath string) error {
 
 		// Recurse into children (if folder)
 		if nodeState.Type == "folder" {
-			children, err := db.GetChildrenStates(boltDB, queueType, path)
+			childIDs, err := db.GetChildrenIDsByParentID(boltDB, queueType, nodeState.ID)
 			if err != nil {
-				return fmt.Errorf("failed to get children for %s: %w", path, err)
+				return fmt.Errorf("failed to get children for %s: %w", nodeID, err)
 			}
 
-			for _, child := range children {
-				if err := dfsCollect(child.Path); err != nil {
+			for _, childID := range childIDs {
+				if err := dfsCollect(childID); err != nil {
 					return err
 				}
 			}
@@ -149,7 +155,13 @@ func DeleteSubtree(boltDB *db.DB, queueType string, rootPath string) error {
 		return nil
 	}
 
-	if err := dfsCollect(rootPath); err != nil {
+	// Find root node by path
+	rootNode, err := findNodeByPath(boltDB, queueType, rootPath)
+	if err != nil {
+		return fmt.Errorf("failed to find root node: %w", err)
+	}
+
+	if err := dfsCollect(rootNode.ID); err != nil {
 		return err
 	}
 
@@ -162,13 +174,16 @@ func DeleteSubtree(boltDB *db.DB, queueType string, rootPath string) error {
 
 	return boltDB.Update(func(tx *bolt.Tx) error {
 		for _, nodeState := range nodesToDelete {
-			pathHash := []byte(db.HashPath(nodeState.Path))
-			parentHash := []byte(db.HashPath(nodeState.ParentPath))
+			nodeIDBytes := []byte(nodeState.ID)
+			var parentIDBytes []byte
+			if nodeState.ParentID != "" {
+				parentIDBytes = []byte(nodeState.ParentID)
+			}
 
 			// 1. Delete from nodes bucket
 			nodesBucket := db.GetNodesBucket(tx, queueType)
 			if nodesBucket != nil {
-				nodesBucket.Delete(pathHash)
+				nodesBucket.Delete(nodeIDBytes)
 			}
 
 			// 2. Delete from status bucket (check all status buckets at all levels)
@@ -177,8 +192,8 @@ func DeleteSubtree(boltDB *db.DB, queueType string, rootPath string) error {
 			for _, level := range levels {
 				for _, status := range statuses {
 					statusBucket := db.GetStatusBucket(tx, queueType, level, status)
-					if statusBucket != nil && statusBucket.Get(pathHash) != nil {
-						statusBucket.Delete(pathHash)
+					if statusBucket != nil && statusBucket.Get(nodeIDBytes) != nil {
+						statusBucket.Delete(nodeIDBytes)
 					}
 				}
 			}
@@ -187,22 +202,21 @@ func DeleteSubtree(boltDB *db.DB, queueType string, rootPath string) error {
 			for _, level := range levels {
 				lookupBucket := db.GetStatusLookupBucket(tx, queueType, level)
 				if lookupBucket != nil {
-					lookupBucket.Delete(pathHash)
+					lookupBucket.Delete(nodeIDBytes)
 				}
 			}
 
 			// 4. Remove from parent's children list
-			if nodeState.ParentPath != "" {
+			if nodeState.ParentID != "" {
 				childrenBucket := db.GetChildrenBucket(tx, queueType)
 				if childrenBucket != nil {
-					childrenData := childrenBucket.Get(parentHash)
+					childrenData := childrenBucket.Get(parentIDBytes)
 					if childrenData != nil {
 						var children []string
 						if err := json.Unmarshal(childrenData, &children); err == nil {
-							childHash := db.HashPath(nodeState.Path)
 							filtered := make([]string, 0, len(children))
 							for _, c := range children {
-								if c != childHash {
+								if c != nodeState.ID {
 									filtered = append(filtered, c)
 								}
 							}
@@ -210,10 +224,10 @@ func DeleteSubtree(boltDB *db.DB, queueType string, rootPath string) error {
 							if len(filtered) > 0 {
 								updatedData, err := json.Marshal(filtered)
 								if err == nil {
-									childrenBucket.Put(parentHash, updatedData)
+									childrenBucket.Put(parentIDBytes, updatedData)
 								}
 							} else {
-								childrenBucket.Delete(parentHash)
+								childrenBucket.Delete(parentIDBytes)
 							}
 						}
 					}
@@ -227,46 +241,26 @@ func DeleteSubtree(boltDB *db.DB, queueType string, rootPath string) error {
 
 // MarkNodeAsFailed marks a node as failed in the database.
 func MarkNodeAsFailed(boltDB *db.DB, queueType string, nodePath string) error {
-	pathHash := db.HashPath(nodePath)
-
-	// First, get the node to find its level and current status
-	var nodeState *db.NodeState
-	var currentLevel int
-	var currentStatus string
-
-	err := boltDB.View(func(tx *bolt.Tx) error {
-		nodesBucket := db.GetNodesBucket(tx, queueType)
-		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found")
-		}
-
-		nodeData := nodesBucket.Get([]byte(pathHash))
-		if nodeData == nil {
-			return fmt.Errorf("node not found: %s", nodePath)
-		}
-
-		var err error
-		nodeState, err = db.DeserializeNodeState(nodeData)
-		if err != nil {
-			return err
-		}
-
-		currentLevel = nodeState.Depth
-		currentStatus = nodeState.TraversalStatus
-		return nil
-	})
+	// Find node by path
+	nodeState, err := findNodeByPath(boltDB, queueType, nodePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to find node: %w", err)
 	}
 
-	// Update status to failed
-	_, err = db.UpdateNodeStatus(boltDB, queueType, currentLevel, currentStatus, db.StatusFailed, nodePath)
+	// Update status to failed using ULID
+	_, err = db.UpdateNodeStatusByID(boltDB, queueType, nodeState.Depth, nodeState.TraversalStatus, db.StatusFailed, nodeState.ID)
 	return err
 }
 
 // MarkNodeAsExcluded marks a node as explicitly excluded in the database.
 func MarkNodeAsExcluded(boltDB *db.DB, queueType string, nodePath string) error {
-	pathHash := []byte(db.HashPath(nodePath))
+	// Find node by path
+	nodeState, err := findNodeByPath(boltDB, queueType, nodePath)
+	if err != nil {
+		return fmt.Errorf("failed to find node: %w", err)
+	}
+
+	nodeIDBytes := []byte(nodeState.ID)
 
 	return boltDB.Update(func(tx *bolt.Tx) error {
 		nodesBucket := db.GetNodesBucket(tx, queueType)
@@ -274,7 +268,7 @@ func MarkNodeAsExcluded(boltDB *db.DB, queueType string, nodePath string) error 
 			return fmt.Errorf("nodes bucket not found")
 		}
 
-		nodeData := nodesBucket.Get([]byte(pathHash))
+		nodeData := nodesBucket.Get(nodeIDBytes)
 		if nodeData == nil {
 			return fmt.Errorf("node not found: %s", nodePath)
 		}
@@ -293,13 +287,19 @@ func MarkNodeAsExcluded(boltDB *db.DB, queueType string, nodePath string) error 
 			return fmt.Errorf("failed to serialize node state: %w", err)
 		}
 
-		return nodesBucket.Put(pathHash, updatedData)
+		return nodesBucket.Put(nodeIDBytes, updatedData)
 	})
 }
 
 // MarkNodeAsUnexcluded marks a node as explicitly unexcluded in the database.
 func MarkNodeAsUnexcluded(boltDB *db.DB, queueType string, nodePath string) error {
-	pathHash := []byte(db.HashPath(nodePath))
+	// Find node by path
+	nodeState, err := findNodeByPath(boltDB, queueType, nodePath)
+	if err != nil {
+		return fmt.Errorf("failed to find node: %w", err)
+	}
+
+	nodeIDBytes := []byte(nodeState.ID)
 
 	return boltDB.Update(func(tx *bolt.Tx) error {
 		nodesBucket := db.GetNodesBucket(tx, queueType)
@@ -307,7 +307,7 @@ func MarkNodeAsUnexcluded(boltDB *db.DB, queueType string, nodePath string) erro
 			return fmt.Errorf("nodes bucket not found")
 		}
 
-		nodeData := nodesBucket.Get([]byte(pathHash))
+		nodeData := nodesBucket.Get(nodeIDBytes)
 		if nodeData == nil {
 			return fmt.Errorf("node not found: %s", nodePath)
 		}
@@ -326,7 +326,7 @@ func MarkNodeAsUnexcluded(boltDB *db.DB, queueType string, nodePath string) erro
 			return fmt.Errorf("failed to serialize node state: %w", err)
 		}
 
-		return nodesBucket.Put(pathHash, updatedData)
+		return nodesBucket.Put(nodeIDBytes, updatedData)
 	})
 }
 
@@ -386,25 +386,30 @@ func PickFirstExcludedTopLevelChild(boltDB *db.DB, queueType string, rootPath st
 
 // GetTopLevelChildren returns all direct children of the root (depth 1).
 // Uses multiple strategies:
-// 1. Try children bucket with "/" (normalized root path)
-// 2. Try children bucket with "" (root's ParentPath)
-// 3. Fall back to finding all nodes at depth 1
+// 1. Find root node by path, then get its children by ParentID
+// 2. Fall back to finding all nodes at depth 1
 func GetTopLevelChildren(boltDB *db.DB, queueType string, rootPath string) ([]*db.NodeState, error) {
-	// Strategy 1: Try with "/" (normalized root path)
-	children, err := db.GetChildrenStates(boltDB, queueType, "/")
-	if err == nil && len(children) > 0 {
-		return children, nil
+	// Strategy 1: Find root node and get its children
+	rootNode, err := findNodeByPath(boltDB, queueType, rootPath)
+	if err == nil && rootNode != nil {
+		childIDs, err := db.GetChildrenIDsByParentID(boltDB, queueType, rootNode.ID)
+		if err == nil && len(childIDs) > 0 {
+			// Convert child IDs to NodeStates
+			var childStates []*db.NodeState
+			for _, childID := range childIDs {
+				childState, err := db.GetNodeState(boltDB, queueType, childID)
+				if err == nil && childState != nil {
+					childStates = append(childStates, childState)
+				}
+			}
+			if len(childStates) > 0 {
+				return childStates, nil
+			}
+		}
 	}
 
-	// Strategy 2: Try with empty string (root's actual ParentPath)
-	children, err = db.GetChildrenStates(boltDB, queueType, "")
-	if err == nil && len(children) > 0 {
-		return children, nil
-	}
-
-	// Strategy 3: Fall back to finding all nodes at depth 1
+	// Strategy 2: Fall back to finding all nodes at depth 1
 	// This is more reliable if children bucket structure is inconsistent
-	// First check if level 1 exists (outside transaction)
 	levels, err := boltDB.GetAllLevels(queueType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get levels: %w", err)
@@ -432,7 +437,7 @@ func GetTopLevelChildren(boltDB *db.DB, queueType string, rootPath string) ([]*d
 
 		// Iterate through all status buckets at level 1
 		statuses := []string{db.StatusPending, db.StatusSuccessful, db.StatusFailed, db.StatusNotOnSrc}
-		seenHashes := make(map[string]bool)
+		seenIDs := make(map[string]bool)
 
 		for _, status := range statuses {
 			statusBucket := db.GetStatusBucket(tx, queueType, 1, status)
@@ -441,15 +446,15 @@ func GetTopLevelChildren(boltDB *db.DB, queueType string, rootPath string) ([]*d
 			}
 
 			cursor := statusBucket.Cursor()
-			for pathHash, _ := cursor.First(); pathHash != nil; pathHash, _ = cursor.Next() {
-				hashStr := string(pathHash)
-				if seenHashes[hashStr] {
+			for nodeIDBytes, _ := cursor.First(); nodeIDBytes != nil; nodeIDBytes, _ = cursor.Next() {
+				nodeIDStr := string(nodeIDBytes)
+				if seenIDs[nodeIDStr] {
 					continue // Already processed
 				}
-				seenHashes[hashStr] = true
+				seenIDs[nodeIDStr] = true
 
 				// Get node data
-				nodeData := nodesBucket.Get(pathHash)
+				nodeData := nodesBucket.Get(nodeIDBytes)
 				if nodeData == nil {
 					continue
 				}
@@ -459,7 +464,7 @@ func GetTopLevelChildren(boltDB *db.DB, queueType string, rootPath string) ([]*d
 					continue
 				}
 
-				// Verify it's actually depth 1 and parent is root
+				// Verify it's actually depth 1 and parent is root (ParentID empty or matches root)
 				if nodeState.Depth == 1 && (nodeState.ParentPath == "/" || nodeState.ParentPath == "") {
 					depth1Nodes = append(depth1Nodes, nodeState)
 				}
@@ -543,35 +548,22 @@ func CountExcludedNodes(boltDB *db.DB, queueType string) (int, error) {
 // CountExcludedInSubtree counts excluded nodes (explicit_excluded = true OR inherited_excluded = true) within a subtree.
 func CountExcludedInSubtree(boltDB *db.DB, queueType string, rootPath string) (int, error) {
 	count := 0
-	visited := make(map[string]bool)
+	visited := make(map[string]bool) // Track by ULID
 
-	var dfs func(path string) error
-	dfs = func(path string) error {
-		pathHash := db.HashPath(path)
-		if visited[pathHash] {
+	var dfs func(nodeID string) error
+	dfs = func(nodeID string) error {
+		if visited[nodeID] {
 			return nil
 		}
-		visited[pathHash] = true
+		visited[nodeID] = true
 
-		// Get node state
-		var nodeState *db.NodeState
-		err := boltDB.View(func(tx *bolt.Tx) error {
-			nodesBucket := db.GetNodesBucket(tx, queueType)
-			if nodesBucket == nil {
-				return fmt.Errorf("nodes bucket not found")
-			}
-
-			nodeData := nodesBucket.Get([]byte(pathHash))
-			if nodeData == nil {
-				return fmt.Errorf("node not found: %s", path)
-			}
-
-			var err error
-			nodeState, err = db.DeserializeNodeState(nodeData)
-			return err
-		})
+		// Get node state by ULID
+		nodeState, err := db.GetNodeState(boltDB, queueType, nodeID)
 		if err != nil {
-			return fmt.Errorf("failed to get node state for %s: %w", path, err)
+			return fmt.Errorf("failed to get node state for %s: %w", nodeID, err)
+		}
+		if nodeState == nil {
+			return fmt.Errorf("node not found: %s", nodeID)
 		}
 
 		// Count if excluded (explicitly OR inherited)
@@ -581,13 +573,13 @@ func CountExcludedInSubtree(boltDB *db.DB, queueType string, rootPath string) (i
 
 		// Recurse into children (if folder)
 		if nodeState.Type == "folder" {
-			children, err := db.GetChildrenStates(boltDB, queueType, path)
+			childIDs, err := db.GetChildrenIDsByParentID(boltDB, queueType, nodeState.ID)
 			if err != nil {
-				return fmt.Errorf("failed to get children for %s: %w", path, err)
+				return fmt.Errorf("failed to get children for %s: %w", nodeID, err)
 			}
 
-			for _, child := range children {
-				if err := dfs(child.Path); err != nil {
+			for _, childID := range childIDs {
+				if err := dfs(childID); err != nil {
 					return err
 				}
 			}
@@ -596,7 +588,13 @@ func CountExcludedInSubtree(boltDB *db.DB, queueType string, rootPath string) (i
 		return nil
 	}
 
-	if err := dfs(rootPath); err != nil {
+	// Find root node by path
+	rootNode, err := findNodeByPath(boltDB, queueType, rootPath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to find root node: %w", err)
+	}
+
+	if err := dfs(rootNode.ID); err != nil {
 		return 0, err
 	}
 

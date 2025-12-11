@@ -98,15 +98,15 @@ func (w *TraversalWorker) Run() {
 		mode := w.queue.mode
 		boltDB := w.queue.boltDB
 		w.queue.mu.RUnlock()
-		if mode == QueueModeRetry && boltDB != nil {
-			pathHash := db.HashPath(task.LocationPath())
+		if mode == QueueModeRetry && boltDB != nil && task.ID != "" {
 			queueType := getQueueType(w.queueName)
-			excluded, err := db.CheckExclusionHoldingEntry(boltDB, queueType, pathHash)
+			exists, mode, err := db.CheckHoldingEntry(boltDB, queueType, task.ID)
+			excluded := (err == nil && exists && mode == "exclude")
 			if err == nil && excluded {
 				// Skip excluded nodes during retry sweep
 				if logservice.LS != nil {
 					_ = logservice.LS.Log("debug",
-						fmt.Sprintf("Skipping excluded node in retry sweep: path=%s", task.LocationPath()),
+						fmt.Sprintf("Skipping excluded node in retry sweep: id=%s path=%s", task.ID, task.LocationPath()),
 						"worker", w.id, w.queueName)
 				}
 				// Mark as successful (skipped, not failed)
@@ -129,8 +129,8 @@ func (w *TraversalWorker) Run() {
 			w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
 			// Check if task was retried for logging
 			w.queue.mu.RLock()
-			path := task.LocationPath()
-			_, willRetry := w.queue.pendingSet[path]
+			nodeID := task.ID
+			_, willRetry := w.queue.pendingSet[nodeID]
 			w.queue.mu.RUnlock()
 			w.logError(task, err, willRetry)
 		} else {
@@ -218,72 +218,90 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 
 // executeDstComparison performs comparison between expected (src) and actual (dst) children.
 // It populates task.DiscoveredChildren with comparison results.
+// Matching is done by Type + Name, not LocationPath.
 func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult types.ListResult) error {
 	// Extract expected children from task (populated by queue)
 	expectedFolders := task.ExpectedFolders
 	expectedFiles := task.ExpectedFiles
+	srcIDMap := task.ExpectedSrcIDMap
+	if srcIDMap == nil {
+		srcIDMap = make(map[string]string)
+	}
 
 	task.DiscoveredChildren = make([]ChildResult, 0)
 
-	// Build maps for quick lookup
+	// Build maps for quick lookup by Type+Name (matching key)
 	actualFolderMap := make(map[string]types.Folder)
 	for _, f := range actualResult.Folders {
 		// Override adapter-provided depth with BFS depth based on current round.
 		f.DepthLevel = task.Round + 1
-		actualFolderMap[f.LocationPath] = f
+		matchKey := f.Type + ":" + f.DisplayName
+		actualFolderMap[matchKey] = f
 	}
 
 	actualFileMap := make(map[string]types.File)
 	for _, f := range actualResult.Files {
 		// Override adapter-provided depth with BFS depth based on current round.
 		f.DepthLevel = task.Round + 1
-		actualFileMap[f.LocationPath] = f
+		matchKey := f.Type + ":" + f.DisplayName
+		actualFileMap[matchKey] = f
 	}
 
 	expectedFolderMap := make(map[string]types.Folder)
 	for _, f := range expectedFolders {
-		expectedFolderMap[f.LocationPath] = f
+		matchKey := f.Type + ":" + f.DisplayName
+		expectedFolderMap[matchKey] = f
 	}
 
 	expectedFileMap := make(map[string]types.File)
 	for _, f := range expectedFiles {
-		expectedFileMap[f.LocationPath] = f
+		matchKey := f.Type + ":" + f.DisplayName
+		expectedFileMap[matchKey] = f
 	}
 
-	// Compare folders
+	// Compare folders by Type + Name
 	for _, expectedFolder := range expectedFolders {
-		if actualFolder, exists := actualFolderMap[expectedFolder.LocationPath]; exists {
-			// Folder exists on both: compare timestamps to determine status
-			status := compareTimestamps(expectedFolder.LastUpdated, actualFolder.LastUpdated)
+		matchKey := expectedFolder.Type + ":" + expectedFolder.DisplayName
+		if actualFolder, exists := actualFolderMap[matchKey]; exists {
+
+			// Get SRC node ID from map
+			srcID := srcIDMap[matchKey]
 
 			// TODO: During copy phase, update NodeState.CopyStatus for pending folders
 
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				Folder: actualFolder,
-				Status: status,
+				Status: "Successful",
 				IsFile: false,
+				SrcID:  srcID,
 			})
 		}
 	}
 
 	// Check for extra folders on dst (not on src)
 	for _, actualFolder := range actualResult.Folders {
-		if _, exists := expectedFolderMap[actualFolder.LocationPath]; !exists {
+		matchKey := actualFolder.Type + ":" + actualFolder.DisplayName
+		if _, exists := expectedFolderMap[matchKey]; !exists {
 			// Folder exists on dst but not src: mark as "NotOnSrc"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				Folder: actualFolder,
 				Status: "NotOnSrc",
 				IsFile: false,
+				SrcID:  "", // No SRC node for items not on src
 			})
 		}
 	}
 
-	// Compare files
+	// Compare files by Type + Name
 	for _, expectedFile := range expectedFiles {
-		if actualFile, exists := actualFileMap[expectedFile.LocationPath]; exists {
+		matchKey := expectedFile.Type + ":" + expectedFile.DisplayName
+		if actualFile, exists := actualFileMap[matchKey]; exists {
 			// File exists on both: compare timestamps to determine status
 			// Files don't need traversal, but we still compare to determine if copy is needed
 			status := compareTimestamps(expectedFile.LastUpdated, actualFile.LastUpdated)
+
+			// Get SRC node ID from map
+			srcID := srcIDMap[matchKey]
 
 			// TODO: During copy phase, update NodeState.CopyStatus for pending files
 
@@ -291,25 +309,21 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 				File:   actualFile,
 				Status: status,
 				IsFile: true,
-			})
-		} else {
-			// File missing from dst: mark as "Missing"
-			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
-				File:   expectedFile,
-				Status: "Missing",
-				IsFile: true,
+				SrcID:  srcID,
 			})
 		}
 	}
 
 	// Check for extra files on dst (not on src)
 	for _, actualFile := range actualResult.Files {
-		if _, exists := expectedFileMap[actualFile.LocationPath]; !exists {
+		matchKey := actualFile.Type + ":" + actualFile.DisplayName
+		if _, exists := expectedFileMap[matchKey]; !exists {
 			// File exists on dst but not src: mark as "NotOnSrc"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				File:   actualFile,
 				Status: "NotOnSrc",
 				IsFile: true,
+				SrcID:  "", // No SRC node for items not on src
 			})
 		}
 	}

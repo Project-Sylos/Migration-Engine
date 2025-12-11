@@ -12,35 +12,6 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// getNodeIDByPath looks up a node by its path and returns its ULID.
-// This is used when we need to find a parent's ULID from its path.
-func getNodeIDByPath(tx *bolt.Tx, queueType string, path string) (string, error) {
-	if path == "" {
-		return "", nil
-	}
-
-	// We need to iterate through all nodes to find one with matching path
-	// This is inefficient but necessary during transition
-	// TODO: Consider adding a path->ULID index if this becomes a bottleneck
-	nodesBucket := GetNodesBucket(tx, queueType)
-	if nodesBucket == nil {
-		return "", fmt.Errorf("nodes bucket not found for %s", queueType)
-	}
-
-	cursor := nodesBucket.Cursor()
-	for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
-		state, err := DeserializeNodeState(value)
-		if err != nil {
-			continue
-		}
-		if state.Path == path {
-			return state.ID, nil
-		}
-	}
-
-	return "", fmt.Errorf("node not found for path: %s", path)
-}
-
 // InsertNodeWithIndex atomically inserts a node into the nodes bucket, adds it to a status bucket,
 // and updates the parent's children list in the children bucket.
 func InsertNodeWithIndex(db *DB, queueType string, level int, status string, state *NodeState) error {
@@ -52,15 +23,8 @@ func InsertNodeWithIndex(db *DB, queueType string, level int, status string, sta
 	var parentID []byte
 
 	return db.Update(func(tx *bolt.Tx) error {
-		// Look up parent's ULID if we have parent path but not parent ID
-		if state.ParentPath != "" && state.ParentID == "" {
-			parentULID, err := getNodeIDByPath(tx, queueType, state.ParentPath)
-			if err != nil {
-				return fmt.Errorf("failed to find parent node for path %s: %w", state.ParentPath, err)
-			}
-			state.ParentID = parentULID
-			parentID = []byte(parentULID)
-		} else if state.ParentID != "" {
+		// ParentID can be empty for root nodes, otherwise must be set
+		if state.ParentID != "" {
 			parentID = []byte(state.ParentID)
 		}
 
@@ -154,14 +118,11 @@ func DeleteNodeWithIndex(db *DB, queueType string, level int, status string, sta
 	var parentID []byte
 
 	return db.Update(func(tx *bolt.Tx) error {
-		// Look up parent's ULID if we have parent path but not parent ID
-		if state.ParentPath != "" && state.ParentID == "" {
-			parentULID, err := getNodeIDByPath(tx, queueType, state.ParentPath)
-			if err == nil {
-				state.ParentID = parentULID
-				parentID = []byte(parentULID)
-			}
-		} else if state.ParentID != "" {
+		// ParentID must be set - no path-based lookup
+		if state.ParentID == "" {
+			// Skip parent operations if no ParentID
+			parentID = nil
+		} else {
 			parentID = []byte(state.ParentID)
 		}
 
@@ -218,18 +179,11 @@ func DeleteNodeWithIndex(db *DB, queueType string, level int, status string, sta
 	})
 }
 
-// GetChildrenIDs retrieves the list of child ULIDs for a given parent path.
-// This function looks up the parent by path first, then gets its children.
-func GetChildrenIDs(db *DB, queueType string, parentPath string) ([]string, error) {
+// GetChildrenIDsByParentID retrieves the list of child ULIDs for a given parent ULID.
+func GetChildrenIDsByParentID(db *DB, queueType string, parentID string) ([]string, error) {
 	var children []string
 
 	err := db.View(func(tx *bolt.Tx) error {
-		// First, find the parent's ULID by path
-		parentID, err := getNodeIDByPath(tx, queueType, parentPath)
-		if err != nil {
-			return fmt.Errorf("parent not found for path %s: %w", parentPath, err)
-		}
-
 		childrenBucket := GetChildrenBucket(tx, queueType)
 		if childrenBucket == nil {
 			return fmt.Errorf("children bucket not found for %s", queueType)
@@ -254,15 +208,9 @@ func GetChildrenIDs(db *DB, queueType string, parentPath string) ([]string, erro
 	return children, nil
 }
 
-// GetChildrenHashes is deprecated - use GetChildrenIDs instead.
-// Kept for backward compatibility during migration.
-func GetChildrenHashes(db *DB, queueType string, parentPath string) ([]string, error) {
-	return GetChildrenIDs(db, queueType, parentPath)
-}
-
-// GetChildrenStates retrieves the full NodeState for all children of a parent.
-func GetChildrenStates(db *DB, queueType string, parentPath string) ([]*NodeState, error) {
-	childIDs, err := GetChildrenIDs(db, queueType, parentPath)
+// GetChildrenStatesByParentID retrieves the full NodeState for all children of a parent by parent ULID.
+func GetChildrenStatesByParentID(db *DB, queueType string, parentID string) ([]*NodeState, error) {
+	childIDs, err := GetChildrenIDsByParentID(db, queueType, parentID)
 	if err != nil {
 		return nil, err
 	}
@@ -303,13 +251,6 @@ func GetChildrenStates(db *DB, queueType string, parentPath string) ([]*NodeStat
 	return children, nil
 }
 
-// FetchChildrenByParentPath is a compatibility function that fetches children for a parent.
-func FetchChildrenByParentPath(db *DB, queueType string, parentPath string, levels []int) ([]*NodeState, error) {
-	// Note: In the new Bolt structure, we don't filter by level in the children bucket
-	// The children bucket stores all children regardless of level
-	return GetChildrenStates(db, queueType, parentPath)
-}
-
 // BatchInsertNodes inserts multiple nodes with their indices in a single transaction.
 type InsertOperation struct {
 	QueueType string
@@ -337,14 +278,8 @@ func computeBatchInsertStatsDeltas(tx *bolt.Tx, ops []InsertOperation) map[strin
 		nodeID := []byte(op.State.ID)
 		var parentID []byte
 
-		// Look up parent ID if needed
-		if op.State.ParentPath != "" && op.State.ParentID == "" {
-			parentULID, err := getNodeIDByPath(tx, op.QueueType, op.State.ParentPath)
-			if err == nil {
-				op.State.ParentID = parentULID
-				parentID = []byte(parentULID)
-			}
-		} else if op.State.ParentID != "" {
+		// ParentID must be set - no path-based lookup
+		if op.State.ParentID != "" {
 			parentID = []byte(op.State.ParentID)
 		}
 
@@ -396,9 +331,8 @@ func computeBatchInsertStatsDeltas(tx *bolt.Tx, ops []InsertOperation) map[strin
 }
 
 // BatchInsertNodes inserts multiple nodes with their indices in a single transaction.
-// joinLookupMappings is optional - if provided, maps DST node ULIDs to SRC node ULIDs for join-lookup table.
-// Format: map[dstNodeID]srcNodeID
-func BatchInsertNodes(db *DB, ops []InsertOperation, joinLookupMappings map[string]string) error {
+// SrcID is already populated in NodeState during matching, so no join-lookup needed.
+func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 	if len(ops) == 0 {
 		return nil
 	}
@@ -424,15 +358,8 @@ func BatchInsertNodes(db *DB, ops []InsertOperation, joinLookupMappings map[stri
 			nodeID := []byte(op.State.ID)
 			var parentID []byte
 
-			// Look up parent ID if needed
-			if op.State.ParentPath != "" && op.State.ParentID == "" {
-				parentULID, err := getNodeIDByPath(tx, op.QueueType, op.State.ParentPath)
-				if err != nil {
-					return fmt.Errorf("failed to find parent node for path %s: %w", op.State.ParentPath, err)
-				}
-				op.State.ParentID = parentULID
-				parentID = []byte(parentULID)
-			} else if op.State.ParentID != "" {
+			// ParentID must be set - no path-based lookup
+			if op.State.ParentID != "" {
 				parentID = []byte(op.State.ParentID)
 			}
 
@@ -502,18 +429,7 @@ func BatchInsertNodes(db *DB, ops []InsertOperation, joinLookupMappings map[stri
 				}
 			}
 
-			// 5. Populate join-lookup for DST nodes
-			if op.QueueType == BucketDst && joinLookupMappings != nil {
-				if srcNodeID, exists := joinLookupMappings[op.State.ID]; exists {
-					joinLookupBucket, err := GetOrCreateJoinLookupBucket(tx)
-					if err != nil {
-						return fmt.Errorf("failed to get join-lookup bucket: %w", err)
-					}
-					if err := joinLookupBucket.Put([]byte(op.State.ID), []byte(srcNodeID)); err != nil {
-						return fmt.Errorf("failed to insert join-lookup entry: %w", err)
-					}
-				}
-			}
+			// SrcID is already populated in NodeState during matching, no join-lookup needed
 		}
 
 		// Apply all stats updates in one batch

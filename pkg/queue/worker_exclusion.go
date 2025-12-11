@@ -94,8 +94,8 @@ func (w *ExclusionWorker) Run() {
 			}
 			w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
 			w.queue.mu.RLock()
-			path := task.LocationPath()
-			_, willRetry := w.queue.pendingSet[path]
+			nodeID := task.ID
+			_, willRetry := w.queue.pendingSet[nodeID]
 			w.queue.mu.RUnlock()
 			w.logError(task, err, willRetry)
 		} else {
@@ -116,15 +116,11 @@ func (w *ExclusionWorker) execute(task *TaskBase) error {
 		return w.executeFileExclusion(task)
 	}
 
-	path := task.LocationPath()
-	queueType := getQueueType(w.queueName)
-
-	// Get node's ULID by path
-	nodeState, err := db.GetNodeStateByPath(w.boltDB, queueType, path)
-	if err != nil || nodeState == nil {
-		return fmt.Errorf("node not found for path %s: %w", path, err)
+	nodeID := task.ID
+	if nodeID == "" {
+		return fmt.Errorf("task missing ULID")
 	}
-	nodeID := nodeState.ID
+	queueType := getQueueType(w.queueName)
 
 	// Get queue's output buffer for write operations
 	w.queue.mu.RLock()
@@ -134,7 +130,7 @@ func (w *ExclusionWorker) execute(task *TaskBase) error {
 	// Read children ULIDs from children bucket (DB lookup)
 	childIDs, err := w.getChildrenIDs(queueType, nodeID)
 	if err != nil {
-		return fmt.Errorf("failed to get children IDs for %s: %w", path, err)
+		return fmt.Errorf("failed to get children IDs for node %s: %w", nodeID, err)
 	}
 
 	// Process based on exclusion mode
@@ -192,8 +188,7 @@ func (w *ExclusionWorker) executeExclude(task *TaskBase, childIDs []string, queu
 		// If we somehow get here, it means a file was in the exclusion-holding bucket
 		// This shouldn't happen, but if it does, mark it as inherited excluded
 		if outputBuffer != nil {
-			path := task.LocationPath()
-			outputBuffer.AddExclusionUpdate(queueType, path, true) // inherited_excluded = true
+			outputBuffer.AddExclusionUpdate(queueType, task.ID, true) // inherited_excluded = true
 		}
 		task.DiscoveredChildren = make([]ChildResult, 0)
 		return nil
@@ -202,16 +197,15 @@ func (w *ExclusionWorker) executeExclude(task *TaskBase, childIDs []string, queu
 	// Step 1: Mark the parent node as inherited excluded (if not already explicitly excluded)
 	// Check if parent is already explicitly excluded - if so, skip marking
 	var parentExplicitlyExcluded bool
-	path := task.LocationPath()
-	nodeState, err := db.GetNodeStateByPath(w.boltDB, queueType, path)
+	nodeState, err := db.GetNodeState(w.boltDB, queueType, task.ID)
 	if err != nil || nodeState == nil {
-		return fmt.Errorf("node not found for path %s: %w", path, err)
+		return fmt.Errorf("node not found for id %s: %w", task.ID, err)
 	}
 	parentExplicitlyExcluded = nodeState.ExplicitExcluded
 
 	// Only mark as inherited excluded if not already explicitly excluded
 	if !parentExplicitlyExcluded && outputBuffer != nil {
-		outputBuffer.AddExclusionUpdate(queueType, path, true) // inherited_excluded = true
+		outputBuffer.AddExclusionUpdate(queueType, task.ID, true) // inherited_excluded = true
 	}
 
 	// Step 2: Get all children (files and folders) and add them to exclusion-holding bucket
@@ -251,7 +245,7 @@ func (w *ExclusionWorker) executeExclude(task *TaskBase, childIDs []string, queu
 	if len(childEntries) > 0 {
 		mode := "exclude" // executeExclude always uses exclusion bucket
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug", fmt.Sprintf("executeExclude: Adding %d children to %s-holding bucket (parent: %s)", len(childEntries), mode, path), "worker", w.id, w.queueName)
+			_ = logservice.LS.Log("debug", fmt.Sprintf("executeExclude: Adding %d children to %s-holding bucket (parent: %s)", len(childEntries), mode, task.ID), "worker", w.id, w.queueName)
 		}
 		err = w.boltDB.Update(func(tx *bolt.Tx) error {
 			holdingBucket, err := db.GetOrCreateHoldingBucket(tx, queueType, mode)
@@ -290,43 +284,41 @@ func (w *ExclusionWorker) executeUnexclude(task *TaskBase, nodeID string, childI
 		// If we somehow get here, it means a file was in the unexclusion-holding bucket
 		// This shouldn't happen, but if it does, check if it should be unexcluded
 
-		// Get parent path to check for excluded ancestor
+		// Get parent ID to check for excluded ancestor
 		nodeState, err := db.GetNodeState(w.boltDB, queueType, nodeID)
 		if err != nil || nodeState == nil {
 			return fmt.Errorf("node not found: %s", nodeID)
 		}
-		parentPath := nodeState.ParentPath
+		parentID := nodeState.ParentID
 
-		hasExcludedAncestor, err := w.checkExcludedAncestor(parentPath, queueType)
+		hasExcludedAncestor, err := w.checkExcludedAncestorByID(parentID, queueType)
 		if err != nil {
 			return fmt.Errorf("failed to check excluded ancestor: %w", err)
 		}
 
 		if !hasExcludedAncestor && outputBuffer != nil {
-			path := task.LocationPath()
-			outputBuffer.AddExclusionUpdate(queueType, path, false) // inherited_excluded = false
+			outputBuffer.AddExclusionUpdate(queueType, task.ID, false) // inherited_excluded = false
 		}
 
 		task.DiscoveredChildren = make([]ChildResult, 0)
 		return nil
 	}
 	// Step 1: Check if parent node still has an excluded ancestor
-	path := task.LocationPath()
 	nodeState, err := db.GetNodeState(w.boltDB, queueType, nodeID)
 	if err != nil || nodeState == nil {
 		return fmt.Errorf("node not found: %s", nodeID)
 	}
-	parentPath := nodeState.ParentPath
+	parentID := nodeState.ParentID
 
 	// Check if node still has an excluded ancestor
-	hasExcludedAncestor, err := w.checkExcludedAncestor(parentPath, queueType)
+	hasExcludedAncestor, err := w.checkExcludedAncestorByID(parentID, queueType)
 	if err != nil {
 		return fmt.Errorf("failed to check excluded ancestor: %w", err)
 	}
 
 	// Step 2: Mark the parent node as inherited excluded = false (if no excluded ancestor)
 	if !hasExcludedAncestor && outputBuffer != nil {
-		outputBuffer.AddExclusionUpdate(queueType, path, false) // inherited_excluded = false
+		outputBuffer.AddExclusionUpdate(queueType, task.ID, false) // inherited_excluded = false
 	}
 
 	if hasExcludedAncestor {
@@ -372,7 +364,7 @@ func (w *ExclusionWorker) executeUnexclude(task *TaskBase, nodeID string, childI
 	if len(childEntries) > 0 {
 		mode := "unexclude" // executeUnexclude always uses unexclusion bucket
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug", fmt.Sprintf("executeUnexclude: Adding %d children to %s-holding bucket (parent: %s)", len(childEntries), mode, path), "worker", w.id, w.queueName)
+			_ = logservice.LS.Log("debug", fmt.Sprintf("executeUnexclude: Adding %d children to %s-holding bucket (parent: %s)", len(childEntries), mode, task.ID), "worker", w.id, w.queueName)
 		}
 		err = w.boltDB.Update(func(tx *bolt.Tx) error {
 			holdingBucket, err := db.GetOrCreateHoldingBucket(tx, queueType, mode)
@@ -401,8 +393,10 @@ func (w *ExclusionWorker) executeUnexclude(task *TaskBase, nodeID string, childI
 
 // executeFileExclusion handles exclusion for files (no children to propagate).
 func (w *ExclusionWorker) executeFileExclusion(task *TaskBase) error {
-	path := task.LocationPath()
-	pathHash := db.HashPath(path)
+	nodeID := task.ID
+	if nodeID == "" {
+		return fmt.Errorf("task missing ULID")
+	}
 	queueType := getQueueType(w.queueName)
 
 	w.queue.mu.RLock()
@@ -411,32 +405,14 @@ func (w *ExclusionWorker) executeFileExclusion(task *TaskBase) error {
 
 	// For unexclude mode, check if ancestor is still excluded
 	if task.ExclusionMode == "unexclude" {
-		// Get parent path from node state
-		var parentPath string
-		err := w.boltDB.View(func(tx *bolt.Tx) error {
-			nodesBucket := db.GetNodesBucket(tx, queueType)
-			if nodesBucket == nil {
-				return fmt.Errorf("nodes bucket not found")
-			}
-
-			nodeData := nodesBucket.Get([]byte(pathHash))
-			if nodeData == nil {
-				return fmt.Errorf("node not found: %s", pathHash)
-			}
-
-			nodeState, err := db.DeserializeNodeState(nodeData)
-			if err != nil {
-				return fmt.Errorf("failed to deserialize node state: %w", err)
-			}
-
-			parentPath = nodeState.ParentPath
-			return nil
-		})
-		if err != nil {
-			return fmt.Errorf("failed to get node state: %w", err)
+		// Get parent ID from node state
+		nodeState, err := db.GetNodeState(w.boltDB, queueType, nodeID)
+		if err != nil || nodeState == nil {
+			return fmt.Errorf("node not found: %s", nodeID)
 		}
 
-		hasExcludedAncestor, err := w.checkExcludedAncestor(parentPath, queueType)
+		parentID := nodeState.ParentID
+		hasExcludedAncestor, err := w.checkExcludedAncestorByID(parentID, queueType)
 		if err != nil {
 			return fmt.Errorf("failed to check excluded ancestor: %w", err)
 		}
@@ -450,23 +426,23 @@ func (w *ExclusionWorker) executeFileExclusion(task *TaskBase) error {
 	// Queue write op to update file exclusion state via output buffer
 	if outputBuffer != nil {
 		inheritedExcluded := (task.ExclusionMode == "exclude")
-		outputBuffer.AddExclusionUpdate(queueType, path, inheritedExcluded)
+		outputBuffer.AddExclusionUpdate(queueType, nodeID, inheritedExcluded)
 	}
 
 	task.DiscoveredChildren = make([]ChildResult, 0)
 	return nil
 }
 
-// checkExcludedAncestor checks if any ancestor is still excluded by walking up the parent chain.
-func (w *ExclusionWorker) checkExcludedAncestor(startPath string, queueType string) (bool, error) {
-	if startPath == "" {
+// checkExcludedAncestorByID checks if any ancestor is still excluded by walking up the parent chain using ULIDs.
+func (w *ExclusionWorker) checkExcludedAncestorByID(startID string, queueType string) (bool, error) {
+	if startID == "" {
 		return false, nil // Root has no parent
 	}
 
-	currentPath := startPath
+	currentID := startID
 	for {
-		// Get node's ULID by path
-		nodeState, err := db.GetNodeStateByPath(w.boltDB, queueType, currentPath)
+		// Get node state by ULID
+		nodeState, err := db.GetNodeState(w.boltDB, queueType, currentID)
 		if err != nil || nodeState == nil {
 			break // Can't continue up chain
 		}
@@ -481,11 +457,11 @@ func (w *ExclusionWorker) checkExcludedAncestor(startPath string, queueType stri
 			return true, nil // Found excluded ancestor
 		}
 
-		if nodeState.ParentPath == "" || nodeState.ParentPath == currentPath {
+		if nodeState.ParentID == "" || nodeState.ParentID == currentID {
 			break // Reached root or circular reference
 		}
 
-		currentPath = nodeState.ParentPath
+		currentID = nodeState.ParentID
 	}
 
 	return false, nil // No excluded ancestor found
