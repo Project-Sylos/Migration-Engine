@@ -72,29 +72,9 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	currentRound := snapshot.Round
 	coordinator := q.getCoordinator()
 
-	// For DST: Check if there are any pending tasks in current round BEFORE checking coordinator gate
-	// This allows us to exit early if there's no work, avoiding unnecessary waiting at the gate
-	// Skip this check for round 0 (bootstrap round) - we need to process at least one round before checking completion
-	if q.name == "dst" && coordinator != nil && currentRound > 0 {
-		// Check if DST is complete (requires first pull to avoid false positives)
-		if q.checkCompletion(currentRound, CompletionCheckOptions{
-			CheckDstComplete:      true,
-			MarkDstCompleteIfDone: true,
-			RequireFirstPull:      true,
-			FlushBuffer:           true,
-		}) {
-			return
-		}
-
-		// There are tasks (in-memory or in DB) - check coordinator gate
-		canStartRound := coordinator.CanDstStartRound(currentRound)
-		if !canStartRound {
-			// Can't start this round yet - wait for coordinator gate
-			return
-		}
-		// Gate passed - we'll mark firstPullForRound = false only after actually fetching tasks
-	} else if q.name == "dst" && coordinator != nil && currentRound == 0 {
-		// For round 0, just check the coordinator gate (no completion check)
+	// For DST: Check coordinator gate before pulling (but don't check completion yet)
+	// We'll check completion AFTER pulling to ensure workers have finished adding tasks
+	if q.name == "dst" && coordinator != nil {
 		canStartRound := coordinator.CanDstStartRound(currentRound)
 		if !canStartRound {
 			// Can't start this round yet - wait for coordinator gate
@@ -120,24 +100,39 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		q.setFirstPullForRound(false)
 	}
 
-	// we've exhausted max depth - mark queue as completed
+	// For DST: Check completion AFTER pulling to ensure workers have finished adding tasks
+	// This prevents race conditions where workers are still completing tasks that add pending items
+	if q.name == "dst" && coordinator != nil && currentRound > 0 && wasFirstPullForRound && len(batch) == 0 {
+		// First pull returned empty - check if we're truly complete (no in-progress, no pending buffer, no DB pending)
+		if q.checkCompletion(currentRound, CompletionCheckOptions{
+			CheckDstComplete:      true,
+			MarkDstCompleteIfDone: true,
+			RequireFirstPull:      true,
+			FlushBuffer:           true,
+		}) {
+			return
+		}
+		// If checkCompletion returned false, there might be tasks in progress or buffer
+		// Don't mark as complete yet - let workers finish and check again later
+	}
+
+	// we've exhausted max depth - mark queue as completed (only if not DST, or if DST check above passed)
 	if wasFirstPullForRound && len(batch) == 0 {
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("info",
-				fmt.Sprintf("First pull for round %d returned empty batch - traversal complete (max depth exhausted)", currentRound),
-				"queue", q.name, q.name)
-		}
-		q.setState(QueueStateCompleted)
-		// Update coordinator
-		if coordinator != nil {
-			switch q.name {
-			case "src":
-				coordinator.MarkSrcCompleted()
-			case "dst":
-				coordinator.MarkDstCompleted()
+		// For DST, completion was already checked above, so if we reach here it means checkCompletion returned false
+		// For SRC, we can mark as complete directly
+		if q.name != "dst" {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("info",
+					fmt.Sprintf("First pull for round %d returned empty batch - traversal complete (max depth exhausted)", currentRound),
+					"queue", q.name, q.name)
 			}
+			q.setState(QueueStateCompleted)
+			// Update coordinator
+			if coordinator != nil {
+				coordinator.MarkSrcCompleted()
+			}
+			return
 		}
-		return
 	}
 
 	// Batch-load expected children for DST tasks
