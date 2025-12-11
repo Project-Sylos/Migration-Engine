@@ -383,10 +383,6 @@ func UpdateConfigFromStatus(yamlCfg *MigrationConfigYAML, status MigrationStatus
 		if status.IsComplete() {
 			yamlCfg.State.Status = StatusAwaitingPathReview
 			fmt.Printf("DEBUG: Status transition: Traversal-In-Progress -> Awaiting-Path-Review\n")
-		} else {
-			fmt.Printf("DEBUG: Status NOT transitioning - IsComplete() returned false. Status: SrcTotal=%d, DstTotal=%d, SrcPending=%d, DstPending=%d, SrcFailed=%d, DstFailed=%d, IsEmpty=%v, HasPending=%v, HasFailures=%v\n",
-				status.SrcTotal, status.DstTotal, status.SrcPending, status.DstPending, status.SrcFailed, status.DstFailed,
-				status.IsEmpty(), status.HasPending(), status.HasFailures())
 		}
 		// Note: If traversal fails or has pending work, status remains Traversal-In-Progress
 		// The API should handle error states and decide when to transition

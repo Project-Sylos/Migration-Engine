@@ -56,6 +56,30 @@ func (q *Queue) getOutputBuffer() *db.OutputBuffer {
 	return q.outputBuffer
 }
 
+func (q *Queue) getInProgressCount() int {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return len(q.inProgress)
+}
+
+func (q *Queue) getPendingCount() int {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return len(q.pendingBuff)
+}
+
+func (q *Queue) getFirstPullForRound() bool {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.firstPullForRound
+}
+
+func (q *Queue) getLastPullWasPartial() bool {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.lastPullWasPartial
+}
+
 func (q *Queue) isLeased(nodeID string) bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
