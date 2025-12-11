@@ -144,24 +144,27 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	var expectedFoldersMap map[string][]types.Folder
 	var expectedFilesMap map[string][]types.File
 	if q.name == "dst" {
-		// First pass: collect all valid (not already leased) folder tasks and their parent paths
-		var parentPaths []string
+		// First pass: collect all valid (not already leased) folder tasks and their DST parent ULIDs
+		var dstParentIDs []string
+		dstIDToPath := make(map[string]string) // DST ULID -> path (for mapping results back)
 		for _, item := range batch {
-			// Skip path hashes we've already leased (prevents duplicate pulls from stale views)
+			// Skip ULIDs we've already leased (prevents duplicate pulls from stale views)
 			if q.isLeased(item.Key) {
 				continue
 			}
 
 			task := nodeStateToTask(item.State, taskType)
 			if task.IsFolder() {
-				parentPaths = append(parentPaths, task.Folder.LocationPath)
+				dstParentIDs = append(dstParentIDs, item.State.ID) // DST parent ULID
+				dstIDToPath[item.State.ID] = task.Folder.LocationPath
 			}
 		}
 
 		// Batch-load expected children for all folder tasks in one DB operation
-		if len(parentPaths) > 0 {
+		// Uses join-lookup to find corresponding SRC parents, then loads their children
+		if len(dstParentIDs) > 0 {
 			var err error
-			expectedFoldersMap, expectedFilesMap, err = BatchLoadExpectedChildren(boltDB, parentPaths)
+			expectedFoldersMap, expectedFilesMap, err = BatchLoadExpectedChildrenByDSTIDs(boltDB, dstParentIDs, dstIDToPath)
 			if err != nil {
 				if logservice.LS != nil {
 					_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to batch load expected children: %v", err), "queue", q.name, q.name)
@@ -174,21 +177,22 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	}
 
 	for _, item := range batch {
-		// Skip path hashes we've already leased (prevents duplicate pulls from stale views)
+		// Skip ULIDs we've already leased (prevents duplicate pulls from stale views)
 		if q.isLeased(item.Key) {
 			continue
 		}
 
-		// Mark this path hash as leased
+		// Mark this ULID as leased
 		q.addLeasedKey(item.Key)
 
 		task := nodeStateToTask(item.State, taskType)
 
 		// For DST folder tasks, populate ExpectedFolders/ExpectedFiles from batch-loaded results
 		if q.name == "dst" && task.IsFolder() {
-			parentPath := task.Folder.LocationPath
-			expectedFolders := expectedFoldersMap[parentPath]
-			expectedFiles := expectedFilesMap[parentPath]
+			// Use DST ULID to look up expected children
+			dstID := item.State.ID
+			expectedFolders := expectedFoldersMap[dstID]
+			expectedFiles := expectedFilesMap[dstID]
 			task.ExpectedFolders = expectedFolders
 			task.ExpectedFiles = expectedFiles
 		}

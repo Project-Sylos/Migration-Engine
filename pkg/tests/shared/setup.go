@@ -87,12 +87,12 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 		return migration.Config{}, err
 	}
 
-	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.Id, "primary")
+	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary")
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create src adapter: %w", err)
 	}
 
-	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.Id, "s1")
+	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1")
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
 	}
@@ -157,7 +157,7 @@ func LoadSpectraRoots(spectraFS *sdk.SpectraFS) (types.Folder, types.Folder, err
 
 	// Create folder structs
 	srcFolder := types.Folder{
-		Id:           srcRoot.ID,
+		ServiceID:    srcRoot.ID,
 		ParentId:     "",
 		DisplayName:  srcRoot.Name,
 		LocationPath: "/",
@@ -167,7 +167,7 @@ func LoadSpectraRoots(spectraFS *sdk.SpectraFS) (types.Folder, types.Folder, err
 	}
 
 	dstFolder := types.Folder{
-		Id:           dstRoot.ID,
+		ServiceID:    dstRoot.ID,
 		ParentId:     "",
 		DisplayName:  dstRoot.Name,
 		LocationPath: "/",
@@ -211,7 +211,7 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 
 	// Create root folder structures
 	srcRoot := types.Folder{
-		Id:           srcPath,
+		ServiceID:    srcPath,
 		ParentId:     filepath.Dir(srcPath),
 		ParentPath:   "",
 		DisplayName:  filepath.Base(srcPath),
@@ -222,7 +222,7 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 	}
 
 	dstRoot := types.Folder{
-		Id:           dstPath,
+		ServiceID:    dstPath,
 		ParentId:     filepath.Dir(dstPath),
 		ParentPath:   "",
 		DisplayName:  filepath.Base(dstPath),

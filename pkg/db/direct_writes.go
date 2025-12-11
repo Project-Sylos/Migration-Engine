@@ -12,7 +12,12 @@ import (
 // UpdateNodeStatusInTx updates a node's status within an existing transaction.
 // This is used by queue.Complete() and queue.Fail() to write directly to BoltDB.
 func UpdateNodeStatusInTx(tx *bolt.Tx, queueType string, level int, oldStatus, newStatus, path string) error {
-	pathHash := []byte(HashPath(path))
+	// Look up node's ULID by path
+	nodeIDStr, err := getNodeIDByPath(tx, queueType, path)
+	if err != nil {
+		return fmt.Errorf("node not found for path %s: %w", path, err)
+	}
+	nodeID := []byte(nodeIDStr)
 
 	// Get the node data from nodes bucket
 	nodesBucket := GetNodesBucket(tx, queueType)
@@ -20,7 +25,7 @@ func UpdateNodeStatusInTx(tx *bolt.Tx, queueType string, level int, oldStatus, n
 		return fmt.Errorf("nodes bucket not found for %s", queueType)
 	}
 
-	nodeData := nodesBucket.Get(pathHash)
+	nodeData := nodesBucket.Get(nodeID)
 	if nodeData == nil {
 		return fmt.Errorf("node not found in nodes bucket: %s", path)
 	}
@@ -38,7 +43,7 @@ func UpdateNodeStatusInTx(tx *bolt.Tx, queueType string, level int, oldStatus, n
 		return fmt.Errorf("failed to serialize node state: %w", err)
 	}
 
-	if err := nodesBucket.Put(pathHash, updatedData); err != nil {
+	if err := nodesBucket.Put(nodeID, updatedData); err != nil {
 		return fmt.Errorf("failed to update node in nodes bucket: %w", err)
 	}
 
@@ -46,7 +51,7 @@ func UpdateNodeStatusInTx(tx *bolt.Tx, queueType string, level int, oldStatus, n
 	// Delete from old status bucket
 	oldBucket := GetStatusBucket(tx, queueType, level, oldStatus)
 	if oldBucket != nil {
-		if err := oldBucket.Delete(pathHash); err != nil {
+		if err := oldBucket.Delete(nodeID); err != nil {
 			return fmt.Errorf("failed to delete from old status bucket: %w", err)
 		}
 	}
@@ -57,12 +62,12 @@ func UpdateNodeStatusInTx(tx *bolt.Tx, queueType string, level int, oldStatus, n
 		return fmt.Errorf("failed to get new status bucket: %w", err)
 	}
 
-	if err := newBucket.Put(pathHash, []byte{}); err != nil {
+	if err := newBucket.Put(nodeID, []byte{}); err != nil {
 		return fmt.Errorf("failed to add to new status bucket: %w", err)
 	}
 
 	// Update status-lookup index
-	if err := UpdateStatusLookup(tx, queueType, level, pathHash, newStatus); err != nil {
+	if err := UpdateStatusLookup(tx, queueType, level, nodeID, newStatus); err != nil {
 		return fmt.Errorf("failed to update status-lookup: %w", err)
 	}
 
@@ -73,13 +78,14 @@ func UpdateNodeStatusInTx(tx *bolt.Tx, queueType string, level int, oldStatus, n
 // BatchInsertNodesInTx inserts multiple nodes within an existing transaction.
 // This is used by queue.Complete() to insert discovered children atomically.
 // Stats updates are handled separately by batch processing in output buffer flush.
-func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation) error {
+// joinLookupMappings is optional - if provided, maps DST node ULIDs to SRC node ULIDs for join-lookup table.
+func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation, joinLookupMappings map[string]string) error {
 	var nodesBucket *bolt.Bucket
 	var currentQueueType string
 
 	for _, op := range operations {
-		if op.State == nil {
-			continue
+		if op.State == nil || op.State.ID == "" {
+			return fmt.Errorf("node state must have ID (ULID)")
 		}
 
 		// Ensure NodeState has the status field populated
@@ -87,8 +93,20 @@ func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation) error {
 			op.State.TraversalStatus = op.Status
 		}
 
-		pathHash := []byte(HashPath(op.State.Path))
-		parentHash := []byte(HashPath(op.State.ParentPath))
+		nodeID := []byte(op.State.ID)
+		var parentID []byte
+
+		// Look up parent ID if needed
+		if op.State.ParentPath != "" && op.State.ParentID == "" {
+			parentULID, err := getNodeIDByPath(tx, op.QueueType, op.State.ParentPath)
+			if err != nil {
+				return fmt.Errorf("failed to find parent node for path %s: %w", op.State.ParentPath, err)
+			}
+			op.State.ParentID = parentULID
+			parentID = []byte(parentULID)
+		} else if op.State.ParentID != "" {
+			parentID = []byte(op.State.ParentID)
+		}
 
 		// Get or cache nodes bucket
 		if currentQueueType != op.QueueType {
@@ -105,7 +123,7 @@ func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation) error {
 			return fmt.Errorf("failed to serialize node state: %w", err)
 		}
 
-		if err := nodesBucket.Put(pathHash, nodeData); err != nil {
+		if err := nodesBucket.Put(nodeID, nodeData); err != nil {
 			return fmt.Errorf("failed to insert node: %w", err)
 		}
 
@@ -115,17 +133,17 @@ func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation) error {
 			return fmt.Errorf("failed to get status bucket: %w", err)
 		}
 
-		if err := statusBucket.Put(pathHash, []byte{}); err != nil {
+		if err := statusBucket.Put(nodeID, []byte{}); err != nil {
 			return fmt.Errorf("failed to add to status bucket: %w", err)
 		}
 
 		// 3. Update status-lookup index
-		if err := UpdateStatusLookup(tx, op.QueueType, op.Level, pathHash, op.Status); err != nil {
+		if err := UpdateStatusLookup(tx, op.QueueType, op.Level, nodeID, op.Status); err != nil {
 			return fmt.Errorf("failed to update status-lookup: %w", err)
 		}
 
 		// 4. Update children index
-		if op.State.ParentPath != "" {
+		if op.State.ParentID != "" {
 			childrenBucket := GetChildrenBucket(tx, op.QueueType)
 			if childrenBucket == nil {
 				return fmt.Errorf("children bucket not found for %s", op.QueueType)
@@ -133,32 +151,44 @@ func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation) error {
 
 			// Get existing children list
 			var children []string
-			childrenData := childrenBucket.Get(parentHash)
+			childrenData := childrenBucket.Get(parentID)
 			if childrenData != nil {
 				if err := DeserializeStringSlice(childrenData, &children); err != nil {
 					return fmt.Errorf("failed to unmarshal children list: %w", err)
 				}
 			}
 
-			// Add this child's hash if not already present
-			childHash := HashPath(op.State.Path)
+			// Add this child's ULID if not already present
 			found := false
 			for _, c := range children {
-				if c == childHash {
+				if c == op.State.ID {
 					found = true
 					break
 				}
 			}
 
 			if !found {
-				children = append(children, childHash)
+				children = append(children, op.State.ID)
 				childrenData, err := SerializeStringSlice(children)
 				if err != nil {
 					return fmt.Errorf("failed to marshal children list: %w", err)
 				}
 
-				if err := childrenBucket.Put(parentHash, childrenData); err != nil {
+				if err := childrenBucket.Put(parentID, childrenData); err != nil {
 					return fmt.Errorf("failed to update children list: %w", err)
+				}
+			}
+		}
+
+		// 5. Populate join-lookup for DST nodes
+		if op.QueueType == BucketDst && joinLookupMappings != nil {
+			if srcNodeID, exists := joinLookupMappings[op.State.ID]; exists {
+				joinLookupBucket, err := GetOrCreateJoinLookupBucket(tx)
+				if err != nil {
+					return fmt.Errorf("failed to get join-lookup bucket: %w", err)
+				}
+				if err := joinLookupBucket.Put([]byte(op.State.ID), []byte(srcNodeID)); err != nil {
+					return fmt.Errorf("failed to insert join-lookup entry: %w", err)
 				}
 			}
 		}

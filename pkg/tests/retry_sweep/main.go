@@ -54,12 +54,12 @@ func runTest() error {
 		return fmt.Errorf("failed to load Spectra roots: %w", err)
 	}
 
-	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.Id, "primary")
+	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary")
 	if err != nil {
 		return fmt.Errorf("failed to create src adapter: %w", err)
 	}
 
-	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.Id, "s1")
+	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1")
 	if err != nil {
 		return fmt.Errorf("failed to create dst adapter: %w", err)
 	}

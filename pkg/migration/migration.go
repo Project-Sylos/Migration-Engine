@@ -549,12 +549,12 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 }
 
 func normalizeRootFolder(folder types.Folder) (types.Folder, error) {
-	if folder.Id == "" {
-		return types.Folder{}, fmt.Errorf("folder ID cannot be empty")
+	if folder.ServiceID == "" {
+		return types.Folder{}, fmt.Errorf("folder ServiceID cannot be empty")
 	}
 
 	if folder.DisplayName == "" {
-		folder.DisplayName = folder.Id
+		folder.DisplayName = folder.ServiceID
 	}
 	// The actual folder path doesn't matter - the root node is always stored at "/".
 	// Child paths will be relative to this root (e.g., "/child", "/child/grandchild").
@@ -571,15 +571,15 @@ func normalizeRootFolder(folder types.Folder) (types.Folder, error) {
 // resuming would cause "node not found" errors because the migration DB has stale node IDs.
 func validateRootNodesExist(srcAdapter, dstAdapter types.FSAdapter, srcRoot, dstRoot types.Folder) error {
 	// Try to list children of the source root - if it doesn't exist, this will fail
-	_, err := srcAdapter.ListChildren(srcRoot.Id)
+	_, err := srcAdapter.ListChildren(srcRoot.ServiceID)
 	if err != nil {
-		return fmt.Errorf("source root node '%s' does not exist in filesystem: %w", srcRoot.Id, err)
+		return fmt.Errorf("source root node '%s' does not exist in filesystem: %w", srcRoot.ServiceID, err)
 	}
 
 	// Try to list children of the destination root - if it doesn't exist, this will fail
-	_, err = dstAdapter.ListChildren(dstRoot.Id)
+	_, err = dstAdapter.ListChildren(dstRoot.ServiceID)
 	if err != nil {
-		return fmt.Errorf("destination root node '%s' does not exist in filesystem: %w", dstRoot.Id, err)
+		return fmt.Errorf("destination root node '%s' does not exist in filesystem: %w", dstRoot.ServiceID, err)
 	}
 
 	return nil

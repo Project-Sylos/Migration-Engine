@@ -18,14 +18,14 @@ import (
 )
 
 type folderConfig struct {
-	Id           string `json:"id"`
-	ParentId     string `json:"parentId"`
-	ParentPath   string `json:"parentPath"`
-	DisplayName  string `json:"displayName"`
-	LocationPath string `json:"locationPath"`
-	LastUpdated  string `json:"lastUpdated"`
-	DepthLevel   int    `json:"depthLevel"`
-	Type         string `json:"type"`
+	ServiceID           string `json:"serviceId"`
+	ParentServiceID string `json:"parentServiceId"`
+	DisplayName     string `json:"displayName"`
+	LocationPath    string `json:"locationPath"`
+	ParentPath      string `json:"parentPath"`
+	LastUpdated     string `json:"lastUpdated"`
+	DepthLevel      int    `json:"depthLevel"`
+	Type            string `json:"type"`
 }
 
 type adapterConfig struct {
@@ -79,13 +79,13 @@ func (f *folderConfig) toFolder(defaultName string) (types.Folder, bool, error) 
 	if f == nil {
 		return types.Folder{}, false, nil
 	}
-	if f.Id == "" {
+	if f.ServiceID == "" {
 		return types.Folder{}, false, nil
 	}
 
 	folder := types.Folder{
-		Id:           f.Id,
-		ParentId:     f.ParentId,
+		ServiceID:    f.ServiceID,
+		ParentId:     f.ParentServiceID,
 		ParentPath:   f.ParentPath,
 		DisplayName:  f.DisplayName,
 		LocationPath: f.LocationPath,
@@ -114,8 +114,8 @@ func (f *adapterFactory) buildService(cfg adapterConfig) (migration.Service, typ
 	var folder types.Folder
 	var hasFolder bool
 	var err error
-	if cfg.Root.Id != "" {
-		folder, hasFolder, err = cfg.Root.toFolder(cfg.Root.Id)
+	if cfg.Root.ServiceID != "" {
+		folder, hasFolder, err = cfg.Root.toFolder(cfg.Root.ServiceID)
 		if err != nil {
 			return migration.Service{}, types.Folder{}, err
 		}
@@ -136,7 +136,7 @@ func (f *adapterFactory) buildService(cfg adapterConfig) (migration.Service, typ
 		rootID := cfg.RootID
 		if rootID == "" {
 			if hasFolder {
-				rootID = folder.Id
+				rootID = folder.ServiceID
 			} else {
 				rootID = "root"
 			}
@@ -162,7 +162,7 @@ func (f *adapterFactory) buildService(cfg adapterConfig) (migration.Service, typ
 			}
 
 			folder = types.Folder{
-				Id:           node.ID,
+				ServiceID:    node.ID,
 				DisplayName:  node.Name,
 				LocationPath: "/",
 				LastUpdated:  node.LastUpdated.Format(time.RFC3339),

@@ -11,9 +11,11 @@ import (
 // NodeState represents the state of a node stored in BoltDB.
 // This is used during traversal and copy phases.
 type NodeState struct {
-	ID                string `json:"id"`
-	ParentID          string `json:"parent_id"`
-	ParentPath        string `json:"parent_path"` // Parent's relative path (for querying children)
+	ID                string `json:"id"`                // ULID for internal use (database keys)
+	ServiceID         string `json:"service_id"`        // FS identifier (from Folder/File.ServiceID)
+	ParentID          string `json:"parent_id"`         // Parent's ULID (internal ID)
+	ParentServiceID   string `json:"parent_service_id"` // Parent's FS identifier
+	ParentPath        string `json:"parent_path"`       // Parent's relative path (for querying children)
 	Name              string `json:"name"`
 	Path              string `json:"path"` // Relative to root (normalized, used for cross-service matching)
 	Type              string `json:"type"` // "file" or "folder"
