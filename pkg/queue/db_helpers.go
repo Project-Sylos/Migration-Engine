@@ -107,7 +107,7 @@ func LoadExpectedChildren(boltDB *db.DB, parentPath string, dstLevel int) ([]typ
 	normalizedParent := types.NormalizeLocationPath(parentPath)
 
 	// Use the children index for efficient O(k) lookup
-	children, err := db.GetChildrenStates(boltDB, "SRC", normalizedParent)
+	children, err := db.GetChildrenStatesByParentID(boltDB, "SRC", normalizedParent)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to fetch children from index: %w", err)
 	}
@@ -146,34 +146,29 @@ func LoadExpectedChildren(boltDB *db.DB, parentPath string, dstLevel int) ([]typ
 	return folders, files, nil
 }
 
-// BatchLoadExpectedChildrenByDSTIDs loads expected children for DST parent nodes using join-lookup.
-// Takes DST parent ULIDs, queries join-lookup to get corresponding SRC parent ULIDs,
-// then loads SRC children and maps them back to DST parents.
-// Returns maps keyed by DST ULID -> (folders, files).
-func BatchLoadExpectedChildrenByDSTIDs(boltDB *db.DB, dstParentIDs []string, dstIDToPath map[string]string) (map[string][]types.Folder, map[string][]types.File, error) {
+// BatchLoadExpectedChildrenByDSTIDs loads expected children for DST parent nodes using SrcID from DST NodeState.
+// Takes DST parent ULIDs, gets SrcID from each DST NodeState, then loads SRC children and maps them back to DST parents.
+// Returns maps keyed by DST ULID -> (folders, files), and a map of SRC node IDs keyed by Type+Name for matching.
+func BatchLoadExpectedChildrenByDSTIDs(boltDB *db.DB, dstParentIDs []string, dstIDToPath map[string]string) (map[string][]types.Folder, map[string][]types.File, map[string]map[string]string, error) {
 	if boltDB == nil {
-		return nil, nil, fmt.Errorf("boltDB cannot be nil")
+		return nil, nil, nil, fmt.Errorf("boltDB cannot be nil")
 	}
 
 	if len(dstParentIDs) == 0 {
-		return make(map[string][]types.Folder), make(map[string][]types.File), nil
+		return make(map[string][]types.Folder), make(map[string][]types.File), make(map[string]map[string]string), nil
 	}
 
 	// Initialize result maps (keyed by DST ULID)
 	resultFolders := make(map[string][]types.Folder)
 	resultFiles := make(map[string][]types.File)
+	// Map: DST ULID -> (Type+Name -> SRC node ID)
+	srcIDMap := make(map[string]map[string]string)
 
 	// Single transaction to load all children
 	err := boltDB.View(func(tx *bolt.Tx) error {
-		// Step 1: Query join-lookup table to get SRC parent ULIDs for each DST parent ULID
-		joinLookupBucket := db.GetJoinLookupBucket(tx)
-		if joinLookupBucket == nil {
-			// No join-lookup entries yet - return empty results for all DST parents
-			for _, dstID := range dstParentIDs {
-				resultFolders[dstID] = []types.Folder{}
-				resultFiles[dstID] = []types.File{}
-			}
-			return nil
+		dstNodesBucket := db.GetNodesBucket(tx, "DST")
+		if dstNodesBucket == nil {
+			return fmt.Errorf("nodes bucket not found for DST")
 		}
 
 		srcChildrenBucket := db.GetChildrenBucket(tx, "SRC")
@@ -186,23 +181,35 @@ func BatchLoadExpectedChildrenByDSTIDs(boltDB *db.DB, dstParentIDs []string, dst
 			return fmt.Errorf("nodes bucket not found for SRC")
 		}
 
+		// Step 1: Get SrcID from each DST parent NodeState
 		// Map: DST ULID -> SRC parent ULID
 		dstToSrcParent := make(map[string]string)
 		// Map: SRC parent ULID -> []DST ULIDs (multiple DST parents might map to same SRC parent)
 		srcParentToDSTs := make(map[string][]string)
 
 		for _, dstID := range dstParentIDs {
-			srcParentIDBytes := joinLookupBucket.Get([]byte(dstID))
-			if srcParentIDBytes == nil {
-				// No corresponding SRC parent found - initialize empty slices
+			dstNodeData := dstNodesBucket.Get([]byte(dstID))
+			if dstNodeData == nil {
+				// DST node not found - initialize empty slices
 				resultFolders[dstID] = []types.Folder{}
 				resultFiles[dstID] = []types.File{}
+				srcIDMap[dstID] = make(map[string]string)
 				continue
 			}
 
-			srcParentID := string(srcParentIDBytes)
+			dstState, err := db.DeserializeNodeState(dstNodeData)
+			if err != nil || dstState.SrcID == "" {
+				// No SrcID in DST node - initialize empty slices
+				resultFolders[dstID] = []types.Folder{}
+				resultFiles[dstID] = []types.File{}
+				srcIDMap[dstID] = make(map[string]string)
+				continue
+			}
+
+			srcParentID := dstState.SrcID
 			dstToSrcParent[dstID] = srcParentID
 			srcParentToDSTs[srcParentID] = append(srcParentToDSTs[srcParentID], dstID)
+			srcIDMap[dstID] = make(map[string]string)
 		}
 
 		// Step 2: Get all SRC child ULIDs for all SRC parents
@@ -258,6 +265,9 @@ func BatchLoadExpectedChildrenByDSTIDs(boltDB *db.DB, dstParentIDs []string, dst
 				continue // Child was deleted or deserialization failed
 			}
 
+			// Create key for matching: Type+Name
+			matchKey := state.Type + ":" + state.Name
+
 			// Convert NodeState to Folder or File
 			var folder *types.Folder
 			var file *types.File
@@ -288,13 +298,15 @@ func BatchLoadExpectedChildrenByDSTIDs(boltDB *db.DB, dstParentIDs []string, dst
 				}
 			}
 
-			// Add this child to all corresponding DST parents
+			// Add this child to all corresponding DST parents and track SRC node ID
 			for _, dstID := range dstParentIDs {
 				if folder != nil {
 					resultFolders[dstID] = append(resultFolders[dstID], *folder)
+					srcIDMap[dstID][matchKey] = childID
 				}
 				if file != nil {
 					resultFiles[dstID] = append(resultFiles[dstID], *file)
+					srcIDMap[dstID][matchKey] = childID
 				}
 			}
 		}
@@ -307,14 +319,17 @@ func BatchLoadExpectedChildrenByDSTIDs(boltDB *db.DB, dstParentIDs []string, dst
 			if _, exists := resultFiles[dstID]; !exists {
 				resultFiles[dstID] = []types.File{}
 			}
+			if _, exists := srcIDMap[dstID]; !exists {
+				srcIDMap[dstID] = make(map[string]string)
+			}
 		}
 
 		return nil
 	})
 
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to batch load expected children: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to batch load expected children: %w", err)
 	}
 
-	return resultFolders, resultFiles, nil
+	return resultFolders, resultFiles, srcIDMap, nil
 }

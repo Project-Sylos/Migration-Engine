@@ -4,21 +4,11 @@
 package db
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"strconv"
 
 	bolt "go.etcd.io/bbolt"
 )
-
-// HashPath creates a fixed-length hash of a normalized path for use as keys.
-// Uses SHA256 and returns first 32 hex characters (16 bytes).
-// This ensures paths can be used as keys even if they contain special characters.
-func HashPath(path string) string {
-	h := sha256.Sum256([]byte(path))
-	return hex.EncodeToString(h[:16]) // 32 hex characters
-}
 
 // Status constants for both traversal and copy phases
 const (
@@ -160,7 +150,7 @@ func EnsureLevelBucket(tx *bolt.Tx, queueType string, level int) error {
 	}
 
 	// Create status-lookup bucket (regular bucket, not nested bucket)
-	// This stores pathHash -> status string mappings
+	// This stores ULID -> status string mappings
 	lookupPath := GetStatusLookupBucketPath(queueType, level)
 	if _, err := getOrCreateBucket(tx, lookupPath); err != nil {
 		return fmt.Errorf("failed to create status-lookup bucket: %w", err)
@@ -209,13 +199,13 @@ func GetOrCreateQueueStatsBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
 }
 
 // GetStatusLookupBucket returns the status-lookup bucket for a specific level.
-// This bucket stores pathHash -> status string mappings.
+// This bucket stores ULID -> status string mappings.
 func GetStatusLookupBucket(tx *bolt.Tx, queueType string, level int) *bolt.Bucket {
 	return getBucket(tx, GetStatusLookupBucketPath(queueType, level))
 }
 
 // GetOrCreateStatusLookupBucket returns or creates the status-lookup bucket for a specific level.
-// This bucket stores pathHash -> status string mappings.
+// This bucket stores ULID -> status string mappings.
 func GetOrCreateStatusLookupBucket(tx *bolt.Tx, queueType string, level int) (*bolt.Bucket, error) {
 	// Ensure the level bucket exists first
 	if err := EnsureLevelBucket(tx, queueType, level); err != nil {

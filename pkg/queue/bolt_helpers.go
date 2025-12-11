@@ -9,7 +9,7 @@ import (
 )
 
 // taskToNodeState converts a TaskBase to a NodeState for BoltDB storage.
-// Generates a ULID for the ID field and uses ServiceID for FS interactions.
+// Uses existing ULID from task.ID if present, otherwise generates a new one.
 func taskToNodeState(task *TaskBase) *db.NodeState {
 	var serviceID, parentServiceID, name, path, parentPath, nodeType string
 	var size int64
@@ -40,11 +40,14 @@ func taskToNodeState(task *TaskBase) *db.NodeState {
 		return nil
 	}
 
-	// Generate ULID for internal ID
-	nodeID := db.GenerateNodeID()
+	// Use existing ULID if present, otherwise generate a new one
+	nodeID := task.ID
 	if nodeID == "" {
-		// If ULID generation fails, return nil
-		return nil
+		nodeID = db.GenerateNodeID()
+		if nodeID == "" {
+			// If ULID generation fails, return nil
+			return nil
+		}
 	}
 
 	return &db.NodeState{
@@ -66,9 +69,10 @@ func taskToNodeState(task *TaskBase) *db.NodeState {
 // nodeStateToTask converts a NodeState back to a TaskBase.
 // Note: This reconstructs the task but doesn't restore DiscoveredChildren or ExpectedFolders/Files.
 // Those need to be populated separately if needed.
-// Uses ServiceID for FS interactions (not the internal ID).
+// Preserves the ULID from NodeState for internal tracking.
 func nodeStateToTask(state *db.NodeState, taskType string) *TaskBase {
 	task := &TaskBase{
+		ID:    state.ID, // Preserve ULID for internal tracking
 		Type:  taskType,
 		Round: state.Depth,
 	}

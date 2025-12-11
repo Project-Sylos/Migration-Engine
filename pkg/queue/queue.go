@@ -55,9 +55,9 @@ type Queue struct {
 	mode               QueueMode            // Operation mode (traversal/exclusion/retry)
 	mu                 sync.RWMutex         // Protects all internal state
 	state              QueueState           // Lifecycle state (running/paused/stopped/completed/waiting)
-	inProgress         map[string]*TaskBase // Tasks currently being executed (keyed by path)
+	inProgress         map[string]*TaskBase // Tasks currently being executed (keyed by ULID)
 	pendingBuff        []*TaskBase          // Local task buffer fetched from BoltDB
-	pendingSet         map[string]struct{}  // Fast lookup for pending buffer dedupe
+	pendingSet         map[string]struct{}  // Fast lookup for pending buffer dedupe (keyed by ULID)
 	leasedKeys         map[string]struct{}  // ULIDs already pulled/leased - prevents duplicate pulls from stale views
 	pulling            bool                 // Indicates a pull operation is active
 	pullLowWM          int                  // Low watermark threshold for pulling more work
@@ -351,10 +351,16 @@ func (q *Queue) Lease() *TaskBase {
 
 		task := q.dequeuePendingLocked()
 		if task != nil {
-			path := task.LocationPath()
+			nodeID := task.ID
+			if nodeID == "" {
+				// Task doesn't have ULID - this shouldn't happen for tasks pulled from DB
+				// Generate one for safety (shouldn't happen in normal flow)
+				nodeID = db.GenerateNodeID()
+				task.ID = nodeID
+			}
 			task.Locked = true
 			task.LeaseTime = time.Now() // Record lease time for execution tracking
-			q.inProgress[path] = task
+			q.inProgress[nodeID] = task
 			q.mu.Unlock()
 			return task
 		}
@@ -575,17 +581,16 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		return
 	}
 
-	path := state.Path
+	nodeID := state.ID
 	queueType := getQueueType(q.name)
 	nextRound := currentRound + 1
 
 	q.mu.Lock()
-	// Remove from in-progress (keyed by path)
-	delete(q.inProgress, path)
+	// Remove from in-progress (keyed by ULID)
+	delete(q.inProgress, nodeID)
 
-	// Remove the path hash from leased set
-	pathHash := db.HashPath(path)
-	delete(q.leasedKeys, pathHash)
+	// Remove the ULID from leased set
+	delete(q.leasedKeys, nodeID)
 
 	task.Locked = false
 	task.Status = "successful"
@@ -629,7 +634,7 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 			continue
 		}
 
-		childState := childResultToNodeState(child, parentPath, nextRound)
+		childState := childResultToNodeState(child, parentPath, nextRound, queueType)
 		if childState == nil {
 			continue
 		}
@@ -721,16 +726,12 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 	// Write to buffer instead of directly to database
 	if q.outputBuffer != nil {
 		// Add parent status update to buffer
-		q.outputBuffer.AddStatusUpdate(queueType, currentRound, db.StatusPending, db.StatusSuccessful, path)
+		q.outputBuffer.AddStatusUpdate(queueType, currentRound, db.StatusPending, db.StatusSuccessful, nodeID)
 
 		// Add child inserts to buffer
-		// For DST nodes, we need to match them to SRC nodes and populate join-lookup
-		var joinLookupMappings map[string]string
-		if q.name == "dst" && len(childNodesToInsert) > 0 {
-			joinLookupMappings = q.buildJoinLookupMappings(childNodesToInsert)
-		}
+		// SrcID is already populated in NodeState during matching, so no join-lookup needed
 		if len(childNodesToInsert) > 0 {
-			q.outputBuffer.AddBatchInsert(childNodesToInsert, joinLookupMappings)
+			q.outputBuffer.AddBatchInsert(childNodesToInsert)
 		}
 	}
 }
@@ -739,17 +740,14 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 // Workers have already done the DB operations, so this just updates queue state.
 func (q *Queue) completeExclusionTask(task *TaskBase) {
 	currentRound := task.Round
-	path := task.LocationPath()
+	nodeID := task.ID
 
 	q.mu.Lock()
-	// Remove from in-progress
-	delete(q.inProgress, path)
+	// Remove from in-progress (keyed by ULID)
+	delete(q.inProgress, nodeID)
 	// Remove ULID from leased set
-	if q.boltDB != nil {
-		state, err := db.GetNodeStateByPath(q.boltDB, getQueueType(q.name), path)
-		if err == nil && state != nil {
-			delete(q.leasedKeys, state.ID)
-		}
+	if nodeID != "" {
+		delete(q.leasedKeys, nodeID)
 	}
 	task.Locked = false
 	task.Status = "successful"
@@ -765,12 +763,18 @@ func (q *Queue) completeExclusionTask(task *TaskBase) {
 	// Queue just needs to track completion stats
 }
 
-func childResultToNodeState(child ChildResult, parentPath string, depth int) *db.NodeState {
+func childResultToNodeState(child ChildResult, parentPath string, depth int, queueType string) *db.NodeState {
 	// Generate ULID for internal ID
 	nodeID := db.GenerateNodeID()
 	if nodeID == "" {
 		// If ULID generation fails, we can't proceed
 		return nil
+	}
+
+	// Set SrcID for DST nodes (from ChildResult, populated during matching)
+	var srcID string
+	if queueType == "DST" {
+		srcID = child.SrcID
 	}
 
 	if child.IsFile {
@@ -789,6 +793,7 @@ func childResultToNodeState(child ChildResult, parentPath string, depth int) *db
 			Depth:           depth,
 			CopyNeeded:      false,
 			Status:          child.Status,
+			SrcID:           srcID, // ULID of corresponding SRC node (for DST nodes only)
 		}
 	}
 
@@ -807,6 +812,7 @@ func childResultToNodeState(child ChildResult, parentPath string, depth int) *db
 		Depth:           depth,
 		CopyNeeded:      false,
 		Status:          child.Status,
+		SrcID:           srcID, // ULID of corresponding SRC node (for DST nodes only)
 	}
 }
 
@@ -867,18 +873,20 @@ func (q *Queue) enqueuePendingLocked(task *TaskBase) {
 	if task == nil {
 		return
 	}
-	path := task.LocationPath()
-	if path == "" {
+	nodeID := task.ID
+	if nodeID == "" {
+		// Generate ULID if not present (for newly created tasks)
+		nodeID = db.GenerateNodeID()
+		task.ID = nodeID
+	}
+	if _, exists := q.inProgress[nodeID]; exists {
 		return
 	}
-	if _, exists := q.inProgress[path]; exists {
-		return
-	}
-	if _, exists := q.pendingSet[path]; exists {
+	if _, exists := q.pendingSet[nodeID]; exists {
 		return
 	}
 	q.pendingBuff = append(q.pendingBuff, task)
-	q.pendingSet[path] = struct{}{}
+	q.pendingSet[nodeID] = struct{}{}
 }
 
 func (q *Queue) dequeuePendingLocked() *TaskBase {
@@ -888,13 +896,18 @@ func (q *Queue) dequeuePendingLocked() *TaskBase {
 		if task == nil {
 			continue
 		}
-		path := task.LocationPath()
-		delete(q.pendingSet, path)
+		nodeID := task.ID
+		if nodeID == "" {
+			// Generate ULID if not present
+			nodeID = db.GenerateNodeID()
+			task.ID = nodeID
+		}
+		delete(q.pendingSet, nodeID)
 
 		if task.Round < q.round {
 			continue
 		}
-		if _, exists := q.inProgress[path]; exists {
+		if _, exists := q.inProgress[nodeID]; exists {
 			continue
 		}
 		return task
@@ -909,8 +922,8 @@ func (q *Queue) Fail(task *TaskBase) bool {
 	q.ReportTaskResult(task, TaskExecutionResultFailed)
 	// Check if task was retried by checking if it's still in pending
 	q.mu.RLock()
-	path := task.LocationPath()
-	_, willRetry := q.pendingSet[path]
+	nodeID := task.ID
+	_, willRetry := q.pendingSet[nodeID]
 	q.mu.RUnlock()
 	return willRetry
 }
@@ -920,20 +933,20 @@ func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
 	// Record execution time delta (even for failures)
 	q.recordExecutionTime(executionDelta)
 	currentRound := task.Round
-	path := task.LocationPath() // Use path (not ID) to match Lease() and Complete()
+	nodeID := task.ID // Use ULID for tracking
 
 	if logservice.LS != nil {
 		_ = logservice.LS.Log("debug",
-			fmt.Sprintf("Failing task: path=%s round=%d type=%s currentAttempts=%d maxRetries=%d",
-				path, currentRound, task.Type, task.Attempts, q.maxRetries),
+			fmt.Sprintf("Failing task: id=%s path=%s round=%d type=%s currentAttempts=%d maxRetries=%d",
+				nodeID, task.LocationPath(), currentRound, task.Type, task.Attempts, q.maxRetries),
 			"queue", q.name, q.name)
 	}
 
 	q.mu.Lock()
 	task.Attempts++
 
-	// Remove from in-progress
-	delete(q.inProgress, path)
+	// Remove from in-progress (keyed by ULID)
+	delete(q.inProgress, nodeID)
 
 	// Check if we should retry
 	if task.Attempts < q.maxRetries {
@@ -942,8 +955,8 @@ func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
 		q.mu.Unlock()
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("debug",
-				fmt.Sprintf("Retrying task: path=%s round=%d attempt=%d/%d",
-					path, currentRound, task.Attempts, q.maxRetries),
+				fmt.Sprintf("Retrying task: id=%s path=%s round=%d attempt=%d/%d",
+					nodeID, task.LocationPath(), currentRound, task.Attempts, q.maxRetries),
 				"queue", q.name, q.name)
 		}
 		return // Will retry - ReportTaskResult will handle pulling tasks
@@ -951,17 +964,14 @@ func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
 
 	// Max retries reached - task is truly done
 	// Remove the ULID from leased set
-	if q.boltDB != nil {
-		state, err := db.GetNodeStateByPath(q.boltDB, getQueueType(q.name), path)
-		if err == nil && state != nil {
-			delete(q.leasedKeys, state.ID)
-		}
+	if nodeID != "" {
+		delete(q.leasedKeys, nodeID)
 	}
 
 	if logservice.LS != nil {
 		_ = logservice.LS.Log("error",
-			fmt.Sprintf("Failed to traverse folder %s after %d attempts (max retries exceeded) round=%d",
-				path, task.Attempts, currentRound),
+			fmt.Sprintf("Failed to traverse folder %s (id=%s) after %d attempts (max retries exceeded) round=%d",
+				task.LocationPath(), nodeID, task.Attempts, currentRound),
 			"queue", q.name, q.name)
 	}
 
@@ -974,10 +984,9 @@ func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
 	q.mu.Unlock()
 
 	// Update traversal status to failed so leasing stops retrying this node.
-	state := taskToNodeState(task)
-	if state != nil && q.outputBuffer != nil {
+	if nodeID != "" && q.outputBuffer != nil {
 		queueType := getQueueType(q.name)
-		q.outputBuffer.AddStatusUpdate(queueType, currentRound, db.StatusPending, db.StatusFailed, state.Path)
+		q.outputBuffer.AddStatusUpdate(queueType, currentRound, db.StatusPending, db.StatusFailed, nodeID)
 	}
 }
 
@@ -1491,31 +1500,4 @@ func (q *Queue) advanceToNextRound() {
 	// - lastPullWasPartial == true
 	// Then it will flush buffer and advance to next round
 	q.PullTasksIfNeeded(true)
-}
-
-// buildJoinLookupMappings matches DST nodes to SRC nodes by path and returns a map of DST ULID -> SRC ULID.
-// This is used to populate the join-lookup table during DST bulk inserts.
-func (q *Queue) buildJoinLookupMappings(dstOps []db.InsertOperation) map[string]string {
-	if q.boltDB == nil {
-		return nil
-	}
-
-	mappings := make(map[string]string)
-
-	// For each DST node, find the corresponding SRC node by path
-	for _, op := range dstOps {
-		if op.QueueType != "DST" || op.State == nil {
-			continue
-		}
-
-		// Look up SRC node by path
-		srcState, err := db.GetNodeStateByPath(q.boltDB, "SRC", op.State.Path)
-		if err == nil && srcState != nil {
-			// Found matching SRC node - add to mappings
-			mappings[op.State.ID] = srcState.ID
-		}
-		// If no match found, skip (node doesn't exist on SRC)
-	}
-
-	return mappings
 }

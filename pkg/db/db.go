@@ -115,14 +115,7 @@ func (db *DB) initializeBuckets() error {
 			}
 		}
 
-		// Create join-lookup bucket under DST only
-		// This stores DST node ULID -> SRC node ULID mappings (1:1)
-		dstBucket := traversalBucket.Bucket([]byte("DST"))
-		if dstBucket != nil {
-			if _, err := dstBucket.CreateBucketIfNotExists([]byte("join-lookup")); err != nil {
-				return fmt.Errorf("failed to create Traversal-Data/DST/join-lookup bucket: %w", err)
-			}
-		}
+		// SrcID is now stored directly in DST NodeState, no join-lookup bucket needed
 
 		// Create LOGS bucket as separate top-level (its own island)
 		if _, err := tx.CreateBucketIfNotExists([]byte("LOGS")); err != nil {

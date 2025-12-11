@@ -16,6 +16,7 @@ type NodeState struct {
 	ParentID          string `json:"parent_id"`         // Parent's ULID (internal ID)
 	ParentServiceID   string `json:"parent_service_id"` // Parent's FS identifier
 	ParentPath        string `json:"parent_path"`       // Parent's relative path (for querying children)
+	SrcID             string `json:"src_id,omitempty"`  // Corresponding SRC node ULID (DST nodes only)
 	Name              string `json:"name"`
 	Path              string `json:"path"` // Relative to root (normalized, used for cross-service matching)
 	Type              string `json:"type"` // "file" or "folder"

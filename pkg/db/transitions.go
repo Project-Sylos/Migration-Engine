@@ -9,19 +9,14 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// UpdateNodeStatus updates a node's traversal status by moving it between status buckets.
+// UpdateNodeStatusByID updates a node's traversal status by moving it between status buckets using ULID.
 // The node data remains in the nodes bucket; only the status membership changes.
 // Returns the updated NodeState.
-func UpdateNodeStatus(db *DB, queueType string, level int, oldStatus, newStatus, path string) (*NodeState, error) {
+func UpdateNodeStatusByID(db *DB, queueType string, level int, oldStatus, newStatus string, nodeID string) (*NodeState, error) {
 	var nodeState *NodeState
 
 	err := db.Update(func(tx *bolt.Tx) error {
-		// Look up node's ULID by path
-		nodeIDStr, err := getNodeIDByPath(tx, queueType, path)
-		if err != nil {
-			return fmt.Errorf("node not found for path %s: %w", path, err)
-		}
-		nodeID := []byte(nodeIDStr)
+		nodeIDBytes := []byte(nodeID)
 
 		// Get the node data from nodes bucket
 		nodesBucket := GetNodesBucket(tx, queueType)
@@ -29,9 +24,9 @@ func UpdateNodeStatus(db *DB, queueType string, level int, oldStatus, newStatus,
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}
 
-		nodeData := nodesBucket.Get(nodeID)
+		nodeData := nodesBucket.Get(nodeIDBytes)
 		if nodeData == nil {
-			return fmt.Errorf("node not found in nodes bucket: %s", path)
+			return fmt.Errorf("node not found in nodes bucket: %s", nodeID)
 		}
 
 		// Deserialize and update traversal status
@@ -47,7 +42,7 @@ func UpdateNodeStatus(db *DB, queueType string, level int, oldStatus, newStatus,
 			return fmt.Errorf("failed to serialize node state: %w", err)
 		}
 
-		if err := nodesBucket.Put(nodeID, updatedData); err != nil {
+		if err := nodesBucket.Put(nodeIDBytes, updatedData); err != nil {
 			return fmt.Errorf("failed to update node in nodes bucket: %w", err)
 		}
 
@@ -57,7 +52,7 @@ func UpdateNodeStatus(db *DB, queueType string, level int, oldStatus, newStatus,
 		// Delete from old status bucket
 		oldBucket := GetStatusBucket(tx, queueType, level, oldStatus)
 		if oldBucket != nil {
-			if err := oldBucket.Delete(nodeID); err != nil {
+			if err := oldBucket.Delete(nodeIDBytes); err != nil {
 				return fmt.Errorf("failed to delete from old status bucket: %w", err)
 			}
 		}
@@ -68,12 +63,12 @@ func UpdateNodeStatus(db *DB, queueType string, level int, oldStatus, newStatus,
 			return fmt.Errorf("failed to get new status bucket: %w", err)
 		}
 
-		if err := newBucket.Put(nodeID, []byte{}); err != nil {
+		if err := newBucket.Put(nodeIDBytes, []byte{}); err != nil {
 			return fmt.Errorf("failed to add to new status bucket: %w", err)
 		}
 
 		// Update status-lookup index
-		if err := UpdateStatusLookup(tx, queueType, level, nodeID, newStatus); err != nil {
+		if err := UpdateStatusLookup(tx, queueType, level, nodeIDBytes, newStatus); err != nil {
 			return fmt.Errorf("failed to update status-lookup: %w", err)
 		}
 
@@ -87,27 +82,22 @@ func UpdateNodeStatus(db *DB, queueType string, level int, oldStatus, newStatus,
 	return nodeState, nil
 }
 
-// UpdateNodeCopyStatus updates a node's copy status in the metadata (in nodes bucket).
+// UpdateNodeCopyStatusByID updates a node's copy status in the metadata (in nodes bucket) using ULID.
 // This only updates the CopyStatus field in NodeState without changing status bucket membership.
-func UpdateNodeCopyStatus(db *DB, queueType string, level int, status, path string, newCopyStatus string) (*NodeState, error) {
+func UpdateNodeCopyStatusByID(db *DB, queueType string, level int, status string, nodeID string, newCopyStatus string) (*NodeState, error) {
 	var nodeState *NodeState
 
 	err := db.Update(func(tx *bolt.Tx) error {
-		// Look up node's ULID by path
-		nodeIDStr, err := getNodeIDByPath(tx, queueType, path)
-		if err != nil {
-			return fmt.Errorf("node not found for path %s: %w", path, err)
-		}
-		nodeID := []byte(nodeIDStr)
+		nodeIDBytes := []byte(nodeID)
 
 		nodesBucket := GetNodesBucket(tx, queueType)
 		if nodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}
 
-		nodeData := nodesBucket.Get(nodeID)
+		nodeData := nodesBucket.Get(nodeIDBytes)
 		if nodeData == nil {
-			return fmt.Errorf("node not found: %s", path)
+			return fmt.Errorf("node not found: %s", nodeID)
 		}
 
 		ns, err := DeserializeNodeState(nodeData)
@@ -125,7 +115,7 @@ func UpdateNodeCopyStatus(db *DB, queueType string, level int, status, path stri
 			return fmt.Errorf("failed to serialize node state: %w", err)
 		}
 
-		if err := nodesBucket.Put(nodeID, updatedData); err != nil {
+		if err := nodesBucket.Put(nodeIDBytes, updatedData); err != nil {
 			return fmt.Errorf("failed to update node: %w", err)
 		}
 
@@ -198,45 +188,8 @@ func GetNodeState(db *DB, queueType string, nodeID string) (*NodeState, error) {
 	return nodeState, nil
 }
 
-// GetNodeStateByPath retrieves a NodeState by path.
-// This function looks up the node's ULID by path first, then retrieves the node.
-func GetNodeStateByPath(db *DB, queueType string, path string) (*NodeState, error) {
-	var nodeState *NodeState
-
-	err := db.View(func(tx *bolt.Tx) error {
-		nodeID, err := getNodeIDByPath(tx, queueType, path)
-		if err != nil {
-			return err
-		}
-
-		nodesBucket := GetNodesBucket(tx, queueType)
-		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found for %s", queueType)
-		}
-
-		nodeData := nodesBucket.Get([]byte(nodeID))
-		if nodeData == nil {
-			return nil // Not found
-		}
-
-		ns, err := DeserializeNodeState(nodeData)
-		if err != nil {
-			return fmt.Errorf("failed to deserialize node state: %w", err)
-		}
-
-		nodeState = ns
-		return nil
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return nodeState, nil
-}
-
-// BatchUpdateNodeStatus updates multiple nodes from one status to another in a single transaction.
-func BatchUpdateNodeStatus(db *DB, queueType string, level int, oldStatus, newStatus string, paths []string) (map[string]*NodeState, error) {
+// BatchUpdateNodeStatusByID updates multiple nodes from one status to another in a single transaction using ULIDs.
+func BatchUpdateNodeStatusByID(db *DB, queueType string, level int, oldStatus, newStatus string, nodeIDs []string) (map[string]*NodeState, error) {
 	results := make(map[string]*NodeState)
 
 	err := db.Update(func(tx *bolt.Tx) error {
@@ -251,13 +204,7 @@ func BatchUpdateNodeStatus(db *DB, queueType string, level int, oldStatus, newSt
 			return fmt.Errorf("failed to get new status bucket: %w", err)
 		}
 
-		for _, path := range paths {
-			// Look up node's ULID by path
-			nodeIDStr, err := getNodeIDByPath(tx, queueType, path)
-			if err != nil {
-				// Skip if not found (may have been processed by another worker)
-				continue
-			}
+		for _, nodeIDStr := range nodeIDs {
 			nodeID := []byte(nodeIDStr)
 
 			// Get node data
@@ -298,7 +245,7 @@ func BatchUpdateNodeStatus(db *DB, queueType string, level int, oldStatus, newSt
 				return fmt.Errorf("failed to update status-lookup: %w", err)
 			}
 
-			results[path] = ns
+			results[nodeIDStr] = ns
 		}
 
 		return nil
@@ -307,8 +254,8 @@ func BatchUpdateNodeStatus(db *DB, queueType string, level int, oldStatus, newSt
 	return results, err
 }
 
-// BatchUpdateNodeCopyStatus updates copy status for multiple nodes in one transaction.
-func BatchUpdateNodeCopyStatus(db *DB, queueType string, level int, status string, newCopyStatus string, paths []string) (map[string]*NodeState, error) {
+// BatchUpdateNodeCopyStatusByID updates copy status for multiple nodes in one transaction using ULIDs.
+func BatchUpdateNodeCopyStatusByID(db *DB, queueType string, level int, status string, newCopyStatus string, nodeIDs []string) (map[string]*NodeState, error) {
 	results := make(map[string]*NodeState)
 
 	err := db.Update(func(tx *bolt.Tx) error {
@@ -317,12 +264,7 @@ func BatchUpdateNodeCopyStatus(db *DB, queueType string, level int, status strin
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}
 
-		for _, path := range paths {
-			// Look up node's ULID by path
-			nodeIDStr, err := getNodeIDByPath(tx, queueType, path)
-			if err != nil {
-				continue // Skip if not found
-			}
+		for _, nodeIDStr := range nodeIDs {
 			nodeID := []byte(nodeIDStr)
 
 			nodeData := nodesBucket.Get(nodeID)
@@ -347,7 +289,7 @@ func BatchUpdateNodeCopyStatus(db *DB, queueType string, level int, status strin
 				return fmt.Errorf("failed to update node: %w", err)
 			}
 
-			results[path] = ns
+			results[nodeIDStr] = ns
 		}
 
 		return nil

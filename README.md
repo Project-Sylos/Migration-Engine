@@ -143,25 +143,25 @@ The database is partitioned into two main areas:
 ```
 /Traversal-Data
   /SRC
-    /nodes                  → pathHash: NodeState JSON (canonical data)
-    /children               → parentHash: []childHash JSON (tree relationships)
+    /nodes                  → ULID: NodeState JSON (canonical data)
+    /children               → parentULID: []childULID JSON (tree relationships)
     /levels
       /00000000
-        /pending            → pathHash: empty (membership set)
-        /successful         → pathHash: empty
-        /failed             → pathHash: empty
-        /status-lookup      → pathHash: status string (reverse index)
+        /pending            → ULID: empty (membership set)
+        /successful         → ULID: empty
+        /failed             → ULID: empty
+        /status-lookup      → ULID: status string (reverse index)
       /00000001/...
   /DST
-    /nodes
-    /children
+    /nodes                  → ULID: NodeState JSON (includes src_id for matching)
+    /children               → parentULID: []childULID JSON (tree relationships)
     /levels
       /00000000
         /pending
         /successful
         /failed
-        /not_on_src         → pathHash: empty (DST-specific status)
-        /status-lookup      → pathHash: status string (reverse index)
+        /not_on_src         → ULID: empty (DST-specific status)
+        /status-lookup      → ULID: status string (reverse index)
       /00000001/...
   /STATS
     /totals                → bucketPath: int64 (bucket count statistics)
@@ -186,8 +186,9 @@ This partitioning separates traversal operations (discovery/scanning phase) from
 1. **Separation of Concerns**
    - Node data lives in `/nodes` (single source of truth)
    - Status membership tracked in `/levels/{level}/{status}` buckets
-   - Status-lookup index in `/levels/{level}/status-lookup` provides reverse lookup (pathHash → status)
+   - Status-lookup index in `/levels/{level}/status-lookup` provides reverse lookup (ULID → status)
    - Tree relationships in `/children` buckets
+   - DST nodes store `src_id` field linking to corresponding SRC node ULID
 
 2. **Status Transitions are Atomic**
    Status transitions update multiple buckets atomically:
@@ -199,14 +200,16 @@ This partitioning separates traversal operations (discovery/scanning phase) from
    ```
 
 3. **Status-Lookup Index**
-   - Each level has a `status-lookup` bucket that maps `pathHash → status string`
+   - Each level has a `status-lookup` bucket that maps `ULID → status string`
    - Provides O(1) lookup to find which status bucket a node belongs to
    - Automatically maintained on every insert and status update
    - Enables efficient queries without scanning all status buckets
 
-4. **No Key Encoding**
-   - Structure is explicit in buckets, not encoded in key names
-   - Path hashes are simple lookup keys
-   - Hierarchy is natural and navigable
+4. **ULID-Based Keys**
+   - All internal operations use ULID (Universally Unique Lexicographically Sortable Identifier) for keys
+   - ULIDs provide unique, sortable identifiers without path dependencies
+   - DST nodes store `src_id` field (ULID) linking to corresponding SRC node
+   - Matching between SRC and DST nodes is done by Type + Name, not path
+   - Hierarchy is natural and navigable through parent-child ULID relationships
 
 See `pkg/db/README.md` for detailed documentation on the database layer.

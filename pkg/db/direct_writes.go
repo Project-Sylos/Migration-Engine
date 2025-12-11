@@ -9,15 +9,9 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// UpdateNodeStatusInTx updates a node's status within an existing transaction.
-// This is used by queue.Complete() and queue.Fail() to write directly to BoltDB.
-func UpdateNodeStatusInTx(tx *bolt.Tx, queueType string, level int, oldStatus, newStatus, path string) error {
-	// Look up node's ULID by path
-	nodeIDStr, err := getNodeIDByPath(tx, queueType, path)
-	if err != nil {
-		return fmt.Errorf("node not found for path %s: %w", path, err)
-	}
-	nodeID := []byte(nodeIDStr)
+// UpdateNodeStatusInTxByID updates a node's status within an existing transaction using ULID.
+// This is the preferred method - use ULID directly instead of path lookup.
+func UpdateNodeStatusInTxByID(tx *bolt.Tx, queueType string, level int, oldStatus, newStatus string, nodeID []byte) error {
 
 	// Get the node data from nodes bucket
 	nodesBucket := GetNodesBucket(tx, queueType)
@@ -27,7 +21,7 @@ func UpdateNodeStatusInTx(tx *bolt.Tx, queueType string, level int, oldStatus, n
 
 	nodeData := nodesBucket.Get(nodeID)
 	if nodeData == nil {
-		return fmt.Errorf("node not found in nodes bucket: %s", path)
+		return fmt.Errorf("node not found in nodes bucket: %s", string(nodeID))
 	}
 
 	// Deserialize and update traversal status
@@ -78,8 +72,8 @@ func UpdateNodeStatusInTx(tx *bolt.Tx, queueType string, level int, oldStatus, n
 // BatchInsertNodesInTx inserts multiple nodes within an existing transaction.
 // This is used by queue.Complete() to insert discovered children atomically.
 // Stats updates are handled separately by batch processing in output buffer flush.
-// joinLookupMappings is optional - if provided, maps DST node ULIDs to SRC node ULIDs for join-lookup table.
-func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation, joinLookupMappings map[string]string) error {
+// SrcID is already populated in NodeState during matching, so no join-lookup needed.
+func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation) error {
 	var nodesBucket *bolt.Bucket
 	var currentQueueType string
 
@@ -96,15 +90,8 @@ func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation, joinLookupM
 		nodeID := []byte(op.State.ID)
 		var parentID []byte
 
-		// Look up parent ID if needed
-		if op.State.ParentPath != "" && op.State.ParentID == "" {
-			parentULID, err := getNodeIDByPath(tx, op.QueueType, op.State.ParentPath)
-			if err != nil {
-				return fmt.Errorf("failed to find parent node for path %s: %w", op.State.ParentPath, err)
-			}
-			op.State.ParentID = parentULID
-			parentID = []byte(parentULID)
-		} else if op.State.ParentID != "" {
+		// ParentID must be set - no path-based lookup
+		if op.State.ParentID != "" {
 			parentID = []byte(op.State.ParentID)
 		}
 
@@ -180,18 +167,7 @@ func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation, joinLookupM
 			}
 		}
 
-		// 5. Populate join-lookup for DST nodes
-		if op.QueueType == BucketDst && joinLookupMappings != nil {
-			if srcNodeID, exists := joinLookupMappings[op.State.ID]; exists {
-				joinLookupBucket, err := GetOrCreateJoinLookupBucket(tx)
-				if err != nil {
-					return fmt.Errorf("failed to get join-lookup bucket: %w", err)
-				}
-				if err := joinLookupBucket.Put([]byte(op.State.ID), []byte(srcNodeID)); err != nil {
-					return fmt.Errorf("failed to insert join-lookup entry: %w", err)
-				}
-			}
-		}
+		// SrcID is already populated in NodeState during matching, no join-lookup needed
 	}
 
 	return nil

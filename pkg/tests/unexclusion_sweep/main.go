@@ -125,16 +125,20 @@ func runTest() error {
 
 	// Get children and add them to unexclusion-holding bucket
 	// They will keep their inherited_excluded status until the sweep processes them
-	children, err := db.GetChildrenStates(boltDB, "SRC", selectedChild.Path)
+	childIDs, err := db.GetChildrenIDsByParentID(boltDB, "SRC", selectedChild.ID)
 	if err != nil {
 		return fmt.Errorf("failed to get children: %w", err)
 	}
 
-	if len(children) > 0 {
-		fmt.Printf("Adding %d children to unexclusion-holding bucket...\n", len(children))
-		for _, child := range children {
-			if err := addToUnexclusionHolding(boltDB, "SRC", child.Path, child.Depth); err != nil {
-				return fmt.Errorf("failed to add child %s to unexclusion-holding bucket: %w", child.Path, err)
+	if len(childIDs) > 0 {
+		fmt.Printf("Adding %d children to unexclusion-holding bucket...\n", len(childIDs))
+		for _, childID := range childIDs {
+			childState, err := db.GetNodeState(boltDB, "SRC", childID)
+			if err != nil {
+				continue
+			}
+			if err := addToUnexclusionHolding(boltDB, "SRC", childState.Path, childState.Depth); err != nil {
+				return fmt.Errorf("failed to add child %s to unexclusion-holding bucket: %w", childState.Path, err)
 			}
 		}
 	}
@@ -205,7 +209,31 @@ func runTest() error {
 
 // addToUnexclusionHolding adds a node to the unexclusion-holding bucket.
 func addToUnexclusionHolding(boltDB *db.DB, queueType string, nodePath string, depth int) error {
-	pathHash := []byte(db.HashPath(nodePath))
+	// Find node by path to get ULID
+	var nodeID string
+	err := boltDB.View(func(tx *bolt.Tx) error {
+		nodesBucket := db.GetNodesBucket(tx, queueType)
+		if nodesBucket == nil {
+			return fmt.Errorf("nodes bucket not found")
+		}
+
+		cursor := nodesBucket.Cursor()
+		for nodeIDBytes, nodeData := cursor.First(); nodeIDBytes != nil; nodeIDBytes, nodeData = cursor.Next() {
+			nodeState, err := db.DeserializeNodeState(nodeData)
+			if err != nil {
+				continue
+			}
+			if nodeState.Path == nodePath {
+				nodeID = nodeState.ID
+				return nil
+			}
+		}
+		return fmt.Errorf("node not found: %s", nodePath)
+	})
+	if err != nil {
+		return err
+	}
+
 	depthBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(depthBytes, uint64(depth))
 
@@ -215,6 +243,6 @@ func addToUnexclusionHolding(boltDB *db.DB, queueType string, nodePath string, d
 			return fmt.Errorf("failed to get unexclusion-holding bucket: %w", err)
 		}
 
-		return bucket.Put(pathHash, depthBytes)
+		return bucket.Put([]byte(nodeID), depthBytes)
 	})
 }
