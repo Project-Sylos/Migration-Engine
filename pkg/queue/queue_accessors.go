@@ -56,10 +56,10 @@ func (q *Queue) getOutputBuffer() *db.OutputBuffer {
 	return q.outputBuffer
 }
 
-func (q *Queue) isLeased(pathHash string) bool {
+func (q *Queue) isLeased(nodeID string) bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
-	_, exists := q.leasedKeys[pathHash]
+	_, exists := q.leasedKeys[nodeID]
 	return exists
 }
 
@@ -89,10 +89,10 @@ func (q *Queue) setLastPullWasPartial(value bool) {
 	q.lastPullWasPartial = value
 }
 
-func (q *Queue) addLeasedKey(pathHash string) {
+func (q *Queue) addLeasedKey(nodeID string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.leasedKeys[pathHash] = struct{}{}
+	q.leasedKeys[nodeID] = struct{}{}
 }
 
 // Batch operations (require lock, but provide convenience methods)

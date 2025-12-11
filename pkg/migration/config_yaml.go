@@ -254,7 +254,7 @@ func (yamlCfg *MigrationConfigYAML) ToMigrationConfig(adapterFactory AdapterFact
 func yamlFolderToFolder(yamlRoot *RootFolderYAML, rootID, rootPath string) types.Folder {
 	if yamlRoot != nil {
 		return types.Folder{
-			Id:           yamlRoot.Id,
+			ServiceID:    yamlRoot.Id,
 			ParentId:     yamlRoot.ParentId,
 			ParentPath:   yamlRoot.ParentPath,
 			DisplayName:  yamlRoot.DisplayName,
@@ -267,7 +267,7 @@ func yamlFolderToFolder(yamlRoot *RootFolderYAML, rootID, rootPath string) types
 
 	// Fallback to rootID and rootPath if yamlRoot is nil
 	return types.Folder{
-		Id:           rootID,
+		ServiceID:    rootID,
 		LocationPath: rootPath,
 		Type:         types.NodeTypeFolder,
 		DepthLevel:   0,
@@ -307,14 +307,14 @@ func NewMigrationConfigYAML(cfg Config, status MigrationStatus) (*MigrationConfi
 			Source: ServiceConfigYAML{
 				Type:     detectServiceType(cfg.Source.Adapter),
 				Name:     cfg.Source.Name,
-				RootID:   cfg.Source.Root.Id,
+				RootID:   cfg.Source.Root.ServiceID,
 				RootPath: cfg.Source.Root.LocationPath,
 				Root:     folderToYAML(cfg.Source.Root),
 			},
 			Destination: ServiceConfigYAML{
 				Type:     detectServiceType(cfg.Destination.Adapter),
 				Name:     cfg.Destination.Name,
-				RootID:   cfg.Destination.Root.Id,
+				RootID:   cfg.Destination.Root.ServiceID,
 				RootPath: cfg.Destination.Root.LocationPath,
 				Root:     folderToYAML(cfg.Destination.Root),
 			},
@@ -514,11 +514,11 @@ func UpdateConfigFromRoots(yamlCfg *MigrationConfigYAML, srcRoot, dstRoot types.
 	now := time.Now().UTC().Format(time.RFC3339)
 	yamlCfg.Metadata.LastModified = now
 
-	yamlCfg.Services.Source.RootID = srcRoot.Id
+	yamlCfg.Services.Source.RootID = srcRoot.ServiceID
 	yamlCfg.Services.Source.RootPath = srcRoot.LocationPath
 	yamlCfg.Services.Source.Root = folderToYAML(srcRoot)
 
-	yamlCfg.Services.Destination.RootID = dstRoot.Id
+	yamlCfg.Services.Destination.RootID = dstRoot.ServiceID
 	yamlCfg.Services.Destination.RootPath = dstRoot.LocationPath
 	yamlCfg.Services.Destination.Root = folderToYAML(dstRoot)
 }
@@ -570,7 +570,7 @@ func isSameService(srcAdapter, dstAdapter types.FSAdapter) bool {
 
 func folderToYAML(folder types.Folder) *RootFolderYAML {
 	return &RootFolderYAML{
-		Id:           folder.Id,
+		Id:           folder.ServiceID,
 		ParentId:     folder.ParentId,
 		ParentPath:   folder.ParentPath,
 		DisplayName:  folder.DisplayName,

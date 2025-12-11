@@ -58,7 +58,7 @@ type Queue struct {
 	inProgress         map[string]*TaskBase // Tasks currently being executed (keyed by path)
 	pendingBuff        []*TaskBase          // Local task buffer fetched from BoltDB
 	pendingSet         map[string]struct{}  // Fast lookup for pending buffer dedupe
-	leasedKeys         map[string]struct{}  // Path hashes already pulled/leased - prevents duplicate pulls from stale views
+	leasedKeys         map[string]struct{}  // ULIDs already pulled/leased - prevents duplicate pulls from stale views
 	pulling            bool                 // Indicates a pull operation is active
 	pullLowWM          int                  // Low watermark threshold for pulling more work
 	lastPullWasPartial bool                 // True if last pull returned fewer tasks than requested (partial batch)
@@ -717,8 +717,13 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		q.outputBuffer.AddStatusUpdate(queueType, currentRound, db.StatusPending, db.StatusSuccessful, path)
 
 		// Add child inserts to buffer
+		// For DST nodes, we need to match them to SRC nodes and populate join-lookup
+		var joinLookupMappings map[string]string
+		if q.name == "dst" && len(childNodesToInsert) > 0 {
+			joinLookupMappings = q.buildJoinLookupMappings(childNodesToInsert)
+		}
 		if len(childNodesToInsert) > 0 {
-			q.outputBuffer.AddBatchInsert(childNodesToInsert)
+			q.outputBuffer.AddBatchInsert(childNodesToInsert, joinLookupMappings)
 		}
 	}
 }
@@ -728,12 +733,17 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 func (q *Queue) completeExclusionTask(task *TaskBase) {
 	currentRound := task.Round
 	path := task.LocationPath()
-	pathHash := db.HashPath(path)
 
 	q.mu.Lock()
 	// Remove from in-progress
 	delete(q.inProgress, path)
-	delete(q.leasedKeys, pathHash)
+	// Remove ULID from leased set
+	if q.boltDB != nil {
+		state, err := db.GetNodeStateByPath(q.boltDB, getQueueType(q.name), path)
+		if err == nil && state != nil {
+			delete(q.leasedKeys, state.ID)
+		}
+	}
 	task.Locked = false
 	task.Status = "successful"
 
@@ -749,36 +759,47 @@ func (q *Queue) completeExclusionTask(task *TaskBase) {
 }
 
 func childResultToNodeState(child ChildResult, parentPath string, depth int) *db.NodeState {
+	// Generate ULID for internal ID
+	nodeID := db.GenerateNodeID()
+	if nodeID == "" {
+		// If ULID generation fails, we can't proceed
+		return nil
+	}
+
 	if child.IsFile {
 		file := child.File
 		return &db.NodeState{
-			ID:         file.Id,
-			ParentID:   file.ParentId,
-			ParentPath: parentPath,
-			Name:       file.DisplayName,
-			Path:       types.NormalizeLocationPath(file.LocationPath),
-			Type:       types.NodeTypeFile,
-			Size:       file.Size,
-			MTime:      file.LastUpdated,
-			Depth:      depth,
-			CopyNeeded: false,
-			Status:     child.Status,
+			ID:              nodeID,         // ULID for database keys
+			ServiceID:       file.ServiceID, // FS identifier
+			ParentID:        "",             // Will be looked up by parent path if needed
+			ParentServiceID: file.ParentId,  // Parent's FS identifier
+			ParentPath:      parentPath,
+			Name:            file.DisplayName,
+			Path:            types.NormalizeLocationPath(file.LocationPath),
+			Type:            types.NodeTypeFile,
+			Size:            file.Size,
+			MTime:           file.LastUpdated,
+			Depth:           depth,
+			CopyNeeded:      false,
+			Status:          child.Status,
 		}
 	}
 
 	folder := child.Folder
 	return &db.NodeState{
-		ID:         folder.Id,
-		ParentID:   folder.ParentId,
-		ParentPath: parentPath,
-		Name:       folder.DisplayName,
-		Path:       types.NormalizeLocationPath(folder.LocationPath),
-		Type:       types.NodeTypeFolder,
-		Size:       0,
-		MTime:      folder.LastUpdated,
-		Depth:      depth,
-		CopyNeeded: false,
-		Status:     child.Status,
+		ID:              nodeID,           // ULID for database keys
+		ServiceID:       folder.ServiceID, // FS identifier
+		ParentID:        "",               // Will be looked up by parent path if needed
+		ParentServiceID: folder.ParentId,  // Parent's FS identifier
+		ParentPath:      parentPath,
+		Name:            folder.DisplayName,
+		Path:            types.NormalizeLocationPath(folder.LocationPath),
+		Type:            types.NodeTypeFolder,
+		Size:            0,
+		MTime:           folder.LastUpdated,
+		Depth:           depth,
+		CopyNeeded:      false,
+		Status:          child.Status,
 	}
 }
 
@@ -922,9 +943,13 @@ func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
 	}
 
 	// Max retries reached - task is truly done
-	// Remove the path hash from leased set
-	pathHash := db.HashPath(path)
-	delete(q.leasedKeys, pathHash)
+	// Remove the ULID from leased set
+	if q.boltDB != nil {
+		state, err := db.GetNodeStateByPath(q.boltDB, getQueueType(q.name), path)
+		if err == nil && state != nil {
+			delete(q.leasedKeys, state.ID)
+		}
+	}
 
 	if logservice.LS != nil {
 		_ = logservice.LS.Log("error",
@@ -1459,4 +1484,31 @@ func (q *Queue) advanceToNextRound() {
 	// - lastPullWasPartial == true
 	// Then it will flush buffer and advance to next round
 	q.PullTasksIfNeeded(true)
+}
+
+// buildJoinLookupMappings matches DST nodes to SRC nodes by path and returns a map of DST ULID -> SRC ULID.
+// This is used to populate the join-lookup table during DST bulk inserts.
+func (q *Queue) buildJoinLookupMappings(dstOps []db.InsertOperation) map[string]string {
+	if q.boltDB == nil {
+		return nil
+	}
+
+	mappings := make(map[string]string)
+
+	// For each DST node, find the corresponding SRC node by path
+	for _, op := range dstOps {
+		if op.QueueType != "DST" || op.State == nil {
+			continue
+		}
+
+		// Look up SRC node by path
+		srcState, err := db.GetNodeStateByPath(q.boltDB, "SRC", op.State.Path)
+		if err == nil && srcState != nil {
+			// Found matching SRC node - add to mappings
+			mappings[op.State.ID] = srcState.ID
+		}
+		// If no match found, skip (node doesn't exist on SRC)
+	}
+
+	return mappings
 }

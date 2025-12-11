@@ -22,9 +22,9 @@ func LoadRootFolders(boltDB *db.DB, queueType string) ([]types.Folder, error) {
 	// Iterate all pending nodes at level 0
 	var folders []types.Folder
 
-	err := boltDB.IterateStatusBucket(queueType, 0, db.StatusPending, db.IteratorOptions{}, func(pathHash []byte) error {
-		// Get the node state from nodes bucket
-		state, err := db.GetNodeState(boltDB, queueType, pathHash)
+	err := boltDB.IterateStatusBucket(queueType, 0, db.StatusPending, db.IteratorOptions{}, func(nodeIDBytes []byte) error {
+		// Get the node state from nodes bucket (convert ULID bytes to string)
+		state, err := db.GetNodeState(boltDB, queueType, string(nodeIDBytes))
 		if err != nil || state == nil {
 			return nil // Skip if not found
 		}
@@ -32,7 +32,7 @@ func LoadRootFolders(boltDB *db.DB, queueType string) ([]types.Folder, error) {
 		// Filter for folders only
 		if state.Type == types.NodeTypeFolder {
 			folder := types.Folder{
-				Id:           state.ID,
+				ServiceID:    state.ServiceID,
 				ParentId:     state.ParentID,
 				ParentPath:   types.NormalizeParentPath(state.ParentPath),
 				DisplayName:  state.Name,
@@ -65,9 +65,9 @@ func LoadPendingFolders(boltDB *db.DB, queueType string) ([]types.Folder, error)
 
 	// Iterate each level's pending bucket
 	for _, level := range levels {
-		err := boltDB.IterateStatusBucket(queueType, level, db.StatusPending, db.IteratorOptions{}, func(pathHash []byte) error {
-			// Get the node state from nodes bucket
-			state, err := db.GetNodeState(boltDB, queueType, pathHash)
+		err := boltDB.IterateStatusBucket(queueType, level, db.StatusPending, db.IteratorOptions{}, func(nodeIDBytes []byte) error {
+			// Get the node state from nodes bucket (convert ULID bytes to string)
+			state, err := db.GetNodeState(boltDB, queueType, string(nodeIDBytes))
 			if err != nil || state == nil {
 				return nil // Skip if not found
 			}
@@ -75,7 +75,7 @@ func LoadPendingFolders(boltDB *db.DB, queueType string) ([]types.Folder, error)
 			// Filter for folders only
 			if state.Type == types.NodeTypeFolder {
 				folder := types.Folder{
-					Id:           state.ID,
+					ServiceID:    state.ServiceID,
 					ParentId:     state.ParentID,
 					ParentPath:   types.NormalizeParentPath(state.ParentPath),
 					DisplayName:  state.Name,
@@ -119,7 +119,7 @@ func LoadExpectedChildren(boltDB *db.DB, parentPath string, dstLevel int) ([]typ
 		switch state.Type {
 		case types.NodeTypeFolder:
 			folders = append(folders, types.Folder{
-				Id:           state.ID,
+				ServiceID:    state.ServiceID,
 				ParentId:     state.ParentID,
 				ParentPath:   types.NormalizeParentPath(state.ParentPath),
 				DisplayName:  state.Name,
@@ -130,7 +130,7 @@ func LoadExpectedChildren(boltDB *db.DB, parentPath string, dstLevel int) ([]typ
 			})
 		case types.NodeTypeFile:
 			files = append(files, types.File{
-				Id:           state.ID,
+				ServiceID:    state.ServiceID,
 				ParentId:     state.ParentID,
 				ParentPath:   types.NormalizeParentPath(state.ParentPath),
 				DisplayName:  state.Name,
@@ -146,74 +146,99 @@ func LoadExpectedChildren(boltDB *db.DB, parentPath string, dstLevel int) ([]typ
 	return folders, files, nil
 }
 
-// BatchLoadExpectedChildren loads expected children for multiple parent paths in a single DB transaction.
-// Returns a map of normalized parent path -> (folders, files).
-// This is more efficient than calling LoadExpectedChildren() multiple times as it batches all DB operations.
-func BatchLoadExpectedChildren(boltDB *db.DB, parentPaths []string) (map[string][]types.Folder, map[string][]types.File, error) {
+// BatchLoadExpectedChildrenByDSTIDs loads expected children for DST parent nodes using join-lookup.
+// Takes DST parent ULIDs, queries join-lookup to get corresponding SRC parent ULIDs,
+// then loads SRC children and maps them back to DST parents.
+// Returns maps keyed by DST ULID -> (folders, files).
+func BatchLoadExpectedChildrenByDSTIDs(boltDB *db.DB, dstParentIDs []string, dstIDToPath map[string]string) (map[string][]types.Folder, map[string][]types.File, error) {
 	if boltDB == nil {
 		return nil, nil, fmt.Errorf("boltDB cannot be nil")
 	}
 
-	if len(parentPaths) == 0 {
+	if len(dstParentIDs) == 0 {
 		return make(map[string][]types.Folder), make(map[string][]types.File), nil
 	}
 
-	// Normalize all parent paths and build lookup maps
-	normalizedPaths := make([]string, 0, len(parentPaths))
-	normalizedToOriginal := make(map[string]string)
-	for _, path := range parentPaths {
-		normalized := types.NormalizeLocationPath(path)
-		normalizedPaths = append(normalizedPaths, normalized)
-		normalizedToOriginal[normalized] = path
-	}
-
-	// Initialize result maps (using original paths as keys for caller convenience)
+	// Initialize result maps (keyed by DST ULID)
 	resultFolders := make(map[string][]types.Folder)
 	resultFiles := make(map[string][]types.File)
 
 	// Single transaction to load all children
 	err := boltDB.View(func(tx *bolt.Tx) error {
-		childrenBucket := db.GetChildrenBucket(tx, "SRC")
-		if childrenBucket == nil {
+		// Step 1: Query join-lookup table to get SRC parent ULIDs for each DST parent ULID
+		joinLookupBucket := db.GetJoinLookupBucket(tx)
+		if joinLookupBucket == nil {
+			// No join-lookup entries yet - return empty results for all DST parents
+			for _, dstID := range dstParentIDs {
+				resultFolders[dstID] = []types.Folder{}
+				resultFiles[dstID] = []types.File{}
+			}
+			return nil
+		}
+
+		srcChildrenBucket := db.GetChildrenBucket(tx, "SRC")
+		if srcChildrenBucket == nil {
 			return fmt.Errorf("children bucket not found for SRC")
 		}
 
-		nodesBucket := db.GetNodesBucket(tx, "SRC")
-		if nodesBucket == nil {
+		srcNodesBucket := db.GetNodesBucket(tx, "SRC")
+		if srcNodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found for SRC")
 		}
 
-		// Map to collect all unique child hashes and their parent associations
-		// childHash -> []normalizedParentPaths (a child might be referenced by multiple parents in edge cases)
-		childHashToParents := make(map[string][]string)
+		// Map: DST ULID -> SRC parent ULID
+		dstToSrcParent := make(map[string]string)
+		// Map: SRC parent ULID -> []DST ULIDs (multiple DST parents might map to same SRC parent)
+		srcParentToDSTs := make(map[string][]string)
 
-		// Step 1: Get children hashes for all parents
-		for _, normalizedParent := range normalizedPaths {
-			parentHash := []byte(db.HashPath(normalizedParent))
-			childrenData := childrenBucket.Get(parentHash)
-			if childrenData == nil {
-				// No children for this parent - initialize empty slices
-				originalPath := normalizedToOriginal[normalizedParent]
-				resultFolders[originalPath] = []types.Folder{}
-				resultFiles[originalPath] = []types.File{}
+		for _, dstID := range dstParentIDs {
+			srcParentIDBytes := joinLookupBucket.Get([]byte(dstID))
+			if srcParentIDBytes == nil {
+				// No corresponding SRC parent found - initialize empty slices
+				resultFolders[dstID] = []types.Folder{}
+				resultFiles[dstID] = []types.File{}
 				continue
 			}
 
-			var childHashes []string
-			if err := json.Unmarshal(childrenData, &childHashes); err != nil {
-				return fmt.Errorf("failed to unmarshal children list for %s: %w", normalizedParent, err)
+			srcParentID := string(srcParentIDBytes)
+			dstToSrcParent[dstID] = srcParentID
+			srcParentToDSTs[srcParentID] = append(srcParentToDSTs[srcParentID], dstID)
+		}
+
+		// Step 2: Get all SRC child ULIDs for all SRC parents
+		// Map: SRC child ULID -> []DST parent ULIDs (a child might be shared by multiple DST parents)
+		srcChildIDToDSTParents := make(map[string][]string)
+		allSrcChildIDs := make(map[string]bool) // Set of all unique SRC child ULIDs
+
+		for srcParentID, dstIDs := range srcParentToDSTs {
+			childrenData := srcChildrenBucket.Get([]byte(srcParentID))
+			if childrenData == nil {
+				// No children for this SRC parent - initialize empty slices for all corresponding DST parents
+				for _, dstID := range dstIDs {
+					if _, exists := resultFolders[dstID]; !exists {
+						resultFolders[dstID] = []types.Folder{}
+						resultFiles[dstID] = []types.File{}
+					}
+				}
+				continue
 			}
 
-			// Associate each child hash with this parent
-			for _, childHash := range childHashes {
-				childHashToParents[childHash] = append(childHashToParents[childHash], normalizedParent)
+			var childIDs []string
+			if err := json.Unmarshal(childrenData, &childIDs); err != nil {
+				return fmt.Errorf("failed to unmarshal children list for SRC parent %s: %w", srcParentID, err)
+			}
+
+			// Associate each SRC child with all corresponding DST parents
+			for _, childID := range childIDs {
+				allSrcChildIDs[childID] = true
+				srcChildIDToDSTParents[childID] = append(srcChildIDToDSTParents[childID], dstIDs...)
 			}
 		}
 
-		// Step 2: Fetch all unique child NodeStates in one pass
+		// Step 3: Fetch all unique SRC child NodeStates in one pass
 		childStates := make(map[string]*db.NodeState)
-		for childHash := range childHashToParents {
-			nodeData := nodesBucket.Get([]byte(childHash))
+		for childID := range allSrcChildIDs {
+			nodeData := srcNodesBucket.Get([]byte(childID))
 			if nodeData == nil {
 				continue // Child may have been deleted
 			}
@@ -223,57 +248,65 @@ func BatchLoadExpectedChildren(boltDB *db.DB, parentPaths []string) (map[string]
 				// Log but continue - don't fail entire batch for one bad node
 				continue
 			}
-			childStates[childHash] = ns
+			childStates[childID] = ns
 		}
 
-		// Step 3: Group children by parent and convert to Folder/File types
-		for _, normalizedParent := range normalizedPaths {
-			originalPath := normalizedToOriginal[normalizedParent]
-			var folders []types.Folder
-			var files []types.File
+		// Step 4: Group children by DST parent and convert to Folder/File types
+		for childID, dstParentIDs := range srcChildIDToDSTParents {
+			state, exists := childStates[childID]
+			if !exists {
+				continue // Child was deleted or deserialization failed
+			}
 
-			parentHash := []byte(db.HashPath(normalizedParent))
-			childrenData := childrenBucket.Get(parentHash)
-			if childrenData != nil {
-				var childHashes []string
-				if err := json.Unmarshal(childrenData, &childHashes); err == nil {
-					for _, childHash := range childHashes {
-						state, exists := childStates[childHash]
-						if !exists {
-							continue // Child was deleted or deserialization failed
-						}
+			// Convert NodeState to Folder or File
+			var folder *types.Folder
+			var file *types.File
 
-						switch state.Type {
-						case types.NodeTypeFolder:
-							folders = append(folders, types.Folder{
-								Id:           state.ID,
-								ParentId:     state.ParentID,
-								ParentPath:   types.NormalizeParentPath(state.ParentPath),
-								DisplayName:  state.Name,
-								LocationPath: types.NormalizeLocationPath(state.Path),
-								LastUpdated:  state.MTime,
-								DepthLevel:   state.Depth,
-								Type:         state.Type,
-							})
-						case types.NodeTypeFile:
-							files = append(files, types.File{
-								Id:           state.ID,
-								ParentId:     state.ParentID,
-								ParentPath:   types.NormalizeParentPath(state.ParentPath),
-								DisplayName:  state.Name,
-								LocationPath: types.NormalizeLocationPath(state.Path),
-								LastUpdated:  state.MTime,
-								DepthLevel:   state.Depth,
-								Size:         state.Size,
-								Type:         state.Type,
-							})
-						}
-					}
+			switch state.Type {
+			case types.NodeTypeFolder:
+				folder = &types.Folder{
+					ServiceID:    state.ServiceID,
+					ParentId:     state.ParentServiceID, // Use ParentServiceID for FS interactions
+					ParentPath:   types.NormalizeParentPath(state.ParentPath),
+					DisplayName:  state.Name,
+					LocationPath: types.NormalizeLocationPath(state.Path),
+					LastUpdated:  state.MTime,
+					DepthLevel:   state.Depth,
+					Type:         state.Type,
+				}
+			case types.NodeTypeFile:
+				file = &types.File{
+					ServiceID:    state.ServiceID,
+					ParentId:     state.ParentServiceID, // Use ParentServiceID for FS interactions
+					ParentPath:   types.NormalizeParentPath(state.ParentPath),
+					DisplayName:  state.Name,
+					LocationPath: types.NormalizeLocationPath(state.Path),
+					LastUpdated:  state.MTime,
+					DepthLevel:   state.Depth,
+					Size:         state.Size,
+					Type:         state.Type,
 				}
 			}
 
-			resultFolders[originalPath] = folders
-			resultFiles[originalPath] = files
+			// Add this child to all corresponding DST parents
+			for _, dstID := range dstParentIDs {
+				if folder != nil {
+					resultFolders[dstID] = append(resultFolders[dstID], *folder)
+				}
+				if file != nil {
+					resultFiles[dstID] = append(resultFiles[dstID], *file)
+				}
+			}
+		}
+
+		// Ensure all DST parents have entries (even if empty)
+		for _, dstID := range dstParentIDs {
+			if _, exists := resultFolders[dstID]; !exists {
+				resultFolders[dstID] = []types.Folder{}
+			}
+			if _, exists := resultFiles[dstID]; !exists {
+				resultFiles[dstID] = []types.File{}
+			}
 		}
 
 		return nil

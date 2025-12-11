@@ -355,8 +355,8 @@ func PickRandomExcludedTopLevelChild(boltDB *db.DB, queueType string, rootPath s
 	}
 
 	// Pick random excluded folder
-	rand.Seed(time.Now().UnixNano())
-	selected := excludedFolders[rand.Intn(len(excludedFolders))]
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	selected := excludedFolders[r.Intn(len(excludedFolders))]
 
 	return selected, nil
 }
@@ -501,8 +501,8 @@ func PickRandomTopLevelChild(boltDB *db.DB, queueType string, rootPath string) (
 	}
 
 	// Pick random folder
-	rand.Seed(time.Now().UnixNano())
-	selected := folders[rand.Intn(len(folders))]
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	selected := folders[r.Intn(len(folders))]
 
 	return selected, nil
 }

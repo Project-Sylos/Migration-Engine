@@ -104,25 +104,25 @@ func (q *Queue) PullExclusionTasks(force bool) {
 
 	// Pop entries from holding buckets as we pull them
 	type entryToRemove struct {
-		pathHash string
-		mode     string
+		nodeID string
+		mode   string
 	}
-	pathHashesToRemove := make([]entryToRemove, 0, len(entries))
+	nodeIDsToRemove := make([]entryToRemove, 0, len(entries))
 
 	for _, entry := range entries {
-		// Skip path hashes we've already leased
-		if q.isLeased(entry.PathHash) {
+		// Skip ULIDs we've already leased
+		if q.isLeased(entry.NodeID) {
 			continue
 		}
 
 		// Mark as leased
-		q.addLeasedKey(entry.PathHash)
+		q.addLeasedKey(entry.NodeID)
 
 		// Get node state to determine exclusion mode
-		nodeState, err := db.GetNodeState(boltDB, queueType, []byte(entry.PathHash))
+		nodeState, err := db.GetNodeState(boltDB, queueType, entry.NodeID)
 		if err != nil || nodeState == nil {
 			if logservice.LS != nil {
-				_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to get node state for exclusion task %s: %v", entry.PathHash, err), "queue", q.name, q.name)
+				_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to get node state for exclusion task %s: %v", entry.NodeID, err), "queue", q.name, q.name)
 			}
 			continue
 		}
@@ -148,7 +148,7 @@ func (q *Queue) PullExclusionTasks(force bool) {
 
 		if nodeState.Type == "folder" {
 			task.Folder = types.Folder{
-				Id:           nodeState.ID,
+				ServiceID:    nodeState.ServiceID,
 				ParentId:     nodeState.ParentID,
 				ParentPath:   types.NormalizeParentPath(nodeState.ParentPath),
 				DisplayName:  nodeState.Name,
@@ -159,7 +159,7 @@ func (q *Queue) PullExclusionTasks(force bool) {
 			}
 		} else {
 			task.File = types.File{
-				Id:           nodeState.ID,
+				ServiceID:    nodeState.ServiceID,
 				ParentId:     nodeState.ParentID,
 				ParentPath:   types.NormalizeParentPath(nodeState.ParentPath),
 				DisplayName:  nodeState.Name,
@@ -174,23 +174,23 @@ func (q *Queue) PullExclusionTasks(force bool) {
 		// Enqueue task and track if it was added
 		_, _, wasAdded := q.getPendingCountAndEnqueue(task)
 		if wasAdded {
-			// Track path hashes to remove from appropriate holding bucket (with mode)
-			pathHashesToRemove = append(pathHashesToRemove, entryToRemove{
-				pathHash: entry.PathHash,
-				mode:     exclusionMode,
+			// Track ULIDs to remove from appropriate holding bucket (with mode)
+			nodeIDsToRemove = append(nodeIDsToRemove, entryToRemove{
+				nodeID: entry.NodeID,
+				mode:   exclusionMode,
 			})
 		}
 	}
 
 	// Pop entries from appropriate holding buckets (outside lock)
-	if len(pathHashesToRemove) > 0 {
+	if len(nodeIDsToRemove) > 0 {
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug", fmt.Sprintf("Removing %d entries from holding buckets (Round %d)", len(pathHashesToRemove), snapshot.Round), "queue", q.name, q.name)
+			_ = logservice.LS.Log("debug", fmt.Sprintf("Removing %d entries from holding buckets (Round %d)", len(nodeIDsToRemove), snapshot.Round), "queue", q.name, q.name)
 		}
-		for _, entryToRemove := range pathHashesToRemove {
-			if err := db.RemoveHoldingEntry(boltDB, queueType, entryToRemove.pathHash, entryToRemove.mode); err != nil {
+		for _, entryToRemove := range nodeIDsToRemove {
+			if err := db.RemoveHoldingEntry(boltDB, queueType, entryToRemove.nodeID, entryToRemove.mode); err != nil {
 				if logservice.LS != nil {
-					_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to remove holding entry %s from %s bucket: %v", entryToRemove.pathHash, entryToRemove.mode, err), "queue", q.name, q.name)
+					_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to remove holding entry %s from %s bucket: %v", entryToRemove.nodeID, entryToRemove.mode, err), "queue", q.name, q.name)
 				}
 			}
 		}

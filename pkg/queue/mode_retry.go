@@ -71,7 +71,7 @@ func (q *Queue) PullRetryTasks(force bool) {
 		}
 
 		for _, item := range batch {
-			// Skip path hashes we've already leased
+			// Skip ULIDs we've already leased
 			if q.isLeased(item.Key) {
 				continue
 			}

@@ -43,9 +43,9 @@ func EnsureExclusionHoldingBuckets(db *DB) error {
 
 // ExclusionEntry represents an entry in the exclusion-holding or unexclusion-holding bucket.
 type ExclusionEntry struct {
-	PathHash string // Path hash (key)
-	Depth    int    // Depth level (value)
-	Mode     string // "exclude" or "unexclude" - indicates which bucket this came from
+	NodeID string // ULID of the node (key)
+	Depth  int    // Depth level (value)
+	Mode   string // "exclude" or "unexclude" - indicates which bucket this came from
 }
 
 // ScanExclusionHoldingBucketByLevel scans both exclusion-holding and unexclusion-holding buckets and returns entries matching the specified level.
@@ -78,9 +78,9 @@ func ScanExclusionHoldingBucketByLevel(db *DB, queueType string, currentLevel in
 				if depth == currentLevel {
 					if entriesCollected < limit {
 						entries = append(entries, ExclusionEntry{
-							PathHash: string(k),
-							Depth:    depth,
-							Mode:     mode,
+							NodeID: string(k), // k is the ULID
+							Depth:  depth,
+							Mode:   mode,
 						})
 						entriesCollected++
 					}
@@ -99,8 +99,8 @@ func ScanExclusionHoldingBucketByLevel(db *DB, queueType string, currentLevel in
 	return entries, hasHigherLevels, err
 }
 
-// AddHoldingEntry adds a path hash to the appropriate holding bucket (exclusion or unexclusion) with its depth level.
-func AddHoldingEntry(db *DB, queueType string, pathHash string, depth int, mode string) error {
+// AddHoldingEntry adds a ULID to the appropriate holding bucket (exclusion or unexclusion) with its depth level.
+func AddHoldingEntry(db *DB, queueType string, nodeID string, depth int, mode string) error {
 	return db.Update(func(tx *bolt.Tx) error {
 		holdingBucket, err := GetOrCreateHoldingBucket(tx, queueType, mode)
 		if err != nil {
@@ -111,44 +111,44 @@ func AddHoldingEntry(db *DB, queueType string, pathHash string, depth int, mode 
 		depthBytes := make([]byte, 8)
 		binary.BigEndian.PutUint64(depthBytes, uint64(depth))
 
-		return holdingBucket.Put([]byte(pathHash), depthBytes)
+		return holdingBucket.Put([]byte(nodeID), depthBytes)
 	})
 }
 
-// AddExclusionHoldingEntry adds a path hash to the exclusion-holding bucket with its depth level.
+// AddExclusionHoldingEntry adds a ULID to the exclusion-holding bucket with its depth level.
 // Deprecated: Use AddHoldingEntry with mode "exclude" instead.
-func AddExclusionHoldingEntry(db *DB, queueType string, pathHash string, depth int) error {
-	return AddHoldingEntry(db, queueType, pathHash, depth, "exclude")
+func AddExclusionHoldingEntry(db *DB, queueType string, nodeID string, depth int) error {
+	return AddHoldingEntry(db, queueType, nodeID, depth, "exclude")
 }
 
-// RemoveHoldingEntry removes a path hash from the appropriate holding bucket (exclusion or unexclusion).
-func RemoveHoldingEntry(db *DB, queueType string, pathHash string, mode string) error {
+// RemoveHoldingEntry removes a ULID from the appropriate holding bucket (exclusion or unexclusion).
+func RemoveHoldingEntry(db *DB, queueType string, nodeID string, mode string) error {
 	return db.Update(func(tx *bolt.Tx) error {
 		holdingBucket := GetHoldingBucket(tx, queueType, mode)
 		if holdingBucket == nil {
 			return nil // Bucket doesn't exist, nothing to remove
 		}
 
-		return holdingBucket.Delete([]byte(pathHash))
+		return holdingBucket.Delete([]byte(nodeID))
 	})
 }
 
-// RemoveExclusionHoldingEntry removes a path hash from the exclusion-holding bucket.
+// RemoveExclusionHoldingEntry removes a ULID from the exclusion-holding bucket.
 // Deprecated: Use RemoveHoldingEntry with mode "exclude" instead.
-func RemoveExclusionHoldingEntry(db *DB, queueType string, pathHash string) error {
-	return RemoveHoldingEntry(db, queueType, pathHash, "exclude")
+func RemoveExclusionHoldingEntry(db *DB, queueType string, nodeID string) error {
+	return RemoveHoldingEntry(db, queueType, nodeID, "exclude")
 }
 
-// CheckHoldingEntry checks if a path hash exists in either holding bucket (O(1) lookup).
+// CheckHoldingEntry checks if a ULID exists in either holding bucket (O(1) lookup).
 // Returns (exists, mode) where mode is "exclude", "unexclude", or "" if not found.
-func CheckHoldingEntry(db *DB, queueType string, pathHash string) (bool, string, error) {
+func CheckHoldingEntry(db *DB, queueType string, nodeID string) (bool, string, error) {
 	var exists bool
 	var mode string
 
 	err := db.View(func(tx *bolt.Tx) error {
 		// Check exclusion bucket first
 		exclusionBucket := GetExclusionHoldingBucket(tx, queueType)
-		if exclusionBucket != nil && exclusionBucket.Get([]byte(pathHash)) != nil {
+		if exclusionBucket != nil && exclusionBucket.Get([]byte(nodeID)) != nil {
 			exists = true
 			mode = "exclude"
 			return nil
@@ -156,7 +156,7 @@ func CheckHoldingEntry(db *DB, queueType string, pathHash string) (bool, string,
 
 		// Check unexclusion bucket
 		unexclusionBucket := GetUnexclusionHoldingBucket(tx, queueType)
-		if unexclusionBucket != nil && unexclusionBucket.Get([]byte(pathHash)) != nil {
+		if unexclusionBucket != nil && unexclusionBucket.Get([]byte(nodeID)) != nil {
 			exists = true
 			mode = "unexclude"
 			return nil
@@ -168,10 +168,10 @@ func CheckHoldingEntry(db *DB, queueType string, pathHash string) (bool, string,
 	return exists, mode, err
 }
 
-// CheckExclusionHoldingEntry checks if a path hash exists in the exclusion-holding bucket (O(1) lookup).
+// CheckExclusionHoldingEntry checks if a ULID exists in the exclusion-holding bucket (O(1) lookup).
 // Deprecated: Use CheckHoldingEntry instead.
-func CheckExclusionHoldingEntry(db *DB, queueType string, pathHash string) (bool, error) {
-	exists, mode, err := CheckHoldingEntry(db, queueType, pathHash)
+func CheckExclusionHoldingEntry(db *DB, queueType string, nodeID string) (bool, error) {
+	exists, mode, err := CheckHoldingEntry(db, queueType, nodeID)
 	return exists && mode == "exclude", err
 }
 

@@ -117,31 +117,37 @@ func (w *ExclusionWorker) execute(task *TaskBase) error {
 	}
 
 	path := task.LocationPath()
-	pathHash := db.HashPath(path)
 	queueType := getQueueType(w.queueName)
+
+	// Get node's ULID by path
+	nodeState, err := db.GetNodeStateByPath(w.boltDB, queueType, path)
+	if err != nil || nodeState == nil {
+		return fmt.Errorf("node not found for path %s: %w", path, err)
+	}
+	nodeID := nodeState.ID
 
 	// Get queue's output buffer for write operations
 	w.queue.mu.RLock()
 	outputBuffer := w.queue.outputBuffer
 	w.queue.mu.RUnlock()
 
-	// Read children hash keys from children bucket (DB lookup)
-	childHashes, err := w.getChildrenHashes(queueType, pathHash)
+	// Read children ULIDs from children bucket (DB lookup)
+	childIDs, err := w.getChildrenIDs(queueType, nodeID)
 	if err != nil {
-		return fmt.Errorf("failed to get children hashes for %s: %w", path, err)
+		return fmt.Errorf("failed to get children IDs for %s: %w", path, err)
 	}
 
 	// Process based on exclusion mode
 	if task.ExclusionMode == "exclude" {
-		return w.executeExclude(task, childHashes, queueType, outputBuffer)
+		return w.executeExclude(task, childIDs, queueType, outputBuffer)
 	} else {
-		return w.executeUnexclude(task, pathHash, childHashes, queueType, outputBuffer)
+		return w.executeUnexclude(task, nodeID, childIDs, queueType, outputBuffer)
 	}
 }
 
-// getChildrenHashes reads child hash keys from the children bucket for a given parent path hash.
-func (w *ExclusionWorker) getChildrenHashes(queueType string, parentPathHash string) ([]string, error) {
-	var childHashes []string
+// getChildrenIDs reads child ULIDs from the children bucket for a given parent ULID.
+func (w *ExclusionWorker) getChildrenIDs(queueType string, parentID string) ([]string, error) {
+	var childIDs []string
 
 	err := w.boltDB.View(func(tx *bolt.Tx) error {
 		childrenBucket := db.GetChildrenBucket(tx, queueType)
@@ -149,14 +155,14 @@ func (w *ExclusionWorker) getChildrenHashes(queueType string, parentPathHash str
 			return nil // No children bucket, no children
 		}
 
-		parentHashBytes := []byte(parentPathHash)
-		childrenData := childrenBucket.Get(parentHashBytes)
+		parentIDBytes := []byte(parentID)
+		childrenData := childrenBucket.Get(parentIDBytes)
 		if childrenData == nil {
 			return nil // No children for this parent
 		}
 
-		// Unmarshal the list of child hash keys
-		if err := json.Unmarshal(childrenData, &childHashes); err != nil {
+		// Unmarshal the list of child ULIDs
+		if err := json.Unmarshal(childrenData, &childIDs); err != nil {
 			return fmt.Errorf("failed to unmarshal children list: %w", err)
 		}
 
@@ -168,18 +174,18 @@ func (w *ExclusionWorker) getChildrenHashes(queueType string, parentPathHash str
 	}
 
 	// Return empty slice if no children found (not nil)
-	if childHashes == nil {
+	if childIDs == nil {
 		return []string{}, nil
 	}
 
-	return childHashes, nil
+	return childIDs, nil
 }
 
 // executeExclude handles exclusion propagation.
 // Marks the parent node as inherited excluded (if not already explicitly excluded),
 // then adds all children (files and folders) to the exclusion-holding bucket.
 // Note: This function should only be called for folders. Files are handled by executeFileExclusion.
-func (w *ExclusionWorker) executeExclude(task *TaskBase, childHashes []string, queueType string, outputBuffer *db.OutputBuffer) error {
+func (w *ExclusionWorker) executeExclude(task *TaskBase, childIDs []string, queueType string, outputBuffer *db.OutputBuffer) error {
 	// Safety check: files don't have children, so don't process them here
 	if !task.IsFolder() {
 		// Files should be handled by executeFileExclusion, not here
@@ -197,29 +203,11 @@ func (w *ExclusionWorker) executeExclude(task *TaskBase, childHashes []string, q
 	// Check if parent is already explicitly excluded - if so, skip marking
 	var parentExplicitlyExcluded bool
 	path := task.LocationPath()
-	pathHash := db.HashPath(path)
-	err := w.boltDB.View(func(tx *bolt.Tx) error {
-		nodesBucket := db.GetNodesBucket(tx, queueType)
-		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found")
-		}
-
-		nodeData := nodesBucket.Get([]byte(pathHash))
-		if nodeData == nil {
-			return fmt.Errorf("node not found: %s", path)
-		}
-
-		nodeState, err := db.DeserializeNodeState(nodeData)
-		if err != nil {
-			return err
-		}
-
-		parentExplicitlyExcluded = nodeState.ExplicitExcluded
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("failed to check parent exclusion state: %w", err)
+	nodeState, err := db.GetNodeStateByPath(w.boltDB, queueType, path)
+	if err != nil || nodeState == nil {
+		return fmt.Errorf("node not found for path %s: %w", path, err)
 	}
+	parentExplicitlyExcluded = nodeState.ExplicitExcluded
 
 	// Only mark as inherited excluded if not already explicitly excluded
 	if !parentExplicitlyExcluded && outputBuffer != nil {
@@ -235,8 +223,8 @@ func (w *ExclusionWorker) executeExclude(task *TaskBase, childHashes []string, q
 			return fmt.Errorf("nodes bucket not found")
 		}
 
-		for _, childHash := range childHashes {
-			nodeData := nodesBucket.Get([]byte(childHash))
+		for _, childID := range childIDs {
+			nodeData := nodesBucket.Get([]byte(childID))
 			if nodeData == nil {
 				continue // Child may have been deleted
 			}
@@ -248,8 +236,8 @@ func (w *ExclusionWorker) executeExclude(task *TaskBase, childHashes []string, q
 
 			// Add ALL children (both files and folders) to the exclusion-holding bucket
 			childEntries = append(childEntries, db.ExclusionEntry{
-				PathHash: childHash,
-				Depth:    childState.Depth,
+				NodeID: childID,
+				Depth:  childState.Depth,
 			})
 		}
 
@@ -271,11 +259,11 @@ func (w *ExclusionWorker) executeExclude(task *TaskBase, childHashes []string, q
 				return err
 			}
 
-			// Write each child hash with its depth as value
+			// Write each child ULID with its depth as value
 			for _, entry := range childEntries {
 				depthBytes := make([]byte, 8)
 				binary.BigEndian.PutUint64(depthBytes, uint64(entry.Depth))
-				if err := holdingBucket.Put([]byte(entry.PathHash), depthBytes); err != nil {
+				if err := holdingBucket.Put([]byte(entry.NodeID), depthBytes); err != nil {
 					return fmt.Errorf("failed to write child to %s-holding: %w", mode, err)
 				}
 			}
@@ -295,7 +283,7 @@ func (w *ExclusionWorker) executeExclude(task *TaskBase, childHashes []string, q
 
 // executeUnexclude handles unexclusion propagation.
 // Note: This function should only be called for folders. Files are handled by executeFileExclusion.
-func (w *ExclusionWorker) executeUnexclude(task *TaskBase, pathHash string, childHashes []string, queueType string, outputBuffer *db.OutputBuffer) error {
+func (w *ExclusionWorker) executeUnexclude(task *TaskBase, nodeID string, childIDs []string, queueType string, outputBuffer *db.OutputBuffer) error {
 	// Safety check: files don't have children, so don't process them here
 	if !task.IsFolder() {
 		// Files should be handled by executeFileExclusion, not here
@@ -303,29 +291,11 @@ func (w *ExclusionWorker) executeUnexclude(task *TaskBase, pathHash string, chil
 		// This shouldn't happen, but if it does, check if it should be unexcluded
 
 		// Get parent path to check for excluded ancestor
-		var parentPath string
-		err := w.boltDB.View(func(tx *bolt.Tx) error {
-			nodesBucket := db.GetNodesBucket(tx, queueType)
-			if nodesBucket == nil {
-				return fmt.Errorf("nodes bucket not found")
-			}
-
-			nodeData := nodesBucket.Get([]byte(pathHash))
-			if nodeData == nil {
-				return fmt.Errorf("node not found: %s", pathHash)
-			}
-
-			nodeState, err := db.DeserializeNodeState(nodeData)
-			if err != nil {
-				return fmt.Errorf("failed to deserialize node state: %w", err)
-			}
-
-			parentPath = nodeState.ParentPath
-			return nil
-		})
-		if err != nil {
-			return fmt.Errorf("failed to get node state: %w", err)
+		nodeState, err := db.GetNodeState(w.boltDB, queueType, nodeID)
+		if err != nil || nodeState == nil {
+			return fmt.Errorf("node not found: %s", nodeID)
 		}
+		parentPath := nodeState.ParentPath
 
 		hasExcludedAncestor, err := w.checkExcludedAncestor(parentPath, queueType)
 		if err != nil {
@@ -342,29 +312,11 @@ func (w *ExclusionWorker) executeUnexclude(task *TaskBase, pathHash string, chil
 	}
 	// Step 1: Check if parent node still has an excluded ancestor
 	path := task.LocationPath()
-	var parentPath string
-	err := w.boltDB.View(func(tx *bolt.Tx) error {
-		nodesBucket := db.GetNodesBucket(tx, queueType)
-		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found")
-		}
-
-		nodeData := nodesBucket.Get([]byte(pathHash))
-		if nodeData == nil {
-			return fmt.Errorf("node not found: %s", pathHash)
-		}
-
-		nodeState, err := db.DeserializeNodeState(nodeData)
-		if err != nil {
-			return fmt.Errorf("failed to deserialize node state: %w", err)
-		}
-
-		parentPath = nodeState.ParentPath
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("failed to get node state: %w", err)
+	nodeState, err := db.GetNodeState(w.boltDB, queueType, nodeID)
+	if err != nil || nodeState == nil {
+		return fmt.Errorf("node not found: %s", nodeID)
 	}
+	parentPath := nodeState.ParentPath
 
 	// Check if node still has an excluded ancestor
 	hasExcludedAncestor, err := w.checkExcludedAncestor(parentPath, queueType)
@@ -392,8 +344,8 @@ func (w *ExclusionWorker) executeUnexclude(task *TaskBase, pathHash string, chil
 			return fmt.Errorf("nodes bucket not found")
 		}
 
-		for _, childHash := range childHashes {
-			nodeData := nodesBucket.Get([]byte(childHash))
+		for _, childID := range childIDs {
+			nodeData := nodesBucket.Get([]byte(childID))
 			if nodeData == nil {
 				continue // Child may have been deleted
 			}
@@ -405,8 +357,8 @@ func (w *ExclusionWorker) executeUnexclude(task *TaskBase, pathHash string, chil
 
 			// Add ALL children (both files and folders) to the unexclusion-holding bucket
 			childEntries = append(childEntries, db.ExclusionEntry{
-				PathHash: childHash,
-				Depth:    childState.Depth,
+				NodeID: childID,
+				Depth:  childState.Depth,
 			})
 		}
 
@@ -431,7 +383,7 @@ func (w *ExclusionWorker) executeUnexclude(task *TaskBase, pathHash string, chil
 			for _, entry := range childEntries {
 				depthBytes := make([]byte, 8)
 				binary.BigEndian.PutUint64(depthBytes, uint64(entry.Depth))
-				if err := holdingBucket.Put([]byte(entry.PathHash), depthBytes); err != nil {
+				if err := holdingBucket.Put([]byte(entry.NodeID), depthBytes); err != nil {
 					return fmt.Errorf("failed to write child to %s-holding: %w", mode, err)
 				}
 			}
@@ -513,20 +465,20 @@ func (w *ExclusionWorker) checkExcludedAncestor(startPath string, queueType stri
 
 	currentPath := startPath
 	for {
-		pathHash := db.HashPath(currentPath)
-		exists, mode, err := db.CheckHoldingEntry(w.boltDB, queueType, pathHash)
+		// Get node's ULID by path
+		nodeState, err := db.GetNodeStateByPath(w.boltDB, queueType, currentPath)
+		if err != nil || nodeState == nil {
+			break // Can't continue up chain
+		}
+
+		// Check if this node is in the exclusion-holding bucket
+		exists, mode, err := db.CheckHoldingEntry(w.boltDB, queueType, nodeState.ID)
 		if err != nil {
 			return false, err
 		}
 		// If found in exclusion bucket, ancestor is excluded
 		if exists && mode == "exclude" {
 			return true, nil // Found excluded ancestor
-		}
-
-		// Get parent path
-		nodeState, err := db.GetNodeState(w.boltDB, queueType, []byte(pathHash))
-		if err != nil || nodeState == nil {
-			break // Can't continue up chain
 		}
 
 		if nodeState.ParentPath == "" || nodeState.ParentPath == currentPath {

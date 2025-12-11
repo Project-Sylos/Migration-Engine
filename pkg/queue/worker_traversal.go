@@ -151,12 +151,12 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 	folder := task.Folder
 
 	// List children using the filesystem adapter
-	result, err := w.fsAdapter.ListChildren(folder.Id)
+	result, err := w.fsAdapter.ListChildren(folder.ServiceID)
 	if err != nil {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("error",
 				fmt.Sprintf("Failed to list children: path=%s folderId=%s error=%v",
-					folder.LocationPath, folder.Id, err),
+					folder.LocationPath, folder.ServiceID, err),
 				"worker", w.id, w.queueName)
 		}
 		return fmt.Errorf("failed to list children of %s: %w", folder.LocationPath, err)

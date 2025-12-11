@@ -55,6 +55,7 @@ const (
 	SubBucketStatusLookup       = "status-lookup"
 	SubBucketExclusionHolding   = "exclusion-holding"
 	SubBucketUnexclusionHolding = "unexclusion-holding"
+	SubBucketJoinLookup         = "join-lookup"
 )
 
 // FormatLevel formats a level number as an 8-digit zero-padded string.
@@ -223,14 +224,15 @@ func GetOrCreateStatusLookupBucket(tx *bolt.Tx, queueType string, level int) (*b
 	return getOrCreateBucket(tx, GetStatusLookupBucketPath(queueType, level))
 }
 
-// UpdateStatusLookup updates the status-lookup index for a pathHash at a given level.
+// UpdateStatusLookup updates the status-lookup index for a node ULID at a given level.
 // This should be called whenever a node's status changes.
-func UpdateStatusLookup(tx *bolt.Tx, queueType string, level int, pathHash []byte, status string) error {
+// nodeID is the ULID of the node (as []byte).
+func UpdateStatusLookup(tx *bolt.Tx, queueType string, level int, nodeID []byte, status string) error {
 	lookupBucket, err := GetOrCreateStatusLookupBucket(tx, queueType, level)
 	if err != nil {
 		return fmt.Errorf("failed to get status-lookup bucket: %w", err)
 	}
-	return lookupBucket.Put(pathHash, []byte(status))
+	return lookupBucket.Put(nodeID, []byte(status))
 }
 
 // GetExclusionHoldingBucket returns the exclusion-holding bucket for a queue type.
@@ -285,4 +287,22 @@ func GetOrCreateHoldingBucket(tx *bolt.Tx, queueType string, mode string) (*bolt
 	default:
 		return nil, fmt.Errorf("invalid exclusion mode: %s", mode)
 	}
+}
+
+// GetJoinLookupBucketPath returns the bucket path for the join-lookup bucket.
+// Returns: ["Traversal-Data", "DST", "join-lookup"]
+// This bucket maps DST node ULIDs to corresponding SRC node ULIDs (1:1 mapping).
+func GetJoinLookupBucketPath() []string {
+	return []string{TraversalDataBucket, BucketDst, SubBucketJoinLookup}
+}
+
+// GetJoinLookupBucket returns the join-lookup bucket for DST→SRC node mapping.
+// Returns nil if the bucket doesn't exist.
+func GetJoinLookupBucket(tx *bolt.Tx) *bolt.Bucket {
+	return getBucket(tx, GetJoinLookupBucketPath())
+}
+
+// GetOrCreateJoinLookupBucket returns or creates the join-lookup bucket for DST→SRC node mapping.
+func GetOrCreateJoinLookupBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
+	return getOrCreateBucket(tx, GetJoinLookupBucketPath())
 }

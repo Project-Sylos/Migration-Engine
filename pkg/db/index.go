@@ -12,13 +12,58 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
+// getNodeIDByPath looks up a node by its path and returns its ULID.
+// This is used when we need to find a parent's ULID from its path.
+func getNodeIDByPath(tx *bolt.Tx, queueType string, path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+
+	// We need to iterate through all nodes to find one with matching path
+	// This is inefficient but necessary during transition
+	// TODO: Consider adding a path->ULID index if this becomes a bottleneck
+	nodesBucket := GetNodesBucket(tx, queueType)
+	if nodesBucket == nil {
+		return "", fmt.Errorf("nodes bucket not found for %s", queueType)
+	}
+
+	cursor := nodesBucket.Cursor()
+	for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+		state, err := DeserializeNodeState(value)
+		if err != nil {
+			continue
+		}
+		if state.Path == path {
+			return state.ID, nil
+		}
+	}
+
+	return "", fmt.Errorf("node not found for path: %s", path)
+}
+
 // InsertNodeWithIndex atomically inserts a node into the nodes bucket, adds it to a status bucket,
 // and updates the parent's children list in the children bucket.
 func InsertNodeWithIndex(db *DB, queueType string, level int, status string, state *NodeState) error {
-	pathHash := []byte(HashPath(state.Path))
-	parentHash := []byte(HashPath(state.ParentPath))
+	if state.ID == "" {
+		return fmt.Errorf("node ID (ULID) cannot be empty")
+	}
+
+	nodeID := []byte(state.ID)
+	var parentID []byte
 
 	return db.Update(func(tx *bolt.Tx) error {
+		// Look up parent's ULID if we have parent path but not parent ID
+		if state.ParentPath != "" && state.ParentID == "" {
+			parentULID, err := getNodeIDByPath(tx, queueType, state.ParentPath)
+			if err != nil {
+				return fmt.Errorf("failed to find parent node for path %s: %w", state.ParentPath, err)
+			}
+			state.ParentID = parentULID
+			parentID = []byte(parentULID)
+		} else if state.ParentID != "" {
+			parentID = []byte(state.ParentID)
+		}
+
 		// 1. Insert into nodes bucket
 		nodesBucket := GetNodesBucket(tx, queueType)
 		if nodesBucket == nil {
@@ -35,7 +80,7 @@ func InsertNodeWithIndex(db *DB, queueType string, level int, status string, sta
 			return fmt.Errorf("failed to serialize node state: %w", err)
 		}
 
-		if err := nodesBucket.Put(pathHash, nodeData); err != nil {
+		if err := nodesBucket.Put(nodeID, nodeData); err != nil {
 			return fmt.Errorf("failed to insert node: %w", err)
 		}
 
@@ -45,17 +90,17 @@ func InsertNodeWithIndex(db *DB, queueType string, level int, status string, sta
 			return fmt.Errorf("failed to get status bucket: %w", err)
 		}
 
-		if err := statusBucket.Put(pathHash, []byte{}); err != nil {
+		if err := statusBucket.Put(nodeID, []byte{}); err != nil {
 			return fmt.Errorf("failed to add to status bucket: %w", err)
 		}
 
 		// 3. Update status-lookup index
-		if err := UpdateStatusLookup(tx, queueType, level, pathHash, status); err != nil {
+		if err := UpdateStatusLookup(tx, queueType, level, nodeID, status); err != nil {
 			return fmt.Errorf("failed to update status-lookup: %w", err)
 		}
 
 		// 4. Update parent's children list in children bucket
-		if state.ParentPath != "" {
+		if state.ParentID != "" {
 			childrenBucket := GetChildrenBucket(tx, queueType)
 			if childrenBucket == nil {
 				return fmt.Errorf("children bucket not found for %s", queueType)
@@ -63,25 +108,24 @@ func InsertNodeWithIndex(db *DB, queueType string, level int, status string, sta
 
 			// Get existing children list
 			var children []string
-			childrenData := childrenBucket.Get(parentHash)
+			childrenData := childrenBucket.Get(parentID)
 			if childrenData != nil {
 				if err := json.Unmarshal(childrenData, &children); err != nil {
 					return fmt.Errorf("failed to unmarshal children list: %w", err)
 				}
 			}
 
-			// Add this child's hash if not already present
-			childHash := HashPath(state.Path)
+			// Add this child's ULID if not already present
 			found := false
 			for _, c := range children {
-				if c == childHash {
+				if c == state.ID {
 					found = true
 					break
 				}
 			}
 
 			if !found {
-				children = append(children, childHash)
+				children = append(children, state.ID)
 
 				// Save updated children list
 				childrenData, err := json.Marshal(children)
@@ -89,7 +133,7 @@ func InsertNodeWithIndex(db *DB, queueType string, level int, status string, sta
 					return fmt.Errorf("failed to marshal children list: %w", err)
 				}
 
-				if err := childrenBucket.Put(parentHash, childrenData); err != nil {
+				if err := childrenBucket.Put(parentID, childrenData); err != nil {
 					return fmt.Errorf("failed to update children list: %w", err)
 				}
 			}
@@ -102,41 +146,55 @@ func InsertNodeWithIndex(db *DB, queueType string, level int, status string, sta
 // DeleteNodeWithIndex atomically deletes a node from the nodes bucket, removes it from status buckets,
 // and updates the parent's children list.
 func DeleteNodeWithIndex(db *DB, queueType string, level int, status string, state *NodeState) error {
-	pathHash := []byte(HashPath(state.Path))
-	parentHash := []byte(HashPath(state.ParentPath))
+	if state.ID == "" {
+		return fmt.Errorf("node ID (ULID) cannot be empty")
+	}
+
+	nodeID := []byte(state.ID)
+	var parentID []byte
 
 	return db.Update(func(tx *bolt.Tx) error {
+		// Look up parent's ULID if we have parent path but not parent ID
+		if state.ParentPath != "" && state.ParentID == "" {
+			parentULID, err := getNodeIDByPath(tx, queueType, state.ParentPath)
+			if err == nil {
+				state.ParentID = parentULID
+				parentID = []byte(parentULID)
+			}
+		} else if state.ParentID != "" {
+			parentID = []byte(state.ParentID)
+		}
+
 		// 1. Delete from nodes bucket
 		nodesBucket := GetNodesBucket(tx, queueType)
 		if nodesBucket != nil {
-			nodesBucket.Delete(pathHash) // Ignore errors
+			nodesBucket.Delete(nodeID) // Ignore errors
 		}
 
 		// 2. Remove from status bucket
 		statusBucket := GetStatusBucket(tx, queueType, level, status)
 		if statusBucket != nil {
-			statusBucket.Delete(pathHash) // Ignore errors
+			statusBucket.Delete(nodeID) // Ignore errors
 		}
 
 		// 3. Remove from status-lookup index
 		lookupBucket := GetStatusLookupBucket(tx, queueType, level)
 		if lookupBucket != nil {
-			lookupBucket.Delete(pathHash) // Ignore errors
+			lookupBucket.Delete(nodeID) // Ignore errors
 		}
 
 		// 4. Remove from parent's children list
-		if state.ParentPath != "" {
+		if state.ParentID != "" {
 			childrenBucket := GetChildrenBucket(tx, queueType)
 			if childrenBucket != nil {
 				var children []string
-				childrenData := childrenBucket.Get(parentHash)
+				childrenData := childrenBucket.Get(parentID)
 				if childrenData != nil {
 					if err := json.Unmarshal(childrenData, &children); err == nil {
-						// Remove this child's hash
-						childHash := HashPath(state.Path)
+						// Remove this child's ULID
 						filtered := make([]string, 0, len(children))
 						for _, c := range children {
-							if c != childHash {
+							if c != state.ID {
 								filtered = append(filtered, c)
 							}
 						}
@@ -145,11 +203,11 @@ func DeleteNodeWithIndex(db *DB, queueType string, level int, status string, sta
 						if len(filtered) > 0 {
 							childrenData, err := json.Marshal(filtered)
 							if err == nil {
-								childrenBucket.Put(parentHash, childrenData)
+								childrenBucket.Put(parentID, childrenData)
 							}
 						} else {
 							// No children left, remove entry
-							childrenBucket.Delete(parentHash)
+							childrenBucket.Delete(parentID)
 						}
 					}
 				}
@@ -160,18 +218,24 @@ func DeleteNodeWithIndex(db *DB, queueType string, level int, status string, sta
 	})
 }
 
-// GetChildrenHashes retrieves the list of child path hashes for a given parent path.
-func GetChildrenHashes(db *DB, queueType string, parentPath string) ([]string, error) {
-	parentHash := []byte(HashPath(parentPath))
+// GetChildrenIDs retrieves the list of child ULIDs for a given parent path.
+// This function looks up the parent by path first, then gets its children.
+func GetChildrenIDs(db *DB, queueType string, parentPath string) ([]string, error) {
 	var children []string
 
 	err := db.View(func(tx *bolt.Tx) error {
+		// First, find the parent's ULID by path
+		parentID, err := getNodeIDByPath(tx, queueType, parentPath)
+		if err != nil {
+			return fmt.Errorf("parent not found for path %s: %w", parentPath, err)
+		}
+
 		childrenBucket := GetChildrenBucket(tx, queueType)
 		if childrenBucket == nil {
 			return fmt.Errorf("children bucket not found for %s", queueType)
 		}
 
-		childrenData := childrenBucket.Get(parentHash)
+		childrenData := childrenBucket.Get([]byte(parentID))
 		if childrenData == nil {
 			return nil // No children
 		}
@@ -190,14 +254,20 @@ func GetChildrenHashes(db *DB, queueType string, parentPath string) ([]string, e
 	return children, nil
 }
 
+// GetChildrenHashes is deprecated - use GetChildrenIDs instead.
+// Kept for backward compatibility during migration.
+func GetChildrenHashes(db *DB, queueType string, parentPath string) ([]string, error) {
+	return GetChildrenIDs(db, queueType, parentPath)
+}
+
 // GetChildrenStates retrieves the full NodeState for all children of a parent.
 func GetChildrenStates(db *DB, queueType string, parentPath string) ([]*NodeState, error) {
-	childHashes, err := GetChildrenHashes(db, queueType, parentPath)
+	childIDs, err := GetChildrenIDs(db, queueType, parentPath)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(childHashes) == 0 {
+	if len(childIDs) == 0 {
 		return []*NodeState{}, nil
 	}
 
@@ -209,8 +279,8 @@ func GetChildrenStates(db *DB, queueType string, parentPath string) ([]*NodeStat
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}
 
-		for _, childHash := range childHashes {
-			nodeData := nodesBucket.Get([]byte(childHash))
+		for _, childID := range childIDs {
+			nodeData := nodesBucket.Get([]byte(childID))
 			if nodeData == nil {
 				continue // Child may have been deleted
 			}
@@ -260,30 +330,41 @@ func computeBatchInsertStatsDeltas(tx *bolt.Tx, ops []InsertOperation) map[strin
 	childrenCounts := make(map[string]int64) // queueType -> count of new parent entries
 
 	for _, op := range ops {
-		if op.State == nil {
+		if op.State == nil || op.State.ID == "" {
 			continue
 		}
 
-		pathHash := []byte(HashPath(op.State.Path))
-		parentHash := []byte(HashPath(op.State.ParentPath))
+		nodeID := []byte(op.State.ID)
+		var parentID []byte
+
+		// Look up parent ID if needed
+		if op.State.ParentPath != "" && op.State.ParentID == "" {
+			parentULID, err := getNodeIDByPath(tx, op.QueueType, op.State.ParentPath)
+			if err == nil {
+				op.State.ParentID = parentULID
+				parentID = []byte(parentULID)
+			}
+		} else if op.State.ParentID != "" {
+			parentID = []byte(op.State.ParentID)
+		}
 
 		// Check if node already exists - only count new nodes
 		nodesBucket := GetNodesBucket(tx, op.QueueType)
-		if nodesBucket != nil && nodesBucket.Get(pathHash) == nil {
+		if nodesBucket != nil && nodesBucket.Get(nodeID) == nil {
 			nodesCounts[op.QueueType]++
 		}
 
 		// Check if status entry already exists - only count new entries
 		statusBucket := GetStatusBucket(tx, op.QueueType, op.Level, op.Status)
-		if statusBucket == nil || statusBucket.Get(pathHash) == nil {
+		if statusBucket == nil || statusBucket.Get(nodeID) == nil {
 			statusKey := fmt.Sprintf("%s/%d/%s", op.QueueType, op.Level, op.Status)
 			statusCounts[statusKey]++
 		}
 
 		// Check if children entry needs to be created
-		if op.State.ParentPath != "" {
+		if op.State.ParentID != "" {
 			childrenBucket := GetChildrenBucket(tx, op.QueueType)
-			if childrenBucket != nil && childrenBucket.Get(parentHash) == nil {
+			if childrenBucket != nil && childrenBucket.Get(parentID) == nil {
 				childrenCounts[op.QueueType]++
 			}
 		}
@@ -314,7 +395,10 @@ func computeBatchInsertStatsDeltas(tx *bolt.Tx, ops []InsertOperation) map[strin
 	return deltas
 }
 
-func BatchInsertNodes(db *DB, ops []InsertOperation) error {
+// BatchInsertNodes inserts multiple nodes with their indices in a single transaction.
+// joinLookupMappings is optional - if provided, maps DST node ULIDs to SRC node ULIDs for join-lookup table.
+// Format: map[dstNodeID]srcNodeID
+func BatchInsertNodes(db *DB, ops []InsertOperation, joinLookupMappings map[string]string) error {
 	if len(ops) == 0 {
 		return nil
 	}
@@ -333,8 +417,24 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 		var currentQueueType string
 
 		for _, op := range ops {
-			pathHash := []byte(HashPath(op.State.Path))
-			parentHash := []byte(HashPath(op.State.ParentPath))
+			if op.State == nil || op.State.ID == "" {
+				return fmt.Errorf("node state must have ID (ULID)")
+			}
+
+			nodeID := []byte(op.State.ID)
+			var parentID []byte
+
+			// Look up parent ID if needed
+			if op.State.ParentPath != "" && op.State.ParentID == "" {
+				parentULID, err := getNodeIDByPath(tx, op.QueueType, op.State.ParentPath)
+				if err != nil {
+					return fmt.Errorf("failed to find parent node for path %s: %w", op.State.ParentPath, err)
+				}
+				op.State.ParentID = parentULID
+				parentID = []byte(parentULID)
+			} else if op.State.ParentID != "" {
+				parentID = []byte(op.State.ParentID)
+			}
 
 			// Get or cache nodes bucket
 			if currentQueueType != op.QueueType {
@@ -355,7 +455,7 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 				return fmt.Errorf("failed to serialize node: %w", err)
 			}
 
-			if err := nodesBucket.Put(pathHash, nodeData); err != nil {
+			if err := nodesBucket.Put(nodeID, nodeData); err != nil {
 				return fmt.Errorf("failed to insert node: %w", err)
 			}
 
@@ -365,41 +465,53 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 				return fmt.Errorf("failed to get status bucket: %w", err)
 			}
 
-			if err := statusBucket.Put(pathHash, []byte{}); err != nil {
+			if err := statusBucket.Put(nodeID, []byte{}); err != nil {
 				return fmt.Errorf("failed to add to status bucket: %w", err)
 			}
 
 			// 3. Update status-lookup index
-			if err := UpdateStatusLookup(tx, op.QueueType, op.Level, pathHash, op.Status); err != nil {
+			if err := UpdateStatusLookup(tx, op.QueueType, op.Level, nodeID, op.Status); err != nil {
 				return fmt.Errorf("failed to update status-lookup: %w", err)
 			}
 
 			// 4. Update children index
-			if op.State.ParentPath != "" {
+			if op.State.ParentID != "" {
 				childrenBucket := GetChildrenBucket(tx, op.QueueType)
 				if childrenBucket == nil {
 					return fmt.Errorf("children bucket not found for %s", op.QueueType)
 				}
 
 				var children []string
-				childrenData := childrenBucket.Get(parentHash)
+				childrenData := childrenBucket.Get(parentID)
 				if childrenData != nil {
 					json.Unmarshal(childrenData, &children)
 				}
 
-				childHash := HashPath(op.State.Path)
 				found := false
 				for _, c := range children {
-					if c == childHash {
+					if c == op.State.ID {
 						found = true
 						break
 					}
 				}
 
 				if !found {
-					children = append(children, childHash)
+					children = append(children, op.State.ID)
 					childrenData, _ := json.Marshal(children)
-					childrenBucket.Put(parentHash, childrenData)
+					childrenBucket.Put(parentID, childrenData)
+				}
+			}
+
+			// 5. Populate join-lookup for DST nodes
+			if op.QueueType == BucketDst && joinLookupMappings != nil {
+				if srcNodeID, exists := joinLookupMappings[op.State.ID]; exists {
+					joinLookupBucket, err := GetOrCreateJoinLookupBucket(tx)
+					if err != nil {
+						return fmt.Errorf("failed to get join-lookup bucket: %w", err)
+					}
+					if err := joinLookupBucket.Put([]byte(op.State.ID), []byte(srcNodeID)); err != nil {
+						return fmt.Errorf("failed to insert join-lookup entry: %w", err)
+					}
 				}
 			}
 		}

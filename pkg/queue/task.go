@@ -46,10 +46,10 @@ type ChildResult struct {
 
 // Identifier returns the unique identifier for this task (absolute path).
 func (t *TaskBase) Identifier() string {
-	if t.Folder.Id != "" {
-		return t.Folder.Id
+	if t.Folder.ServiceID != "" {
+		return t.Folder.ServiceID
 	}
-	return t.File.Id
+	return t.File.ServiceID
 }
 
 // LocationPath returns the logical, root-relative path for this task.
@@ -62,12 +62,12 @@ func (t *TaskBase) LocationPath() string {
 
 // IsFolder returns whether this task represents a folder traversal.
 func (t *TaskBase) IsFolder() bool {
-	return t.Folder.Id != ""
+	return t.Folder.ServiceID != ""
 }
 
 // IsFile returns whether this task represents a file operation.
 func (t *TaskBase) IsFile() bool {
-	return t.File.Id != ""
+	return t.File.ServiceID != ""
 }
 
 // UploadTask represents a task to upload a file from source to destination.
