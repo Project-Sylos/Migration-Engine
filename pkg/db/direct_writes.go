@@ -12,7 +12,6 @@ import (
 // UpdateNodeStatusInTxByID updates a node's status within an existing transaction using ULID.
 // This is the preferred method - use ULID directly instead of path lookup.
 func UpdateNodeStatusInTxByID(tx *bolt.Tx, queueType string, level int, oldStatus, newStatus string, nodeID []byte) error {
-
 	// Get the node data from nodes bucket
 	nodesBucket := GetNodesBucket(tx, queueType)
 	if nodesBucket == nil {

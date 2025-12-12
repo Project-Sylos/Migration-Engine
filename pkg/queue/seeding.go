@@ -46,7 +46,7 @@ func SeedRootTask(queueType string, rootFolder types.Folder, rootNodeID string, 
 		MTime:           rootFolder.LastUpdated,
 		Depth:           0, // Root is always depth 0
 		CopyNeeded:      false,
-		Status:          "Pending",
+		Status:          db.StatusPending,
 	}
 
 	// Populate traversal status in the NodeState metadata
@@ -151,7 +151,7 @@ func SeedRootTaskWithSrcID(queueType string, rootFolder types.Folder, rootNodeID
 		MTime:           rootFolder.LastUpdated,
 		Depth:           0, // Root is always depth 0
 		CopyNeeded:      false,
-		Status:          "Pending",
+		Status:          db.StatusPending,
 		SrcID:           srcID, // Set SrcID to match SRC root
 	}
 

@@ -15,11 +15,9 @@ import (
 )
 
 // WriteOperation represents a buffered database write operation.
-// All operations must implement Execute() to perform the actual DB write,
-// and Key() to enable duplicate detection and coalescing.
+// All operations must implement Execute() to perform the actual DB write.
 type WriteOperation interface {
 	Execute(tx *bolt.Tx) error
-	Key() string // Returns a unique key for duplicate detection (typically path hash)
 }
 
 // StatusUpdateOperation represents a node status transition (e.g., pending → successful).
@@ -31,11 +29,6 @@ type StatusUpdateOperation struct {
 	NodeID    string // ULID of the node
 }
 
-// Key returns the ULID as the unique key for this operation (for coalescing).
-func (op *StatusUpdateOperation) Key() string {
-	return op.NodeID // Use ULID for duplicate detection
-}
-
 // Execute performs the status update within a transaction.
 func (op *StatusUpdateOperation) Execute(tx *bolt.Tx) error {
 	return UpdateNodeStatusInTxByID(tx, op.QueueType, op.Level, op.OldStatus, op.NewStatus, []byte(op.NodeID))
@@ -44,12 +37,6 @@ func (op *StatusUpdateOperation) Execute(tx *bolt.Tx) error {
 // BatchInsertOperation represents a batch of child node insertions.
 type BatchInsertOperation struct {
 	Operations []InsertOperation
-}
-
-// Key returns a composite key for batch operations (not used for coalescing, but required by interface).
-func (op *BatchInsertOperation) Key() string {
-	// Batch operations are not coalesced by key - they're merged by path hash during flush
-	return fmt.Sprintf("batch_%d", len(op.Operations))
 }
 
 // Execute performs the batch insert within a transaction.
@@ -64,11 +51,6 @@ type CopyStatusOperation struct {
 	Status        string
 	NodeID        string // ULID of the node
 	NewCopyStatus string
-}
-
-// Key returns the ULID as the unique key for this operation (for coalescing).
-func (op *CopyStatusOperation) Key() string {
-	return op.NodeID // Use ULID for duplicate detection
 }
 
 // Execute performs the copy status update within a transaction.
@@ -112,11 +94,6 @@ type ExclusionUpdateOperation struct {
 	InheritedExcluded bool
 }
 
-// Key returns the ULID as the unique key for this operation (for coalescing).
-func (op *ExclusionUpdateOperation) Key() string {
-	return op.NodeID // Use ULID for duplicate detection
-}
-
 // Execute performs the exclusion state update within a transaction.
 func (op *ExclusionUpdateOperation) Execute(tx *bolt.Tx) error {
 	nodeID := []byte(op.NodeID)
@@ -156,11 +133,6 @@ type ExclusionHoldingRemoveOperation struct {
 	NodeID    string // ULID of the node
 }
 
-// Key returns the ULID as the unique key for this operation.
-func (op *ExclusionHoldingRemoveOperation) Key() string {
-	return op.NodeID
-}
-
 // Execute performs the removal from exclusion-holding bucket within a transaction.
 func (op *ExclusionHoldingRemoveOperation) Execute(tx *bolt.Tx) error {
 	holdingBucket := GetExclusionHoldingBucket(tx, op.QueueType)
@@ -176,11 +148,6 @@ type ExclusionHoldingAddOperation struct {
 	QueueType string
 	NodeID    string // ULID of the node
 	Depth     int
-}
-
-// Key returns a unique key for this operation.
-func (op *ExclusionHoldingAddOperation) Key() string {
-	return fmt.Sprintf("exclusion-add-%s-%s", op.QueueType, op.NodeID)
 }
 
 // Execute performs the addition to exclusion-holding bucket within a transaction.
@@ -307,119 +274,8 @@ func (ob *OutputBuffer) Add(op WriteOperation) {
 	}
 }
 
-// bucketKey represents a unique bucket identifier for grouping operations.
-type bucketKey struct {
-	Type      string // "nodes", "status", "exclusion-holding"
-	QueueType string // For nodes, status, exclusion-holding
-	Level     int    // For status buckets (-1 if not applicable)
-	Status    string // For status buckets (empty if not applicable)
-}
-
-// String returns a string representation of the bucket key for use as a map key.
-func (bk bucketKey) String() string {
-	if bk.Type == "status" {
-		return fmt.Sprintf("%s:%s:%d:%s", bk.Type, bk.QueueType, bk.Level, bk.Status)
-	}
-	return fmt.Sprintf("%s:%s", bk.Type, bk.QueueType)
-}
-
-// getBucketKeysForOperation returns all bucket keys that an operation affects.
-func getBucketKeysForOperation(op WriteOperation) []bucketKey {
-	var keys []bucketKey
-
-	switch v := op.(type) {
-	case *StatusUpdateOperation:
-		// Affects nodes bucket, old status bucket, and new status bucket
-		keys = append(keys, bucketKey{Type: "nodes", QueueType: v.QueueType})
-		keys = append(keys, bucketKey{Type: "status", QueueType: v.QueueType, Level: v.Level, Status: v.OldStatus})
-		keys = append(keys, bucketKey{Type: "status", QueueType: v.QueueType, Level: v.Level, Status: v.NewStatus})
-
-	case *BatchInsertOperation:
-		// Affects nodes bucket for each queue type and status buckets for each insert
-		queueTypes := make(map[string]bool)
-		statusKeys := make(map[bucketKey]bool)
-
-		for _, insertOp := range v.Operations {
-			if insertOp.State != nil {
-				queueTypes[insertOp.QueueType] = true
-				if insertOp.QueueType != "" && insertOp.Level >= 0 && insertOp.Status != "" {
-					statusKeys[bucketKey{Type: "status", QueueType: insertOp.QueueType, Level: insertOp.Level, Status: insertOp.Status}] = true
-				}
-			}
-		}
-
-		for qt := range queueTypes {
-			keys = append(keys, bucketKey{Type: "nodes", QueueType: qt})
-		}
-		for sk := range statusKeys {
-			keys = append(keys, sk)
-		}
-
-	case *CopyStatusOperation:
-		// Affects nodes bucket
-		keys = append(keys, bucketKey{Type: "nodes", QueueType: v.QueueType})
-
-	case *ExclusionUpdateOperation:
-		// Affects nodes bucket
-		keys = append(keys, bucketKey{Type: "nodes", QueueType: v.QueueType})
-
-	case *ExclusionHoldingRemoveOperation:
-		// Affects exclusion-holding bucket
-		keys = append(keys, bucketKey{Type: "exclusion-holding", QueueType: v.QueueType})
-
-	case *ExclusionHoldingAddOperation:
-		// Affects exclusion-holding bucket
-		keys = append(keys, bucketKey{Type: "exclusion-holding", QueueType: v.QueueType})
-	}
-
-	return keys
-}
-
-// deduplicateOperationsByBucket groups operations by bucket and deduplicates within each bucket.
-// Returns a map of bucket key -> deduplicated operations for that bucket.
-// An operation may appear in multiple bucket groups if it affects multiple buckets.
-func deduplicateOperationsByBucket(operations []WriteOperation) map[string][]WriteOperation {
-	// First, group operations by bucket key
-	bucketGroups := make(map[string][]WriteOperation)
-
-	for _, op := range operations {
-		bucketKeys := getBucketKeysForOperation(op)
-		for _, bk := range bucketKeys {
-			keyStr := bk.String()
-			bucketGroups[keyStr] = append(bucketGroups[keyStr], op)
-		}
-	}
-
-	// Deduplicate within each bucket group (last write wins for same Key())
-	deduplicated := make(map[string][]WriteOperation)
-	for bucketKeyStr, ops := range bucketGroups {
-		// Track the last operation for each key (preserve insertion order, last wins)
-		seenKeys := make(map[string]bool)
-		deduped := make([]WriteOperation, 0, len(ops))
-
-		// Process in reverse order so last write wins
-		for i := len(ops) - 1; i >= 0; i-- {
-			op := ops[i]
-			key := op.Key()
-			if !seenKeys[key] {
-				deduped = append(deduped, op)
-				seenKeys[key] = true
-			}
-		}
-
-		// Reverse to get original order (but with duplicates removed, last write kept)
-		for i, j := 0, len(deduped)-1; i < j; i, j = i+1, j-1 {
-			deduped[i], deduped[j] = deduped[j], deduped[i]
-		}
-
-		deduplicated[bucketKeyStr] = deduped
-	}
-
-	return deduplicated
-}
-
 // Flush writes all buffered operations to BoltDB in a single transaction.
-// Operations are grouped by bucket, deduplicated per bucket, and executed per bucket.
+// Operations are executed in the order they were added to the buffer.
 // This is synchronous and blocks until the flush completes.
 // Holds the lock during the entire transaction to prevent other goroutines
 // from adding operations to the buffer while the transaction is executing.
@@ -437,63 +293,6 @@ func (ob *OutputBuffer) Flush() {
 	copy(batch, ob.operations)
 	ob.operations = make([]WriteOperation, 0, ob.batchSize)
 
-	// First, merge all batch inserts globally (they affect multiple buckets)
-	// Separate batch inserts from other operations
-	var batchInserts []*BatchInsertOperation
-	var otherOps []WriteOperation
-	for _, op := range batch {
-		if batch, ok := op.(*BatchInsertOperation); ok {
-			batchInserts = append(batchInserts, batch)
-		} else {
-			otherOps = append(otherOps, op)
-		}
-	}
-
-	// Merge all batch inserts into one
-	var mergedBatch *BatchInsertOperation
-	if len(batchInserts) > 0 {
-		mergedNodes := make(map[string]InsertOperation) // ULID -> InsertOperation
-
-		for _, batch := range batchInserts {
-			for _, insertOp := range batch.Operations {
-				if insertOp.State != nil && insertOp.State.ID != "" {
-					// Use ULID as key for deduplication
-					mergedNodes[insertOp.State.ID] = insertOp
-				}
-			}
-		}
-
-		if len(mergedNodes) > 0 {
-			mergedOps := make([]InsertOperation, 0, len(mergedNodes))
-			for _, op := range mergedNodes {
-				mergedOps = append(mergedOps, op)
-			}
-			mergedBatch = &BatchInsertOperation{
-				Operations: mergedOps,
-			}
-			otherOps = append(otherOps, mergedBatch)
-		}
-	}
-
-	// Now group all operations (including merged batch) by bucket and deduplicate within each bucket
-	bucketGroups := deduplicateOperationsByBucket(otherOps)
-
-	// Collect all unique operations to execute (an operation may appear in multiple bucket groups)
-	// Use operation Key() to identify unique operations
-	seenOpKeys := make(map[string]bool)
-	allOpsToExecute := make([]WriteOperation, 0)
-
-	// Collect operations from all bucket groups, but only add each unique operation once
-	for _, ops := range bucketGroups {
-		for _, op := range ops {
-			opKey := op.Key()
-			if !seenOpKeys[opKey] {
-				allOpsToExecute = append(allOpsToExecute, op)
-				seenOpKeys[opKey] = true
-			}
-		}
-	}
-
 	// Execute all operations in a single transaction
 	// Lock is held during transaction to prevent concurrent additions to buffer
 	err := ob.db.Update(func(tx *bolt.Tx) error {
@@ -503,21 +302,13 @@ func (ob *OutputBuffer) Flush() {
 		}
 
 		// Compute stats deltas BEFORE executing writes (check what exists first)
-		statsDeltas := computeStatsDeltas(tx, allOpsToExecute)
+		statsDeltas := computeStatsDeltas(tx, batch)
 
-		// Execute all operations grouped by bucket
-		// Each operation is executed once, but we organize execution by bucket
-		executedOpKeys := make(map[string]bool)
-		for _, ops := range bucketGroups {
-			for _, op := range ops {
-				opKey := op.Key()
-				// Only execute if we haven't already executed it (it may appear in multiple bucket groups)
-				if !executedOpKeys[opKey] {
-					if err := op.Execute(tx); err != nil {
-						return fmt.Errorf("failed to execute operation: %w", err)
-					}
-					executedOpKeys[opKey] = true
-				}
+		// Execute all operations in order
+		for i, op := range batch {
+			if err := op.Execute(tx); err != nil {
+				opType := fmt.Sprintf("%T", op)
+				return fmt.Errorf("failed to execute operation %d of %d (type: %s): %w", i+1, len(batch), opType, err)
 			}
 		}
 
@@ -534,10 +325,12 @@ func (ob *OutputBuffer) Flush() {
 	})
 
 	if err != nil {
-		// Log error but don't fail - operations will be retried on next flush
-		fmt.Printf("Error flushing output buffer: %v\n", err)
-		// Re-add operations to buffer for retry (only if not a critical error)
-		// For now, we'll let them be lost on error - in production might want retry logic
+		// Log error with details
+		fmt.Printf("ERROR flushing output buffer (%d operations): %v\n", len(batch), err)
+		// Re-add operations to buffer for retry
+		ob.mu.Lock()
+		ob.operations = append(ob.operations, batch...)
+		ob.mu.Unlock()
 	}
 }
 

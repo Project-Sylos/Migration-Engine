@@ -127,6 +127,7 @@ func (c *QueueCoordinator) MarkDstCompleted() {
 func (c *QueueCoordinator) IsCompleted(queueType string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+
 	switch queueType {
 	case "src":
 		return c.srcDone
