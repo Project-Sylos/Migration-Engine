@@ -36,7 +36,7 @@ func runTest() error {
 
 	// Load pre-configured test database (should be copied by PowerShell script)
 	// This DB should already have some excluded nodes from a previous exclusion sweep
-	dbPath := "pkg/tests/unexclusion_sweep/unexclusion_sweep_test.db"
+	dbPath := "pkg/tests/shared/main_test.db"
 	boltDB, _, err := migration.SetupDatabase(migration.DatabaseConfig{
 		Path:           dbPath,
 		RemoveExisting: false, // Use existing pre-configured DB
@@ -46,8 +46,8 @@ func runTest() error {
 	}
 	defer boltDB.Close()
 
-	// Load Spectra configuration (test-specific config pointing to test directory's spectra.db)
-	spectraFS, err := shared.SetupSpectraFS("pkg/tests/unexclusion_sweep/spectra.json", false)
+	// Load Spectra configuration (test-specific config pointing to shared directory's spectra.db)
+	spectraFS, err := shared.SetupSpectraFS("pkg/tests/shared/spectra.json", false)
 	if err != nil {
 		return fmt.Errorf("failed to setup Spectra: %w", err)
 	}

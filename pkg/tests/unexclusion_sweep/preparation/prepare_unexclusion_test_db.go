@@ -40,13 +40,13 @@ func prepareBaseDB() error {
 	fmt.Println("=============================================")
 
 	// Start with the exclusion test base DB (which has no excluded nodes)
-	sourceDBPath := "pkg/tests/exclusion_sweep/exclusion_sweep_test_base.db"
-	sourceYAMLPath := "pkg/tests/exclusion_sweep/exclusion_sweep_test_base.yaml"
-	sourceSpectraPath := "pkg/tests/exclusion_sweep/spectra_exclusion_sweep_base.db"
+	sourceDBPath := "pkg/tests/shared/main.db"
+	sourceYAMLPath := "pkg/tests/shared/main.yaml"
+	sourceSpectraPath := "pkg/tests/shared/spectra.db"
 
-	targetDBPath := "pkg/tests/unexclusion_sweep/unexclusion_sweep_test_base.db"
-	targetYAMLPath := "pkg/tests/unexclusion_sweep/unexclusion_sweep_test_base.yaml"
-	targetSpectraPath := "pkg/tests/unexclusion_sweep/spectra_unexclusion_sweep_base.db"
+	targetDBPath := "pkg/tests/shared/main_test.db"
+	targetYAMLPath := "pkg/tests/shared/main_test.yaml"
+	targetSpectraPath := "pkg/tests/shared/spectra_test.db"
 
 	// Check if source exists
 	if _, err := os.Stat(sourceDBPath); os.IsNotExist(err) {
@@ -91,8 +91,8 @@ func prepareBaseDB() error {
 	}
 	defer boltDB.Close()
 
-	// Load Spectra configuration (test-specific config pointing to test directory's spectra.db)
-	spectraFS, err := shared.SetupSpectraFS("pkg/tests/exclusion_sweep/spectra.json", false)
+	// Load Spectra configuration (test-specific config pointing to shared directory's spectra.db)
+	spectraFS, err := shared.SetupSpectraFS("pkg/tests/shared/spectra.json", false)
 	if err != nil {
 		return fmt.Errorf("failed to setup Spectra: %w", err)
 	}

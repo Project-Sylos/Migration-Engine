@@ -9,14 +9,14 @@ Write-Host ""
 
 # Source files (user-provided pre-configured test data)
 # Paths are relative to this script's location
-$sourceDB = "pkg/tests/exclusion_sweep/exclusion_sweep_test_base.db"
-$sourceYAML = "pkg/tests/exclusion_sweep/exclusion_sweep_test_base.yaml"
-$sourceSpectra = "pkg/tests/exclusion_sweep/spectra_exclusion_sweep_base.db"
+$sourceDB = "pkg/tests/shared/main.db"
+$sourceYAML = "pkg/tests/shared/main.yaml"
+$sourceSpectra = "pkg/tests/shared/spectra.db"
 
 # Destination files (mutable test objects)
-$destDB = "pkg/tests/exclusion_sweep/exclusion_sweep_test.db"
-$destYAML = "pkg/tests/exclusion_sweep/exclusion_sweep_test.yaml"
-$destSpectra = "pkg/tests/exclusion_sweep/spectra.db"
+$destDB = "pkg/tests/shared/main_test.db"
+$destYAML = "pkg/tests/shared/main_test.yaml"
+$destSpectra = "pkg/tests/shared/spectra_test.db"
 
 # Check if source files exist
 if (-not (Test-Path $sourceDB)) {

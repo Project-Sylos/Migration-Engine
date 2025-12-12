@@ -289,26 +289,23 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 	}
 
 	// Compare files by Type + Name
-	// for _, expectedFile := range expectedFiles {
-	// 	matchKey := expectedFile.Type + ":" + expectedFile.DisplayName
-	// 	if actualFile, exists := actualFileMap[matchKey]; exists {
-	// 		// File exists on both: compare timestamps to determine status
-	// 		// Files don't need traversal, but we still compare to determine if copy is needed
-	// 		status := compareTimestamps(expectedFile.LastUpdated, actualFile.LastUpdated)
+	for _, expectedFile := range expectedFiles {
+		matchKey := expectedFile.Type + ":" + expectedFile.DisplayName
+		if actualFile, exists := actualFileMap[matchKey]; exists {
+			// File exists on both - mark as Successful (already on dst)
+			// TODO: During copy phase, compare timestamps to determine if copy is needed
 
-	// 		// Get SRC node ID from map
-	// 		srcID := srcIDMap[matchKey]
+			// Get SRC node ID from map
+			srcID := srcIDMap[matchKey]
 
-	// 		// TODO: During copy phase, update NodeState.CopyStatus for pending files
-
-	// 		task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
-	// 			File:   actualFile,
-	// 			Status: status,
-	// 			IsFile: true,
-	// 			SrcID:  srcID,
-	// 		})
-	// 	}
-	// }
+			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
+				File:   actualFile,
+				Status: db.StatusSuccessful, // File exists on dst, no traversal needed
+				IsFile: true,
+				SrcID:  srcID,
+			})
+		}
+	}
 
 	// Check for extra files on dst (not on src)
 	for _, actualFile := range actualResult.Files {
