@@ -364,7 +364,6 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 		}
 
 		queueType := getQueueType(q.name)
-		fmt.Printf("Checking for completion for round %d\n", currentRound)
 
 		// Check DB for pending items (buffer already flushed above)
 		hasPending, err := boltDB.HasStatusBucketItems(queueType, currentRound, db.StatusPending)
@@ -377,6 +376,7 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 
 			state := q.getState()
 			if state == QueueStateRunning || state == QueueStateWaiting {
+
 				if logservice.LS != nil {
 					_ = logservice.LS.Log("info",
 						fmt.Sprintf("No pending tasks found for round %d - traversal complete (first pull)", currentRound),
@@ -587,7 +587,11 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 	// 3. Handle DST queue special case: create tasks for child folders
 	// Note: ExpectedFolders/ExpectedFiles will be loaded later during PullTasks() batch loading
 	if q.name == "dst" {
-		var childFolders []types.Folder
+		type dstChildFolder struct {
+			folder types.Folder
+			srcID  string
+		}
+		var childFolders []dstChildFolder
 		totalFolders := 0
 		pendingFolders := 0
 		for _, child := range task.DiscoveredChildren {
@@ -597,16 +601,20 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 					pendingFolders++
 					f := child.Folder
 					f.DepthLevel = nextRound
-					childFolders = append(childFolders, f)
+					childFolders = append(childFolders, dstChildFolder{
+						folder: f,
+						srcID:  child.SrcID, // Preserve SrcID from ChildResult
+					})
 				}
 			}
 		}
 
-		for _, childFolder := range childFolders {
+		tasksCreated := 0
+		for _, child := range childFolders {
 			// Create task state for DST child (without ExpectedFolders/ExpectedFiles - loaded in PullTasks)
 			taskState := taskToNodeState(&TaskBase{
 				Type:   TaskTypeDstTraversal,
-				Folder: childFolder,
+				Folder: child.folder,
 				Round:  nextRound,
 			})
 			if taskState != nil {
@@ -614,6 +622,8 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 				taskState.ParentID = nodeID
 				// Populate traversal status in the NodeState metadata
 				taskState.TraversalStatus = db.StatusPending
+				// Set SrcID from ChildResult (for DST child folder matching)
+				taskState.SrcID = child.srcID
 
 				childNodesToInsert = append(childNodesToInsert, db.InsertOperation{
 					QueueType: queueType,
@@ -623,6 +633,7 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 				})
 
 				q.incrementRoundStatsExpected(nextRound)
+				tasksCreated++
 			}
 		}
 	}
@@ -1148,7 +1159,6 @@ func (q *Queue) Run() {
 					fmt.Sprintf("Run() exiting - queue %s (round %d)", state, currentRound),
 					"queue", q.name, q.name)
 			}
-			fmt.Printf("[DEBUG] Run() loop exiting outer loop - state=%s for %s\n", state, q.name)
 			// Stop output buffer when queue completes to prevent goroutine leak
 			outputBuffer := q.getOutputBuffer()
 			if outputBuffer != nil {
@@ -1212,13 +1222,10 @@ func (q *Queue) Run() {
 
 			// If stopped or completed, exit
 			if innerState == QueueStateStopped || innerState == QueueStateCompleted {
-				fmt.Printf("[DEBUG] Run() loop exiting inner loop - state=%s for %s\n", innerState, q.name)
 				// Stop output buffer when queue completes to prevent goroutine leak
 				outputBuffer := q.getOutputBuffer()
 				if outputBuffer != nil {
-					fmt.Printf("[DEBUG] Stopping output buffer for %s (from inner loop)\n", q.name)
 					outputBuffer.Stop()
-					fmt.Printf("[DEBUG] Output buffer stopped for %s (from inner loop)\n", q.name)
 				}
 				return
 			}
@@ -1236,7 +1243,6 @@ func (q *Queue) Run() {
 					FlushBuffer:            true,
 				})
 				if completed {
-					fmt.Printf("[DEBUG] Run() loop returning - traversal completed for %s\n", q.name)
 					// Stop output buffer when queue completes to prevent goroutine leak
 					outputBuffer := q.getOutputBuffer()
 					if outputBuffer != nil {
@@ -1288,6 +1294,8 @@ func (q *Queue) advanceToNextRound() {
 	// Advance round
 	currentRound := q.getRound()
 	newRound := currentRound + 1
+
+	// Get stats for logging
 	q.setRound(newRound)
 
 	// Reset lastPullWasPartial since we're advancing to a new round
@@ -1295,8 +1303,6 @@ func (q *Queue) advanceToNextRound() {
 	// Reset firstPullForRound so next pull will check coordinator gate (for DST)
 	q.setFirstPullForRound(true)
 	// Initialize stats for the new round (if not already exists)
-	q.getOrCreateRoundStats(newRound)
-
 	// Update coordinator when rounds advance
 	coordinator := q.getCoordinator()
 	if coordinator != nil {

@@ -99,7 +99,7 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 
 	// Open database - tests own the lifecycle
 	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           "pkg/tests/bolt.db",
+		Path:           "pkg/tests/shared/main_test.db",
 		RemoveExisting: removeMigrationDB,
 	})
 	if err != nil {
@@ -110,7 +110,7 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 		DatabaseInstance: dbInstance,               // Tests provide DB instance
 		Runtime:          migration.ModeStandalone, // Tests use standalone mode (ME closes DB)
 		Database: migration.DatabaseConfig{
-			Path:           "pkg/tests/bolt.db",
+			Path:           "pkg/tests/shared/main_test.db",
 			RemoveExisting: removeMigrationDB,
 		},
 		Source: migration.Service{
@@ -234,7 +234,7 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 
 	// Open database - tests own the lifecycle
 	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           "pkg/tests/migration_test_local.db",
+		Path:           "pkg/tests/shared/main_test.db",
 		RemoveExisting: removeMigrationDB,
 	})
 	if err != nil {
@@ -245,7 +245,7 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 		DatabaseInstance: dbInstance,               // Tests provide DB instance
 		Runtime:          migration.ModeStandalone, // Tests use standalone mode (ME closes DB)
 		Database: migration.DatabaseConfig{
-			Path:           "pkg/tests/migration_test_local.db",
+			Path:           "pkg/tests/shared/main_test.db",
 			RemoveExisting: removeMigrationDB,
 		},
 		Source: migration.Service{

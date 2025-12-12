@@ -8,7 +8,7 @@ Write-Host ""
 
 # Check if base DB exists, if not, prepare it
 # Paths are relative to this script's location
-$baseDBPath = "pkg/tests/unexclusion_sweep/unexclusion_sweep_test_base.db"
+$baseDBPath = "pkg/tests/shared/main_test.db"
 if (-not (Test-Path $baseDBPath)) {
     Write-Host "Base DB not found. Preparing base DB..." -ForegroundColor Yellow
     Write-Host "This will mark the first root folder as excluded and run an exclusion sweep." -ForegroundColor Yellow
@@ -28,9 +28,9 @@ if (-not (Test-Path $baseDBPath)) {
 # Clean up previous test files
 Write-Host "Cleaning up previous test files..." -ForegroundColor Yellow
 $testFiles = @(
-    "pkg/tests/unexclusion_sweep/unexclusion_sweep_test.db",
-    "pkg/tests/unexclusion_sweep/unexclusion_sweep_test.yaml",
-    "pkg/tests/unexclusion_sweep/spectra.db"
+    "pkg/tests/shared/main_test.db",
+    "pkg/tests/shared/main_test.yaml",
+    "pkg/tests/shared/spectra_test.db"
 )
 
 foreach ($file in $testFiles) {
@@ -43,15 +43,15 @@ foreach ($file in $testFiles) {
 # Copy test files
 Write-Host "Copying test files..." -ForegroundColor Yellow
 $baseFiles = @{
-    "pkg/tests/unexclusion_sweep/unexclusion_sweep_test_base.db" = "pkg/tests/unexclusion_sweep/unexclusion_sweep_test.db"
-    "pkg/tests/unexclusion_sweep/unexclusion_sweep_test_base.yaml" = "pkg/tests/unexclusion_sweep/unexclusion_sweep_test.yaml"
-    "pkg/tests/unexclusion_sweep/spectra_unexclusion_sweep_base.db" = "pkg/tests/unexclusion_sweep/spectra.db"
+    "pkg/tests/shared/main.db" = "pkg/tests/shared/main_test.db"
+    "pkg/tests/shared/main.yaml" = "pkg/tests/shared/main_test.yaml"
+    "pkg/tests/shared/spectra.db" = "pkg/tests/shared/spectra_test.db"
 }
 
 foreach ($baseFile in $baseFiles.GetEnumerator()) {
     if (-not (Test-Path $baseFile.Key)) {
         Write-Host "  ERROR: Base file not found: $($baseFile.Key)" -ForegroundColor Red
-        Write-Host "  NOTE: Run the prepare script first: go run ../prepare_unexclusion_test_db.go" -ForegroundColor Yellow
+        Write-Host "  NOTE: Run the prepare script first: go run pkg/tests/unexclusion_sweep/preparation/prepare_unexclusion_test_db.go" -ForegroundColor Yellow
         exit 1
     }
     Copy-Item $baseFile.Key $baseFile.Value -Force

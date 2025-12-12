@@ -294,15 +294,6 @@ func (q *Queue) removeInProgress(nodeID string) {
 	delete(q.inProgress, nodeID)
 }
 
-func (q *Queue) getOrCreateRoundStats(round int) *RoundStats {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.roundStats[round] == nil {
-		q.roundStats[round] = &RoundStats{}
-	}
-	return q.roundStats[round]
-}
-
 func (q *Queue) incrementRoundStatsCompleted(round int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
