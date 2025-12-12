@@ -88,11 +88,11 @@ func RunExclusionSweep(cfg SweepConfig) (RuntimeStats, error) {
 	// Create queues in exclusion mode
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
 	srcQueue.SetMode(queue.QueueModeExclusion)
-	srcQueue.InitializeWithContext(boltDB, cfg.SrcAdapter, nil, cfg.ShutdownContext)
+	srcQueue.InitializeWithContext(boltDB, cfg.SrcAdapter, cfg.ShutdownContext)
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
 	dstQueue.SetMode(queue.QueueModeExclusion)
-	dstQueue.InitializeWithContext(boltDB, cfg.DstAdapter, srcQueue, cfg.ShutdownContext)
+	dstQueue.InitializeWithContext(boltDB, cfg.DstAdapter, cfg.ShutdownContext)
 
 	// Set initial rounds to 0 for exclusion sweep (starts from root level)
 	srcQueue.SetRound(0)
@@ -297,14 +297,14 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	if cfg.MaxKnownDepth >= 0 {
 		srcQueue.SetMaxKnownDepth(cfg.MaxKnownDepth)
 	}
-	srcQueue.InitializeWithContext(boltDB, cfg.SrcAdapter, nil, cfg.ShutdownContext)
+	srcQueue.InitializeWithContext(boltDB, cfg.SrcAdapter, cfg.ShutdownContext)
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
 	dstQueue.SetMode(queue.QueueModeRetry)
 	if cfg.MaxKnownDepth >= 0 {
 		dstQueue.SetMaxKnownDepth(cfg.MaxKnownDepth)
 	}
-	dstQueue.InitializeWithContext(boltDB, cfg.DstAdapter, srcQueue, cfg.ShutdownContext)
+	dstQueue.InitializeWithContext(boltDB, cfg.DstAdapter, cfg.ShutdownContext)
 
 	// Set initial rounds to 0 for retry sweep
 	srcQueue.SetRound(0)

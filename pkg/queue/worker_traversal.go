@@ -94,10 +94,8 @@ func (w *TraversalWorker) Run() {
 		}
 
 		// For retry sweep mode, check if task is excluded (O(1) check)
-		w.queue.mu.RLock()
-		mode := w.queue.mode
-		boltDB := w.queue.boltDB
-		w.queue.mu.RUnlock()
+		mode := w.queue.getMode()
+		boltDB := w.queue.getBoltDB()
 		if mode == QueueModeRetry && boltDB != nil && task.ID != "" {
 			queueType := getQueueType(w.queueName)
 			exists, mode, err := db.CheckHoldingEntry(boltDB, queueType, task.ID)
@@ -128,10 +126,8 @@ func (w *TraversalWorker) Run() {
 			// Report failure - queue will handle retry logic
 			w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
 			// Check if task was retried for logging
-			w.queue.mu.RLock()
 			nodeID := task.ID
-			_, willRetry := w.queue.pendingSet[nodeID]
-			w.queue.mu.RUnlock()
+			willRetry := w.queue.isInPendingSet(nodeID)
 			w.logError(task, err, willRetry)
 		} else {
 			// Task succeeded
