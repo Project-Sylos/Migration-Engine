@@ -68,12 +68,6 @@ func (q *Queue) getPendingCount() int {
 	return len(q.pendingBuff)
 }
 
-func (q *Queue) getFirstPullForRound() bool {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	return q.firstPullForRound
-}
-
 func (q *Queue) getLastPullWasPartial() bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()

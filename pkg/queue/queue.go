@@ -51,25 +51,27 @@ const (
 // It handles task leasing, retry logic, and cross-queue task propagation.
 // All operational state lives in BoltDB, flushed via per-queue buffers.
 type Queue struct {
-	name               string               // Queue name ("src" or "dst")
-	mode               QueueMode            // Operation mode (traversal/exclusion/retry)
-	mu                 sync.RWMutex         // Protects all internal state
-	state              QueueState           // Lifecycle state (running/paused/stopped/completed/waiting)
-	inProgress         map[string]*TaskBase // Tasks currently being executed (keyed by ULID)
-	pendingBuff        []*TaskBase          // Local task buffer fetched from BoltDB
-	pendingSet         map[string]struct{}  // Fast lookup for pending buffer dedupe (keyed by ULID)
-	leasedKeys         map[string]struct{}  // ULIDs already pulled/leased - prevents duplicate pulls from stale views
-	pulling            bool                 // Indicates a pull operation is active
-	pullLowWM          int                  // Low watermark threshold for pulling more work
-	lastPullWasPartial bool                 // True if last pull returned fewer tasks than requested (partial batch)
-	firstPullForRound  bool                 // True if we haven't done the first pull for the current round yet (used for DST gate check)
-	maxRetries         int                  // Maximum retry attempts per task
-	round              int                  // Current BFS round/depth level
-	workers            []Worker             // Workers associated with this queue (for reference only)
-	boltDB             *db.DB               // BoltDB for operational queue storage
-	srcQueue           *Queue               // For dst queue: reference to src queue for BoltDB lookups
-	coordinator        *QueueCoordinator    // Coordinator for round advancement gates (DST only)
-	outputBuffer       *db.OutputBuffer     // Buffer for batched write operations
+	name                         string               // Queue name ("src" or "dst")
+	mode                         QueueMode            // Operation mode (traversal/exclusion/retry)
+	mu                           sync.RWMutex         // Protects all internal state
+	state                        QueueState           // Lifecycle state (running/paused/stopped/completed/waiting)
+	inProgress                   map[string]*TaskBase // Tasks currently being executed (keyed by ULID)
+	pendingBuff                  []*TaskBase          // Local task buffer fetched from BoltDB
+	pendingSet                   map[string]struct{}  // Fast lookup for pending buffer dedupe (keyed by ULID)
+	leasedKeys                   map[string]struct{}  // ULIDs already pulled/leased - prevents duplicate pulls from stale views
+	pulling                      bool                 // Indicates a pull operation is active
+	pullLowWM                    int                  // Low watermark threshold for pulling more work
+	lastPullWasPartial           bool                 // True if last pull returned fewer tasks than requested (partial batch)
+	firstPullForRound            bool                 // True if we haven't done the first pull for the current round yet (used for DST gate check)
+	shouldCheckRoundComplete     bool                 // Soft flag: indicates round completion should be checked (set by task complete/pull)
+	shouldCheckTraversalComplete bool                 // Soft flag: indicates traversal completion should be checked (set by pull)
+	maxRetries                   int                  // Maximum retry attempts per task
+	round                        int                  // Current BFS round/depth level
+	workers                      []Worker             // Workers associated with this queue (for reference only)
+	boltDB                       *db.DB               // BoltDB for operational queue storage
+	srcQueue                     *Queue               // For dst queue: reference to src queue for BoltDB lookups
+	coordinator                  *QueueCoordinator    // Coordinator for round advancement gates (DST only)
+	outputBuffer                 *db.OutputBuffer     // Buffer for batched write operations
 	// Round-based statistics for completion detection
 	roundStats  map[int]*RoundStats // Per-round statistics (key: round number, value: stats for that round)
 	shutdownCtx context.Context     // Context for shutdown signaling (optional)
@@ -377,10 +379,9 @@ func (q *Queue) Lease() *TaskBase {
 // CompletionCheckOptions configures what actions to take during completion checks.
 type CompletionCheckOptions struct {
 	CheckRoundComplete     bool // Check if current round is complete
-	CheckDstComplete       bool // Check if DST queue is complete (DST only)
+	CheckTraversalComplete bool // Check if traversal is complete (first pull with 0 items)
 	AdvanceRoundIfComplete bool // Advance to next round if current round is complete
-	MarkDstCompleteIfDone  bool // Mark DST as complete if done (DST only)
-	RequireFirstPull       bool // Only mark DST complete on first pull (DST only)
+	WasFirstPull           bool // Whether this is the first pull of the round (passed from caller)
 	FlushBuffer            bool // Flush buffer before checking DB
 }
 
@@ -394,17 +395,18 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 		outputBuffer.Flush()
 	}
 
-	// For DST completion check
-	if opts.CheckDstComplete && opts.MarkDstCompleteIfDone {
-		if q.name != "dst" || q.coordinator == nil {
+	// For traversal completion check (unified for both SRC and DST)
+	if opts.CheckTraversalComplete {
+		// Skip check if queue is in waiting state (DST gating)
+		queueState := q.getState()
+		if queueState == QueueStateWaiting {
 			return false
 		}
 
 		// Check state and conditions after flush
 		inProgressCount := q.getInProgressCount()
 		pendingBuffCount := q.getPendingCount()
-		wasFirstPull := q.getFirstPullForRound()
-		queueState := q.getState()
+		wasFirstPull := opts.WasFirstPull // Use passed value instead of reading from queue
 		boltDB := q.getBoltDB()
 
 		// If we have tasks in progress or in buffer, we're definitely not done
@@ -412,8 +414,8 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			return false
 		}
 
-		// If requireFirstPull is true, only mark complete on first pull
-		if opts.RequireFirstPull && !wasFirstPull {
+		// Only mark complete on first pull (if WasFirstPull is false, we're not on first pull)
+		if !wasFirstPull {
 			return false
 		}
 
@@ -422,48 +424,40 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			return false
 		}
 
+		queueType := getQueueType(q.name)
 		fmt.Printf("Checking for completion for round %d\n", currentRound)
 
 		// Check DB for pending items (buffer already flushed above)
-		hasPending, err := boltDB.HasStatusBucketItems("DST", currentRound, db.StatusPending)
+		hasPending, err := boltDB.HasStatusBucketItems(queueType, currentRound, db.StatusPending)
 		if err != nil {
 			return false
 		}
 
 		if !hasPending {
-			// No pending tasks in current round
-			q.mu.Lock()
-			if queueState == QueueStateRunning || queueState == QueueStateWaiting {
-				if wasFirstPull {
-					// Traversal is complete ONLY if this is the first pull of the round and there are no pendings
-					if logservice.LS != nil {
-						_ = logservice.LS.Log("info",
-							fmt.Sprintf("No pending tasks found for round %d - traversal complete (first pull)", currentRound),
-							"queue", q.name, q.name)
-					}
-					q.state = QueueStateCompleted
-					if q.coordinator != nil {
-						fmt.Printf("Marking DST as completed for round %d\n", currentRound)
-						q.coordinator.MarkDstCompleted()
-					}
-					q.mu.Unlock()
-					return true
-				} else {
-					// No pending tasks, but not first pull - just advance the round if needed.
-					if logservice.LS != nil {
-						_ = logservice.LS.Log("info",
-							fmt.Sprintf("No pending tasks found for round %d (not first pull) - advancing round", currentRound),
-							"queue", q.name, q.name)
-					}
-					q.mu.Unlock()
-					// Advance round if requested
-					if opts.AdvanceRoundIfComplete {
-						q.advanceToNextRound()
-					}
-					return false
+			// No pending tasks in current round - traversal is complete
+
+			state := q.getState()
+			if state == QueueStateRunning || state == QueueStateWaiting {
+				if logservice.LS != nil {
+					_ = logservice.LS.Log("info",
+						fmt.Sprintf("No pending tasks found for round %d - traversal complete (first pull)", currentRound),
+						"queue", q.name, q.name)
 				}
+				q.setState(QueueStateCompleted)
+
+				// Get coordinator reference before calling methods (avoid holding queue lock)
+				coordinator := q.getCoordinator()
+				if coordinator != nil {
+					// Call coordinator methods outside of any queue locks to avoid deadlock
+					switch queueType {
+					case "SRC":
+						coordinator.MarkSrcCompleted()
+					case "DST":
+						coordinator.MarkDstCompleted()
+					}
+				}
+				return true
 			}
-			q.mu.Unlock()
 			return false
 		}
 
@@ -634,39 +628,18 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 			continue
 		}
 
-		childState := childResultToNodeState(child, parentPath, nextRound, queueType)
+		childState := childResultToNodeState(child, parentPath, nextRound, queueType, nodeID)
 		if childState == nil {
 			continue
 		}
 
-		// Determine traversal status based on child status
-		// For SRC: folders are "Pending" (need traversal), files are "Successful" (no traversal needed)
-		// For DST: folders get status from comparison, files are ALWAYS "Successful" (no traversal)
-		//          Note: DST file "Pending" status means COPY needed, not traversal needed
-		var status string
-
-		if child.IsFile {
-			// Files (both SRC and DST) NEVER need traversal - always mark as successful
-			// For DST files, "Pending" from comparison means copy needed, not traversal
-			status = db.StatusSuccessful
-		} else {
-			// For folders, determine traversal status from comparison/discovery
-			status = db.StatusPending // Default for folders needing traversal
-			switch child.Status {
-			case "Successful":
-				status = db.StatusSuccessful
-			case "NotOnSrc":
-				status = db.StatusNotOnSrc
-			}
-		}
-
 		// Populate traversal status in the NodeState metadata
-		childState.TraversalStatus = status
+		childState.TraversalStatus = child.Status
 
 		childNodesToInsert = append(childNodesToInsert, db.InsertOperation{
 			QueueType: queueType,
 			Level:     nextRound,
-			Status:    status,
+			Status:    child.Status,
 			State:     childState,
 		})
 
@@ -688,7 +661,7 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		for _, child := range task.DiscoveredChildren {
 			if !child.IsFile {
 				totalFolders++
-				if child.Status == "Pending" {
+				if child.Status == db.StatusPending {
 					pendingFolders++
 					f := child.Folder
 					f.DepthLevel = nextRound
@@ -705,6 +678,8 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 				Round:  nextRound,
 			})
 			if taskState != nil {
+				// Set parent's ULID for database relationships
+				taskState.ParentID = nodeID
 				// Populate traversal status in the NodeState metadata
 				taskState.TraversalStatus = db.StatusPending
 
@@ -733,6 +708,22 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		if len(childNodesToInsert) > 0 {
 			q.outputBuffer.AddBatchInsert(childNodesToInsert)
 		}
+	}
+
+	// Set soft flag for round completion check (Run() loop will do the hard check)
+	// Round might be complete if: no in-progress, no pending buffer, and last pull was partial
+	q.mu.RLock()
+	pendingCount := len(q.pendingBuff)
+	inProgressCount := len(q.inProgress)
+	lastPullWasPartial := q.lastPullWasPartial
+	queueState := q.state
+	q.mu.RUnlock()
+
+	// Set soft flag if conditions suggest round might be complete
+	if (queueState == QueueStateRunning || queueState == QueueStateWaiting) && inProgressCount == 0 && pendingCount == 0 && lastPullWasPartial {
+		q.mu.Lock()
+		q.shouldCheckRoundComplete = true
+		q.mu.Unlock()
 	}
 }
 
@@ -763,7 +754,7 @@ func (q *Queue) completeExclusionTask(task *TaskBase) {
 	// Queue just needs to track completion stats
 }
 
-func childResultToNodeState(child ChildResult, parentPath string, depth int, queueType string) *db.NodeState {
+func childResultToNodeState(child ChildResult, parentPath string, depth int, queueType string, parentID string) *db.NodeState {
 	// Generate ULID for internal ID
 	nodeID := db.GenerateNodeID()
 	if nodeID == "" {
@@ -782,7 +773,7 @@ func childResultToNodeState(child ChildResult, parentPath string, depth int, que
 		return &db.NodeState{
 			ID:              nodeID,         // ULID for database keys
 			ServiceID:       file.ServiceID, // FS identifier
-			ParentID:        "",             // Will be looked up by parent path if needed
+			ParentID:        parentID,       // Parent's ULID for database relationships
 			ParentServiceID: file.ParentId,  // Parent's FS identifier
 			ParentPath:      parentPath,
 			Name:            file.DisplayName,
@@ -801,7 +792,7 @@ func childResultToNodeState(child ChildResult, parentPath string, depth int, que
 	return &db.NodeState{
 		ID:              nodeID,           // ULID for database keys
 		ServiceID:       folder.ServiceID, // FS identifier
-		ParentID:        "",               // Will be looked up by parent path if needed
+		ParentID:        parentID,         // Parent's ULID for database relationships
 		ParentServiceID: folder.ParentId,  // Parent's FS identifier
 		ParentPath:      parentPath,
 		Name:            folder.DisplayName,
@@ -1334,6 +1325,14 @@ func (q *Queue) Run() {
 					fmt.Sprintf("Run() exiting - queue %s (round %d)", state, currentRound),
 					"queue", q.name, q.name)
 			}
+			fmt.Printf("[DEBUG] Run() loop exiting outer loop - state=%s for %s\n", state, q.name)
+			// Stop output buffer when queue completes to prevent goroutine leak
+			q.mu.RLock()
+			outputBuffer := q.outputBuffer
+			q.mu.RUnlock()
+			if outputBuffer != nil {
+				outputBuffer.Stop()
+			}
 			return
 		}
 
@@ -1389,6 +1388,8 @@ func (q *Queue) Run() {
 
 			q.mu.RLock()
 			innerState := q.state
+			shouldCheckRound := q.shouldCheckRoundComplete
+			shouldCheckTraversal := q.shouldCheckTraversalComplete
 			q.mu.RUnlock()
 
 			// If paused, block here (pause blocks everything)
@@ -1399,41 +1400,61 @@ func (q *Queue) Run() {
 
 			// If stopped or completed, exit
 			if innerState == QueueStateStopped || innerState == QueueStateCompleted {
+				fmt.Printf("[DEBUG] Run() loop exiting inner loop - state=%s for %s\n", innerState, q.name)
+				// Stop output buffer when queue completes to prevent goroutine leak
+				q.mu.RLock()
+				outputBuffer := q.outputBuffer
+				q.mu.RUnlock()
+				if outputBuffer != nil {
+					fmt.Printf("[DEBUG] Stopping output buffer for %s (from inner loop)\n", q.name)
+					outputBuffer.Stop()
+					fmt.Printf("[DEBUG] Output buffer stopped for %s (from inner loop)\n", q.name)
+				}
 				return
 			}
 
-			// Check periodically if round advanced (for outer loop to continue)
-			if q.getRound() != currentRound {
-				break // Round advanced, continue outer loop
-			}
+			// Check traversal completion if soft flag is set (only Run() loop can do hard checks)
+			if shouldCheckTraversal {
+				q.mu.Lock()
+				q.shouldCheckTraversalComplete = false // Clear flag
+				roundToCheck := q.round
+				// Flag is only set when it was the first pull, so wasFirstPull is true
+				wasFirstPull := true
+				q.mu.Unlock()
 
-			// Periodic completion check: check if round is complete or queue is done
-			// This replaces event-driven checks from ReportTaskResult to avoid race conditions
-			q.mu.RLock()
-			pendingCount := len(q.pendingBuff)
-			inProgressCount := len(q.inProgress)
-			lastPullWasPartial := q.lastPullWasPartial
-			state := q.state
-			q.mu.RUnlock()
-
-			// Only check if queue is running
-			if state == QueueStateRunning || state == QueueStateWaiting {
-
-				// Check if round is complete (inProgress + pendingBuff == 0 AND lastPullWasPartial == true)
-				// Only check if we truly have no work left
-				if inProgressCount == 0 && pendingCount == 0 && lastPullWasPartial {
+				completed := q.checkCompletion(roundToCheck, CompletionCheckOptions{
+					CheckTraversalComplete: true,
+					WasFirstPull:           wasFirstPull,
+					FlushBuffer:            true,
+				})
+				if completed {
+					fmt.Printf("[DEBUG] Run() loop returning - traversal completed for %s\n", q.name)
+					// Stop output buffer when queue completes to prevent goroutine leak
 					q.mu.RLock()
-					roundToCheck := q.round
+					outputBuffer := q.outputBuffer
 					q.mu.RUnlock()
-					q.checkCompletion(roundToCheck, CompletionCheckOptions{
-						CheckRoundComplete:     true,
-						AdvanceRoundIfComplete: true,
-						FlushBuffer:            true,
-					})
+					if outputBuffer != nil {
+						outputBuffer.Stop()
+					}
+					return
 				}
 			}
 
-			// After checking completion, re-check if round advanced (it might have advanced)
+			// Check round completion if soft flag is set (only Run() loop can do hard checks)
+			if shouldCheckRound {
+				q.mu.Lock()
+				q.shouldCheckRoundComplete = false // Clear flag
+				roundToCheck := q.round
+				q.mu.Unlock()
+
+				q.checkCompletion(roundToCheck, CompletionCheckOptions{
+					CheckRoundComplete:     true,
+					AdvanceRoundIfComplete: true,
+					FlushBuffer:            true,
+				})
+			}
+
+			// Check periodically if round advanced (for outer loop to continue)
 			if q.getRound() != currentRound {
 				break // Round advanced, continue outer loop
 			}

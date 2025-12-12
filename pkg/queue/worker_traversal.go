@@ -197,7 +197,7 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 			childFolder.DepthLevel = task.Round + 1
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				Folder: childFolder,
-				Status: "Pending",
+				Status: db.StatusPending,
 				IsFile: false,
 			})
 		}
@@ -207,7 +207,7 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 			childFile.DepthLevel = task.Round + 1
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				File:   childFile,
-				Status: "Successful", // Files are immediately successful (no traversal needed)
+				Status: db.StatusSuccessful, // Files are immediately successful (no traversal needed)
 				IsFile: true,
 			})
 		}
@@ -271,7 +271,7 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				Folder: actualFolder,
-				Status: "Successful",
+				Status: db.StatusPending,
 				IsFile: false,
 				SrcID:  srcID,
 			})
@@ -285,7 +285,7 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 			// Folder exists on dst but not src: mark as "NotOnSrc"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				Folder: actualFolder,
-				Status: "NotOnSrc",
+				Status: db.StatusNotOnSrc,
 				IsFile: false,
 				SrcID:  "", // No SRC node for items not on src
 			})
@@ -293,26 +293,26 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 	}
 
 	// Compare files by Type + Name
-	for _, expectedFile := range expectedFiles {
-		matchKey := expectedFile.Type + ":" + expectedFile.DisplayName
-		if actualFile, exists := actualFileMap[matchKey]; exists {
-			// File exists on both: compare timestamps to determine status
-			// Files don't need traversal, but we still compare to determine if copy is needed
-			status := compareTimestamps(expectedFile.LastUpdated, actualFile.LastUpdated)
+	// for _, expectedFile := range expectedFiles {
+	// 	matchKey := expectedFile.Type + ":" + expectedFile.DisplayName
+	// 	if actualFile, exists := actualFileMap[matchKey]; exists {
+	// 		// File exists on both: compare timestamps to determine status
+	// 		// Files don't need traversal, but we still compare to determine if copy is needed
+	// 		status := compareTimestamps(expectedFile.LastUpdated, actualFile.LastUpdated)
 
-			// Get SRC node ID from map
-			srcID := srcIDMap[matchKey]
+	// 		// Get SRC node ID from map
+	// 		srcID := srcIDMap[matchKey]
 
-			// TODO: During copy phase, update NodeState.CopyStatus for pending files
+	// 		// TODO: During copy phase, update NodeState.CopyStatus for pending files
 
-			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
-				File:   actualFile,
-				Status: status,
-				IsFile: true,
-				SrcID:  srcID,
-			})
-		}
-	}
+	// 		task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
+	// 			File:   actualFile,
+	// 			Status: status,
+	// 			IsFile: true,
+	// 			SrcID:  srcID,
+	// 		})
+	// 	}
+	// }
 
 	// Check for extra files on dst (not on src)
 	for _, actualFile := range actualResult.Files {
@@ -335,24 +335,24 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 // Returns:
 // - "Successful" if dst is newer (no copy needed)
 // - "Pending" if src is newer (copy needed) or if timestamps are equal
-func compareTimestamps(srcMTime, dstMTime string) string {
-	// Parse timestamps (RFC3339 format)
-	srcTime, err1 := time.Parse(time.RFC3339, srcMTime)
-	dstTime, err2 := time.Parse(time.RFC3339, dstMTime)
+// func compareTimestamps(srcMTime, dstMTime string) string {
+// 	// Parse timestamps (RFC3339 format)
+// 	srcTime, err1 := time.Parse(time.RFC3339, srcMTime)
+// 	dstTime, err2 := time.Parse(time.RFC3339, dstMTime)
 
-	// If parsing fails, default to "Pending" (conservative - assume copy needed)
-	if err1 != nil || err2 != nil {
-		return "Pending"
-	}
+// 	// If parsing fails, default to "Pending" (conservative - assume copy needed)
+// 	if err1 != nil || err2 != nil {
+// 		return "Pending"
+// 	}
 
-	// If dst is newer, no copy needed - mark as successful
-	if dstTime.After(srcTime) {
-		return "Successful"
-	}
+// 	// If dst is newer, no copy needed - mark as successful
+// 	if dstTime.After(srcTime) {
+// 		return "Successful"
+// 	}
 
-	// If src is newer or equal, copy is needed - mark as pending
-	return "Pending"
-}
+// 	// If src is newer or equal, copy is needed - mark as pending
+// 	return "Pending"
+// }
 
 // logError logs a failed task execution.
 func (w *TraversalWorker) logError(task *TaskBase, err error, willRetry bool) {

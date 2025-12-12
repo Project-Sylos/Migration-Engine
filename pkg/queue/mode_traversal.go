@@ -94,45 +94,27 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		return
 	}
 
-	// Pull was successful - set firstPullForRound = false only if we actually fetched tasks
-	// This ensures we only mark completion on the actual first pull that fetched tasks
-	if wasFirstPullForRound && len(batch) > 0 {
+	// Set soft flag for traversal completion check (Run() loop will do the hard check)
+	// Only set on first pull with 0 items - Run() loop will check if we're truly complete
+	if wasFirstPullForRound && len(batch) == 0 && currentRound > 0 {
+		q.mu.RLock()
+		pendingCount := len(q.pendingBuff)
+		inProgressCount := len(q.inProgress)
+		queueState := q.state
+		q.mu.RUnlock()
+
+		// Set soft flag if conditions suggest traversal might be complete
+		// Skip if queue is in waiting state (DST gating)
+		if queueState != QueueStateWaiting && inProgressCount == 0 && pendingCount == 0 {
+			q.mu.Lock()
+			q.shouldCheckTraversalComplete = true
+			q.mu.Unlock()
+		}
+	}
+
+	// Mark that we've done the first pull
+	if wasFirstPullForRound {
 		q.setFirstPullForRound(false)
-	}
-
-	// For DST: Check completion AFTER pulling to ensure workers have finished adding tasks
-	// This prevents race conditions where workers are still completing tasks that add pending items
-	if q.name == "dst" && coordinator != nil && currentRound > 0 && wasFirstPullForRound && len(batch) == 0 {
-		// First pull returned empty - check if we're truly complete (no in-progress, no pending buffer, no DB pending)
-		if q.checkCompletion(currentRound, CompletionCheckOptions{
-			CheckDstComplete:      true,
-			MarkDstCompleteIfDone: true,
-			RequireFirstPull:      true,
-			FlushBuffer:           true,
-		}) {
-			return
-		}
-		// If checkCompletion returned false, there might be tasks in progress or buffer
-		// Don't mark as complete yet - let workers finish and check again later
-	}
-
-	// we've exhausted max depth - mark queue as completed (only if not DST, or if DST check above passed)
-	if wasFirstPullForRound && len(batch) == 0 {
-		// For DST, completion was already checked above, so if we reach here it means checkCompletion returned false
-		// For SRC, we can mark as complete directly
-		if q.name != "dst" {
-			if logservice.LS != nil {
-				_ = logservice.LS.Log("info",
-					fmt.Sprintf("First pull for round %d returned empty batch - traversal complete (max depth exhausted)", currentRound),
-					"queue", q.name, q.name)
-			}
-			q.setState(QueueStateCompleted)
-			// Update coordinator
-			if coordinator != nil {
-				coordinator.MarkSrcCompleted()
-			}
-			return
-		}
 	}
 
 	// Batch-load expected children for DST tasks
@@ -210,4 +192,5 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	// Track if this pull was partial (fewer tasks than requested)
 	// This signals we might have exhausted the current round
 	q.setLastPullWasPartial(len(batch) < defaultLeaseBatchSize)
+
 }
