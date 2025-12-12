@@ -93,10 +93,8 @@ func (w *ExclusionWorker) Run() {
 					"worker", w.id, w.queueName)
 			}
 			w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
-			w.queue.mu.RLock()
 			nodeID := task.ID
-			_, willRetry := w.queue.pendingSet[nodeID]
-			w.queue.mu.RUnlock()
+			willRetry := w.queue.isInPendingSet(nodeID)
 			w.logError(task, err, willRetry)
 		} else {
 			w.queue.ReportTaskResult(task, TaskExecutionResultSuccessful)
@@ -123,9 +121,7 @@ func (w *ExclusionWorker) execute(task *TaskBase) error {
 	queueType := getQueueType(w.queueName)
 
 	// Get queue's output buffer for write operations
-	w.queue.mu.RLock()
-	outputBuffer := w.queue.outputBuffer
-	w.queue.mu.RUnlock()
+	outputBuffer := w.queue.getOutputBuffer()
 
 	// Read children ULIDs from children bucket (DB lookup)
 	childIDs, err := w.getChildrenIDs(queueType, nodeID)
@@ -399,9 +395,7 @@ func (w *ExclusionWorker) executeFileExclusion(task *TaskBase) error {
 	}
 	queueType := getQueueType(w.queueName)
 
-	w.queue.mu.RLock()
-	outputBuffer := w.queue.outputBuffer
-	w.queue.mu.RUnlock()
+	outputBuffer := w.queue.getOutputBuffer()
 
 	// For unexclude mode, check if ancestor is still excluded
 	if task.ExclusionMode == "unexclude" {

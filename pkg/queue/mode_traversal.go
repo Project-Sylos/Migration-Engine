@@ -97,18 +97,14 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	// Set soft flag for traversal completion check (Run() loop will do the hard check)
 	// Only set on first pull with 0 items - Run() loop will check if we're truly complete
 	if wasFirstPullForRound && len(batch) == 0 && currentRound > 0 {
-		q.mu.RLock()
-		pendingCount := len(q.pendingBuff)
-		inProgressCount := len(q.inProgress)
-		queueState := q.state
-		q.mu.RUnlock()
+		pendingCount := q.getPendingCount()
+		inProgressCount := q.getInProgressCount()
+		queueState := q.getState()
 
 		// Set soft flag if conditions suggest traversal might be complete
 		// Skip if queue is in waiting state (DST gating)
 		if queueState != QueueStateWaiting && inProgressCount == 0 && pendingCount == 0 {
-			q.mu.Lock()
-			q.shouldCheckTraversalComplete = true
-			q.mu.Unlock()
+			q.setShouldCheckTraversalComplete(true)
 		}
 	}
 
