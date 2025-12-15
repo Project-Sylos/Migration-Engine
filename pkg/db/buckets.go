@@ -10,12 +10,55 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
+// GetMaxKnownDepth scans the levels bucket and returns the highest level number found.
+// Returns -1 if no levels exist or on error.
+func (db *DB) GetMaxKnownDepth(queueType string) int {
+	maxDepth := -1
+
+	_ = db.db.View(func(tx *bolt.Tx) error {
+		traversalBucket := tx.Bucket([]byte("Traversal-Data"))
+		if traversalBucket == nil {
+			return nil
+		}
+
+		topBucket := traversalBucket.Bucket([]byte(queueType))
+		if topBucket == nil {
+			return nil
+		}
+
+		levelsBucket := topBucket.Bucket([]byte(SubBucketLevels))
+		if levelsBucket == nil {
+			return nil
+		}
+
+		// Iterate through all level buckets
+		cursor := levelsBucket.Cursor()
+		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+			// Parse level number from bucket name (format: "00000000", "00000001", etc.)
+			levelStr := string(k)
+			levelNum, err := strconv.Atoi(levelStr)
+			if err != nil {
+				// Skip non-numeric bucket names
+				continue
+			}
+			if levelNum > maxDepth {
+				maxDepth = levelNum
+			}
+		}
+
+		return nil
+	})
+
+	return maxDepth
+}
+
 // Status constants for both traversal and copy phases
 const (
 	StatusPending    = "pending"
 	StatusSuccessful = "successful"
 	StatusFailed     = "failed"
 	StatusNotOnSrc   = "not_on_src" // Only for dst nodes during traversal
+	StatusExcluded   = "excluded"   // Node is excluded from migration
 )
 
 // Legacy constants for compatibility during migration
@@ -46,6 +89,8 @@ const (
 	SubBucketExclusionHolding   = "exclusion-holding"
 	SubBucketUnexclusionHolding = "unexclusion-holding"
 	SubBucketJoinLookup         = "join-lookup"
+	SubBucketSrcToDst           = "src-to-dst"
+	SubBucketDstToSrc           = "dst-to-src"
 )
 
 // FormatLevel formats a level number as an 8-digit zero-padded string.
@@ -138,7 +183,7 @@ func EnsureLevelBucket(tx *bolt.Tx, queueType string, level int) error {
 	}
 
 	// Create status sub-buckets
-	statuses := []string{StatusPending, StatusSuccessful, StatusFailed}
+	statuses := []string{StatusPending, StatusSuccessful, StatusFailed, StatusExcluded}
 	if queueType == BucketDst {
 		statuses = append(statuses, StatusNotOnSrc)
 	}
@@ -295,4 +340,40 @@ func GetJoinLookupBucket(tx *bolt.Tx) *bolt.Bucket {
 // GetOrCreateJoinLookupBucket returns or creates the join-lookup bucket for DST→SRC node mapping.
 func GetOrCreateJoinLookupBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
 	return getOrCreateBucket(tx, GetJoinLookupBucketPath())
+}
+
+// GetSrcToDstBucketPath returns the bucket path for the src-to-dst lookup bucket.
+// Returns: ["Traversal-Data", "SRC", "src-to-dst"]
+// This bucket maps SRC node ULIDs to corresponding DST node ULIDs (1:1 mapping).
+func GetSrcToDstBucketPath() []string {
+	return []string{TraversalDataBucket, BucketSrc, SubBucketSrcToDst}
+}
+
+// GetSrcToDstBucket returns the src-to-dst lookup bucket for SRC→DST node mapping.
+// Returns nil if the bucket doesn't exist.
+func GetSrcToDstBucket(tx *bolt.Tx) *bolt.Bucket {
+	return getBucket(tx, GetSrcToDstBucketPath())
+}
+
+// GetOrCreateSrcToDstBucket returns or creates the src-to-dst lookup bucket for SRC→DST node mapping.
+func GetOrCreateSrcToDstBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
+	return getOrCreateBucket(tx, GetSrcToDstBucketPath())
+}
+
+// GetDstToSrcBucketPath returns the bucket path for the dst-to-src lookup bucket.
+// Returns: ["Traversal-Data", "DST", "dst-to-src"]
+// This bucket maps DST node ULIDs to corresponding SRC node ULIDs (1:1 mapping).
+func GetDstToSrcBucketPath() []string {
+	return []string{TraversalDataBucket, BucketDst, SubBucketDstToSrc}
+}
+
+// GetDstToSrcBucket returns the dst-to-src lookup bucket for DST→SRC node mapping.
+// Returns nil if the bucket doesn't exist.
+func GetDstToSrcBucket(tx *bolt.Tx) *bolt.Bucket {
+	return getBucket(tx, GetDstToSrcBucketPath())
+}
+
+// GetOrCreateDstToSrcBucket returns or creates the dst-to-src lookup bucket for DST→SRC node mapping.
+func GetOrCreateDstToSrcBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
+	return getOrCreateBucket(tx, GetDstToSrcBucketPath())
 }

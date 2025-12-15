@@ -5,6 +5,7 @@ package db
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -164,6 +165,89 @@ func (op *ExclusionHoldingAddOperation) Execute(tx *bolt.Tx) error {
 	return holdingBucket.Put([]byte(op.NodeID), depthBytes)
 }
 
+// NodeDeletionOperation represents deletion of a node from all relevant buckets.
+type NodeDeletionOperation struct {
+	QueueType string
+	NodeID    string // ULID of the node
+	Level     int
+	Status    string // Current status before deletion (to determine which status bucket to update)
+}
+
+// Execute performs the node deletion within a transaction.
+// Deletes from: nodes bucket, status bucket, status-lookup bucket, and removes from parent's children list.
+func (op *NodeDeletionOperation) Execute(tx *bolt.Tx) error {
+	nodeID := []byte(op.NodeID)
+
+	// Get node state to determine parent ID
+	nodesBucket := GetNodesBucket(tx, op.QueueType)
+	if nodesBucket == nil {
+		return fmt.Errorf("nodes bucket not found for %s", op.QueueType)
+	}
+
+	nodeData := nodesBucket.Get(nodeID)
+	if nodeData == nil {
+		// Node already deleted, skip
+		return nil
+	}
+
+	// Deserialize to get parent ID
+	ns, err := DeserializeNodeState(nodeData)
+	if err != nil {
+		return fmt.Errorf("failed to deserialize node state: %w", err)
+	}
+
+	// 1. Delete from nodes bucket
+	if err := nodesBucket.Delete(nodeID); err != nil {
+		return fmt.Errorf("failed to delete from nodes bucket: %w", err)
+	}
+
+	// 2. Delete from status bucket
+	statusBucket := GetStatusBucket(tx, op.QueueType, op.Level, op.Status)
+	if statusBucket != nil {
+		statusBucket.Delete(nodeID) // Ignore errors - node may not be in this bucket
+	}
+
+	// 3. Delete from status-lookup bucket
+	lookupBucket := GetStatusLookupBucket(tx, op.QueueType, op.Level)
+	if lookupBucket != nil {
+		lookupBucket.Delete(nodeID) // Ignore errors
+	}
+
+	// 4. Remove from parent's children list
+	if ns.ParentID != "" {
+		childrenBucket := GetChildrenBucket(tx, op.QueueType)
+		if childrenBucket != nil {
+			parentID := []byte(ns.ParentID)
+			childrenData := childrenBucket.Get(parentID)
+			if childrenData != nil {
+				var children []string
+				if err := json.Unmarshal(childrenData, &children); err == nil {
+					// Remove this child's ULID
+					filtered := make([]string, 0, len(children))
+					for _, c := range children {
+						if c != op.NodeID {
+							filtered = append(filtered, c)
+						}
+					}
+
+					// Save updated list
+					if len(filtered) > 0 {
+						updatedData, err := json.Marshal(filtered)
+						if err == nil {
+							childrenBucket.Put(parentID, updatedData)
+						}
+					} else {
+						// No children left, remove entry
+						childrenBucket.Delete(parentID)
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 // OutputBuffer batches write operations for efficient database writes.
 // It supports three flush triggers: forced, size threshold, and time-based.
 type OutputBuffer struct {
@@ -254,6 +338,17 @@ func (ob *OutputBuffer) AddExclusionHoldingAdd(queueType string, nodeID string, 
 		QueueType: queueType,
 		NodeID:    nodeID,
 		Depth:     depth,
+	}
+	ob.Add(op)
+}
+
+// AddNodeDeletion adds a node deletion operation to the buffer.
+func (ob *OutputBuffer) AddNodeDeletion(queueType string, nodeID string, level int, status string) {
+	op := &NodeDeletionOperation{
+		QueueType: queueType,
+		NodeID:    nodeID,
+		Level:     level,
+		Status:    status,
 	}
 	ob.Add(op)
 }
@@ -418,6 +513,24 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 		case *ExclusionHoldingRemoveOperation, *ExclusionHoldingAddOperation:
 			// Exclusion-holding bucket operations don't affect stats
 			// No stats updates needed
+
+		case *NodeDeletionOperation:
+			// Node deletion: subtract from status bucket and nodes bucket
+			nodeID := []byte(v.NodeID)
+
+			// Check if status bucket has this entry
+			statusBucket := GetStatusBucket(tx, v.QueueType, v.Level, v.Status)
+			if statusBucket != nil && statusBucket.Get(nodeID) != nil {
+				statusKey := fmt.Sprintf("%s/%d/%s", v.QueueType, v.Level, v.Status)
+				oldStatusCounts[statusKey]++
+			}
+
+			// Always subtract from nodes bucket if node exists
+			nodesBucket := GetNodesBucket(tx, v.QueueType)
+			if nodesBucket != nil && nodesBucket.Get(nodeID) != nil {
+				nodesPath := strings.Join(GetNodesBucketPath(v.QueueType), "/")
+				deltas[nodesPath]--
+			}
 		}
 	}
 

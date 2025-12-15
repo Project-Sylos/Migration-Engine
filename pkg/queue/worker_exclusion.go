@@ -202,6 +202,11 @@ func (w *ExclusionWorker) executeExclude(task *TaskBase, childIDs []string, queu
 	// Only mark as inherited excluded if not already explicitly excluded
 	if !parentExplicitlyExcluded && outputBuffer != nil {
 		outputBuffer.AddExclusionUpdate(queueType, task.ID, true) // inherited_excluded = true
+
+		// Move node from previous status bucket to excluded status bucket
+		if task.PreviousStatus != "" && task.PreviousStatus != db.StatusExcluded {
+			outputBuffer.AddStatusUpdate(queueType, nodeState.Depth, task.PreviousStatus, db.StatusExcluded, task.ID)
+		}
 	}
 
 	// Step 2: Get all children (files and folders) and add them to exclusion-holding bucket
@@ -294,6 +299,10 @@ func (w *ExclusionWorker) executeUnexclude(task *TaskBase, nodeID string, childI
 
 		if !hasExcludedAncestor && outputBuffer != nil {
 			outputBuffer.AddExclusionUpdate(queueType, task.ID, false) // inherited_excluded = false
+
+			// Move from excluded status back to successful (unconditional for unexclusion tasks)
+			// We've already verified the node is in excluded bucket during pull
+			outputBuffer.AddStatusUpdate(queueType, nodeState.Depth, db.StatusExcluded, db.StatusSuccessful, task.ID)
 		}
 
 		task.DiscoveredChildren = make([]ChildResult, 0)
@@ -315,6 +324,10 @@ func (w *ExclusionWorker) executeUnexclude(task *TaskBase, nodeID string, childI
 	// Step 2: Mark the parent node as inherited excluded = false (if no excluded ancestor)
 	if !hasExcludedAncestor && outputBuffer != nil {
 		outputBuffer.AddExclusionUpdate(queueType, task.ID, false) // inherited_excluded = false
+
+		// Move from excluded status back to successful (unconditional for unexclusion tasks)
+		// We've already verified the node is in excluded bucket during pull
+		outputBuffer.AddStatusUpdate(queueType, nodeState.Depth, db.StatusExcluded, db.StatusSuccessful, task.ID)
 	}
 
 	if hasExcludedAncestor {
@@ -421,6 +434,19 @@ func (w *ExclusionWorker) executeFileExclusion(task *TaskBase) error {
 	if outputBuffer != nil {
 		inheritedExcluded := (task.ExclusionMode == "exclude")
 		outputBuffer.AddExclusionUpdate(queueType, nodeID, inheritedExcluded)
+
+		// Move node from previous status bucket to excluded status bucket (or back from excluded)
+		nodeState, _ := db.GetNodeState(w.boltDB, queueType, nodeID)
+		if nodeState != nil {
+			if task.ExclusionMode == "exclude" && task.PreviousStatus != "" && task.PreviousStatus != db.StatusExcluded {
+				// Moving to excluded status
+				outputBuffer.AddStatusUpdate(queueType, nodeState.Depth, task.PreviousStatus, db.StatusExcluded, nodeID)
+			} else if task.ExclusionMode == "unexclude" {
+				// Moving back from excluded to successful (unconditional for unexclusion tasks)
+				// We've already verified the node is in excluded bucket during pull
+				outputBuffer.AddStatusUpdate(queueType, nodeState.Depth, db.StatusExcluded, db.StatusSuccessful, nodeID)
+			}
+		}
 	}
 
 	task.DiscoveredChildren = make([]ChildResult, 0)

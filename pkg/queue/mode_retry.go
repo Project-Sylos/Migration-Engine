@@ -6,6 +6,8 @@ package queue
 import (
 	"fmt"
 
+	bolt "go.etcd.io/bbolt"
+
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 )
@@ -65,6 +67,78 @@ func (q *Queue) PullRetryTasks(force bool) {
 			}
 		}
 
+		// For SRC queue, handle DST node cleanup when retrying SRC nodes
+		if q.name == "src" && len(batch) > 0 {
+			// Collect SRC node IDs being retried
+			srcNodeIDs := make([]string, 0, len(batch))
+			for _, item := range batch {
+				if item.State != nil && item.State.ID != "" {
+					srcNodeIDs = append(srcNodeIDs, item.State.ID)
+				}
+			}
+
+			// Query SrcToDst lookup table for each SRC ID to get corresponding DST parent IDs
+			dstParentIDs := make(map[string]bool) // Use map to deduplicate
+			for _, srcID := range srcNodeIDs {
+				dstID, err := db.GetDstIDFromSrcID(boltDB, srcID)
+				if err == nil && dstID != "" {
+					dstParentIDs[dstID] = true
+				}
+			}
+
+			// For each DST parent ID found, mark as pending and delete its children
+			for dstParentID := range dstParentIDs {
+				// Get DST parent node state to determine its level
+				dstParentState, err := db.GetNodeState(boltDB, "DST", dstParentID)
+				if err != nil || dstParentState == nil {
+					continue // DST parent not found, skip
+				}
+
+				// Direct DB write: Mark DST parent as pending status
+				oldStatus := dstParentState.TraversalStatus
+				if oldStatus == "" {
+					// Try to get status from status-lookup bucket
+					var lookupStatus string
+					_ = boltDB.View(func(tx *bolt.Tx) error {
+						lookupBucket := db.GetStatusLookupBucket(tx, "DST", dstParentState.Depth)
+						if lookupBucket != nil {
+							statusData := lookupBucket.Get([]byte(dstParentID))
+							if statusData != nil {
+								lookupStatus = string(statusData)
+							}
+						}
+						return nil
+					})
+					if lookupStatus != "" {
+						oldStatus = lookupStatus
+					} else {
+						oldStatus = db.StatusSuccessful // Default assumption
+					}
+				}
+				_, err = db.UpdateNodeStatusByID(boltDB, "DST", dstParentState.Depth, oldStatus, db.StatusPending, dstParentID)
+				if err != nil {
+					if logservice.LS != nil {
+						_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to mark DST parent %s as pending: %v", dstParentID, err), "queue", q.name, q.name)
+					}
+					continue
+				}
+
+				// Query DST children bucket to get child node IDs for this parent
+				childIDs, err := db.GetChildrenIDsByParentID(boltDB, "DST", dstParentID)
+				if err != nil || len(childIDs) == 0 {
+					continue // No children or error
+				}
+
+				// Delete all DST child nodes using batch deletion (direct write)
+				if err := db.BatchDeleteNodes(boltDB, "DST", childIDs); err != nil {
+					if logservice.LS != nil {
+						_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to delete DST children for parent %s: %v", dstParentID, err), "queue", q.name, q.name)
+					}
+					// Continue anyway - deletion failure shouldn't block retry
+				}
+			}
+		}
+
 		taskType := TaskTypeSrcTraversal
 		if q.name == "dst" {
 			taskType = TaskTypeDstTraversal
@@ -84,20 +158,17 @@ func (q *Queue) PullRetryTasks(force bool) {
 			q.enqueuePending(task)
 		}
 
-		q.setLastPullWasPartial(len(batch) < defaultLeaseBatchSize)
+		wasPartial := len(batch) < defaultLeaseBatchSize
+		q.setLastPullWasPartial(wasPartial)
 
-		// Check if we've exhausted all known levels
-		if len(batch) == 0 && currentRound >= maxKnownDepth {
-			// Check if there are any more failed/pending tasks in deeper levels
-			// If not, retry sweep is complete
-			// For now, advance and let normal logic handle deeper discovery
-			q.setLastPullWasPartial(true)
-		}
+		// Record pull in RoundInfo
+		q.recordPull(currentRound, len(batch), wasPartial)
 
 		return
 	}
 
 	// For rounds > maxKnownDepth, use normal traversal pull logic
 	// This allows discovering new deeper levels
+	// Note: PullTraversalTasks will handle incrementing counters itself
 	q.PullTraversalTasks(force)
 }

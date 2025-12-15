@@ -99,6 +99,38 @@ func ScanExclusionHoldingBucketByLevel(db *DB, queueType string, currentLevel in
 	return entries, hasHigherLevels, err
 }
 
+// HasExclusionHoldingEntries checks if either exclusion-holding or unexclusion-holding bucket has any entries.
+// Returns true if at least one bucket has entries.
+func HasExclusionHoldingEntries(db *DB, queueType string) (bool, error) {
+	var hasEntries bool
+	err := db.View(func(tx *bolt.Tx) error {
+		// Check exclusion-holding bucket
+		exclusionBucket := GetExclusionHoldingBucket(tx, queueType)
+		if exclusionBucket != nil {
+			cursor := exclusionBucket.Cursor()
+			k, _ := cursor.First()
+			if k != nil {
+				hasEntries = true
+				return nil
+			}
+		}
+
+		// Check unexclusion-holding bucket
+		unexclusionBucket := GetUnexclusionHoldingBucket(tx, queueType)
+		if unexclusionBucket != nil {
+			cursor := unexclusionBucket.Cursor()
+			k, _ := cursor.First()
+			if k != nil {
+				hasEntries = true
+				return nil
+			}
+		}
+
+		return nil
+	})
+	return hasEntries, err
+}
+
 // AddHoldingEntry adds a ULID to the appropriate holding bucket (exclusion or unexclusion) with its depth level.
 func AddHoldingEntry(db *DB, queueType string, nodeID string, depth int, mode string) error {
 	return db.Update(func(tx *bolt.Tx) error {

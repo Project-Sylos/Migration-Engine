@@ -429,7 +429,20 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 				}
 			}
 
-			// SrcID is already populated in NodeState during matching, no join-lookup needed
+			// Store lookup mappings if SrcID is present in NodeState (for backward compatibility)
+			// For DST nodes, store DST→SRC and SRC→DST mappings
+			if op.QueueType == "DST" && op.State.SrcID != "" {
+				// Store DST→SRC mapping
+				dstToSrcBucket, err := GetOrCreateDstToSrcBucket(tx)
+				if err == nil {
+					dstToSrcBucket.Put(nodeID, []byte(op.State.SrcID))
+				}
+				// Store SRC→DST mapping
+				srcToDstBucket, err := GetOrCreateSrcToDstBucket(tx)
+				if err == nil {
+					srcToDstBucket.Put([]byte(op.State.SrcID), nodeID)
+				}
+			}
 		}
 
 		// Apply all stats updates in one batch
@@ -438,6 +451,118 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 			bucketPath := strings.Split(bucketPathStr, "/")
 			if err := updateBucketStats(tx, bucketPath, delta); err != nil {
 				return fmt.Errorf("failed to update stats for %s: %w", bucketPathStr, err)
+			}
+		}
+
+		return nil
+	})
+}
+
+// BatchDeleteNodes deletes multiple nodes by their IDs in a single transaction.
+// For each node ID, it retrieves the node state to determine level and status,
+// then deletes from all relevant buckets (nodes, status, status-lookup, children).
+func BatchDeleteNodes(db *DB, queueType string, nodeIDs []string) error {
+	if len(nodeIDs) == 0 {
+		return nil
+	}
+
+	return db.Update(func(tx *bolt.Tx) error {
+		nodesBucket := GetNodesBucket(tx, queueType)
+		if nodesBucket == nil {
+			return fmt.Errorf("nodes bucket not found for %s", queueType)
+		}
+
+		childrenBucket := GetChildrenBucket(tx, queueType)
+		if childrenBucket == nil {
+			return fmt.Errorf("children bucket not found for %s", queueType)
+		}
+
+		// Track parent updates to batch them
+		parentUpdates := make(map[string][]string) // parentID -> remaining children
+
+		for _, nodeIDStr := range nodeIDs {
+			nodeID := []byte(nodeIDStr)
+
+			// Get node state to determine level and status
+			nodeData := nodesBucket.Get(nodeID)
+			if nodeData == nil {
+				continue // Node already deleted, skip
+			}
+
+			ns, err := DeserializeNodeState(nodeData)
+			if err != nil {
+				return fmt.Errorf("failed to deserialize node state for %s: %w", nodeIDStr, err)
+			}
+
+			// Determine current status from status-lookup
+			lookupBucket := GetStatusLookupBucket(tx, queueType, ns.Depth)
+			var currentStatus string
+			if lookupBucket != nil {
+				statusData := lookupBucket.Get(nodeID)
+				if statusData != nil {
+					currentStatus = string(statusData)
+				}
+			}
+
+			// 1. Delete from nodes bucket
+			if err := nodesBucket.Delete(nodeID); err != nil {
+				return fmt.Errorf("failed to delete from nodes bucket: %w", err)
+			}
+
+			// 2. Delete from status bucket
+			if currentStatus != "" {
+				statusBucket := GetStatusBucket(tx, queueType, ns.Depth, currentStatus)
+				if statusBucket != nil {
+					statusBucket.Delete(nodeID) // Ignore errors
+				}
+			}
+
+			// 3. Delete from status-lookup bucket
+			if lookupBucket != nil {
+				lookupBucket.Delete(nodeID) // Ignore errors
+			}
+
+			// 4. Track parent for children list update
+			if ns.ParentID != "" {
+				if _, exists := parentUpdates[ns.ParentID]; !exists {
+					// Load current children list
+					parentID := []byte(ns.ParentID)
+					childrenData := childrenBucket.Get(parentID)
+					if childrenData != nil {
+						var children []string
+						if err := json.Unmarshal(childrenData, &children); err == nil {
+							parentUpdates[ns.ParentID] = children
+						}
+					} else {
+						parentUpdates[ns.ParentID] = []string{}
+					}
+				}
+				// Remove this child from the list
+				children := parentUpdates[ns.ParentID]
+				filtered := make([]string, 0, len(children))
+				for _, c := range children {
+					if c != nodeIDStr {
+						filtered = append(filtered, c)
+					}
+				}
+				parentUpdates[ns.ParentID] = filtered
+			}
+		}
+
+		// Apply all parent children list updates
+		for parentIDStr, children := range parentUpdates {
+			parentID := []byte(parentIDStr)
+			if len(children) > 0 {
+				childrenData, err := json.Marshal(children)
+				if err != nil {
+					return fmt.Errorf("failed to marshal children list: %w", err)
+				}
+				if err := childrenBucket.Put(parentID, childrenData); err != nil {
+					return fmt.Errorf("failed to update children list: %w", err)
+				}
+			} else {
+				// No children left, remove entry
+				childrenBucket.Delete(parentID)
 			}
 		}
 

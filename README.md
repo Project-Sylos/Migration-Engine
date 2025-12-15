@@ -145,22 +145,26 @@ The database is partitioned into two main areas:
   /SRC
     /nodes                  → ULID: NodeState JSON (canonical data)
     /children               → parentULID: []childULID JSON (tree relationships)
+    /src-to-dst             → srcULID: dstULID (join-lookup table)
     /levels
       /00000000
         /pending            → ULID: empty (membership set)
         /successful         → ULID: empty
         /failed             → ULID: empty
+        /excluded           → ULID: empty
         /status-lookup      → ULID: status string (reverse index)
       /00000001/...
   /DST
-    /nodes                  → ULID: NodeState JSON (includes src_id for matching)
+    /nodes                  → ULID: NodeState JSON (canonical data)
     /children               → parentULID: []childULID JSON (tree relationships)
+    /dst-to-src             → dstULID: srcULID (join-lookup table)
     /levels
       /00000000
         /pending
         /successful
         /failed
         /not_on_src         → ULID: empty (DST-specific status)
+        /excluded           → ULID: empty
         /status-lookup      → ULID: status string (reverse index)
       /00000001/...
   /STATS
@@ -188,7 +192,7 @@ This partitioning separates traversal operations (discovery/scanning phase) from
    - Status membership tracked in `/levels/{level}/{status}` buckets
    - Status-lookup index in `/levels/{level}/status-lookup` provides reverse lookup (ULID → status)
    - Tree relationships in `/children` buckets
-   - DST nodes store `src_id` field linking to corresponding SRC node ULID
+   - Join-lookup tables (`/src-to-dst` and `/dst-to-src`) map SRC and DST node ULIDs bidirectionally
 
 2. **Status Transitions are Atomic**
    Status transitions update multiple buckets atomically:
@@ -208,7 +212,7 @@ This partitioning separates traversal operations (discovery/scanning phase) from
 4. **ULID-Based Keys**
    - All internal operations use ULID (Universally Unique Lexicographically Sortable Identifier) for keys
    - ULIDs provide unique, sortable identifiers without path dependencies
-   - DST nodes store `src_id` field (ULID) linking to corresponding SRC node
+   - Join-lookup tables (`/src-to-dst` and `/dst-to-src`) provide bidirectional mapping between SRC and DST node ULIDs
    - Matching between SRC and DST nodes is done by Type + Name, not path
    - Hierarchy is natural and navigable through parent-child ULID relationships
 

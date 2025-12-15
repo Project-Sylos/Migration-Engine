@@ -4,9 +4,11 @@
 package shared
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"strings"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -161,8 +163,19 @@ func DeleteSubtree(boltDB *db.DB, queueType string, rootPath string) error {
 		return fmt.Errorf("failed to find root node: %w", err)
 	}
 
-	if err := dfsCollect(rootNode.ID); err != nil {
-		return err
+	// Collect all children of the root node (but NOT the root node itself)
+	// The root node should remain so it can be retried by the retry sweep
+	if rootNode.Type == "folder" {
+		childIDs, err := db.GetChildrenIDsByParentID(boltDB, queueType, rootNode.ID)
+		if err != nil {
+			return fmt.Errorf("failed to get children for root node: %w", err)
+		}
+
+		for _, childID := range childIDs {
+			if err := dfsCollect(childID); err != nil {
+				return err
+			}
+		}
 	}
 
 	// Second pass: delete all collected nodes
@@ -173,6 +186,9 @@ func DeleteSubtree(boltDB *db.DB, queueType string, rootPath string) error {
 	}
 
 	return boltDB.Update(func(tx *bolt.Tx) error {
+		// Track stats deltas for batch update
+		statsDeltas := make(map[string]int64) // bucket path string -> delta
+
 		for _, nodeState := range nodesToDelete {
 			nodeIDBytes := []byte(nodeState.ID)
 			var parentIDBytes []byte
@@ -182,8 +198,11 @@ func DeleteSubtree(boltDB *db.DB, queueType string, rootPath string) error {
 
 			// 1. Delete from nodes bucket
 			nodesBucket := db.GetNodesBucket(tx, queueType)
-			if nodesBucket != nil {
+			if nodesBucket != nil && nodesBucket.Get(nodeIDBytes) != nil {
 				nodesBucket.Delete(nodeIDBytes)
+				// Decrement nodes bucket count
+				nodesPath := db.GetNodesBucketPath(queueType)
+				statsDeltas[strings.Join(nodesPath, "/")]--
 			}
 
 			// 2. Delete from status bucket (check all status buckets at all levels)
@@ -194,6 +213,9 @@ func DeleteSubtree(boltDB *db.DB, queueType string, rootPath string) error {
 					statusBucket := db.GetStatusBucket(tx, queueType, level, status)
 					if statusBucket != nil && statusBucket.Get(nodeIDBytes) != nil {
 						statusBucket.Delete(nodeIDBytes)
+						// Decrement status bucket count
+						statusPath := db.GetStatusBucketPath(queueType, level, status)
+						statsDeltas[strings.Join(statusPath, "/")]--
 					}
 				}
 			}
@@ -235,8 +257,56 @@ func DeleteSubtree(boltDB *db.DB, queueType string, rootPath string) error {
 			}
 		}
 
+		// Update stats bucket for all deletions
+		for pathStr, delta := range statsDeltas {
+			path := strings.Split(pathStr, "/")
+			if err := updateBucketStatsInTx(tx, path, delta); err != nil {
+				return fmt.Errorf("failed to update stats for %s: %w", pathStr, err)
+			}
+		}
+
 		return nil
 	})
+}
+
+// updateBucketStatsInTx is a helper to update stats within a transaction.
+// This manually updates the stats bucket since we can't call db.UpdateBucketStats from within an existing transaction.
+func updateBucketStatsInTx(tx *bolt.Tx, bucketPath []string, delta int64) error {
+	// Navigate to stats bucket using the same constants as the db package
+	traversalBucket := tx.Bucket([]byte(db.TraversalDataBucket))
+	if traversalBucket == nil {
+		return nil // Stats bucket doesn't exist yet
+	}
+	statsBucket := traversalBucket.Bucket([]byte(db.StatsBucketName))
+	if statsBucket == nil {
+		return nil // Stats bucket doesn't exist yet
+	}
+
+	key := strings.Join(bucketPath, "/")
+	keyBytes := []byte(key)
+
+	// Get current count
+	var currentCount int64
+	existingValue := statsBucket.Get(keyBytes)
+	if existingValue != nil {
+		currentCount = int64(binary.BigEndian.Uint64(existingValue))
+	}
+
+	// Compute new count
+	newCount := currentCount + delta
+	if newCount < 0 {
+		newCount = 0
+	}
+
+	if newCount == 0 {
+		// Remove stats entry if count is zero
+		return statsBucket.Delete(keyBytes)
+	} else {
+		// Store new count as 8-byte big-endian int64
+		valueBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(valueBytes, uint64(newCount))
+		return statsBucket.Put(keyBytes, valueBytes)
+	}
 }
 
 // MarkNodeAsFailed marks a node as failed in the database.

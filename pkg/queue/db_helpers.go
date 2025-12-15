@@ -197,16 +197,24 @@ func BatchLoadExpectedChildrenByDSTIDs(boltDB *db.DB, dstParentIDs []string, dst
 				continue
 			}
 
-			dstState, err := db.DeserializeNodeState(dstNodeData)
-			if err != nil || dstState.SrcID == "" {
-				// No SrcID in DST node - initialize empty slices
+			_, err := db.DeserializeNodeState(dstNodeData)
+			if err != nil {
+				// Deserialization failed - initialize empty slices
 				resultFolders[dstID] = []types.Folder{}
 				resultFiles[dstID] = []types.File{}
 				srcIDMap[dstID] = make(map[string]string)
 				continue
 			}
 
-			srcParentID := dstState.SrcID
+			// Get SrcID from lookup table instead of NodeState
+			srcParentID, err := db.GetSrcIDFromDstID(boltDB, dstID)
+			if err != nil || srcParentID == "" {
+				// No SrcID mapping found - initialize empty slices
+				resultFolders[dstID] = []types.Folder{}
+				resultFiles[dstID] = []types.File{}
+				srcIDMap[dstID] = make(map[string]string)
+				continue
+			}
 			dstToSrcParent[dstID] = srcParentID
 			srcParentToDSTs[srcParentID] = append(srcParentToDSTs[srcParentID], dstID)
 			srcIDMap[dstID] = make(map[string]string)

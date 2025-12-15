@@ -82,12 +82,20 @@ func RunExclusionSweep(cfg SweepConfig) (RuntimeStats, error) {
 		return RuntimeStats{}, fmt.Errorf("failed to ensure exclusion-holding buckets: %w", err)
 	}
 
+	// Get max known depth from levels bucket for SRC
+	// Exclusion sweep should scan all existing levels, then complete
+	maxKnownDepth := boltDB.GetMaxKnownDepth(db.BucketSrc)
+	if maxKnownDepth < 0 {
+		maxKnownDepth = 0 // Default to 0 if no levels found
+	}
+
 	// Create coordinator (minimal - exclusion sweeps don't need round coordination)
 	coordinator := queue.NewQueueCoordinator()
 
 	// Create queues in exclusion mode
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
 	srcQueue.SetMode(queue.QueueModeExclusion)
+	srcQueue.SetMaxKnownDepth(maxKnownDepth)
 	srcQueue.InitializeWithContext(boltDB, cfg.SrcAdapter, cfg.ShutdownContext)
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
@@ -100,6 +108,11 @@ func RunExclusionSweep(cfg SweepConfig) (RuntimeStats, error) {
 
 	// Give queues a moment to start
 	time.Sleep(100 * time.Millisecond)
+
+	// Trigger initial pull from exclusion-holding buckets (force=true to bypass low-water checks)
+	// This is critical for event-driven Run() loop - without initial tasks, workers never trigger pulls
+	srcQueue.PullTasksIfNeeded(true)
+	dstQueue.PullTasksIfNeeded(true)
 
 	// Create observer for stats publishing
 	observer := queue.NewQueueObserver(boltDB, 200*time.Millisecond)
@@ -291,12 +304,20 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	// Create coordinator for round advancement gates (retry uses traversal-like coordination)
 	coordinator := queue.NewQueueCoordinator()
 
+	// Get max known depth from config or detect from levels bucket
+	maxKnownDepth := cfg.MaxKnownDepth
+	if maxKnownDepth < 0 {
+		// Auto-detect from levels bucket
+		maxKnownDepth = boltDB.GetMaxKnownDepth(db.BucketSrc)
+		if maxKnownDepth < 0 {
+			maxKnownDepth = 0 // Default to 0 if no levels found
+		}
+	}
+
 	// Create queues in retry mode
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
 	srcQueue.SetMode(queue.QueueModeRetry)
-	if cfg.MaxKnownDepth >= 0 {
-		srcQueue.SetMaxKnownDepth(cfg.MaxKnownDepth)
-	}
+	srcQueue.SetMaxKnownDepth(maxKnownDepth)
 	srcQueue.InitializeWithContext(boltDB, cfg.SrcAdapter, cfg.ShutdownContext)
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
@@ -312,6 +333,11 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 
 	// Give queues a moment to start
 	time.Sleep(100 * time.Millisecond)
+
+	// Trigger initial pull from database (force=true to bypass low-water checks)
+	// This is critical for event-driven Run() loop - without initial tasks, workers never trigger pulls
+	srcQueue.PullTasksIfNeeded(true)
+	dstQueue.PullTasksIfNeeded(true)
 
 	// Create observer for stats publishing
 	observer := queue.NewQueueObserver(boltDB, 200*time.Millisecond)

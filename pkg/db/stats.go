@@ -188,6 +188,16 @@ func (db *DB) EnsureStatsBucket() error {
 	})
 }
 
+// UpdateBucketStats updates the count for a bucket path by the given delta.
+// Delta can be positive (increment) or negative (decrement).
+// This is a public wrapper around the internal updateBucketStats function.
+// Thread-safe (uses Update transaction).
+func (db *DB) UpdateBucketStats(bucketPath []string, delta int64) error {
+	return db.Update(func(tx *bolt.Tx) error {
+		return updateBucketStats(tx, bucketPath, delta)
+	})
+}
+
 // GetBucketCount retrieves the count for a bucket path from the stats bucket.
 // This is the public API for reading stats. Returns 0 if stats don't exist.
 // Thread-safe (uses View transaction).

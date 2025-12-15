@@ -40,9 +40,9 @@ func prepareBaseDB() error {
 	fmt.Println("=============================================")
 
 	// Start with the exclusion test base DB (which has no excluded nodes)
-	sourceDBPath := "pkg/tests/shared/main.db"
-	sourceYAMLPath := "pkg/tests/shared/main.yaml"
-	sourceSpectraPath := "pkg/tests/shared/spectra.db"
+	sourceDBPath := "pkg/tests/unexclusion_sweep/preparation/excluded.db"
+	sourceYAMLPath := "pkg/tests/unexclusion_sweep/preparation/excluded.yaml"
+	sourceSpectraPath := "pkg/tests/unexclusion_sweep/preparation/excluded_spectra.db"
 
 	targetDBPath := "pkg/tests/shared/main_test.db"
 	targetYAMLPath := "pkg/tests/shared/main_test.yaml"

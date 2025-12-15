@@ -89,18 +89,6 @@ func (q *Queue) getLastPullWasPartial() bool {
 	return q.lastPullWasPartial
 }
 
-func (q *Queue) getShouldCheckRoundComplete() bool {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	return q.shouldCheckRoundComplete
-}
-
-func (q *Queue) getShouldCheckTraversalComplete() bool {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	return q.shouldCheckTraversalComplete
-}
-
 func (q *Queue) getMaxRetries() int {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
@@ -204,28 +192,113 @@ func (q *Queue) setMaxKnownDepth(depth int) {
 	q.maxKnownDepth = depth
 }
 
-func (q *Queue) setFirstPullForRound(value bool) {
+// getRoundInfo returns the RoundInfo for the specified round, creating it if it doesn't exist.
+func (q *Queue) getRoundInfo(round int) *RoundInfo {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.firstPullForRound = value
+
+	if q.roundInfoMap[round] == nil {
+		q.roundInfoMap[round] = &RoundInfo{
+			Round:     round,
+			StartTime: time.Now(),
+		}
+	}
+	return q.roundInfoMap[round]
+}
+
+// getRoundInfoReadOnly returns a read-only copy of RoundInfo for the specified round.
+// Returns nil if the round doesn't exist yet.
+func (q *Queue) getRoundInfoReadOnly(round int) *RoundInfo {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+
+	if q.roundInfoMap[round] == nil {
+		return nil
+	}
+
+	// Return a copy to prevent external mutation
+	info := *q.roundInfoMap[round]
+	return &info
+}
+
+// recordPull records a pull operation for the current round.
+func (q *Queue) recordPull(round int, itemsYielded int, wasPartial bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.roundInfoMap[round] == nil {
+		q.roundInfoMap[round] = &RoundInfo{
+			Round:     round,
+			StartTime: time.Now(),
+		}
+	}
+
+	info := q.roundInfoMap[round]
+	info.PullCount++
+	info.ItemsYielded += itemsYielded
+	info.LastPullTime = time.Now()
+	info.LastPartialPull = wasPartial
+
+	// Calculate avg tasks/sec if we have a start time
+	if !info.StartTime.IsZero() {
+		elapsed := time.Since(info.StartTime).Seconds()
+		if elapsed > 0 {
+			info.AvgTasksPerSec = float64(info.TasksCompleted) / elapsed
+		}
+	}
+}
+
+// recordTaskCompletion records a completed task for the current round.
+func (q *Queue) recordTaskCompletion(round int, success bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.roundInfoMap[round] == nil {
+		q.roundInfoMap[round] = &RoundInfo{
+			Round:     round,
+			StartTime: time.Now(),
+		}
+	}
+
+	info := q.roundInfoMap[round]
+	if success {
+		info.TasksCompleted++
+	} else {
+		info.TasksFailed++
+	}
+
+	// Update avg tasks/sec
+	if !info.StartTime.IsZero() {
+		elapsed := time.Since(info.StartTime).Seconds()
+		if elapsed > 0 {
+			info.AvgTasksPerSec = float64(info.TasksCompleted) / elapsed
+		}
+	}
+}
+
+// Convenience getters for current round
+func (q *Queue) getCurrentRoundPullCount() int {
+	currentRound := q.getRound()
+	info := q.getRoundInfoReadOnly(currentRound)
+	if info == nil {
+		return 0
+	}
+	return info.PullCount
+}
+
+func (q *Queue) getCurrentRoundItemsYielded() int {
+	currentRound := q.getRound()
+	info := q.getRoundInfoReadOnly(currentRound)
+	if info == nil {
+		return 0
+	}
+	return info.ItemsYielded
 }
 
 func (q *Queue) setLastPullWasPartial(value bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.lastPullWasPartial = value
-}
-
-func (q *Queue) setShouldCheckRoundComplete(value bool) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.shouldCheckRoundComplete = value
-}
-
-func (q *Queue) setShouldCheckTraversalComplete(value bool) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.shouldCheckTraversalComplete = value
 }
 
 func (q *Queue) setShutdownCtx(ctx context.Context) {
@@ -342,7 +415,6 @@ type QueueStateSnapshot struct {
 	PendingCount       int
 	InProgressCount    int
 	Pulling            bool
-	FirstPullForRound  bool
 	LastPullWasPartial bool
 	PullLowWM          int
 	BoltDB             *db.DB
@@ -359,7 +431,6 @@ func (q *Queue) getStateSnapshot() QueueStateSnapshot {
 		PendingCount:       len(q.pendingBuff),
 		InProgressCount:    len(q.inProgress),
 		Pulling:            q.pulling,
-		FirstPullForRound:  q.firstPullForRound,
 		LastPullWasPartial: q.lastPullWasPartial,
 		PullLowWM:          q.pullLowWM,
 		BoltDB:             q.boltDB,

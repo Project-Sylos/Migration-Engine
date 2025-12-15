@@ -12,6 +12,7 @@ import (
 )
 
 func main() {
+
 	fmt.Println("=== Spectra Migration Test Runner ===")
 	fmt.Println()
 

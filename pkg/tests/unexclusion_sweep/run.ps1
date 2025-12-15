@@ -6,25 +6,6 @@ $ErrorActionPreference = "Stop"
 Write-Host "=== Unexclusion Sweep Test Runner ===" -ForegroundColor Cyan
 Write-Host ""
 
-# Check if base DB exists, if not, prepare it
-# Paths are relative to this script's location
-$baseDBPath = "pkg/tests/shared/main_test.db"
-if (-not (Test-Path $baseDBPath)) {
-    Write-Host "Base DB not found. Preparing base DB..." -ForegroundColor Yellow
-    Write-Host "This will mark the first root folder as excluded and run an exclusion sweep." -ForegroundColor Yellow
-    Write-Host ""
-    
-    # Run prepare script (located in preparation subfolder)
-    go run pkg/tests/unexclusion_sweep/preparation/prepare_unexclusion_test_db.go
-    
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "❌ Failed to prepare base DB" -ForegroundColor Red
-        exit 1
-    }
-    
-    Write-Host ""
-}
-
 # Clean up previous test files
 Write-Host "Cleaning up previous test files..." -ForegroundColor Yellow
 $testFiles = @(
@@ -40,22 +21,20 @@ foreach ($file in $testFiles) {
     }
 }
 
-# Copy test files
-Write-Host "Copying test files..." -ForegroundColor Yellow
-$baseFiles = @{
-    "pkg/tests/shared/main.db" = "pkg/tests/shared/main_test.db"
-    "pkg/tests/shared/main.yaml" = "pkg/tests/shared/main_test.yaml"
-    "pkg/tests/shared/spectra.db" = "pkg/tests/shared/spectra_test.db"
-}
+Write-Host ""
 
-foreach ($baseFile in $baseFiles.GetEnumerator()) {
-    if (-not (Test-Path $baseFile.Key)) {
-        Write-Host "  ERROR: Base file not found: $($baseFile.Key)" -ForegroundColor Red
-        Write-Host "  NOTE: Run the prepare script first: go run pkg/tests/unexclusion_sweep/preparation/prepare_unexclusion_test_db.go" -ForegroundColor Yellow
-        exit 1
-    }
-    Copy-Item $baseFile.Key $baseFile.Value -Force
-    Write-Host "  Copied: $($baseFile.Key) -> $($baseFile.Value)" -ForegroundColor Gray
+# Prepare the base DB
+# Paths are relative to this script's location
+Write-Host "Preparing base DB..." -ForegroundColor Yellow
+Write-Host "This will mark the first root folder as excluded and run an exclusion sweep." -ForegroundColor Yellow
+Write-Host ""
+
+# Run prepare script (located in preparation subfolder)
+go run pkg/tests/unexclusion_sweep/preparation/prepare_unexclusion_test_db.go
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "❌ Failed to prepare base DB" -ForegroundColor Red
+    exit 1
 }
 
 # Run the test
