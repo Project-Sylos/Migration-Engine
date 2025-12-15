@@ -67,20 +67,16 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		}
 	}
 
-	// Track if this is the first pull for the round (before we potentially set it to false)
-	wasFirstPullForRound := snapshot.FirstPullForRound
 	currentRound := snapshot.Round
 	coordinator := q.getCoordinator()
 
-	// For DST: Check coordinator gate before pulling (but don't check completion yet)
-	// We'll check completion AFTER pulling to ensure workers have finished adding tasks
+	// For DST: Check coordinator gate before pulling
 	if q.name == "dst" && coordinator != nil {
 		canStartRound := coordinator.CanDstStartRound(currentRound)
 		if !canStartRound {
 			// Can't start this round yet - wait for coordinator gate
 			return
 		}
-		// Gate passed - we'll mark firstPullForRound = false only after actually fetching tasks
 	}
 
 	batch, err := db.BatchFetchWithKeys(boltDB, queueType, currentRound, db.StatusPending, defaultLeaseBatchSize)
@@ -90,27 +86,7 @@ func (q *Queue) PullTraversalTasks(force bool) {
 			_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to fetch batch from BoltDB: %v", err), "queue", q.name, q.name)
 		}
 		// On error, don't change lastPullWasPartial - keep existing state
-		// Also don't set firstPullForRound = false since pull failed
 		return
-	}
-
-	// Set soft flag for traversal completion check (Run() loop will do the hard check)
-	// Only set on first pull with 0 items - Run() loop will check if we're truly complete
-	if wasFirstPullForRound && len(batch) == 0 && currentRound > 0 {
-		pendingCount := q.getPendingCount()
-		inProgressCount := q.getInProgressCount()
-		queueState := q.getState()
-
-		// Set soft flag if conditions suggest traversal might be complete
-		// Skip if queue is in waiting state (DST gating)
-		if queueState != QueueStateWaiting && inProgressCount == 0 && pendingCount == 0 {
-			q.setShouldCheckTraversalComplete(true)
-		}
-	}
-
-	// Mark that we've done the first pull
-	if wasFirstPullForRound {
-		q.setFirstPullForRound(false)
 	}
 
 	// Batch-load expected children for DST tasks
@@ -187,6 +163,10 @@ func (q *Queue) PullTraversalTasks(force bool) {
 
 	// Track if this pull was partial (fewer tasks than requested)
 	// This signals we might have exhausted the current round
-	q.setLastPullWasPartial(len(batch) < defaultLeaseBatchSize)
+	wasPartial := len(batch) < defaultLeaseBatchSize
+	q.setLastPullWasPartial(wasPartial)
+
+	// Record pull in RoundInfo
+	q.recordPull(currentRound, len(batch), wasPartial)
 
 }

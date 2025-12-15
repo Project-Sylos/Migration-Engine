@@ -1,0 +1,72 @@
+metadata:
+    migration_id: migration-1765579774
+    created_at: "2025-12-12T22:49:34Z"
+    last_modified: "2025-12-12T22:49:39Z"
+state:
+    status: Awaiting-Path-Review
+    last_level_src: 5
+    last_level_dst: 5
+    last_round_src: 5
+    last_round_dst: 5
+services:
+    source:
+        type: spectra
+        name: Spectra-Primary
+        root_id: root
+        root_path: /
+        root:
+            id: root
+            parent_id: ""
+            parent_path: ""
+            display_name: root
+            location_path: /
+            last_updated: "2025-12-12T16:50:13-05:00"
+            depth_level: 0
+            type: folder
+    destination:
+        type: spectra
+        name: Spectra-S1
+        root_id: root
+        root_path: /
+        root:
+            id: root
+            parent_id: ""
+            parent_path: ""
+            display_name: root
+            location_path: /
+            last_updated: "2025-12-12T16:50:13-05:00"
+            depth_level: 0
+            type: folder
+    same_service_reference:
+        shared_instance: true
+        reference_to: destination
+service_configs:
+    spectra:
+        api:
+            host: localhost
+            port: 8086
+        secondary_tables:
+            s1: 0.9
+        seed:
+            db_path: ./spectra.db
+            max_depth: 4
+            max_files: 20
+            max_folders: 8
+            min_files: 10
+            min_folders: 4
+            seed: 0
+migration_options:
+    seed_roots: true
+    worker_count: 10
+    max_retries: 3
+    coordinator_lead: 4
+logging:
+    address: 127.0.0.1
+    port: 8081
+    level: trace
+database:
+    path: pkg/tests/shared/main_test.db
+    remove_existing: true
+verification:
+    allowpending: false
+    allownotonsrc: false

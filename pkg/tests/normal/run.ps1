@@ -59,15 +59,15 @@ if ($exitCode -eq 0) {
     # # Run DB inspector with Spectra comparison if test passed
     # Write-Host ""
     # Write-Host "=== Running DB Inspector with Spectra Comparison ===" -ForegroundColor Cyan
-    # # The normal test uses pkg/tests/bolt.db (from shared.SetupTest)
-    # if (Test-Path "pkg/tests/normal/migration_test.db") {
-    #     go run cmd/inspect_db/main.go pkg/tests/normal/migration_test.db pkg/configs/spectra.json
+    # # The normal test uses pkg/tests/normal/main_test.db (from shared.SetupTest)
+    # if (Test-Path "pkg/tests/shared/main_test.db") {
+    #     go run cmd/inspect_db/main.go 
     #     $inspectExitCode = $LASTEXITCODE
     #     if ($inspectExitCode -ne 0) {
     #         Write-Host "⚠️  DB Inspector reported issues (exit code: $inspectExitCode)" -ForegroundColor Yellow
     #     }
     # } else {
-    #     Write-Host "⚠️  Database file not found (pkg/tests/normal/migration_test.db), skipping inspection" -ForegroundColor Yellow
+    #     Write-Host "⚠️  Database file not found (pkg/tests/shared/main_test.db), skipping inspection" -ForegroundColor Yellow
     # }
 } else {
     Write-Host "Status: FAILED" -ForegroundColor Red

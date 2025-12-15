@@ -36,6 +36,7 @@ type TaskBase struct {
 	Round              int               // The round this task belongs to (for buffer coordination)
 	LeaseTime          time.Time         // Time when task was leased (for execution time tracking)
 	ExclusionMode      string            // Exclusion mode: "exclude" or "unexclude" (exclusion tasks only)
+	PreviousStatus     string            // Previous status before exclusion (for status bucket tracking)
 }
 
 // ChildResult represents a discovered child node with its traversal status.

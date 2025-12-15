@@ -6,6 +6,8 @@ package queue
 import (
 	"fmt"
 
+	bolt "go.etcd.io/bbolt"
+
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 	"github.com/Project-Sylos/Sylos-FS/pkg/types"
@@ -58,7 +60,7 @@ func (q *Queue) PullExclusionTasks(force bool) {
 	}
 
 	// Scan exclusion-holding bucket for current round
-	entries, hasHigherLevels, err := db.ScanExclusionHoldingBucketByLevel(boltDB, queueType, snapshot.Round, defaultLeaseBatchSize)
+	entries, _, err := db.ScanExclusionHoldingBucketByLevel(boltDB, queueType, snapshot.Round, defaultLeaseBatchSize)
 	if err != nil {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to scan exclusion-holding bucket: %v", err), "queue", q.name, q.name)
@@ -68,38 +70,7 @@ func (q *Queue) PullExclusionTasks(force bool) {
 
 	// Debug: Log pull stats
 	if logservice.LS != nil {
-		_ = logservice.LS.Log("debug", fmt.Sprintf("PullExclusionTasks: Round %d, found %d entries, hasHigherLevels=%v", snapshot.Round, len(entries), hasHigherLevels), "queue", q.name, q.name)
-	}
-
-	// Set firstPullForRound = false if we got tasks
-	if snapshot.FirstPullForRound && len(entries) > 0 {
-		q.setFirstPullForRound(false)
-	}
-
-	// Check if both holding buckets are empty (no entries found and no higher levels)
-	if snapshot.FirstPullForRound && len(entries) == 0 && !hasHigherLevels {
-		// Flush output buffer before completing to ensure all file exclusion updates are written
-		outputBuffer := q.getOutputBuffer()
-		if outputBuffer != nil {
-			outputBuffer.Flush()
-		}
-
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("info",
-				"Both exclusion and unexclusion holding buckets are empty - exclusion sweep complete",
-				"queue", q.name, q.name)
-		}
-		q.setState(QueueStateCompleted)
-		return
-	}
-
-	// If no entries found at current level but higher levels exist, we need to advance round
-	// This will be handled by round completion check when task count hits 0
-	if len(entries) == 0 && hasHigherLevels {
-		// No tasks for this round, but more work in future rounds
-		// Set lastPullWasPartial to trigger round advancement
-		q.setLastPullWasPartial(true)
-		return
+		_ = logservice.LS.Log("debug", fmt.Sprintf("PullExclusionTasks: Round %d, found %d entries", snapshot.Round, len(entries)), "queue", q.name, q.name)
 	}
 
 	// Pop entries from holding buckets as we pull them
@@ -110,7 +81,7 @@ func (q *Queue) PullExclusionTasks(force bool) {
 	nodeIDsToRemove := make([]entryToRemove, 0, len(entries))
 
 	for _, entry := range entries {
-		// Skip ULIDs we've already leased
+		// Skip ULIDs we've already leased (these are legitimately in progress)
 		if q.isLeased(entry.NodeID) {
 			continue
 		}
@@ -122,8 +93,14 @@ func (q *Queue) PullExclusionTasks(force bool) {
 		nodeState, err := db.GetNodeState(boltDB, queueType, entry.NodeID)
 		if err != nil || nodeState == nil {
 			if logservice.LS != nil {
-				_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to get node state for exclusion task %s: %v", entry.NodeID, err), "queue", q.name, q.name)
+				_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to get node state for exclusion task %s: %v - removing from holding bucket", entry.NodeID, err), "queue", q.name, q.name)
 			}
+			// Node doesn't exist or lookup failed - remove from holding bucket to prevent infinite retries
+			q.removeLeasedKey(entry.NodeID) // Un-lease since we're skipping
+			nodeIDsToRemove = append(nodeIDsToRemove, entryToRemove{
+				nodeID: entry.NodeID,
+				mode:   entry.Mode, // Use mode from entry
+			})
 			continue
 		}
 
@@ -139,11 +116,58 @@ func (q *Queue) PullExclusionTasks(force bool) {
 			}
 		}
 
+		// Query status-lookup bucket to get current status (for moving between status buckets)
+		previousStatus := db.StatusPending // Default to pending if not found
+		_ = boltDB.View(func(tx *bolt.Tx) error {
+			lookupBucket := db.GetStatusLookupBucket(tx, queueType, nodeState.Depth)
+			if lookupBucket != nil {
+				statusBytes := lookupBucket.Get([]byte(entry.NodeID))
+				if statusBytes != nil {
+					previousStatus = string(statusBytes)
+				}
+			}
+			return nil
+		})
+
+		// For unexclusion tasks, verify the node is actually in the excluded status bucket
+		// (mirroring how exclusion verifies nodes are in their previous status bucket)
+		if exclusionMode == "unexclude" {
+			var isInExcludedBucket bool
+			_ = boltDB.View(func(tx *bolt.Tx) error {
+				excludedBucket := db.GetStatusBucket(tx, queueType, nodeState.Depth, db.StatusExcluded)
+				if excludedBucket != nil {
+					isInExcludedBucket = excludedBucket.Get([]byte(entry.NodeID)) != nil
+				}
+				return nil
+			})
+
+			// If node is not in excluded bucket, skip it (may have been processed already)
+			// Remove from holding bucket to prevent infinite retries
+			if !isInExcludedBucket {
+				if logservice.LS != nil {
+					_ = logservice.LS.Log("debug", fmt.Sprintf("Skipping unexclusion task %s: not in excluded status bucket - removing from holding bucket", entry.NodeID), "queue", q.name, q.name)
+				}
+				q.removeLeasedKey(entry.NodeID) // Un-lease since we're skipping
+				nodeIDsToRemove = append(nodeIDsToRemove, entryToRemove{
+					nodeID: entry.NodeID,
+					mode:   exclusionMode,
+				})
+				continue
+			}
+
+			// Ensure PreviousStatus is set to excluded for unexclusion tasks
+			if previousStatus != db.StatusExcluded {
+				previousStatus = db.StatusExcluded
+			}
+		}
+
 		// Convert to task
 		task := &TaskBase{
-			Type:          TaskTypeExclusion,
-			Round:         snapshot.Round,
-			ExclusionMode: exclusionMode,
+			ID:             entry.NodeID,
+			Type:           TaskTypeExclusion,
+			Round:          snapshot.Round,
+			ExclusionMode:  exclusionMode,
+			PreviousStatus: previousStatus,
 		}
 
 		if nodeState.Type == "folder" {
@@ -196,7 +220,12 @@ func (q *Queue) PullExclusionTasks(force bool) {
 		}
 	}
 
-	// Set lastPullWasPartial: true if we found fewer entries than limit OR if there are higher levels
-	// If hasHigherLevels is true, we know there are more tasks in future rounds
-	q.setLastPullWasPartial(len(entries) < defaultLeaseBatchSize || hasHigherLevels)
+	// Set lastPullWasPartial based on batch size (same as traversal mode)
+	// If we got fewer entries than the batch limit, this round is exhausted
+	// Workers may add more entries to future rounds, which we'll discover when we advance
+	wasPartial := len(entries) < defaultLeaseBatchSize
+	q.setLastPullWasPartial(wasPartial)
+
+	// Record pull in RoundInfo
+	q.recordPull(snapshot.Round, len(entries), wasPartial)
 }

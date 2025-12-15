@@ -115,7 +115,21 @@ func (db *DB) initializeBuckets() error {
 			}
 		}
 
-		// SrcID is now stored directly in DST NodeState, no join-lookup bucket needed
+		// Create src-to-dst lookup bucket under SRC
+		srcBucket := traversalBucket.Bucket([]byte("SRC"))
+		if srcBucket != nil {
+			if _, err := srcBucket.CreateBucketIfNotExists([]byte("src-to-dst")); err != nil {
+				return fmt.Errorf("failed to create Traversal-Data/SRC/src-to-dst bucket: %w", err)
+			}
+		}
+
+		// Create dst-to-src lookup bucket under DST
+		dstBucket := traversalBucket.Bucket([]byte("DST"))
+		if dstBucket != nil {
+			if _, err := dstBucket.CreateBucketIfNotExists([]byte("dst-to-src")); err != nil {
+				return fmt.Errorf("failed to create Traversal-Data/DST/dst-to-src bucket: %w", err)
+			}
+		}
 
 		// Create LOGS bucket as separate top-level (its own island)
 		if _, err := tx.CreateBucketIfNotExists([]byte("LOGS")); err != nil {

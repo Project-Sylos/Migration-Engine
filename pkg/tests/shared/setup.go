@@ -38,25 +38,25 @@ func SetupSpectraFS(configPath string, cleanDB bool) (*sdk.SpectraFS, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	// Resolve DB path relative to config file location
-	configDir := filepath.Dir(configPath)
+	// Resolve DB path the same way the SDK will (for cleanup purposes only)
+	// The SDK resolves paths relative to the config file directory
 	dbPath := config.Seed.DBPath
 	if !filepath.IsAbs(dbPath) {
-		// If relative, resolve relative to config file directory
+		configDir := filepath.Dir(configPath)
 		dbPath = filepath.Join(configDir, dbPath)
 	}
 
-	// Check if DB file exists
-	dbExists := false
-	if _, err := os.Stat(dbPath); err == nil {
-		dbExists = true
-	}
-
 	// Clean DB only if explicitly requested
-	if cleanDB && dbExists {
-		fmt.Println("Cleaning up previous Spectra state...")
-		if err := os.Remove(dbPath); err != nil {
-			return nil, fmt.Errorf("failed to remove existing Spectra DB: %w", err)
+	if cleanDB {
+		// Check if DB file exists
+		if _, err := os.Stat(dbPath); err == nil {
+			fmt.Println("Cleaning up previous Spectra state...")
+			if err := os.Remove(dbPath); err != nil {
+				return nil, fmt.Errorf("failed to remove existing Spectra DB (may be locked from previous run): %w", err)
+			}
+			// Also try to remove lock files (Windows-specific: .db.lock)
+			lockPath := dbPath + ".lock"
+			_ = os.Remove(lockPath) // Ignore errors - lock file might not exist
 		}
 	}
 
@@ -77,7 +77,7 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 	fmt.Println("Loading Spectra configuration...")
 
 	// Create SpectraFS instance (SDK should load existing DB data if file exists)
-	spectraFS, err := SetupSpectraFS("pkg/configs/spectra.json", cleanSpectraDB)
+	spectraFS, err := SetupSpectraFS("pkg/tests/shared/spectra.json", cleanSpectraDB)
 	if err != nil {
 		return migration.Config{}, err
 	}

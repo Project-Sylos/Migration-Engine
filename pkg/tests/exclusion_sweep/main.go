@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -114,10 +115,10 @@ func runTest() error {
 		return fmt.Errorf("failed to mark node as excluded: %w", err)
 	}
 
-	// Add to exclusion-holding bucket (simulating what the API would do)
-	// Get child depth and add to exclusion-holding bucket
-	if err := addToExclusionHolding(boltDB, "SRC", selectedChild.Path, selectedChild.Depth); err != nil {
-		return fmt.Errorf("failed to add to exclusion-holding bucket: %w", err)
+	// Add the node's CHILDREN to exclusion-holding bucket (simulating what the API would do)
+	// The node itself is already explicitly excluded, so workers should process its children
+	if err := addChildrenToExclusionHolding(boltDB, "SRC", selectedChild.Path); err != nil {
+		return fmt.Errorf("failed to add children to exclusion-holding bucket: %w", err)
 	}
 
 	fmt.Println("\n🚀 Phase 3: Run Exclusion Sweep")
@@ -184,16 +185,20 @@ func runTest() error {
 	return nil
 }
 
-// addToExclusionHolding adds a node to the exclusion-holding bucket.
-func addToExclusionHolding(boltDB *db.DB, queueType string, nodePath string, depth int) error {
-	// Find node by path to get ULID
+// addChildrenToExclusionHolding adds a node's children to the exclusion-holding bucket.
+// This simulates what the API would do: when a node is marked as explicitly excluded,
+// its children should be added to the exclusion-holding bucket for workers to process.
+func addChildrenToExclusionHolding(boltDB *db.DB, queueType string, nodePath string) error {
+	// Find node by path to get ULID and children
 	var nodeID string
+	var childIDs []string
 	err := boltDB.View(func(tx *bolt.Tx) error {
 		nodesBucket := db.GetNodesBucket(tx, queueType)
 		if nodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found")
 		}
 
+		// Find the node by path
 		cursor := nodesBucket.Cursor()
 		for nodeIDBytes, nodeData := cursor.First(); nodeIDBytes != nil; nodeIDBytes, nodeData = cursor.Next() {
 			nodeState, err := db.DeserializeNodeState(nodeData)
@@ -202,24 +207,104 @@ func addToExclusionHolding(boltDB *db.DB, queueType string, nodePath string, dep
 			}
 			if nodeState.Path == nodePath {
 				nodeID = nodeState.ID
-				return nil
+				break
 			}
 		}
-		return fmt.Errorf("node not found: %s", nodePath)
+		if nodeID == "" {
+			return fmt.Errorf("node not found: %s", nodePath)
+		}
+
+		// Get children from children bucket
+		childrenBucket := db.GetChildrenBucket(tx, queueType)
+		if childrenBucket != nil {
+			childrenData := childrenBucket.Get([]byte(nodeID))
+			if childrenData != nil {
+				if err := json.Unmarshal(childrenData, &childIDs); err != nil {
+					return fmt.Errorf("failed to unmarshal children: %w", err)
+				}
+			}
+		}
+
+		return nil
 	})
 	if err != nil {
 		return err
 	}
 
-	depthBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(depthBytes, uint64(depth))
+	if len(childIDs) == 0 {
+		// No children to add - this is fine, the node itself is already explicitly excluded
+		return nil
+	}
 
+	// Get child depths and add to exclusion-holding bucket
+	type childEntry struct {
+		nodeID string
+		depth  int
+	}
+	var entries []childEntry
+	var missingChildren []string
+
+	err = boltDB.View(func(tx *bolt.Tx) error {
+		nodesBucket := db.GetNodesBucket(tx, queueType)
+		if nodesBucket == nil {
+			return fmt.Errorf("nodes bucket not found")
+		}
+
+		for _, childID := range childIDs {
+			nodeData := nodesBucket.Get([]byte(childID))
+			if nodeData == nil {
+				missingChildren = append(missingChildren, childID)
+				continue // Child doesn't exist in nodes bucket
+			}
+
+			childState, err := db.DeserializeNodeState(nodeData)
+			if err != nil {
+				continue // Skip invalid nodes
+			}
+
+			entries = append(entries, childEntry{
+				nodeID: childID,
+				depth:  childState.Depth,
+			})
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// Report data integrity issue if any children are missing
+	if len(missingChildren) > 0 {
+		fmt.Printf("⚠️  WARNING: Children bucket has %d stale references (nodes don't exist):\n", len(missingChildren))
+		for i, childID := range missingChildren {
+			if i < 5 { // Only print first 5
+				fmt.Printf("  - %s\n", childID)
+			}
+		}
+		if len(missingChildren) > 5 {
+			fmt.Printf("  ... and %d more\n", len(missingChildren)-5)
+		}
+		return fmt.Errorf("data integrity issue: children bucket has stale references - database may be corrupted")
+	}
+
+	fmt.Printf("Found %d existing children (out of %d in children bucket)\n", len(entries), len(childIDs))
+
+	// Add all children to exclusion-holding bucket
 	return boltDB.Update(func(tx *bolt.Tx) error {
 		bucket, err := db.GetOrCreateExclusionHoldingBucket(tx, queueType)
 		if err != nil {
 			return fmt.Errorf("failed to get exclusion-holding bucket: %w", err)
 		}
 
-		return bucket.Put([]byte(nodeID), depthBytes)
+		for _, entry := range entries {
+			depthBytes := make([]byte, 8)
+			binary.BigEndian.PutUint64(depthBytes, uint64(entry.depth))
+			if err := bucket.Put([]byte(entry.nodeID), depthBytes); err != nil {
+				return fmt.Errorf("failed to add child to exclusion-holding bucket: %w", err)
+			}
+		}
+
+		return nil
 	})
 }

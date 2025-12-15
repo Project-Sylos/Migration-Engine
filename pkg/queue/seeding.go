@@ -137,7 +137,7 @@ func SeedRootTaskWithSrcID(queueType string, rootFolder types.Folder, rootNodeID
 		return fmt.Errorf("failed to ensure stats bucket exists: %w", err)
 	}
 
-	// Create NodeState from root folder with SrcID set
+	// Create NodeState from root folder (SrcID will be stored in lookup tables by BatchInsertNodes)
 	state := &db.NodeState{
 		ID:              rootNodeID,           // ULID for database keys
 		ServiceID:       rootFolder.ServiceID, // FS identifier
@@ -152,13 +152,13 @@ func SeedRootTaskWithSrcID(queueType string, rootFolder types.Folder, rootNodeID
 		Depth:           0, // Root is always depth 0
 		CopyNeeded:      false,
 		Status:          db.StatusPending,
-		SrcID:           srcID, // Set SrcID to match SRC root
+		SrcID:           srcID, // Temporarily stored for BatchInsertNodes to create lookup mappings
 	}
 
 	// Populate traversal status in the NodeState metadata
 	state.TraversalStatus = db.StatusPending
 
-	// Use BatchInsertNodes to write to BoltDB
+	// Use BatchInsertNodes to write to BoltDB (will also create lookup mappings)
 	ops := []db.InsertOperation{
 		{
 			QueueType: queueType,
