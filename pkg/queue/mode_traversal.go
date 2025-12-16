@@ -111,7 +111,7 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		}
 
 		// Batch-load expected children for all folder tasks in one DB operation
-		// Uses SrcID from DST NodeState to find corresponding SRC parents, then loads their children
+		// Uses lookup table to get SrcID from DST parent IDs, then loads SRC children
 		if len(dstParentIDs) > 0 {
 			var err error
 			expectedFoldersMap, expectedFilesMap, srcIDMap, err = BatchLoadExpectedChildrenByDSTIDs(boltDB, dstParentIDs, dstIDToPath)

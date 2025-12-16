@@ -248,6 +248,39 @@ func (op *NodeDeletionOperation) Execute(tx *bolt.Tx) error {
 	return nil
 }
 
+// LookupMappingOperation represents creation of a bidirectional lookup mapping between SRC and DST nodes.
+type LookupMappingOperation struct {
+	SrcID string // ULID of the SRC node
+	DstID string // ULID of the DST node
+}
+
+// Execute performs the lookup mapping creation within a transaction.
+func (op *LookupMappingOperation) Execute(tx *bolt.Tx) error {
+	if op.SrcID == "" || op.DstID == "" {
+		return nil // Skip if either ID is empty
+	}
+
+	// Store DST→SRC mapping
+	dstToSrcBucket, err := GetOrCreateDstToSrcBucket(tx)
+	if err != nil {
+		return fmt.Errorf("failed to get dst-to-src bucket: %w", err)
+	}
+	if err := dstToSrcBucket.Put([]byte(op.DstID), []byte(op.SrcID)); err != nil {
+		return fmt.Errorf("failed to store dst-to-src mapping: %w", err)
+	}
+
+	// Store SRC→DST mapping
+	srcToDstBucket, err := GetOrCreateSrcToDstBucket(tx)
+	if err != nil {
+		return fmt.Errorf("failed to get src-to-dst bucket: %w", err)
+	}
+	if err := srcToDstBucket.Put([]byte(op.SrcID), []byte(op.DstID)); err != nil {
+		return fmt.Errorf("failed to store src-to-dst mapping: %w", err)
+	}
+
+	return nil
+}
+
 // OutputBuffer batches write operations for efficient database writes.
 // It supports three flush triggers: forced, size threshold, and time-based.
 type OutputBuffer struct {
@@ -349,6 +382,18 @@ func (ob *OutputBuffer) AddNodeDeletion(queueType string, nodeID string, level i
 		NodeID:    nodeID,
 		Level:     level,
 		Status:    status,
+	}
+	ob.Add(op)
+}
+
+// AddLookupMapping adds a bidirectional lookup mapping operation to the buffer.
+func (ob *OutputBuffer) AddLookupMapping(srcID, dstID string) {
+	if srcID == "" || dstID == "" {
+		return // Skip if either ID is empty
+	}
+	op := &LookupMappingOperation{
+		SrcID: srcID,
+		DstID: dstID,
 	}
 	ob.Add(op)
 }

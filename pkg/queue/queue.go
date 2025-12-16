@@ -455,10 +455,30 @@ func (q *Queue) markComplete(format string, args ...interface{}) bool {
 		return false
 	}
 
+	// Calculate total statistics across all rounds
+	q.mu.RLock()
+	totalTasksProcessed := 0
+	totalChildrenDiscovered := 0
+	for _, roundStats := range q.roundStats {
+		if roundStats != nil {
+			totalTasksProcessed += roundStats.Completed
+			totalChildrenDiscovered += roundStats.Expected
+		}
+	}
+	q.mu.RUnlock()
+
 	if logservice.LS != nil {
 		message := fmt.Sprintf(format, args...)
 		_ = logservice.LS.Log("info", message, "queue", q.name, q.name)
+		_ = logservice.LS.Log("info",
+			fmt.Sprintf("Queue %s completion stats: %d tasks processed, %d children discovered",
+				q.name, totalTasksProcessed, totalChildrenDiscovered),
+			"queue", q.name, q.name)
 	}
+
+	// Also print to stdout for test visibility
+	fmt.Printf("\n[%s Queue Complete] Tasks Processed: %d | Children Discovered: %d\n",
+		q.name, totalTasksProcessed, totalChildrenDiscovered)
 
 	q.setState(QueueStateCompleted)
 
@@ -604,14 +624,38 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		}
 	}
 
-	// 2. Collect discovered children for insertion
+	// 2. Build map of existing children (ServiceID -> ULID) to avoid creating duplicates
+	existingChildrenMap := make(map[string]string) // ServiceID -> ULID
+	boltDB := q.getBoltDB()
+	if boltDB != nil {
+		if existingChildren, err := db.GetChildrenStatesByParentID(boltDB, queueType, nodeID); err == nil {
+			for _, existingChild := range existingChildren {
+				if existingChild != nil && existingChild.ServiceID != "" {
+					existingChildrenMap[existingChild.ServiceID] = existingChild.ID
+				}
+			}
+		}
+	}
+
+	// 3. Collect discovered children for insertion
 	for _, child := range task.DiscoveredChildren {
 		// For DST queues, skip folder children here - they'll be handled separately
 		if queueType == "DST" && !child.IsFile {
 			continue
 		}
 
-		childState := childResultToNodeState(child, parentPath, nextRound, queueType, nodeID)
+		// Get ServiceID from child
+		var childServiceID string
+		if child.IsFile {
+			childServiceID = child.File.ServiceID
+		} else {
+			childServiceID = child.Folder.ServiceID
+		}
+
+		// Check if child already exists - if so, reuse its ULID
+		existingULID, exists := existingChildrenMap[childServiceID]
+
+		childState := childResultToNodeStateWithID(child, parentPath, nextRound, queueType, nodeID, existingULID, exists)
 		if childState == nil {
 			continue
 		}
@@ -625,6 +669,15 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 			Status:    child.Status,
 			State:     childState,
 		})
+
+		// For DST queue: queue lookup mapping if this child has a matching SRC node
+		if queueType == "DST" && child.SrcID != "" {
+			outputBuffer := q.getOutputBuffer()
+			if outputBuffer != nil {
+				// Queue bidirectional lookup mapping: SrcID <-> DST node ID
+				outputBuffer.AddLookupMapping(child.SrcID, childState.ID)
+			}
+		}
 
 		// Increment expected count for folder children (only folders need traversal)
 		if !child.IsFile {
@@ -659,6 +712,9 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 
 		tasksCreated := 0
 		for _, child := range childFolders {
+			// Check if this folder already exists (by ServiceID) and reuse its ULID
+			existingFolderULID, folderExists := existingChildrenMap[child.folder.ServiceID]
+
 			// Create task state for DST child (without ExpectedFolders/ExpectedFiles - loaded in PullTasks)
 			taskState := taskToNodeState(&TaskBase{
 				Type:   TaskTypeDstTraversal,
@@ -666,6 +722,11 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 				Round:  nextRound,
 			})
 			if taskState != nil {
+				// Reuse existing ULID if folder already exists
+				if folderExists && existingFolderULID != "" {
+					taskState.ID = existingFolderULID
+				}
+
 				// Set parent's ULID for database relationships
 				taskState.ParentID = nodeID
 				// Populate traversal status in the NodeState metadata
@@ -683,6 +744,15 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 					State:     taskState,
 				})
 
+				// Queue lookup mapping if this child has a matching SRC node
+				if child.srcID != "" {
+					outputBuffer := q.getOutputBuffer()
+					if outputBuffer != nil {
+						// Queue bidirectional lookup mapping: SrcID <-> DST node ID
+						outputBuffer.AddLookupMapping(child.srcID, taskState.ID)
+					}
+				}
+
 				q.incrementRoundStatsExpected(nextRound)
 				tasksCreated++
 			}
@@ -696,9 +766,43 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		outputBuffer.AddStatusUpdate(queueType, currentRound, db.StatusPending, db.StatusSuccessful, nodeID)
 
 		// Add child inserts to buffer
-		// BatchInsertNodes will handle storing SrcID mappings in lookup tables
+		// Lookup mappings are queued above when creating child states
 		if len(childNodesToInsert) > 0 {
 			outputBuffer.AddBatchInsert(childNodesToInsert)
+		}
+
+		// For SRC FOLDER tasks in retry mode: Queue DST cleanup (mark parent as pending, delete children)
+		// Only folders have children to clean up - files don't need this
+		if q.name == "src" && q.getMode() == QueueModeRetry && q.boltDB != nil && task.IsFolder() {
+			dstID, err := db.GetDstIDFromSrcID(q.boltDB, nodeID)
+			if err == nil && dstID != "" {
+				// Get DST node state to determine its depth and current status
+				dstState, err := db.GetNodeState(q.boltDB, "DST", dstID)
+				if err == nil && dstState != nil {
+					// Queue status update to mark DST parent as pending
+					oldStatus := dstState.TraversalStatus
+					if oldStatus == "" {
+						oldStatus = db.StatusSuccessful // Default assumption
+					}
+					outputBuffer.AddStatusUpdate("DST", dstState.Depth, oldStatus, db.StatusPending, dstID)
+
+					// Queue deletion of DST children using batch deletion
+					childIDs, err := db.GetChildrenIDsByParentID(q.boltDB, "DST", dstID)
+					if err == nil && len(childIDs) > 0 {
+						for _, childID := range childIDs {
+							// Get child state to know its depth and status for deletion
+							childState, err := db.GetNodeState(q.boltDB, "DST", childID)
+							if err == nil && childState != nil {
+								childStatus := childState.TraversalStatus
+								if childStatus == "" {
+									childStatus = db.StatusSuccessful
+								}
+								outputBuffer.AddNodeDeletion("DST", childID, childState.Depth, childStatus)
+							}
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -727,12 +831,18 @@ func (q *Queue) completeExclusionTask(task *TaskBase) {
 	q.recordTaskCompletion(currentRound, true)
 }
 
-func childResultToNodeState(child ChildResult, parentPath string, depth int, queueType string, parentID string) *db.NodeState {
-	// Generate ULID for internal ID
-	nodeID := db.GenerateNodeID()
-	if nodeID == "" {
-		// If ULID generation fails, we can't proceed
-		return nil
+// childResultToNodeStateWithID converts a ChildResult to NodeState, reusing existing ULID if provided.
+func childResultToNodeStateWithID(child ChildResult, parentPath string, depth int, queueType string, parentID string, existingULID string, useExisting bool) *db.NodeState {
+	// Use existing ULID if provided, otherwise generate new one
+	var nodeID string
+	if useExisting && existingULID != "" {
+		nodeID = existingULID
+	} else {
+		nodeID = db.GenerateNodeID()
+		if nodeID == "" {
+			// If ULID generation fails, we can't proceed
+			return nil
+		}
 	}
 
 	// Store SrcID temporarily in NodeState for BatchInsertNodes to create lookup mappings
@@ -745,7 +855,7 @@ func childResultToNodeState(child ChildResult, parentPath string, depth int, que
 	if child.IsFile {
 		file := child.File
 		return &db.NodeState{
-			ID:              nodeID,         // ULID for database keys
+			ID:              nodeID,         // ULID for database keys (reused if exists)
 			ServiceID:       file.ServiceID, // FS identifier
 			ParentID:        parentID,       // Parent's ULID for database relationships
 			ParentServiceID: file.ParentId,  // Parent's FS identifier
@@ -764,7 +874,7 @@ func childResultToNodeState(child ChildResult, parentPath string, depth int, que
 
 	folder := child.Folder
 	return &db.NodeState{
-		ID:              nodeID,           // ULID for database keys
+		ID:              nodeID,           // ULID for database keys (reused if exists)
 		ServiceID:       folder.ServiceID, // FS identifier
 		ParentID:        parentID,         // Parent's ULID for database relationships
 		ParentServiceID: folder.ParentId,  // Parent's FS identifier

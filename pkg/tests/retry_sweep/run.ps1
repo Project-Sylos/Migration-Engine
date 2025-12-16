@@ -43,10 +43,6 @@ if (Test-Path $destYAML) {
 if (Test-Path $destSpectra) {
     Remove-Item -Path $destSpectra -Force -ErrorAction SilentlyContinue
 }
-# Also clean up project root spectra.db if it exists (from previous test run)
-if (Test-Path "spectra.db") {
-    Remove-Item -Path "spectra.db" -Force -ErrorAction SilentlyContinue
-}
 
 # Copy source files to destination
 Write-Host "Copying test files..." -ForegroundColor Yellow
