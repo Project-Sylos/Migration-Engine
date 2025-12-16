@@ -206,8 +206,8 @@ func DeleteSubtree(boltDB *db.DB, queueType string, rootPath string) error {
 			}
 
 			// 2. Delete from status bucket (check all status buckets at all levels)
-			// We'll check common statuses: pending, successful, failed, not_on_src
-			statuses := []string{db.StatusPending, db.StatusSuccessful, db.StatusFailed, db.StatusNotOnSrc}
+			// Check all statuses: pending, successful, failed, not_on_src, excluded
+			statuses := []string{db.StatusPending, db.StatusSuccessful, db.StatusFailed, db.StatusNotOnSrc, db.StatusExcluded}
 			for _, level := range levels {
 				for _, status := range statuses {
 					statusBucket := db.GetStatusBucket(tx, queueType, level, status)
@@ -253,6 +253,36 @@ func DeleteSubtree(boltDB *db.DB, queueType string, rootPath string) error {
 							}
 						}
 					}
+				}
+			}
+
+			// 5. Delete node's own children list (if folder)
+			if nodeState.Type == "folder" {
+				childrenBucket := db.GetChildrenBucket(tx, queueType)
+				if childrenBucket != nil {
+					// Check if entry exists before deleting (for stats)
+					if childrenBucket.Get(nodeIDBytes) != nil {
+						childrenBucket.Delete(nodeIDBytes)
+						// Decrement children bucket count
+						childrenPath := db.GetChildrenBucketPath(queueType)
+						statsDeltas[strings.Join(childrenPath, "/")]--
+					}
+				}
+			}
+
+			// 6. Delete from join-lookup tables
+			switch queueType {
+			case "SRC":
+				// Delete SrcToDst mapping
+				srcToDstBucket := db.GetSrcToDstBucket(tx)
+				if srcToDstBucket != nil {
+					srcToDstBucket.Delete(nodeIDBytes)
+				}
+			case "DST":
+				// Delete DstToSrc mapping
+				dstToSrcBucket := db.GetDstToSrcBucket(tx)
+				if dstToSrcBucket != nil {
+					dstToSrcBucket.Delete(nodeIDBytes)
 				}
 			}
 		}
@@ -307,6 +337,19 @@ func updateBucketStatsInTx(tx *bolt.Tx, bucketPath []string, delta int64) error 
 		binary.BigEndian.PutUint64(valueBytes, uint64(newCount))
 		return statsBucket.Put(keyBytes, valueBytes)
 	}
+}
+
+// MarkNodeAsPending marks a node as pending in the database.
+func MarkNodeAsPending(boltDB *db.DB, queueType string, nodePath string) error {
+	// Find node by path
+	nodeState, err := findNodeByPath(boltDB, queueType, nodePath)
+	if err != nil {
+		return fmt.Errorf("failed to find node: %w", err)
+	}
+
+	// Update status to pending using ULID
+	_, err = db.UpdateNodeStatusByID(boltDB, queueType, nodeState.Depth, nodeState.TraversalStatus, db.StatusPending, nodeState.ID)
+	return err
 }
 
 // MarkNodeAsFailed marks a node as failed in the database.

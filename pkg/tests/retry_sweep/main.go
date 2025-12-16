@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Migration-Engine/pkg/tests/shared"
 	"github.com/Project-Sylos/Spectra/sdk"
@@ -103,34 +104,79 @@ func runTest() error {
 		return fmt.Errorf("failed to pick random child: %w", err)
 	}
 
-	fmt.Printf("Selected node: %s (depth: %d, type: %s)\n", selectedChild.Path, selectedChild.Depth, selectedChild.Type)
+	fmt.Printf("Selected SRC node: %s (depth: %d, type: %s)\n", selectedChild.Path, selectedChild.Depth, selectedChild.Type)
 
-	// Count subtree before deletion
-	subtreeStats, err := shared.CountSubtree(boltDB, "SRC", selectedChild.Path)
+	// Find corresponding DST node using join-lookup table
+	dstNodeID, err := db.GetDstIDFromSrcID(boltDB, selectedChild.ID)
 	if err != nil {
-		return fmt.Errorf("failed to count subtree: %w", err)
+		return fmt.Errorf("failed to get DST node ID from SRC node: %w", err)
 	}
-	fmt.Printf("Subtree stats: %d nodes (%d folders, %d files), max depth: %d\n",
-		subtreeStats.TotalNodes, subtreeStats.TotalFolders, subtreeStats.TotalFiles, subtreeStats.MaxDepth)
-
-	// Mark the selected node as failed
-	fmt.Printf("Marking node as failed...\n")
-	if err := shared.MarkNodeAsFailed(boltDB, "SRC", selectedChild.Path); err != nil {
-		return fmt.Errorf("failed to mark node as failed: %w", err)
+	if dstNodeID == "" {
+		return fmt.Errorf("no corresponding DST node found for SRC node %s", selectedChild.ID)
 	}
 
-	// Delete all children of the selected node from BoltDB
-	fmt.Printf("Deleting subtree from BoltDB (keeping Spectra DB intact)...\n")
+	// Get DST node state to get its path
+	dstNodeState, err := db.GetNodeState(boltDB, "DST", dstNodeID)
+	if err != nil {
+		return fmt.Errorf("failed to get DST node state: %w", err)
+	}
+	if dstNodeState == nil {
+		return fmt.Errorf("DST node not found: %s", dstNodeID)
+	}
+
+	fmt.Printf("Found corresponding DST node: %s (depth: %d, type: %s)\n", dstNodeState.Path, dstNodeState.Depth, dstNodeState.Type)
+
+	// Count SRC subtree before deletion
+	srcSubtreeStats, err := shared.CountSubtree(boltDB, "SRC", selectedChild.Path)
+	if err != nil {
+		return fmt.Errorf("failed to count SRC subtree: %w", err)
+	}
+	fmt.Printf("SRC subtree stats: %d nodes (%d folders, %d files), max depth: %d\n",
+		srcSubtreeStats.TotalNodes, srcSubtreeStats.TotalFolders, srcSubtreeStats.TotalFiles, srcSubtreeStats.MaxDepth)
+
+	// Count DST subtree before deletion
+	dstSubtreeStats, err := shared.CountSubtree(boltDB, "DST", dstNodeState.Path)
+	if err != nil {
+		return fmt.Errorf("failed to count DST subtree: %w", err)
+	}
+	fmt.Printf("DST subtree stats: %d nodes (%d folders, %d files), max depth: %d\n",
+		dstSubtreeStats.TotalNodes, dstSubtreeStats.TotalFolders, dstSubtreeStats.TotalFiles, dstSubtreeStats.MaxDepth)
+
+	// Mark both nodes as pending
+	fmt.Printf("Marking SRC node as pending...\n")
+	if err := shared.MarkNodeAsPending(boltDB, "SRC", selectedChild.Path); err != nil {
+		return fmt.Errorf("failed to mark SRC node as pending: %w", err)
+	}
+
+	fmt.Printf("Marking DST node as pending...\n")
+	if err := shared.MarkNodeAsPending(boltDB, "DST", dstNodeState.Path); err != nil {
+		return fmt.Errorf("failed to mark DST node as pending: %w", err)
+	}
+
+	// Delete all children of the selected SRC node from BoltDB
+	fmt.Printf("Deleting SRC subtree from BoltDB (keeping Spectra DB intact)...\n")
 	if err := shared.DeleteSubtree(boltDB, "SRC", selectedChild.Path); err != nil {
-		return fmt.Errorf("failed to delete subtree: %w", err)
+		return fmt.Errorf("failed to delete SRC subtree: %w", err)
+	}
+
+	// Delete all children of the corresponding DST node from BoltDB
+	fmt.Printf("Deleting DST subtree from BoltDB (keeping Spectra DB intact)...\n")
+	if err := shared.DeleteSubtree(boltDB, "DST", dstNodeState.Path); err != nil {
+		return fmt.Errorf("failed to delete DST subtree: %w", err)
 	}
 
 	// Count nodes in BoltDB after deletion
-	boltNodeCountBefore, err := boltDB.CountNodes("SRC")
+	boltNodeCountSRCBefore, err := boltDB.CountNodes("SRC")
 	if err != nil {
-		return fmt.Errorf("failed to count BoltDB nodes: %w", err)
+		return fmt.Errorf("failed to count BoltDB SRC nodes: %w", err)
 	}
-	fmt.Printf("BoltDB node count after deletion: %d\n", boltNodeCountBefore)
+	fmt.Printf("BoltDB SRC node count after deletion: %d\n", boltNodeCountSRCBefore)
+
+	boltNodeCountDSTBefore, err := boltDB.CountNodes("DST")
+	if err != nil {
+		return fmt.Errorf("failed to count BoltDB DST nodes: %w", err)
+	}
+	fmt.Printf("BoltDB DST node count after deletion: %d\n", boltNodeCountDSTBefore)
 
 	fmt.Println("\n🚀 Phase 3: Run Retry Sweep")
 	fmt.Println("============================")
@@ -166,31 +212,58 @@ func runTest() error {
 	fmt.Println("========================")
 
 	// Count nodes in BoltDB after retry sweep
-	boltNodeCountAfter, err := boltDB.CountNodes("SRC")
+	boltNodeCountSRCAfter, err := boltDB.CountNodes("SRC")
 	if err != nil {
-		return fmt.Errorf("failed to count BoltDB nodes after sweep: %w", err)
+		return fmt.Errorf("failed to count BoltDB SRC nodes after sweep: %w", err)
 	}
-	fmt.Printf("BoltDB node count after retry sweep: %d\n", boltNodeCountAfter)
+	fmt.Printf("BoltDB SRC node count after retry sweep: %d\n", boltNodeCountSRCAfter)
 
-	// Verify that we found all nodes again
-	expectedCount := spectraNodeCount
-	if boltNodeCountAfter != expectedCount {
-		return fmt.Errorf("node count mismatch: expected %d (from Spectra), got %d (in BoltDB)",
-			expectedCount, boltNodeCountAfter)
-	}
-
-	fmt.Printf("✅ Node count matches Spectra DB: %d nodes\n", expectedCount)
-
-	// Verify no pending nodes remain
-	pendingCount, err := shared.CountPendingNodes(boltDB, "SRC")
+	boltNodeCountDSTAfter, err := boltDB.CountNodes("DST")
 	if err != nil {
-		return fmt.Errorf("failed to count pending nodes: %w", err)
+		return fmt.Errorf("failed to count BoltDB DST nodes after sweep: %w", err)
+	}
+	fmt.Printf("BoltDB DST node count after retry sweep: %d\n", boltNodeCountDSTAfter)
+
+	// Verify that we found all SRC nodes again
+	expectedSRCCount := spectraNodeCount
+	if boltNodeCountSRCAfter != expectedSRCCount {
+		return fmt.Errorf("SRC node count mismatch: expected %d (from Spectra), got %d (in BoltDB)",
+			expectedSRCCount, boltNodeCountSRCAfter)
 	}
 
-	if pendingCount > 0 {
-		fmt.Printf("⚠️  Warning: %d pending nodes remain (this may be expected if some nodes failed)\n", pendingCount)
+	fmt.Printf("✅ SRC node count matches Spectra DB: %d nodes\n", expectedSRCCount)
+
+	// Verify that DST was also restored to original count
+	expectedDSTCount := boltNodeCountDST // Original DST count before deletion
+	if boltNodeCountDSTAfter != expectedDSTCount {
+		return fmt.Errorf("DST node count mismatch: expected %d (original count), got %d (after retry sweep)",
+			expectedDSTCount, boltNodeCountDSTAfter)
+	}
+
+	fmt.Printf("✅ DST node count matches original: %d nodes\n", expectedDSTCount)
+
+	// Verify no pending nodes remain in SRC
+	srcPendingCount, err := shared.CountPendingNodes(boltDB, "SRC")
+	if err != nil {
+		return fmt.Errorf("failed to count pending SRC nodes: %w", err)
+	}
+
+	if srcPendingCount > 0 {
+		fmt.Printf("⚠️  Warning: %d pending SRC nodes remain (this may be expected if some nodes failed)\n", srcPendingCount)
 	} else {
-		fmt.Println("✅ No pending nodes remaining")
+		fmt.Println("✅ No pending SRC nodes remaining")
+	}
+
+	// Verify no pending nodes remain in DST
+	dstPendingCount, err := shared.CountPendingNodes(boltDB, "DST")
+	if err != nil {
+		return fmt.Errorf("failed to count pending DST nodes: %w", err)
+	}
+
+	if dstPendingCount > 0 {
+		fmt.Printf("⚠️  Warning: %d pending DST nodes remain (this may be expected if some nodes failed)\n", dstPendingCount)
+	} else {
+		fmt.Println("✅ No pending DST nodes remaining")
 	}
 
 	return nil

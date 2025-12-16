@@ -181,14 +181,28 @@ func BatchLoadExpectedChildrenByDSTIDs(boltDB *db.DB, dstParentIDs []string, dst
 			return fmt.Errorf("nodes bucket not found for SRC")
 		}
 
-		// Step 1: Get SrcID from each DST parent NodeState
+		// Step 1: Get SrcID from lookup table for each DST parent
 		// Map: DST ULID -> SRC parent ULID
 		dstToSrcParent := make(map[string]string)
 		// Map: SRC parent ULID -> []DST ULIDs (multiple DST parents might map to same SRC parent)
 		srcParentToDSTs := make(map[string][]string)
 
+		// Get dst-to-src lookup bucket
+		dstToSrcBucket := db.GetDstToSrcBucket(tx)
+		if dstToSrcBucket == nil {
+			// Lookup bucket doesn't exist - initialize empty slices for all DST parents
+			for _, dstID := range dstParentIDs {
+				resultFolders[dstID] = []types.Folder{}
+				resultFiles[dstID] = []types.File{}
+				srcIDMap[dstID] = make(map[string]string)
+			}
+			fmt.Println("Lookup bucket doesn't exist - initializing empty slices for all DST parents")
+			return nil // No mappings available
+		}
+
 		for _, dstID := range dstParentIDs {
-			dstNodeData := dstNodesBucket.Get([]byte(dstID))
+			dstIDBytes := []byte(dstID)
+			dstNodeData := dstNodesBucket.Get(dstIDBytes)
 			if dstNodeData == nil {
 				// DST node not found - initialize empty slices
 				resultFolders[dstID] = []types.Folder{}
@@ -206,15 +220,17 @@ func BatchLoadExpectedChildrenByDSTIDs(boltDB *db.DB, dstParentIDs []string, dst
 				continue
 			}
 
-			// Get SrcID from lookup table instead of NodeState
-			srcParentID, err := db.GetSrcIDFromDstID(boltDB, dstID)
-			if err != nil || srcParentID == "" {
+			// Get SrcID from lookup table directly within this transaction
+			srcParentIDBytes := dstToSrcBucket.Get(dstIDBytes)
+			if srcParentIDBytes == nil {
 				// No SrcID mapping found - initialize empty slices
 				resultFolders[dstID] = []types.Folder{}
 				resultFiles[dstID] = []types.File{}
 				srcIDMap[dstID] = make(map[string]string)
 				continue
 			}
+
+			srcParentID := string(srcParentIDBytes)
 			dstToSrcParent[dstID] = srcParentID
 			srcParentToDSTs[srcParentID] = append(srcParentToDSTs[srcParentID], dstID)
 			srcIDMap[dstID] = make(map[string]string)

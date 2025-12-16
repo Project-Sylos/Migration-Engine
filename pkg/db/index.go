@@ -4,6 +4,7 @@
 package db
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -477,8 +478,18 @@ func BatchDeleteNodes(db *DB, queueType string, nodeIDs []string) error {
 			return fmt.Errorf("children bucket not found for %s", queueType)
 		}
 
-		// Track parent updates to batch them
+		// Get join-lookup buckets
+		var srcToDstBucket, dstToSrcBucket *bolt.Bucket
+		switch queueType {
+		case "SRC":
+			srcToDstBucket = GetSrcToDstBucket(tx)
+		case "DST":
+			dstToSrcBucket = GetDstToSrcBucket(tx)
+		}
+
+		// Track parent updates and stats deltas
 		parentUpdates := make(map[string][]string) // parentID -> remaining children
+		statsDeltas := make(map[string]int64)      // bucket path -> delta
 
 		for _, nodeIDStr := range nodeIDs {
 			nodeID := []byte(nodeIDStr)
@@ -508,12 +519,18 @@ func BatchDeleteNodes(db *DB, queueType string, nodeIDs []string) error {
 			if err := nodesBucket.Delete(nodeID); err != nil {
 				return fmt.Errorf("failed to delete from nodes bucket: %w", err)
 			}
+			// Decrement nodes bucket count
+			nodesPath := GetNodesBucketPath(queueType)
+			statsDeltas[strings.Join(nodesPath, "/")]--
 
 			// 2. Delete from status bucket
 			if currentStatus != "" {
 				statusBucket := GetStatusBucket(tx, queueType, ns.Depth, currentStatus)
 				if statusBucket != nil {
 					statusBucket.Delete(nodeID) // Ignore errors
+					// Decrement status bucket count
+					statusPath := GetStatusBucketPath(queueType, ns.Depth, currentStatus)
+					statsDeltas[strings.Join(statusPath, "/")]--
 				}
 			}
 
@@ -547,6 +564,23 @@ func BatchDeleteNodes(db *DB, queueType string, nodeIDs []string) error {
 				}
 				parentUpdates[ns.ParentID] = filtered
 			}
+
+			// 5. Delete node's own children list (if folder)
+			if ns.Type == "folder" {
+				if childrenBucket.Get(nodeID) != nil {
+					childrenBucket.Delete(nodeID)
+					// Decrement children bucket count
+					childrenPath := GetChildrenBucketPath(queueType)
+					statsDeltas[strings.Join(childrenPath, "/")]--
+				}
+			}
+
+			// 6. Delete from join-lookup tables
+			if queueType == "SRC" && srcToDstBucket != nil {
+				srcToDstBucket.Delete(nodeID)
+			} else if queueType == "DST" && dstToSrcBucket != nil {
+				dstToSrcBucket.Delete(nodeID)
+			}
 		}
 
 		// Apply all parent children list updates
@@ -563,6 +597,37 @@ func BatchDeleteNodes(db *DB, queueType string, nodeIDs []string) error {
 			} else {
 				// No children left, remove entry
 				childrenBucket.Delete(parentID)
+			}
+		}
+
+		// Update stats bucket for all deletions
+		statsBucket, err := getStatsBucket(tx)
+		if err == nil && statsBucket != nil {
+			for pathStr, delta := range statsDeltas {
+				keyBytes := []byte(pathStr)
+
+				// Get current count
+				var currentCount int64
+				existingValue := statsBucket.Get(keyBytes)
+				if existingValue != nil {
+					currentCount = int64(binary.BigEndian.Uint64(existingValue))
+				}
+
+				// Compute new count
+				newCount := currentCount + delta
+				if newCount < 0 {
+					newCount = 0
+				}
+
+				if newCount == 0 {
+					// Remove stats entry if count is zero
+					statsBucket.Delete(keyBytes)
+				} else {
+					// Store new count as 8-byte big-endian int64
+					valueBytes := make([]byte, 8)
+					binary.BigEndian.PutUint64(valueBytes, uint64(newCount))
+					statsBucket.Put(keyBytes, valueBytes)
+				}
 			}
 		}
 
