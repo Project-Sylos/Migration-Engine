@@ -91,6 +91,7 @@ const (
 	SubBucketJoinLookup         = "join-lookup"
 	SubBucketSrcToDst           = "src-to-dst"
 	SubBucketDstToSrc           = "dst-to-src"
+	SubBucketPathToULID         = "path-to-ulid" // Path hash → ULID lookup
 )
 
 // FormatLevel formats a level number as an 8-digit zero-padded string.

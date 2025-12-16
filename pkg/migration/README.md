@@ -392,6 +392,85 @@ if err != nil {
 
 ---
 
+## Retry Sweeps
+
+Retry sweeps allow re-processing of failed or pending nodes to discover new or changed content. This is useful for:
+- Recovering from transient failures
+- Re-scanning subtrees marked as pending for investigation
+- Testing migration behavior with partial tree reprocessing
+
+### How Retry Sweeps Work
+
+1. **Mark Nodes for Retry**: Change node status from `successful` to `pending` (or leave as `failed`)
+2. **Delete Subtree Data**: Remove all descendant nodes and their metadata from BoltDB
+3. **Run Retry Sweep**: Execute migration in retry mode (`QueueModeRetry`)
+4. **Re-discover Content**: Queues re-traverse marked subtrees as if doing fresh traversal
+
+### Retry Sweep Flow
+
+**SRC Queue**:
+- Scans all known levels for pending/failed tasks
+- Re-processes marked nodes (lists children, applies filters)
+- On successful completion of SRC folder tasks:
+  - Triggers DST cleanup for corresponding DST nodes
+  - Marks DST parent as pending
+  - Deletes DST children
+
+**DST Queue**:
+- Waits for SRC to complete (coordinator gating)
+- Processes pending DST tasks
+- Loads expected children from SRC via join-lookup tables
+- Performs comparison and discovers new/changed content
+
+### DST Cleanup During SRC Completion
+
+To prevent node duplication and maintain consistency, DST cleanup happens **during SRC task completion**, not during pull:
+
+```go
+// In completeTask() for SRC folder tasks in retry mode:
+if q.name == "src" && q.getMode() == QueueModeRetry && task.IsFolder() {
+    // Find corresponding DST node via join-lookup table
+    dstID, err := db.GetDstIDFromSrcID(boltDB, srcNodeID)
+    
+    // Mark DST parent as pending (via OutputBuffer)
+    outputBuffer.AddStatusUpdate("DST", dstDepth, oldStatus, db.StatusPending, dstID)
+    
+    // Delete all DST children (via OutputBuffer)
+    childIDs, err := db.GetChildrenIDsByParentID(boltDB, "DST", dstID)
+    for _, childID := range childIDs {
+        outputBuffer.AddNodeDeletion("DST", childID, childDepth, childStatus)
+    }
+}
+```
+
+This ensures:
+- DST cleanup is buffered along with other task completion writes
+- Cleanup only occurs when SRC task successfully completes
+- All operations are atomic within the output buffer
+- No race conditions between cleanup and other queue operations
+
+### Testing Retry Sweeps
+
+The `pkg/tests/retry_sweep` package provides a comprehensive test:
+
+1. **Setup**: Runs normal migration to completion (all nodes successful)
+2. **Prepare Retry**: 
+   - Randomly selects a top-level folder
+   - Marks it as pending
+   - Deletes its entire subtree (children, status, join tables, stats)
+3. **Execute Retry**: Runs retry sweep migration
+4. **Verify**: 
+   - Confirms node counts match expected (subtree size)
+   - Validates no duplicates were created
+   - Checks both SRC and DST queues completed successfully
+
+**Run the test**:
+```powershell
+powershell -File pkg/tests/retry_sweep/run.ps1
+```
+
+---
+
 ## Examples
 
 See the main package (`main.go`) and test packages for complete examples of:

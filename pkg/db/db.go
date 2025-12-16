@@ -113,6 +113,12 @@ func (db *DB) initializeBuckets() error {
 			if _, err := queueBucket.CreateBucketIfNotExists([]byte("unexclusion-holding")); err != nil {
 				return fmt.Errorf("failed to create Traversal-Data/%s/unexclusion-holding bucket: %w", queueType, err)
 			}
+
+			// Create path-to-ulid lookup bucket
+			// This stores path hash -> ULID mappings for API path-based queries
+			if _, err := queueBucket.CreateBucketIfNotExists([]byte("path-to-ulid")); err != nil {
+				return fmt.Errorf("failed to create Traversal-Data/%s/path-to-ulid bucket: %w", queueType, err)
+			}
 		}
 
 		// Create src-to-dst lookup bucket under SRC

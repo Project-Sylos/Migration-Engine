@@ -76,7 +76,107 @@ parentULID → []childULID JSON
 ["01ARZ3NDEKTSV4RRFFQ69G5FAV", "01ARZ3NDEKTSV4RRFFQ69G5FAW", "01ARZ3NDEKTSV4RRFFQ69G5FAX"]
 ```
 
-#### 3. Levels Bucket (`/levels`)
+#### 3. Join-Lookup Tables (`/src-to-dst` and `/dst-to-src`)
+
+**Paths**: 
+- `/Traversal-Data/SRC/src-to-dst/`
+- `/Traversal-Data/DST/dst-to-src/`
+
+Bidirectional mappings between corresponding SRC and DST nodes. These tables replace the legacy `SrcID` field that was previously embedded in DST NodeState.
+
+```
+SRC: srcULID → dstULID
+DST: dstULID → srcULID
+```
+
+**Purpose:**
+- Enable efficient correlation between SRC and DST nodes without embedding references in node data
+- Support retry sweeps where DST nodes need to be reset when their corresponding SRC nodes are retried
+- Populated during DST task completion when children are matched by Type + Name
+
+**Usage:**
+```go
+// Find DST node corresponding to SRC node
+dstID, err := db.GetDstIDFromSrcID(boltDB, srcULID)
+
+// Find SRC node corresponding to DST node
+srcID, err := db.GetSrcIDFromDstID(boltDB, dstULID)
+
+// Set bidirectional mapping (usually done via OutputBuffer)
+err := db.SetSrcToDstMapping(tx, srcULID, dstULID)
+err := db.SetDstToSrcMapping(tx, dstULID, srcULID)
+```
+
+#### 4. Path-to-ULID Lookup Table (`/path-to-ulid`)
+
+**Paths**:
+- `/Traversal-Data/SRC/path-to-ulid/`
+- `/Traversal-Data/DST/path-to-ulid/`
+
+Maps path hashes to ULIDs, enabling API to query nodes by path without scanning the entire nodes bucket.
+
+```
+pathHash (SHA-256) → ULID
+```
+
+**Purpose:**
+- Enable path-based queries for API endpoints
+- Maintain ULID as primary key while supporting user-friendly path queries
+- Automatically maintained during insert/delete operations
+
+**Usage:**
+```go
+// Hash a path (SHA-256)
+pathHash := db.HashPath("/parent/child")  // Returns 64-char hex string
+
+// Get ULID from path (hashes internally)
+ulid, err := db.GetULIDFromPath(boltDB, "SRC", "/parent/child")
+
+// Get ULID from pre-computed path hash
+ulid, err := db.GetULIDFromPathHash(boltDB, "SRC", pathHash)
+
+// Batch get ULIDs from multiple paths
+paths := []string{"/path1", "/path2", "/path3"}
+results, err := db.BatchGetULIDsFromPaths(boltDB, "SRC", paths)
+// results: map[string]string { "/path1": "ulid1", "/path2": "ulid2", ... }
+
+// Batch get ULIDs from pre-computed path hashes
+pathHashes := []string{hash1, hash2, hash3}
+results, err := db.BatchGetULIDsFromPathHashes(boltDB, "SRC", pathHashes)
+
+// Set mapping (automatically done during BatchInsertNodes)
+err := db.SetPathToULIDMapping(tx, "SRC", "/parent/child", ulid)
+
+// Delete mapping (automatically done during BatchDeleteNodes)
+err := db.DeletePathToULIDMapping(tx, "SRC", "/parent/child")
+```
+
+**API Integration:**
+```go
+// API receives path from user
+userPath := "/Projects/MyProject"
+
+// Hash the path
+pathHash := db.HashPath(userPath)
+
+// Query for ULID
+ulid, err := db.GetULIDFromPathHash(database, "SRC", pathHash)
+if err != nil {
+    return fmt.Errorf("path not found: %s", userPath)
+}
+
+// Now use ULID for all operations
+nodeState, err := db.GetNodeState(database, "SRC", ulid)
+children, err := db.GetChildrenIDsByParentID(database, "SRC", ulid)
+```
+
+**Notes:**
+- Path hashes are SHA-256 (64 hex characters)
+- Mappings are automatically created during `BatchInsertNodes`
+- Mappings are automatically deleted during `BatchDeleteNodes`
+- For bulk queries, use batch functions to reduce transaction overhead
+
+#### 5. Levels Bucket (`/levels`)
 
 **Path**: `/Traversal-Data/SRC/levels/` or `/Traversal-Data/DST/levels/`
 
@@ -193,6 +293,30 @@ nodeID := db.GenerateNodeID() // Returns ULID string (e.g., "01ARZ3NDEKTSV4RRFFQ
 
 **Note**: The `HashPath` function still exists for backward compatibility with test utilities, but is not used for internal operations.
 
+### Join-Lookup Table Operations
+
+```go
+// Get DST ULID from SRC ULID
+dstID, err := db.GetDstIDFromSrcID(boltDB, srcULID)
+
+// Get SRC ULID from DST ULID
+srcID, err := db.GetSrcIDFromDstID(boltDB, dstULID)
+
+// Set bidirectional mapping (within transaction)
+err := database.Update(func(tx *bolt.Tx) error {
+    err := db.SetSrcToDstMapping(tx, srcULID, dstULID)
+    if err != nil {
+        return err
+    }
+    return db.SetDstToSrcMapping(tx, dstULID, srcULID)
+})
+
+// Or use OutputBuffer for automatic batching
+outputBuffer.AddLookupMapping(srcULID, dstULID)
+```
+
+**Important:** Join-lookup mappings are created during DST task completion when DST children are matched to their corresponding SRC children (by Type + Name). This replaces the legacy `SrcID` field that was previously stored in DST NodeState structs.
+
 ### Node State Operations
 
 ```go
@@ -278,12 +402,27 @@ for _, result := range results {
 ### Batch Operations
 
 ```go
-// Batch insert multiple nodes (automatically updates stats)
+// Batch insert multiple nodes (automatically updates stats and join-lookup tables)
+// If State.SrcID is populated, bidirectional join mappings are created
 ops := []db.InsertOperation{
     {QueueType: "SRC", Level: 1, Status: db.StatusPending, State: state1},
-    {QueueType: "SRC", Level: 1, Status: db.StatusPending, State: state2},
+    {QueueType: "DST", Level: 1, Status: db.StatusPending, State: state2}, // state2.SrcID set
 }
 err := db.BatchInsertNodes(database, ops)
+
+// Batch delete nodes (comprehensive cleanup)
+// Automatically deletes from:
+// - /nodes bucket
+// - status buckets (/levels/{level}/{status})
+// - status-lookup index
+// - parent's children list
+// - join-lookup tables (src-to-dst and dst-to-src)
+// - node's own children list (if folder)
+// - stats bucket (decrements counts)
+deleteOps := []db.DeleteNodeOperation{
+    {QueueType: "DST", NodeID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", Level: 1, Status: db.StatusSuccessful},
+}
+err := db.BatchDeleteNodes(database, deleteOps)
 
 // Batch update node statuses
 results, err := db.BatchUpdateNodeStatus(database, "SRC", 1,
@@ -341,7 +480,7 @@ The package provides two buffering systems for high-throughput scenarios:
 
 #### OutputBuffer
 
-Batches write operations (status updates, inserts, copy status) with automatic coalescing and stats updates:
+Batches write operations (status updates, inserts, deletions, copy status, lookup mappings) with automatic coalescing and stats updates:
 
 ```go
 // Create output buffer
@@ -349,7 +488,7 @@ outputBuffer := db.NewOutputBuffer(database, 500, 2*time.Second)
 defer outputBuffer.Stop()
 
 // Add status update (coalesces duplicates - last write wins)
-outputBuffer.AddStatusUpdate("SRC", 1, db.StatusPending, db.StatusSuccessful, "/path/to/node")
+outputBuffer.AddStatusUpdate("SRC", 1, db.StatusPending, db.StatusSuccessful, nodeID)
 
 // Add batch insert (merges with existing batch inserts)
 ops := []db.InsertOperation{
@@ -358,8 +497,14 @@ ops := []db.InsertOperation{
 }
 outputBuffer.AddBatchInsert(ops)
 
+// Add node deletion (comprehensive cleanup including join tables)
+outputBuffer.AddNodeDeletion("DST", nodeID, 1, db.StatusSuccessful)
+
 // Add copy status update
-outputBuffer.AddCopyStatusUpdate("SRC", 1, db.StatusSuccessful, "/path/to/node", db.CopyStatusPending)
+outputBuffer.AddCopyStatusUpdate("SRC", 1, db.StatusSuccessful, nodeID, db.CopyStatusPending)
+
+// Add join-lookup mapping (bidirectional: src-to-dst and dst-to-src)
+outputBuffer.AddLookupMapping(srcULID, dstULID)
 
 // Force flush (or wait for automatic flush on batch size or interval)
 outputBuffer.Flush()
@@ -373,6 +518,8 @@ outputBuffer.Resume()
 **Features:**
 - Automatic coalescing of duplicate operations (last write wins)
 - Batch merging for insert operations
+- Comprehensive node deletion (nodes, status, children, join tables, stats)
+- Automatic bidirectional join-lookup mapping creation
 - Automatic stats updates
 - Time-based and size-based flush triggers
 - Thread-safe
