@@ -444,6 +444,13 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 					srcToDstBucket.Put([]byte(op.State.SrcID), nodeID)
 				}
 			}
+
+			// Store path-to-ulid mapping for API path-based queries
+			if op.State.Path != "" {
+				if err := SetPathToULIDMapping(tx, op.QueueType, op.State.Path, string(nodeID)); err != nil {
+					return fmt.Errorf("failed to set path-to-ulid mapping: %w", err)
+				}
+			}
 		}
 
 		// Apply all stats updates in one batch
@@ -580,6 +587,11 @@ func BatchDeleteNodes(db *DB, queueType string, nodeIDs []string) error {
 				srcToDstBucket.Delete(nodeID)
 			} else if queueType == "DST" && dstToSrcBucket != nil {
 				dstToSrcBucket.Delete(nodeID)
+			}
+
+			// 7. Delete from path-to-ulid lookup table
+			if ns.Path != "" {
+				DeletePathToULIDMapping(tx, queueType, ns.Path) // Ignore errors
 			}
 		}
 

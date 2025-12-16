@@ -145,7 +145,8 @@ The database is partitioned into two main areas:
   /SRC
     /nodes                  → ULID: NodeState JSON (canonical data)
     /children               → parentULID: []childULID JSON (tree relationships)
-    /src-to-dst             → srcULID: dstULID (join-lookup table)
+    /src-to-dst             → srcULID: dstULID (bidirectional join-lookup table)
+    /path-to-ulid           → pathHash: ULID (path-based lookup for API)
     /levels
       /00000000
         /pending            → ULID: empty (membership set)
@@ -157,7 +158,8 @@ The database is partitioned into two main areas:
   /DST
     /nodes                  → ULID: NodeState JSON (canonical data)
     /children               → parentULID: []childULID JSON (tree relationships)
-    /dst-to-src             → dstULID: srcULID (join-lookup table)
+    /dst-to-src             → dstULID: srcULID (bidirectional join-lookup table)
+    /path-to-ulid           → pathHash: ULID (path-based lookup for API)
     /levels
       /00000000
         /pending
@@ -192,7 +194,9 @@ This partitioning separates traversal operations (discovery/scanning phase) from
    - Status membership tracked in `/levels/{level}/{status}` buckets
    - Status-lookup index in `/levels/{level}/status-lookup` provides reverse lookup (ULID → status)
    - Tree relationships in `/children` buckets
-   - Join-lookup tables (`/src-to-dst` and `/dst-to-src`) map SRC and DST node ULIDs bidirectionally
+   - Bidirectional join-lookup tables (`/src-to-dst` and `/dst-to-src`) map corresponding SRC and DST node ULIDs
+   - Path-to-ULID lookup table (`/path-to-ulid`) maps path hashes to ULIDs for API path-based queries
+   - Join tables enable efficient correlation without embedding references in node data
 
 2. **Status Transitions are Atomic**
    Status transitions update multiple buckets atomically:
@@ -209,10 +213,17 @@ This partitioning separates traversal operations (discovery/scanning phase) from
    - Automatically maintained on every insert and status update
    - Enables efficient queries without scanning all status buckets
 
-4. **ULID-Based Keys**
+4. **ULID-Based Keys and Lookup Tables**
    - All internal operations use ULID (Universally Unique Lexicographically Sortable Identifier) for keys
    - ULIDs provide unique, sortable identifiers without path dependencies
-   - Join-lookup tables (`/src-to-dst` and `/dst-to-src`) provide bidirectional mapping between SRC and DST node ULIDs
+   - **Bidirectional join-lookup tables** (`/src-to-dst` and `/dst-to-src`) map corresponding SRC ↔ DST node ULIDs
+     - Join tables are populated when DST children are discovered and matched to SRC children (by Type + Name)
+     - This architecture replaces the legacy `SrcID` field that was previously embedded in DST NodeState
+     - Enables efficient lookups: given a SRC ULID, find the corresponding DST ULID (and vice versa)
+   - **Path-to-ULID lookup table** (`/path-to-ulid`) maps path hashes to ULIDs
+     - Enables API to query nodes by path without scanning
+     - Path hashes are SHA-256 (64-char hex strings)
+     - Automatically maintained during insert/delete operations
    - Matching between SRC and DST nodes is done by Type + Name, not path
    - Hierarchy is natural and navigable through parent-child ULID relationships
 
