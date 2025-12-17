@@ -77,9 +77,6 @@ func VerifyMigration(boltDB *db.DB, opts VerifyOptions) (VerificationReport, err
 	var srcPendingCount, srcFailedCount int
 	for _, level := range srcLevels {
 		pendingCount, _ := boltDB.CountStatusBucket("SRC", level, db.StatusPending)
-		if pendingCount > 0 {
-			fmt.Printf("[DEBUG] SRC Level %d: %d pending nodes\n", level, pendingCount)
-		}
 		srcPendingCount += pendingCount
 
 		failedCount, _ := boltDB.CountStatusBucket("SRC", level, db.StatusFailed)
