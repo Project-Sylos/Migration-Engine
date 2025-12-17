@@ -262,6 +262,7 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 		CoordinatorLead: 4,
 		LogAddress:      "127.0.0.1:8081",
 		LogLevel:        "trace",
+		SkipListener:    true,
 		StartupDelay:    3 * time.Second,
 		Verification:    migration.VerifyOptions{},
 	}

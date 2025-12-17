@@ -281,6 +281,22 @@ func (op *LookupMappingOperation) Execute(tx *bolt.Tx) error {
 	return nil
 }
 
+// PathToULIDMappingOperation represents a path hash → ULID mapping creation.
+type PathToULIDMappingOperation struct {
+	QueueType string // "SRC" or "DST"
+	Path      string // Full path to hash and map
+	NodeID    string // ULID of the node
+}
+
+// Execute performs the path-to-ulid mapping creation within a transaction.
+func (op *PathToULIDMappingOperation) Execute(tx *bolt.Tx) error {
+	if op.Path == "" || op.NodeID == "" {
+		return nil // Skip if either is empty
+	}
+
+	return SetPathToULIDMapping(tx, op.QueueType, op.Path, op.NodeID)
+}
+
 // OutputBuffer batches write operations for efficient database writes.
 // It supports three flush triggers: forced, size threshold, and time-based.
 type OutputBuffer struct {
@@ -398,19 +414,48 @@ func (ob *OutputBuffer) AddLookupMapping(srcID, dstID string) {
 	ob.Add(op)
 }
 
+// AddPathToULIDMapping queues a path-to-ulid mapping creation.
+func (ob *OutputBuffer) AddPathToULIDMapping(queueType string, path string, nodeID string) {
+	if path == "" || nodeID == "" {
+		return // Skip if either is empty
+	}
+	op := &PathToULIDMappingOperation{
+		QueueType: queueType,
+		Path:      path,
+		NodeID:    nodeID,
+	}
+	ob.Add(op)
+}
+
+// AddMultiple adds multiple operations to the buffer atomically.
+// This prevents flushes from happening between related operations (e.g., status update + batch insert).
+// All operations are added before checking if a flush is needed.
+func (ob *OutputBuffer) AddMultiple(ops []WriteOperation) {
+	if len(ops) == 0 {
+		return
+	}
+
+	ob.mu.Lock()
+	// Add all operations at once
+	ob.operations = append(ob.operations, ops...)
+	shouldFlush := len(ob.operations) >= ob.batchSize
+	ob.mu.Unlock()
+
+	if shouldFlush {
+		ob.Flush()
+	}
+}
+
 // Add adds a write operation to the buffer. If batch size is reached, it triggers a flush.
 // No deduplication happens here - that's done per-bucket during flush.
 func (ob *OutputBuffer) Add(op WriteOperation) {
 	ob.mu.Lock()
-	defer ob.mu.Unlock()
-
 	ob.operations = append(ob.operations, op)
 	shouldFlush := len(ob.operations) >= ob.batchSize
+	ob.mu.Unlock()
 
 	if shouldFlush {
-		ob.mu.Unlock()
 		ob.Flush()
-		ob.mu.Lock()
 	}
 }
 

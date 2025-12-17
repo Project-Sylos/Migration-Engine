@@ -445,12 +445,9 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 				}
 			}
 
-			// Store path-to-ulid mapping for API path-based queries
-			if op.State.Path != "" {
-				if err := SetPathToULIDMapping(tx, op.QueueType, op.State.Path, string(nodeID)); err != nil {
-					return fmt.Errorf("failed to set path-to-ulid mapping: %w", err)
-				}
-			}
+			// Note: Path-to-ULID mappings are now queued via OutputBuffer.AddPathToULIDMapping()
+			// during task completion (queue.go), not here. This avoids duplicates and ensures
+			// proper ordering with other buffered operations.
 		}
 
 		// Apply all stats updates in one batch
