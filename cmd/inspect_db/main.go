@@ -1,6 +1,9 @@
 // Copyright 2025 Sylos contributors
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
+// inspect_db performs O(n) bucket scans to count nodes and status buckets.
+// This ensures we're counting actual data, not cached stats.
+// For fast O(1) stats-based inspection, use inspect_db_stats instead.
 package main
 
 import (
@@ -13,6 +16,7 @@ import (
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/tests/shared"
 	"github.com/Project-Sylos/Spectra/sdk"
+	bolt "go.etcd.io/bbolt"
 )
 
 func main() {
@@ -122,8 +126,9 @@ func inspectQueue(boltDB *db.DB, queueType string) (*QueueReport, error) {
 		QueueType: queueType,
 	}
 
-	// Count total nodes
-	totalNodes, err := boltDB.CountNodes(queueType)
+	// Count total nodes by scanning (O(n)) - not using stats bucket
+	// This ensures we're counting actual nodes, not cached stats
+	totalNodes, err := countNodesByScan(boltDB, queueType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to count nodes: %w", err)
 	}
@@ -143,31 +148,31 @@ func inspectQueue(boltDB *db.DB, queueType string) (*QueueReport, error) {
 	for _, level := range levels {
 		levelStatus := &LevelStatus{Level: level}
 
-		// Count pending
-		pending, err := boltDB.CountStatusBucket(queueType, level, db.StatusPending)
+		// Count pending by scanning bucket (O(n)) - not using stats bucket
+		pending, err := countStatusBucketByScan(boltDB, queueType, level, db.StatusPending)
 		if err != nil {
 			// Bucket might not exist, that's okay
 			pending = 0
 		}
 		levelStatus.Pending = pending
 
-		// Count successful
-		successful, err := boltDB.CountStatusBucket(queueType, level, db.StatusSuccessful)
+		// Count successful by scanning bucket (O(n))
+		successful, err := countStatusBucketByScan(boltDB, queueType, level, db.StatusSuccessful)
 		if err != nil {
 			successful = 0
 		}
 		levelStatus.Successful = successful
 
-		// Count failed
-		failed, err := boltDB.CountStatusBucket(queueType, level, db.StatusFailed)
+		// Count failed by scanning bucket (O(n))
+		failed, err := countStatusBucketByScan(boltDB, queueType, level, db.StatusFailed)
 		if err != nil {
 			failed = 0
 		}
 		levelStatus.Failed = failed
 
-		// Count not_on_src (DST only)
+		// Count not_on_src (DST only) by scanning bucket (O(n))
 		if queueType == "DST" {
-			notOnSrc, err := boltDB.CountStatusBucket(queueType, level, db.StatusNotOnSrc)
+			notOnSrc, err := countStatusBucketByScan(boltDB, queueType, level, db.StatusNotOnSrc)
 			if err != nil {
 				notOnSrc = 0
 			}
@@ -202,7 +207,7 @@ func inspectQueue(boltDB *db.DB, queueType string) (*QueueReport, error) {
 
 func printReport(report *DatabaseReport, dbPath string) {
 	fmt.Println(strings.Repeat("=", 80))
-	fmt.Printf("BoltDB Inspection Report: %s\n", dbPath)
+	fmt.Printf("BoltDB Inspection Report (Bucket Scan - O(n)): %s\n", dbPath)
 	fmt.Println(strings.Repeat("=", 80))
 	fmt.Println()
 
@@ -427,4 +432,44 @@ func printQueueReport(qr *QueueReport) {
 		}
 		fmt.Printf(" %10d\n", total)
 	}
+}
+
+// countNodesByScan counts nodes by scanning the nodes bucket (O(n)).
+// This is used by inspect_db to ensure we're counting actual nodes, not cached stats.
+func countNodesByScan(boltDB *db.DB, queueType string) (int, error) {
+	count := 0
+	err := boltDB.GetDB().View(func(tx *bolt.Tx) error {
+		bucket := db.GetNodesBucket(tx, queueType)
+		if bucket == nil {
+			return nil // Bucket doesn't exist, count is 0
+		}
+
+		cursor := bucket.Cursor()
+		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+			count++
+		}
+
+		return nil
+	})
+	return count, err
+}
+
+// countStatusBucketByScan counts nodes in a status bucket by scanning (O(n)).
+// This is used by inspect_db to ensure we're counting actual nodes, not cached stats.
+func countStatusBucketByScan(boltDB *db.DB, queueType string, level int, status string) (int, error) {
+	count := 0
+	err := boltDB.GetDB().View(func(tx *bolt.Tx) error {
+		bucket := db.GetStatusBucket(tx, queueType, level, status)
+		if bucket == nil {
+			return nil // Bucket doesn't exist, count is 0
+		}
+
+		cursor := bucket.Cursor()
+		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+			count++
+		}
+
+		return nil
+	})
+	return count, err
 }

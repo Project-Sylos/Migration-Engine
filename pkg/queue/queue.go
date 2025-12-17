@@ -177,7 +177,7 @@ func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter types.FSAdapt
 
 	// Initialize output buffer for batched writes
 	// Default: 1000 operations or 1 second interval
-	outputBuffer := db.NewOutputBuffer(boltInstance, 1000, 1*time.Second)
+	outputBuffer := db.NewOutputBuffer(boltInstance, 10000, 3*time.Second)
 	q.setOutputBuffer(outputBuffer)
 
 	// Create and start workers - they manage themselves
@@ -582,10 +582,7 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 	queueType := getQueueType(q.name)
 	nextRound := currentRound + 1
 
-	// Remove from in-progress (keyed by ULID)
-	q.removeInProgress(nodeID)
-
-	// Remove the ULID from leased set
+	// Remove the ULID from leased set (can do this early, doesn't affect pending count)
 	q.removeLeasedKey(nodeID)
 
 	task.Locked = false
@@ -670,9 +667,14 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 			State:     childState,
 		})
 
+		// Queue path-to-ulid mapping for this child (for API path-based queries)
+		outputBuffer := q.getOutputBuffer()
+		if outputBuffer != nil && childState.Path != "" {
+			outputBuffer.AddPathToULIDMapping(queueType, childState.Path, childState.ID)
+		}
+
 		// For DST queue: queue lookup mapping if this child has a matching SRC node
 		if queueType == "DST" && child.SrcID != "" {
-			outputBuffer := q.getOutputBuffer()
 			if outputBuffer != nil {
 				// Queue bidirectional lookup mapping: SrcID <-> DST node ID
 				outputBuffer.AddLookupMapping(child.SrcID, childState.ID)
@@ -744,9 +746,14 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 					State:     taskState,
 				})
 
+				// Queue path-to-ulid mapping for DST child folder (for API path-based queries)
+				outputBuffer := q.getOutputBuffer()
+				if outputBuffer != nil && taskState.Path != "" {
+					outputBuffer.AddPathToULIDMapping(queueType, taskState.Path, taskState.ID)
+				}
+
 				// Queue lookup mapping if this child has a matching SRC node
 				if child.srcID != "" {
-					outputBuffer := q.getOutputBuffer()
 					if outputBuffer != nil {
 						// Queue bidirectional lookup mapping: SrcID <-> DST node ID
 						outputBuffer.AddLookupMapping(child.srcID, taskState.ID)
@@ -762,14 +769,29 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 	// Write to buffer instead of directly to database
 	outputBuffer := q.getOutputBuffer()
 	if outputBuffer != nil {
-		// Add parent status update to buffer
-		outputBuffer.AddStatusUpdate(queueType, currentRound, db.StatusPending, db.StatusSuccessful, nodeID)
+		// Add all related operations atomically to prevent flushes between them
+		// This ensures status update and batch insert are written together
+		atomicOps := make([]db.WriteOperation, 0, 2)
 
-		// Add child inserts to buffer
+		// Add parent status update operation
+		atomicOps = append(atomicOps, &db.StatusUpdateOperation{
+			QueueType: queueType,
+			Level:     currentRound,
+			OldStatus: db.StatusPending,
+			NewStatus: db.StatusSuccessful,
+			NodeID:    nodeID,
+		})
+
+		// Add child inserts operation (if any)
 		// Lookup mappings are queued above when creating child states
 		if len(childNodesToInsert) > 0 {
-			outputBuffer.AddBatchInsert(childNodesToInsert)
+			atomicOps = append(atomicOps, &db.BatchInsertOperation{
+				Operations: childNodesToInsert,
+			})
 		}
+
+		// Add all operations atomically to prevent partial flushes
+		outputBuffer.AddMultiple(atomicOps)
 
 		// For SRC FOLDER tasks in retry mode: Queue DST cleanup (mark parent as pending, delete children)
 		// Only folders have children to clean up - files don't need this
@@ -806,6 +828,11 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		}
 	}
 
+	// CRITICAL: Remove from in-progress LAST, after all buffer operations are queued.
+	// This prevents the Run() polling loop from seeing inProgressCount == 0 before
+	// the buffer operations are flushed, which could cause premature round advancement.
+	q.removeInProgress(nodeID)
+
 	// Run() polling loop will check round completion directly - no soft flags needed
 }
 
@@ -815,9 +842,7 @@ func (q *Queue) completeExclusionTask(task *TaskBase) {
 	currentRound := task.Round
 	nodeID := task.ID
 
-	// Remove from in-progress (keyed by ULID)
-	q.removeInProgress(nodeID)
-	// Remove ULID from leased set
+	// Remove ULID from leased set (can do this early, doesn't affect pending count)
 	if nodeID != "" {
 		q.removeLeasedKey(nodeID)
 	}
@@ -829,6 +854,11 @@ func (q *Queue) completeExclusionTask(task *TaskBase) {
 
 	// Record task completion in RoundInfo
 	q.recordTaskCompletion(currentRound, true)
+
+	// CRITICAL: Remove from in-progress LAST, after all operations are complete.
+	// Even though exclusion workers handle buffer operations, we still want to ensure
+	// the Run() polling loop doesn't see inProgressCount == 0 prematurely.
+	q.removeInProgress(nodeID)
 }
 
 // childResultToNodeStateWithID converts a ChildResult to NodeState, reusing existing ULID if provided.
@@ -974,12 +1004,12 @@ func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
 
 	task.Attempts++
 
-	// Remove from in-progress (keyed by ULID)
-	q.removeInProgress(nodeID)
-
 	// Check if we should retry
 	if task.Attempts < maxRetries {
 		task.Locked = false
+		// CRITICAL: Remove from in-progress BEFORE re-enqueuing to pending
+		// This ensures the task moves from in-progress to pending atomically
+		q.removeInProgress(nodeID)
 		q.enqueuePending(task) // Re-adds to tracked automatically
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("debug",
@@ -1018,6 +1048,11 @@ func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
 		queueType := getQueueType(q.name)
 		outputBuffer.AddStatusUpdate(queueType, currentRound, db.StatusPending, db.StatusFailed, nodeID)
 	}
+
+	// CRITICAL: Remove from in-progress LAST, after all buffer operations are queued.
+	// This prevents the Run() polling loop from seeing inProgressCount == 0 before
+	// the buffer operations are flushed, which could cause premature round advancement.
+	q.removeInProgress(nodeID)
 }
 
 // InProgressCount returns the number of tasks currently being executed.

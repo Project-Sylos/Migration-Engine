@@ -203,6 +203,9 @@ func (q *Queue) PullExclusionTasks(force bool) {
 				nodeID: entry.NodeID,
 				mode:   exclusionMode,
 			})
+		} else {
+			// Enqueue failed - remove from leased set to allow future attempts
+			q.removeLeasedKey(entry.NodeID)
 		}
 	}
 

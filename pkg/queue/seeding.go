@@ -9,6 +9,7 @@ import (
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 	"github.com/Project-Sylos/Sylos-FS/pkg/types"
+	bolt "go.etcd.io/bbolt"
 )
 
 // SeedRootTask inserts the initial root folder task into BoltDB to kickstart traversal.
@@ -65,6 +66,13 @@ func SeedRootTask(queueType string, rootFolder types.Folder, rootNodeID string, 
 
 	if err := db.BatchInsertNodes(boltDB, ops); err != nil {
 		return fmt.Errorf("failed to seed root task to BoltDB for %s: %w", queueType, err)
+	}
+
+	// Create path-to-ulid mapping for root (for API path-based queries)
+	if err := boltDB.Update(func(tx *bolt.Tx) error {
+		return db.SetPathToULIDMapping(tx, queueType, state.Path, rootNodeID)
+	}); err != nil {
+		return fmt.Errorf("failed to create path-to-ulid mapping for root: %w", err)
 	}
 
 	if logservice.LS != nil {
@@ -170,6 +178,13 @@ func SeedRootTaskWithSrcID(queueType string, rootFolder types.Folder, rootNodeID
 
 	if err := db.BatchInsertNodes(boltDB, ops); err != nil {
 		return fmt.Errorf("failed to seed root task to BoltDB for %s: %w", queueType, err)
+	}
+
+	// Create path-to-ulid mapping for root (for API path-based queries)
+	if err := boltDB.Update(func(tx *bolt.Tx) error {
+		return db.SetPathToULIDMapping(tx, queueType, state.Path, rootNodeID)
+	}); err != nil {
+		return fmt.Errorf("failed to create path-to-ulid mapping for root: %w", err)
 	}
 
 	if logservice.LS != nil {

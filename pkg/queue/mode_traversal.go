@@ -135,9 +135,6 @@ func (q *Queue) PullTraversalTasks(force bool) {
 			continue
 		}
 
-		// Mark this ULID as leased
-		q.addLeasedKey(item.Key)
-
 		task := nodeStateToTask(item.State, taskType)
 		// Ensure task has the ULID from the database
 		if task != nil && task.ID == "" {
@@ -157,8 +154,10 @@ func (q *Queue) PullTraversalTasks(force bool) {
 			}
 		}
 
-		// Enqueue task
-		q.enqueuePending(task)
+		// Enqueue task - only mark as leased if enqueue succeeds
+		if q.enqueuePending(task) {
+			q.addLeasedKey(item.Key)
+		}
 	}
 
 	// Track if this pull was partial (fewer tasks than requested)

@@ -150,9 +150,6 @@ func (q *Queue) PullRetryTasks(force bool) {
 				continue
 			}
 
-			// Mark as leased
-			q.addLeasedKey(item.Key)
-
 			task := nodeStateToTask(item.State, taskType)
 			// Ensure task has the ULID from the database
 			if task != nil && task.ID == "" {
@@ -169,9 +166,11 @@ func (q *Queue) PullRetryTasks(force bool) {
 				}
 			}
 
-			// Enqueue task
-			q.enqueuePending(task)
-			enqueuedCount++
+			// Enqueue task - only mark as leased if enqueue succeeds
+			if q.enqueuePending(task) {
+				q.addLeasedKey(item.Key)
+				enqueuedCount++
+			}
 		}
 
 		// Track if pull was partial based on actual enqueued count

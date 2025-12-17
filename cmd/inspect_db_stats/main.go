@@ -1,6 +1,9 @@
 // Copyright 2025 Sylos contributors
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
+// inspect_db_stats performs O(1) stats bucket lookups for fast inspection.
+// This uses cached statistics and may not reflect the actual bucket contents if stats are stale.
+// For accurate O(n) bucket scans, use inspect_db instead.
 package main
 
 import (
