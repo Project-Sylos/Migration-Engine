@@ -125,9 +125,10 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 		WorkerCount:     10,
 		MaxRetries:      3,
 		CoordinatorLead: 4,
+		SkipListener:    true,
 		LogAddress:      "127.0.0.1:8081",
 		LogLevel:        "trace",
-		StartupDelay:    3 * time.Second,
+		StartupDelay:    1 * time.Second, // you should set this to 3 if you set skip listener to false to account for terminal opening delay
 		Verification:    migration.VerifyOptions{},
 	}
 
