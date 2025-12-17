@@ -242,18 +242,6 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	}
 	boltDB = cfg.DatabaseInstance
 
-	// Determine if database is fresh by checking if it has any nodes
-	// (We can't use file existence since API opened it, so inspect the DB contents)
-	var wasFresh bool
-	status, inspectErr := InspectMigrationStatus(boltDB)
-	if inspectErr != nil {
-		// If we can't inspect, assume it's not fresh (safer default)
-		wasFresh = false
-		status = MigrationStatus{} // Empty status as fallback
-	} else {
-		wasFresh = status.IsEmpty()
-	}
-
 	if cfg.Source.Adapter == nil || cfg.Destination.Adapter == nil {
 		return Result{}, fmt.Errorf("source and destination adapters must be provided")
 	}
@@ -273,25 +261,59 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 		configPath = ConfigPathFromDatabasePath(cfg.Database.Path)
 	}
 
-	// Load or create migration config YAML
-	var yamlCfg *MigrationConfigYAML
-	if wasFresh {
-		// Create new config
-		yamlCfg, err = NewMigrationConfigYAML(cfg, status)
-		if err != nil {
-			return Result{}, fmt.Errorf("failed to create migration config: %w", err)
+	// ----------------- DETERMINE "wasFresh" LOGIC BASED ON YAML -----------------
+
+	var (
+		yamlCfg      *MigrationConfigYAML
+		status       MigrationStatus
+		inspectErr   error
+		wasFresh     bool
+		yamlLoadErr  error
+		loadedCfg    *MigrationConfigYAML
+	)
+	// Try to load existing YAML
+	loadedCfg, yamlLoadErr = LoadMigrationConfig(configPath)
+
+	if yamlLoadErr != nil {
+		// YAML does not exist -> this is a fresh start
+		wasFresh = true
+		status, inspectErr = InspectMigrationStatus(boltDB)
+		if inspectErr != nil {
+			status = MigrationStatus{}
 		}
-		// Update with root info
+	} else {
+		// YAML exists, check its status
+		yamlCfg = loadedCfg
+		switch yamlCfg.State.Status {
+		case StatusRootsSet, StatusFiltersSet:
+			// Only these states count as "fresh"
+			wasFresh = true
+		default:
+			wasFresh = false
+		}
+		// Grab migration status from DB as well (for non-fresh runs)
+		status, inspectErr = InspectMigrationStatus(boltDB)
+		if inspectErr != nil {
+			status = MigrationStatus{}
+		}
+	}
+
+	// If this is a fresh run (as decided by yaml existence/status), create fresh YAML/config if needed
+	if wasFresh {
+		if yamlCfg == nil {
+			yamlCfg, err = NewMigrationConfigYAML(cfg, status)
+			if err != nil {
+				return Result{}, fmt.Errorf("failed to create migration config: %w", err)
+			}
+		}
 		UpdateConfigFromRoots(yamlCfg, srcRoot, dstRoot)
-		// Save initial config
+		// Save initial or reset config
 		if err := SaveMigrationConfig(configPath, yamlCfg); err != nil {
 			return Result{}, fmt.Errorf("failed to save migration config: %w", err)
 		}
 	} else {
-		// Try to load existing config
-		loadedCfg, loadErr := LoadMigrationConfig(configPath)
-		if loadErr != nil {
-			// If config doesn't exist, create a new one
+		// Already loaded YAML above if it exists, otherwise create new
+		if yamlCfg == nil {
 			yamlCfg, err = NewMigrationConfigYAML(cfg, status)
 			if err != nil {
 				return Result{}, fmt.Errorf("failed to create migration config: %w", err)
@@ -301,15 +323,11 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 				return Result{}, fmt.Errorf("failed to save migration config: %w", err)
 			}
 		} else {
-			yamlCfg = loadedCfg
-			// Update with current root info
 			UpdateConfigFromRoots(yamlCfg, srcRoot, dstRoot)
-			// Update status (preserves "suspended" status if set)
 			UpdateConfigFromStatus(yamlCfg, status, 0, 0)
 			if err := SaveMigrationConfig(configPath, yamlCfg); err != nil {
 				return Result{}, fmt.Errorf("failed to save migration config: %w", err)
 			}
-
 			// If status was "suspended", indicate resume from suspension
 			if yamlCfg.State.Status == StatusSuspended {
 				fmt.Println("Resuming from suspended migration state...")
@@ -319,8 +337,8 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 
 	result := Result{RootsSeeded: cfg.SeedRoots}
 
-	// Decide whether to run a fresh migration (seed + traversal) or resume from
-	// an existing in-progress database.
+	// Decide whether to run a fresh migration (seed + traversal) or resume from an in-progress database.
+
 	var runtime RuntimeStats
 	var runErr error
 
@@ -373,15 +391,13 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 		})
 	}
 
-	switch {
-	case status.IsEmpty():
+	// The next logic block should key off yaml status, not just the DB.
+	if wasFresh {
 		// Fresh run: optionally seed roots, then run normal traversal.
 		runtime, runErr = runFreshMigration()
-
-	case status.HasPending():
+	} else if status.HasPending() {
 		// Resume from an in-progress migration (including suspended state).
 		// Root seeding is assumed to have been done previously and is skipped here.
-
 		// Validate that root nodes still exist in the filesystem before resuming.
 		// If they don't exist (e.g., Spectra DB was reset), we can't safely resume
 		// because the migration DB contains stale node IDs.
@@ -429,8 +445,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 				ShutdownContext: shutdownCtx,
 			})
 		}
-
-	default:
+	} else {
 		// Completed (or failed-only) migration with no pending work. For now we
 		// do not re-run traversal automatically; verification below will report
 		// success or failure based on the existing DB contents.

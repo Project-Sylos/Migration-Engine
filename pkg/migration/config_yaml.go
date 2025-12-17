@@ -54,8 +54,6 @@ type MetadataConfig struct {
 // StateConfig tracks the current migration checkpoint state.
 type StateConfig struct {
 	Status       string `yaml:"status"` // Roots-Set, Filters-Set, Traversal-In-Progress, Awaiting-Path-Review, Copy-In-Progress, Complete, Suspended
-	LastLevelSrc *int   `yaml:"last_level_src,omitempty"`
-	LastLevelDst *int   `yaml:"last_level_dst,omitempty"`
 	LastRoundSrc *int   `yaml:"last_round_src,omitempty"`
 	LastRoundDst *int   `yaml:"last_round_dst,omitempty"`
 	// Retry metadata (only set when Status = Filters-Set for retry)
@@ -354,12 +352,10 @@ func NewMigrationConfigYAML(cfg Config, status MigrationStatus) (*MigrationConfi
 	// Update state from status
 	if status.MinPendingDepthSrc != nil {
 		level := *status.MinPendingDepthSrc
-		yamlCfg.State.LastLevelSrc = &level
 		yamlCfg.State.LastRoundSrc = &level
 	}
 	if status.MinPendingDepthDst != nil {
 		level := *status.MinPendingDepthDst
-		yamlCfg.State.LastLevelDst = &level
 		yamlCfg.State.LastRoundDst = &level
 	}
 
@@ -373,9 +369,7 @@ func UpdateConfigFromStatus(yamlCfg *MigrationConfigYAML, status MigrationStatus
 
 	// Update rounds/levels
 	yamlCfg.State.LastRoundSrc = &srcRound
-	yamlCfg.State.LastLevelSrc = &srcRound
 	yamlCfg.State.LastRoundDst = &dstRound
-	yamlCfg.State.LastLevelDst = &dstRound
 
 	// Auto-transition to Awaiting-Path-Review only if traversal is in progress and completes successfully
 	// All other state transitions should be managed by the API
@@ -396,9 +390,7 @@ func SetSuspendedStatus(yamlCfg *MigrationConfigYAML, status MigrationStatus, sr
 
 	// Update rounds/levels
 	yamlCfg.State.LastRoundSrc = &srcRound
-	yamlCfg.State.LastLevelSrc = &srcRound
 	yamlCfg.State.LastRoundDst = &dstRound
-	yamlCfg.State.LastLevelDst = &dstRound
 
 	// Set status to suspended
 	yamlCfg.State.Status = StatusSuspended
