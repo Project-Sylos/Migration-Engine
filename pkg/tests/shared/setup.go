@@ -113,6 +113,8 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 		WithServices(srcAdapter, dstAdapter, "Spectra-Primary", "Spectra-S1").
 		WithRoots(srcRoot, dstRoot)
 
+	// override skip listener to false
+	cfg.SkipListener = false
 	return *cfg, nil
 }
 
