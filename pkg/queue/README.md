@@ -156,10 +156,8 @@ Both modes force-flush the OutputBuffer before pulling tasks:
 
 ```go
 // Force-flush buffer before pulling tasks
-outputBuffer := q.getOutputBuffer()
-if outputBuffer != nil {
-    outputBuffer.Flush()
-}
+// Buffering/flush is owned by Store. Use semantic barriers when you need coordination.
+_ = q.GetStore().Barrier(store.BarrierRoundCompletion)
 ```
 
 This ensures all pending writes (status updates, child inserts, deletions) are persisted to BoltDB before new tasks are pulled, preventing:

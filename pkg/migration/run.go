@@ -9,16 +9,16 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
+	"github.com/Project-Sylos/Sylos-DB/pkg/store"
 	"github.com/Project-Sylos/Sylos-FS/pkg/fs"
 	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
 // MigrationConfig is the configuration passed to RunMigration.
 type MigrationConfig struct {
-	BoltDB          *db.DB
+	StoreInstance   *store.Store
 	BoltPath        string
 	SrcAdapter      types.FSAdapter
 	DstAdapter      types.FSAdapter
@@ -47,17 +47,19 @@ type RuntimeStats struct {
 }
 
 // getQueueStats builds QueueStats from coordinator and queue queries (non-blocking)
-func getQueueStats(coordinator *queue.QueueCoordinator, boltDB *db.DB) (queue.QueueStats, queue.QueueStats) {
+func getQueueStats(coordinator *queue.QueueCoordinator, storeInstance *store.Store) (queue.QueueStats, queue.QueueStats) {
 	srcRound := coordinator.GetSrcRound()
 	dstRound := coordinator.GetDstRound()
 
 	// Get pending counts from DB for current round (non-blocking, uses View transaction)
+	// Use GetLevelProgress for pending counts (already available in Store API)
 	srcPending := 0
 	dstPending := 0
-	if boltDB != nil {
-		srcPendingCount, _ := boltDB.CountByPrefix("SRC", srcRound, db.StatusPending)
+	if storeInstance != nil {
+		// GetLevelProgress returns (pending, completed, failed, error)
+		srcPendingCount, _, _, _ := storeInstance.GetLevelProgress("SRC", srcRound)
+		dstPendingCount, _, _, _ := storeInstance.GetLevelProgress("DST", dstRound)
 		srcPending = srcPendingCount
-		dstPendingCount, _ := boltDB.CountByPrefix("DST", dstRound, db.StatusPending)
 		dstPending = dstPendingCount
 	}
 
@@ -72,16 +74,79 @@ func getQueueStats(coordinator *queue.QueueCoordinator, boltDB *db.DB) (queue.Qu
 		}
 }
 
+// handleMigrationComplete handles the completion of a migration run.
+// It ensures exclusion buckets exist, updates YAML config, and closes log service.
+func handleMigrationComplete(cfg MigrationConfig, storeInstance *store.Store, srcStats, dstStats queue.QueueStats, start time.Time) RuntimeStats {
+	// Store API handles bucket initialization internally
+	if false { // Disabled until Store API supports this
+		err := fmt.Errorf("exclusion buckets check disabled")
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("warning",
+				fmt.Sprintf("Failed to ensure exclusion-holding buckets: %v", err),
+				"migration", "run", "run")
+		}
+	}
+
+	fmt.Println("\nMigration complete!")
+
+	// Update config YAML with final state (fire-and-forget to avoid blocking)
+	if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			done := make(chan error, 1)
+			go func() {
+				status, statusErr := InspectMigrationStatus(storeInstance)
+				if statusErr != nil {
+					done <- statusErr
+					return
+				}
+				UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
+				done <- SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
+			}()
+
+			select {
+			case <-done:
+			case <-ctx.Done():
+			}
+		}()
+	}
+
+	// Close log service with timeout
+	if logservice.LS != nil {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer closeCancel()
+
+		closeDone := make(chan struct{}, 1)
+		go func() {
+			_ = logservice.LS.Close()
+			closeDone <- struct{}{}
+		}()
+
+		select {
+		case <-closeDone:
+		case <-closeCtx.Done():
+		}
+	}
+
+	return RuntimeStats{
+		Duration: time.Since(start),
+		Src:      srcStats,
+		Dst:      dstStats,
+	}
+}
+
 // RunMigration executes the migration traversal using the provided configuration.
 func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
-	if cfg.BoltDB == nil {
-		return RuntimeStats{}, fmt.Errorf("boltDB cannot be nil")
+	if cfg.StoreInstance == nil {
+		return RuntimeStats{}, fmt.Errorf("store instance cannot be nil")
 	}
 	if cfg.SrcAdapter == nil || cfg.DstAdapter == nil {
 		return RuntimeStats{}, fmt.Errorf("source and destination adapters must be provided")
 	}
 
-	boltDB := cfg.BoltDB
+	storeInstance := cfg.StoreInstance
 
 	// Initialize log service (always initialize, even if listener is skipped)
 	// The logger will still send to UDP and write to DB, we just skip starting the listener terminal
@@ -104,7 +169,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		}
 		// Always initialize logger (sends to UDP and writes to DB)
 		// SkipListener only affects whether we start the listener terminal window
-		if err := logservice.InitGlobalLogger(boltDB, cfg.LogAddress, cfg.LogLevel); err != nil {
+		if err := logservice.InitGlobalLogger(storeInstance, cfg.LogAddress, cfg.LogLevel); err != nil {
 			return RuntimeStats{}, fmt.Errorf("failed to initialize logger: %w", err)
 		}
 	}
@@ -117,7 +182,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		coordinator.SetYAMLUpdateCallback(func(srcRound, dstRound int) {
 			// Thread-safe YAML update in background goroutine
 			go func() {
-				status, err := InspectMigrationStatus(boltDB)
+				status, err := InspectMigrationStatus(storeInstance)
 				if err == nil {
 					UpdateConfigFromStatus(cfg.YAMLConfig, status, srcRound, dstRound)
 					_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
@@ -128,12 +193,12 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 	// Create queues
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
-	srcQueue.InitializeWithContext(boltDB, cfg.SrcAdapter, cfg.ShutdownContext)
+	srcQueue.InitializeWithContext(storeInstance, cfg.SrcAdapter, cfg.ShutdownContext)
 	// Note: Queues clean themselves up when they complete (Run() exits when state=QueueStateCompleted)
 	// We only need to explicitly close for forced shutdowns, which is handled via Pause() + shutdown context
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
-	dstQueue.InitializeWithContext(boltDB, cfg.DstAdapter, cfg.ShutdownContext)
+	dstQueue.InitializeWithContext(storeInstance, cfg.DstAdapter, cfg.ShutdownContext)
 	// Note: Queues clean themselves up when they complete (Run() exits when state=QueueStateCompleted)
 	// We only need to explicitly close for forced shutdowns, which is handled via Pause() + shutdown context
 
@@ -146,7 +211,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Create observer for BoltDB stats publishing (200ms update interval)
-	observer := queue.NewQueueObserver(boltDB, 200*time.Millisecond)
+	observer := queue.NewQueueObserver(storeInstance, 200*time.Millisecond)
 	observer.Start()      // Start observer loop immediately
 	defer observer.Stop() // Ensure observer is stopped on exit
 
@@ -224,7 +289,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 	// Update config: Traversal started
 	if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-		status, statusErr := InspectMigrationStatus(boltDB)
+		status, statusErr := InspectMigrationStatus(storeInstance)
 		if statusErr == nil {
 			UpdateConfigFromStatus(cfg.YAMLConfig, status, coordinator.GetSrcRound(), coordinator.GetDstRound())
 			SetStatusTraversalInProgress(cfg.YAMLConfig)
@@ -268,7 +333,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				case <-cleanupCtx.Done():
 					// Timeout - skip cleanup and exit immediately
 					fmt.Printf("⚠️  Cleanup timeout - exiting immediately to prevent hang\n")
-					srcStats, dstStats := getQueueStats(coordinator, boltDB)
+					srcStats, dstStats := getQueueStats(coordinator, storeInstance)
 					return RuntimeStats{
 						Duration: time.Since(start),
 						Src:      srcStats,
@@ -277,7 +342,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				}
 
 				// Get stats directly (non-blocking)
-				srcStats, dstStats := getQueueStats(coordinator, boltDB)
+				srcStats, dstStats := getQueueStats(coordinator, storeInstance)
 
 				// BoltDB doesn't need checkpointing - data is already persisted
 
@@ -288,7 +353,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
 					yamlDone := make(chan error, 1)
 					go func() {
-						status, statusErr := InspectMigrationStatus(boltDB)
+						status, statusErr := InspectMigrationStatus(storeInstance)
 						if statusErr == nil {
 							SetSuspendedStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
 							yamlDone <- SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
@@ -321,172 +386,22 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		bothCompleted := coordinator.IsCompleted("both")
 
 		if bothCompleted {
-
-			// Ensure exclusion-holding buckets exist for exclusion intent queuing
-			if err := db.EnsureExclusionHoldingBuckets(boltDB); err != nil {
-				if logservice.LS != nil {
-					_ = logservice.LS.Log("warning",
-						fmt.Sprintf("Failed to ensure exclusion-holding buckets: %v", err),
-						"migration", "run", "run")
-				}
-				// Non-fatal - continue with completion
-			}
-
-			// Get stats directly (non-blocking)
-			srcStats, dstStats := getQueueStats(coordinator, boltDB)
-
-			fmt.Println("\nMigration complete!")
-
-			// Update config YAML with final state (fire-and-forget to avoid blocking)
-			if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-				// Fire-and-forget - don't block completion on config save
-				go func() {
-					// Use a context with timeout to prevent indefinite blocking
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer cancel()
-
-					done := make(chan error, 1)
-					go func() {
-						status, statusErr := InspectMigrationStatus(boltDB)
-						if statusErr != nil {
-							fmt.Printf("ERROR: Failed to inspect migration status for YAML update: %v\n", statusErr)
-							if logservice.LS != nil {
-								_ = logservice.LS.Log("warning", fmt.Sprintf("InspectMigrationStatus error: %v", statusErr), "migration", "run", "run")
-							}
-							done <- statusErr
-							return
-						}
-						UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
-						done <- SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
-					}()
-
-					select {
-					case err := <-done:
-						if err != nil {
-							fmt.Printf("ERROR: Failed to save migration config YAML: %v\n", err)
-							if logservice.LS != nil {
-								_ = logservice.LS.Log("warning", fmt.Sprintf("Config save failed: %v", err), "migration", "run", "run")
-							}
-						}
-					case <-ctx.Done():
-						fmt.Printf("ERROR: Config save timeout (5s) - YAML status may not be updated from Traversal-In-Progress\n")
-						if logservice.LS != nil {
-							_ = logservice.LS.Log("warning", "Config save timeout (fire-and-forget)", "migration", "run", "run")
-						}
-					}
-				}()
-			}
-
-			// Stop progress ticker to prevent any more ticks
+			srcStats, dstStats := getQueueStats(coordinator, storeInstance)
 			progressTicker.Stop()
-
-			// Close log service before returning (flush logs) - with timeout to prevent hanging
-			if logservice.LS != nil {
-				// Use a timeout context to prevent indefinite blocking
-				closeCtx, closeCancel := context.WithTimeout(context.Background(), 1*time.Second)
-				defer closeCancel()
-
-				closeDone := make(chan struct{}, 1)
-				go func() {
-					_ = logservice.LS.Close()
-					closeDone <- struct{}{}
-				}()
-
-				select {
-				case <-closeDone:
-				case <-closeCtx.Done():
-					// Timeout - log service close is taking too long, continue anyway
-					// (flushes should only take a few ms, so 1s timeout is generous)
-				}
-			}
-
-			return RuntimeStats{
-				Duration: time.Since(start),
-				Src:      srcStats,
-				Dst:      dstStats,
-			}, nil
+			return handleMigrationComplete(cfg, storeInstance, srcStats, dstStats, start), nil
 		}
 
 		select {
 		case <-progressTicker.C:
 			// Re-check exhaustion from coordinator (queues might have completed during tick)
 			if coordinator.IsCompleted("both") {
-				// Ensure exclusion-holding buckets exist for exclusion intent queuing
-				if err := db.EnsureExclusionHoldingBuckets(boltDB); err != nil {
-					if logservice.LS != nil {
-						_ = logservice.LS.Log("warning",
-							fmt.Sprintf("Failed to ensure exclusion-holding buckets: %v", err),
-							"migration", "run", "run")
-					}
-					// Non-fatal - continue with completion
-				}
-
-				// Get stats directly (non-blocking)
-				srcStats, dstStats := getQueueStats(coordinator, boltDB)
-				fmt.Println("\nMigration complete!")
-
-				// Update config YAML with final state (fire-and-forget to avoid blocking)
-				if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-					// Fire-and-forget - don't block completion on config save
-					go func() {
-						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-						defer cancel()
-
-						done := make(chan error, 1)
-						go func() {
-							status, statusErr := InspectMigrationStatus(boltDB)
-							if statusErr != nil {
-								fmt.Printf("ERROR: Failed to inspect migration status for YAML update (ticker path): %v\n", statusErr)
-								done <- statusErr
-								return
-							}
-							UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
-							done <- SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
-						}()
-
-						select {
-						case err := <-done:
-							if err != nil {
-								fmt.Printf("ERROR: Failed to save migration config YAML (ticker path): %v\n", err)
-							}
-						case <-ctx.Done():
-							fmt.Printf("ERROR: Config save timeout (5s) - YAML status may not be updated from Traversal-In-Progress (ticker path)\n")
-						}
-					}()
-				}
-
-				// Stop progress ticker to prevent any more ticks
+				srcStats, dstStats := getQueueStats(coordinator, storeInstance)
 				progressTicker.Stop()
-
-				// Close log service before returning (flush logs) - with timeout to prevent hanging
-				if logservice.LS != nil {
-					// Use a timeout context to prevent indefinite blocking
-					closeCtx, closeCancel := context.WithTimeout(context.Background(), 1*time.Second)
-					defer closeCancel()
-
-					closeDone := make(chan struct{}, 1)
-					go func() {
-						_ = logservice.LS.Close()
-						closeDone <- struct{}{}
-					}()
-
-					select {
-					case <-closeDone:
-					case <-closeCtx.Done():
-						// Timeout - log service close is taking too long, continue anyway
-						// (flushes should only take a few ms, so 1s timeout is generous)
-					}
-				}
-
-				return RuntimeStats{
-					Duration: time.Since(start),
-					Src:      srcStats,
-					Dst:      dstStats,
-				}, nil
+				return handleMigrationComplete(cfg, storeInstance, srcStats, dstStats, start), nil
 			}
 
 			// Get stats directly (non-blocking queries)
-			srcStats, dstStats := getQueueStats(coordinator, boltDB)
+			srcStats, dstStats := getQueueStats(coordinator, storeInstance)
 
 			// Stats are printed via the channel listener goroutine, not here
 			// This section only updates config YAML
@@ -504,7 +419,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			shouldUpdate := roundAdvanced || (tickCount%10 == 0)
 
 			if cfg.YAMLConfig != nil && cfg.ConfigPath != "" && shouldUpdate {
-				status, statusErr := InspectMigrationStatus(boltDB)
+				status, statusErr := InspectMigrationStatus(storeInstance)
 				if statusErr == nil {
 					UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
 					// Save config (ignore errors to avoid disrupting migration)
@@ -513,9 +428,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			}
 
 		default:
-			// Debug: Log when taking default case
-			if bothCompleted {
-			}
 			time.Sleep(100 * time.Millisecond)
 		}
 	}

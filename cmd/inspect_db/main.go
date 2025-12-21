@@ -10,13 +10,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/tests/shared"
 	"github.com/Project-Sylos/Spectra/sdk"
-	bolt "go.etcd.io/bbolt"
+	"github.com/Project-Sylos/Sylos-DB/pkg/store"
 )
 
 func main() {
@@ -45,16 +43,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Open database (read-only mode handled by BoltDB automatically)
-	boltDB, err := db.Open(db.Options{Path: dbPath})
+	// Open store
+	storeInstance, err := store.Open(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
 		os.Exit(1)
 	}
-	defer boltDB.Close()
+	defer storeInstance.Close()
 
-	// Generate report
-	report, err := inspectDatabase(boltDB)
+	// Generate report using Store API with scan mode (O(n) - counts actual buckets)
+	report, err := storeInstance.InspectDatabase(store.InspectionModeScan)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error inspecting database: %v\n", err)
 		os.Exit(1)
@@ -66,146 +64,19 @@ func main() {
 	// If Spectra config path provided, compare counts
 	if len(os.Args) >= 3 {
 		spectraConfigPath := os.Args[2]
-		if err := compareWithSpectra(boltDB, spectraConfigPath); err != nil {
+		if err := compareWithSpectra(storeInstance, spectraConfigPath); err != nil {
 			fmt.Fprintf(os.Stderr, "\n⚠️  Warning: Failed to compare with Spectra: %v\n", err)
 			// Don't exit with error, just warn
 		}
 	}
 }
 
-type LevelStatus struct {
-	Level      int
-	Pending    int
-	Successful int
-	Failed     int
-	NotOnSrc   int
-}
+// Type aliases for Store API types to keep print functions unchanged
+type LevelStatus = store.LevelStatus
+type QueueReport = store.QueueReport
+type DatabaseReport = store.DatabaseReport
 
-type QueueReport struct {
-	QueueType       string
-	TotalNodes      int
-	Levels          []LevelStatus
-	TotalPending    int
-	TotalSuccessful int
-	TotalFailed     int
-	TotalNotOnSrc   int
-	MinPendingLevel *int
-}
-
-type DatabaseReport struct {
-	DatabasePath string
-	Src          QueueReport
-	Dst          QueueReport
-}
-
-func inspectDatabase(boltDB *db.DB) (*DatabaseReport, error) {
-	report := &DatabaseReport{
-		Src: QueueReport{QueueType: "SRC"},
-		Dst: QueueReport{QueueType: "DST"},
-	}
-
-	// Inspect SRC
-	srcReport, err := inspectQueue(boltDB, "SRC")
-	if err != nil {
-		return nil, fmt.Errorf("failed to inspect SRC: %w", err)
-	}
-	report.Src = *srcReport
-
-	// Inspect DST
-	dstReport, err := inspectQueue(boltDB, "DST")
-	if err != nil {
-		return nil, fmt.Errorf("failed to inspect DST: %w", err)
-	}
-	report.Dst = *dstReport
-
-	return report, nil
-}
-
-func inspectQueue(boltDB *db.DB, queueType string) (*QueueReport, error) {
-	report := &QueueReport{
-		QueueType: queueType,
-	}
-
-	// Count total nodes by scanning (O(n)) - not using stats bucket
-	// This ensures we're counting actual nodes, not cached stats
-	totalNodes, err := countNodesByScan(boltDB, queueType)
-	if err != nil {
-		return nil, fmt.Errorf("failed to count nodes: %w", err)
-	}
-	report.TotalNodes = totalNodes
-
-	// Get all levels
-	levels, err := boltDB.GetAllLevels(queueType)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get levels: %w", err)
-	}
-
-	// Sort levels
-	sort.Ints(levels)
-
-	// Inspect each level
-	levelMap := make(map[int]*LevelStatus)
-	for _, level := range levels {
-		levelStatus := &LevelStatus{Level: level}
-
-		// Count pending by scanning bucket (O(n)) - not using stats bucket
-		pending, err := countStatusBucketByScan(boltDB, queueType, level, db.StatusPending)
-		if err != nil {
-			// Bucket might not exist, that's okay
-			pending = 0
-		}
-		levelStatus.Pending = pending
-
-		// Count successful by scanning bucket (O(n))
-		successful, err := countStatusBucketByScan(boltDB, queueType, level, db.StatusSuccessful)
-		if err != nil {
-			successful = 0
-		}
-		levelStatus.Successful = successful
-
-		// Count failed by scanning bucket (O(n))
-		failed, err := countStatusBucketByScan(boltDB, queueType, level, db.StatusFailed)
-		if err != nil {
-			failed = 0
-		}
-		levelStatus.Failed = failed
-
-		// Count not_on_src (DST only) by scanning bucket (O(n))
-		if queueType == "DST" {
-			notOnSrc, err := countStatusBucketByScan(boltDB, queueType, level, db.StatusNotOnSrc)
-			if err != nil {
-				notOnSrc = 0
-			}
-			levelStatus.NotOnSrc = notOnSrc
-		}
-
-		levelMap[level] = levelStatus
-		report.TotalPending += pending
-		report.TotalSuccessful += successful
-		report.TotalFailed += failed
-		if queueType == "DST" {
-			report.TotalNotOnSrc += levelStatus.NotOnSrc
-		}
-
-		// Track minimum pending level
-		if pending > 0 {
-			if report.MinPendingLevel == nil || level < *report.MinPendingLevel {
-				level := level
-				report.MinPendingLevel = &level
-			}
-		}
-	}
-
-	// Convert map to sorted slice
-	report.Levels = make([]LevelStatus, 0, len(levelMap))
-	for _, level := range levels {
-		report.Levels = append(report.Levels, *levelMap[level])
-	}
-
-	return report, nil
-}
-
-func printReport(report *DatabaseReport, dbPath string) {
+func printReport(report *store.DatabaseReport, dbPath string) {
 	fmt.Println(strings.Repeat("=", 80))
 	fmt.Printf("BoltDB Inspection Report (Bucket Scan - O(n)): %s\n", dbPath)
 	fmt.Println(strings.Repeat("=", 80))
@@ -293,7 +164,7 @@ func printReport(report *DatabaseReport, dbPath string) {
 }
 
 // compareWithSpectra compares the SRC node count in BoltDB with the Spectra node count.
-func compareWithSpectra(boltDB *db.DB, spectraConfigPath string) error {
+func compareWithSpectra(storeInstance *store.Store, spectraConfigPath string) error {
 	fmt.Println()
 	fmt.Println(strings.Repeat("=", 80))
 	fmt.Println("SPECTRA COMPARISON")
@@ -312,7 +183,7 @@ func compareWithSpectra(boltDB *db.DB, spectraConfigPath string) error {
 	}
 
 	// Count SRC nodes
-	srcCount, err := boltDB.CountNodes("SRC")
+	srcCount, err := storeInstance.CountNodes("SRC")
 	if err != nil {
 		return fmt.Errorf("failed to count SRC nodes: %w", err)
 	}
@@ -389,7 +260,7 @@ func countSpectraNodes(spectraFS *sdk.SpectraFS) (int, error) {
 	return count, nil
 }
 
-func printQueueReport(qr *QueueReport) {
+func printQueueReport(qr *store.QueueReport) {
 	fmt.Printf("%s QUEUE REPORT\n", qr.QueueType)
 	fmt.Println(strings.Repeat("-", 80))
 	fmt.Printf("Total Nodes: %d\n", qr.TotalNodes)
@@ -432,44 +303,4 @@ func printQueueReport(qr *QueueReport) {
 		}
 		fmt.Printf(" %10d\n", total)
 	}
-}
-
-// countNodesByScan counts nodes by scanning the nodes bucket (O(n)).
-// This is used by inspect_db to ensure we're counting actual nodes, not cached stats.
-func countNodesByScan(boltDB *db.DB, queueType string) (int, error) {
-	count := 0
-	err := boltDB.GetDB().View(func(tx *bolt.Tx) error {
-		bucket := db.GetNodesBucket(tx, queueType)
-		if bucket == nil {
-			return nil // Bucket doesn't exist, count is 0
-		}
-
-		cursor := bucket.Cursor()
-		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
-			count++
-		}
-
-		return nil
-	})
-	return count, err
-}
-
-// countStatusBucketByScan counts nodes in a status bucket by scanning (O(n)).
-// This is used by inspect_db to ensure we're counting actual nodes, not cached stats.
-func countStatusBucketByScan(boltDB *db.DB, queueType string, level int, status string) (int, error) {
-	count := 0
-	err := boltDB.GetDB().View(func(tx *bolt.Tx) error {
-		bucket := db.GetStatusBucket(tx, queueType, level, status)
-		if bucket == nil {
-			return nil // Bucket doesn't exist, count is 0
-		}
-
-		cursor := bucket.Cursor()
-		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
-			count++
-		}
-
-		return nil
-	})
-	return count, err
 }

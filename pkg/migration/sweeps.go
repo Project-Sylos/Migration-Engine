@@ -8,16 +8,16 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
+	"github.com/Project-Sylos/Sylos-DB/pkg/store"
 	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
 // Gotta, sweep sweep sweep!!! 🧹🧹🧹
 // SweepConfig is the configuration for running exclusion or retry sweeps.
 type SweepConfig struct {
-	BoltDB          *db.DB
+	StoreInstance   *store.Store
 	SrcAdapter      types.FSAdapter
 	DstAdapter      types.FSAdapter
 	WorkerCount     int
@@ -50,14 +50,14 @@ type SweepConfig struct {
 //	}
 //	stats, err := migration.RunExclusionSweep(config)
 func RunExclusionSweep(cfg SweepConfig) (RuntimeStats, error) {
-	if cfg.BoltDB == nil {
-		return RuntimeStats{}, fmt.Errorf("boltDB cannot be nil")
+	if cfg.StoreInstance == nil {
+		return RuntimeStats{}, fmt.Errorf("store instance cannot be nil")
 	}
 	if cfg.SrcAdapter == nil || cfg.DstAdapter == nil {
 		return RuntimeStats{}, fmt.Errorf("source and destination adapters must be provided")
 	}
 
-	boltDB := cfg.BoltDB
+	storeInstance := cfg.StoreInstance
 
 	// Initialize log service if address is provided
 	if cfg.LogAddress != "" {
@@ -72,19 +72,17 @@ func RunExclusionSweep(cfg SweepConfig) (RuntimeStats, error) {
 				time.Sleep(startupDelay)
 			}
 		}
-		if err := logservice.InitGlobalLogger(boltDB, cfg.LogAddress, cfg.LogLevel); err != nil {
+		if err := logservice.InitGlobalLogger(storeInstance, cfg.LogAddress, cfg.LogLevel); err != nil {
 			return RuntimeStats{}, fmt.Errorf("failed to initialize logger: %w", err)
 		}
 	}
 
-	// Ensure exclusion-holding buckets exist
-	if err := db.EnsureExclusionHoldingBuckets(boltDB); err != nil {
-		return RuntimeStats{}, fmt.Errorf("failed to ensure exclusion-holding buckets: %w", err)
-	}
-
 	// Get max known depth from levels bucket for SRC
 	// Exclusion sweep should scan all existing levels, then complete
-	maxKnownDepth := boltDB.GetMaxKnownDepth(db.BucketSrc)
+	maxKnownDepth, err := storeInstance.GetMaxKnownDepth("SRC")
+	if err != nil {
+		return RuntimeStats{}, fmt.Errorf("failed to get max known depth: %w", err)
+	}
 	if maxKnownDepth < 0 {
 		maxKnownDepth = 0 // Default to 0 if no levels found
 	}
@@ -96,11 +94,11 @@ func RunExclusionSweep(cfg SweepConfig) (RuntimeStats, error) {
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
 	srcQueue.SetMode(queue.QueueModeExclusion)
 	srcQueue.SetMaxKnownDepth(maxKnownDepth)
-	srcQueue.InitializeWithContext(boltDB, cfg.SrcAdapter, cfg.ShutdownContext)
+	srcQueue.InitializeWithContext(storeInstance, cfg.SrcAdapter, cfg.ShutdownContext)
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
 	dstQueue.SetMode(queue.QueueModeExclusion)
-	dstQueue.InitializeWithContext(boltDB, cfg.DstAdapter, cfg.ShutdownContext)
+	dstQueue.InitializeWithContext(storeInstance, cfg.DstAdapter, cfg.ShutdownContext)
 
 	// Set initial rounds to 0 for exclusion sweep (starts from root level)
 	srcQueue.SetRound(0)
@@ -115,7 +113,7 @@ func RunExclusionSweep(cfg SweepConfig) (RuntimeStats, error) {
 	dstQueue.PullTasksIfNeeded(true)
 
 	// Create observer for stats publishing
-	observer := queue.NewQueueObserver(boltDB, 200*time.Millisecond)
+	observer := queue.NewQueueObserver(storeInstance, 200*time.Millisecond)
 	observer.Start()
 	defer observer.Stop()
 
@@ -274,14 +272,14 @@ func RunExclusionSweep(cfg SweepConfig) (RuntimeStats, error) {
 //	}
 //	stats, err := migration.RunRetrySweep(config)
 func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
-	if cfg.BoltDB == nil {
-		return RuntimeStats{}, fmt.Errorf("boltDB cannot be nil")
+	if cfg.StoreInstance == nil {
+		return RuntimeStats{}, fmt.Errorf("store instance cannot be nil")
 	}
 	if cfg.SrcAdapter == nil || cfg.DstAdapter == nil {
 		return RuntimeStats{}, fmt.Errorf("source and destination adapters must be provided")
 	}
 
-	boltDB := cfg.BoltDB
+	storeInstance := cfg.StoreInstance
 
 	// Initialize log service if address is provided
 	if cfg.LogAddress != "" {
@@ -296,7 +294,7 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 				time.Sleep(startupDelay)
 			}
 		}
-		if err := logservice.InitGlobalLogger(boltDB, cfg.LogAddress, cfg.LogLevel); err != nil {
+		if err := logservice.InitGlobalLogger(storeInstance, cfg.LogAddress, cfg.LogLevel); err != nil {
 			return RuntimeStats{}, fmt.Errorf("failed to initialize logger: %w", err)
 		}
 	}
@@ -308,8 +306,8 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	maxKnownDepth := cfg.MaxKnownDepth
 	if maxKnownDepth < 0 {
 		// Auto-detect from levels bucket
-		maxKnownDepth = boltDB.GetMaxKnownDepth(db.BucketSrc)
-		if maxKnownDepth < 0 {
+		maxKnownDepth, err := storeInstance.GetMaxKnownDepth("SRC")
+		if err != nil || maxKnownDepth < 0 {
 			maxKnownDepth = 0 // Default to 0 if no levels found
 		}
 	}
@@ -318,14 +316,14 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
 	srcQueue.SetMode(queue.QueueModeRetry)
 	srcQueue.SetMaxKnownDepth(maxKnownDepth)
-	srcQueue.InitializeWithContext(boltDB, cfg.SrcAdapter, cfg.ShutdownContext)
+	srcQueue.InitializeWithContext(storeInstance, cfg.SrcAdapter, cfg.ShutdownContext)
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
 	dstQueue.SetMode(queue.QueueModeRetry)
 	if cfg.MaxKnownDepth >= 0 {
 		dstQueue.SetMaxKnownDepth(cfg.MaxKnownDepth)
 	}
-	dstQueue.InitializeWithContext(boltDB, cfg.DstAdapter, cfg.ShutdownContext)
+	dstQueue.InitializeWithContext(storeInstance, cfg.DstAdapter, cfg.ShutdownContext)
 
 	// Set initial rounds to 0 for retry sweep
 	srcQueue.SetRound(0)
@@ -340,7 +338,7 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	dstQueue.PullTasksIfNeeded(true)
 
 	// Create observer for stats publishing
-	observer := queue.NewQueueObserver(boltDB, 200*time.Millisecond)
+	observer := queue.NewQueueObserver(storeInstance, 200*time.Millisecond)
 	observer.Start()
 	defer observer.Stop()
 

@@ -6,16 +6,18 @@ package queue
 import (
 	"fmt"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
+	"github.com/Project-Sylos/Sylos-DB/pkg/bolt"
 	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
+
+// Buffer flush calls should eventually be replaced with store.Barrier() semantic barriers.
 
 // PullTraversalTasks pulls traversal tasks from BoltDB for the current round.
 // Uses getter/setter methods - no direct mutex access.
 func (q *Queue) PullTraversalTasks(force bool) {
-	boltDB := q.getBoltDB()
-	if boltDB == nil {
+	storeInstance := q.getStore()
+	if storeInstance == nil {
 		return
 	}
 
@@ -33,18 +35,11 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	// Set pulling flag early and defer clearing it
 	// This ensures only one thread can execute the pull logic at a time
 	q.setPulling(true)
-	outputBuffer := q.getOutputBuffer()
 
 	// Always clear pulling flag when done
 	defer func() {
 		q.setPulling(false)
 	}()
-
-	// Force-flush buffer before pulling tasks to ensure we don't pull tasks
-	// that are waiting in the buffer to be written
-	if outputBuffer != nil {
-		outputBuffer.Flush()
-	}
 
 	queueType := getQueueType(q.name)
 	taskType := TaskTypeSrcTraversal
@@ -79,7 +74,7 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		}
 	}
 
-	batch, err := db.BatchFetchWithKeys(boltDB, queueType, currentRound, db.StatusPending, defaultLeaseBatchSize)
+	leasedIDs, err := storeInstance.LeaseTasksAtLevel(queueType, currentRound, defaultLeaseBatchSize)
 
 	if err != nil {
 		if logservice.LS != nil {
@@ -89,6 +84,24 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		return
 	}
 
+	// Convert leased IDs -> NodeStates (no wrappers/no-ops: if we can't load state, we skip that ID)
+	type leasedItem struct {
+		Key   string
+		State *bolt.NodeState
+	}
+	batch := make([]leasedItem, 0, len(leasedIDs))
+	for _, idBytes := range leasedIDs {
+		nodeID := string(idBytes)
+		if nodeID == "" {
+			continue
+		}
+		state, err := storeInstance.GetNode(queueType, nodeID)
+		if err != nil || state == nil {
+			continue
+		}
+		batch = append(batch, leasedItem{Key: nodeID, State: state})
+	}
+
 	// Batch-load expected children for DST tasks
 	var expectedFoldersMap map[string][]types.Folder
 	var expectedFilesMap map[string][]types.File
@@ -96,7 +109,6 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	if q.name == "dst" {
 		// First pass: collect all valid (not already leased) folder tasks and their DST parent ULIDs
 		var dstParentIDs []string
-		dstIDToPath := make(map[string]string) // DST ULID -> path (for mapping results back)
 		for _, item := range batch {
 			// Skip ULIDs we've already leased (prevents duplicate pulls from stale views)
 			if q.isLeased(item.Key) {
@@ -106,23 +118,77 @@ func (q *Queue) PullTraversalTasks(force bool) {
 			task := nodeStateToTask(item.State, taskType)
 			if task.IsFolder() {
 				dstParentIDs = append(dstParentIDs, item.State.ID) // DST parent ULID
-				dstIDToPath[item.State.ID] = task.Folder.LocationPath
 			}
 		}
 
 		// Batch-load expected children for all folder tasks in one DB operation
-		// Uses lookup table to get SrcID from DST parent IDs, then loads SRC children
+		// Uses lookup table to get SRC parent ID from DST parent IDs, then loads SRC children
 		if len(dstParentIDs) > 0 {
-			var err error
-			expectedFoldersMap, expectedFilesMap, srcIDMap, err = BatchLoadExpectedChildrenByDSTIDs(boltDB, dstParentIDs, dstIDToPath)
-			if err != nil {
-				if logservice.LS != nil {
-					_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to batch load expected children: %v", err), "queue", q.name, q.name)
+			expectedFoldersMap = make(map[string][]types.Folder)
+			expectedFilesMap = make(map[string][]types.File)
+			srcIDMap = make(map[string]map[string]string)
+
+			// For each DST parent, find corresponding SRC parent and load its children
+			for _, dstParentID := range dstParentIDs {
+				// Get corresponding SRC parent ID via join mapping
+				srcParentID, err := q.getStore().GetJoinMapping("dst-to-src", dstParentID)
+				if err != nil || srcParentID == "" {
+					// No SRC parent found - skip (this DST folder has no corresponding SRC)
+					continue
 				}
-				// Continue anyway - tasks will have empty expected children
-				expectedFoldersMap = make(map[string][]types.Folder)
-				expectedFilesMap = make(map[string][]types.File)
-				srcIDMap = make(map[string]map[string]string)
+
+				// Load SRC children (these are the expected children for this DST parent)
+				childIDsResult, err := q.getStore().GetChildren("SRC", srcParentID, "ids")
+				if err != nil {
+					if logservice.LS != nil {
+						_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to load SRC children for parent %s: %v", srcParentID, err), "queue", q.name, q.name)
+					}
+					continue
+				}
+
+				childIDs, ok := childIDsResult.([]string)
+				if !ok {
+					continue
+				}
+
+				// Convert child IDs to Folder/File objects
+				var folders []types.Folder
+				var files []types.File
+				childSrcIDMap := make(map[string]string) // Type+Name -> SRC node ID
+
+				for _, childID := range childIDs {
+					// Get child NodeState from SRC
+					childState, err := q.getStore().GetNode("SRC", childID)
+					if err != nil {
+						continue
+					}
+
+					// Convert NodeState to Folder/File using nodeStateToTask helper
+					childTask := nodeStateToTask(childState, TaskTypeSrcTraversal)
+					if childTask == nil {
+						continue
+					}
+
+					// Build match key (Type:Name) for srcIDMap
+					var matchKey string
+					if childTask.IsFolder() {
+						matchKey = childTask.Folder.Type + ":" + childTask.Folder.DisplayName
+						folders = append(folders, childTask.Folder)
+					} else if childTask.IsFile() {
+						matchKey = childTask.File.Type + ":" + childTask.File.DisplayName
+						files = append(files, childTask.File)
+					} else {
+						continue
+					}
+
+					// Map Type+Name to SRC node ID
+					childSrcIDMap[matchKey] = childID
+				}
+
+				// Store results keyed by DST parent ID
+				expectedFoldersMap[dstParentID] = folders
+				expectedFilesMap[dstParentID] = files
+				srcIDMap[dstParentID] = childSrcIDMap
 			}
 		} else {
 			srcIDMap = make(map[string]map[string]string)

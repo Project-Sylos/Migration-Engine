@@ -8,17 +8,18 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
+	"github.com/Project-Sylos/Sylos-DB/pkg/bolt"
+	"github.com/Project-Sylos/Sylos-DB/pkg/store"
 	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
-// TraversalWorker executes traversal tasks by listing children and recording them to BoltDB.
+// TraversalWorker executes traversal tasks by listing children and recording them to the Store.
 // Each worker runs independently in its own goroutine, continuously polling the queue for work.
 type TraversalWorker struct {
 	id          string
 	queue       *Queue
-	boltDB      *db.DB
+	store       *store.Store
 	fsAdapter   types.FSAdapter
 	queueName   string          // "src" or "dst" for logging
 	isDst       bool            // true if this is a destination worker (performs comparison)
@@ -30,7 +31,7 @@ type TraversalWorker struct {
 func NewTraversalWorker(
 	id string,
 	queue *Queue,
-	boltInstance *db.DB,
+	storeInstance *store.Store,
 	adapter types.FSAdapter,
 	queueName string,
 	shutdownCtx context.Context,
@@ -38,7 +39,7 @@ func NewTraversalWorker(
 	return &TraversalWorker{
 		id:          id,
 		queue:       queue,
-		boltDB:      boltInstance,
+		store:       storeInstance,
 		fsAdapter:   adapter,
 		queueName:   queueName,
 		isDst:       queueName == "dst",
@@ -95,11 +96,10 @@ func (w *TraversalWorker) Run() {
 
 		// For retry sweep mode, check if task is excluded (O(1) check)
 		mode := w.queue.getMode()
-		boltDB := w.queue.getBoltDB()
-		if mode == QueueModeRetry && boltDB != nil && task.ID != "" {
+		if mode == QueueModeRetry && w.store != nil && task.ID != "" {
 			queueType := getQueueType(w.queueName)
-			exists, mode, err := db.CheckHoldingEntry(boltDB, queueType, task.ID)
-			excluded := (err == nil && exists && mode == "exclude")
+			exists, holdingMode, err := w.store.CheckHoldingEntry(queueType, task.ID)
+			excluded := (err == nil && exists && holdingMode == "exclude")
 			if err == nil && excluded {
 				// Skip excluded nodes during retry sweep
 				if logservice.LS != nil {
@@ -193,7 +193,7 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 			childFolder.DepthLevel = task.Round + 1
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				Folder: childFolder,
-				Status: db.StatusPending,
+				Status: bolt.StatusPending,
 				IsFile: false,
 			})
 		}
@@ -203,7 +203,7 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 			childFile.DepthLevel = task.Round + 1
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				File:   childFile,
-				Status: db.StatusSuccessful, // Files are immediately successful (no traversal needed)
+				Status: bolt.StatusSuccessful, // Files are immediately successful (no traversal needed)
 				IsFile: true,
 			})
 		}
@@ -267,7 +267,7 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				Folder: actualFolder,
-				Status: db.StatusPending,
+				Status: bolt.StatusPending,
 				IsFile: false,
 				SrcID:  srcID,
 			})
@@ -281,7 +281,7 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 			// Folder exists on dst but not src: mark as "NotOnSrc"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				Folder: actualFolder,
-				Status: db.StatusNotOnSrc,
+				Status: bolt.StatusNotOnSrc,
 				IsFile: false,
 				SrcID:  "", // No SRC node for items not on src
 			})
@@ -300,7 +300,7 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				File:   actualFile,
-				Status: db.StatusSuccessful, // File exists on dst, no traversal needed
+				Status: bolt.StatusSuccessful, // File exists on dst, no traversal needed
 				IsFile: true,
 				SrcID:  srcID,
 			})

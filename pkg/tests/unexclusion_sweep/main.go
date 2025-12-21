@@ -5,16 +5,13 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"os"
 	"time"
 
-	bolt "go.etcd.io/bbolt"
-
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Migration-Engine/pkg/tests/shared"
+	"github.com/Project-Sylos/Sylos-DB/pkg/store"
 	"github.com/Project-Sylos/Sylos-FS/pkg/fs"
 )
 
@@ -76,7 +73,7 @@ func runTest() error {
 		if err2 != nil {
 			return fmt.Errorf("failed to count total nodes: %w (stats error: %v)", err2, err)
 		}
-		totalNodesBefore = int64(totalNodesBeforeInt)
+		totalNodesBefore = totalNodesBeforeInt
 	}
 
 	excludedNodesBefore, err := shared.CountExcludedNodes(boltDB, "SRC")
@@ -125,15 +122,19 @@ func runTest() error {
 
 	// Get children and add them to unexclusion-holding bucket
 	// They will keep their inherited_excluded status until the sweep processes them
-	childIDs, err := db.GetChildrenIDsByParentID(boltDB, "SRC", selectedChild.ID)
+	childIDsResult, err := boltDB.GetChildren("SRC", selectedChild.ID, "ids")
 	if err != nil {
-		return fmt.Errorf("failed to get children: %w", err)
+		return err
+	}
+	childIDs, ok := childIDsResult.([]string)
+	if !ok {
+		return fmt.Errorf("failed to convert children result to []string")
 	}
 
 	if len(childIDs) > 0 {
 		fmt.Printf("Adding %d children to unexclusion-holding bucket...\n", len(childIDs))
 		for _, childID := range childIDs {
-			childState, err := db.GetNodeState(boltDB, "SRC", childID)
+			childState, err := boltDB.GetNode("SRC", childID)
 			if err != nil {
 				continue
 			}
@@ -148,7 +149,7 @@ func runTest() error {
 
 	// Run unexclusion sweep
 	sweepConfig := migration.SweepConfig{
-		BoltDB:          boltDB,
+		StoreInstance:   boltDB,
 		SrcAdapter:      srcAdapter,
 		DstAdapter:      dstAdapter,
 		WorkerCount:     10,
@@ -208,41 +209,16 @@ func runTest() error {
 }
 
 // addToUnexclusionHolding adds a node to the unexclusion-holding bucket.
-func addToUnexclusionHolding(boltDB *db.DB, queueType string, nodePath string, depth int) error {
-	// Find node by path to get ULID
-	var nodeID string
-	err := boltDB.View(func(tx *bolt.Tx) error {
-		nodesBucket := db.GetNodesBucket(tx, queueType)
-		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found")
-		}
-
-		cursor := nodesBucket.Cursor()
-		for nodeIDBytes, nodeData := cursor.First(); nodeIDBytes != nil; nodeIDBytes, nodeData = cursor.Next() {
-			nodeState, err := db.DeserializeNodeState(nodeData)
-			if err != nil {
-				continue
-			}
-			if nodeState.Path == nodePath {
-				nodeID = nodeState.ID
-				return nil
-			}
-		}
-		return fmt.Errorf("node not found: %s", nodePath)
-	})
+func addToUnexclusionHolding(s *store.Store, queueType string, nodePath string, depth int) error {
+	// Get node by path using Store API
+	node, err := s.GetNodeByPath(queueType, nodePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get node by path: %w", err)
+	}
+	if node == nil {
+		return fmt.Errorf("node not found: %s", nodePath)
 	}
 
-	depthBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(depthBytes, uint64(depth))
-
-	return boltDB.Update(func(tx *bolt.Tx) error {
-		bucket, err := db.GetOrCreateHoldingBucket(tx, queueType, "unexclude")
-		if err != nil {
-			return fmt.Errorf("failed to get unexclusion-holding bucket: %w", err)
-		}
-
-		return bucket.Put([]byte(nodeID), depthBytes)
-	})
+	// Add to unexclusion-holding bucket using Store API
+	return s.AddHoldingEntry(queueType, node.ID, depth, "unexclude")
 }

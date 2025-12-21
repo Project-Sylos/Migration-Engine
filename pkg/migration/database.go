@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"github.com/Project-Sylos/Sylos-DB/pkg/store"
 )
 
 // DatabaseConfig defines how the migration engine should prepare its backing store.
@@ -34,12 +34,12 @@ func removeBoltDatabase(path string) error {
 	return nil
 }
 
-// SetupDatabase is a helper function for the API/caller to open a BoltDB instance.
-// The Migration Engine does NOT call this - it requires the DB to be passed in via Config.DatabaseInstance.
+// SetupDatabase is a helper function for the API/caller to open a store.Store instance.
+// The Migration Engine does NOT call this - it requires the Store to be passed in via Config.StoreInstance.
 // This function is provided for convenience when the API needs to open the database.
-// Returns the database and a boolean indicating whether this is a fresh database (true = fresh).
-// The caller is responsible for closing the database when done.
-func SetupDatabase(cfg DatabaseConfig) (*db.DB, bool, error) {
+// Returns the store.Store and a boolean indicating whether this is a fresh database (true = fresh).
+// The caller is responsible for closing the Store when done.
+func SetupDatabase(cfg DatabaseConfig) (*store.Store, bool, error) {
 	if cfg.Path == "" {
 		return nil, false, fmt.Errorf("database path cannot be empty")
 	}
@@ -57,13 +57,11 @@ func SetupDatabase(cfg DatabaseConfig) (*db.DB, bool, error) {
 		}
 	}
 
-	boltOpts := db.DefaultOptions()
-	boltOpts.Path = cfg.Path
-
-	database, err := db.Open(boltOpts)
+	// Open Store (which internally opens bolt.DB)
+	storeInstance, err := store.Open(cfg.Path)
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to create database %s: %w", cfg.Path, err)
+		return nil, false, fmt.Errorf("failed to open store %s: %w", cfg.Path, err)
 	}
 
-	return database, wasFresh, nil
+	return storeInstance, wasFresh, nil
 }

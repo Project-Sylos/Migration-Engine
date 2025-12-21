@@ -6,7 +6,7 @@ package migration
 import (
 	"fmt"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"github.com/Project-Sylos/Sylos-DB/pkg/store"
 )
 
 // VerifyOptions define the expectations for post-migration validation.
@@ -43,77 +43,53 @@ func (r VerificationReport) Success(opts VerifyOptions) bool {
 
 // VerifyMigration inspects BoltDB for pending, failed, or missing nodes and returns a report.
 // In addition to previous checks, also verifies that at least one file/folder (not just roots) was migrated.
-func VerifyMigration(boltDB *db.DB, opts VerifyOptions) (VerificationReport, error) {
-	if boltDB == nil {
-		return VerificationReport{}, fmt.Errorf("boltDB cannot be nil")
+func VerifyMigration(storeInstance *store.Store, opts VerifyOptions) (VerificationReport, error) {
+	if storeInstance == nil {
+		return VerificationReport{}, fmt.Errorf("storeInstance cannot be nil")
 	}
 
-	report := VerificationReport{}
-
-	// Count all src nodes
-	srcTotal, err := boltDB.CountNodes("SRC")
+	// For verification, prefer scan mode (accurate even if stats drifted).
+	dbReport, err := storeInstance.InspectDatabase(store.InspectionModeScan)
 	if err != nil {
-		return VerificationReport{}, fmt.Errorf("failed to count src nodes: %w", err)
+		return VerificationReport{}, err
 	}
-	report.SrcTotal = srcTotal
 
-	// Count all dst nodes
-	dstTotal, err := boltDB.CountNodes("DST")
-	if err != nil {
-		return VerificationReport{}, fmt.Errorf("failed to count dst nodes: %w", err)
+	report := VerificationReport{
+		SrcTotal: dbReport.Src.TotalNodes,
+		DstTotal: dbReport.Dst.TotalNodes,
+
+		SrcPending: dbReport.Src.TotalPending,
+		DstPending: dbReport.Dst.TotalPending,
+
+		SrcFailed: dbReport.Src.TotalFailed,
+		DstFailed: dbReport.Dst.TotalFailed,
+
+		DstNotOnSrc: dbReport.Dst.TotalNotOnSrc,
 	}
-	report.DstTotal = dstTotal
 
 	if report.SrcTotal == 0 && report.DstTotal == 0 {
 		return report, fmt.Errorf("no nodes discovered - migration did not run")
 	}
 
-	// Count pending, failed, and not_on_src nodes across all levels
-	srcLevels, err := boltDB.GetAllLevels("SRC")
-	if err != nil {
-		return VerificationReport{}, fmt.Errorf("failed to get src levels: %w", err)
-	}
-
-	var srcPendingCount, srcFailedCount int
-	for _, level := range srcLevels {
-		pendingCount, _ := boltDB.CountStatusBucket("SRC", level, db.StatusPending)
-		srcPendingCount += pendingCount
-
-		failedCount, _ := boltDB.CountStatusBucket("SRC", level, db.StatusFailed)
-		srcFailedCount += failedCount
-	}
-	report.SrcPending = srcPendingCount
-	report.SrcFailed = srcFailedCount
-
-	// Count dst nodes
-	dstLevels, err := boltDB.GetAllLevels("DST")
-	if err != nil {
-		return VerificationReport{}, fmt.Errorf("failed to get dst levels: %w", err)
-	}
-
-	var dstPendingCount, dstFailedCount, dstNotOnSrcCount int
-	for _, level := range dstLevels {
-		pendingCount, _ := boltDB.CountStatusBucket("DST", level, db.StatusPending)
-		dstPendingCount += pendingCount
-
-		failedCount, _ := boltDB.CountStatusBucket("DST", level, db.StatusFailed)
-		dstFailedCount += failedCount
-
-		notOnSrcCount, _ := boltDB.CountStatusBucket("DST", level, db.StatusNotOnSrc)
-		dstNotOnSrcCount += notOnSrcCount
-	}
-	report.DstPending = dstPendingCount
-	report.DstFailed = dstFailedCount
-	report.DstNotOnSrc = dstNotOnSrcCount
-
-	// Calculate number of actually moved nodes (excluding root, which is level 0)
-	// Only count successful dst traversals at depth > 0
-	var movedCount int
-	for _, level := range dstLevels {
-		if level > 0 {
-			successCount, _ := boltDB.CountStatusBucket("DST", level, db.StatusSuccessful)
-			movedCount += successCount
+	// Must have actually migrated/traversed more than just roots.
+	// We treat "moved" as any successful DST node at depth > 0.
+	movedCount := 0
+	for _, lvl := range dbReport.Dst.Levels {
+		if lvl.Level > 0 {
+			movedCount += lvl.Successful
 		}
+	}
+	if movedCount == 0 {
+		return report, fmt.Errorf("no migrated nodes detected beyond roots (dst successful at depth > 0 == 0)")
+	}
+
+	// Preserve existing semantics: only enforce via Success(opts) at call site,
+	// but also fail fast here if policy disallows known bad states.
+	if !opts.AllowPending && (report.SrcPending > 0 || report.DstPending > 0) {
+		return report, fmt.Errorf("verification failed: pending nodes remain (src=%d dst=%d)", report.SrcPending, report.DstPending)
+	}
+	if !opts.AllowNotOnSrc && report.DstNotOnSrc > 0 {
+		return report, fmt.Errorf("verification failed: dst nodes not on src (count=%d)", report.DstNotOnSrc)
 	}
 
 	return report, nil

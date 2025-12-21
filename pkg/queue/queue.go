@@ -10,8 +10,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
+	"github.com/Project-Sylos/Sylos-DB/pkg/bolt"
+	"github.com/Project-Sylos/Sylos-DB/pkg/store"
+	"github.com/Project-Sylos/Sylos-DB/pkg/utils"
 	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
@@ -80,9 +82,8 @@ type Queue struct {
 	round              int                  // Current BFS round/depth level
 	roundInfoMap       map[int]*RoundInfo   // Per-round statistics and metadata (key: round number)
 	workers            []Worker             // Workers associated with this queue (for reference only)
-	boltDB             *db.DB               // BoltDB for operational queue storage
+	storeAPI           *store.Store         // Store API for all database operations (handles buffering internally)
 	coordinator        *QueueCoordinator    // Coordinator for round advancement gates (DST only)
-	outputBuffer       *db.OutputBuffer     // Buffer for batched write operations
 	// Round-based statistics for completion detection
 	roundStats  map[int]*RoundStats // Per-round statistics (key: round number, value: stats for that round)
 	shutdownCtx context.Context     // Context for shutdown signaling (optional)
@@ -139,14 +140,9 @@ func (q *Queue) GetMode() string {
 	return string(q.getMode())
 }
 
-// GetBoltDB returns the BoltDB instance (implements worker.QueueAccessor).
-func (q *Queue) GetBoltDB() interface{} {
-	return q.getBoltDB()
-}
-
-// GetOutputBuffer returns the output buffer (implements worker.QueueAccessor).
-func (q *Queue) GetOutputBuffer() interface{} {
-	return q.getOutputBuffer()
+// GetStore returns the Store instance (implements worker.QueueAccessor).
+func (q *Queue) GetStore() *store.Store {
+	return q.getStore()
 }
 
 // GetPendingSet returns a copy of the pending set (implements worker.QueueAccessor).
@@ -162,23 +158,18 @@ func (q *Queue) GetPendingSet() map[string]struct{} {
 	return result
 }
 
-// InitializeWithContext sets up the queue with BoltDB, context, and filesystem adapter references.
+// InitializeWithContext sets up the queue with Store API, context, and filesystem adapter references.
 // Creates and starts workers immediately - they'll poll for tasks autonomously.
 // shutdownCtx is optional - if provided, workers will check for cancellation and exit on shutdown.
-func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter types.FSAdapter, shutdownCtx context.Context) {
-	// Set BoltDB and shutdownCtx using setters
-	q.setBoltDB(boltInstance)
+func (q *Queue) InitializeWithContext(storeInstance *store.Store, adapter types.FSAdapter, shutdownCtx context.Context) {
+	// Set Store and shutdownCtx using setters
+	q.setStore(storeInstance)
 	q.setShutdownCtx(shutdownCtx)
 
 	// Get worker count from capacity (workers haven't been added yet, so length is 0)
 	q.mu.RLock()
 	workerCount := cap(q.workers) // Get the worker count we preallocated for
 	q.mu.RUnlock()
-
-	// Initialize output buffer for batched writes
-	// Default: 1000 operations or 1 second interval
-	outputBuffer := db.NewOutputBuffer(boltInstance, 10000, 3*time.Second)
-	q.setOutputBuffer(outputBuffer)
 
 	// Create and start workers - they manage themselves
 	// Worker type depends on queue mode
@@ -190,7 +181,7 @@ func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter types.FSAdapt
 			w = NewExclusionWorker(
 				fmt.Sprintf("%s-exclusion-worker-%d", q.name, i),
 				q,
-				boltInstance,
+				storeInstance,
 				q.name,
 				shutdownCtx,
 			)
@@ -199,7 +190,7 @@ func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter types.FSAdapt
 			w = NewTraversalWorker(
 				fmt.Sprintf("%s-worker-%d", q.name, i),
 				q,
-				boltInstance,
+				storeInstance,
 				adapter,
 				q.name,
 				shutdownCtx,
@@ -219,11 +210,6 @@ func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter types.FSAdapt
 	if logservice.LS != nil {
 		_ = logservice.LS.Log("info", fmt.Sprintf("%s queue initialized", strings.ToUpper(q.name)), "queue", q.name, q.name)
 	}
-}
-
-// Initialize is a convenience wrapper that calls InitializeWithContext with nil shutdown context.
-func (q *Queue) Initialize(boltInstance *db.DB, adapter types.FSAdapter) {
-	q.InitializeWithContext(boltInstance, adapter, nil)
 }
 
 // SetShutdownContext sets the shutdown context for the queue.
@@ -261,21 +247,16 @@ func (q *Queue) IsPaused() bool {
 // Pause pauses the queue (workers will not lease new tasks).
 func (q *Queue) Pause() {
 	q.setState(QueueStatePaused)
-	outputBuffer := q.getOutputBuffer()
-	// Pause buffer (which will force-flush before pausing)
-	if outputBuffer != nil {
-		outputBuffer.Pause()
+	// Use semantic barrier to ensure consistency
+	storeInstance := q.getStore()
+	if storeInstance != nil {
+		_ = storeInstance.Barrier(store.BarrierPhaseTransition)
 	}
 }
 
 // Resume resumes the queue after a pause.
 func (q *Queue) Resume() {
 	q.setState(QueueStateRunning)
-	outputBuffer := q.getOutputBuffer()
-	// Resume buffer
-	if outputBuffer != nil {
-		outputBuffer.Resume()
-	}
 }
 
 // Add enqueues a task into the in-memory buffer only (no database writes).
@@ -299,10 +280,9 @@ func (q *Queue) Lease() *TaskBase {
 	q.PullTasksIfNeeded(false)
 
 	for attempt := 0; attempt < 2; attempt++ {
-		// Block if paused, completed, or no DB (waiting doesn't block - rounds continue once started)
+		// Block if paused or completed (waiting doesn't block - rounds continue once started)
 		state := q.getState()
-		boltDB := q.getBoltDB()
-		if state == QueueStatePaused || state == QueueStateCompleted || boltDB == nil {
+		if state == QueueStatePaused || state == QueueStateCompleted {
 			return nil
 		}
 
@@ -312,7 +292,7 @@ func (q *Queue) Lease() *TaskBase {
 			if nodeID == "" {
 				// Task doesn't have ULID - this shouldn't happen for tasks pulled from DB
 				// Generate one for safety (shouldn't happen in normal flow)
-				nodeID = db.GenerateNodeID()
+				nodeID = utils.GenerateULID()
 				task.ID = nodeID
 			}
 			task.Locked = true
@@ -340,10 +320,13 @@ type CompletionCheckOptions struct {
 // checkCompletion performs completion checks based on the provided options.
 // Returns true if queue was marked as completed, false otherwise.
 func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) bool {
-	// Flush buffer first (if requested) to ensure all writes are persisted before checking
-	outputBuffer := q.getOutputBuffer()
-	if opts.FlushBuffer && outputBuffer != nil {
-		outputBuffer.Flush()
+	// Use semantic barrier before completion check (if requested)
+	// Store API ensures all buffered writes are visible before the check
+	if opts.FlushBuffer {
+		storeInstance := q.getStore()
+		if storeInstance != nil {
+			_ = storeInstance.Barrier(store.BarrierCompletionCheck)
+		}
 	}
 
 	// For traversal/sweep completion check (handles all modes)
@@ -359,7 +342,7 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 		inProgressCount := q.getInProgressCount()
 		pendingBuffCount := q.getPendingCount()
 		wasFirstPull := opts.WasFirstPull
-		boltDB := q.getBoltDB()
+		storeInstance := q.getStore()
 
 		// If we have tasks in progress or in buffer, we're definitely not done
 		if inProgressCount > 0 || pendingBuffCount > 0 {
@@ -368,7 +351,7 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 
 		// Only check completion on first pull (prevents premature completion mid-round)
 
-		if boltDB == nil {
+		if storeInstance == nil {
 			return false
 		}
 
@@ -380,7 +363,7 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 		case QueueModeTraversal:
 			// Traversal: first pull with 0 entries → complete (exhausted all depths)
 			// Check if any pending tasks exist at current round
-			hasPending, err := boltDB.HasStatusBucketItems(queueType, currentRound, db.StatusPending)
+			hasPending, err := storeInstance.HasPendingAtLevel(queueType, currentRound)
 			if err != nil {
 				return false
 			}
@@ -408,7 +391,7 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			maxKnownDepth := q.getMaxKnownDepth()
 			if maxKnownDepth >= 0 && currentRound > maxKnownDepth {
 				// Past maxKnownDepth - apply traversal completion rules
-				hasPending, err1 := boltDB.HasStatusBucketItems(queueType, currentRound, db.StatusPending)
+				hasPending, err1 := storeInstance.HasPendingAtLevel(queueType, currentRound)
 				if err1 == nil && !hasPending && wasFirstPull {
 					return q.markComplete("Retry sweep complete - past maxKnownDepth (%d), no pending/failed tasks at round %d", maxKnownDepth, currentRound)
 				}
@@ -449,7 +432,7 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 
 // markComplete marks the queue as completed and notifies the coordinator.
 // Returns true if successfully marked complete.
-func (q *Queue) markComplete(format string, args ...interface{}) bool {
+func (q *Queue) markComplete(format string, args ...any) bool {
 	state := q.getState()
 	if state != QueueStateRunning && state != QueueStateWaiting {
 		return false
@@ -545,19 +528,16 @@ func (q *Queue) ReportTaskResult(task *TaskBase, result TaskExecutionResult) {
 	}
 }
 
-// Complete is a public wrapper for backward compatibility.
-// New code should use ReportTaskResult instead.
-func (q *Queue) Complete(task *TaskBase) {
-	q.ReportTaskResult(task, TaskExecutionResultSuccessful)
-}
-
+// Complete is a convenience method that calls ReportTaskResult.
+// New code should use ReportTaskResult directly.
 // completeTask is the internal implementation for successful task completion.
 func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 	// Record execution time delta
 	q.recordExecutionTime(executionDelta)
 	currentRound := task.Round
 
-	if q.boltDB == nil {
+	storeInstance := q.getStore()
+	if storeInstance == nil {
 		return
 	}
 
@@ -594,12 +574,11 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 	// Record task completion in RoundInfo
 	q.recordTaskCompletion(currentRound, true)
 
-	// Note: We'll check for completion again at the end after all writes are done
 	// This early check helps catch completion as soon as possible
 
 	// Prepare child nodes for insertion
 	parentPath := types.NormalizeLocationPath(task.LocationPath())
-	var childNodesToInsert []db.InsertOperation
+	var childNodesToInsert []bolt.InsertOperation
 
 	// Log folder discovery with details
 	if logservice.LS != nil {
@@ -623,9 +602,9 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 
 	// 2. Build map of existing children (ServiceID -> ULID) to avoid creating duplicates
 	existingChildrenMap := make(map[string]string) // ServiceID -> ULID
-	boltDB := q.getBoltDB()
-	if boltDB != nil {
-		if existingChildren, err := db.GetChildrenStatesByParentID(boltDB, queueType, nodeID); err == nil {
+	if existingChildrenResult, err := storeInstance.GetChildren(queueType, nodeID, "states"); err == nil {
+		// Type assert the result to []*bolt.NodeState
+		if existingChildren, ok := existingChildrenResult.([]*bolt.NodeState); ok {
 			for _, existingChild := range existingChildren {
 				if existingChild != nil && existingChild.ServiceID != "" {
 					existingChildrenMap[existingChild.ServiceID] = existingChild.ID
@@ -660,7 +639,7 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		// Populate traversal status in the NodeState metadata
 		childState.TraversalStatus = child.Status
 
-		childNodesToInsert = append(childNodesToInsert, db.InsertOperation{
+		childNodesToInsert = append(childNodesToInsert, bolt.InsertOperation{
 			QueueType: queueType,
 			Level:     nextRound,
 			Status:    child.Status,
@@ -668,17 +647,14 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		})
 
 		// Queue path-to-ulid mapping for this child (for API path-based queries)
-		outputBuffer := q.getOutputBuffer()
-		if outputBuffer != nil && childState.Path != "" {
-			outputBuffer.AddPathToULIDMapping(queueType, childState.Path, childState.ID)
+		if childState.Path != "" {
+			queuePathToULIDMapping(q.getStore(), queueType, childState.Path, childState.ID)
 		}
 
 		// For DST queue: queue lookup mapping if this child has a matching SRC node
 		if queueType == "DST" && child.SrcID != "" {
-			if outputBuffer != nil {
-				// Queue bidirectional lookup mapping: SrcID <-> DST node ID
-				outputBuffer.AddLookupMapping(child.SrcID, childState.ID)
-			}
+			// Queue bidirectional lookup mapping: SrcID <-> DST node ID
+			queueLookupMapping(q.getStore(), child.SrcID, childState.ID)
 		}
 
 		// Increment expected count for folder children (only folders need traversal)
@@ -688,7 +664,6 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 	}
 
 	// 3. Handle DST queue special case: create tasks for child folders
-	// Note: ExpectedFolders/ExpectedFiles will be loaded later during PullTasks() batch loading
 	if q.name == "dst" {
 		type dstChildFolder struct {
 			folder types.Folder
@@ -700,7 +675,7 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		for _, child := range task.DiscoveredChildren {
 			if !child.IsFile {
 				totalFolders++
-				if child.Status == db.StatusPending {
+				if child.Status == bolt.StatusPending {
 					pendingFolders++
 					f := child.Folder
 					f.DepthLevel = nextRound
@@ -732,32 +707,29 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 				// Set parent's ULID for database relationships
 				taskState.ParentID = nodeID
 				// Populate traversal status in the NodeState metadata
-				taskState.TraversalStatus = db.StatusPending
+				taskState.TraversalStatus = bolt.StatusPending
 				// Store SrcID in NodeState temporarily for BatchInsertNodes to create lookup mappings
 				// (BatchInsertNodes will handle storing in lookup tables)
 				if child.srcID != "" {
 					taskState.SrcID = child.srcID
 				}
 
-				childNodesToInsert = append(childNodesToInsert, db.InsertOperation{
+				childNodesToInsert = append(childNodesToInsert, bolt.InsertOperation{
 					QueueType: queueType,
 					Level:     nextRound,
-					Status:    db.StatusPending,
+					Status:    bolt.StatusPending,
 					State:     taskState,
 				})
 
 				// Queue path-to-ulid mapping for DST child folder (for API path-based queries)
-				outputBuffer := q.getOutputBuffer()
-				if outputBuffer != nil && taskState.Path != "" {
-					outputBuffer.AddPathToULIDMapping(queueType, taskState.Path, taskState.ID)
+				if taskState.Path != "" {
+					queuePathToULIDMapping(q.getStore(), queueType, taskState.Path, taskState.ID)
 				}
 
 				// Queue lookup mapping if this child has a matching SRC node
 				if child.srcID != "" {
-					if outputBuffer != nil {
-						// Queue bidirectional lookup mapping: SrcID <-> DST node ID
-						outputBuffer.AddLookupMapping(child.srcID, taskState.ID)
-					}
+					// Queue bidirectional lookup mapping: SrcID <-> DST node ID
+					queueLookupMapping(q.getStore(), child.srcID, taskState.ID)
 				}
 
 				q.incrementRoundStatsExpected(nextRound)
@@ -766,60 +738,129 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		}
 	}
 
-	// Write to buffer instead of directly to database
-	outputBuffer := q.getOutputBuffer()
-	if outputBuffer != nil {
-		// Add all related operations atomically to prevent flushes between them
-		// This ensures status update and batch insert are written together
-		atomicOps := make([]db.WriteOperation, 0, 2)
-
-		// Add parent status update operation
-		atomicOps = append(atomicOps, &db.StatusUpdateOperation{
-			QueueType: queueType,
-			Level:     currentRound,
-			OldStatus: db.StatusPending,
-			NewStatus: db.StatusSuccessful,
-			NodeID:    nodeID,
-		})
-
-		// Add child inserts operation (if any)
-		// Lookup mappings are queued above when creating child states
-		if len(childNodesToInsert) > 0 {
-			atomicOps = append(atomicOps, &db.BatchInsertOperation{
-				Operations: childNodesToInsert,
-			})
+	// Update status + insert children using Store domain verbs (no direct Bolt transactions).
+	if err := storeInstance.TransitionNodeStatus(queueType, currentRound, bolt.StatusPending, bolt.StatusSuccessful, nodeID); err != nil {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to update parent status: %v", err), "queue", q.name, queueType)
 		}
+	}
 
-		// Add all operations atomically to prevent partial flushes
-		outputBuffer.AddMultiple(atomicOps)
+	// Insert child nodes (Store handles indexes/stats internally)
+	for _, op := range childNodesToInsert {
+		if op.State == nil {
+			continue
+		}
+		if err := storeInstance.RegisterNode(op.QueueType, op.Level, op.Status, op.State); err != nil {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("error", fmt.Sprintf("Failed to insert child node %s: %v", op.State.ID, err), "queue", q.name, op.QueueType)
+			}
+		}
+	}
 
-		// For SRC FOLDER tasks in retry mode: Queue DST cleanup (mark parent as pending, delete children)
-		// Only folders have children to clean up - files don't need this
-		if q.name == "src" && q.getMode() == QueueModeRetry && q.boltDB != nil && task.IsFolder() {
-			dstID, err := db.GetDstIDFromSrcID(q.boltDB, nodeID)
-			if err == nil && dstID != "" {
-				// Get DST node state to determine its depth and current status
-				dstState, err := db.GetNodeState(q.boltDB, "DST", dstID)
-				if err == nil && dstState != nil {
-					// Queue status update to mark DST parent as pending
-					oldStatus := dstState.TraversalStatus
-					if oldStatus == "" {
-						oldStatus = db.StatusSuccessful // Default assumption
+	// For SRC FOLDER tasks in retry mode: Queue DST cleanup (mark parent as pending, delete children)
+	// Only folders have children to clean up - files don't need this
+	// Retry mode DST cleanup: GetJoinMapping, GetChildren, TransitionNodeStatus, and DeleteNode
+	// are available in Store API.
+	if q.name == "src" && q.getMode() == QueueModeRetry && task.IsFolder() {
+		// 1) Lookup corresponding DST node for this SRC folder
+		dstParentID, err := storeInstance.GetJoinMapping("src-to-dst", nodeID)
+		if err != nil {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("error", fmt.Sprintf("Retry DST cleanup: failed to lookup src-to-dst mapping for %s: %v", nodeID, err), "queue", q.name, queueType)
+			}
+		} else if dstParentID != "" {
+			// 2) Load DST parent state for level/status
+			dstParentState, err := storeInstance.GetNode("DST", dstParentID)
+			if err != nil || dstParentState == nil {
+				if logservice.LS != nil {
+					_ = logservice.LS.Log("error", fmt.Sprintf("Retry DST cleanup: failed to load DST parent %s for SRC %s: %v", dstParentID, nodeID, err), "queue", q.name, queueType)
+				}
+			} else {
+				dstLevel := dstParentState.Depth
+
+				// 3) Only apply cleanup when *all* current DST children are marked NotOnSrc
+				childStatesResult, err := storeInstance.GetChildren("DST", dstParentID, "states")
+				childStates, ok := childStatesResult.([]*bolt.NodeState)
+				if err == nil && ok && len(childStates) > 0 {
+					allNotOnSrc := true
+					for _, cs := range childStates {
+						if cs == nil {
+							continue
+						}
+						if cs.TraversalStatus != bolt.StatusNotOnSrc {
+							allNotOnSrc = false
+							break
+						}
 					}
-					outputBuffer.AddStatusUpdate("DST", dstState.Depth, oldStatus, db.StatusPending, dstID)
 
-					// Queue deletion of DST children using batch deletion
-					childIDs, err := db.GetChildrenIDsByParentID(q.boltDB, "DST", dstID)
-					if err == nil && len(childIDs) > 0 {
-						for _, childID := range childIDs {
-							// Get child state to know its depth and status for deletion
-							childState, err := db.GetNodeState(q.boltDB, "DST", childID)
-							if err == nil && childState != nil {
-								childStatus := childState.TraversalStatus
-								if childStatus == "" {
-									childStatus = db.StatusSuccessful
+					if allNotOnSrc {
+						if logservice.LS != nil {
+							_ = logservice.LS.Log("debug",
+								fmt.Sprintf("Retry DST cleanup: resetting DST parent %s (level=%d) to pending and deleting %d child subtree nodes", dstParentID, dstLevel, len(childStates)),
+								"queue", q.name, queueType)
+						}
+
+						// 3a) Delete entire subtree under DST parent (children + descendants), keeping parent itself.
+						visited := make(map[string]struct{}, len(childStates))
+						toDelete := make([]string, 0, len(childStates))
+						stack := make([]string, 0, len(childStates))
+
+						for _, cs := range childStates {
+							if cs == nil || cs.ID == "" {
+								continue
+							}
+							stack = append(stack, cs.ID)
+						}
+
+						for len(stack) > 0 {
+							// pop
+							n := len(stack) - 1
+							curID := stack[n]
+							stack = stack[:n]
+
+							if curID == "" {
+								continue
+							}
+							if _, seen := visited[curID]; seen {
+								continue
+							}
+							visited[curID] = struct{}{}
+							toDelete = append(toDelete, curID)
+
+							// enqueue children
+							childIDsResult, err := storeInstance.GetChildren("DST", curID, "ids")
+							if err != nil {
+								continue
+							}
+							childIDs, ok := childIDsResult.([]string)
+							if !ok || len(childIDs) == 0 {
+								continue
+							}
+							for _, cid := range childIDs {
+								if cid != "" {
+									stack = append(stack, cid)
 								}
-								outputBuffer.AddNodeDeletion("DST", childID, childState.Depth, childStatus)
+							}
+						}
+
+						for _, delID := range toDelete {
+							if err := storeInstance.DeleteNode("DST", delID); err != nil {
+								if logservice.LS != nil {
+									_ = logservice.LS.Log("error", fmt.Sprintf("Retry DST cleanup: failed to delete DST node %s: %v", delID, err), "queue", q.name, queueType)
+								}
+							}
+						}
+
+						// 3b) Mark DST parent as pending so it will be re-traversed.
+						oldStatus := dstParentState.TraversalStatus
+						if oldStatus == "" {
+							oldStatus = bolt.StatusSuccessful
+						}
+						if oldStatus != bolt.StatusPending {
+							if err := storeInstance.TransitionNodeStatus("DST", dstLevel, oldStatus, bolt.StatusPending, dstParentID); err != nil {
+								if logservice.LS != nil {
+									_ = logservice.LS.Log("error", fmt.Sprintf("Retry DST cleanup: failed to transition DST parent %s status %s->pending: %v", dstParentID, oldStatus, err), "queue", q.name, queueType)
+								}
 							}
 						}
 					}
@@ -828,7 +869,6 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		}
 	}
 
-	// CRITICAL: Remove from in-progress LAST, after all buffer operations are queued.
 	// This prevents the Run() polling loop from seeing inProgressCount == 0 before
 	// the buffer operations are flushed, which could cause premature round advancement.
 	q.removeInProgress(nodeID)
@@ -855,20 +895,19 @@ func (q *Queue) completeExclusionTask(task *TaskBase) {
 	// Record task completion in RoundInfo
 	q.recordTaskCompletion(currentRound, true)
 
-	// CRITICAL: Remove from in-progress LAST, after all operations are complete.
 	// Even though exclusion workers handle buffer operations, we still want to ensure
 	// the Run() polling loop doesn't see inProgressCount == 0 prematurely.
 	q.removeInProgress(nodeID)
 }
 
 // childResultToNodeStateWithID converts a ChildResult to NodeState, reusing existing ULID if provided.
-func childResultToNodeStateWithID(child ChildResult, parentPath string, depth int, queueType string, parentID string, existingULID string, useExisting bool) *db.NodeState {
+func childResultToNodeStateWithID(child ChildResult, parentPath string, depth int, queueType string, parentID string, existingULID string, useExisting bool) *bolt.NodeState {
 	// Use existing ULID if provided, otherwise generate new one
 	var nodeID string
 	if useExisting && existingULID != "" {
 		nodeID = existingULID
 	} else {
-		nodeID = db.GenerateNodeID()
+		nodeID = utils.GenerateULID()
 		if nodeID == "" {
 			// If ULID generation fails, we can't proceed
 			return nil
@@ -884,7 +923,7 @@ func childResultToNodeStateWithID(child ChildResult, parentPath string, depth in
 
 	if child.IsFile {
 		file := child.File
-		return &db.NodeState{
+		return &bolt.NodeState{
 			ID:              nodeID,         // ULID for database keys (reused if exists)
 			ServiceID:       file.ServiceID, // FS identifier
 			ParentID:        parentID,       // Parent's ULID for database relationships
@@ -903,7 +942,7 @@ func childResultToNodeStateWithID(child ChildResult, parentPath string, depth in
 	}
 
 	folder := child.Folder
-	return &db.NodeState{
+	return &bolt.NodeState{
 		ID:              nodeID,           // ULID for database keys (reused if exists)
 		ServiceID:       folder.ServiceID, // FS identifier
 		ParentID:        parentID,         // Parent's ULID for database relationships
@@ -922,10 +961,6 @@ func childResultToNodeStateWithID(child ChildResult, parentPath string, depth in
 }
 
 func (q *Queue) PullTasksIfNeeded(force bool) {
-	boltDB := q.getBoltDB()
-	if boltDB == nil {
-		return
-	}
 
 	// Don't pull if queue is paused or completed (waiting doesn't block pulls - rounds continue once started)
 	state := q.getState()
@@ -933,7 +968,6 @@ func (q *Queue) PullTasksIfNeeded(force bool) {
 		return
 	}
 
-	// Note: firstPullForRound will be set to false in PullTasks() after successful pull
 	// We don't set it here because we need to know if it was the first pull when checking completion
 
 	if force {
@@ -972,21 +1006,9 @@ func (q *Queue) pullTasksForMode(force bool) {
 // - PullExclusionTasks: mode_exclusion.go
 // - PullRetryTasks: mode_retry.go
 
-// enqueuePendingLocked and dequeuePendingLocked are now replaced by enqueuePending and dequeuePending
-// which use getters/setters internally. These functions are kept for backward compatibility
-// but should not be used directly - use enqueuePending and dequeuePending instead.
-
-// Fail is a public wrapper for backward compatibility.
-// New code should use ReportTaskResult instead.
+// Fail is a convenience method that calls ReportTaskResult.
+// New code should use ReportTaskResult directly.
 // Returns true if the task will be retried, false if max retries exceeded.
-func (q *Queue) Fail(task *TaskBase) bool {
-	q.ReportTaskResult(task, TaskExecutionResultFailed)
-	// Check if task was retried by checking if it's still in pending
-	nodeID := task.ID
-	willRetry := q.isInPendingSet(nodeID)
-	return willRetry
-}
-
 // failTask is the internal implementation for failed task handling.
 func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
 	// Record execution time delta (even for failures)
@@ -1043,10 +1065,9 @@ func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
 	q.recordTaskCompletion(currentRound, false)
 
 	// Update traversal status to failed so leasing stops retrying this node.
-	outputBuffer := q.getOutputBuffer()
-	if nodeID != "" && outputBuffer != nil {
+	if nodeID != "" {
 		queueType := getQueueType(q.name)
-		outputBuffer.AddStatusUpdate(queueType, currentRound, db.StatusPending, db.StatusFailed, nodeID)
+		queueStatusUpdate(q.getStore(), queueType, currentRound, bolt.StatusPending, bolt.StatusFailed, nodeID)
 	}
 
 	// CRITICAL: Remove from in-progress LAST, after all buffer operations are queued.
@@ -1216,10 +1237,9 @@ func (q *Queue) Close() {
 	// Quick check - if already completed, nothing to do (queues clean themselves up)
 	state := q.getState()
 	hasStatsTick := q.getStatsTick() != nil
-	outputBuffer := q.getOutputBuffer()
 
 	if state == QueueStateCompleted {
-		// Still need to clean up stats ticker and buffer if they exist
+		// Still need to clean up stats ticker if it exists
 		if hasStatsTick {
 			statsTick := q.getStatsTick()
 			if statsTick != nil {
@@ -1227,10 +1247,6 @@ func (q *Queue) Close() {
 				q.setStatsTick(nil)
 			}
 			q.setStatsChan(nil)
-		}
-		// Ensure buffer is stopped
-		if outputBuffer != nil {
-			outputBuffer.Stop()
 		}
 		return
 	}
@@ -1242,14 +1258,15 @@ func (q *Queue) Close() {
 		q.setStatsTick(nil)
 	}
 	q.setStatsChan(nil)
-	closeOutputBuffer := q.getOutputBuffer()
 	if state != QueueStateCompleted && state != QueueStateStopped {
 		q.setState(QueueStateStopped)
 	}
 
-	// Ensure buffer is stopped and flushed
-	if closeOutputBuffer != nil {
-		closeOutputBuffer.Stop()
+	// NOTE: No buffer stop/flush needed - Store API handles cleanup internally
+	// Use semantic barrier to ensure final writes are persisted
+	storeInstance := q.getStore()
+	if storeInstance != nil {
+		_ = storeInstance.Barrier(store.BarrierPhaseTransition)
 	}
 }
 
@@ -1344,12 +1361,6 @@ func (q *Queue) Run() {
 		}
 
 		state := q.getState()
-		boltDB := q.getBoltDB()
-
-		if boltDB == nil {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
 
 		// If queue is completed or stopped, exit
 		if state == QueueStateCompleted || state == QueueStateStopped {
@@ -1358,11 +1369,6 @@ func (q *Queue) Run() {
 				_ = logservice.LS.Log("info",
 					fmt.Sprintf("Run() exiting - queue %s (round %d)", state, currentRound),
 					"queue", q.name, q.name)
-			}
-			// Stop output buffer when queue completes to prevent goroutine leak
-			outputBuffer := q.getOutputBuffer()
-			if outputBuffer != nil {
-				outputBuffer.Stop()
 			}
 			return
 		}
@@ -1415,10 +1421,6 @@ func (q *Queue) Run() {
 
 			// If stopped or completed, exit
 			if innerState == QueueStateStopped || innerState == QueueStateCompleted {
-				outputBuffer := q.getOutputBuffer()
-				if outputBuffer != nil {
-					outputBuffer.Stop()
-				}
 				return
 			}
 
@@ -1439,10 +1441,6 @@ func (q *Queue) Run() {
 					FlushBuffer:          true,
 				})
 				if completed {
-					outputBuffer := q.getOutputBuffer()
-					if outputBuffer != nil {
-						outputBuffer.Stop()
-					}
 					return
 				}
 			}
@@ -1468,14 +1466,15 @@ func (q *Queue) Run() {
 }
 
 // advanceToNextRound advances the queue to the next round and cleans up old round queues.
-// Note: Round advancement is now free - gating only happens when STARTING a round (checked in Run()).
 func (q *Queue) advanceToNextRound() {
 	// No gating here - rounds advance freely
 	// Gating only happens when STARTING a round (checked in Run() outer loop)
 
-	outputBuffer := q.getOutputBuffer()
-	if outputBuffer != nil {
-		outputBuffer.Flush()
+	// Use semantic barrier before advancing rounds
+	// Ensures all writes from current round are persisted
+	storeInstance := q.getStore()
+	if storeInstance != nil {
+		_ = storeInstance.Barrier(store.BarrierRoundAdvance)
 	}
 
 	// Ensure state is running if it was waiting

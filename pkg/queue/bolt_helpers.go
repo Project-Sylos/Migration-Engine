@@ -4,13 +4,14 @@
 package queue
 
 import (
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"github.com/Project-Sylos/Sylos-DB/pkg/utils"
+	"github.com/Project-Sylos/Sylos-DB/pkg/bolt"
 	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
 // taskToNodeState converts a TaskBase to a NodeState for BoltDB storage.
 // Uses existing ULID from task.ID if present, otherwise generates a new one.
-func taskToNodeState(task *TaskBase) *db.NodeState {
+func taskToNodeState(task *TaskBase) *bolt.NodeState {
 	var serviceID, parentServiceID, name, path, parentPath, nodeType string
 	var size int64
 	var mtime string
@@ -43,14 +44,14 @@ func taskToNodeState(task *TaskBase) *db.NodeState {
 	// Use existing ULID if present, otherwise generate a new one
 	nodeID := task.ID
 	if nodeID == "" {
-		nodeID = db.GenerateNodeID()
+		nodeID = utils.GenerateULID()
 		if nodeID == "" {
 			// If ULID generation fails, return nil
 			return nil
 		}
 	}
 
-	return &db.NodeState{
+	return &bolt.NodeState{
 		ID:              nodeID,          // ULID for database keys
 		ServiceID:       serviceID,       // FS identifier for FS interactions
 		ParentID:        "",              // Will be looked up by parent path if needed
@@ -70,7 +71,7 @@ func taskToNodeState(task *TaskBase) *db.NodeState {
 // Note: This reconstructs the task but doesn't restore DiscoveredChildren or ExpectedFolders/Files.
 // Those need to be populated separately if needed.
 // Preserves the ULID from NodeState for internal tracking.
-func nodeStateToTask(state *db.NodeState, taskType string) *TaskBase {
+func nodeStateToTask(state *bolt.NodeState, taskType string) *TaskBase {
 	task := &TaskBase{
 		ID:    state.ID, // Preserve ULID for internal tracking
 		Type:  taskType,

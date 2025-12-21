@@ -6,19 +6,19 @@ package queue
 import (
 	"fmt"
 
-	bolt "go.etcd.io/bbolt"
-
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
+	"github.com/Project-Sylos/Sylos-DB/pkg/bolt"
 	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
+
+// Exclusion pulling uses Store holding-bucket APIs and NodeState.TraversalStatus as the source of truth.
 
 // PullExclusionTasks pulls exclusion tasks from the exclusion-holding bucket for the current round.
 // Scans the bucket O(n) and filters by current round level. Breaks when finding first node with level > current round.
 // Uses getter/setter methods - no direct mutex access.
 func (q *Queue) PullExclusionTasks(force bool) {
-	boltDB := q.getBoltDB()
-	if boltDB == nil {
+	storeInstance := q.getStore()
+	if storeInstance == nil {
 		return
 	}
 
@@ -31,18 +31,12 @@ func (q *Queue) PullExclusionTasks(force bool) {
 		return
 	}
 
-	// Set pulling flag and get output buffer
+	// Set pulling flag
 	q.setPulling(true)
-	outputBuffer := q.getOutputBuffer()
 
 	defer func() {
 		q.setPulling(false)
 	}()
-
-	// Force-flush buffer before pulling tasks
-	if outputBuffer != nil {
-		outputBuffer.Flush()
-	}
 
 	queueType := getQueueType(q.name)
 
@@ -60,7 +54,7 @@ func (q *Queue) PullExclusionTasks(force bool) {
 	}
 
 	// Scan exclusion-holding bucket for current round
-	entries, _, err := db.ScanExclusionHoldingBucketByLevel(boltDB, queueType, snapshot.Round, defaultLeaseBatchSize)
+	entries, _, err := storeInstance.ScanExclusionHoldingAtLevel(queueType, snapshot.Round, defaultLeaseBatchSize)
 	if err != nil {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to scan exclusion-holding bucket: %v", err), "queue", q.name, q.name)
@@ -90,7 +84,7 @@ func (q *Queue) PullExclusionTasks(force bool) {
 		q.addLeasedKey(entry.NodeID)
 
 		// Get node state to determine exclusion mode
-		nodeState, err := db.GetNodeState(boltDB, queueType, entry.NodeID)
+		nodeState, err := storeInstance.GetNode(queueType, entry.NodeID)
 		if err != nil || nodeState == nil {
 			if logservice.LS != nil {
 				_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to get node state for exclusion task %s: %v - removing from holding bucket", entry.NodeID, err), "queue", q.name, q.name)
@@ -116,34 +110,18 @@ func (q *Queue) PullExclusionTasks(force bool) {
 			}
 		}
 
-		// Query status-lookup bucket to get current status (for moving between status buckets)
-		previousStatus := db.StatusPending // Default to pending if not found
-		_ = boltDB.View(func(tx *bolt.Tx) error {
-			lookupBucket := db.GetStatusLookupBucket(tx, queueType, nodeState.Depth)
-			if lookupBucket != nil {
-				statusBytes := lookupBucket.Get([]byte(entry.NodeID))
-				if statusBytes != nil {
-					previousStatus = string(statusBytes)
-				}
-			}
-			return nil
-		})
+		// Use NodeState.TraversalStatus as the authoritative previous status.
+		previousStatus := nodeState.TraversalStatus
+		if previousStatus == "" {
+			previousStatus = bolt.StatusPending
+		}
 
 		// For unexclusion tasks, verify the node is actually in the excluded status bucket
 		// (mirroring how exclusion verifies nodes are in their previous status bucket)
 		if exclusionMode == "unexclude" {
-			var isInExcludedBucket bool
-			_ = boltDB.View(func(tx *bolt.Tx) error {
-				excludedBucket := db.GetStatusBucket(tx, queueType, nodeState.Depth, db.StatusExcluded)
-				if excludedBucket != nil {
-					isInExcludedBucket = excludedBucket.Get([]byte(entry.NodeID)) != nil
-				}
-				return nil
-			})
-
-			// If node is not in excluded bucket, skip it (may have been processed already)
+			// If node is not excluded, skip it (may have been processed already)
 			// Remove from holding bucket to prevent infinite retries
-			if !isInExcludedBucket {
+			if nodeState.TraversalStatus != bolt.StatusExcluded {
 				if logservice.LS != nil {
 					_ = logservice.LS.Log("debug", fmt.Sprintf("Skipping unexclusion task %s: not in excluded status bucket - removing from holding bucket", entry.NodeID), "queue", q.name, q.name)
 				}
@@ -156,9 +134,7 @@ func (q *Queue) PullExclusionTasks(force bool) {
 			}
 
 			// Ensure PreviousStatus is set to excluded for unexclusion tasks
-			if previousStatus != db.StatusExcluded {
-				previousStatus = db.StatusExcluded
-			}
+			previousStatus = bolt.StatusExcluded
 		}
 
 		// Convert to task
@@ -215,7 +191,7 @@ func (q *Queue) PullExclusionTasks(force bool) {
 			_ = logservice.LS.Log("debug", fmt.Sprintf("Removing %d entries from holding buckets (Round %d)", len(nodeIDsToRemove), snapshot.Round), "queue", q.name, q.name)
 		}
 		for _, entryToRemove := range nodeIDsToRemove {
-			if err := db.RemoveHoldingEntry(boltDB, queueType, entryToRemove.nodeID, entryToRemove.mode); err != nil {
+			if err := storeInstance.RemoveHoldingEntry(queueType, entryToRemove.nodeID, entryToRemove.mode); err != nil {
 				if logservice.LS != nil {
 					_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to remove holding entry %s from %s bucket: %v", entryToRemove.nodeID, entryToRemove.mode, err), "queue", q.name, q.name)
 				}
