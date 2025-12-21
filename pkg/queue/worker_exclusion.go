@@ -157,7 +157,10 @@ func (w *ExclusionWorker) executeExclude(task *TaskBase, childIDs []string, queu
 		// Files should be handled by executeFileExclusion, not here
 		// If we somehow get here, it means a file was in the exclusion-holding bucket
 		// This shouldn't happen, but if it does, mark it as inherited excluded
-		queueExclusionUpdate(w.store, queueType, task.ID, true) // inherited_excluded = true
+		err := w.store.MarkExcluded(queueType, task.ID, true) // inherited_excluded = true
+		if err != nil {
+			return fmt.Errorf("failed to mark node as excluded: %w", err)
+		}
 		task.DiscoveredChildren = make([]ChildResult, 0)
 		return nil
 	}
@@ -173,11 +176,17 @@ func (w *ExclusionWorker) executeExclude(task *TaskBase, childIDs []string, queu
 
 	// Only mark as inherited excluded if not already explicitly excluded
 	if !parentExplicitlyExcluded {
-		queueExclusionUpdate(w.store, queueType, task.ID, true) // inherited_excluded = true
+		err := w.store.MarkExcluded(queueType, task.ID, true) // inherited_excluded = true
+		if err != nil {
+			return fmt.Errorf("failed to mark node as excluded: %w", err)
+		}
 
 		// Move node from previous status bucket to excluded status bucket
 		if task.PreviousStatus != "" && task.PreviousStatus != bolt.StatusExcluded {
-			queueStatusUpdate(w.store, queueType, nodeState.Depth, task.PreviousStatus, bolt.StatusExcluded, task.ID)
+			err := w.store.TransitionNodeStatus(queueType, nodeState.Depth, task.PreviousStatus, bolt.StatusExcluded, task.ID)
+			if err != nil {
+				return fmt.Errorf("failed to update status: %w", err)
+			}
 		}
 	}
 
@@ -235,11 +244,17 @@ func (w *ExclusionWorker) executeUnexclude(task *TaskBase, nodeID string, childI
 		}
 
 		if !hasExcludedAncestor {
-			queueExclusionUpdate(w.store, queueType, task.ID, false) // inherited_excluded = false
+			err := w.store.MarkExcluded(queueType, task.ID, false) // inherited_excluded = false
+			if err != nil {
+				return fmt.Errorf("failed to mark node as excluded: %w", err)
+			}
 
 			// Move from excluded status back to successful (unconditional for unexclusion tasks)
 			// We've already verified the node is in excluded bucket during pull
-			queueStatusUpdate(w.store, queueType, nodeState.Depth, bolt.StatusExcluded, bolt.StatusSuccessful, task.ID)
+			err = w.store.TransitionNodeStatus(queueType, nodeState.Depth, bolt.StatusExcluded, bolt.StatusSuccessful, task.ID)
+			if err != nil {
+				return fmt.Errorf("failed to update status: %w", err)
+			}
 		}
 
 		task.DiscoveredChildren = make([]ChildResult, 0)
@@ -260,11 +275,17 @@ func (w *ExclusionWorker) executeUnexclude(task *TaskBase, nodeID string, childI
 
 	// Step 2: Mark the parent node as inherited excluded = false (if no excluded ancestor)
 	if !hasExcludedAncestor {
-		queueExclusionUpdate(w.store, queueType, task.ID, false) // inherited_excluded = false
+		err := w.store.MarkExcluded(queueType, task.ID, false) // inherited_excluded = false
+		if err != nil {
+			return fmt.Errorf("failed to mark node as excluded: %w", err)
+		}
 
 		// Move from excluded status back to successful (unconditional for unexclusion tasks)
 		// We've already verified the node is in excluded bucket during pull
-		queueStatusUpdate(w.store, queueType, nodeState.Depth, bolt.StatusExcluded, bolt.StatusSuccessful, task.ID)
+		err = w.store.TransitionNodeStatus(queueType, nodeState.Depth, bolt.StatusExcluded, bolt.StatusSuccessful, task.ID)
+		if err != nil {
+			return fmt.Errorf("failed to update status: %w", err)
+		}
 	}
 
 	if hasExcludedAncestor {
@@ -333,18 +354,27 @@ func (w *ExclusionWorker) executeFileExclusion(task *TaskBase) error {
 
 	// Queue write op to update file exclusion state
 	inheritedExcluded := (task.ExclusionMode == "exclude")
-	queueExclusionUpdate(w.store, queueType, nodeID, inheritedExcluded)
+	err := w.store.MarkExcluded(queueType, nodeID, inheritedExcluded)
+	if err != nil {
+		return fmt.Errorf("failed to mark node as excluded: %w", err)
+	}
 
 	// Move node from previous status bucket to excluded status bucket (or back from excluded)
 	nodeState, _ := w.store.GetNode(queueType, nodeID)
 	if nodeState != nil {
 		if task.ExclusionMode == "exclude" && task.PreviousStatus != "" && task.PreviousStatus != bolt.StatusExcluded {
 			// Moving to excluded status
-			queueStatusUpdate(w.store, queueType, nodeState.Depth, task.PreviousStatus, bolt.StatusExcluded, nodeID)
+			err := w.store.TransitionNodeStatus(queueType, nodeState.Depth, task.PreviousStatus, bolt.StatusExcluded, nodeID)
+			if err != nil {
+				return fmt.Errorf("failed to update status: %w", err)
+			}
 		} else if task.ExclusionMode == "unexclude" {
 			// Moving back from excluded to successful (unconditional for unexclusion tasks)
 			// We've already verified the node is in excluded bucket during pull
-			queueStatusUpdate(w.store, queueType, nodeState.Depth, bolt.StatusExcluded, bolt.StatusSuccessful, nodeID)
+			err := w.store.TransitionNodeStatus(queueType, nodeState.Depth, bolt.StatusExcluded, bolt.StatusSuccessful, nodeID)
+			if err != nil {
+				return fmt.Errorf("failed to update status: %w", err)
+			}
 		}
 	}
 

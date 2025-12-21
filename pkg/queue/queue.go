@@ -579,6 +579,10 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 	// Prepare child nodes for insertion
 	parentPath := types.NormalizeLocationPath(task.LocationPath())
 	var childNodesToInsert []bolt.InsertOperation
+	// Collect mappings to commit atomically with traversal results.
+	// This avoids per-child Store calls (SetPathMapping / SetJoinMapping).
+	pathMappings := make(map[string]string, len(task.DiscoveredChildren))
+	joinMappings := make(map[string]string)
 
 	// Log folder discovery with details
 	if logservice.LS != nil {
@@ -615,8 +619,10 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 
 	// 3. Collect discovered children for insertion
 	for _, child := range task.DiscoveredChildren {
-		// For DST queues, skip folder children here - they'll be handled separately
-		if queueType == "DST" && !child.IsFile {
+		// For DST queues, only skip *pending folder* children here - they'll be handled separately
+		// so we can create proper traversal tasks. Non-pending folders (e.g., NotOnSrc) should still
+		// be recorded in the DB for reporting, but not traversed.
+		if queueType == "DST" && !child.IsFile && child.Status == bolt.StatusPending {
 			continue
 		}
 
@@ -646,15 +652,13 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 			State:     childState,
 		})
 
-		// Queue path-to-ulid mapping for this child (for API path-based queries)
-		if childState.Path != "" {
-			queuePathToULIDMapping(q.getStore(), queueType, childState.Path, childState.ID)
+		// Record path mapping for commit (path -> ULID)
+		if childState.Path != "" && childState.ID != "" {
+			pathMappings[childState.Path] = childState.ID
 		}
-
-		// For DST queue: queue lookup mapping if this child has a matching SRC node
-		if queueType == "DST" && child.SrcID != "" {
-			// Queue bidirectional lookup mapping: SrcID <-> DST node ID
-			queueLookupMapping(q.getStore(), child.SrcID, childState.ID)
+		// Record join mapping for commit (src ULID -> dst ULID)
+		if queueType == "DST" && child.SrcID != "" && childState.ID != "" {
+			joinMappings[child.SrcID] = childState.ID
 		}
 
 		// Increment expected count for folder children (only folders need traversal)
@@ -708,6 +712,8 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 				taskState.ParentID = nodeID
 				// Populate traversal status in the NodeState metadata
 				taskState.TraversalStatus = bolt.StatusPending
+				// CommitTraversalTask relies on NodeState.Status for status bucket placement.
+				taskState.Status = bolt.StatusPending
 				// Store SrcID in NodeState temporarily for BatchInsertNodes to create lookup mappings
 				// (BatchInsertNodes will handle storing in lookup tables)
 				if child.srcID != "" {
@@ -721,15 +727,13 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 					State:     taskState,
 				})
 
-				// Queue path-to-ulid mapping for DST child folder (for API path-based queries)
-				if taskState.Path != "" {
-					queuePathToULIDMapping(q.getStore(), queueType, taskState.Path, taskState.ID)
+				// Record path mapping for commit (path -> ULID)
+				if taskState.Path != "" && taskState.ID != "" {
+					pathMappings[taskState.Path] = taskState.ID
 				}
-
-				// Queue lookup mapping if this child has a matching SRC node
-				if child.srcID != "" {
-					// Queue bidirectional lookup mapping: SrcID <-> DST node ID
-					queueLookupMapping(q.getStore(), child.srcID, taskState.ID)
+				// Record join mapping for commit (src ULID -> dst ULID)
+				if child.srcID != "" && taskState.ID != "" {
+					joinMappings[child.srcID] = taskState.ID
 				}
 
 				q.incrementRoundStatsExpected(nextRound)
@@ -738,22 +742,37 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		}
 	}
 
-	// Update status + insert children using Store domain verbs (no direct Bolt transactions).
-	if err := storeInstance.TransitionNodeStatus(queueType, currentRound, bolt.StatusPending, bolt.StatusSuccessful, nodeID); err != nil {
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to update parent status: %v", err), "queue", q.name, queueType)
-		}
-	}
-
-	// Insert child nodes (Store handles indexes/stats internally)
+	children := make([]*bolt.NodeState, 0, len(childNodesToInsert))
 	for _, op := range childNodesToInsert {
 		if op.State == nil {
 			continue
 		}
-		if err := storeInstance.RegisterNode(op.QueueType, op.Level, op.Status, op.State); err != nil {
-			if logservice.LS != nil {
-				_ = logservice.LS.Log("error", fmt.Sprintf("Failed to insert child node %s: %v", op.State.ID, err), "queue", q.name, op.QueueType)
-			}
+		// Ensure NodeState.Status is populated (CommitTraversalTask uses it for status buckets).
+		if op.State.Status == "" && op.Status != "" {
+			op.State.Status = op.Status
+		}
+		children = append(children, op.State)
+	}
+	var jm map[string]string
+	if len(joinMappings) > 0 {
+		jm = joinMappings
+	}
+	var pm map[string]string
+	if len(pathMappings) > 0 {
+		pm = pathMappings
+	}
+	if err := storeInstance.CommitTraversalTask(&store.TraversalTaskResult{
+		ParentID:     nodeID,
+		OldStatus:    bolt.StatusPending,
+		NewStatus:    bolt.StatusSuccessful,
+		Children:     children,
+		QueueType:    queueType,
+		Level:        currentRound, // parent level
+		JoinMappings: jm,
+		PathMappings: pm,
+	}); err != nil {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to commit traversal task: %v", err), "queue", q.name, queueType)
 		}
 	}
 
@@ -1067,10 +1086,17 @@ func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
 	// Update traversal status to failed so leasing stops retrying this node.
 	if nodeID != "" {
 		queueType := getQueueType(q.name)
-		queueStatusUpdate(q.getStore(), queueType, currentRound, bolt.StatusPending, bolt.StatusFailed, nodeID)
+		storeInstance := q.getStore()
+		if storeInstance != nil {
+			err := storeInstance.TransitionNodeStatus(queueType, currentRound, bolt.StatusPending, bolt.StatusFailed, nodeID)
+			if err != nil {
+				if logservice.LS != nil {
+					_ = logservice.LS.Log("error", fmt.Sprintf("Failed to update traversal status to failed: %v", err), "queue", q.name, q.name)
+				}
+			}
+		}
 	}
 
-	// CRITICAL: Remove from in-progress LAST, after all buffer operations are queued.
 	// This prevents the Run() polling loop from seeing inProgressCount == 0 before
 	// the buffer operations are flushed, which could cause premature round advancement.
 	q.removeInProgress(nodeID)
@@ -1103,7 +1129,6 @@ func (q *Queue) Clear() {
 }
 
 // Shutdown gracefully shuts down the queue.
-// No buffer to stop - all writes are direct/synchronous now.
 // SetStatsChannel sets the channel for publishing queue statistics for UDP logging.
 // The queue will periodically publish stats to this channel.
 func (q *Queue) SetStatsChannel(ch chan QueueStats) {
