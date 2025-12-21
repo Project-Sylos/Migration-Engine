@@ -225,5 +225,8 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 		WithServices(srcAdapter, dstAdapter, "Local-Src", "Local-Dst").
 		WithRoots(srcRoot, dstRoot)
 
+	// override verification to allow not on src
+	cfg.Verification.AllowNotOnSrc = true
+
 	return *cfg, nil
 }

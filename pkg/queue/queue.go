@@ -298,6 +298,7 @@ func (q *Queue) Lease() *TaskBase {
 			task.Locked = true
 			task.LeaseTime = time.Now() // Record lease time for execution tracking
 			q.addInProgress(nodeID, task)
+			q.addLeasedKey(nodeID)
 			return task
 		}
 
@@ -417,6 +418,18 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 		// Round is complete if: no in-progress, no pending, and last pull was partial
 		if inProgressCount > 0 || pendingBuffCount > 0 || !lastPullWasPartial {
 			return false
+		}
+
+		storeInstance := q.getStore()
+		queueType := getQueueType(q.name)
+		if storeInstance != nil {
+			hasPending, err := storeInstance.HasPendingAtLevel(queueType, currentRound)
+			if err != nil {
+				return false
+			}
+			if hasPending {
+				return false
+			}
 		}
 
 		// Round is complete - advance if requested
@@ -1100,6 +1113,7 @@ func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
 	// This prevents the Run() polling loop from seeing inProgressCount == 0 before
 	// the buffer operations are flushed, which could cause premature round advancement.
 	q.removeInProgress(nodeID)
+	q.removeLeasedKey(nodeID)
 }
 
 // InProgressCount returns the number of tasks currently being executed.
