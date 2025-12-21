@@ -26,10 +26,6 @@ func PrintVerification(result migration.Result) {
 		report.DstFailed,
 	)
 
-	if report.DstNotOnSrc > 0 {
-		fmt.Printf("⚠ Warning: %d dst nodes marked as NotOnSrc\n", report.DstNotOnSrc)
-	}
-
 	fmt.Println()
 	fmt.Println("✓ All verification checks passed!")
 	fmt.Printf("✓ Successfully migrated %d nodes\n", report.SrcTotal)
