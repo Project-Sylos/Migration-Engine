@@ -6,7 +6,7 @@ package migration
 import (
 	"fmt"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"github.com/Project-Sylos/Sylos-DB/pkg/store"
 )
 
 // MigrationStatus summarizes the current state of a migration in the database.
@@ -47,85 +47,36 @@ func (s MigrationStatus) IsComplete() bool {
 	return !s.HasPending()
 }
 
-// InspectMigrationStatus inspects the BoltDB node data and returns a MigrationStatus.
-func InspectMigrationStatus(boltDB *db.DB) (MigrationStatus, error) {
-	if boltDB == nil {
-		return MigrationStatus{}, fmt.Errorf("boltDB cannot be nil")
+// InspectMigrationStatus inspects the Store and returns a MigrationStatus.
+func InspectMigrationStatus(storeInstance *store.Store) (MigrationStatus, error) {
+	if storeInstance == nil {
+		return MigrationStatus{}, fmt.Errorf("storeInstance cannot be nil")
 	}
 
-	status := MigrationStatus{}
-
-	// Count all src nodes
-	srcTotal, err := boltDB.CountNodes("SRC")
+	dbReport, err := storeInstance.InspectDatabase(store.InspectionModeStats)
 	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to count src nodes: %w", err)
-	}
-	status.SrcTotal = srcTotal
-
-	// Count all dst nodes
-	dstTotal, err := boltDB.CountNodes("DST")
-	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to count dst nodes: %w", err)
-	}
-	status.DstTotal = dstTotal
-
-	// Count pending and failed nodes for src across all levels
-	srcLevels, err := boltDB.GetAllLevels("SRC")
-	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to get src levels: %w", err)
+		return MigrationStatus{}, err
 	}
 
-	var srcPendingCount, srcFailedCount int
-	var minSrcDepth *int
+	status := MigrationStatus{
+		SrcTotal: dbReport.Src.TotalNodes,
+		DstTotal: dbReport.Dst.TotalNodes,
 
-	for _, level := range srcLevels {
-		pendingCount, err := boltDB.CountStatusBucket("SRC", level, db.StatusPending)
-		if err == nil {
-			srcPendingCount += pendingCount
-			if pendingCount > 0 && (minSrcDepth == nil || level < *minSrcDepth) {
-				d := level
-				minSrcDepth = &d
-			}
-		}
+		SrcPending: dbReport.Src.TotalPending,
+		DstPending: dbReport.Dst.TotalPending,
 
-		failedCount, err := boltDB.CountStatusBucket("SRC", level, db.StatusFailed)
-		if err == nil {
-			srcFailedCount += failedCount
-		}
+		SrcFailed: dbReport.Src.TotalFailed,
+		DstFailed: dbReport.Dst.TotalFailed,
+
+		MinPendingDepthSrc: dbReport.Src.MinPendingLevel,
+		MinPendingDepthDst: dbReport.Dst.MinPendingLevel,
 	}
 
-	status.SrcPending = srcPendingCount
-	status.SrcFailed = srcFailedCount
-	status.MinPendingDepthSrc = minSrcDepth
-
-	// Count pending and failed nodes for dst across all levels
-	dstLevels, err := boltDB.GetAllLevels("DST")
-	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to get dst levels: %w", err)
+	// Optional: treat "not_on_src" as a failure signal for DST in UI/status reporting.
+	// (We keep it separate in VerifyMigration where it is explicitly reported.)
+	if status.DstFailed == 0 && dbReport.Dst.TotalNotOnSrc > 0 {
+		status.DstFailed = dbReport.Dst.TotalNotOnSrc
 	}
-
-	var dstPendingCount, dstFailedCount int
-	var minDstDepth *int
-
-	for _, level := range dstLevels {
-		pendingCount, err := boltDB.CountStatusBucket("DST", level, db.StatusPending)
-		if err == nil {
-			dstPendingCount += pendingCount
-			if pendingCount > 0 && (minDstDepth == nil || level < *minDstDepth) {
-				d := level
-				minDstDepth = &d
-			}
-		}
-
-		failedCount, err := boltDB.CountStatusBucket("DST", level, db.StatusFailed)
-		if err == nil {
-			dstFailedCount += failedCount
-		}
-	}
-
-	status.DstPending = dstPendingCount
-	status.DstFailed = dstFailedCount
-	status.MinPendingDepthDst = minDstDepth
 
 	return status, nil
 }

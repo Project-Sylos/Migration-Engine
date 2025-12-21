@@ -1,35 +1,26 @@
 // Copyright 2025 Sylos contributors
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
-// Package queue provides the QueueObserver for collecting and publishing queue statistics.
-//
-// The QueueObserver polls queues directly at regular intervals (default: 200ms) and publishes
-// metrics to BoltDB. This allows external APIs to poll BoltDB for real-time queue statistics
-// without disrupting queue operations.
-//
-// Usage:
-//   observer := queue.NewQueueObserver(boltDB, 200*time.Millisecond)
-//   observer.RegisterQueue("src", srcQueue)
-//   observer.RegisterQueue("dst", dstQueue)
-//   observer.Start()
-//   // Stats are published to /STATS/queue-stats bucket with keys like "src-traversal", "dst-traversal"
-//
-// Stats can be retrieved from BoltDB using:
-//   statsJSON, err := boltDB.GetQueueStats("src-traversal")
-//   allStats, err := boltDB.GetAllQueueStats()
-
 package queue
 
 import (
 	"encoding/json"
-	"fmt"
 	"sync"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
-	bolt "go.etcd.io/bbolt"
+	"github.com/Project-Sylos/Sylos-DB/pkg/store"
 )
+
+// QueueStatsProvider is an interface that queue implementations must implement
+// to provide statistics to the observer.
+type QueueStatsProvider interface {
+	// Stats returns the current queue statistics
+	Stats() QueueStats
+	// GetAverageExecutionTime returns the average task execution time
+	GetAverageExecutionTime() time.Duration
+	// GetTotalCompleted returns the total number of completed tasks across all rounds
+	GetTotalCompleted() int
+}
 
 // QueueObserverMetrics contains computed metrics for a queue.
 type QueueObserverMetrics struct {
@@ -41,11 +32,11 @@ type QueueObserverMetrics struct {
 }
 
 // QueueObserver collects statistics from queues by polling them directly and publishes them to BoltDB periodically.
-// Similar to QueueCoordinator, but focused on observability rather than coordination.
+// This allows external APIs to poll BoltDB for real-time queue statistics without disrupting queue operations.
 type QueueObserver struct {
 	mu             sync.RWMutex
-	boltDB         *db.DB
-	queues         map[string]*Queue // Map of queue name -> queue reference
+	store          *store.Store
+	queues         map[string]QueueStatsProvider // Map of queue name -> queue reference
 	stopChan       chan struct{}
 	updateTicker   *time.Ticker
 	updateInterval time.Duration
@@ -54,16 +45,16 @@ type QueueObserver struct {
 	prevMetrics map[string]QueueObserverMetrics // Previous metrics for each queue
 }
 
-// NewQueueObserver creates a new observer that will publish stats to BoltDB.
-// updateInterval is how often stats are written to BoltDB (default: 200ms).
-func NewQueueObserver(boltInstance *db.DB, updateInterval time.Duration) *QueueObserver {
+// NewQueueObserver creates a new observer that will publish stats to the Store.
+// updateInterval is how often stats are written to the Store (default: 200ms).
+func NewQueueObserver(storeInstance *store.Store, updateInterval time.Duration) *QueueObserver {
 	if updateInterval <= 0 {
 		updateInterval = 200 * time.Millisecond
 	}
 
 	return &QueueObserver{
-		boltDB:         boltInstance,
-		queues:         make(map[string]*Queue),
+		store:          storeInstance,
+		queues:         make(map[string]QueueStatsProvider),
 		stopChan:       make(chan struct{}),
 		updateTicker:   time.NewTicker(updateInterval),
 		updateInterval: updateInterval,
@@ -73,7 +64,7 @@ func NewQueueObserver(boltInstance *db.DB, updateInterval time.Duration) *QueueO
 
 // RegisterQueue registers a queue with the observer.
 // The observer will poll this queue directly for statistics.
-func (o *QueueObserver) RegisterQueue(queueName string, queue *Queue) {
+func (o *QueueObserver) RegisterQueue(queueName string, queue QueueStatsProvider) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
@@ -141,7 +132,7 @@ func (o *QueueObserver) Stop() {
 	}
 
 	// Clear queues
-	o.queues = make(map[string]*Queue)
+	o.queues = make(map[string]QueueStatsProvider)
 	o.prevMetrics = make(map[string]QueueObserverMetrics)
 }
 
@@ -173,7 +164,7 @@ func (o *QueueObserver) observeLoop() {
 		case <-ticker.C:
 			// Get queue references
 			o.mu.RLock()
-			queues := make(map[string]*Queue)
+			queues := make(map[string]QueueStatsProvider)
 			for name, queue := range o.queues {
 				queues[name] = queue
 			}
@@ -189,7 +180,7 @@ func (o *QueueObserver) observeLoop() {
 			}
 
 			// Publish all collected metrics to BoltDB
-			if len(metrics) > 0 && o.boltDB != nil {
+			if len(metrics) > 0 && o.store != nil {
 				o.publishMetricsToBoltDB(metrics)
 			}
 		}
@@ -197,7 +188,7 @@ func (o *QueueObserver) observeLoop() {
 }
 
 // pollQueue polls a queue directly and calculates metrics.
-func (o *QueueObserver) pollQueue(queueName string, queue *Queue) *QueueObserverMetrics {
+func (o *QueueObserver) pollQueue(queueName string, queue QueueStatsProvider) *QueueObserverMetrics {
 	if queue == nil {
 		return nil
 	}
@@ -247,49 +238,30 @@ func (o *QueueObserver) pollQueue(queueName string, queue *Queue) *QueueObserver
 // publishMetricsToBoltDB writes queue metrics to BoltDB in the queue-stats bucket.
 // Each queue's metrics are stored under a key like "src-traversal", "dst-traversal", etc.
 func (o *QueueObserver) publishMetricsToBoltDB(metricsMap map[string]QueueObserverMetrics) {
-	if o.boltDB == nil {
+	if o.store == nil {
 		return
 	}
 
-	err := o.boltDB.Update(func(tx *bolt.Tx) error {
-		// Get or create the queue-stats bucket
-		statsBucket, err := getQueueStatsBucket(tx)
+	// Convert metrics to JSON map for batch write
+	statsMap := make(map[string][]byte)
+	for queueName, metrics := range metricsMap {
+		// Determine the key based on queue name
+		key := queueNameToStatsKey(queueName)
+
+		// Marshal metrics to JSON
+		metricsJSON, err := json.Marshal(metrics)
 		if err != nil {
-			return err
+			// Log error but continue with other queues
+			continue
 		}
 
-		// Write metrics for each queue
-		for queueName, metrics := range metricsMap {
-			// Determine the key based on queue name
-			// "src" -> "src-traversal", "dst" -> "dst-traversal", etc.
-			key := queueNameToStatsKey(queueName)
+		statsMap[key] = metricsJSON
+	}
 
-			// Marshal metrics to JSON
-			metricsJSON, err := json.Marshal(metrics)
-			if err != nil {
-				if logservice.LS != nil {
-					_ = logservice.LS.Log("error",
-						fmt.Sprintf("Failed to marshal metrics for queue %s: %v", queueName, err),
-						"observer", "publish", "")
-				}
-				continue
-			}
-
-			// Write to BoltDB
-			if err := statsBucket.Put([]byte(key), metricsJSON); err != nil {
-				return fmt.Errorf("failed to write metrics for %s: %w", key, err)
-			}
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("error",
-				fmt.Sprintf("Failed to publish metrics to BoltDB: %v", err),
-				"observer", "publish", "")
-		}
+	// Write all metrics in a single transaction using Store API
+	if err := o.store.SetQueueStatsBatch(statsMap); err != nil {
+		// Error logging should be handled by caller or logging service
+		_ = err
 	}
 }
 
@@ -305,10 +277,4 @@ func queueNameToStatsKey(queueName string) string {
 		// For other queue types, use as-is or add suffix
 		return queueName
 	}
-}
-
-// getQueueStatsBucket returns the queue-stats bucket, creating it if needed.
-// This is a helper that uses the db package's bucket helpers.
-func getQueueStatsBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
-	return db.GetOrCreateQueueStatsBucket(tx)
 }

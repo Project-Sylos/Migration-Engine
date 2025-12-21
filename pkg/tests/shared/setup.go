@@ -98,45 +98,22 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 	}
 
 	// Open database - tests own the lifecycle
+	dbPath := "pkg/tests/shared/main_test.db"
 	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           "pkg/tests/shared/main_test.db",
+		Path:           dbPath,
 		RemoveExisting: removeMigrationDB,
 	})
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	cfg := migration.Config{
-		DatabaseInstance: dbInstance,               // Tests provide DB instance
-		Runtime:          migration.ModeStandalone, // Tests use standalone mode (ME closes DB)
-		Database: migration.DatabaseConfig{
-			Path:           "pkg/tests/shared/main_test.db",
-			RemoveExisting: removeMigrationDB,
-		},
-		Source: migration.Service{
-			Name:    "Spectra-Primary",
-			Adapter: srcAdapter,
-		},
-		Destination: migration.Service{
-			Name:    "Spectra-S1",
-			Adapter: dstAdapter,
-		},
-		SeedRoots:       true,
-		WorkerCount:     10,
-		MaxRetries:      3,
-		CoordinatorLead: 4,
-		SkipListener:    true,
-		LogAddress:      "127.0.0.1:8081",
-		LogLevel:        "trace",
-		StartupDelay:    1 * time.Second, // you should set this to 3 if you set skip listener to false to account for terminal opening delay
-		Verification:    migration.VerifyOptions{},
-	}
+	// Use NewConfig() template and customize with builder methods
+	cfg := migration.NewConfig().
+		WithStore(dbInstance, dbPath).
+		WithServices(srcAdapter, dstAdapter, "Spectra-Primary", "Spectra-S1").
+		WithRoots(srcRoot, dstRoot)
 
-	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {
-		return migration.Config{}, err
-	}
-
-	return cfg, nil
+	return *cfg, nil
 }
 
 // LoadSpectraRoots fetches the Spectra root nodes and maps them to types.Folder structures.
@@ -188,6 +165,14 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 	fmt.Printf("  Source: %s\n", srcPath)
 	fmt.Printf("  Destination: %s\n", dstPath)
 
+	// Verify paths exist
+	if _, err := os.Stat(srcPath); err != nil {
+		return migration.Config{}, fmt.Errorf("source path does not exist or is not accessible: %s (error: %w)", srcPath, err)
+	}
+	if _, err := os.Stat(dstPath); err != nil {
+		return migration.Config{}, fmt.Errorf("destination path does not exist or is not accessible: %s (error: %w)", dstPath, err)
+	}
+
 	// Create LocalFS adapters
 	srcAdapter, err := fs.NewLocalFS(srcPath)
 	if err != nil {
@@ -197,17 +182,6 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 	dstAdapter, err := fs.NewLocalFS(dstPath)
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
-	}
-
-	// Verify source path exists and is accessible
-	if _, err := os.Stat(srcPath); err != nil {
-		return migration.Config{}, fmt.Errorf("source path does not exist or is not accessible: %s (error: %w)", srcPath, err)
-	}
-
-	// Verify destination path exists and is accessible
-	// Note: We don't create it automatically to avoid accidentally creating directories
-	if _, err := os.Stat(dstPath); err != nil {
-		return migration.Config{}, fmt.Errorf("destination path does not exist or is not accessible: %s (error: %w)", dstPath, err)
 	}
 
 	// Create root folder structures
@@ -234,43 +208,20 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 	}
 
 	// Open database - tests own the lifecycle
+	dbPath := "pkg/tests/shared/main_test.db"
 	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           "pkg/tests/shared/main_test.db",
+		Path:           dbPath,
 		RemoveExisting: removeMigrationDB,
 	})
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	cfg := migration.Config{
-		DatabaseInstance: dbInstance,               // Tests provide DB instance
-		Runtime:          migration.ModeStandalone, // Tests use standalone mode (ME closes DB)
-		Database: migration.DatabaseConfig{
-			Path:           "pkg/tests/shared/main_test.db",
-			RemoveExisting: removeMigrationDB,
-		},
-		Source: migration.Service{
-			Name:    "Local-Src",
-			Adapter: srcAdapter,
-		},
-		Destination: migration.Service{
-			Name:    "Local-Dst",
-			Adapter: dstAdapter,
-		},
-		SeedRoots:       true,
-		WorkerCount:     10,
-		MaxRetries:      3,
-		CoordinatorLead: 4,
-		LogAddress:      "127.0.0.1:8081",
-		LogLevel:        "trace",
-		SkipListener:    true,
-		StartupDelay:    3 * time.Second,
-		Verification:    migration.VerifyOptions{},
-	}
+	// Use NewConfig() template and customize with builder methods
+	cfg := migration.NewConfig().
+		WithStore(dbInstance, dbPath).
+		WithServices(srcAdapter, dstAdapter, "Local-Src", "Local-Dst").
+		WithRoots(srcRoot, dstRoot)
 
-	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {
-		return migration.Config{}, err
-	}
-
-	return cfg, nil
+	return *cfg, nil
 }

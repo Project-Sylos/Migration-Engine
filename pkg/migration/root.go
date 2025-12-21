@@ -6,8 +6,8 @@ package migration
 import (
 	"fmt"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
+	"github.com/Project-Sylos/Sylos-DB/pkg/store"
 	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
@@ -19,31 +19,27 @@ type RootSeedSummary struct {
 
 // SeedRootTasks inserts the supplied source and destination root folders into BoltDB.
 // The folders should already contain root-relative metadata (LocationPath="/", DepthLevel=0).
-func SeedRootTasks(srcRoot types.Folder, dstRoot types.Folder, boltDB *db.DB) (RootSeedSummary, error) {
-	if boltDB == nil {
-		return RootSeedSummary{}, fmt.Errorf("boltDB cannot be nil")
+func SeedRootTasks(srcRoot types.Folder, dstRoot types.Folder, dbOrStore any) (RootSeedSummary, error) {
+	if dbOrStore == nil {
+		return RootSeedSummary{}, fmt.Errorf("database instance cannot be nil")
 	}
 
 	if srcRoot.ServiceID == "" || dstRoot.ServiceID == "" {
 		return RootSeedSummary{}, fmt.Errorf("source and destination root folders must have a ServiceID")
 	}
 
-	if err := queue.SeedRootTasks(srcRoot, dstRoot, boltDB); err != nil {
+	// queue.SeedRootTasks now requires *store.Store
+	storeInstance, ok := dbOrStore.(*store.Store)
+	if !ok {
+		return RootSeedSummary{}, fmt.Errorf("dbOrStore must be *store.Store")
+	}
+	if err := queue.SeedRootTasks(srcRoot, dstRoot, storeInstance); err != nil {
 		return RootSeedSummary{}, fmt.Errorf("failed to seed root tasks: %w", err)
 	}
 
-	var summary RootSeedSummary
-
-	// Count root tasks from BoltDB
-	srcCount, err := boltDB.CountByPrefix("SRC", 0, db.StatusPending)
-	if err == nil {
-		summary.SrcRoots = srcCount
-	}
-
-	dstCount, err := boltDB.CountByPrefix("DST", 0, db.StatusPending)
-	if err == nil {
-		summary.DstRoots = dstCount
-	}
-
-	return summary, nil
+	// Return summary with known root counts
+	return RootSeedSummary{
+		SrcRoots: 1,
+		DstRoots: 1,
+	}, nil
 }

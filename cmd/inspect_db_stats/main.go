@@ -10,10 +10,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"github.com/Project-Sylos/Sylos-DB/pkg/store"
 )
 
 func main() {
@@ -41,15 +40,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Open database (read-only mode handled by BoltDB automatically)
-	boltDB, err := db.Open(db.Options{Path: dbPath})
+	// Open store
+	storeInstance, err := store.Open(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
 		os.Exit(1)
 	}
+	defer storeInstance.Close()
 
-	// Generate report using stats bucket
-	report, err := inspectDatabase(boltDB)
+	// Generate report using Store API with stats mode (O(1) - uses cached stats)
+	report, err := storeInstance.InspectDatabase(store.InspectionModeStats)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error inspecting database: %v\n", err)
 		os.Exit(1)
@@ -59,168 +59,12 @@ func main() {
 	printReport(report, dbPath)
 }
 
-type LevelStatus struct {
-	Level      int
-	Pending    int
-	Successful int
-	Failed     int
-	NotOnSrc   int
-}
+// Type aliases for Store API types to keep print functions unchanged
+type LevelStatus = store.LevelStatus
+type QueueReport = store.QueueReport
+type DatabaseReport = store.DatabaseReport
 
-type QueueReport struct {
-	QueueType       string
-	TotalNodes      int
-	Levels          []LevelStatus
-	TotalPending    int
-	TotalSuccessful int
-	TotalFailed     int
-	TotalNotOnSrc   int
-	MinPendingLevel *int
-}
-
-type DatabaseReport struct {
-	DatabasePath string
-	Src          QueueReport
-	Dst          QueueReport
-}
-
-func inspectDatabase(boltDB *db.DB) (*DatabaseReport, error) {
-	report := &DatabaseReport{
-		Src: QueueReport{QueueType: "SRC"},
-		Dst: QueueReport{QueueType: "DST"},
-	}
-
-	// Inspect SRC
-	srcReport, err := inspectQueue(boltDB, "SRC")
-	if err != nil {
-		return nil, fmt.Errorf("failed to inspect SRC: %w", err)
-	}
-	report.Src = *srcReport
-
-	// Inspect DST
-	dstReport, err := inspectQueue(boltDB, "DST")
-	if err != nil {
-		return nil, fmt.Errorf("failed to inspect DST: %w", err)
-	}
-	report.Dst = *dstReport
-
-	return report, nil
-}
-
-func inspectQueue(boltDB *db.DB, queueType string) (*QueueReport, error) {
-	report := &QueueReport{
-		QueueType: queueType,
-	}
-
-	// Count total nodes using stats bucket
-	nodesPath := db.GetNodesBucketPath(queueType)
-	totalNodes, err := boltDB.GetBucketCount(nodesPath)
-	if err != nil {
-		// Stats might not exist, fall back to counting
-		totalNodesInt, countErr := boltDB.CountNodes(queueType)
-		if countErr != nil {
-			return nil, fmt.Errorf("failed to count nodes: %w", countErr)
-		}
-		totalNodes = int64(totalNodesInt)
-	}
-	report.TotalNodes = int(totalNodes)
-
-	// Get all levels
-	levels, err := boltDB.GetAllLevels(queueType)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get levels: %w", err)
-	}
-
-	// Sort levels
-	sort.Ints(levels)
-
-	// Inspect each level using stats bucket
-	levelMap := make(map[int]*LevelStatus)
-	for _, level := range levels {
-		levelStatus := &LevelStatus{Level: level}
-
-		// Count pending using stats bucket
-		pendingPath := db.GetStatusBucketPath(queueType, level, db.StatusPending)
-		pending, err := boltDB.GetBucketCount(pendingPath)
-		if err != nil {
-			// Stats might not exist, fall back to counting
-			pendingInt, countErr := boltDB.CountStatusBucket(queueType, level, db.StatusPending)
-			if countErr != nil {
-				pending = 0
-			} else {
-				pending = int64(pendingInt)
-			}
-		}
-		levelStatus.Pending = int(pending)
-
-		// Count successful using stats bucket
-		successfulPath := db.GetStatusBucketPath(queueType, level, db.StatusSuccessful)
-		successful, err := boltDB.GetBucketCount(successfulPath)
-		if err != nil {
-			successfulInt, countErr := boltDB.CountStatusBucket(queueType, level, db.StatusSuccessful)
-			if countErr != nil {
-				successful = 0
-			} else {
-				successful = int64(successfulInt)
-			}
-		}
-		levelStatus.Successful = int(successful)
-
-		// Count failed using stats bucket
-		failedPath := db.GetStatusBucketPath(queueType, level, db.StatusFailed)
-		failed, err := boltDB.GetBucketCount(failedPath)
-		if err != nil {
-			failedInt, countErr := boltDB.CountStatusBucket(queueType, level, db.StatusFailed)
-			if countErr != nil {
-				failed = 0
-			} else {
-				failed = int64(failedInt)
-			}
-		}
-		levelStatus.Failed = int(failed)
-
-		// Count not_on_src (DST only) using stats bucket
-		if queueType == "DST" {
-			notOnSrcPath := db.GetStatusBucketPath(queueType, level, db.StatusNotOnSrc)
-			notOnSrc, err := boltDB.GetBucketCount(notOnSrcPath)
-			if err != nil {
-				notOnSrcInt, countErr := boltDB.CountStatusBucket(queueType, level, db.StatusNotOnSrc)
-				if countErr != nil {
-					notOnSrc = 0
-				} else {
-					notOnSrc = int64(notOnSrcInt)
-				}
-			}
-			levelStatus.NotOnSrc = int(notOnSrc)
-		}
-
-		levelMap[level] = levelStatus
-		report.TotalPending += levelStatus.Pending
-		report.TotalSuccessful += levelStatus.Successful
-		report.TotalFailed += levelStatus.Failed
-		if queueType == "DST" {
-			report.TotalNotOnSrc += levelStatus.NotOnSrc
-		}
-
-		// Track minimum pending level
-		if levelStatus.Pending > 0 {
-			if report.MinPendingLevel == nil || level < *report.MinPendingLevel {
-				level := level
-				report.MinPendingLevel = &level
-			}
-		}
-	}
-
-	// Convert map to sorted slice
-	report.Levels = make([]LevelStatus, 0, len(levelMap))
-	for _, level := range levels {
-		report.Levels = append(report.Levels, *levelMap[level])
-	}
-
-	return report, nil
-}
-
-func printReport(report *DatabaseReport, dbPath string) {
+func printReport(report *store.DatabaseReport, dbPath string) {
 	fmt.Println(strings.Repeat("=", 80))
 	fmt.Printf("BoltDB Inspection Report (Stats-Based): %s\n", dbPath)
 	fmt.Println(strings.Repeat("=", 80))
@@ -306,7 +150,7 @@ func printReport(report *DatabaseReport, dbPath string) {
 	fmt.Println(strings.Repeat("=", 80))
 }
 
-func printQueueReport(qr *QueueReport) {
+func printQueueReport(qr *store.QueueReport) {
 	fmt.Printf("%s QUEUE REPORT\n", qr.QueueType)
 	fmt.Println(strings.Repeat("-", 80))
 	fmt.Printf("Total Nodes: %d\n", qr.TotalNodes)

@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"github.com/Project-Sylos/Sylos-DB/pkg/store"
 )
 
 // LS is the global log service sender instance.
@@ -20,8 +20,8 @@ var LS *Sender
 
 // InitGlobalLogger initializes the global LS instance.
 // This should be called once during application startup.
-func InitGlobalLogger(dbInstance *db.DB, addr, level string) error {
-	sender, err := NewSender(dbInstance, addr, level)
+func InitGlobalLogger(storeInstance *store.Store, addr, level string) error {
+	sender, err := NewSender(storeInstance, addr, level)
 	if err != nil {
 		return fmt.Errorf("failed to initialize global logger: %w", err)
 	}
@@ -41,10 +41,9 @@ func InitGlobalLogger(dbInstance *db.DB, addr, level string) error {
 
 // Sender transmits logs over UDP and writes them to the database.
 type Sender struct {
-	DB         *db.DB        // BoltDB handle for persistence
-	logBuffer  *db.LogBuffer // buffered log writer
-	Addr       string        // e.g. "127.0.0.1:1997"
-	Level      string        // threshold for UDP output
+	Store      *store.Store // Store handle for persistence
+	Addr       string       // e.g. "127.0.0.1:1997"
+	Level      string       // threshold for UDP output
 	conn       net.Conn
 	minLevelIx int
 	mu         sync.Mutex // guards buffer/encoder
@@ -74,8 +73,8 @@ func getLevelIndex(level string) int {
 }
 
 // NewSender initializes a new dual-channel sender.
-// dbInstance should be a BoltDB instance.
-func NewSender(dbInstance *db.DB, addr, level string) (*Sender, error) {
+// storeInstance should be a Store instance.
+func NewSender(storeInstance *store.Store, addr, level string) (*Sender, error) {
 	conn, err := net.Dial("udp", addr)
 	if err != nil {
 		return nil, err
@@ -86,12 +85,8 @@ func NewSender(dbInstance *db.DB, addr, level string) (*Sender, error) {
 	}
 	buf := new(bytes.Buffer)
 
-	// Create a log buffer that flushes every 500 entries or every 2 seconds
-	logBuffer := db.NewLogBuffer(dbInstance, 500, 2*time.Second)
-
 	return &Sender{
-		DB:         dbInstance,
-		logBuffer:  logBuffer,
+		Store:      storeInstance,
 		Addr:       addr,
 		Level:      level,
 		conn:       conn,
@@ -112,17 +107,12 @@ func (s *Sender) Log(level, message, entity, entityID string, queues ...string) 
 		queue = queues[0]
 	}
 
-	// --- DB write (always, buffered) ---
-	id := db.GenerateLogID() // Generate UUID for log entry
-	s.logBuffer.Add(db.LogEntry{
-		ID:        id,
-		Timestamp: timestamp.Format(time.RFC3339Nano), // ISO8601 format
-		Level:     level,
-		Entity:    entity,
-		EntityID:  entityID,
-		Message:   message,
-		Queue:     queue,
-	})
+	// --- DB write (always, via Store API) ---
+	// Store handles buffering internally with automatic flush on read conflicts
+	if err := s.Store.RecordLog(level, entity, entityID, message); err != nil {
+		// Log errors are not critical, just continue
+		_ = err
+	}
 
 	// --- UDP send (conditional) ---
 	levelIx := getLevelIndex(level)
@@ -175,12 +165,9 @@ func (s *Sender) ClearConsole() error {
 	return err
 }
 
-// Close terminates the UDP connection and stops the log buffer.
-// The log buffer Stop() has its own timeout to prevent blocking.
+// Close terminates the UDP connection.
+// Note: Store lifecycle is managed by the application, not the log sender.
 func (s *Sender) Close() error {
-	if s.logBuffer != nil {
-		s.logBuffer.Stop()
-	}
 	if s.conn != nil {
 		_ = s.conn.Close()
 	}

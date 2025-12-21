@@ -7,7 +7,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"github.com/Project-Sylos/Sylos-DB/pkg/store"
+	"github.com/Project-Sylos/Sylos-DB/pkg/utils"
 )
 
 // ============================================================================
@@ -53,16 +54,10 @@ func (q *Queue) getCoordinator() *QueueCoordinator {
 	return q.coordinator
 }
 
-func (q *Queue) getBoltDB() *db.DB {
+func (q *Queue) getStore() *store.Store {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
-	return q.boltDB
-}
-
-func (q *Queue) getOutputBuffer() *db.OutputBuffer {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	return q.outputBuffer
+	return q.storeAPI
 }
 
 func (q *Queue) getShutdownCtx() context.Context {
@@ -307,16 +302,10 @@ func (q *Queue) setShutdownCtx(ctx context.Context) {
 	q.shutdownCtx = ctx
 }
 
-func (q *Queue) setBoltDB(boltDB *db.DB) {
+func (q *Queue) setStore(s *store.Store) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.boltDB = boltDB
-}
-
-func (q *Queue) setOutputBuffer(outputBuffer *db.OutputBuffer) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.outputBuffer = outputBuffer
+	q.storeAPI = s
 }
 
 func (q *Queue) setStatsChan(ch chan QueueStats) {
@@ -417,8 +406,7 @@ type QueueStateSnapshot struct {
 	Pulling            bool
 	LastPullWasPartial bool
 	PullLowWM          int
-	BoltDB             *db.DB
-	OutputBuffer       *db.OutputBuffer
+	StoreAPI           *store.Store
 	Mode               QueueMode
 }
 
@@ -433,8 +421,7 @@ func (q *Queue) getStateSnapshot() QueueStateSnapshot {
 		Pulling:            q.pulling,
 		LastPullWasPartial: q.lastPullWasPartial,
 		PullLowWM:          q.pullLowWM,
-		BoltDB:             q.boltDB,
-		OutputBuffer:       q.outputBuffer,
+		StoreAPI:           q.storeAPI,
 		Mode:               q.mode,
 	}
 }
@@ -447,7 +434,7 @@ func (q *Queue) enqueuePending(task *TaskBase) bool {
 	nodeID := task.ID
 	if nodeID == "" {
 		// Generate ULID if not present (for newly created tasks)
-		nodeID = db.GenerateNodeID()
+		nodeID = utils.GenerateULID()
 		task.ID = nodeID
 	}
 
@@ -491,7 +478,7 @@ func (q *Queue) dequeuePending() *TaskBase {
 		nodeID := task.ID
 		if nodeID == "" {
 			// Generate ULID if not present
-			nodeID = db.GenerateNodeID()
+			nodeID = utils.GenerateULID()
 			task.ID = nodeID
 		}
 

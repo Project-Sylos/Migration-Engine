@@ -9,16 +9,13 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"os"
 	"time"
 
-	bolt "go.etcd.io/bbolt"
-
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Migration-Engine/pkg/tests/shared"
+	"github.com/Project-Sylos/Sylos-DB/pkg/store"
 	"github.com/Project-Sylos/Sylos-FS/pkg/fs"
 )
 
@@ -143,7 +140,7 @@ func prepareBaseDB() error {
 
 	// Run exclusion sweep
 	sweepConfig := migration.SweepConfig{
-		BoltDB:          boltDB,
+		StoreInstance:   boltDB,
 		SrcAdapter:      srcAdapter,
 		DstAdapter:      dstAdapter,
 		WorkerCount:     10,
@@ -178,41 +175,16 @@ func prepareBaseDB() error {
 }
 
 // addToExclusionHolding adds a node to the exclusion-holding bucket.
-func addToExclusionHolding(boltDB *db.DB, queueType string, nodePath string, depth int) error {
-	// Find node by path to get ULID
-	var nodeID string
-	err := boltDB.View(func(tx *bolt.Tx) error {
-		nodesBucket := db.GetNodesBucket(tx, queueType)
-		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found")
-		}
-
-		cursor := nodesBucket.Cursor()
-		for nodeIDBytes, nodeData := cursor.First(); nodeIDBytes != nil; nodeIDBytes, nodeData = cursor.Next() {
-			nodeState, err := db.DeserializeNodeState(nodeData)
-			if err != nil {
-				continue
-			}
-			if nodeState.Path == nodePath {
-				nodeID = nodeState.ID
-				return nil
-			}
-		}
-		return fmt.Errorf("node not found: %s", nodePath)
-	})
+func addToExclusionHolding(s *store.Store, queueType string, nodePath string, depth int) error {
+	// Get node by path using Store API
+	node, err := s.GetNodeByPath(queueType, nodePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get node by path: %w", err)
+	}
+	if node == nil {
+		return fmt.Errorf("node not found: %s", nodePath)
 	}
 
-	depthBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(depthBytes, uint64(depth))
-
-	return boltDB.Update(func(tx *bolt.Tx) error {
-		bucket, err := db.GetOrCreateHoldingBucket(tx, queueType, "exclude")
-		if err != nil {
-			return fmt.Errorf("failed to get exclusion-holding bucket: %w", err)
-		}
-
-		return bucket.Put([]byte(nodeID), depthBytes)
-	})
+	// Add to exclusion-holding bucket using Store API
+	return s.AddHoldingEntry(queueType, node.ID, depth, "exclude")
 }

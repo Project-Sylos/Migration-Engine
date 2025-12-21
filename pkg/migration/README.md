@@ -276,7 +276,7 @@ type MigrationStatus struct {
 Query the current migration state from BoltDB:
 
 ```go
-status, err := migration.InspectMigrationStatus(boltDB)
+status, err := migration.InspectMigrationStatus(storeInstance)
 if status.HasPending() {
     fmt.Println("Migration has pending work")
 }
@@ -303,7 +303,7 @@ verifyOpts := migration.VerifyOptions{
     AllowNotOnSrc: true,
 }
 
-report, err := migration.VerifyMigration(boltDB, verifyOpts)
+report, err := migration.VerifyMigration(storeInstance, verifyOpts)
 if report.Success(verifyOpts) {
     fmt.Println("Migration verified successfully")
 }

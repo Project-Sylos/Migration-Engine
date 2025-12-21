@@ -9,7 +9,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Migration-Engine/pkg/tests/shared"
 	"github.com/Project-Sylos/Spectra/sdk"
@@ -106,22 +105,13 @@ func runTest() error {
 
 	fmt.Printf("Selected SRC node: %s (depth: %d, type: %s)\n", selectedChild.Path, selectedChild.Depth, selectedChild.Type)
 
-	// Find corresponding DST node using join-lookup table
-	dstNodeID, err := db.GetDstIDFromSrcID(boltDB, selectedChild.ID)
+	// Get DST node using path-based lookup
+	dstNodeState, err := boltDB.GetNodeByPath("DST", selectedChild.Path)
 	if err != nil {
-		return fmt.Errorf("failed to get DST node ID from SRC node: %w", err)
-	}
-	if dstNodeID == "" {
-		return fmt.Errorf("no corresponding DST node found for SRC node %s", selectedChild.ID)
-	}
-
-	// Get DST node state to get its path
-	dstNodeState, err := db.GetNodeState(boltDB, "DST", dstNodeID)
-	if err != nil {
-		return fmt.Errorf("failed to get DST node state: %w", err)
+		return fmt.Errorf("failed to get DST node by path: %w", err)
 	}
 	if dstNodeState == nil {
-		return fmt.Errorf("DST node not found: %s", dstNodeID)
+		return fmt.Errorf("DST node not found for path: %s", selectedChild.Path)
 	}
 
 	fmt.Printf("Found corresponding DST node: %s (depth: %d, type: %s)\n", dstNodeState.Path, dstNodeState.Depth, dstNodeState.Type)
@@ -183,7 +173,7 @@ func runTest() error {
 
 	// Run retry sweep
 	sweepConfig := migration.SweepConfig{
-		BoltDB:          boltDB,
+		StoreInstance:   boltDB,
 		SrcAdapter:      srcAdapter,
 		DstAdapter:      dstAdapter,
 		WorkerCount:     10,
