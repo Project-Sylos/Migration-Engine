@@ -9,9 +9,9 @@ Write-Host ""
 # Clean up previous test files
 Write-Host "Cleaning up previous test files..." -ForegroundColor Yellow
 $testFiles = @(
-    "pkg/tests/shared/main_test.db",
-    "pkg/tests/shared/main_test.yaml",
-    "pkg/tests/shared/spectra_test.db"
+    "pkg/tests/traversal/shared/main_test.db",
+    "pkg/tests/traversal/shared/main_test.yaml",
+    "pkg/tests/traversal/shared/spectra_test.db"
 )
 
 foreach ($file in $testFiles) {
@@ -30,7 +30,7 @@ Write-Host "This will mark the first root folder as excluded and run an exclusio
 Write-Host ""
 
 # Run prepare script (located in preparation subfolder)
-go run pkg/tests/unexclusion_sweep/preparation/prepare_unexclusion_test_db.go
+go run pkg/tests/traversal/unexclusion_sweep/preparation/prepare_unexclusion_test_db.go
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "❌ Failed to prepare base DB" -ForegroundColor Red
@@ -42,7 +42,7 @@ Write-Host ""
 Write-Host "Running unexclusion sweep test..." -ForegroundColor Yellow
 $startTime = Get-Date
 
-go run pkg/tests/unexclusion_sweep/main.go
+go run pkg/tests/traversal/unexclusion_sweep/main.go
 
 $exitCode = $LASTEXITCODE
 $endTime = Get-Date

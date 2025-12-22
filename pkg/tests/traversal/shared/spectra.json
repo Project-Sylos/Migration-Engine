@@ -6,7 +6,7 @@
     "min_files": 10,
     "max_files": 20,
     "seed": 0,
-    "db_path": "pkg/tests/shared/spectra.db"
+    "db_path": "pkg/tests/traversal/shared/spectra.db"
   },
   "api": {
     "host": "localhost",
