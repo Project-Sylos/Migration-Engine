@@ -11,7 +11,7 @@ import (
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
-	"github.com/Project-Sylos/Migration-Engine/pkg/tests/shared"
+	"github.com/Project-Sylos/Migration-Engine/pkg/tests/traversal/shared"
 	"github.com/Project-Sylos/Spectra/sdk"
 	"github.com/Project-Sylos/Sylos-FS/pkg/fs"
 )
@@ -34,7 +34,7 @@ func runTest() error {
 
 	// Load pre-configured test database (should be copied by PowerShell script)
 	// Path is relative to where the script is run from (project root)
-	dbPath := "pkg/tests/shared/main_test.db"
+	dbPath := "pkg/tests/traversal/shared/main_test.db"
 	boltDB, _, err := migration.SetupDatabase(migration.DatabaseConfig{
 		Path:           dbPath,
 		RemoveExisting: false, // Use existing pre-configured DB
@@ -45,7 +45,7 @@ func runTest() error {
 	defer boltDB.Close()
 
 	// Load Spectra configuration (test-specific config pointing to shared directory's spectra.db)
-	spectraFS, err := shared.SetupSpectraFS("pkg/tests/shared/spectra.json", false)
+	spectraFS, err := shared.SetupSpectraFS("pkg/tests/traversal/shared/spectra.json", false)
 	if err != nil {
 		return fmt.Errorf("failed to setup Spectra: %w", err)
 	}

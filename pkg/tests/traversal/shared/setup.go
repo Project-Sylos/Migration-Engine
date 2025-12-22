@@ -77,7 +77,7 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 	fmt.Println("Loading Spectra configuration...")
 
 	// Create SpectraFS instance (SDK should load existing DB data if file exists)
-	spectraFS, err := SetupSpectraFS("pkg/tests/shared/spectra.json", cleanSpectraDB)
+	spectraFS, err := SetupSpectraFS("pkg/tests/traversal/shared/spectra.json", cleanSpectraDB)
 	if err != nil {
 		return migration.Config{}, err
 	}
@@ -99,7 +99,7 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 
 	// Open database - tests own the lifecycle
 	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           "pkg/tests/shared/main_test.db",
+		Path:           "pkg/tests/traversal/shared/main_test.db",
 		RemoveExisting: removeMigrationDB,
 	})
 	if err != nil {
@@ -110,7 +110,7 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 		DatabaseInstance: dbInstance,               // Tests provide DB instance
 		Runtime:          migration.ModeStandalone, // Tests use standalone mode (ME closes DB)
 		Database: migration.DatabaseConfig{
-			Path:           "pkg/tests/shared/main_test.db",
+			Path:           "pkg/tests/traversal/shared/main_test.db",
 			RemoveExisting: removeMigrationDB,
 		},
 		Source: migration.Service{
@@ -235,7 +235,7 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 
 	// Open database - tests own the lifecycle
 	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           "pkg/tests/shared/main_test.db",
+		Path:           "pkg/tests/traversal/shared/main_test.db",
 		RemoveExisting: removeMigrationDB,
 	})
 	if err != nil {
@@ -246,7 +246,7 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 		DatabaseInstance: dbInstance,               // Tests provide DB instance
 		Runtime:          migration.ModeStandalone, // Tests use standalone mode (ME closes DB)
 		Database: migration.DatabaseConfig{
-			Path:           "pkg/tests/shared/main_test.db",
+			Path:           "pkg/tests/traversal/shared/main_test.db",
 			RemoveExisting: removeMigrationDB,
 		},
 		Source: migration.Service{

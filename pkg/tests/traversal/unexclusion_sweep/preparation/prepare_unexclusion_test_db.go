@@ -44,9 +44,9 @@ func prepareBaseDB() error {
 	sourceYAMLPath := "pkg/tests/unexclusion_sweep/preparation/excluded.yaml"
 	sourceSpectraPath := "pkg/tests/unexclusion_sweep/preparation/excluded_spectra.db"
 
-	targetDBPath := "pkg/tests/shared/main_test.db"
-	targetYAMLPath := "pkg/tests/shared/main_test.yaml"
-	targetSpectraPath := "pkg/tests/shared/spectra_test.db"
+	targetDBPath := "pkg/tests/traversal/shared/main_test.db"
+	targetYAMLPath := "pkg/tests/traversal/shared/main_test.yaml"
+	targetSpectraPath := "pkg/tests/traversal/shared/spectra_test.db"
 
 	// Check if source exists
 	if _, err := os.Stat(sourceDBPath); os.IsNotExist(err) {
@@ -92,7 +92,7 @@ func prepareBaseDB() error {
 	defer boltDB.Close()
 
 	// Load Spectra configuration (test-specific config pointing to shared directory's spectra.db)
-	spectraFS, err := shared.SetupSpectraFS("pkg/tests/shared/spectra.json", false)
+	spectraFS, err := shared.SetupSpectraFS("pkg/tests/traversal/shared/spectra.json", false)
 	if err != nil {
 		return fmt.Errorf("failed to setup Spectra: %w", err)
 	}

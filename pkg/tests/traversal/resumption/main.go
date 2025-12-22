@@ -9,7 +9,7 @@ import (
 	"os"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
-	"github.com/Project-Sylos/Migration-Engine/pkg/tests/shared"
+	"github.com/Project-Sylos/Migration-Engine/pkg/tests/traversal/shared"
 )
 
 func main() {

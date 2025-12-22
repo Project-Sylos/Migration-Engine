@@ -63,7 +63,7 @@ logging:
     port: 8081
     level: trace
 database:
-    path: pkg/tests/shared/main_test.db
+    path: pkg/tests/traversal/shared/main_test.db
     remove_existing: true
 verification:
     allowpending: false

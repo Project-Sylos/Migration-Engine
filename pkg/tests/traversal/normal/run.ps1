@@ -11,21 +11,21 @@ Write-Host ""
 Write-Host "Cleaning up test databases..." -ForegroundColor Yellow
 
 # # Remove the BoltDB file if it exists
-if (Test-Path "pkg/tests/shared/main_test.db") {
-    Write-Host "Removing pkg/tests/shared/main_test.db file..." -ForegroundColor Yellow
-    Remove-Item -Path "pkg/tests/shared/main_test.db" -Force -ErrorAction SilentlyContinue
+if (Test-Path "pkg/tests/traversal/shared/main_test.db") {
+    Write-Host "Removing pkg/tests/traversal/shared/main_test.db file..." -ForegroundColor Yellow
+    Remove-Item -Path "pkg/tests/traversal/shared/main_test.db" -Force -ErrorAction SilentlyContinue
 }
 
 # # Remove the migration config YAML file if it exists
-if (Test-Path "pkg/tests/shared/main_test.yaml") {
-    Write-Host "Removing pkg/tests/shared/main_test.yaml file..." -ForegroundColor Yellow
-    Remove-Item -Path "pkg/tests/shared/main_test.yaml" -Force -ErrorAction SilentlyContinue
+if (Test-Path "pkg/tests/traversal/shared/main_test.yaml") {
+    Write-Host "Removing pkg/tests/traversal/shared/main_test.yaml file..." -ForegroundColor Yellow
+    Remove-Item -Path "pkg/tests/traversal/shared/main_test.yaml" -Force -ErrorAction SilentlyContinue
 }
 
 # # Remove the spectra.db file if it exists
-if (Test-Path "pkg/tests/shared/spectra_test.db") {
-    Write-Host "Removing pkg/tests/shared/spectra_test.db file..." -ForegroundColor Yellow
-    Remove-Item -Path "pkg/tests/shared/spectra_test.db" -Force -ErrorAction SilentlyContinue
+if (Test-Path "pkg/tests/traversal/shared/spectra_test.db") {
+    Write-Host "Removing pkg/tests/traversal/shared/spectra_test.db file..." -ForegroundColor Yellow
+    Remove-Item -Path "pkg/tests/traversal/shared/spectra_test.db" -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host "Cleanup complete" -ForegroundColor Green
@@ -35,7 +35,7 @@ Write-Host ""
 $startTime = Get-Date
 
 # Execute normal test runner
-go run pkg/tests/normal/main.go
+go run pkg/tests/traversal/normal/main.go
 
 $exitCode = $LASTEXITCODE
 
@@ -60,14 +60,14 @@ if ($exitCode -eq 0) {
     # Write-Host ""
     # Write-Host "=== Running DB Inspector with Spectra Comparison ===" -ForegroundColor Cyan
     # # The normal test uses pkg/tests/normal/main_test.db (from shared.SetupTest)
-    # if (Test-Path "pkg/tests/shared/main_test.db") {
+    # if (Test-Path "pkg/tests/traversal/shared/main_test.db") {
     #     go run cmd/inspect_db/main.go 
     #     $inspectExitCode = $LASTEXITCODE
     #     if ($inspectExitCode -ne 0) {
     #         Write-Host "⚠️  DB Inspector reported issues (exit code: $inspectExitCode)" -ForegroundColor Yellow
     #     }
     # } else {
-    #     Write-Host "⚠️  Database file not found (pkg/tests/shared/main_test.db), skipping inspection" -ForegroundColor Yellow
+    #     Write-Host "⚠️  Database file not found (pkg/tests/traversal/shared/main_test.db), skipping inspection" -ForegroundColor Yellow
     # }
 } else {
     Write-Host "Status: FAILED" -ForegroundColor Red

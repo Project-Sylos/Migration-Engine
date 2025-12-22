@@ -9,14 +9,14 @@ Write-Host ""
 
 # Source files (user-provided pre-configured test data)
 # Paths are relative to this script's location
-$sourceDB = "pkg/tests/shared/main.db"
-$sourceYAML = "pkg/tests/shared/main.yaml"
-$sourceSpectra = "pkg/tests/shared/spectra.db"
+$sourceDB = "pkg/tests/traversal/shared/main.db"
+$sourceYAML = "pkg/tests/traversal/shared/main.yaml"
+$sourceSpectra = "pkg/tests/traversal/shared/spectra.db"
 
 # Destination files (mutable test objects)
-$destDB = "pkg/tests/shared/main_test.db"
-$destYAML = "pkg/tests/shared/main_test.yaml"
-$destSpectra = "pkg/tests/shared/spectra_test.db"
+$destDB = "pkg/tests/traversal/shared/main_test.db"
+$destYAML = "pkg/tests/traversal/shared/main_test.yaml"
+$destSpectra = "pkg/tests/traversal/shared/spectra_test.db"
 
 # Check if source files exist
 if (-not (Test-Path $sourceDB)) {
@@ -66,7 +66,7 @@ Write-Host ""
 $startTime = Get-Date
 
 Write-Host "Running exclusion sweep test..." -ForegroundColor Cyan
-go run pkg/tests/exclusion_sweep/main.go
+go run pkg/tests/traversal/exclusion_sweep/main.go
 
 $exitCode = $LASTEXITCODE
 $endTime = Get-Date

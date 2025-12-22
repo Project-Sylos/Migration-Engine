@@ -15,8 +15,8 @@ Write-Host ""
 # The DB will persist between Phase 1 (kill) and Phase 2 (resume)
 # Final cleanup happens at the end after verification
 Write-Host "Cleaning up test databases for fresh test run..." -ForegroundColor Yellow
-Remove-Item -Path "pkg/tests/shared/main_test.db" -ErrorAction SilentlyContinue
-Remove-Item -Path "pkg/tests/shared/main_test.yaml" -ErrorAction SilentlyContinue
+Remove-Item -Path "pkg/tests/traversal/shared/main_test.db" -ErrorAction SilentlyContinue
+Remove-Item -Path "pkg/tests/traversal/shared/main_test.yaml" -ErrorAction SilentlyContinue
 Write-Host "Cleanup complete" -ForegroundColor Green
 Write-Host ""
 
@@ -31,7 +31,7 @@ Write-Host "Starting migration..." -ForegroundColor Yellow
 # Start the process with a process info object so we can kill it
 $processInfo = New-Object System.Diagnostics.ProcessStartInfo
 $processInfo.FileName = "go"
-$processInfo.Arguments = "run pkg/tests/resumption/main.go"
+$processInfo.Arguments = "run pkg/tests/traversal/resumption/main.go"
 $processInfo.WorkingDirectory = (Get-Location).Path
 $processInfo.UseShellExecute = $false
 $processInfo.CreateNoWindow = $false
@@ -107,11 +107,11 @@ Write-Host "Phase 1 Duration: $($phase1Duration.TotalSeconds) seconds" -Foregrou
 Write-Host ""
 
 # Verify shutdown state was saved
-if (Test-Path "pkg/tests/shared/main_test.yaml") {
+if (Test-Path "pkg/tests/traversal/shared/main_test.yaml") {
     Write-Host "YAML config file exists (suspended state saved)" -ForegroundColor Green
     
     # Read YAML to check status
-    $yamlContent = Get-Content "pkg/tests/shared/main_test.yaml" -Raw
+    $yamlContent = Get-Content "pkg/tests/traversal/shared/main_test.yaml" -Raw
     if ($yamlContent -match 'state:\s*\r?\n\s*status\s*:\s*(suspended|running)') {
         Write-Host "Migration state indicates suspension or ready to resume" -ForegroundColor Green
     } else {
@@ -122,7 +122,7 @@ if (Test-Path "pkg/tests/shared/main_test.yaml") {
     exit 1
 }
 
-if (Test-Path "pkg/tests/shared/main_test.db") {
+if (Test-Path "pkg/tests/traversal/shared/main_test.db") {
     Write-Host "Database file exists (checkpoint saved)" -ForegroundColor Green
 } else {
     Write-Host "Database file not found!" -ForegroundColor Red
@@ -139,7 +139,7 @@ $resumeStartTime = Get-Date
 Write-Host "Starting migration with same config (should auto-resume)..." -ForegroundColor Yellow
 
 # Run the resumption test runner (it will resume and complete)
-go run pkg/tests/resumption/main.go -resume
+go run pkg/tests/traversal/resumption/main.go -resume
 
 $exitCode = $LASTEXITCODE
 
@@ -158,8 +158,8 @@ if ($exitCode -eq 0) {
     Write-Host "TEST PASSED - Migration successfully resumed and completed!" -ForegroundColor Green
     
     # Verify final state
-    if (Test-Path "pkg/tests/shared/main_test.yaml") {
-        $finalYaml = Get-Content "pkg/tests/shared/main_test.yaml" -Raw
+    if (Test-Path "pkg/tests/traversal/shared/main_test.yaml") {
+        $finalYaml = Get-Content "pkg/tests/traversal/shared/main_test.yaml" -Raw
         if ($finalYaml -match 'status:\s*completed') {
             Write-Host "Final YAML status is 'completed'" -ForegroundColor Green
         } else {
@@ -170,8 +170,8 @@ if ($exitCode -eq 0) {
     # Clean up test databases after successful test completion
     Write-Host ""
     Write-Host "Cleaning up test databases after successful test..." -ForegroundColor Yellow
-    Remove-Item -Path "pkg/tests/shared/main_test.db" -ErrorAction SilentlyContinue
-    Remove-Item -Path "pkg/tests/shared/main_test.yaml" -ErrorAction SilentlyContinue
+    Remove-Item -Path "pkg/tests/traversal/shared/main_test.db" -ErrorAction SilentlyContinue
+    Remove-Item -Path "pkg/tests/traversal/shared/main_test.yaml" -ErrorAction SilentlyContinue
     Write-Host "Cleanup complete" -ForegroundColor Green
 } else {
     Write-Host "TEST FAILED - Migration resumption did not complete successfully" -ForegroundColor Red
