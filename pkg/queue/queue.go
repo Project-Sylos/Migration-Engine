@@ -52,7 +52,6 @@ type QueueMode string
 
 const (
 	QueueModeTraversal QueueMode = "traversal" // Normal BFS traversal
-	QueueModeExclusion QueueMode = "exclusion" // Exclusion propagation sweep
 	QueueModeRetry     QueueMode = "retry"     // Retry failed tasks sweep
 )
 
@@ -181,30 +180,17 @@ func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter types.FSAdapt
 	q.setOutputBuffer(outputBuffer)
 
 	// Create and start workers - they manage themselves
-	// Worker type depends on queue mode
-	mode := q.getMode()
-
 	for i := 0; i < workerCount; i++ {
 		var w Worker
-		if mode == QueueModeExclusion {
-			w = NewExclusionWorker(
-				fmt.Sprintf("%s-exclusion-worker-%d", q.name, i),
-				q,
-				boltInstance,
-				q.name,
-				shutdownCtx,
-			)
-		} else {
-			// Traversal or retry mode use traversal workers
-			w = NewTraversalWorker(
-				fmt.Sprintf("%s-worker-%d", q.name, i),
-				q,
-				boltInstance,
-				adapter,
-				q.name,
-				shutdownCtx,
-			)
-		}
+		// Traversal or retry mode use traversal workers
+		w = NewTraversalWorker(
+			fmt.Sprintf("%s-worker-%d", q.name, i),
+			q,
+			boltInstance,
+			adapter,
+			q.name,
+			shutdownCtx,
+		)
 		q.AddWorker(w)
 		go w.Run()
 	}
@@ -393,14 +379,6 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 				return q.markComplete("No pending tasks found for round %d - traversal complete (first pull)", currentRound)
 			}
 
-		case QueueModeExclusion:
-			// Exclusion: complete when we've scanned past maxKnownDepth
-			// This ensures we process all existing levels from the original traversal
-			maxKnownDepth := q.getMaxKnownDepth()
-			if currentRound > maxKnownDepth {
-				return q.markComplete("Exclusion sweep complete - scanned past maxKnownDepth (%d) and holding buckets empty at round %d", maxKnownDepth, currentRound)
-			}
-			// At or below maxKnownDepth - rounds will advance naturally
 
 		case QueueModeRetry:
 			// Retry: use traversal rules past maxKnownDepth (exhausted all possible depths beyond known tree)
@@ -958,8 +936,6 @@ func (q *Queue) pullTasksForMode(force bool) {
 	mode := q.getMode()
 
 	switch mode {
-	case QueueModeExclusion:
-		q.PullExclusionTasks(force)
 	case QueueModeRetry:
 		q.PullRetryTasks(force)
 	default: // QueueModeTraversal
@@ -1369,13 +1345,11 @@ func (q *Queue) Run() {
 
 		// Get current round
 		currentRound := q.getRound()
-		mode := q.getMode()
 		coordinator := q.getCoordinator()
 
 		// GATE CHECK: Can we start processing this round? (DST only - SRC has no gates)
-		// Exclusion mode has no coordinator gating (single queue operation)
 		// This check happens IMMEDIATELY at the start of each iteration, before any task processing.
-		if q.name == "dst" && coordinator != nil && mode != QueueModeExclusion {
+		if q.name == "dst" && coordinator != nil {
 			canStartRound := coordinator.CanDstStartRound(currentRound)
 
 			if !canStartRound {
@@ -1508,12 +1482,7 @@ func (q *Queue) advanceToNextRound() {
 	}
 
 	if logservice.LS != nil {
-		mode := q.getMode()
-		if mode == QueueModeExclusion {
-			_ = logservice.LS.Log("info", fmt.Sprintf("Advanced to round %d (exclusion mode)", newRound), "queue", q.name, q.name)
-		} else {
-			_ = logservice.LS.Log("info", fmt.Sprintf("Advanced to round %d", newRound), "queue", q.name, q.name)
-		}
+		_ = logservice.LS.Log("info", fmt.Sprintf("Advanced to round %d", newRound), "queue", q.name, q.name)
 	}
 
 	// Pull tasks for the new round

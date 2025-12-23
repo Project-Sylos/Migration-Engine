@@ -469,15 +469,6 @@ func (q *Queue) enqueuePending(task *TaskBase) bool {
 	return true
 }
 
-// getPendingCountAndEnqueue returns the pending count before enqueueing, then enqueues
-// Returns (count before, count after, was added)
-func (q *Queue) getPendingCountAndEnqueue(task *TaskBase) (int, int, bool) {
-	beforeCount := q.getPendingCount()
-	wasAdded := q.enqueuePending(task)
-	afterCount := q.getPendingCount()
-	return beforeCount, afterCount, wasAdded
-}
-
 // dequeuePending atomically dequeues a task from the pending buffer
 func (q *Queue) dequeuePending() *TaskBase {
 	for {
