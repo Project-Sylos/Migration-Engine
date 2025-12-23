@@ -10,7 +10,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"sync"
 	"time"
 
@@ -137,43 +136,113 @@ func newETLStats(queueType string) *ETLStats {
 	}
 }
 
-// addProcessed increments processed count
-func (s *ETLStats) addProcessed(count int64) {
-	s.mu.Lock()
-	s.TotalProcessed += count
-	s.mu.Unlock()
+// Getters and setters for ETLStats (all thread-safe)
+
+// GetQueueType returns the queue type
+func (s *ETLStats) GetQueueType() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.QueueType
 }
 
-// addFlushed increments flushed count
-func (s *ETLStats) addFlushed(count int64) {
+// GetTotalProcessed returns the total processed count
+func (s *ETLStats) GetTotalProcessed() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.TotalProcessed
+}
+
+// SetTotalProcessed sets the total processed count
+func (s *ETLStats) SetTotalProcessed(count int64) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.TotalProcessed = count
+}
+
+// AddProcessed increments processed count
+func (s *ETLStats) AddProcessed(count int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.TotalProcessed += count
+}
+
+// GetTotalFlushed returns the total flushed count
+func (s *ETLStats) GetTotalFlushed() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.TotalFlushed
+}
+
+// SetTotalFlushed sets the total flushed count
+func (s *ETLStats) SetTotalFlushed(count int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.TotalFlushed = count
+}
+
+// AddFlushed increments flushed count
+func (s *ETLStats) AddFlushed(count int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.TotalFlushed += count
 	s.LastFlushTime = time.Now()
-	s.mu.Unlock()
+}
+
+// GetStartTime returns the start time
+func (s *ETLStats) GetStartTime() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.StartTime
+}
+
+// GetLastReportTime returns the last report time
+func (s *ETLStats) GetLastReportTime() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.LastReportTime
+}
+
+// SetLastReportTime sets the last report time
+func (s *ETLStats) SetLastReportTime(t time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.LastReportTime = t
+}
+
+// GetLastFlushTime returns the last flush time
+func (s *ETLStats) GetLastFlushTime() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.LastFlushTime
 }
 
 // report prints performance stats
 func (s *ETLStats) report() {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	now := time.Now()
-	elapsed := now.Sub(s.StartTime)
-	timeSinceLastReport := now.Sub(s.LastReportTime)
 
+	// Check if we should report (quick check without holding lock)
+	lastReportTime := s.GetLastReportTime()
+	timeSinceLastReport := now.Sub(lastReportTime)
 	if timeSinceLastReport < statsReportInterval {
 		return
 	}
 
-	processedRate := float64(s.TotalProcessed) / elapsed.Seconds()
-	flushedRate := float64(s.TotalFlushed) / elapsed.Seconds()
+	// Get all stats we need for reporting
+	startTime := s.GetStartTime()
+	elapsed := now.Sub(startTime)
+	totalProcessed := s.GetTotalProcessed()
+	totalFlushed := s.GetTotalFlushed()
+	queueType := s.GetQueueType()
+
+	// Calculate rates and print (no locks held during I/O)
+	processedRate := float64(totalProcessed) / elapsed.Seconds()
+	flushedRate := float64(totalFlushed) / elapsed.Seconds()
 
 	fmt.Printf("[ETL %s] Processed: %d (%.0f/sec) | Flushed: %d (%.0f/sec) | Elapsed: %v\n",
-		s.QueueType, s.TotalProcessed, processedRate, s.TotalFlushed, flushedRate, elapsed.Round(time.Second))
+		queueType, totalProcessed, processedRate, totalFlushed, flushedRate, elapsed.Round(time.Second))
 
-	s.mu.Lock()
-	s.LastReportTime = now
-	s.mu.Unlock()
+	// Update LastReportTime
+	s.SetLastReportTime(now)
 }
 
 // MigrateBoltToDuck migrates data from BoltDB to DuckDB
@@ -368,39 +437,6 @@ func transformTraversalStatus(ns *db.NodeState) string {
 }
 
 // nodeBuffer holds rows for a specific queue type with mutex protection
-type nodeBuffer struct {
-	mu    sync.Mutex
-	rows  []NodeRow
-	table string
-}
-
-// add appends a row to the buffer
-func (nb *nodeBuffer) add(row NodeRow) {
-	nb.mu.Lock()
-	nb.rows = append(nb.rows, row)
-	nb.mu.Unlock()
-}
-
-// shouldFlush checks if buffer has reached flush threshold
-func (nb *nodeBuffer) shouldFlush() bool {
-	nb.mu.Lock()
-	defer nb.mu.Unlock()
-	return len(nb.rows) >= defaultBatchSize
-}
-
-// snapshot takes a snapshot of the buffer and clears it
-func (nb *nodeBuffer) snapshot() []NodeRow {
-	nb.mu.Lock()
-	defer nb.mu.Unlock()
-	if len(nb.rows) == 0 {
-		return nil
-	}
-	// Take snapshot and clear buffer
-	batch := make([]NodeRow, len(nb.rows))
-	copy(batch, nb.rows)
-	nb.rows = make([]NodeRow, 0, defaultBatchSize)
-	return batch
-}
 
 // migrateNodes migrates nodes from BoltDB to DuckDB using streaming worker pools
 func migrateNodes(boltDB *db.DB, duckDB *DuckDB, queueType string, numWorkers int) error {
@@ -411,10 +447,7 @@ func migrateNodes(boltDB *db.DB, duckDB *DuckDB, queueType string, numWorkers in
 	}
 
 	// Create buffer for this queue type
-	buffer := &nodeBuffer{
-		rows:  make([]NodeRow, 0, defaultBatchSize),
-		table: tableName,
-	}
+	buffer := NewNodeBuffer(tableName)
 
 	// Create stats tracker
 	stats := newETLStats(queueType)
@@ -509,7 +542,8 @@ func migrateNodes(boltDB *db.DB, duckDB *DuckDB, queueType string, numWorkers in
 	}
 
 	stats.report()
-	fmt.Printf("[ETL %s] Completed: %d nodes migrated\n", queueType, stats.TotalFlushed)
+	totalFlushed := stats.GetTotalFlushed()
+	fmt.Printf("[ETL %s] Completed: %d nodes migrated\n", queueType, totalFlushed)
 
 	return nil
 }
@@ -518,7 +552,7 @@ func migrateNodes(boltDB *db.DB, duckDB *DuckDB, queueType string, numWorkers in
 func migrateNodesWorker(boltDB *db.DB, nodeIDs []string, queueType string, buffer *nodeBuffer, stats *ETLStats) error {
 	processed := int64(0)
 	defer func() {
-		stats.addProcessed(processed)
+		stats.AddProcessed(processed)
 	}()
 
 	return boltDB.View(func(tx *bolt.Tx) error {
@@ -580,6 +614,13 @@ func migrateNodesWorker(boltDB *db.DB, nodeIDs []string, queueType string, buffe
 			}
 
 			// Compute path hash
+			/* TODO: This is already in the buckets but not a way to get it from the ULID or path itself, so we'll need to rework the bolt 
+			buckets to include this. Maybe in the node entry itself perhaps.
+			This is wasteful to compute it here (again). For now this will work.
+			For my optimization nerds, make that change and update it here to 
+			pull from wherever you are storing it in the buckets instead. 
+			It's cheap to calculate during traversal, but not so cheap here.
+			*/
 			pathHash := db.HashPath(ns.Path)
 
 			// Transform status
@@ -618,7 +659,7 @@ func migrateNodesWorker(boltDB *db.DB, nodeIDs []string, queueType string, buffe
 				row.SrcID = joinID
 			}
 
-			buffer.add(row)
+			buffer.Add(row)
 			processed++
 		}
 
@@ -631,29 +672,53 @@ func migrateNodesWriter(buffer *nodeBuffer, appender *duckdb.Appender, tableName
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
+	var flushErr error
+	var flushErrMu sync.Mutex
+
 	for {
 		select {
 		case <-workersDone:
 			// Workers are done, flush any remaining data before exiting
+			// Wait for any in-flight flush to complete
 			for {
-				batch := buffer.snapshot()
-				if len(batch) == 0 {
-					return nil
+				if buffer.IsFlushing() {
+					time.Sleep(50 * time.Millisecond)
+					continue
 				}
-				if err := flushNodeBatch(appender, batch, tableName, stats); err != nil {
+				batch := buffer.GetAndClear()
+				if batch == nil {
+					flushErrMu.Lock()
+					err := flushErr
+					flushErrMu.Unlock()
 					return err
 				}
+				buffer.SetFlushing(true)
+
+				// Flush synchronously on final flush
+				if err := flushNodeBatch(appender, batch, tableName, stats); err != nil {
+					buffer.SetFlushing(false)
+					return err
+				}
+
+				buffer.SetFlushing(false)
 			}
 		case <-ticker.C:
-			// Check if we should flush (threshold reached)
-			if buffer.shouldFlush() {
-				batch := buffer.snapshot()
-				if len(batch) > 0 {
-					if err := flushNodeBatch(appender, batch, tableName, stats); err != nil {
-						return err
-					}
-				}
+			// Snapshot + unlock + flush synchronously (appender is not thread-safe)
+			batch := buffer.GetAndClearIfReady()
+			if batch == nil {
+				// Report stats periodically
+				stats.report()
+				continue
 			}
+
+			// Flush synchronously (appender must be used from single goroutine)
+			if err := flushNodeBatch(appender, batch, tableName, stats); err != nil {
+				buffer.SetFlushing(false)
+				return err
+			}
+
+			buffer.SetFlushing(false)
+
 			// Report stats periodically
 			stats.report()
 		}
@@ -661,80 +726,93 @@ func migrateNodesWriter(buffer *nodeBuffer, appender *duckdb.Appender, tableName
 }
 
 // flushNodeBatch flushes a batch of node rows using the appender
+// Chunks the batch to avoid blocking for too long
 func flushNodeBatch(appender *duckdb.Appender, batch []NodeRow, tableName string, stats *ETLStats) error {
-	for _, row := range batch {
-		var err error
+	const chunkSize = 10_000
 
-		// Convert *int64 to interface{} (nil or int64) for DuckDB
-		var sizeValue interface{}
-		if row.Size != nil {
-			sizeValue = *row.Size
-		} else {
-			sizeValue = nil
+	for i := 0; i < len(batch); i += chunkSize {
+		end := i + chunkSize
+		if end > len(batch) {
+			end = len(batch)
 		}
 
-		// Convert int to int32 for DuckDB INTEGER type
-		depthValue := int32(row.Depth)
+		for _, row := range batch[i:end] {
+			var err error
 
-		// Convert *string to interface{} (nil or string) for nullable join IDs
-		var dstIDValue interface{}
-		if row.DstID != nil {
-			dstIDValue = *row.DstID
-		} else {
-			dstIDValue = nil
+			// Convert *int64 to interface{} (nil or int64) for DuckDB
+			var sizeValue interface{}
+			if row.Size != nil {
+				sizeValue = *row.Size
+			} else {
+				sizeValue = nil
+			}
+
+			// Convert int to int32 for DuckDB INTEGER type
+			depthValue := int32(row.Depth)
+
+			// Convert *string to interface{} (nil or string) for nullable join IDs
+			var dstIDValue interface{}
+			if row.DstID != nil {
+				dstIDValue = *row.DstID
+			} else {
+				dstIDValue = nil
+			}
+
+			var srcIDValue interface{}
+			if row.SrcID != nil {
+				srcIDValue = *row.SrcID
+			} else {
+				srcIDValue = nil
+			}
+
+			if tableName == "src_nodes" {
+				err = appender.AppendRow(
+					row.ID,
+					row.ServiceID,
+					row.ParentID,
+					row.ParentServiceID,
+					row.ParentPath,
+					row.Name,
+					row.Path,
+					row.PathHash,
+					row.ChildIDs,
+					row.Type,
+					sizeValue,
+					row.MTime,
+					depthValue,
+					row.TraversalStatus,
+					row.CopyStatus,
+					dstIDValue,
+				)
+			} else {
+				err = appender.AppendRow(
+					row.ID,
+					row.ServiceID,
+					row.ParentID,
+					row.ParentServiceID,
+					row.ParentPath,
+					row.Name,
+					row.Path,
+					row.PathHash,
+					row.ChildIDs,
+					row.Type,
+					sizeValue,
+					row.MTime,
+					depthValue,
+					row.TraversalStatus,
+					row.CopyStatus,
+					srcIDValue,
+				)
+			}
+			if err != nil {
+				return fmt.Errorf("failed to append row: %w", err)
+			}
 		}
 
-		var srcIDValue interface{}
-		if row.SrcID != nil {
-			srcIDValue = *row.SrcID
-		} else {
-			srcIDValue = nil
-		}
-
-		if tableName == "src_nodes" {
-			err = appender.AppendRow(
-				row.ID,
-				row.ServiceID,
-				row.ParentID,
-				row.ParentServiceID,
-				row.ParentPath,
-				row.Name,
-				row.Path,
-				row.PathHash,
-				row.ChildIDs,
-				row.Type,
-				sizeValue,
-				row.MTime,
-				depthValue,
-				row.TraversalStatus,
-				row.CopyStatus,
-				dstIDValue,
-			)
-		} else {
-			err = appender.AppendRow(
-				row.ID,
-				row.ServiceID,
-				row.ParentID,
-				row.ParentServiceID,
-				row.ParentPath,
-				row.Name,
-				row.Path,
-				row.PathHash,
-				row.ChildIDs,
-				row.Type,
-				sizeValue,
-				row.MTime,
-				depthValue,
-				row.TraversalStatus,
-				row.CopyStatus,
-				srcIDValue,
-			)
-		}
-		if err != nil {
-			return fmt.Errorf("failed to append row: %w", err)
-		}
+		// Update stats after each chunk
+		stats.AddFlushed(int64(end - i))
 	}
-	stats.addFlushed(int64(len(batch)))
+
 	return nil
 }
 
@@ -811,52 +889,10 @@ func migrateQueueStats(boltDB *db.DB, duckDB *DuckDB) error {
 	})
 }
 
-// logBuffer holds log entries with mutex protection and row numbers for ordering
-type logBuffer struct {
-	mu      sync.Mutex
-	entries []LogRow
-}
-
-// add appends a log entry to the buffer
-func (lb *logBuffer) add(entry LogRow) {
-	lb.mu.Lock()
-	lb.entries = append(lb.entries, entry)
-	lb.mu.Unlock()
-}
-
-// shouldFlush checks if buffer has reached flush threshold
-func (lb *logBuffer) shouldFlush() bool {
-	lb.mu.Lock()
-	defer lb.mu.Unlock()
-	return len(lb.entries) >= defaultBatchSize
-}
-
-// snapshot takes a snapshot of the buffer, sorts by row number, and clears it
-func (lb *logBuffer) snapshot() []LogRow {
-	lb.mu.Lock()
-	defer lb.mu.Unlock()
-	if len(lb.entries) == 0 {
-		return nil
-	}
-	// Take snapshot and clear buffer
-	batch := make([]LogRow, len(lb.entries))
-	copy(batch, lb.entries)
-	lb.entries = make([]LogRow, 0, defaultBatchSize)
-
-	// Sort by row number to preserve chronological order
-	sort.Slice(batch, func(i, j int) bool {
-		return batch[i].RowNum < batch[j].RowNum
-	})
-
-	return batch
-}
-
 // migrateLogs migrates log entries using streaming worker pools
 func migrateLogs(boltDB *db.DB, duckDB *DuckDB, numWorkers int) error {
 	// Create buffer for logs
-	buffer := &logBuffer{
-		entries: make([]LogRow, 0, defaultBatchSize),
-	}
+	buffer := NewLogBuffer()
 
 	// Create stats tracker
 	stats := newETLStats("logs")
@@ -967,7 +1003,8 @@ func migrateLogs(boltDB *db.DB, duckDB *DuckDB, numWorkers int) error {
 	}
 
 	stats.report()
-	fmt.Printf("[ETL logs] Completed: %d log entries migrated\n", stats.TotalFlushed)
+	totalFlushed := stats.GetTotalFlushed()
+	fmt.Printf("[ETL logs] Completed: %d log entries migrated\n", totalFlushed)
 
 	return nil
 }
@@ -982,7 +1019,7 @@ type logKey struct {
 func migrateLogsWorker(boltDB *db.DB, logKeys []logKey, startRowNum int, buffer *logBuffer, stats *ETLStats) error {
 	processed := int64(0)
 	defer func() {
-		stats.addProcessed(processed)
+		stats.AddProcessed(processed)
 	}()
 
 	return boltDB.View(func(tx *bolt.Tx) error {
@@ -1002,7 +1039,7 @@ func migrateLogsWorker(boltDB *db.DB, logKeys []logKey, startRowNum int, buffer 
 				continue
 			}
 
-			buffer.add(LogRow{
+			buffer.Add(LogRow{
 				Entry:  entry,
 				RowNum: startRowNum + i,
 			})
@@ -1018,29 +1055,53 @@ func migrateLogsWriter(buffer *logBuffer, appender *duckdb.Appender, stats *ETLS
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
+	var flushErr error
+	var flushErrMu sync.Mutex
+
 	for {
 		select {
 		case <-workersDone:
 			// Workers are done, flush any remaining data before exiting
+			// Wait for any in-flight flush to complete
 			for {
-				batch := buffer.snapshot()
-				if len(batch) == 0 {
-					return nil
+				if buffer.IsFlushing() {
+					time.Sleep(50 * time.Millisecond)
+					continue
 				}
-				if err := flushLogBatch(appender, batch, stats); err != nil {
+				batch := buffer.GetAndClearSorted()
+				if batch == nil {
+					flushErrMu.Lock()
+					err := flushErr
+					flushErrMu.Unlock()
 					return err
 				}
+				buffer.SetFlushing(true)
+
+				// Flush synchronously on final flush
+				if err := flushLogBatch(appender, batch, stats); err != nil {
+					buffer.SetFlushing(false)
+					return err
+				}
+
+				buffer.SetFlushing(false)
 			}
 		case <-ticker.C:
-			// Check if we should flush (threshold reached)
-			if buffer.shouldFlush() {
-				batch := buffer.snapshot()
-				if len(batch) > 0 {
-					if err := flushLogBatch(appender, batch, stats); err != nil {
-						return err
-					}
-				}
+			// Snapshot + unlock + flush synchronously (appender is not thread-safe)
+			batch := buffer.GetAndClearSortedIfReady()
+			if batch == nil {
+				// Report stats periodically
+				stats.report()
+				continue
 			}
+
+			// Flush synchronously (appender must be used from single goroutine)
+			if err := flushLogBatch(appender, batch, stats); err != nil {
+				buffer.SetFlushing(false)
+				return err
+			}
+
+			buffer.SetFlushing(false)
+
 			// Report stats periodically
 			stats.report()
 		}
@@ -1048,22 +1109,35 @@ func migrateLogsWriter(buffer *logBuffer, appender *duckdb.Appender, stats *ETLS
 }
 
 // flushLogBatch flushes a batch of log entries using the appender
+// Chunks the batch to avoid blocking for too long
 func flushLogBatch(appender *duckdb.Appender, batch []LogRow, stats *ETLStats) error {
-	for _, logRow := range batch {
-		entry := logRow.Entry
-		if err := appender.AppendRow(
-			entry.ID,
-			entry.Timestamp,
-			entry.Level,
-			entry.Entity,
-			entry.EntityID,
-			entry.Message,
-			entry.Queue,
-		); err != nil {
-			return fmt.Errorf("failed to append log row: %w", err)
+	const chunkSize = 10_000
+
+	for i := 0; i < len(batch); i += chunkSize {
+		end := i + chunkSize
+		if end > len(batch) {
+			end = len(batch)
 		}
+
+		for _, logRow := range batch[i:end] {
+			entry := logRow.Entry
+			if err := appender.AppendRow(
+				entry.ID,
+				entry.Timestamp,
+				entry.Level,
+				entry.Entity,
+				entry.EntityID,
+				entry.Message,
+				entry.Queue,
+			); err != nil {
+				return fmt.Errorf("failed to append log row: %w", err)
+			}
+		}
+
+		// Update stats after each chunk
+		stats.AddFlushed(int64(end - i))
 	}
-	stats.addFlushed(int64(len(batch)))
+
 	return nil
 }
 
