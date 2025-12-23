@@ -13,25 +13,30 @@ import (
 const (
 	TaskTypeSrcTraversal = "src-traversal"
 	TaskTypeDstTraversal = "dst-traversal"
+	TaskTypeExclusion    = "exclusion"
 	TaskTypeUpload       = "upload"
 	TaskTypeCopy         = "copy"
 )
 
 // TaskBase represents the foundational structure for all task types.
 // Workers lease tasks, mark them Locked, and attempt execution.
-// Tasks are identified by absolute paths (Id) but reconciled by root-relative paths (LocationPath).
+// Tasks are identified by ULID (ID) for internal tracking.
 type TaskBase struct {
-	Type               string         // Task type: "src-traversal", "dst-traversal", "upload", etc.
-	Folder             types.Folder   // Folder to process (if applicable)
-	File               types.File     // File to process (if applicable)
-	Locked             bool           // Whether this task is currently leased by a worker
-	Attempts           int            // Number of execution attempts
-	Status             string         // Execution result: "successful", "failed"
-	ExpectedFolders    []types.Folder // Expected folders (dst tasks only)
-	ExpectedFiles      []types.File   // Expected files (dst tasks only)
-	DiscoveredChildren []ChildResult  // Children discovered during execution
-	Round              int            // The round this task belongs to (for buffer coordination)
-	LeaseTime          time.Time      // Time when task was leased (for execution time tracking)
+	ID                 string            // ULID for internal tracking (database keys)
+	Type               string            // Task type: "src-traversal", "dst-traversal", "upload", etc.
+	Folder             types.Folder      // Folder to process (if applicable)
+	File               types.File        // File to process (if applicable)
+	Locked             bool              // Whether this task is currently leased by a worker
+	Attempts           int               // Number of execution attempts
+	Status             string            // Execution result: "successful", "failed"
+	ExpectedFolders    []types.Folder    // Expected folders (dst tasks only)
+	ExpectedFiles      []types.File      // Expected files (dst tasks only)
+	ExpectedSrcIDMap   map[string]string // Map of Type+Name -> SRC node ID for matching (dst tasks only)
+	DiscoveredChildren []ChildResult     // Children discovered during execution
+	Round              int               // The round this task belongs to (for buffer coordination)
+	LeaseTime          time.Time         // Time when task was leased (for execution time tracking)
+	ExclusionMode      string            // Exclusion mode: "exclude" or "unexclude" (exclusion tasks only)
+	PreviousStatus     string            // Previous status before exclusion (for status bucket tracking)
 }
 
 // ChildResult represents a discovered child node with its traversal status.
@@ -40,14 +45,15 @@ type ChildResult struct {
 	File   types.File   // File info (if file)
 	Status string       // "pending", "successful", "missing", "not_on_src"
 	IsFile bool         // true if this is a file, false if folder
+	SrcID  string       // ULID of corresponding SRC node (for DST nodes only, set during matching)
 }
 
 // Identifier returns the unique identifier for this task (absolute path).
 func (t *TaskBase) Identifier() string {
-	if t.Folder.Id != "" {
-		return t.Folder.Id
+	if t.Folder.ServiceID != "" {
+		return t.Folder.ServiceID
 	}
-	return t.File.Id
+	return t.File.ServiceID
 }
 
 // LocationPath returns the logical, root-relative path for this task.
@@ -60,12 +66,12 @@ func (t *TaskBase) LocationPath() string {
 
 // IsFolder returns whether this task represents a folder traversal.
 func (t *TaskBase) IsFolder() bool {
-	return t.Folder.Id != ""
+	return t.Folder.ServiceID != ""
 }
 
 // IsFile returns whether this task represents a file operation.
 func (t *TaskBase) IsFile() bool {
-	return t.File.Id != ""
+	return t.File.ServiceID != ""
 }
 
 // UploadTask represents a task to upload a file from source to destination.

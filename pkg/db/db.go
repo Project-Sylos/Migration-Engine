@@ -74,33 +74,75 @@ func Open(opts Options) (*DB, error) {
 // This is called once when the database is first opened.
 func (db *DB) initializeBuckets() error {
 	return db.Update(func(tx *bolt.Tx) error {
-		// Create top-level buckets
-		for _, topLevel := range []string{"SRC", "DST", "LOGS"} {
-			bucket, err := tx.CreateBucketIfNotExists([]byte(topLevel))
+		// Create Traversal-Data root bucket for all traversal-related data
+		traversalBucket, err := tx.CreateBucketIfNotExists([]byte("Traversal-Data"))
+		if err != nil {
+			return fmt.Errorf("failed to create Traversal-Data bucket: %w", err)
+		}
+
+		// Create SRC and DST buckets under Traversal-Data
+		for _, queueType := range []string{"SRC", "DST"} {
+			queueBucket, err := traversalBucket.CreateBucketIfNotExists([]byte(queueType))
 			if err != nil {
-				return fmt.Errorf("failed to create %s bucket: %w", topLevel, err)
+				return fmt.Errorf("failed to create %s bucket: %w", queueType, err)
 			}
 
-			// For SRC and DST, create sub-buckets
-			if topLevel == "SRC" || topLevel == "DST" {
-				// Create nodes bucket
-				if _, err := bucket.CreateBucketIfNotExists([]byte("nodes")); err != nil {
-					return fmt.Errorf("failed to create %s/nodes bucket: %w", topLevel, err)
-				}
+			// Create nodes bucket
+			if _, err := queueBucket.CreateBucketIfNotExists([]byte("nodes")); err != nil {
+				return fmt.Errorf("failed to create Traversal-Data/%s/nodes bucket: %w", queueType, err)
+			}
 
-				// Create children bucket
-				if _, err := bucket.CreateBucketIfNotExists([]byte("children")); err != nil {
-					return fmt.Errorf("failed to create %s/children bucket: %w", topLevel, err)
-				}
+			// Create children bucket
+			if _, err := queueBucket.CreateBucketIfNotExists([]byte("children")); err != nil {
+				return fmt.Errorf("failed to create Traversal-Data/%s/children bucket: %w", queueType, err)
+			}
 
-				// Create levels bucket (individual level buckets created on demand)
-				if _, err := bucket.CreateBucketIfNotExists([]byte("levels")); err != nil {
-					return fmt.Errorf("failed to create %s/levels bucket: %w", topLevel, err)
-				}
+			// Create levels bucket (individual level buckets created on demand)
+			if _, err := queueBucket.CreateBucketIfNotExists([]byte("levels")); err != nil {
+				return fmt.Errorf("failed to create Traversal-Data/%s/levels bucket: %w", queueType, err)
+			}
+
+			// Create exclusion-holding bucket (regular bucket, not nested)
+			// This stores path hash -> depth level mappings for exclusion intent queuing
+			if _, err := queueBucket.CreateBucketIfNotExists([]byte("exclusion-holding")); err != nil {
+				return fmt.Errorf("failed to create Traversal-Data/%s/exclusion-holding bucket: %w", queueType, err)
+			}
+
+			// Create unexclusion-holding bucket (regular bucket, not nested)
+			// This stores path hash -> depth level mappings for unexclusion intent queuing
+			if _, err := queueBucket.CreateBucketIfNotExists([]byte("unexclusion-holding")); err != nil {
+				return fmt.Errorf("failed to create Traversal-Data/%s/unexclusion-holding bucket: %w", queueType, err)
+			}
+
+			// Create path-to-ulid lookup bucket
+			// This stores path hash -> ULID mappings for API path-based queries
+			if _, err := queueBucket.CreateBucketIfNotExists([]byte("path-to-ulid")); err != nil {
+				return fmt.Errorf("failed to create Traversal-Data/%s/path-to-ulid bucket: %w", queueType, err)
 			}
 		}
 
-		// Initialize stats bucket
+		// Create src-to-dst lookup bucket under SRC
+		srcBucket := traversalBucket.Bucket([]byte("SRC"))
+		if srcBucket != nil {
+			if _, err := srcBucket.CreateBucketIfNotExists([]byte("src-to-dst")); err != nil {
+				return fmt.Errorf("failed to create Traversal-Data/SRC/src-to-dst bucket: %w", err)
+			}
+		}
+
+		// Create dst-to-src lookup bucket under DST
+		dstBucket := traversalBucket.Bucket([]byte("DST"))
+		if dstBucket != nil {
+			if _, err := dstBucket.CreateBucketIfNotExists([]byte("dst-to-src")); err != nil {
+				return fmt.Errorf("failed to create Traversal-Data/DST/dst-to-src bucket: %w", err)
+			}
+		}
+
+		// Create LOGS bucket as separate top-level (its own island)
+		if _, err := tx.CreateBucketIfNotExists([]byte("LOGS")); err != nil {
+			return fmt.Errorf("failed to create LOGS bucket: %w", err)
+		}
+
+		// Initialize stats bucket (under Traversal-Data)
 		if err := initializeStatsBucket(tx); err != nil {
 			return fmt.Errorf("failed to initialize stats bucket: %w", err)
 		}
@@ -227,26 +269,35 @@ func (db *DB) IsTemporary() bool {
 // Returns an error if any structural issues are found.
 func (db *DB) ValidateCoreSchema() error {
 	return db.View(func(tx *bolt.Tx) error {
-		// Validate top-level buckets
-		requiredTopLevel := []string{BucketSrc, BucketDst, BucketLogs, StatsBucketName}
-		for _, name := range requiredTopLevel {
-			if tx.Bucket([]byte(name)) == nil {
-				return fmt.Errorf("missing top-level bucket: %s", name)
-			}
+		// Validate top-level buckets: Traversal-Data and LOGS
+		traversalBucket := tx.Bucket([]byte("Traversal-Data"))
+		if traversalBucket == nil {
+			return fmt.Errorf("missing top-level bucket: Traversal-Data")
 		}
 
-		// Validate SRC and DST structure
+		logsBucket := tx.Bucket([]byte(BucketLogs))
+		if logsBucket == nil {
+			return fmt.Errorf("missing top-level bucket: %s", BucketLogs)
+		}
+
+		// Validate STATS bucket under Traversal-Data
+		statsBucket := traversalBucket.Bucket([]byte(StatsBucketName))
+		if statsBucket == nil {
+			return fmt.Errorf("missing stats bucket: Traversal-Data/%s", StatsBucketName)
+		}
+
+		// Validate SRC and DST structure under Traversal-Data
 		for _, queueType := range []string{BucketSrc, BucketDst} {
-			topBucket := tx.Bucket([]byte(queueType))
+			topBucket := traversalBucket.Bucket([]byte(queueType))
 			if topBucket == nil {
-				return fmt.Errorf("missing top-level bucket: %s", queueType)
+				return fmt.Errorf("missing queue bucket: Traversal-Data/%s", queueType)
 			}
 
 			// Validate required sub-buckets: nodes, children, levels
 			requiredSubBuckets := []string{SubBucketNodes, SubBucketChildren, SubBucketLevels}
 			for _, subName := range requiredSubBuckets {
 				if topBucket.Bucket([]byte(subName)) == nil {
-					return fmt.Errorf("missing %s/%s bucket", queueType, subName)
+					return fmt.Errorf("missing Traversal-Data/%s/%s bucket", queueType, subName)
 				}
 			}
 
@@ -275,16 +326,10 @@ func (db *DB) ValidateCoreSchema() error {
 				// Validate each status bucket exists
 				for _, status := range requiredStatuses {
 					if levelBucket.Bucket([]byte(status)) == nil {
-						return fmt.Errorf("missing status bucket %s/%s/%s/%s", queueType, SubBucketLevels, string(levelKey), status)
+						return fmt.Errorf("missing status bucket Traversal-Data/%s/%s/%s/%s", queueType, SubBucketLevels, string(levelKey), status)
 					}
 				}
 			}
-		}
-
-		// Validate LOGS bucket structure
-		logsBucket := tx.Bucket([]byte(BucketLogs))
-		if logsBucket == nil {
-			return fmt.Errorf("missing top-level bucket: %s", BucketLogs)
 		}
 
 		// Note: Log level buckets (trace, debug, info, warning, error, critical) are created

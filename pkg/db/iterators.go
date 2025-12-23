@@ -15,9 +15,9 @@ type IteratorOptions struct {
 	Limit int
 }
 
-// IterateStatusBucket iterates over all path hashes in a status bucket.
-// The callback receives the pathHash for each item in the status bucket.
-func (db *DB) IterateStatusBucket(queueType string, level int, status string, opts IteratorOptions, fn func(pathHash []byte) error) error {
+// IterateStatusBucket iterates over all ULIDs in a status bucket.
+// The callback receives the ULID (nodeID) for each item in the status bucket.
+func (db *DB) IterateStatusBucket(queueType string, level int, status string, opts IteratorOptions, fn func(nodeID []byte) error) error {
 	return db.View(func(tx *bolt.Tx) error {
 		bucket := GetStatusBucket(tx, queueType, level, status)
 		if bucket == nil {
@@ -49,8 +49,8 @@ func (db *DB) IterateStatusBucket(queueType string, level int, status string, op
 }
 
 // IterateNodeStates iterates over all nodes in the nodes bucket.
-// The callback receives the pathHash and NodeState for each node.
-func (db *DB) IterateNodeStates(queueType string, opts IteratorOptions, fn func(pathHash []byte, state *NodeState) error) error {
+// The callback receives the ULID (nodeID) and NodeState for each node.
+func (db *DB) IterateNodeStates(queueType string, opts IteratorOptions, fn func(nodeID []byte, state *NodeState) error) error {
 	return db.View(func(tx *bolt.Tx) error {
 		bucket := GetNodesBucket(tx, queueType)
 		if bucket == nil {
@@ -225,7 +225,7 @@ func (db *DB) GetAllLevels(queueType string) ([]int, error) {
 	var levels []int
 
 	err := db.View(func(tx *bolt.Tx) error {
-		levelsBucket := getBucket(tx, []string{queueType, SubBucketLevels})
+		levelsBucket := getBucket(tx, []string{TraversalDataBucket, queueType, SubBucketLevels})
 		if levelsBucket == nil {
 			return nil // No levels yet
 		}
@@ -277,10 +277,10 @@ func (db *DB) FindMinPendingLevel(queueType string) (int, error) {
 	return minLevel, nil
 }
 
-// LeaseTasksFromStatus retrieves up to limit path hashes from a status bucket.
+// LeaseTasksFromStatus retrieves up to limit ULIDs from a status bucket.
 // This is used for worker task leasing.
 func (db *DB) LeaseTasksFromStatus(queueType string, level int, status string, limit int) ([][]byte, error) {
-	var pathHashes [][]byte
+	var nodeIDs [][]byte
 
 	err := db.View(func(tx *bolt.Tx) error {
 		bucket := GetStatusBucket(tx, queueType, level, status)
@@ -294,20 +294,20 @@ func (db *DB) LeaseTasksFromStatus(queueType string, level int, status string, l
 		for k, _ := cursor.First(); k != nil && count < limit; k, _ = cursor.Next() {
 			keyCopy := make([]byte, len(k))
 			copy(keyCopy, k)
-			pathHashes = append(pathHashes, keyCopy)
+			nodeIDs = append(nodeIDs, keyCopy)
 			count++
 		}
 
 		return nil
 	})
 
-	return pathHashes, err
+	return nodeIDs, err
 }
 
 // BatchFetchWithKeys fetches up to limit NodeStates from a status bucket with their keys.
 // This is used for task leasing in the queue system.
 type FetchResult struct {
-	Key   string // Key for deduplication tracking
+	Key   string // ULID for deduplication tracking
 	State *NodeState
 }
 
@@ -328,9 +328,9 @@ func BatchFetchWithKeys(db *DB, queueType string, level int, status string, limi
 		cursor := statusBucket.Cursor()
 		count := 0
 
-		for pathHash, _ := cursor.First(); pathHash != nil && count < limit; pathHash, _ = cursor.Next() {
-			// Get the node state from nodes bucket
-			nodeData := nodesBucket.Get(pathHash)
+		for nodeIDBytes, _ := cursor.First(); nodeIDBytes != nil && count < limit; nodeIDBytes, _ = cursor.Next() {
+			// Get the node state from nodes bucket using ULID
+			nodeData := nodesBucket.Get(nodeIDBytes)
 			if nodeData == nil {
 				continue // Node was deleted
 			}
@@ -340,8 +340,8 @@ func BatchFetchWithKeys(db *DB, queueType string, level int, status string, limi
 				continue // Skip invalid entries
 			}
 
-			// Use path hash as key for deduplication
-			keyStr := string(pathHash)
+			// Use ULID as key for deduplication
+			keyStr := string(nodeIDBytes)
 
 			results = append(results, FetchResult{
 				Key:   keyStr,

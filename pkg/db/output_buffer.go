@@ -4,6 +4,8 @@
 package db
 
 import (
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -14,11 +16,9 @@ import (
 )
 
 // WriteOperation represents a buffered database write operation.
-// All operations must implement Execute() to perform the actual DB write,
-// and Key() to enable duplicate detection and coalescing.
+// All operations must implement Execute() to perform the actual DB write.
 type WriteOperation interface {
 	Execute(tx *bolt.Tx) error
-	Key() string // Returns a unique key for duplicate detection (typically path hash)
 }
 
 // StatusUpdateOperation represents a node status transition (e.g., pending → successful).
@@ -27,28 +27,17 @@ type StatusUpdateOperation struct {
 	Level     int
 	OldStatus string
 	NewStatus string
-	Path      string
-}
-
-// Key returns the path hash as the unique key for this operation.
-func (op *StatusUpdateOperation) Key() string {
-	return HashPath(op.Path)
+	NodeID    string // ULID of the node
 }
 
 // Execute performs the status update within a transaction.
 func (op *StatusUpdateOperation) Execute(tx *bolt.Tx) error {
-	return UpdateNodeStatusInTx(tx, op.QueueType, op.Level, op.OldStatus, op.NewStatus, op.Path)
+	return UpdateNodeStatusInTxByID(tx, op.QueueType, op.Level, op.OldStatus, op.NewStatus, []byte(op.NodeID))
 }
 
 // BatchInsertOperation represents a batch of child node insertions.
 type BatchInsertOperation struct {
 	Operations []InsertOperation
-}
-
-// Key returns a composite key for batch operations (not used for coalescing, but required by interface).
-func (op *BatchInsertOperation) Key() string {
-	// Batch operations are not coalesced by key - they're merged by path hash during flush
-	return fmt.Sprintf("batch_%d", len(op.Operations))
 }
 
 // Execute performs the batch insert within a transaction.
@@ -61,26 +50,22 @@ type CopyStatusOperation struct {
 	QueueType     string
 	Level         int
 	Status        string
-	Path          string
+	NodeID        string // ULID of the node
 	NewCopyStatus string
-}
-
-// Key returns the path hash as the unique key for this operation.
-func (op *CopyStatusOperation) Key() string {
-	return HashPath(op.Path)
 }
 
 // Execute performs the copy status update within a transaction.
 func (op *CopyStatusOperation) Execute(tx *bolt.Tx) error {
-	pathHash := []byte(HashPath(op.Path))
+	nodeID := []byte(op.NodeID)
+
 	nodesBucket := GetNodesBucket(tx, op.QueueType)
 	if nodesBucket == nil {
 		return fmt.Errorf("nodes bucket not found for %s", op.QueueType)
 	}
 
-	nodeData := nodesBucket.Get(pathHash)
+	nodeData := nodesBucket.Get(nodeID)
 	if nodeData == nil {
-		return fmt.Errorf("node not found: %s", op.Path)
+		return fmt.Errorf("node not found: %s", op.NodeID)
 	}
 
 	ns, err := DeserializeNodeState(nodeData)
@@ -96,11 +81,220 @@ func (op *CopyStatusOperation) Execute(tx *bolt.Tx) error {
 		return fmt.Errorf("failed to serialize node state: %w", err)
 	}
 
-	if err := nodesBucket.Put(pathHash, updatedData); err != nil {
+	if err := nodesBucket.Put(nodeID, updatedData); err != nil {
 		return fmt.Errorf("failed to update node: %w", err)
 	}
 
 	return nil
+}
+
+// ExclusionUpdateOperation represents an exclusion state update for a node.
+type ExclusionUpdateOperation struct {
+	QueueType         string
+	NodeID            string // ULID of the node
+	InheritedExcluded bool
+}
+
+// Execute performs the exclusion state update within a transaction.
+func (op *ExclusionUpdateOperation) Execute(tx *bolt.Tx) error {
+	nodeID := []byte(op.NodeID)
+
+	nodesBucket := GetNodesBucket(tx, op.QueueType)
+	if nodesBucket == nil {
+		return fmt.Errorf("nodes bucket not found for %s", op.QueueType)
+	}
+
+	nodeData := nodesBucket.Get(nodeID)
+	if nodeData == nil {
+		return fmt.Errorf("node not found: %s", op.NodeID)
+	}
+
+	ns, err := DeserializeNodeState(nodeData)
+	if err != nil {
+		return fmt.Errorf("failed to deserialize node state: %w", err)
+	}
+
+	ns.InheritedExcluded = op.InheritedExcluded
+
+	updatedData, err := ns.Serialize()
+	if err != nil {
+		return fmt.Errorf("failed to serialize node state: %w", err)
+	}
+
+	if err := nodesBucket.Put(nodeID, updatedData); err != nil {
+		return fmt.Errorf("failed to update node: %w", err)
+	}
+
+	return nil
+}
+
+// ExclusionHoldingRemoveOperation represents removal of a ULID from exclusion-holding bucket.
+type ExclusionHoldingRemoveOperation struct {
+	QueueType string
+	NodeID    string // ULID of the node
+}
+
+// Execute performs the removal from exclusion-holding bucket within a transaction.
+func (op *ExclusionHoldingRemoveOperation) Execute(tx *bolt.Tx) error {
+	holdingBucket := GetExclusionHoldingBucket(tx, op.QueueType)
+	if holdingBucket == nil {
+		return nil // Bucket doesn't exist, nothing to remove
+	}
+
+	return holdingBucket.Delete([]byte(op.NodeID))
+}
+
+// ExclusionHoldingAddOperation represents addition of a ULID to exclusion-holding bucket.
+type ExclusionHoldingAddOperation struct {
+	QueueType string
+	NodeID    string // ULID of the node
+	Depth     int
+}
+
+// Execute performs the addition to exclusion-holding bucket within a transaction.
+func (op *ExclusionHoldingAddOperation) Execute(tx *bolt.Tx) error {
+	holdingBucket, err := GetOrCreateExclusionHoldingBucket(tx, op.QueueType)
+	if err != nil {
+		return err
+	}
+
+	// Encode depth level as 8 bytes, big-endian
+	depthBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(depthBytes, uint64(op.Depth))
+
+	return holdingBucket.Put([]byte(op.NodeID), depthBytes)
+}
+
+// NodeDeletionOperation represents deletion of a node from all relevant buckets.
+type NodeDeletionOperation struct {
+	QueueType string
+	NodeID    string // ULID of the node
+	Level     int
+	Status    string // Current status before deletion (to determine which status bucket to update)
+}
+
+// Execute performs the node deletion within a transaction.
+// Deletes from: nodes bucket, status bucket, status-lookup bucket, and removes from parent's children list.
+func (op *NodeDeletionOperation) Execute(tx *bolt.Tx) error {
+	nodeID := []byte(op.NodeID)
+
+	// Get node state to determine parent ID
+	nodesBucket := GetNodesBucket(tx, op.QueueType)
+	if nodesBucket == nil {
+		return fmt.Errorf("nodes bucket not found for %s", op.QueueType)
+	}
+
+	nodeData := nodesBucket.Get(nodeID)
+	if nodeData == nil {
+		// Node already deleted, skip
+		return nil
+	}
+
+	// Deserialize to get parent ID
+	ns, err := DeserializeNodeState(nodeData)
+	if err != nil {
+		return fmt.Errorf("failed to deserialize node state: %w", err)
+	}
+
+	// 1. Delete from nodes bucket
+	if err := nodesBucket.Delete(nodeID); err != nil {
+		return fmt.Errorf("failed to delete from nodes bucket: %w", err)
+	}
+
+	// 2. Delete from status bucket
+	statusBucket := GetStatusBucket(tx, op.QueueType, op.Level, op.Status)
+	if statusBucket != nil {
+		statusBucket.Delete(nodeID) // Ignore errors - node may not be in this bucket
+	}
+
+	// 3. Delete from status-lookup bucket
+	lookupBucket := GetStatusLookupBucket(tx, op.QueueType, op.Level)
+	if lookupBucket != nil {
+		lookupBucket.Delete(nodeID) // Ignore errors
+	}
+
+	// 4. Remove from parent's children list
+	if ns.ParentID != "" {
+		childrenBucket := GetChildrenBucket(tx, op.QueueType)
+		if childrenBucket != nil {
+			parentID := []byte(ns.ParentID)
+			childrenData := childrenBucket.Get(parentID)
+			if childrenData != nil {
+				var children []string
+				if err := json.Unmarshal(childrenData, &children); err == nil {
+					// Remove this child's ULID
+					filtered := make([]string, 0, len(children))
+					for _, c := range children {
+						if c != op.NodeID {
+							filtered = append(filtered, c)
+						}
+					}
+
+					// Save updated list
+					if len(filtered) > 0 {
+						updatedData, err := json.Marshal(filtered)
+						if err == nil {
+							childrenBucket.Put(parentID, updatedData)
+						}
+					} else {
+						// No children left, remove entry
+						childrenBucket.Delete(parentID)
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// LookupMappingOperation represents creation of a bidirectional lookup mapping between SRC and DST nodes.
+type LookupMappingOperation struct {
+	SrcID string // ULID of the SRC node
+	DstID string // ULID of the DST node
+}
+
+// Execute performs the lookup mapping creation within a transaction.
+func (op *LookupMappingOperation) Execute(tx *bolt.Tx) error {
+	if op.SrcID == "" || op.DstID == "" {
+		return nil // Skip if either ID is empty
+	}
+
+	// Store DST→SRC mapping
+	dstToSrcBucket, err := GetOrCreateDstToSrcBucket(tx)
+	if err != nil {
+		return fmt.Errorf("failed to get dst-to-src bucket: %w", err)
+	}
+	if err := dstToSrcBucket.Put([]byte(op.DstID), []byte(op.SrcID)); err != nil {
+		return fmt.Errorf("failed to store dst-to-src mapping: %w", err)
+	}
+
+	// Store SRC→DST mapping
+	srcToDstBucket, err := GetOrCreateSrcToDstBucket(tx)
+	if err != nil {
+		return fmt.Errorf("failed to get src-to-dst bucket: %w", err)
+	}
+	if err := srcToDstBucket.Put([]byte(op.SrcID), []byte(op.DstID)); err != nil {
+		return fmt.Errorf("failed to store src-to-dst mapping: %w", err)
+	}
+
+	return nil
+}
+
+// PathToULIDMappingOperation represents a path hash → ULID mapping creation.
+type PathToULIDMappingOperation struct {
+	QueueType string // "SRC" or "DST"
+	Path      string // Full path to hash and map
+	NodeID    string // ULID of the node
+}
+
+// Execute performs the path-to-ulid mapping creation within a transaction.
+func (op *PathToULIDMappingOperation) Execute(tx *bolt.Tx) error {
+	if op.Path == "" || op.NodeID == "" {
+		return nil // Skip if either is empty
+	}
+
+	return SetPathToULIDMapping(tx, op.QueueType, op.Path, op.NodeID)
 }
 
 // OutputBuffer batches write operations for efficient database writes.
@@ -134,13 +328,13 @@ func NewOutputBuffer(db *DB, batchSize int, flushInterval time.Duration) *Output
 }
 
 // AddStatusUpdate adds a status update operation to the buffer.
-func (ob *OutputBuffer) AddStatusUpdate(queueType string, level int, oldStatus, newStatus, path string) {
+func (ob *OutputBuffer) AddStatusUpdate(queueType string, level int, oldStatus, newStatus, nodeID string) {
 	op := &StatusUpdateOperation{
 		QueueType: queueType,
 		Level:     level,
 		OldStatus: oldStatus,
 		NewStatus: newStatus,
-		Path:      path,
+		NodeID:    nodeID,
 	}
 	ob.Add(op)
 }
@@ -157,107 +351,116 @@ func (ob *OutputBuffer) AddBatchInsert(operations []InsertOperation) {
 }
 
 // AddCopyStatusUpdate adds a copy status update operation to the buffer.
-func (ob *OutputBuffer) AddCopyStatusUpdate(queueType string, level int, status, path, newCopyStatus string) {
+func (ob *OutputBuffer) AddCopyStatusUpdate(queueType string, level int, status, nodeID, newCopyStatus string) {
 	op := &CopyStatusOperation{
 		QueueType:     queueType,
 		Level:         level,
 		Status:        status,
-		Path:          path,
+		NodeID:        nodeID,
 		NewCopyStatus: newCopyStatus,
 	}
 	ob.Add(op)
 }
 
-// Add adds a write operation to the buffer. If batch size is reached, it triggers a flush.
-func (ob *OutputBuffer) Add(op WriteOperation) {
-	ob.mu.Lock()
-	defer ob.mu.Unlock()
+// AddExclusionUpdate adds an exclusion state update operation to the buffer.
+func (ob *OutputBuffer) AddExclusionUpdate(queueType string, nodeID string, inheritedExcluded bool) {
+	op := &ExclusionUpdateOperation{
+		QueueType:         queueType,
+		NodeID:            nodeID,
+		InheritedExcluded: inheritedExcluded,
+	}
+	ob.Add(op)
+}
 
-	// Coalesce duplicates: for status updates and copy status, last write wins
-	key := op.Key()
-	if _, ok := op.(*StatusUpdateOperation); ok {
-		// Remove any existing status update for the same path
-		for i := len(ob.operations) - 1; i >= 0; i-- {
-			if existing, ok := ob.operations[i].(*StatusUpdateOperation); ok && existing.Key() == key {
-				ob.operations = append(ob.operations[:i], ob.operations[i+1:]...)
-				break
-			}
-		}
-	} else if _, ok := op.(*CopyStatusOperation); ok {
-		// Remove any existing copy status update for the same path
-		for i := len(ob.operations) - 1; i >= 0; i-- {
-			if existing, ok := ob.operations[i].(*CopyStatusOperation); ok && existing.Key() == key {
-				ob.operations = append(ob.operations[:i], ob.operations[i+1:]...)
-				break
-			}
-		}
-	} else if batchOp, ok := op.(*BatchInsertOperation); ok {
-		// For batch inserts, merge by path hash within the batch
-		ob.mergeBatchInsert(batchOp)
-		return // mergeBatchInsert handles adding to operations
+// AddExclusionHoldingRemove adds a removal from exclusion-holding bucket operation to the buffer.
+func (ob *OutputBuffer) AddExclusionHoldingRemove(queueType string, nodeID string) {
+	op := &ExclusionHoldingRemoveOperation{
+		QueueType: queueType,
+		NodeID:    nodeID,
+	}
+	ob.Add(op)
+}
+
+// AddExclusionHoldingAdd adds an addition to exclusion-holding bucket operation to the buffer.
+func (ob *OutputBuffer) AddExclusionHoldingAdd(queueType string, nodeID string, depth int) {
+	op := &ExclusionHoldingAddOperation{
+		QueueType: queueType,
+		NodeID:    nodeID,
+		Depth:     depth,
+	}
+	ob.Add(op)
+}
+
+// AddNodeDeletion adds a node deletion operation to the buffer.
+func (ob *OutputBuffer) AddNodeDeletion(queueType string, nodeID string, level int, status string) {
+	op := &NodeDeletionOperation{
+		QueueType: queueType,
+		NodeID:    nodeID,
+		Level:     level,
+		Status:    status,
+	}
+	ob.Add(op)
+}
+
+// AddLookupMapping adds a bidirectional lookup mapping operation to the buffer.
+func (ob *OutputBuffer) AddLookupMapping(srcID, dstID string) {
+	if srcID == "" || dstID == "" {
+		return // Skip if either ID is empty
+	}
+	op := &LookupMappingOperation{
+		SrcID: srcID,
+		DstID: dstID,
+	}
+	ob.Add(op)
+}
+
+// AddPathToULIDMapping queues a path-to-ulid mapping creation.
+func (ob *OutputBuffer) AddPathToULIDMapping(queueType string, path string, nodeID string) {
+	if path == "" || nodeID == "" {
+		return // Skip if either is empty
+	}
+	op := &PathToULIDMappingOperation{
+		QueueType: queueType,
+		Path:      path,
+		NodeID:    nodeID,
+	}
+	ob.Add(op)
+}
+
+// AddMultiple adds multiple operations to the buffer atomically.
+// This prevents flushes from happening between related operations (e.g., status update + batch insert).
+// All operations are added before checking if a flush is needed.
+func (ob *OutputBuffer) AddMultiple(ops []WriteOperation) {
+	if len(ops) == 0 {
+		return
 	}
 
-	ob.operations = append(ob.operations, op)
+	ob.mu.Lock()
+	// Add all operations at once
+	ob.operations = append(ob.operations, ops...)
 	shouldFlush := len(ob.operations) >= ob.batchSize
+	ob.mu.Unlock()
 
 	if shouldFlush {
-		ob.mu.Unlock()
 		ob.Flush()
-		ob.mu.Lock()
 	}
 }
 
-// mergeBatchInsert merges a new batch insert operation with existing batch inserts,
-// coalescing duplicate path hashes (last insert wins).
-func (ob *OutputBuffer) mergeBatchInsert(newBatch *BatchInsertOperation) {
-	// Build a map of path hashes from existing batch inserts
-	existingPaths := make(map[string]*InsertOperation)
-	for _, existingOp := range ob.operations {
-		if batch, ok := existingOp.(*BatchInsertOperation); ok {
-			for _, insertOp := range batch.Operations {
-				pathHash := HashPath(insertOp.State.Path)
-				existingPaths[pathHash] = &insertOp
-			}
-		}
-	}
-
-	// Merge new batch: overwrite existing paths, add new ones
-	for _, newOp := range newBatch.Operations {
-		pathHash := HashPath(newOp.State.Path)
-		existingPaths[pathHash] = &newOp
-	}
-
-	// Remove all existing batch insert operations
-	filtered := make([]WriteOperation, 0, len(ob.operations))
-	for _, op := range ob.operations {
-		if _, ok := op.(*BatchInsertOperation); !ok {
-			filtered = append(filtered, op)
-		}
-	}
-	ob.operations = filtered
-
-	// Create merged batch insert with all unique operations
-	mergedOps := make([]InsertOperation, 0, len(existingPaths))
-	for _, op := range existingPaths {
-		mergedOps = append(mergedOps, *op)
-	}
-
-	if len(mergedOps) > 0 {
-		mergedBatch := &BatchInsertOperation{
-			Operations: mergedOps,
-		}
-		ob.operations = append(ob.operations, mergedBatch)
-	}
-
+// Add adds a write operation to the buffer. If batch size is reached, it triggers a flush.
+// No deduplication happens here - that's done per-bucket during flush.
+func (ob *OutputBuffer) Add(op WriteOperation) {
+	ob.mu.Lock()
+	ob.operations = append(ob.operations, op)
 	shouldFlush := len(ob.operations) >= ob.batchSize
+	ob.mu.Unlock()
+
 	if shouldFlush {
-		ob.mu.Unlock()
 		ob.Flush()
-		ob.mu.Lock()
 	}
 }
 
 // Flush writes all buffered operations to BoltDB in a single transaction.
+// Operations are executed in the order they were added to the buffer.
 // This is synchronous and blocks until the flush completes.
 // Holds the lock during the entire transaction to prevent other goroutines
 // from adding operations to the buffer while the transaction is executing.
@@ -286,10 +489,11 @@ func (ob *OutputBuffer) Flush() {
 		// Compute stats deltas BEFORE executing writes (check what exists first)
 		statsDeltas := computeStatsDeltas(tx, batch)
 
-		// Execute all data operations
-		for _, op := range batch {
+		// Execute all operations in order
+		for i, op := range batch {
 			if err := op.Execute(tx); err != nil {
-				return fmt.Errorf("failed to execute operation: %w", err)
+				opType := fmt.Sprintf("%T", op)
+				return fmt.Errorf("failed to execute operation %d of %d (type: %s): %w", i+1, len(batch), opType, err)
 			}
 		}
 
@@ -306,10 +510,12 @@ func (ob *OutputBuffer) Flush() {
 	})
 
 	if err != nil {
-		// Log error but don't fail - operations will be retried on next flush
-		fmt.Printf("Error flushing output buffer: %v\n", err)
-		// Re-add operations to buffer for retry (only if not a critical error)
-		// For now, we'll let them be lost on error - in production might want retry logic
+		// Log error with details
+		fmt.Printf("ERROR flushing output buffer (%d operations): %v\n", len(batch), err)
+		// Re-add operations to buffer for retry
+		ob.mu.Lock()
+		ob.operations = append(ob.operations, batch...)
+		ob.mu.Unlock()
 	}
 }
 
@@ -363,17 +569,18 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 	for _, op := range operations {
 		switch v := op.(type) {
 		case *StatusUpdateOperation:
+			nodeID := []byte(v.NodeID)
+
 			// Check if old status bucket has this entry
-			pathHash := []byte(HashPath(v.Path))
 			oldBucket := GetStatusBucket(tx, v.QueueType, v.Level, v.OldStatus)
-			if oldBucket != nil && oldBucket.Get(pathHash) != nil {
+			if oldBucket != nil && oldBucket.Get(nodeID) != nil {
 				oldKey := fmt.Sprintf("%s/%d/%s", v.QueueType, v.Level, v.OldStatus)
 				oldStatusCounts[oldKey]++
 			}
 
 			// Check if new status bucket already has this entry
 			newBucket := GetStatusBucket(tx, v.QueueType, v.Level, v.NewStatus)
-			if newBucket == nil || newBucket.Get(pathHash) == nil {
+			if newBucket == nil || newBucket.Get(nodeID) == nil {
 				newKey := fmt.Sprintf("%s/%d/%s", v.QueueType, v.Level, v.NewStatus)
 				newStatusCounts[newKey]++
 			}
@@ -388,6 +595,32 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 		case *CopyStatusOperation:
 			// Copy status updates don't change bucket counts, just node metadata
 			// No stats updates needed
+
+		case *ExclusionUpdateOperation:
+			// Exclusion updates don't change bucket counts, just node metadata
+			// No stats updates needed
+
+		case *ExclusionHoldingRemoveOperation, *ExclusionHoldingAddOperation:
+			// Exclusion-holding bucket operations don't affect stats
+			// No stats updates needed
+
+		case *NodeDeletionOperation:
+			// Node deletion: subtract from status bucket and nodes bucket
+			nodeID := []byte(v.NodeID)
+
+			// Check if status bucket has this entry
+			statusBucket := GetStatusBucket(tx, v.QueueType, v.Level, v.Status)
+			if statusBucket != nil && statusBucket.Get(nodeID) != nil {
+				statusKey := fmt.Sprintf("%s/%d/%s", v.QueueType, v.Level, v.Status)
+				oldStatusCounts[statusKey]++
+			}
+
+			// Always subtract from nodes bucket if node exists
+			nodesBucket := GetNodesBucket(tx, v.QueueType)
+			if nodesBucket != nil && nodesBucket.Get(nodeID) != nil {
+				nodesPath := strings.Join(GetNodesBucketPath(v.QueueType), "/")
+				deltas[nodesPath]--
+			}
 		}
 	}
 

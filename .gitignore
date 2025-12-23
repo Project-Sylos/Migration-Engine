@@ -39,8 +39,3 @@ __pycache__/
 # ignore logs and misc files
 *logs.txt
 *.log
-*.yaml
-*.db
-
-# spectra config
-pkg/configs/spectra.json

@@ -15,6 +15,16 @@ import (
 	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
+// RuntimeMode determines how the migration engine manages database lifecycle.
+type RuntimeMode int
+
+const (
+	// ModeAPISupervised is the default mode - API owns DB lifecycle, ME never closes it.
+	ModeAPISupervised RuntimeMode = iota
+	// ModeStandalone is for standalone/test mode - ME may close DB on completion (debug guard only).
+	ModeStandalone
+)
+
 // Service defines a single filesystem service participating in a migration.
 type Service struct {
 	Name    string
@@ -23,10 +33,20 @@ type Service struct {
 }
 
 // Config aggregates all of the knobs required to run the migration engine once.
+// The DB must be provided via DatabaseInstance - the ME does not open or close it.
 type Config struct {
-	Database         DatabaseConfig
-	DatabaseInstance *db.DB // BoltDB instance
-	CloseDatabase    bool
+	// DatabaseInstance is the BoltDB instance to use. REQUIRED - ME does not open the DB.
+	// The API/caller is responsible for opening and closing the database.
+	DatabaseInstance *db.DB
+
+	// Runtime determines lifecycle management mode.
+	// ModeAPISupervised (default): ME never closes DB - API owns lifecycle.
+	// ModeStandalone: ME may close DB on completion (for standalone/test mode only).
+	Runtime RuntimeMode
+
+	// Database config is kept for backward compatibility and for determining paths,
+	// but the ME does not use it to open the DB - that's the API's responsibility.
+	Database DatabaseConfig
 
 	Source      Service
 	Destination Service
@@ -64,12 +84,14 @@ type Result struct {
 
 // MigrationController provides programmatic control over a running migration.
 // It allows you to trigger force shutdown and check migration status.
+// Note: The controller does NOT own the DB lifecycle - the API does.
 type MigrationController struct {
 	shutdownCancel context.CancelFunc
 	shutdownCtx    context.Context
 	done           chan struct{}
 	result         *Result
 	err            error
+	boltDB         *db.DB // Thread-safe - BoltDB operations handle their own locking (API owns lifecycle)
 }
 
 // Shutdown triggers a force shutdown of the migration.
@@ -93,6 +115,15 @@ func (mc *MigrationController) Wait() (Result, error) {
 		return *mc.result, mc.err
 	}
 	return Result{}, mc.err
+}
+
+// GetDB returns the BoltDB instance used by this migration.
+// This allows the API to query the database for real-time statistics.
+// Returns nil if the database hasn't been initialized yet.
+// The database instance is thread-safe - BoltDB operations handle their own locking.
+// The API owns the DB lifecycle - do not close it through the controller.
+func (mc *MigrationController) GetDB() *db.DB {
+	return mc.boltDB
 }
 
 // SetRootFolders assigns the source and destination root folders that will seed the migration queues.
@@ -146,15 +177,27 @@ func StartMigration(cfg Config) *MigrationController {
 		done:           done,
 	}
 
+	// DB must be provided - ME does not open it
+	if cfg.DatabaseInstance == nil {
+		controller.err = fmt.Errorf("DatabaseInstance is required - migration engine does not open databases")
+		close(done)
+		return controller
+	}
+
+	// Store DB in controller (API owns lifecycle - ME never closes it)
+	controller.boltDB = cfg.DatabaseInstance
+
 	// Run migration in goroutine
 	go func() {
 		defer close(done)
 		// Pass the shutdown context to LetsMigrate
 		cfgCopy := cfg
 		cfgCopy.ShutdownContext = shutdownCtx
+		// Ensure DB is set (already validated above)
 		result, err := letsMigrateWithContext(cfgCopy)
 		controller.result = &result
 		controller.err = err
+		// ME never closes DB - API owns lifecycle
 	}()
 
 	return controller
@@ -193,33 +236,11 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 		go HandleShutdownSignals(shutdownCancel)
 	}
 
-	var wasFresh bool
-	if cfg.DatabaseInstance != nil {
-		boltDB = cfg.DatabaseInstance
-		wasFresh = false // Existing database instance
-	} else {
-		var setupErr error
-		boltDB, wasFresh, setupErr = SetupDatabase(cfg.Database)
-		if setupErr != nil {
-			return Result{}, setupErr
-		}
-		cfg.CloseDatabase = true
+	// DB must be provided - ME does not open it
+	if cfg.DatabaseInstance == nil {
+		return Result{}, fmt.Errorf("DatabaseInstance is required - migration engine does not open databases")
 	}
-
-	// Only inspect migration status if this isn't a fresh database.
-	// If we just created it (RemoveExisting=true or directory didn't exist), skip the check.
-	var status MigrationStatus
-	if wasFresh {
-		// Fresh database - no need to check, it's definitely empty
-		status = MigrationStatus{}
-	} else {
-		// Existing database - inspect to decide between fresh run and resume
-		var inspectErr error
-		status, inspectErr = InspectMigrationStatus(boltDB)
-		if inspectErr != nil {
-			return Result{}, fmt.Errorf("failed to inspect migration status: %w", inspectErr)
-		}
-	}
+	boltDB = cfg.DatabaseInstance
 
 	if cfg.Source.Adapter == nil || cfg.Destination.Adapter == nil {
 		return Result{}, fmt.Errorf("source and destination adapters must be provided")
@@ -240,25 +261,59 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 		configPath = ConfigPathFromDatabasePath(cfg.Database.Path)
 	}
 
-	// Load or create migration config YAML
-	var yamlCfg *MigrationConfigYAML
-	if wasFresh {
-		// Create new config
-		yamlCfg, err = NewMigrationConfigYAML(cfg, status)
-		if err != nil {
-			return Result{}, fmt.Errorf("failed to create migration config: %w", err)
+	// ----------------- DETERMINE "wasFresh" LOGIC BASED ON YAML -----------------
+
+	var (
+		yamlCfg      *MigrationConfigYAML
+		status       MigrationStatus
+		inspectErr   error
+		wasFresh     bool
+		yamlLoadErr  error
+		loadedCfg    *MigrationConfigYAML
+	)
+	// Try to load existing YAML
+	loadedCfg, yamlLoadErr = LoadMigrationConfig(configPath)
+
+	if yamlLoadErr != nil {
+		// YAML does not exist -> this is a fresh start
+		wasFresh = true
+		status, inspectErr = InspectMigrationStatus(boltDB)
+		if inspectErr != nil {
+			status = MigrationStatus{}
 		}
-		// Update with root info
+	} else {
+		// YAML exists, check its status
+		yamlCfg = loadedCfg
+		switch yamlCfg.State.Status {
+		case StatusRootsSet, StatusFiltersSet:
+			// Only these states count as "fresh"
+			wasFresh = true
+		default:
+			wasFresh = false
+		}
+		// Grab migration status from DB as well (for non-fresh runs)
+		status, inspectErr = InspectMigrationStatus(boltDB)
+		if inspectErr != nil {
+			status = MigrationStatus{}
+		}
+	}
+
+	// If this is a fresh run (as decided by yaml existence/status), create fresh YAML/config if needed
+	if wasFresh {
+		if yamlCfg == nil {
+			yamlCfg, err = NewMigrationConfigYAML(cfg, status)
+			if err != nil {
+				return Result{}, fmt.Errorf("failed to create migration config: %w", err)
+			}
+		}
 		UpdateConfigFromRoots(yamlCfg, srcRoot, dstRoot)
-		// Save initial config
+		// Save initial or reset config
 		if err := SaveMigrationConfig(configPath, yamlCfg); err != nil {
 			return Result{}, fmt.Errorf("failed to save migration config: %w", err)
 		}
 	} else {
-		// Try to load existing config
-		loadedCfg, loadErr := LoadMigrationConfig(configPath)
-		if loadErr != nil {
-			// If config doesn't exist, create a new one
+		// Already loaded YAML above if it exists, otherwise create new
+		if yamlCfg == nil {
 			yamlCfg, err = NewMigrationConfigYAML(cfg, status)
 			if err != nil {
 				return Result{}, fmt.Errorf("failed to create migration config: %w", err)
@@ -268,17 +323,13 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 				return Result{}, fmt.Errorf("failed to save migration config: %w", err)
 			}
 		} else {
-			yamlCfg = loadedCfg
-			// Update with current root info
 			UpdateConfigFromRoots(yamlCfg, srcRoot, dstRoot)
-			// Update status (preserves "suspended" status if set)
 			UpdateConfigFromStatus(yamlCfg, status, 0, 0)
 			if err := SaveMigrationConfig(configPath, yamlCfg); err != nil {
 				return Result{}, fmt.Errorf("failed to save migration config: %w", err)
 			}
-
 			// If status was "suspended", indicate resume from suspension
-			if yamlCfg.State.Status == "suspended" {
+			if yamlCfg.State.Status == StatusSuspended {
 				fmt.Println("Resuming from suspended migration state...")
 			}
 		}
@@ -286,8 +337,8 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 
 	result := Result{RootsSeeded: cfg.SeedRoots}
 
-	// Decide whether to run a fresh migration (seed + traversal) or resume from
-	// an existing in-progress database.
+	// Decide whether to run a fresh migration (seed + traversal) or resume from an in-progress database.
+
 	var runtime RuntimeStats
 	var runErr error
 
@@ -313,7 +364,8 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 			// Update config: Roots seeded milestone
 			if yamlCfg != nil && configPath != "" {
 				UpdateConfigFromRoots(yamlCfg, srcRoot, dstRoot)
-				yamlCfg.State.Status = "seeded"
+				// Set status to Roots-Set when roots are seeded
+				SetStatusRootsSet(yamlCfg)
 				_ = SaveMigrationConfig(configPath, yamlCfg)
 			}
 		}
@@ -339,15 +391,13 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 		})
 	}
 
-	switch {
-	case status.IsEmpty():
+	// The next logic block should key off yaml status, not just the DB.
+	if wasFresh {
 		// Fresh run: optionally seed roots, then run normal traversal.
 		runtime, runErr = runFreshMigration()
-
-	case status.HasPending():
+	} else if status.HasPending() {
 		// Resume from an in-progress migration (including suspended state).
 		// Root seeding is assumed to have been done previously and is skipped here.
-
 		// Validate that root nodes still exist in the filesystem before resuming.
 		// If they don't exist (e.g., Spectra DB was reset), we can't safely resume
 		// because the migration DB contains stale node IDs.
@@ -359,8 +409,8 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 
 			// Update YAML to reflect fresh start
 			if yamlCfg != nil {
-				yamlCfg.State.Status = "running"
 				UpdateConfigFromRoots(yamlCfg, srcRoot, dstRoot)
+				SetStatusRootsSet(yamlCfg)
 				_ = SaveMigrationConfig(configPath, yamlCfg)
 			}
 
@@ -368,7 +418,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 			runtime, runErr = runFreshMigration()
 		} else {
 			// Root nodes exist - safe to resume
-			if yamlCfg != nil && yamlCfg.State.Status == "suspended" {
+			if yamlCfg != nil && yamlCfg.State.Status == StatusSuspended {
 				fmt.Println("Resuming suspended migration from database state...")
 			} else {
 				fmt.Println("Resuming migration from existing database state...")
@@ -395,8 +445,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 				ShutdownContext: shutdownCtx,
 			})
 		}
-
-	default:
+	} else {
 		// Completed (or failed-only) migration with no pending work. For now we
 		// do not re-run traversal automatically; verification below will report
 		// success or failure based on the existing DB contents.
@@ -476,8 +525,9 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	// 2. The API also tries to close it
 	// 3. Verification or other code needs to log after migration completes
 
-	// Close database after verification and log service are done (allows verification and log flushing to access DB)
-	if cfg.CloseDatabase {
+	// ME does NOT close the database - API owns the lifecycle.
+	// Only close in standalone mode (debug/test guard) - API mode never closes.
+	if cfg.Runtime == ModeStandalone {
 		defer boltDB.Close()
 	}
 
@@ -498,20 +548,13 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 			report.SrcTotal, report.SrcPending, report.SrcFailed)
 		errMsg += fmt.Sprintf("  DST: Total=%d Pending=%d Failed=%d NotOnSrc=%d\n",
 			report.DstTotal, report.DstPending, report.DstFailed, report.DstNotOnSrc)
-		errMsg += fmt.Sprintf("  Moved Nodes: %d\n", report.NumMovedNodes)
 
 		// Show which checks failed
 		if !cfg.Verification.AllowPending && (report.SrcPending > 0 || report.DstPending > 0) {
 			errMsg += "  ❌ Pending nodes remain (not allowed)\n"
 		}
-		if !cfg.Verification.AllowFailed && (report.SrcFailed > 0 || report.DstFailed > 0) {
-			errMsg += "  ❌ Failed nodes detected (not allowed)\n"
-		}
 		if !cfg.Verification.AllowNotOnSrc && report.DstNotOnSrc > 0 {
 			errMsg += "  ❌ Nodes found on DST but not on SRC (not allowed)\n"
-		}
-		if report.NumMovedNodes == 0 {
-			errMsg += "  ❌ No nodes were actually migrated\n"
 		}
 
 		return result, errors.New(errMsg)
@@ -521,16 +564,16 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 }
 
 func normalizeRootFolder(folder types.Folder) (types.Folder, error) {
-	if folder.Id == "" {
-		return types.Folder{}, fmt.Errorf("folder ID cannot be empty")
+	if folder.ServiceID == "" {
+		return types.Folder{}, fmt.Errorf("folder ServiceID cannot be empty")
 	}
 
 	if folder.DisplayName == "" {
-		folder.DisplayName = folder.Id
+		folder.DisplayName = folder.ServiceID
 	}
-	if folder.LocationPath == "" {
-		folder.LocationPath = "/"
-	}
+	// The actual folder path doesn't matter - the root node is always stored at "/".
+	// Child paths will be relative to this root (e.g., "/child", "/child/grandchild").
+	folder.LocationPath = "/"
 	if folder.Type == "" {
 		folder.Type = types.NodeTypeFolder
 	}
@@ -543,15 +586,15 @@ func normalizeRootFolder(folder types.Folder) (types.Folder, error) {
 // resuming would cause "node not found" errors because the migration DB has stale node IDs.
 func validateRootNodesExist(srcAdapter, dstAdapter types.FSAdapter, srcRoot, dstRoot types.Folder) error {
 	// Try to list children of the source root - if it doesn't exist, this will fail
-	_, err := srcAdapter.ListChildren(srcRoot.Id)
+	_, err := srcAdapter.ListChildren(srcRoot.ServiceID)
 	if err != nil {
-		return fmt.Errorf("source root node '%s' does not exist in filesystem: %w", srcRoot.Id, err)
+		return fmt.Errorf("source root node '%s' does not exist in filesystem: %w", srcRoot.ServiceID, err)
 	}
 
 	// Try to list children of the destination root - if it doesn't exist, this will fail
-	_, err = dstAdapter.ListChildren(dstRoot.Id)
+	_, err = dstAdapter.ListChildren(dstRoot.ServiceID)
 	if err != nil {
-		return fmt.Errorf("destination root node '%s' does not exist in filesystem: %w", dstRoot.Id, err)
+		return fmt.Errorf("destination root node '%s' does not exist in filesystem: %w", dstRoot.ServiceID, err)
 	}
 
 	return nil
