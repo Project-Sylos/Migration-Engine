@@ -181,3 +181,4 @@ func (lb *logBuffer) GetAndClearSortedIfReady() []LogRow {
 
 	return batch
 }
+
