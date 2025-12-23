@@ -120,13 +120,25 @@ func (o *QueueObserver) Stop() {
 		return // Already stopped
 	}
 
+	o.running = false
+
+	// Signal the observe loop to exit first (so it can check running flag)
+	// Only close if not already closed
+	select {
+	case <-o.stopChan:
+		// Already closed, create a new one for potential future use
+		o.stopChan = make(chan struct{})
+		close(o.stopChan)
+	default:
+		close(o.stopChan)
+	}
+
+	// Stop ticker after signaling (this prevents new ticks from firing)
+	// The observe loop will exit on next iteration due to running=false check
 	if o.updateTicker != nil {
 		o.updateTicker.Stop()
 		o.updateTicker = nil
 	}
-
-	o.running = false
-	close(o.stopChan)
 
 	// Clear queues
 	o.queues = make(map[string]*Queue)
@@ -135,14 +147,30 @@ func (o *QueueObserver) Stop() {
 
 // observeLoop is the main loop that polls queues directly and publishes metrics to BoltDB.
 func (o *QueueObserver) observeLoop() {
+	defer func() {
+		o.mu.Lock()
+		o.running = false
+		o.mu.Unlock()
+	}()
+
 	for {
-		select {
-		case <-o.stopChan:
-			o.mu.Lock()
-			o.running = false
-			o.mu.Unlock()
+		// Get ticker and stop channel references (must check on each iteration)
+		o.mu.RLock()
+		ticker := o.updateTicker
+		running := o.running
+		stopChan := o.stopChan
+		o.mu.RUnlock()
+
+		// If we're not running or ticker is nil, exit
+		if !running || ticker == nil {
 			return
-		case <-o.updateTicker.C:
+		}
+
+		// Use select with nil channel trick: if ticker is nil, this case won't be selected
+		select {
+		case <-stopChan:
+			return
+		case <-ticker.C:
 			// Get queue references
 			o.mu.RLock()
 			queues := make(map[string]*Queue)

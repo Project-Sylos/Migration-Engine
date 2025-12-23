@@ -9,15 +9,16 @@ import (
 )
 
 // taskToNodeState converts a TaskBase to a NodeState for BoltDB storage.
+// Uses existing ULID from task.ID if present, otherwise generates a new one.
 func taskToNodeState(task *TaskBase) *db.NodeState {
-	var id, parentID, name, path, parentPath, nodeType string
+	var serviceID, parentServiceID, name, path, parentPath, nodeType string
 	var size int64
 	var mtime string
 
 	if task.IsFolder() {
 		folder := task.Folder
-		id = folder.Id
-		parentID = folder.ParentId
+		serviceID = folder.ServiceID
+		parentServiceID = folder.ParentId // ParentId is the parent's ServiceID
 		name = folder.DisplayName
 		path = types.NormalizeLocationPath(folder.LocationPath)
 		parentPath = types.NormalizeParentPath(folder.ParentPath)
@@ -26,8 +27,8 @@ func taskToNodeState(task *TaskBase) *db.NodeState {
 		mtime = folder.LastUpdated
 	} else if task.IsFile() {
 		file := task.File
-		id = file.Id
-		parentID = file.ParentId
+		serviceID = file.ServiceID
+		parentServiceID = file.ParentId // ParentId is the parent's ServiceID
 		name = file.DisplayName
 		path = types.NormalizeLocationPath(file.LocationPath)
 		parentPath = types.NormalizeParentPath(file.ParentPath)
@@ -39,25 +40,39 @@ func taskToNodeState(task *TaskBase) *db.NodeState {
 		return nil
 	}
 
+	// Use existing ULID if present, otherwise generate a new one
+	nodeID := task.ID
+	if nodeID == "" {
+		nodeID = db.GenerateNodeID()
+		if nodeID == "" {
+			// If ULID generation fails, return nil
+			return nil
+		}
+	}
+
 	return &db.NodeState{
-		ID:         id,
-		ParentID:   parentID,
-		ParentPath: parentPath,
-		Name:       name,
-		Path:       path,
-		Type:       nodeType,
-		Size:       size,
-		MTime:      mtime,
-		Depth:      task.Round,
-		CopyNeeded: false, // Will be set during traversal comparison
+		ID:              nodeID,          // ULID for database keys
+		ServiceID:       serviceID,       // FS identifier for FS interactions
+		ParentID:        "",              // Will be looked up by parent path if needed
+		ParentServiceID: parentServiceID, // Parent's FS identifier
+		ParentPath:      parentPath,
+		Name:            name,
+		Path:            path,
+		Type:            nodeType,
+		Size:            size,
+		MTime:           mtime,
+		Depth:           task.Round,
+		CopyNeeded:      false, // Will be set during traversal comparison
 	}
 }
 
 // nodeStateToTask converts a NodeState back to a TaskBase.
 // Note: This reconstructs the task but doesn't restore DiscoveredChildren or ExpectedFolders/Files.
 // Those need to be populated separately if needed.
+// Preserves the ULID from NodeState for internal tracking.
 func nodeStateToTask(state *db.NodeState, taskType string) *TaskBase {
 	task := &TaskBase{
+		ID:    state.ID, // Preserve ULID for internal tracking
 		Type:  taskType,
 		Round: state.Depth,
 	}
@@ -65,8 +80,8 @@ func nodeStateToTask(state *db.NodeState, taskType string) *TaskBase {
 	switch state.Type {
 	case types.NodeTypeFolder:
 		task.Folder = types.Folder{
-			Id:           state.ID,
-			ParentId:     state.ParentID,
+			ServiceID:    state.ServiceID,       // Use ServiceID for FS interactions
+			ParentId:     state.ParentServiceID, // Parent's ServiceID for FS interactions
 			ParentPath:   state.ParentPath,
 			DisplayName:  state.Name,
 			LocationPath: state.Path,
@@ -76,8 +91,8 @@ func nodeStateToTask(state *db.NodeState, taskType string) *TaskBase {
 		}
 	case types.NodeTypeFile:
 		task.File = types.File{
-			Id:           state.ID,
-			ParentId:     state.ParentID,
+			ServiceID:    state.ServiceID,       // Use ServiceID for FS interactions
+			ParentId:     state.ParentServiceID, // Parent's ServiceID for FS interactions
 			ParentPath:   state.ParentPath,
 			DisplayName:  state.Name,
 			LocationPath: state.Path,

@@ -23,8 +23,14 @@ func bucketPathToString(bucketPath []string) string {
 }
 
 // getStatsBucket returns the stats bucket, creating it if it doesn't exist.
+// Stats bucket is under Traversal-Data/STATS
 func getStatsBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
-	bucket, err := tx.CreateBucketIfNotExists([]byte(StatsBucketName))
+	// Navigate through Traversal-Data -> STATS
+	traversalBucket, err := tx.CreateBucketIfNotExists([]byte("Traversal-Data"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get Traversal-Data bucket: %w", err)
+	}
+	bucket, err := traversalBucket.CreateBucketIfNotExists([]byte(StatsBucketName))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get stats bucket: %w", err)
 	}
@@ -124,7 +130,13 @@ func getBucketCount(tx *bolt.Tx, bucketPath []string) (int64, error) {
 		return 0, nil
 	}
 
-	statsBucket := tx.Bucket([]byte(StatsBucketName))
+	// Navigate through Traversal-Data -> STATS
+	traversalBucket := tx.Bucket([]byte("Traversal-Data"))
+	if traversalBucket == nil {
+		// Traversal-Data bucket doesn't exist yet - return 0 (safe default)
+		return 0, nil
+	}
+	statsBucket := traversalBucket.Bucket([]byte(StatsBucketName))
 	if statsBucket == nil {
 		// Stats bucket doesn't exist yet - return 0 (safe default)
 		return 0, nil
@@ -173,6 +185,16 @@ func (db *DB) EnsureStatsBucket() error {
 		// Also ensure queue-stats bucket exists
 		_, err = GetOrCreateQueueStatsBucket(tx)
 		return err
+	})
+}
+
+// UpdateBucketStats updates the count for a bucket path by the given delta.
+// Delta can be positive (increment) or negative (decrement).
+// This is a public wrapper around the internal updateBucketStats function.
+// Thread-safe (uses Update transaction).
+func (db *DB) UpdateBucketStats(bucketPath []string, delta int64) error {
+	return db.Update(func(tx *bolt.Tx) error {
+		return updateBucketStats(tx, bucketPath, delta)
 	})
 }
 
@@ -253,7 +275,7 @@ func (db *DB) SyncCounts() error {
 
 		// Sync status buckets for all levels
 		for _, queueType := range []string{"SRC", "DST"} {
-			levelsBucket := getBucket(tx, []string{queueType, SubBucketLevels})
+			levelsBucket := getBucket(tx, []string{"Traversal-Data", queueType, SubBucketLevels})
 			if levelsBucket == nil {
 				continue // No levels yet
 			}

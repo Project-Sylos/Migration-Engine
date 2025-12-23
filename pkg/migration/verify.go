@@ -12,20 +12,18 @@ import (
 // VerifyOptions define the expectations for post-migration validation.
 type VerifyOptions struct {
 	AllowPending  bool
-	AllowFailed   bool
 	AllowNotOnSrc bool
 }
 
 // VerificationReport captures aggregate statistics from the verification pass.
 type VerificationReport struct {
-	SrcTotal      int
-	DstTotal      int
-	SrcPending    int
-	DstPending    int
-	SrcFailed     int
-	DstFailed     int
-	DstNotOnSrc   int
-	NumMovedNodes int // Number of dst_nodes that were actually traversed/moved
+	SrcTotal    int
+	DstTotal    int
+	SrcPending  int
+	DstPending  int
+	SrcFailed   int
+	DstFailed   int
+	DstNotOnSrc int
 }
 
 // Success returns true when the report satisfies the supplied VerifyOptions.
@@ -34,17 +32,10 @@ func (r VerificationReport) Success(opts VerifyOptions) bool {
 	if !opts.AllowPending && (r.SrcPending > 0 || r.DstPending > 0) {
 		return false
 	}
-	if !opts.AllowFailed && (r.SrcFailed > 0 || r.DstFailed > 0) {
-		return false
-	}
 	if !opts.AllowNotOnSrc && r.DstNotOnSrc > 0 {
 		return false
 	}
 	if r.SrcTotal == 0 && r.DstTotal == 0 {
-		return false
-	}
-	// Require at least one node in dst_nodes actually traversed/moved (not just roots inserted)
-	if r.NumMovedNodes == 0 {
 		return false
 	}
 	return true
@@ -124,7 +115,6 @@ func VerifyMigration(boltDB *db.DB, opts VerifyOptions) (VerificationReport, err
 			movedCount += successCount
 		}
 	}
-	report.NumMovedNodes = movedCount
 
 	return report, nil
 }

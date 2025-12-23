@@ -24,8 +24,8 @@ func SeedRootTasks(srcRoot types.Folder, dstRoot types.Folder, boltDB *db.DB) (R
 		return RootSeedSummary{}, fmt.Errorf("boltDB cannot be nil")
 	}
 
-	if srcRoot.Id == "" || dstRoot.Id == "" {
-		return RootSeedSummary{}, fmt.Errorf("source and destination root folders must have an Id")
+	if srcRoot.ServiceID == "" || dstRoot.ServiceID == "" {
+		return RootSeedSummary{}, fmt.Errorf("source and destination root folders must have a ServiceID")
 	}
 
 	if err := queue.SeedRootTasks(srcRoot, dstRoot, boltDB); err != nil {

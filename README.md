@@ -137,28 +137,45 @@ BoltDB was chosen for its simplicity, reliability, and perfect fit with the BFS 
 
 ### Bucket Structure
 
+The database is partitioned into two main areas:
+
+**Traversal-Data** (all traversal-related data):
 ```
-/SRC
-  /nodes                  → pathHash: NodeState JSON (canonical data)
-  /children               → parentHash: []childHash JSON (tree relationships)
-  /levels
-    /00000000
-      /pending            → pathHash: empty (membership set)
-      /successful         → pathHash: empty
-      /failed             → pathHash: empty
-    /00000001/...
+/Traversal-Data
+  /SRC
+    /nodes                  → ULID: NodeState JSON (canonical data)
+    /children               → parentULID: []childULID JSON (tree relationships)
+    /src-to-dst             → srcULID: dstULID (bidirectional join-lookup table)
+    /path-to-ulid           → pathHash: ULID (path-based lookup for API)
+    /levels
+      /00000000
+        /pending            → ULID: empty (membership set)
+        /successful         → ULID: empty
+        /failed             → ULID: empty
+        /excluded           → ULID: empty
+        /status-lookup      → ULID: status string (reverse index)
+      /00000001/...
+  /DST
+    /nodes                  → ULID: NodeState JSON (canonical data)
+    /children               → parentULID: []childULID JSON (tree relationships)
+    /dst-to-src             → dstULID: srcULID (bidirectional join-lookup table)
+    /path-to-ulid           → pathHash: ULID (path-based lookup for API)
+    /levels
+      /00000000
+        /pending
+        /successful
+        /failed
+        /not_on_src         → ULID: empty (DST-specific status)
+        /excluded           → ULID: empty
+        /status-lookup      → ULID: status string (reverse index)
+      /00000001/...
+  /STATS
+    /totals                → bucketPath: int64 (bucket count statistics)
+    /queue-stats           → queueKey: QueueObserverMetrics JSON (queue metrics)
+```
 
-/DST
-  /nodes
-  /children
-  /levels
-    /00000000
-      /pending
-      /successful
-      /failed
-      /not_on_src       → pathHash: empty (DST-specific status)
-    /00000001/...
-
+**LOGS** (separate island, not under Traversal-Data):
+```
 /LOGS
   /trace                 → uuid: LogEntry JSON
   /debug                 → uuid: LogEntry JSON
@@ -168,22 +185,46 @@ BoltDB was chosen for its simplicity, reliability, and perfect fit with the BFS 
   /critical              → uuid: LogEntry JSON
 ```
 
+This partitioning separates traversal operations (discovery/scanning phase) from future copy operations, allowing the copy phase to have its own data structure under a separate root bucket.
+
 ### Key Design Principles
 
 1. **Separation of Concerns**
    - Node data lives in `/nodes` (single source of truth)
    - Status membership tracked in `/levels/{level}/{status}` buckets
+   - Status-lookup index in `/levels/{level}/status-lookup` provides reverse lookup (ULID → status)
    - Tree relationships in `/children` buckets
+   - Bidirectional join-lookup tables (`/src-to-dst` and `/dst-to-src`) map corresponding SRC and DST node ULIDs
+   - Path-to-ULID lookup table (`/path-to-ulid`) maps path hashes to ULIDs for API path-based queries
+   - Join tables enable efficient correlation without embedding references in node data
 
-2. **Status Transitions are Simple**
+2. **Status Transitions are Atomic**
+   Status transitions update multiple buckets atomically:
    ```go
-   bucket.Delete(pathHash)  // Remove from /pending
-   bucket.Put(pathHash, []) // Add to /successful
+   // 1. Update NodeState in /nodes bucket
+   // 2. Remove from old status bucket
+   // 3. Add to new status bucket
+   // 4. Update status-lookup index
    ```
 
-3. **No Key Encoding**
-   - Structure is explicit in buckets, not encoded in key names
-   - Path hashes are simple lookup keys
-   - Hierarchy is natural and navigable
+3. **Status-Lookup Index**
+   - Each level has a `status-lookup` bucket that maps `ULID → status string`
+   - Provides O(1) lookup to find which status bucket a node belongs to
+   - Automatically maintained on every insert and status update
+   - Enables efficient queries without scanning all status buckets
+
+4. **ULID-Based Keys and Lookup Tables**
+   - All internal operations use ULID (Universally Unique Lexicographically Sortable Identifier) for keys
+   - ULIDs provide unique, sortable identifiers without path dependencies
+   - **Bidirectional join-lookup tables** (`/src-to-dst` and `/dst-to-src`) map corresponding SRC ↔ DST node ULIDs
+     - Join tables are populated when DST children are discovered and matched to SRC children (by Type + Name)
+     - This architecture replaces the legacy `SrcID` field that was previously embedded in DST NodeState
+     - Enables efficient lookups: given a SRC ULID, find the corresponding DST ULID (and vice versa)
+   - **Path-to-ULID lookup table** (`/path-to-ulid`) maps path hashes to ULIDs
+     - Enables API to query nodes by path without scanning
+     - Path hashes are SHA-256 (64-char hex strings)
+     - Automatically maintained during insert/delete operations
+   - Matching between SRC and DST nodes is done by Type + Name, not path
+   - Hierarchy is natural and navigable through parent-child ULID relationships
 
 See `pkg/db/README.md` for detailed documentation on the database layer.

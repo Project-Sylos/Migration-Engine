@@ -8,11 +8,15 @@ This package houses scenario-level integration tests for the Sylos Migration Eng
 pkg/tests/
 ├── shared/                     # Shared test utilities (package shared)
 │   ├── setup.go               # Builds migration configs and Spectra adapters
+│   ├── test_utils.go          # Test helpers for subtree deletion and verification
 │   └── verify.go              # Pretty-printer for migration.Result
 ├── normal/                     # Normal migration happy-path runner (package main)
 │   └── main.go
 ├── resumption/                 # Suspension + resumption runner (package main)
 │   └── main.go
+├── retry_sweep/                # Retry sweep test runner (package main)
+│   ├── main.go                # Marks nodes pending, deletes subtree, re-runs migration
+│   └── run.ps1                # Windows runner for retry sweep test
 ├── migration_test.db.yaml      # Sample state file produced by resumption test
 ├── run_test.ps1                # Windows runner for normal test
 ├── run_resumption_test.ps1     # Windows runner that kills then resumes
@@ -40,6 +44,66 @@ pkg/tests/
 
 This test exercises the happy-path traversal, queue coordination, verification, and log listener plumbing without any artificial shutdowns.
 
+### Retry Sweep Test (`retry_sweep/`)
+
+`pkg/tests/retry_sweep/main.go` validates retry sweep functionality:
+
+**Phase 1: Normal Migration**
+- Runs a complete migration from source to destination
+- Verifies all nodes are successful (no pending, failed, or not_on_src)
+
+**Phase 2: Prepare Retry**
+- Randomly selects a top-level folder (directly under root)
+- Marks the selected folder as `pending`
+- Performs comprehensive subtree deletion:
+  - Deletes all descendant nodes from `/nodes` bucket
+  - Removes entries from status buckets (`pending`, `successful`, `failed`, etc.)
+  - Clears status-lookup index entries
+  - Deletes parent-child relationships from `/children` bucket
+  - Removes join-lookup table entries (`src-to-dst`, `dst-to-src`)
+  - Decrements stats bucket counts
+- Records expected counts for verification
+
+**Phase 3: Retry Sweep**
+- Runs migration in retry mode (`QueueModeRetry`)
+- SRC queue re-processes the marked folder and discovers children
+- DST queue re-processes corresponding DST folder:
+  - DST parent marked pending during SRC task completion
+  - DST children deleted during SRC task completion
+  - DST queue re-discovers children from fresh traversal
+
+**Phase 4: Verification**
+- Compares final node counts with expected counts
+- Verifies SRC processed exactly the expected number of tasks
+- Verifies DST processed exactly the expected number of tasks
+- Ensures no duplicate nodes were created
+- Confirms children discovered matches subtree size
+
+**Run the test:**
+```powershell
+powershell -File pkg/tests/retry_sweep/run.ps1
+```
+
+**Expected output:**
+```
+=== RETRY SWEEP TEST ===
+✓ Database setup complete
+✓ Migration successful (Phase 1)
+✓ Verification passed
+✓ Selected folder for retry: /some/folder
+✓ Subtree deleted: 1234 nodes
+✓ Retry sweep successful (Phase 2)
+✓ Node counts verified (SRC: 1234, DST: 1234)
+✓ TEST PASSED!
+```
+
+This test validates:
+- Comprehensive subtree deletion (nodes, status, children, join tables, stats)
+- DST cleanup during SRC task completion in retry mode
+- No duplicate node creation during retry sweeps
+- Correct node counting and statistics
+- Join-lookup table consistency across retries
+
 ### Resumption Test (`resumption/`)
 
 `pkg/tests/resumption/main.go` focuses on force-shutdown and resume:
@@ -61,12 +125,15 @@ This test exercises the happy-path traversal, queue coordination, verification, 
 
 These runners validate the following behaviors:
 
-- SQLite schema initialization, WAL checkpointing, and YAML state persistence
+- **Normal Migration**: BFS traversal correctness, coordinator orchestration, verification
+- **Resumption**: Forced shutdown safety, DB checkpoints, YAML state persistence, resume correctness
+- **Retry Sweep**: Subtree deletion completeness, DST cleanup during SRC completion, no duplication
 - Spectra simulator fidelity (seed data preserved across process restarts)
 - Queue/coordinator orchestration, including worker shutdown when `ShutdownContext` is cancelled
 - BFS traversal correctness under configurable worker counts and retry policy
 - Log listener fan-out (port reuse guards prevent duplicate listeners)
-- Forced shutdown safety: DB checkpoints, YAML `suspended` status, Spectra adapter closing, and subsequent resume correctness
+- Join-lookup table consistency (bidirectional SRC ↔ DST mappings)
+- OutputBuffer operation coalescing and automatic stats updates
 
 ## Expected Output
 

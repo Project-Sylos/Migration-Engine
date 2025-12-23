@@ -26,12 +26,18 @@ BoltDB uses nested buckets to organize data hierarchically:
 
 ### Top-Level Buckets
 
+The database is partitioned into two main areas:
+
 ```
-/SRC     → Source queue data
-/DST     → Destination queue data
-/LOGS    → Log entries organized by level
-/STATS   → Bucket count statistics (O(1) lookups)
+/Traversal-Data  → Root bucket for all traversal-related data
+  /SRC           → Source queue data
+  /DST           → Destination queue data
+  /STATS         → Bucket count statistics and queue metrics (O(1) lookups)
+
+/LOGS            → Log entries organized by level (separate island)
 ```
+
+This partitioning separates traversal operations (discovery/scanning phase) from future copy operations, allowing the copy phase to have its own data structure under a separate root bucket.
 
 ### Node Storage (`/SRC` and `/DST`)
 
@@ -39,62 +45,171 @@ Each queue type has three main sub-buckets:
 
 #### 1. Nodes Bucket (`/nodes`)
 
-**Path**: `/SRC/nodes/` or `/DST/nodes/`
+**Path**: `/Traversal-Data/SRC/nodes/` or `/Traversal-Data/DST/nodes/`
 
-Stores the canonical node data. Key is the path hash, value is NodeState JSON.
+Stores the canonical node data. Key is the ULID, value is NodeState JSON.
 
 ```
-pathHash → NodeState JSON
+ULID → NodeState JSON
 {
-  "id": "node-uuid",
-  "parent_id": "parent-uuid",
+  "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",  // ULID (used as key)
+  "parent_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",  // Parent's ULID
   "parent_path": "/parent",
   "name": "folder-name",
   "path": "/parent/folder-name",
   "type": "folder",
   "depth": 1,
   "traversal_status": "successful",
+  "src_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",  // For DST nodes: corresponding SRC node ULID
   ...
 }
 ```
 
 #### 2. Children Bucket (`/children`)
 
-**Path**: `/SRC/children/` or `/DST/children/`
+**Path**: `/Traversal-Data/SRC/children/` or `/Traversal-Data/DST/children/`
 
-Stores parent-child relationships. Key is parent path hash, value is array of child path hashes.
+Stores parent-child relationships. Key is parent ULID, value is array of child ULIDs.
 
 ```
-parentPathHash → []childPathHash JSON
-["abc123", "def456", "ghi789"]
+parentULID → []childULID JSON
+["01ARZ3NDEKTSV4RRFFQ69G5FAV", "01ARZ3NDEKTSV4RRFFQ69G5FAW", "01ARZ3NDEKTSV4RRFFQ69G5FAX"]
 ```
 
-#### 3. Levels Bucket (`/levels`)
+#### 3. Join-Lookup Tables (`/src-to-dst` and `/dst-to-src`)
 
-**Path**: `/SRC/levels/` or `/DST/levels/`
+**Paths**: 
+- `/Traversal-Data/SRC/src-to-dst/`
+- `/Traversal-Data/DST/dst-to-src/`
 
-Organized by BFS depth level, with status sub-buckets:
+Bidirectional mappings between corresponding SRC and DST nodes. These tables replace the legacy `SrcID` field that was previously embedded in DST NodeState.
+
+```
+SRC: srcULID → dstULID
+DST: dstULID → srcULID
+```
+
+**Purpose:**
+- Enable efficient correlation between SRC and DST nodes without embedding references in node data
+- Support retry sweeps where DST nodes need to be reset when their corresponding SRC nodes are retried
+- Populated during DST task completion when children are matched by Type + Name
+
+**Usage:**
+```go
+// Find DST node corresponding to SRC node
+dstID, err := db.GetDstIDFromSrcID(boltDB, srcULID)
+
+// Find SRC node corresponding to DST node
+srcID, err := db.GetSrcIDFromDstID(boltDB, dstULID)
+
+// Set bidirectional mapping (usually done via OutputBuffer)
+err := db.SetSrcToDstMapping(tx, srcULID, dstULID)
+err := db.SetDstToSrcMapping(tx, dstULID, srcULID)
+```
+
+#### 4. Path-to-ULID Lookup Table (`/path-to-ulid`)
+
+**Paths**:
+- `/Traversal-Data/SRC/path-to-ulid/`
+- `/Traversal-Data/DST/path-to-ulid/`
+
+Maps path hashes to ULIDs, enabling API to query nodes by path without scanning the entire nodes bucket.
+
+```
+pathHash (SHA-256) → ULID
+```
+
+**Purpose:**
+- Enable path-based queries for API endpoints
+- Maintain ULID as primary key while supporting user-friendly path queries
+- Automatically maintained during insert/delete operations
+
+**Usage:**
+```go
+// Hash a path (SHA-256)
+pathHash := db.HashPath("/parent/child")  // Returns 64-char hex string
+
+// Get ULID from path (hashes internally)
+ulid, err := db.GetULIDFromPath(boltDB, "SRC", "/parent/child")
+
+// Get ULID from pre-computed path hash
+ulid, err := db.GetULIDFromPathHash(boltDB, "SRC", pathHash)
+
+// Batch get ULIDs from multiple paths
+paths := []string{"/path1", "/path2", "/path3"}
+results, err := db.BatchGetULIDsFromPaths(boltDB, "SRC", paths)
+// results: map[string]string { "/path1": "ulid1", "/path2": "ulid2", ... }
+
+// Batch get ULIDs from pre-computed path hashes
+pathHashes := []string{hash1, hash2, hash3}
+results, err := db.BatchGetULIDsFromPathHashes(boltDB, "SRC", pathHashes)
+
+// Set mapping (automatically done during BatchInsertNodes)
+err := db.SetPathToULIDMapping(tx, "SRC", "/parent/child", ulid)
+
+// Delete mapping (automatically done during BatchDeleteNodes)
+err := db.DeletePathToULIDMapping(tx, "SRC", "/parent/child")
+```
+
+**API Integration:**
+```go
+// API receives path from user
+userPath := "/Projects/MyProject"
+
+// Hash the path
+pathHash := db.HashPath(userPath)
+
+// Query for ULID
+ulid, err := db.GetULIDFromPathHash(database, "SRC", pathHash)
+if err != nil {
+    return fmt.Errorf("path not found: %s", userPath)
+}
+
+// Now use ULID for all operations
+nodeState, err := db.GetNodeState(database, "SRC", ulid)
+children, err := db.GetChildrenIDsByParentID(database, "SRC", ulid)
+```
+
+**Notes:**
+- Path hashes are SHA-256 (64 hex characters)
+- Mappings are automatically created during `BatchInsertNodes`
+- Mappings are automatically deleted during `BatchDeleteNodes`
+- For bulk queries, use batch functions to reduce transaction overhead
+
+#### 5. Levels Bucket (`/levels`)
+
+**Path**: `/Traversal-Data/SRC/levels/` or `/Traversal-Data/DST/levels/`
+
+Organized by BFS depth level, with status sub-buckets and a status-lookup index:
 
 ```
 /levels
   /00000000              → Level 0 (root)
-    /pending             → pathHash: empty
-    /successful          → pathHash: empty
-    /failed              → pathHash: empty
+    /pending             → ULID: empty (membership set)
+    /successful          → ULID: empty (membership set)
+    /failed              → ULID: empty (membership set)
+    /status-lookup       → ULID: status string (reverse index)
   /00000001              → Level 1
     /pending
     /successful
     /failed
+    /status-lookup
   /00000002              → Level 2
     ...
 ```
 
 For DST queue, there's an additional status:
 ```
-  /not_on_src            → Items in DST but not in SRC
+  /not_on_src            → ULID: empty (membership set)
 ```
 
-**Status buckets are membership sets**: The presence of a pathHash in a bucket means that node has that status. The value is empty; only the key matters.
+**Status buckets are membership sets**: The presence of a ULID in a bucket means that node has that status. The value is empty; only the key matters.
+
+**Status-lookup index**: The `status-lookup` bucket provides a reverse index mapping `ULID → status string`. This enables O(1) lookup to determine which status bucket a node belongs to without scanning all status buckets. The index is automatically maintained:
+- Created when a level bucket is first created
+- Updated on every node insert (with initial status)
+- Updated on every status transition (pending → successful, etc.)
+- Removed when a node is deleted
 
 ### Log Storage (`/LOGS`)
 
@@ -114,20 +229,34 @@ Each log entry is keyed by its UUID within the appropriate level bucket.
 
 ### Statistics Bucket (`/STATS`)
 
-**Path**: `/STATS/`
+**Path**: `/Traversal-Data/STATS/`
 
-Stores count statistics for all buckets to enable O(1) count lookups without scanning:
+Stores count statistics for all buckets and queue performance metrics:
 
 ```
 /STATS
-  "SRC/nodes"                    → int64 (8-byte big-endian)
-  "SRC/children"                 → int64
-  "SRC/levels/00000001/pending"  → int64
-  "DST/levels/00000002/successful" → int64
-  "LOGS"                         → int64
+  /totals                → bucketPath: int64 (8-byte big-endian)
+    "SRC/nodes"                    → int64
+    "SRC/children"                 → int64
+    "SRC/levels/00000001/pending"  → int64
+    "DST/levels/00000002/successful" → int64
+    "LOGS"                         → int64
+  /queue-stats           → queueKey: QueueObserverMetrics JSON
+    "src-traversal"      → QueueObserverMetrics JSON
+    "dst-traversal"      → QueueObserverMetrics JSON
+    "copy"               → QueueObserverMetrics JSON (future)
 ```
 
-Statistics are automatically maintained during writes via `OutputBuffer` and can be manually synchronized using `SyncCounts()`.
+**Totals sub-bucket**: Stores count statistics for all buckets to enable O(1) count lookups without scanning. Statistics are automatically maintained during writes via `OutputBuffer` and can be manually synchronized using `SyncCounts()`.
+
+**Queue-stats sub-bucket**: Stores real-time queue performance metrics published by the `QueueObserver`:
+- Queue statistics (pending, in-progress, workers, round, etc.)
+- Average task execution time
+- Tasks per second (calculated from last poll)
+- Total completed tasks
+- Last poll timestamp
+
+Metrics are updated every 200ms (configurable) during active migrations, allowing external APIs to poll for real-time performance data.
 
 ---
 
@@ -150,38 +279,86 @@ defer database.Close()
 
 **Note:** The database automatically initializes the bucket structure on first open, including the stats bucket for O(1) count operations.
 
-### Path Hashing
+### ULID-Based Keys
 
-Paths are hashed using SHA256 (first 16 bytes, 32 hex characters) for consistent key generation:
+All internal operations use ULID (Universally Unique Lexicographically Sortable Identifier) for keys. ULIDs provide:
+- Unique identifiers without path dependencies
+- Lexicographically sortable (useful for ordering)
+- 26 characters (more compact than UUIDs)
+- Time-ordered (first 48 bits encode timestamp)
 
 ```go
-pathHash := db.HashPath("/parent/child") // Returns 32-character hex string
+nodeID := db.GenerateNodeID() // Returns ULID string (e.g., "01ARZ3NDEKTSV4RRFFQ69G5FAV")
 ```
+
+**Note**: The `HashPath` function still exists for backward compatibility with test utilities, but is not used for internal operations.
+
+### Join-Lookup Table Operations
+
+```go
+// Get DST ULID from SRC ULID
+dstID, err := db.GetDstIDFromSrcID(boltDB, srcULID)
+
+// Get SRC ULID from DST ULID
+srcID, err := db.GetSrcIDFromDstID(boltDB, dstULID)
+
+// Set bidirectional mapping (within transaction)
+err := database.Update(func(tx *bolt.Tx) error {
+    err := db.SetSrcToDstMapping(tx, srcULID, dstULID)
+    if err != nil {
+        return err
+    }
+    return db.SetDstToSrcMapping(tx, dstULID, srcULID)
+})
+
+// Or use OutputBuffer for automatic batching
+outputBuffer.AddLookupMapping(srcULID, dstULID)
+```
+
+**Important:** Join-lookup mappings are created during DST task completion when DST children are matched to their corresponding SRC children (by Type + Name). This replaces the legacy `SrcID` field that was previously stored in DST NodeState structs.
 
 ### Node State Operations
 
 ```go
-// Insert a node (creates entry in nodes, status, and children buckets)
+// Insert a node (creates entry in nodes, status, status-lookup, and children buckets)
 state := &db.NodeState{
-    ID:         "node-id",
-    ParentID:   "parent-id",
+    ID:         "01ARZ3NDEKTSV4RRFFQ69G5FAV",  // ULID
+    ParentID:   "01ARZ3NDEKTSV4RRFFQ69G5FAW",  // Parent's ULID
     ParentPath: "/parent",
     Name:       "child",
     Path:       "/parent/child",
     Type:       "folder",
     Depth:      1,
 }
+// This automatically:
+// 1. Inserts into /nodes bucket (keyed by ULID)
+// 2. Adds to status bucket (/levels/{level}/{status})
+// 3. Updates status-lookup index (/levels/{level}/status-lookup)
+// 4. Updates parent's children list
 err := db.InsertNodeWithIndex(database, "SRC", 1, db.StatusPending, state)
 
-// Update node status (moves between status buckets)
-updatedState, err := db.UpdateNodeStatus(database, "SRC", 1, 
-    db.StatusPending, db.StatusSuccessful, "/parent/child")
+// Update node status (moves between status buckets and updates status-lookup)
+// This automatically:
+// 1. Updates NodeState in /nodes bucket
+// 2. Removes from old status bucket
+// 3. Adds to new status bucket
+// 4. Updates status-lookup index
+nodeID := "01ARZ3NDEKTSV4RRFFQ69G5FAV"  // ULID of the node
+updatedState, err := db.UpdateNodeStatusByID(database, "SRC", 1, 
+    db.StatusPending, db.StatusSuccessful, nodeID)
 
-// Get node state
-state, err := db.GetNodeStateByPath(database, "SRC", "/parent/child")
+// Get node state by ULID
+state, err := db.GetNodeState(database, "SRC", nodeID)
 
-// Get children of a node
-children, err := db.GetChildrenStates(database, "SRC", "/parent")
+// Get children of a node by parent ULID
+parentID := "01ARZ3NDEKTSV4RRFFQ69G5FAW"  // Parent's ULID
+children, err := db.GetChildrenStatesByParentID(database, "SRC", parentID)
+
+// Query status-lookup index (find which status bucket a node belongs to)
+lookupBucket := db.GetStatusLookupBucket(tx, "SRC", 1)
+nodeIDBytes := []byte(nodeID)  // Convert ULID string to bytes
+statusBytes := lookupBucket.Get(nodeIDBytes)
+status := string(statusBytes) // "pending", "successful", "failed", etc.
 ```
 
 ### Iteration
@@ -190,8 +367,9 @@ children, err := db.GetChildrenStates(database, "SRC", "/parent")
 // Iterate over all nodes in a status bucket
 err := database.IterateStatusBucket("SRC", 1, db.StatusPending, 
     db.IteratorOptions{Limit: 100}, 
-    func(pathHash []byte) error {
+    func(nodeIDBytes []byte) error {
         // Process each pending node at level 1
+        // nodeIDBytes contains the ULID of the node
         return nil
     })
 
@@ -211,12 +389,12 @@ levels, err := database.GetAllLevels("SRC")
 minLevel, err := database.FindMinPendingLevel("SRC")
 
 // Lease tasks from status bucket (for worker task distribution)
-pathHashes, err := database.LeaseTasksFromStatus("SRC", 1, db.StatusPending, 1000)
+nodeIDs, err := database.LeaseTasksFromStatus("SRC", 1, db.StatusPending, 1000)
 
 // Batch fetch with keys (for task leasing with deduplication)
 results, err := db.BatchFetchWithKeys(database, "SRC", 1, db.StatusPending, 100)
 for _, result := range results {
-    // result.Key is the path hash string
+    // result.Key is the ULID string
     // result.State is the NodeState
 }
 ```
@@ -224,12 +402,27 @@ for _, result := range results {
 ### Batch Operations
 
 ```go
-// Batch insert multiple nodes (automatically updates stats)
+// Batch insert multiple nodes (automatically updates stats and join-lookup tables)
+// If State.SrcID is populated, bidirectional join mappings are created
 ops := []db.InsertOperation{
     {QueueType: "SRC", Level: 1, Status: db.StatusPending, State: state1},
-    {QueueType: "SRC", Level: 1, Status: db.StatusPending, State: state2},
+    {QueueType: "DST", Level: 1, Status: db.StatusPending, State: state2}, // state2.SrcID set
 }
 err := db.BatchInsertNodes(database, ops)
+
+// Batch delete nodes (comprehensive cleanup)
+// Automatically deletes from:
+// - /nodes bucket
+// - status buckets (/levels/{level}/{status})
+// - status-lookup index
+// - parent's children list
+// - join-lookup tables (src-to-dst and dst-to-src)
+// - node's own children list (if folder)
+// - stats bucket (decrements counts)
+deleteOps := []db.DeleteNodeOperation{
+    {QueueType: "DST", NodeID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", Level: 1, Status: db.StatusSuccessful},
+}
+err := db.BatchDeleteNodes(database, deleteOps)
 
 // Batch update node statuses
 results, err := db.BatchUpdateNodeStatus(database, "SRC", 1,
@@ -287,7 +480,7 @@ The package provides two buffering systems for high-throughput scenarios:
 
 #### OutputBuffer
 
-Batches write operations (status updates, inserts, copy status) with automatic coalescing and stats updates:
+Batches write operations (status updates, inserts, deletions, copy status, lookup mappings) with automatic coalescing and stats updates:
 
 ```go
 // Create output buffer
@@ -295,7 +488,7 @@ outputBuffer := db.NewOutputBuffer(database, 500, 2*time.Second)
 defer outputBuffer.Stop()
 
 // Add status update (coalesces duplicates - last write wins)
-outputBuffer.AddStatusUpdate("SRC", 1, db.StatusPending, db.StatusSuccessful, "/path/to/node")
+outputBuffer.AddStatusUpdate("SRC", 1, db.StatusPending, db.StatusSuccessful, nodeID)
 
 // Add batch insert (merges with existing batch inserts)
 ops := []db.InsertOperation{
@@ -304,8 +497,14 @@ ops := []db.InsertOperation{
 }
 outputBuffer.AddBatchInsert(ops)
 
+// Add node deletion (comprehensive cleanup including join tables)
+outputBuffer.AddNodeDeletion("DST", nodeID, 1, db.StatusSuccessful)
+
 // Add copy status update
-outputBuffer.AddCopyStatusUpdate("SRC", 1, db.StatusSuccessful, "/path/to/node", db.CopyStatusPending)
+outputBuffer.AddCopyStatusUpdate("SRC", 1, db.StatusSuccessful, nodeID, db.CopyStatusPending)
+
+// Add join-lookup mapping (bidirectional: src-to-dst and dst-to-src)
+outputBuffer.AddLookupMapping(srcULID, dstULID)
 
 // Force flush (or wait for automatic flush on batch size or interval)
 outputBuffer.Flush()
@@ -319,6 +518,8 @@ outputBuffer.Resume()
 **Features:**
 - Automatic coalescing of duplicate operations (last write wins)
 - Batch merging for insert operations
+- Comprehensive node deletion (nodes, status, children, join tables, stats)
+- Automatic bidirectional join-lookup mapping creation
 - Automatic stats updates
 - Time-based and size-based flush triggers
 - Thread-safe
@@ -377,18 +578,26 @@ err := database.Update(func(tx *bolt.Tx) error {
 
 ```go
 // Get bucket paths
-nodesPath := db.GetNodesBucketPath("SRC")        // ["SRC", "nodes"]
-childrenPath := db.GetChildrenBucketPath("SRC")  // ["SRC", "children"]
-levelPath := db.GetLevelBucketPath("SRC", 1)     // ["SRC", "levels", "00000001"]
+nodesPath := db.GetNodesBucketPath("SRC")        // ["Traversal-Data", "SRC", "nodes"]
+childrenPath := db.GetChildrenBucketPath("SRC")  // ["Traversal-Data", "SRC", "children"]
+levelPath := db.GetLevelBucketPath("SRC", 1)     // ["Traversal-Data", "SRC", "levels", "00000001"]
 statusPath := db.GetStatusBucketPath("SRC", 1, db.StatusPending)
-// ["SRC", "levels", "00000001", "pending"]
+// ["Traversal-Data", "SRC", "levels", "00000001", "pending"]
+lookupPath := db.GetStatusLookupBucketPath("SRC", 1)
+// ["Traversal-Data", "SRC", "levels", "00000001", "status-lookup"]
 
-// Create level bucket with all status sub-buckets
+// Create level bucket with all status sub-buckets and status-lookup index
 err := db.EnsureLevelBucket(tx, "SRC", 1)
 
 // Get bucket within transaction
 nodesBucket := db.GetNodesBucket(tx, "SRC")
 statusBucket := db.GetStatusBucket(tx, "SRC", 1, db.StatusPending)
+lookupBucket := db.GetStatusLookupBucket(tx, "SRC", 1)
+
+// Update status-lookup index (automatically called by insert/update functions)
+nodeID := "01ARZ3NDEKTSV4RRFFQ69G5FAV"  // ULID
+nodeIDBytes := []byte(nodeID)
+err := db.UpdateStatusLookup(tx, "SRC", 1, nodeIDBytes, db.StatusSuccessful)
 ```
 
 ---
@@ -429,7 +638,8 @@ BoltDB makes status transitions atomic and race-free:
 // 1. Update NodeState in /nodes bucket
 // 2. Remove from old status bucket
 // 3. Add to new status bucket
-// All three operations succeed or all fail
+// 4. Update status-lookup index
+// All four operations succeed or all fail
 ```
 
 ### Batch Operations
@@ -533,10 +743,10 @@ if state == nil {
 
 ## Statistics Management
 
-The stats bucket provides O(1) count lookups for all buckets:
+The stats bucket provides O(1) count lookups for all buckets and queue performance metrics:
 
 ```go
-// Get count for any bucket path
+// Get count for any bucket path (from /STATS/totals)
 count, err := database.GetBucketCount([]string{"SRC", "nodes"})
 count, err := database.GetBucketCount([]string{"SRC", "levels", "00000001", "pending"})
 
@@ -548,11 +758,22 @@ err := database.SyncCounts()
 
 // Ensure stats bucket exists
 err := database.EnsureStatsBucket()
+
+// Get queue statistics (from /STATS/queue-stats)
+srcStats, err := db.GetQueueStats(database, "src-traversal")
+allStats, err := db.GetAllQueueStats(database)
+// Returns QueueObserverMetrics with:
+// - QueueStats (pending, in-progress, workers, round, etc.)
+// - AverageExecutionTime
+// - TasksPerSecond
+// - TotalCompleted
+// - LastPollTime
 ```
 
 **Stats are automatically maintained by:**
 - `OutputBuffer` - Updates stats during buffered writes
 - `BatchInsertNodes` - Updates stats during batch inserts
+- `QueueObserver` - Publishes queue metrics to `/STATS/queue-stats` every 200ms
 
 **Manual sync is useful for:**
 - Recovery after crashes
@@ -566,12 +787,14 @@ err := database.EnsureStatsBucket()
 The database package provides:
 - ✅ **BoltDB Integration** - Simple, reliable embedded database
 - ✅ **Bucket Hierarchies** - Natural structure, not key encoding
-- ✅ **Status Transitions** - Atomic, race-free status changes
+- ✅ **Status Transitions** - Atomic, race-free status changes with status-lookup index
+- ✅ **Status-Lookup Index** - O(1) reverse lookup to find node status without scanning
 - ✅ **High-Level Operations** - Convenient functions for common operations
 - ✅ **Batch Support** - Efficient bulk operations with automatic stats
 - ✅ **Buffered Writes** - `OutputBuffer` and `LogBuffer` for high throughput
-- ✅ **O(1) Statistics** - Stats bucket for fast count lookups
-- ✅ **Path Hashing** - Consistent key generation from paths
+- ✅ **O(1) Statistics** - Stats bucket for fast count lookups and queue metrics
+- ✅ **Queue Observability** - Real-time queue performance metrics in `/STATS/queue-stats`
+- ✅ **ULID-Based Keys** - Unique, sortable identifiers for all internal operations
 - ✅ **Task Leasing** - Efficient task distribution for workers
 - ✅ **Thread Safety** - Safe for concurrent reads, serialized writes
 - ✅ **Crash Resilience** - ACID transactions with automatic recovery

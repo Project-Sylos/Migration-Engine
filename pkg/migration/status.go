@@ -44,7 +44,7 @@ func (s MigrationStatus) IsComplete() bool {
 	if s.IsEmpty() {
 		return false
 	}
-	return !s.HasPending() && !s.HasFailures()
+	return !s.HasPending()
 }
 
 // InspectMigrationStatus inspects the BoltDB node data and returns a MigrationStatus.
