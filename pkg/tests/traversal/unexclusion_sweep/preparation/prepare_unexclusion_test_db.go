@@ -18,7 +18,7 @@ import (
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
-	"github.com/Project-Sylos/Migration-Engine/pkg/tests/shared"
+	"github.com/Project-Sylos/Migration-Engine/pkg/tests/traversal/shared"
 	"github.com/Project-Sylos/Sylos-FS/pkg/fs"
 )
 

@@ -40,23 +40,21 @@ type DuckDB struct {
 
 // OpenDuckDB opens or creates a DuckDB database
 func OpenDuckDB(dbPath string) (*DuckDB, error) {
-	sqlDB, err := sql.Open("duckdb", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open DuckDB: %w", err)
-	}
-
-	// Create connector for Appender API
+	// Create connector first - this will be used for both sql.DB and Appender API
 	connector, err := duckdb.NewConnector(dbPath, nil)
 	if err != nil {
-		sqlDB.Close()
 		return nil, fmt.Errorf("failed to create DuckDB connector: %w", err)
 	}
 
+	// Use the connector to open sql.DB
+	sqlDB := sql.OpenDB(connector)
+
+	// Get a connection from sql.DB for the Appender API
 	ctx := context.Background()
 	conn, err := connector.Connect(ctx)
 	if err != nil {
-		connector.Close()
 		sqlDB.Close()
+		connector.Close()
 		return nil, fmt.Errorf("failed to connect to DuckDB: %w", err)
 	}
 
@@ -107,8 +105,8 @@ type NodeRow struct {
 	Depth           int
 	TraversalStatus string
 	CopyStatus      string
-	DstID           string // For SRC nodes
-	SrcID           string // For DST nodes
+	DstID           *string // For SRC nodes (nullable)
+	SrcID           *string // For DST nodes (nullable)
 }
 
 // LogRow represents a log entry with row number for ordering
@@ -566,13 +564,19 @@ func migrateNodesWorker(boltDB *db.DB, nodeIDs []string, queueType string, buffe
 				}
 			}
 
-			// Get join lookup
-			var joinID string
+			// Get join lookup from the join bucket
+			// If the nodeID doesn't exist in the join bucket, joinID remains nil
+			// This means the corresponding node (DST for SRC nodes, SRC for DST nodes) doesn't exist
+			// and the field will be NULL in DuckDB
+			var joinID *string
 			if joinBucket != nil {
 				joinData := joinBucket.Get([]byte(nodeID))
 				if joinData != nil {
-					joinID = string(joinData)
+					// Join exists - set the pointer to the ID string
+					joinIDStr := string(joinData)
+					joinID = &joinIDStr
 				}
+				// If joinData is nil, joinID stays nil (NULL in DuckDB)
 			}
 
 			// Compute path hash
@@ -607,7 +611,7 @@ func migrateNodesWorker(boltDB *db.DB, nodeIDs []string, queueType string, buffe
 				row.Size = &ns.Size
 			}
 
-			// Set join ID based on queue type
+			// Set join ID based on queue type (nil if no join exists)
 			if queueType == "SRC" {
 				row.DstID = joinID
 			} else {
@@ -660,6 +664,33 @@ func migrateNodesWriter(buffer *nodeBuffer, appender *duckdb.Appender, tableName
 func flushNodeBatch(appender *duckdb.Appender, batch []NodeRow, tableName string, stats *ETLStats) error {
 	for _, row := range batch {
 		var err error
+
+		// Convert *int64 to interface{} (nil or int64) for DuckDB
+		var sizeValue interface{}
+		if row.Size != nil {
+			sizeValue = *row.Size
+		} else {
+			sizeValue = nil
+		}
+
+		// Convert int to int32 for DuckDB INTEGER type
+		depthValue := int32(row.Depth)
+
+		// Convert *string to interface{} (nil or string) for nullable join IDs
+		var dstIDValue interface{}
+		if row.DstID != nil {
+			dstIDValue = *row.DstID
+		} else {
+			dstIDValue = nil
+		}
+
+		var srcIDValue interface{}
+		if row.SrcID != nil {
+			srcIDValue = *row.SrcID
+		} else {
+			srcIDValue = nil
+		}
+
 		if tableName == "src_nodes" {
 			err = appender.AppendRow(
 				row.ID,
@@ -672,12 +703,12 @@ func flushNodeBatch(appender *duckdb.Appender, batch []NodeRow, tableName string
 				row.PathHash,
 				row.ChildIDs,
 				row.Type,
-				row.Size,
+				sizeValue,
 				row.MTime,
-				row.Depth,
+				depthValue,
 				row.TraversalStatus,
 				row.CopyStatus,
-				row.DstID,
+				dstIDValue,
 			)
 		} else {
 			err = appender.AppendRow(
@@ -691,12 +722,12 @@ func flushNodeBatch(appender *duckdb.Appender, batch []NodeRow, tableName string
 				row.PathHash,
 				row.ChildIDs,
 				row.Type,
-				row.Size,
+				sizeValue,
 				row.MTime,
-				row.Depth,
+				depthValue,
 				row.TraversalStatus,
 				row.CopyStatus,
-				row.SrcID,
+				srcIDValue,
 			)
 		}
 		if err != nil {

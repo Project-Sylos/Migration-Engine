@@ -14,7 +14,7 @@ import (
 	"strings"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/tests/shared"
+	"github.com/Project-Sylos/Migration-Engine/pkg/tests/traversal/shared"
 	"github.com/Project-Sylos/Spectra/sdk"
 	bolt "go.etcd.io/bbolt"
 )
