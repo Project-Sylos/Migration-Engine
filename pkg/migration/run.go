@@ -322,16 +322,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 		if bothCompleted {
 
-			// Ensure exclusion-holding buckets exist for exclusion intent queuing
-			if err := db.EnsureExclusionHoldingBuckets(boltDB); err != nil {
-				if logservice.LS != nil {
-					_ = logservice.LS.Log("warning",
-						fmt.Sprintf("Failed to ensure exclusion-holding buckets: %v", err),
-						"migration", "run", "run")
-				}
-				// Non-fatal - continue with completion
-			}
-
 			// Get stats directly (non-blocking)
 			srcStats, dstStats := getQueueStats(coordinator, boltDB)
 
@@ -411,15 +401,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		case <-progressTicker.C:
 			// Re-check exhaustion from coordinator (queues might have completed during tick)
 			if coordinator.IsCompleted("both") {
-				// Ensure exclusion-holding buckets exist for exclusion intent queuing
-				if err := db.EnsureExclusionHoldingBuckets(boltDB); err != nil {
-					if logservice.LS != nil {
-						_ = logservice.LS.Log("warning",
-							fmt.Sprintf("Failed to ensure exclusion-holding buckets: %v", err),
-							"migration", "run", "run")
-					}
-					// Non-fatal - continue with completion
-				}
 
 				// Get stats directly (non-blocking)
 				srcStats, dstStats := getQueueStats(coordinator, boltDB)
