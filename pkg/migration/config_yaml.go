@@ -25,6 +25,7 @@ const (
 	StatusRootsSet            = "Roots-Set"             // User has set root folders and services (initial state)
 	StatusFiltersSet          = "Filters-Set"           // Filters configured, ready for traversal (also used for retry)
 	StatusTraversalInProgress = "Traversal-In-Progress" // Traversal is currently running
+	StatusPreparingPathReview = "Preparing-Path-Review" // Preparing for path review - ETL from BoltDB to DuckDB
 	StatusAwaitingPathReview  = "Awaiting-Path-Review"  // Traversal complete, awaiting user review
 	StatusCopyInProgress      = "Copy-In-Progress"      // Copy phase is currently running
 	StatusComplete            = "Complete"              // Migration completed successfully
@@ -53,7 +54,7 @@ type MetadataConfig struct {
 
 // StateConfig tracks the current migration checkpoint state.
 type StateConfig struct {
-	Status       string `yaml:"status"` // Roots-Set, Filters-Set, Traversal-In-Progress, Awaiting-Path-Review, Copy-In-Progress, Complete, Suspended
+	Status       string `yaml:"status"` // Roots-Set, Filters-Set, Traversal-In-Progress, Preparing-Path-Review, Awaiting-Path-Review, Copy-In-Progress, Complete, Suspended
 	LastRoundSrc *int   `yaml:"last_round_src,omitempty"`
 	LastRoundDst *int   `yaml:"last_round_dst,omitempty"`
 	// Retry metadata (only set when Status = Filters-Set for retry)
@@ -371,11 +372,11 @@ func UpdateConfigFromStatus(yamlCfg *MigrationConfigYAML, status MigrationStatus
 	yamlCfg.State.LastRoundSrc = &srcRound
 	yamlCfg.State.LastRoundDst = &dstRound
 
-	// Auto-transition to Awaiting-Path-Review only if traversal is in progress and completes successfully
+	// Auto-transition to Preparing-Path-Review only if traversal is in progress and completes successfully
 	// All other state transitions should be managed by the API
 	if yamlCfg.State.Status != StatusSuspended && yamlCfg.State.Status == StatusTraversalInProgress {
 		if status.IsComplete() {
-			yamlCfg.State.Status = StatusAwaitingPathReview
+			yamlCfg.State.Status = StatusPreparingPathReview
 		}
 		// Note: If traversal fails or has pending work, status remains Traversal-In-Progress
 		// The API should handle error states and decide when to transition

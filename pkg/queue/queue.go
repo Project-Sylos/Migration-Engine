@@ -379,7 +379,6 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 				return q.markComplete("No pending tasks found for round %d - traversal complete (first pull)", currentRound)
 			}
 
-
 		case QueueModeRetry:
 			// Retry: use traversal rules past maxKnownDepth (exhausted all possible depths beyond known tree)
 			// Below maxKnownDepth, keep scanning all known levels
@@ -523,12 +522,6 @@ func (q *Queue) ReportTaskResult(task *TaskBase, result TaskExecutionResult) {
 	}
 }
 
-// Complete is a public wrapper for backward compatibility.
-// New code should use ReportTaskResult instead.
-func (q *Queue) Complete(task *TaskBase) {
-	q.ReportTaskResult(task, TaskExecutionResultSuccessful)
-}
-
 // completeTask is the internal implementation for successful task completion.
 func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 	// Record execution time delta
@@ -536,12 +529,6 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 	currentRound := task.Round
 
 	if q.boltDB == nil {
-		return
-	}
-
-	// Handle exclusion tasks differently
-	if task.Type == TaskTypeExclusion {
-		q.completeExclusionTask(task)
 		return
 	}
 
@@ -671,6 +658,7 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		type dstChildFolder struct {
 			folder types.Folder
 			srcID  string
+			status string // Preserve the original status from ChildResult
 		}
 		var childFolders []dstChildFolder
 		totalFolders := 0
@@ -678,15 +666,18 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		for _, child := range task.DiscoveredChildren {
 			if !child.IsFile {
 				totalFolders++
+				// Process ALL folders regardless of status (Pending, NotOnSrc, Failed, etc.)
+				// Only pending folders will be traversed on the next round
 				if child.Status == db.StatusPending {
 					pendingFolders++
-					f := child.Folder
-					f.DepthLevel = nextRound
-					childFolders = append(childFolders, dstChildFolder{
-						folder: f,
-						srcID:  child.SrcID, // Preserve SrcID from ChildResult
-					})
 				}
+				f := child.Folder
+				f.DepthLevel = nextRound
+				childFolders = append(childFolders, dstChildFolder{
+					folder: f,
+					srcID:  child.SrcID,  // Preserve SrcID from ChildResult
+					status: child.Status, // Preserve the original status
+				})
 			}
 		}
 
@@ -709,8 +700,8 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 
 				// Set parent's ULID for database relationships
 				taskState.ParentID = nodeID
-				// Populate traversal status in the NodeState metadata
-				taskState.TraversalStatus = db.StatusPending
+				// Populate traversal status in the NodeState metadata using the original status
+				taskState.TraversalStatus = child.status
 				// Store SrcID in NodeState temporarily for BatchInsertNodes to create lookup mappings
 				// (BatchInsertNodes will handle storing in lookup tables)
 				if child.srcID != "" {
@@ -720,7 +711,7 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 				childNodesToInsert = append(childNodesToInsert, db.InsertOperation{
 					QueueType: queueType,
 					Level:     nextRound,
-					Status:    db.StatusPending,
+					Status:    child.status, // Use the original status from ChildResult
 					State:     taskState,
 				})
 
@@ -738,7 +729,10 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 					}
 				}
 
-				q.incrementRoundStatsExpected(nextRound)
+				// Only increment round stats for pending folders (only those will be traversed)
+				if child.status == db.StatusPending {
+					q.incrementRoundStatsExpected(nextRound)
+				}
 				tasksCreated++
 			}
 		}
@@ -812,31 +806,6 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 	q.removeInProgress(nodeID)
 
 	// Run() polling loop will check round completion directly - no soft flags needed
-}
-
-// completeExclusionTask handles completion of exclusion tasks.
-// Workers have already done the DB operations, so this just updates queue state.
-func (q *Queue) completeExclusionTask(task *TaskBase) {
-	currentRound := task.Round
-	nodeID := task.ID
-
-	// Remove ULID from leased set (can do this early, doesn't affect pending count)
-	if nodeID != "" {
-		q.removeLeasedKey(nodeID)
-	}
-	task.Locked = false
-	task.Status = "successful"
-
-	// Increment completed count
-	q.incrementRoundStatsCompleted(currentRound)
-
-	// Record task completion in RoundInfo
-	q.recordTaskCompletion(currentRound, true)
-
-	// CRITICAL: Remove from in-progress LAST, after all operations are complete.
-	// Even though exclusion workers handle buffer operations, we still want to ensure
-	// the Run() polling loop doesn't see inProgressCount == 0 prematurely.
-	q.removeInProgress(nodeID)
 }
 
 // childResultToNodeStateWithID converts a ChildResult to NodeState, reusing existing ULID if provided.

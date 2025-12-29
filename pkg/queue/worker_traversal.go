@@ -93,26 +93,6 @@ func (w *TraversalWorker) Run() {
 			continue
 		}
 
-		// For retry sweep mode, check if task is excluded (O(1) check)
-		mode := w.queue.getMode()
-		boltDB := w.queue.getBoltDB()
-		if mode == QueueModeRetry && boltDB != nil && task.ID != "" {
-			queueType := getQueueType(w.queueName)
-			exists, mode, err := db.CheckHoldingEntry(boltDB, queueType, task.ID)
-			excluded := (err == nil && exists && mode == "exclude")
-			if err == nil && excluded {
-				// Skip excluded nodes during retry sweep
-				if logservice.LS != nil {
-					_ = logservice.LS.Log("debug",
-						fmt.Sprintf("Skipping excluded node in retry sweep: id=%s path=%s", task.ID, task.LocationPath()),
-						"worker", w.id, w.queueName)
-				}
-				// Mark as successful (skipped, not failed)
-				w.queue.ReportTaskResult(task, TaskExecutionResultSuccessful)
-				continue
-			}
-		}
-
 		// Execute the task (check for shutdown during execution if needed)
 		err := w.execute(task)
 		if err != nil {
