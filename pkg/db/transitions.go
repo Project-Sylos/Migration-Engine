@@ -107,7 +107,6 @@ func UpdateNodeCopyStatusByID(db *DB, queueType string, level int, status string
 
 		// Update copy status and copy_needed flag
 		ns.CopyStatus = newCopyStatus
-		ns.CopyNeeded = (newCopyStatus == CopyStatusPending)
 
 		// Serialize and save
 		updatedData, err := ns.Serialize()
@@ -278,7 +277,6 @@ func BatchUpdateNodeCopyStatusByID(db *DB, queueType string, level int, status s
 			}
 
 			ns.CopyStatus = newCopyStatus
-			ns.CopyNeeded = (newCopyStatus == CopyStatusPending)
 
 			updatedData, err := ns.Serialize()
 			if err != nil {

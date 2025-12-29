@@ -62,7 +62,6 @@ func taskToNodeState(task *TaskBase) *db.NodeState {
 		Size:            size,
 		MTime:           mtime,
 		Depth:           task.Round,
-		CopyNeeded:      false, // Will be set during traversal comparison
 	}
 }
 
