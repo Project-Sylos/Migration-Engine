@@ -41,11 +41,12 @@ type TaskBase struct {
 
 // ChildResult represents a discovered child node with its traversal status.
 type ChildResult struct {
-	Folder types.Folder // Folder info (if folder)
-	File   types.File   // File info (if file)
-	Status string       // "pending", "successful", "missing", "not_on_src"
-	IsFile bool         // true if this is a file, false if folder
-	SrcID  string       // ULID of corresponding SRC node (for DST nodes only, set during matching)
+	Folder        types.Folder // Folder info (if folder)
+	File          types.File   // File info (if file)
+	Status        string       // "pending", "successful", "missing", "not_on_src"
+	IsFile        bool         // true if this is a file, false if folder
+	SrcID         string       // ULID of corresponding SRC node (for DST nodes only, set during matching)
+	SrcCopyStatus string       // Copy status to update on SRC node (if SrcID is set and match found): "pending" or "successful", empty if no update needed
 }
 
 // Identifier returns the unique identifier for this task (absolute path).

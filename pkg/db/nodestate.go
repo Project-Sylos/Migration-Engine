@@ -23,7 +23,6 @@ type NodeState struct {
 	Size              int64  `json:"size,omitempty"`
 	MTime             string `json:"mtime"` // Last modified time
 	Depth             int    `json:"depth"`
-	CopyNeeded        bool   `json:"copy_needed"`        // Set during traversal if copy is required
 	TraversalStatus   string `json:"traversal_status"`   // "pending", "successful", "failed", "not_on_src"
 	CopyStatus        string `json:"copy_status"`        // "pending", "successful", "failed" (for future copy phase)
 	Status            string `json:"status,omitempty"`   // Legacy: Comparison status for dst nodes

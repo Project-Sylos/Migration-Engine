@@ -74,7 +74,6 @@ func (op *CopyStatusOperation) Execute(tx *bolt.Tx) error {
 	}
 
 	ns.CopyStatus = op.NewCopyStatus
-	ns.CopyNeeded = (op.NewCopyStatus == CopyStatusPending)
 
 	updatedData, err := ns.Serialize()
 	if err != nil {

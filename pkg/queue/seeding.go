@@ -67,7 +67,6 @@ func SeedRootTask(queueType string, rootFolder types.Folder, rootNodeID string, 
 		Size:            0, // Folders have no size
 		MTime:           rootFolder.LastUpdated,
 		Depth:           0, // Root is always depth 0
-		CopyNeeded:      false,
 		Status:          db.StatusPending,
 	}
 
@@ -221,7 +220,6 @@ func SeedRootTaskWithSrcID(queueType string, rootFolder types.Folder, rootNodeID
 		Size:            0, // Folders have no size
 		MTime:           rootFolder.LastUpdated,
 		Depth:           0, // Root is always depth 0
-		CopyNeeded:      false,
 		Status:          db.StatusPending,
 		SrcID:           srcID, // Temporarily stored for BatchInsertNodes to create lookup mappings
 	}

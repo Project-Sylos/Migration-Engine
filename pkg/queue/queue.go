@@ -644,6 +644,16 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 				// Queue bidirectional lookup mapping: SrcID <-> DST node ID
 				outputBuffer.AddLookupMapping(child.SrcID, childState.ID)
 			}
+
+			// Update SRC node's CopyStatus if worker determined an update is needed
+			if child.SrcCopyStatus != "" {
+				// Get SRC node to get its depth and traversal status for the update
+				if srcNode, err := db.GetNodeState(boltDB, "SRC", child.SrcID); err == nil && srcNode != nil {
+					if outputBuffer != nil {
+						outputBuffer.AddCopyStatusUpdate("SRC", srcNode.Depth, srcNode.TraversalStatus, child.SrcID, child.SrcCopyStatus)
+					}
+				}
+			}
 		}
 
 		// Increment expected count for folder children (only folders need traversal)
@@ -656,9 +666,10 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 	// Note: ExpectedFolders/ExpectedFiles will be loaded later during PullTasks() batch loading
 	if q.name == "dst" {
 		type dstChildFolder struct {
-			folder types.Folder
-			srcID  string
-			status string // Preserve the original status from ChildResult
+			folder        types.Folder
+			srcID         string
+			status        string // Preserve the original status from ChildResult
+			srcCopyStatus string // Preserve copy status update from worker
 		}
 		var childFolders []dstChildFolder
 		totalFolders := 0
@@ -674,9 +685,10 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 				f := child.Folder
 				f.DepthLevel = nextRound
 				childFolders = append(childFolders, dstChildFolder{
-					folder: f,
-					srcID:  child.SrcID,  // Preserve SrcID from ChildResult
-					status: child.Status, // Preserve the original status
+					folder:        f,
+					srcID:         child.SrcID,         // Preserve SrcID from ChildResult
+					status:        child.Status,        // Preserve the original status
+					srcCopyStatus: child.SrcCopyStatus, // Preserve copy status update from worker
 				})
 			}
 		}
@@ -726,6 +738,16 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 					if outputBuffer != nil {
 						// Queue bidirectional lookup mapping: SrcID <-> DST node ID
 						outputBuffer.AddLookupMapping(child.srcID, taskState.ID)
+					}
+
+					// Update SRC node's CopyStatus if worker determined an update is needed
+					if child.srcCopyStatus != "" {
+						// Get SRC node to get its depth and traversal status for the update
+						if srcNode, err := db.GetNodeState(boltDB, "SRC", child.srcID); err == nil && srcNode != nil {
+							if outputBuffer != nil {
+								outputBuffer.AddCopyStatusUpdate("SRC", srcNode.Depth, srcNode.TraversalStatus, child.srcID, child.srcCopyStatus)
+							}
+						}
 					}
 				}
 
@@ -829,6 +851,14 @@ func childResultToNodeStateWithID(child ChildResult, parentPath string, depth in
 		srcID = child.SrcID
 	}
 
+	// Set CopyStatus to "pending" for all SRC children (will be updated during DST comparison)
+	var copyStatus string
+	if queueType == "SRC" {
+		copyStatus = db.CopyStatusPending
+	} else {
+		copyStatus = "" // DST nodes don't have copy status
+	}
+
 	if child.IsFile {
 		file := child.File
 		return &db.NodeState{
@@ -843,7 +873,7 @@ func childResultToNodeStateWithID(child ChildResult, parentPath string, depth in
 			Size:            file.Size,
 			MTime:           file.LastUpdated,
 			Depth:           depth,
-			CopyNeeded:      false,
+			CopyStatus:      copyStatus, // Set to "pending" for SRC, empty for DST
 			Status:          child.Status,
 			SrcID:           srcID, // Temporarily stored for BatchInsertNodes to create lookup mappings
 		}
@@ -862,7 +892,7 @@ func childResultToNodeStateWithID(child ChildResult, parentPath string, depth in
 		Size:            0,
 		MTime:           folder.LastUpdated,
 		Depth:           depth,
-		CopyNeeded:      false,
+		CopyStatus:      copyStatus, // Set to "pending" for SRC, empty for DST
 		Status:          child.Status,
 		SrcID:           srcID, // Temporarily stored for BatchInsertNodes to create lookup mappings
 	}
