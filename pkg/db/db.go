@@ -340,6 +340,44 @@ func (db *DB) ValidateCoreSchema() error {
 	})
 }
 
+// getRootNode returns the first node (key and value) in the "nodes" bucket for the given source ("src" or "dst").
+// Returns (key, value, error). If there are no nodes, key and value will be nil.
+func (db *DB) GetRootNode(queueType string) ([]byte, []byte, error) {
+	var key, value []byte
+
+	err := db.View(func(tx *bolt.Tx) error {
+		var b *bolt.Bucket
+
+		switch queueType {
+		case "SRC", "src":
+			b = getBucket(tx, []string{"Traversal-Data", "SRC", "nodes"})
+		case "DST", "dst":
+			b = getBucket(tx, []string{"Traversal-Data", "DST", "nodes"})
+		default:
+			return fmt.Errorf("invalid queue type: %s", queueType)
+		}
+
+		if b == nil {
+			return fmt.Errorf("nodes bucket not found for queue type: %s", queueType)
+		}
+
+		c := b.Cursor()
+		k, v := c.First()
+		if k == nil {
+			// No node in this table
+			key, value = nil, nil
+			return nil
+		}
+		key = make([]byte, len(k))
+		copy(key, k)
+		value = make([]byte, len(v))
+		copy(value, v)
+		return nil
+	})
+
+	return key, value, err
+}
+
 // getBucket navigates to a nested bucket given a path.
 // Returns nil if any bucket in the path doesn't exist.
 func getBucket(tx *bolt.Tx, bucketPath []string) *bolt.Bucket {
