@@ -101,6 +101,37 @@ func (q *Queue) getPullLowWM() int {
 	return q.pullLowWM
 }
 
+func (q *Queue) GetFilesDiscoveredTotal() int64 {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.filesDiscoveredTotal
+}
+
+func (q *Queue) GetFoldersDiscoveredTotal() int64 {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.foldersDiscoveredTotal
+}
+
+// GetTotalDiscovered returns the total number of items discovered (files + folders).
+func (q *Queue) GetTotalDiscovered() int64 {
+	return q.GetFilesDiscoveredTotal() + q.GetFoldersDiscoveredTotal()
+}
+
+// GetTotalFailed returns the total number of failed tasks across all rounds.
+func (q *Queue) GetTotalFailed() int {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+
+	total := 0
+	for _, roundInfo := range q.roundInfoMap {
+		if roundInfo != nil {
+			total += roundInfo.TasksFailed
+		}
+	}
+	return total
+}
+
 func (q *Queue) isLeased(nodeID string) bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()

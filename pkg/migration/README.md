@@ -48,6 +48,8 @@ type Service struct {
 }
 ```
 
+**Important**: The `Adapter` field must be provided by the caller. The Migration Engine never creates or closes adapters - the caller owns the adapter lifecycle. This design eliminates connection lock issues (especially with Spectra which only supports one connection at a time) and allows the API to manage adapter lifecycle centrally.
+
 ### LetsMigrate
 
 The main entry point for executing a migration (synchronous):
@@ -65,6 +67,8 @@ This function:
 6. Returns results
 
 **Note:** This function blocks until the migration completes or is shutdown. It automatically handles SIGINT/SIGTERM signals for graceful shutdown.
+
+**Adapter Lifecycle**: The engine validates that adapters are provided (non-nil) but never creates or closes them. The caller is responsible for adapter lifecycle management.
 
 ### StartMigration
 
@@ -148,26 +152,22 @@ fmt.Printf("Last Round Src: %d\n", *yamlCfg.State.LastRoundSrc)
 
 #### Option 2: Reconstruct Full Config (For Resuming)
 
-To resume a migration, you need to reconstruct a `migration.Config` from the YAML. This requires an `AdapterFactory` to create service adapters:
+To resume a migration, you need to reconstruct a `migration.Config` from the YAML. Adapters must be provided directly - the engine never creates adapters:
 
 ```go
-// Define your adapter factory
-factory := func(serviceType string, serviceCfg migration.ServiceConfigYAML, serviceConfigs map[string]any) (fsservices.FSAdapter, error) {
-    switch strings.ToLower(serviceType) {
-    case "spectra":
-        // Extract spectra config and create adapter
-        spectraFS, err := sdk.New(configPath)
-        if err != nil {
-            return nil, err
-        }
-        return fsservices.NewSpectraFS(spectraFS, rootID, world)
-    default:
-        return nil, fmt.Errorf("unsupported service type: %s", serviceType)
-    }
+// Create adapters (caller is responsible for adapter lifecycle)
+srcAdapter, err := createSourceAdapter(...)
+if err != nil {
+    return err
 }
 
-// Load and reconstruct the config
-cfg, err := migration.LoadMigrationConfigFromYAML("migration.yaml", factory)
+dstAdapter, err := createDestinationAdapter(...)
+if err != nil {
+    return err
+}
+
+// Load and reconstruct the config with provided adapters
+cfg, err := migration.LoadMigrationConfigFromYAML("migration.yaml", srcAdapter, dstAdapter)
 if err != nil {
     return err
 }
@@ -175,6 +175,8 @@ if err != nil {
 // Resume the migration
 result, err := migration.LetsMigrate(cfg)
 ```
+
+**Important**: The engine never creates or closes adapters. The caller is responsible for adapter lifecycle management.
 
 ### YAML Config Structure
 
@@ -378,7 +380,8 @@ if err != nil {
 3. **Handle errors gracefully** - Migrations can be partially complete
 4. **Use verification** - Always verify migration results before considering it complete
 5. **Save configs explicitly** - For important migrations, save configs at key points
-6. **Provide proper AdapterFactory** - When loading from YAML, ensure your factory handles all service types
+6. **Provide adapters explicitly** - The engine never creates adapters; all adapters must be provided by the caller
+7. **Manage adapter lifecycle** - The engine never closes adapters; the caller is responsible for cleanup
 
 ---
 

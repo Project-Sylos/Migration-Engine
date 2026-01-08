@@ -180,32 +180,66 @@ children, err := db.GetChildrenIDsByParentID(database, "SRC", ulid)
 
 **Path**: `/Traversal-Data/SRC/levels/` or `/Traversal-Data/DST/levels/`
 
-Organized by BFS depth level, with status sub-buckets and a status-lookup index:
+Organized by BFS depth level, with separate **traversal** and **copy** status sub-buckets (copy buckets exist only for SRC):
 
+**SRC Structure:**
 ```
 /levels
   /00000000              → Level 0 (root)
-    /pending             → ULID: empty (membership set)
-    /successful          → ULID: empty (membership set)
-    /failed              → ULID: empty (membership set)
-    /status-lookup       → ULID: status string (reverse index)
+    /traversal
+      /pending           → ULID: empty (membership set)
+      /successful        → ULID: empty (membership set)
+      /failed            → ULID: empty (membership set)
+      /excluded          → ULID: empty (membership set)
+      /status-lookup     → ULID: status string (reverse index)
+    /copy
+      /pending           → ULID: empty (membership set)
+      /successful        → ULID: empty (membership set)
+      /skipped           → ULID: empty (membership set)
+      /failed            → ULID: empty (membership set)
+      /status-lookup     → ULID: status string (reverse index)
   /00000001              → Level 1
-    /pending
-    /successful
-    /failed
-    /status-lookup
+    /traversal
+      ...
+    /copy
+      ...
   /00000002              → Level 2
     ...
 ```
 
-For DST queue, there's an additional status:
+**DST Structure:**
 ```
-  /not_on_src            → ULID: empty (membership set)
+/levels
+  /00000000              → Level 0 (root)
+    /traversal
+      /pending           → ULID: empty (membership set)
+      /successful        → ULID: empty (membership set)
+      /failed            → ULID: empty (membership set)
+      /not_on_src        → ULID: empty (membership set)
+      /excluded          → ULID: empty (membership set)
+      /status-lookup     → ULID: status string (reverse index)
+  /00000001              → Level 1
+    /traversal
+      ...
+  /00000002              → Level 2
+    ...
 ```
+
+**Note**: DST nodes do **not** have copy status buckets. Copy status is only relevant for SRC nodes.
 
 **Status buckets are membership sets**: The presence of a ULID in a bucket means that node has that status. The value is empty; only the key matters.
 
-**Status-lookup index**: The `status-lookup` bucket provides a reverse index mapping `ULID → status string`. This enables O(1) lookup to determine which status bucket a node belongs to without scanning all status buckets. The index is automatically maintained:
+**Traversal Status** (SRC and DST):
+- Answers: "Can I descend?", "Should I enqueue children?", "Did listing fail?", "Was this excluded?"
+- Used by: traversal engine, retry/exclusion logic, UI tree expansion
+- Statuses: `pending`, `successful`, `failed`, `excluded` (DST also has `not_on_src`)
+
+**Copy Status** (SRC only):
+- Answers: "Will data move?", "Is this already satisfied?", "Did copy fail?", "Was it skipped?"
+- Used by: copy phase queueing, progress bars, audit & reporting, UI action-plan view
+- Statuses: `pending`, `successful`, `skipped`, `failed`
+
+**Status-lookup indexes**: Both `traversal/status-lookup` and `copy/status-lookup` buckets provide reverse indexes mapping `ULID → status string`. This enables O(1) lookup to determine which status bucket a node belongs to without scanning all status buckets. The indexes are automatically maintained:
 - Created when a level bucket is first created
 - Updated on every node insert (with initial status)
 - Updated on every status transition (pending → successful, etc.)
@@ -238,8 +272,9 @@ Stores count statistics for all buckets and queue performance metrics:
   /totals                → bucketPath: int64 (8-byte big-endian)
     "SRC/nodes"                    → int64
     "SRC/children"                 → int64
-    "SRC/levels/00000001/pending"  → int64
-    "DST/levels/00000002/successful" → int64
+    "SRC/levels/00000001/traversal/pending"  → int64
+    "SRC/levels/00000001/copy/pending"       → int64
+    "DST/levels/00000002/traversal/successful" → int64
     "LOGS"                         → int64
   /queue-stats           → queueKey: QueueObserverMetrics JSON
     "src-traversal"      → QueueObserverMetrics JSON
@@ -332,17 +367,17 @@ state := &db.NodeState{
 }
 // This automatically:
 // 1. Inserts into /nodes bucket (keyed by ULID)
-// 2. Adds to status bucket (/levels/{level}/{status})
-// 3. Updates status-lookup index (/levels/{level}/status-lookup)
+// 2. Adds to traversal status bucket (/levels/{level}/traversal/{status})
+// 3. Updates traversal status-lookup index (/levels/{level}/traversal/status-lookup)
 // 4. Updates parent's children list
 err := db.InsertNodeWithIndex(database, "SRC", 1, db.StatusPending, state)
 
-// Update node status (moves between status buckets and updates status-lookup)
+// Update node traversal status (moves between traversal status buckets and updates status-lookup)
 // This automatically:
 // 1. Updates NodeState in /nodes bucket
-// 2. Removes from old status bucket
-// 3. Adds to new status bucket
-// 4. Updates status-lookup index
+// 2. Removes from old traversal status bucket
+// 3. Adds to new traversal status bucket
+// 4. Updates traversal status-lookup index
 nodeID := "01ARZ3NDEKTSV4RRFFQ69G5FAV"  // ULID of the node
 updatedState, err := db.UpdateNodeStatusByID(database, "SRC", 1, 
     db.StatusPending, db.StatusSuccessful, nodeID)
@@ -388,7 +423,7 @@ levels, err := database.GetAllLevels("SRC")
 // Find minimum level with pending work
 minLevel, err := database.FindMinPendingLevel("SRC")
 
-// Lease tasks from status bucket (for worker task distribution)
+// Lease tasks from traversal status bucket (for worker task distribution)
 nodeIDs, err := database.LeaseTasksFromStatus("SRC", 1, db.StatusPending, 1000)
 
 // Batch fetch with keys (for task leasing with deduplication)
@@ -581,7 +616,8 @@ err := database.Update(func(tx *bolt.Tx) error {
 nodesPath := db.GetNodesBucketPath("SRC")        // ["Traversal-Data", "SRC", "nodes"]
 childrenPath := db.GetChildrenBucketPath("SRC")  // ["Traversal-Data", "SRC", "children"]
 levelPath := db.GetLevelBucketPath("SRC", 1)     // ["Traversal-Data", "SRC", "levels", "00000001"]
-statusPath := db.GetStatusBucketPath("SRC", 1, db.StatusPending)
+traversalStatusPath := db.GetTraversalStatusBucketPath("SRC", 1, db.StatusPending)
+copyStatusPath := db.GetCopyStatusBucketPath(1, db.CopyStatusPending) // SRC only
 // ["Traversal-Data", "SRC", "levels", "00000001", "pending"]
 lookupPath := db.GetStatusLookupBucketPath("SRC", 1)
 // ["Traversal-Data", "SRC", "levels", "00000001", "status-lookup"]
@@ -636,8 +672,9 @@ BoltDB makes status transitions atomic and race-free:
 ```go
 // Atomic within single transaction:
 // 1. Update NodeState in /nodes bucket
-// 2. Remove from old status bucket
-// 3. Add to new status bucket
+// 2. Remove from old traversal status bucket
+// 3. Add to new traversal status bucket
+// 4. Update traversal status-lookup index
 // 4. Update status-lookup index
 // All four operations succeed or all fail
 ```

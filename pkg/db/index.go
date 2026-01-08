@@ -270,6 +270,8 @@ func computeBatchInsertStatsDeltas(tx *bolt.Tx, ops []InsertOperation) map[strin
 	nodesCounts := make(map[string]int64)    // queueType -> count
 	statusCounts := make(map[string]int64)   // "queueType/level/status" -> count
 	childrenCounts := make(map[string]int64) // queueType -> count of new parent entries
+	srcToDstCount := int64(0)                // Count of new src-to-dst entries
+	dstToSrcCount := int64(0)                // Count of new dst-to-src entries
 
 	for _, op := range ops {
 		if op.State == nil || op.State.ID == "" {
@@ -304,6 +306,24 @@ func computeBatchInsertStatsDeltas(tx *bolt.Tx, ops []InsertOperation) map[strin
 				childrenCounts[op.QueueType]++
 			}
 		}
+
+		// Check if lookup mappings need to be created (for DST nodes with SrcID)
+		if op.QueueType == "DST" && op.State.SrcID != "" {
+			// Check dst-to-src bucket
+			dstToSrcBucket := GetDstToSrcBucket(tx)
+			if dstToSrcBucket != nil && dstToSrcBucket.Get(nodeID) == nil {
+				dstToSrcCount++
+			}
+
+			// Check src-to-dst bucket
+			srcToDstBucket := GetSrcToDstBucket(tx)
+			if srcToDstBucket != nil {
+				srcIDBytes := []byte(op.State.SrcID)
+				if srcToDstBucket.Get(srcIDBytes) == nil {
+					srcToDstCount++
+				}
+			}
+		}
 	}
 
 	// Convert to bucket path strings
@@ -326,6 +346,16 @@ func computeBatchInsertStatsDeltas(tx *bolt.Tx, ops []InsertOperation) map[strin
 	for queueType, count := range childrenCounts {
 		path := strings.Join(GetChildrenBucketPath(queueType), "/")
 		deltas[path] += count
+	}
+
+	// Add src-to-dst and dst-to-src stats deltas
+	if srcToDstCount > 0 {
+		srcToDstPath := GetSrcToDstBucketPath()
+		deltas[strings.Join(srcToDstPath, "/")] += srcToDstCount
+	}
+	if dstToSrcCount > 0 {
+		dstToSrcPath := GetDstToSrcBucketPath()
+		deltas[strings.Join(dstToSrcPath, "/")] += dstToSrcCount
 	}
 
 	return deltas
@@ -432,6 +462,7 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 
 			// Store lookup mappings if SrcID is present in NodeState (for backward compatibility)
 			// For DST nodes, store DST→SRC and SRC→DST mappings
+			// Note: Stats deltas are already computed in computeBatchInsertStatsDeltas
 			if op.QueueType == "DST" && op.State.SrcID != "" {
 				// Store DST→SRC mapping
 				dstToSrcBucket, err := GetOrCreateDstToSrcBucket(tx)
@@ -441,11 +472,12 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 				// Store SRC→DST mapping
 				srcToDstBucket, err := GetOrCreateSrcToDstBucket(tx)
 				if err == nil {
-					srcToDstBucket.Put([]byte(op.State.SrcID), nodeID)
+					srcIDBytes := []byte(op.State.SrcID)
+					srcToDstBucket.Put(srcIDBytes, nodeID)
 				}
 			}
 
-			// Note: Path-to-ULID mappings are now queued via OutputBuffer.AddPathToULIDMapping()
+			// Note: Path-to-ULID mappings are queued via OutputBuffer.AddPathToULIDMapping()
 			// during task completion (queue.go), not here. This avoids duplicates and ensures
 			// proper ordering with other buffered operations.
 		}

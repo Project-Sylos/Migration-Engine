@@ -565,6 +565,30 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 	oldStatusCounts := make(map[string]int64) // "queueType/level/status" -> count
 	newStatusCounts := make(map[string]int64) // "queueType/level/status" -> count
 
+	// Track lookup mappings that will be created by BatchInsertOperations in this batch
+	// to avoid double-counting in LookupMappingOperation
+	batchInsertMappings := make(map[string]bool) // "srcID:dstID" -> true
+
+	// First pass: process BatchInsertOperations and collect their mappings
+	for _, op := range operations {
+		if batchInsert, ok := op.(*BatchInsertOperation); ok {
+			// Compute deltas for batch insert (includes lookup mapping tracking)
+			insertDeltas := computeBatchInsertStatsDeltas(tx, batchInsert.Operations)
+			for path, delta := range insertDeltas {
+				deltas[path] += delta
+			}
+
+			// Track which mappings will be created by this batch insert
+			for _, insertOp := range batchInsert.Operations {
+				if insertOp.QueueType == "DST" && insertOp.State != nil && insertOp.State.SrcID != "" {
+					mappingKey := fmt.Sprintf("%s:%s", insertOp.State.SrcID, insertOp.State.ID)
+					batchInsertMappings[mappingKey] = true
+				}
+			}
+		}
+	}
+
+	// Second pass: process other operations, but skip LookupMappingOperation if already tracked
 	for _, op := range operations {
 		switch v := op.(type) {
 		case *StatusUpdateOperation:
@@ -585,11 +609,7 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 			}
 
 		case *BatchInsertOperation:
-			// Batch insert: compute deltas for all inserts
-			insertDeltas := computeBatchInsertStatsDeltas(tx, v.Operations)
-			for path, delta := range insertDeltas {
-				deltas[path] += delta
-			}
+			// Already processed in first pass, skip
 
 		case *CopyStatusOperation:
 			// Copy status updates don't change bucket counts, just node metadata
@@ -602,6 +622,51 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 		case *ExclusionHoldingRemoveOperation, *ExclusionHoldingAddOperation:
 			// Exclusion-holding bucket operations don't affect stats
 			// No stats updates needed
+
+		case *PathToULIDMappingOperation:
+			// Path-to-ULID mapping: check if entry already exists
+			pathToULIDPath := GetPathToULIDBucketPath(v.QueueType)
+			pathToULIDBucket := getBucket(tx, pathToULIDPath)
+			if pathToULIDBucket != nil {
+				pathHash := HashPath(v.Path)
+				pathHashBytes := []byte(pathHash)
+				// Only increment if entry doesn't exist
+				if pathToULIDBucket.Get(pathHashBytes) == nil {
+					pathToULIDPathStr := strings.Join(pathToULIDPath, "/")
+					deltas[pathToULIDPathStr]++
+				}
+			}
+
+		case *LookupMappingOperation:
+			// Check if this mapping was already tracked by a BatchInsertOperation in this batch
+			mappingKey := fmt.Sprintf("%s:%s", v.SrcID, v.DstID)
+			if batchInsertMappings[mappingKey] {
+				// Already tracked by batch insert, skip to avoid double-counting
+				continue
+			}
+
+			// Lookup mapping: check if entries already exist for both src-to-dst and dst-to-src
+			srcToDstPath := GetSrcToDstBucketPath()
+			srcToDstBucket := GetSrcToDstBucket(tx)
+			if srcToDstBucket != nil {
+				srcIDBytes := []byte(v.SrcID)
+				// Only increment if entry doesn't exist
+				if srcToDstBucket.Get(srcIDBytes) == nil {
+					srcToDstPathStr := strings.Join(srcToDstPath, "/")
+					deltas[srcToDstPathStr]++
+				}
+			}
+
+			dstToSrcPath := GetDstToSrcBucketPath()
+			dstToSrcBucket := GetDstToSrcBucket(tx)
+			if dstToSrcBucket != nil {
+				dstIDBytes := []byte(v.DstID)
+				// Only increment if entry doesn't exist
+				if dstToSrcBucket.Get(dstIDBytes) == nil {
+					dstToSrcPathStr := strings.Join(dstToSrcPath, "/")
+					deltas[dstToSrcPathStr]++
+				}
+			}
 
 		case *NodeDeletionOperation:
 			// Node deletion: subtract from status bucket and nodes bucket

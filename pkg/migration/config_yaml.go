@@ -22,14 +22,17 @@ import (
 // Migration checkpoint status constants
 // These represent the current phase/checkpoint of the migration workflow.
 const (
-	StatusRootsSet            = "Roots-Set"             // User has set root folders and services (initial state)
-	StatusFiltersSet          = "Filters-Set"           // Filters configured, ready for traversal (also used for retry)
-	StatusTraversalInProgress = "Traversal-In-Progress" // Traversal is currently running
-	StatusPreparingPathReview = "Preparing-Path-Review" // Preparing for path review - ETL from BoltDB to DuckDB
-	StatusAwaitingPathReview  = "Awaiting-Path-Review"  // Traversal complete, awaiting user review
-	StatusCopyInProgress      = "Copy-In-Progress"      // Copy phase is currently running
-	StatusComplete            = "Complete"              // Migration completed successfully
-	StatusSuspended           = "Suspended"             // Migration suspended (can be resumed)
+	StatusRootsSet                = "Roots-Set"                    // User has set root folders and services (initial state)
+	StatusFiltersSet              = "Filters-Set"                  // Filters configured, ready for traversal (also used for retry)
+	StatusTraversalInProgress     = "Traversal-In-Progress"        // Traversal is currently running
+	StatusPreparingPathReview     = "Preparing-Path-Review"        // Traversal complete, ready for ETL from BoltDB to DuckDB
+	StatusETLBoltToDuckInProgress = "ETL-Bolt-To-Duck-In-Progress" // ETL from BoltDB to DuckDB is currently running
+	StatusAwaitingPathReview      = "Awaiting-Path-Review"         // ETL complete, awaiting user review
+	StatusPreparingRetry          = "Preparing-For-Retry"          // Ready for retry sweep - ETL from DuckDB to BoltDB will start
+	StatusETLDuckToBoltInProgress = "ETL-Duck-To-Bolt-In-Progress" // ETL from DuckDB to BoltDB is currently running
+	StatusCopyInProgress          = "Copy-In-Progress"             // Copy phase is currently running
+	StatusComplete                = "Complete"                     // Migration completed successfully
+	StatusSuspended               = "Suspended"                    // Migration suspended (can be resumed)
 )
 
 // MigrationConfigYAML represents the complete migration configuration stored in YAML format.
@@ -54,7 +57,7 @@ type MetadataConfig struct {
 
 // StateConfig tracks the current migration checkpoint state.
 type StateConfig struct {
-	Status       string `yaml:"status"` // Roots-Set, Filters-Set, Traversal-In-Progress, Preparing-Path-Review, Awaiting-Path-Review, Copy-In-Progress, Complete, Suspended
+	Status       string `yaml:"status"` // Roots-Set, Filters-Set, Traversal-In-Progress, Preparing-Path-Review, ETL-Bolt-To-Duck-In-Progress, Awaiting-Path-Review, Preparing-For-Retry, ETL-Duck-To-Bolt-In-Progress, Copy-In-Progress, Complete, Suspended
 	LastRoundSrc *int   `yaml:"last_round_src,omitempty"`
 	LastRoundDst *int   `yaml:"last_round_dst,omitempty"`
 	// Retry metadata (only set when Status = Filters-Set for retry)
@@ -115,6 +118,7 @@ type LoggingConfig struct {
 type DatabaseConfigYAML struct {
 	Path           string `yaml:"path"`
 	RemoveExisting bool   `yaml:"remove_existing"`
+	RequireOpen    bool   `yaml:"require_open"`
 }
 
 // LoadMigrationConfig loads a migration configuration from a YAML file.
@@ -134,20 +138,19 @@ func LoadMigrationConfig(path string) (*MigrationConfigYAML, error) {
 
 // LoadMigrationConfigFromYAML reconstructs a migration.Config from a YAML file.
 // This is a convenience function that loads the YAML and converts it to a Config.
-// The adapterFactory parameter is used to create FSAdapter instances.
+// Adapters must be provided by the caller - the engine never creates adapters.
 // Example usage:
 //
-//	factory := func(serviceType string, serviceCfg ServiceConfigYAML, serviceConfigs map[string]any) (types.FSAdapter, error) {
-//	    // Your adapter creation logic here
-//	}
-//	cfg, err := LoadMigrationConfigFromYAML("migration.yaml", factory)
-func LoadMigrationConfigFromYAML(path string, adapterFactory AdapterFactory) (Config, error) {
+//	srcAdapter, _ := createAdapter(...)
+//	dstAdapter, _ := createAdapter(...)
+//	cfg, err := LoadMigrationConfigFromYAML("migration.yaml", srcAdapter, dstAdapter)
+func LoadMigrationConfigFromYAML(path string, srcAdapter, dstAdapter types.FSAdapter) (Config, error) {
 	yamlCfg, err := LoadMigrationConfig(path)
 	if err != nil {
 		return Config{}, err
 	}
 
-	cfg, err := yamlCfg.ToMigrationConfig(adapterFactory)
+	cfg, err := yamlCfg.ToMigrationConfig(srcAdapter, dstAdapter)
 	if err != nil {
 		return Config{}, err
 	}
@@ -187,28 +190,14 @@ func ConfigPathFromDatabasePath(dbDir string) string {
 	return base + ".yaml"
 }
 
-// AdapterFactory is a function type that creates FSAdapter instances from service configuration.
-// This allows callers to provide their own adapter creation logic (e.g., for Spectra, LocalFS, etc.)
-type AdapterFactory func(serviceType string, serviceCfg ServiceConfigYAML, serviceConfigs map[string]any) (types.FSAdapter, error)
-
 // ToMigrationConfig reconstructs a migration.Config from a MigrationConfigYAML.
-// The adapterFactory parameter is used to create FSAdapter instances from the service configuration.
-// If adapterFactory is nil, a default factory will be used that supports basic service types.
-func (yamlCfg *MigrationConfigYAML) ToMigrationConfig(adapterFactory AdapterFactory) (Config, error) {
-	if adapterFactory == nil {
-		adapterFactory = defaultAdapterFactory
+// Adapters must be provided by the caller - the engine never creates adapters.
+func (yamlCfg *MigrationConfigYAML) ToMigrationConfig(srcAdapter, dstAdapter types.FSAdapter) (Config, error) {
+	if srcAdapter == nil {
+		return Config{}, fmt.Errorf("source adapter must be provided")
 	}
-
-	// Reconstruct source adapter
-	srcAdapter, err := adapterFactory(yamlCfg.Services.Source.Type, yamlCfg.Services.Source, yamlCfg.ServiceConfigs)
-	if err != nil {
-		return Config{}, fmt.Errorf("failed to create source adapter: %w", err)
-	}
-
-	// Reconstruct destination adapter
-	dstAdapter, err := adapterFactory(yamlCfg.Services.Destination.Type, yamlCfg.Services.Destination, yamlCfg.ServiceConfigs)
-	if err != nil {
-		return Config{}, fmt.Errorf("failed to create destination adapter: %w", err)
+	if dstAdapter == nil {
+		return Config{}, fmt.Errorf("destination adapter must be provided")
 	}
 
 	// Reconstruct root folders
@@ -223,6 +212,7 @@ func (yamlCfg *MigrationConfigYAML) ToMigrationConfig(adapterFactory AdapterFact
 			Path:           yamlCfg.Database.Path,
 			RemoveExisting: yamlCfg.Database.RemoveExisting,
 			ConfigPath:     "", // Will be set by caller if needed
+			RequireOpen:    yamlCfg.Database.RequireOpen,
 		},
 		Source: Service{
 			Name:    yamlCfg.Services.Source.Name,
@@ -273,19 +263,6 @@ func yamlFolderToFolder(yamlRoot *RootFolderYAML, rootID, rootPath string) types
 	}
 }
 
-// defaultAdapterFactory provides a basic adapter factory that supports common service types.
-// For Spectra and other complex services, callers should provide their own factory.
-func defaultAdapterFactory(serviceType string, serviceCfg ServiceConfigYAML, serviceConfigs map[string]any) (types.FSAdapter, error) {
-	switch strings.ToLower(serviceType) {
-	case "spectra":
-		// For Spectra, we need the Spectra SDK which may not be available in this package
-		// Return an error suggesting the caller provide a custom factory
-		return nil, fmt.Errorf("spectra adapter requires custom AdapterFactory - use LoadMigrationConfigFromYAML with a custom factory or provide your own AdapterFactory")
-	default:
-		return nil, fmt.Errorf("unsupported service type: %s (provide custom AdapterFactory)", serviceType)
-	}
-}
-
 // NewMigrationConfigYAML creates a new migration config YAML from a migration Config.
 func NewMigrationConfigYAML(cfg Config, status MigrationStatus) (*MigrationConfigYAML, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -332,6 +309,7 @@ func NewMigrationConfigYAML(cfg Config, status MigrationStatus) (*MigrationConfi
 		Database: DatabaseConfigYAML{
 			Path:           cfg.Database.Path,
 			RemoveExisting: cfg.Database.RemoveExisting,
+			RequireOpen:    cfg.Database.RequireOpen,
 		},
 		Verification: cfg.Verification,
 		Extensions:   make(map[string]any),
@@ -456,6 +434,45 @@ func SetStatusAwaitingPathReview(yamlCfg *MigrationConfigYAML) {
 	yamlCfg.State.Status = StatusAwaitingPathReview
 }
 
+// SetStatusPreparingRetry sets the migration status to "Preparing-For-Retry".
+// Called when API triggers retry sweep - signals that ETL from DuckDB to BoltDB will start.
+// After this status is set, the ETL process should call SetStatusETLDuckToBoltInProgress when it starts,
+// and then SetStatusFiltersSet(isRetry=true, maxKnownDepth) when ETL completes.
+func SetStatusPreparingRetry(yamlCfg *MigrationConfigYAML) {
+	if yamlCfg == nil {
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	yamlCfg.Metadata.LastModified = now
+	yamlCfg.State.Status = StatusPreparingRetry
+}
+
+// SetStatusETLBoltToDuckInProgress sets the migration status to "ETL-Bolt-To-Duck-In-Progress".
+// Called when ETL from BoltDB to DuckDB actually starts.
+// After ETL completes, the caller should call SetStatusAwaitingPathReview to transition
+// to Awaiting-Path-Review status.
+func SetStatusETLBoltToDuckInProgress(yamlCfg *MigrationConfigYAML) {
+	if yamlCfg == nil {
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	yamlCfg.Metadata.LastModified = now
+	yamlCfg.State.Status = StatusETLBoltToDuckInProgress
+}
+
+// SetStatusETLDuckToBoltInProgress sets the migration status to "ETL-Duck-To-Bolt-In-Progress".
+// Called when ETL from DuckDB to BoltDB actually starts.
+// After ETL completes, the caller should call SetStatusFiltersSet(isRetry=true, maxKnownDepth) to transition
+// back to Filters-Set status, signaling that the migration is ready to start the retry sweep.
+func SetStatusETLDuckToBoltInProgress(yamlCfg *MigrationConfigYAML) {
+	if yamlCfg == nil {
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	yamlCfg.Metadata.LastModified = now
+	yamlCfg.State.Status = StatusETLDuckToBoltInProgress
+}
+
 // SetStatusCopyInProgress sets the migration status to "Copy-In-Progress".
 // Called when copy phase starts.
 func SetStatusCopyInProgress(yamlCfg *MigrationConfigYAML) {
@@ -480,7 +497,19 @@ func SetStatusComplete(yamlCfg *MigrationConfigYAML) {
 
 // IsValidCheckpointStatus returns true if the given status string is a valid checkpoint state.
 func IsValidCheckpointStatus(status string) bool {
-	return slices.Contains([]string{StatusRootsSet, StatusFiltersSet, StatusTraversalInProgress, StatusAwaitingPathReview, StatusCopyInProgress, StatusComplete, StatusSuspended}, status)
+	return slices.Contains([]string{
+		StatusRootsSet,
+		StatusFiltersSet,
+		StatusTraversalInProgress,
+		StatusPreparingPathReview,
+		StatusETLBoltToDuckInProgress,
+		StatusAwaitingPathReview,
+		StatusPreparingRetry,
+		StatusETLDuckToBoltInProgress,
+		StatusCopyInProgress,
+		StatusComplete,
+		StatusSuspended,
+	}, status)
 }
 
 // IsRetrySweepEnabled returns true if the migration is configured for a retry sweep.
