@@ -84,14 +84,15 @@ type Result struct {
 
 // MigrationController provides programmatic control over a running migration.
 // It allows you to trigger force shutdown and check migration status.
-// Note: The controller does NOT own the DB lifecycle - the API does.
+// Note: The controller may own the DB lifecycle in standalone mode (RequireOpen=false).
 type MigrationController struct {
 	shutdownCancel context.CancelFunc
 	shutdownCtx    context.Context
 	done           chan struct{}
 	result         *Result
 	err            error
-	boltDB         *db.DB // Thread-safe - BoltDB operations handle their own locking (API owns lifecycle)
+	boltDB         *db.DB        // Thread-safe - BoltDB operations handle their own locking
+	dbManager      *db.DBManager // Tracks DB ownership (nil if API owns it)
 }
 
 // Shutdown triggers a force shutdown of the migration.
@@ -177,19 +178,37 @@ func StartMigration(cfg Config) *MigrationController {
 		done:           done,
 	}
 
-	// DB must be provided - ME does not open it
-	if cfg.DatabaseInstance == nil {
-		controller.err = fmt.Errorf("DatabaseInstance is required - migration engine does not open databases")
+	// Ensure DB is open using manager
+	dbManager, err := db.EnsureOpen(cfg.DatabaseInstance, cfg.Database.Path, cfg.Database.RequireOpen)
+	if err != nil {
+		controller.err = fmt.Errorf("failed to ensure database is open: %w", err)
 		close(done)
 		return controller
 	}
 
-	// Store DB in controller (API owns lifecycle - ME never closes it)
-	controller.boltDB = cfg.DatabaseInstance
+	// Store DB in controller
+	controller.boltDB = dbManager.GetDB()
+
+	// In standalone mode, we own the DB lifecycle and should close it on completion
+	if !cfg.Database.RequireOpen {
+		// Track manager for cleanup
+		controller.dbManager = dbManager
+	}
 
 	// Run migration in goroutine
 	go func() {
 		defer close(done)
+		// In standalone mode, close DB if we opened it
+		if controller.dbManager != nil {
+			defer func() {
+				if closeErr := db.CloseIfOwned(controller.dbManager); closeErr != nil {
+					// Log but don't fail - DB close errors are non-fatal
+					if controller.err == nil {
+						controller.err = fmt.Errorf("failed to close database: %w", closeErr)
+					}
+				}
+			}()
+		}
 		// Pass the shutdown context to LetsMigrate
 		cfgCopy := cfg
 		cfgCopy.ShutdownContext = shutdownCtx
@@ -197,7 +216,6 @@ func StartMigration(cfg Config) *MigrationController {
 		result, err := letsMigrateWithContext(cfgCopy)
 		controller.result = &result
 		controller.err = err
-		// ME never closes DB - API owns lifecycle
 	}()
 
 	return controller
@@ -236,11 +254,24 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 		go HandleShutdownSignals(shutdownCancel)
 	}
 
-	// DB must be provided - ME does not open it
-	if cfg.DatabaseInstance == nil {
-		return Result{}, fmt.Errorf("DatabaseInstance is required - migration engine does not open databases")
+	// Ensure DB is open using manager
+	dbManager, err := db.EnsureOpen(cfg.DatabaseInstance, cfg.Database.Path, cfg.Database.RequireOpen)
+	if err != nil {
+		return Result{}, fmt.Errorf("failed to ensure database is open: %w", err)
 	}
-	boltDB = cfg.DatabaseInstance
+	boltDB = dbManager.GetDB()
+
+	// In standalone mode, defer closing DB if we opened it
+	if !cfg.Database.RequireOpen {
+		defer func() {
+			if closeErr := db.CloseIfOwned(dbManager); closeErr != nil {
+				// Log but don't fail - DB close errors are non-fatal
+				if err == nil {
+					err = fmt.Errorf("failed to close database: %w", closeErr)
+				}
+			}
+		}()
+	}
 
 	if cfg.Source.Adapter == nil || cfg.Destination.Adapter == nil {
 		return Result{}, fmt.Errorf("source and destination adapters must be provided")
@@ -264,12 +295,12 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	// ----------------- DETERMINE "wasFresh" LOGIC BASED ON YAML -----------------
 
 	var (
-		yamlCfg      *MigrationConfigYAML
-		status       MigrationStatus
-		inspectErr   error
-		wasFresh     bool
-		yamlLoadErr  error
-		loadedCfg    *MigrationConfigYAML
+		yamlCfg     *MigrationConfigYAML
+		status      MigrationStatus
+		inspectErr  error
+		wasFresh    bool
+		yamlLoadErr error
+		loadedCfg   *MigrationConfigYAML
 	)
 	// Try to load existing YAML
 	loadedCfg, yamlLoadErr = LoadMigrationConfig(configPath)
@@ -462,8 +493,6 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
 
-		// BoltDB doesn't need checkpointing - data is already persisted
-
 		// Flush log service if available (with timeout)
 		if logservice.LS != nil {
 			flushDone := make(chan struct{}, 1)
@@ -479,10 +508,8 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 			}
 		}
 
-		// Close Spectra adapters to ensure proper cleanup (only close once if they share the same SDK instance)
-		closeSpectraAdapters(cfg.Source.Adapter, cfg.Destination.Adapter, cleanupCtx)
-
 		// Don't run verification on shutdown - just return with suspended state
+		// Note: Adapters are caller-owned and should not be closed by the engine
 		fmt.Println("\nMigration suspended by force shutdown. State saved for resumption.")
 		return result, nil
 	}

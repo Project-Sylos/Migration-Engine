@@ -10,33 +10,34 @@ import (
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"github.com/Project-Sylos/Migration-Engine/pkg/db/etl"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
-	"github.com/Project-Sylos/Sylos-FS/pkg/fs"
 	"github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
 // MigrationConfig is the configuration passed to RunMigration.
 type MigrationConfig struct {
-	BoltDB          *db.DB
-	BoltPath        string
-	SrcAdapter      types.FSAdapter
-	DstAdapter      types.FSAdapter
-	SrcRoot         types.Folder
-	DstRoot         types.Folder
-	SrcServiceName  string
-	WorkerCount     int
-	MaxRetries      int
-	CoordinatorLead int
-	LogAddress      string
-	LogLevel        string
-	SkipListener    bool
-	StartupDelay    time.Duration
-	ProgressTick    time.Duration
-	ResumeStatus    *MigrationStatus
-	ConfigPath      string
-	YAMLConfig      *MigrationConfigYAML
-	ShutdownContext context.Context
+	BoltDB                    *db.DB
+	BoltPath                  string
+	SrcAdapter                types.FSAdapter
+	DstAdapter                types.FSAdapter
+	SrcRoot                   types.Folder
+	DstRoot                   types.Folder
+	SrcServiceName            string
+	WorkerCount               int
+	MaxRetries                int
+	CoordinatorLead           int
+	LogAddress                string
+	LogLevel                  string
+	SkipListener              bool
+	StartupDelay              time.Duration
+	ProgressTick              time.Duration
+	ResumeStatus              *MigrationStatus
+	ConfigPath                string
+	YAMLConfig                *MigrationConfigYAML
+	ShutdownContext           context.Context
+	SkipAutoETLAfterTraversal bool // If true, skip automatic ETL from BoltDB to DuckDB after traversal completes
 }
 
 // RuntimeStats captures execution statistics at the end of a migration run.
@@ -74,14 +75,34 @@ func getQueueStats(coordinator *queue.QueueCoordinator, boltDB *db.DB) (queue.Qu
 
 // RunMigration executes the migration traversal using the provided configuration.
 func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
-	if cfg.BoltDB == nil {
-		return RuntimeStats{}, fmt.Errorf("boltDB cannot be nil")
+	// Use EnsureOpen to validate/ensure the DB is open
+	// For RunMigration, we default to RequireOpen=true (API mode) since MigrationConfig
+	// is typically used with pre-opened DBs. If BoltPath is provided and BoltDB is nil,
+	// we can auto-open in standalone mode.
+	requireOpen := cfg.BoltDB != nil // If BoltDB is provided, require it to be open
+	if cfg.BoltDB == nil && cfg.BoltPath == "" {
+		return RuntimeStats{}, fmt.Errorf("either BoltDB or BoltPath must be provided")
 	}
+
+	dbManager, err := db.EnsureOpen(cfg.BoltDB, cfg.BoltPath, requireOpen)
+	if err != nil {
+		return RuntimeStats{}, fmt.Errorf("failed to ensure database is open: %w", err)
+	}
+
+	boltDB := dbManager.GetDB()
+
+	// In standalone mode (we opened it), defer closing
+	if !requireOpen {
+		defer func() {
+			if closeErr := db.CloseIfOwned(dbManager); closeErr != nil {
+				// Log but don't fail - DB close errors are non-fatal
+			}
+		}()
+	}
+
 	if cfg.SrcAdapter == nil || cfg.DstAdapter == nil {
 		return RuntimeStats{}, fmt.Errorf("source and destination adapters must be provided")
 	}
-
-	boltDB := cfg.BoltDB
 
 	// Initialize log service (always initialize, even if listener is skipped)
 	// The logger will still send to UDP and write to DB, we just skip starting the listener terminal
@@ -281,9 +302,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 				// BoltDB doesn't need checkpointing - data is already persisted
 
-				// Close Spectra adapters to ensure proper cleanup (only close once if they share the same SDK instance)
-				closeSpectraAdapters(cfg.SrcAdapter, cfg.DstAdapter, cleanupCtx)
-
 				// Update YAML config with suspended status and current state (with timeout)
 				if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
 					yamlDone := make(chan error, 1)
@@ -367,6 +385,21 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				}()
 			}
 
+			// Run ETL from BoltDB to DuckDB if not skipped
+			if !cfg.SkipAutoETLAfterTraversal {
+				// Derive DuckDB path from BoltDB path
+				duckDBPath := deriveDuckDBPath(cfg.BoltPath, boltDB)
+				if duckDBPath != "" {
+					if err := runETLBoltToDuckWithStatus(boltDB, duckDBPath, cfg.YAMLConfig, cfg.ConfigPath); err != nil {
+						// Log error but don't fail the migration - ETL is optional
+						fmt.Printf("Warning: Failed to run ETL after traversal: %v\n", err)
+						if logservice.LS != nil {
+							_ = logservice.LS.Log("warning", fmt.Sprintf("ETL after traversal failed: %v", err), "migration", "run", "run")
+						}
+					}
+				}
+			}
+
 			// Stop progress ticker to prevent any more ticks
 			progressTicker.Stop()
 
@@ -434,6 +467,36 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 							fmt.Printf("ERROR: Config save timeout (5s) - YAML status may not be updated from Traversal-In-Progress (ticker path)\n")
 						}
 					}()
+				}
+
+				// Run ETL from BoltDB to DuckDB if not skipped
+				if !cfg.SkipAutoETLAfterTraversal {
+					// Derive DuckDB path from BoltDB path
+					duckDBPath := deriveDuckDBPath(cfg.BoltPath, boltDB)
+					if duckDBPath != "" {
+						if err := runETLBoltToDuckWithStatus(boltDB, duckDBPath, cfg.YAMLConfig, cfg.ConfigPath); err != nil {
+							// Log error but don't fail the migration - ETL is optional
+							fmt.Printf("Warning: Failed to run ETL after traversal: %v\n", err)
+							if logservice.LS != nil {
+								_ = logservice.LS.Log("warning", fmt.Sprintf("ETL after traversal failed: %v", err), "migration", "run", "run")
+							}
+						}
+					}
+				}
+
+				// Run ETL from BoltDB to DuckDB if not skipped
+				if !cfg.SkipAutoETLAfterTraversal {
+					// Derive DuckDB path from BoltDB path
+					duckDBPath := deriveDuckDBPath(cfg.BoltPath, boltDB)
+					if duckDBPath != "" {
+						if err := runETLBoltToDuckWithStatus(boltDB, duckDBPath, cfg.YAMLConfig, cfg.ConfigPath); err != nil {
+							// Log error but don't fail the migration - ETL is optional
+							fmt.Printf("Warning: Failed to run ETL after traversal: %v\n", err)
+							if logservice.LS != nil {
+								_ = logservice.LS.Log("warning", fmt.Sprintf("ETL after traversal failed: %v", err), "migration", "run", "run")
+							}
+						}
+					}
 				}
 
 				// Stop progress ticker to prevent any more ticks
@@ -553,78 +616,85 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 	return nil
 }
 
-// closeSpectraAdapters closes Spectra adapters if they are SpectraFS instances.
-// Handles shared SDK instances by only closing once.
-func closeSpectraAdapters(srcAdapter, dstAdapter types.FSAdapter, ctx context.Context) {
-	// Check if adapters are Spectra instances
-	srcSpectra, srcIsSpectra := srcAdapter.(*fs.SpectraFS)
-	dstSpectra, dstIsSpectra := dstAdapter.(*fs.SpectraFS)
-
-	if srcIsSpectra && dstIsSpectra {
-		// Both are Spectra - check if they share the same SDK instance
-		if srcSpectra != nil && dstSpectra != nil && srcSpectra.GetSDKInstance() == dstSpectra.GetSDKInstance() {
-			// Same SDK - only close once
-			done := make(chan struct{}, 1)
-			go func() {
-				if srcSpectra.GetSDKInstance() != nil {
-					_ = srcSpectra.Close()
-				}
-				done <- struct{}{}
-			}()
-			select {
-			case <-done:
-			case <-ctx.Done():
-				// Timeout - skip
-			}
-		} else {
-			// Different SDK instances - close both
-			done := make(chan struct{}, 2)
-			go func() {
-				if srcSpectra != nil {
-					_ = srcSpectra.Close()
-				}
-				done <- struct{}{}
-			}()
-			go func() {
-				if dstSpectra != nil {
-					_ = dstSpectra.Close()
-				}
-				done <- struct{}{}
-			}()
-			// Wait for both or timeout
-			completed := 0
-			for completed < 2 {
-				select {
-				case <-done:
-					completed++
-				case <-ctx.Done():
-					return
-				}
-			}
+// deriveDuckDBPath derives the DuckDB path from the BoltDB path.
+// Returns empty string if BoltDB path is not available.
+func deriveDuckDBPath(boltPath string, boltDB *db.DB) string {
+	if boltPath != "" {
+		// Replace .db extension with -duck.db
+		if len(boltPath) > 3 && boltPath[len(boltPath)-3:] == ".db" {
+			return boltPath[:len(boltPath)-3] + "-duck.db"
 		}
-	} else {
-		// Close individually if they're Spectra
-		if srcIsSpectra && srcSpectra != nil {
-			done := make(chan struct{}, 1)
-			go func() {
-				_ = srcSpectra.Close()
-				done <- struct{}{}
-			}()
-			select {
-			case <-done:
-			case <-ctx.Done():
-			}
-		}
-		if dstIsSpectra && dstSpectra != nil {
-			done := make(chan struct{}, 1)
-			go func() {
-				_ = dstSpectra.Close()
-				done <- struct{}{}
-			}()
-			select {
-			case <-done:
-			case <-ctx.Done():
-			}
-		}
+		return boltPath + "-duck.db"
 	}
+	// If no path available, can't derive DuckDB path
+	return ""
+}
+
+// runETLBoltToDuckWithStatus runs ETL from BoltDB to DuckDB with automatic status updates.
+func runETLBoltToDuckWithStatus(boltDB *db.DB, duckDBPath string, yamlCfg *MigrationConfigYAML, configPath string) error {
+	// Update status to ETL in progress
+	if yamlCfg != nil && configPath != "" {
+		SetStatusETLBoltToDuckInProgress(yamlCfg)
+		_ = SaveMigrationConfig(configPath, yamlCfg)
+	}
+
+	// Run ETL with status callbacks
+	cfg := etl.BoltToDuckConfig{
+		BoltDB:      boltDB,
+		DuckDBPath:  duckDBPath,
+		Overwrite:   true,
+		RequireOpen: true,
+		OnETLStart: func() error {
+			// Status already set above, but ensure it's saved
+			if yamlCfg != nil && configPath != "" {
+				return SaveMigrationConfig(configPath, yamlCfg)
+			}
+			return nil
+		},
+		OnETLComplete: func() error {
+			// Update status to Awaiting-Path-Review when ETL completes
+			if yamlCfg != nil && configPath != "" {
+				SetStatusAwaitingPathReview(yamlCfg)
+				return SaveMigrationConfig(configPath, yamlCfg)
+			}
+			return nil
+		},
+	}
+
+	return etl.RunBoltToDuck(cfg)
+}
+
+// runETLDuckToBoltWithStatus runs ETL from DuckDB to BoltDB with automatic status updates.
+// This is used before retry sweeps.
+func runETLDuckToBoltWithStatus(boltDB *db.DB, duckDBPath string, yamlCfg *MigrationConfigYAML, configPath string, maxKnownDepth int) error {
+	// Update status to ETL in progress
+	if yamlCfg != nil && configPath != "" {
+		SetStatusETLDuckToBoltInProgress(yamlCfg)
+		_ = SaveMigrationConfig(configPath, yamlCfg)
+	}
+
+	// Run ETL with status callbacks
+	cfg := etl.DuckToBoltConfig{
+		BoltDB:      boltDB,
+		DuckDBPath:  duckDBPath,
+		Overwrite:   true,
+		RequireOpen: true,
+		OnETLStart: func() error {
+			// Status already set above, but ensure it's saved
+			if yamlCfg != nil && configPath != "" {
+				return SaveMigrationConfig(configPath, yamlCfg)
+			}
+			return nil
+		},
+		OnETLComplete: func() error {
+			// Update status to Filters-Set (ready for retry) when ETL completes
+			if yamlCfg != nil && configPath != "" {
+				SetStatusFiltersSet(yamlCfg, true, maxKnownDepth)
+				return SaveMigrationConfig(configPath, yamlCfg)
+			}
+			return nil
+		},
+	}
+
+	return etl.RunDuckToBolt(cfg)
 }

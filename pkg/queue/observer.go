@@ -31,13 +31,43 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// QueueObserverMetrics contains computed metrics for a queue.
-type QueueObserverMetrics struct {
+// ExternalQueueMetrics contains user-facing metrics published to BoltDB for API access.
+type ExternalQueueMetrics struct {
+	// Monotonic counters
+	FilesDiscoveredTotal   int64 `json:"files_discovered_total"`
+	FoldersDiscoveredTotal int64 `json:"folders_discovered_total"`
+
+	// EMA-smoothed rates (2-5 second window)
+	DiscoveryRateItemsPerSec float64 `json:"discovery_rate_items_per_sec"`
+
+	// Verification counts (for O(1) stats bucket lookups)
+	TotalDiscovered int64 `json:"total_discovered"` // files + folders
+	TotalPending    int   `json:"total_pending"`    // pending across all rounds (from DB)
+	TotalFailed     int   `json:"total_failed"`     // failed across all rounds
+
+	// Current state (for API)
 	QueueStats
-	AverageExecutionTime time.Duration // Average task execution time
-	TasksPerSecond       float64       // Tasks completed per second (calculated from last poll)
-	TotalCompleted       int           // Total completed tasks across all rounds
-	LastPollTime         time.Time     // When this metric was last calculated
+	Round int `json:"round"`
+}
+
+// InternalQueueMetrics contains control system metrics stored in memory for autoscaling decisions.
+type InternalQueueMetrics struct {
+	// State-based time tracking (additive counters)
+	TimeProcessing          time.Duration
+	TimeWaitingOnQueue      time.Duration
+	TimeWaitingOnFS         time.Duration
+	TimeRateLimited         time.Duration
+	TimePausedRoundBoundary time.Duration
+	TimeIdleNoWork          time.Duration
+
+	// Capacity metrics
+	TasksCompletedWhileActive int64
+	ActiveProcessingTime      time.Duration
+
+	// Utilization metrics
+	WallClockTime       time.Duration
+	LastState           QueueState
+	LastStateChangeTime time.Time
 }
 
 // QueueObserver collects statistics from queues by polling them directly and publishes them to BoltDB periodically.
@@ -50,9 +80,22 @@ type QueueObserver struct {
 	updateTicker   *time.Ticker
 	updateInterval time.Duration
 	running        bool // Whether the observe loop is running
-	// Track previous state for rate calculations
-	prevMetrics map[string]QueueObserverMetrics // Previous metrics for each queue
+	// Internal metrics (in-memory only, for autoscaling)
+	internalMetrics map[string]*InternalQueueMetrics // Per-queue internal metrics
+	// EMA rate tracking
+	prevEMARates map[string]float64 // Previous EMA values for rate smoothing (key: queueName)
+	// Discovery totals tracking for delta calculation
+	prevDiscoveryTotals map[string]struct {
+		files   int64
+		folders int64
+		time    time.Time
+	} // Previous discovery totals and time for each queue
 }
+
+const (
+	// emaAlpha is the smoothing factor for exponential moving average (0.2 = ~5 second window)
+	emaAlpha = 0.2
+)
 
 // NewQueueObserver creates a new observer that will publish stats to BoltDB.
 // updateInterval is how often stats are written to BoltDB (default: 200ms).
@@ -62,12 +105,18 @@ func NewQueueObserver(boltInstance *db.DB, updateInterval time.Duration) *QueueO
 	}
 
 	return &QueueObserver{
-		boltDB:         boltInstance,
-		queues:         make(map[string]*Queue),
-		stopChan:       make(chan struct{}),
-		updateTicker:   time.NewTicker(updateInterval),
-		updateInterval: updateInterval,
-		prevMetrics:    make(map[string]QueueObserverMetrics),
+		boltDB:          boltInstance,
+		queues:          make(map[string]*Queue),
+		stopChan:        make(chan struct{}),
+		updateTicker:    time.NewTicker(updateInterval),
+		updateInterval:  updateInterval,
+		internalMetrics: make(map[string]*InternalQueueMetrics),
+		prevEMARates:    make(map[string]float64),
+		prevDiscoveryTotals: make(map[string]struct {
+			files   int64
+			folders int64
+			time    time.Time
+		}),
 	}
 }
 
@@ -92,7 +141,9 @@ func (o *QueueObserver) UnregisterQueue(queueName string) {
 	defer o.mu.Unlock()
 
 	delete(o.queues, queueName)
-	delete(o.prevMetrics, queueName)
+	delete(o.internalMetrics, queueName)
+	delete(o.prevEMARates, queueName)
+	delete(o.prevDiscoveryTotals, queueName)
 }
 
 // Start begins the observer loop that publishes stats to BoltDB.
@@ -142,7 +193,13 @@ func (o *QueueObserver) Stop() {
 
 	// Clear queues
 	o.queues = make(map[string]*Queue)
-	o.prevMetrics = make(map[string]QueueObserverMetrics)
+	o.internalMetrics = make(map[string]*InternalQueueMetrics)
+	o.prevEMARates = make(map[string]float64)
+	o.prevDiscoveryTotals = make(map[string]struct {
+		files   int64
+		folders int64
+		time    time.Time
+	})
 }
 
 // observeLoop is the main loop that polls queues directly and publishes metrics to BoltDB.
@@ -180,7 +237,7 @@ func (o *QueueObserver) observeLoop() {
 			o.mu.RUnlock()
 
 			// Poll each queue and collect metrics
-			metrics := make(map[string]QueueObserverMetrics)
+			metrics := make(map[string]ExternalQueueMetrics)
 			for queueName, queue := range queues {
 				metric := o.pollQueue(queueName, queue)
 				if metric != nil {
@@ -196,57 +253,239 @@ func (o *QueueObserver) observeLoop() {
 	}
 }
 
-// pollQueue polls a queue directly and calculates metrics.
-func (o *QueueObserver) pollQueue(queueName string, queue *Queue) *QueueObserverMetrics {
+// pollQueue polls a queue directly and calculates both external and internal metrics.
+func (o *QueueObserver) pollQueue(queueName string, queue *Queue) *ExternalQueueMetrics {
 	if queue == nil {
 		return nil
 	}
 
-	// Get current queue stats
-	stats := queue.Stats()
-	avgExecutionTime := queue.GetAverageExecutionTime()
-
-	// Calculate total completed tasks across all rounds
-	totalCompleted := queue.GetTotalCompleted()
-
-	// Get previous metrics for rate calculation
-	o.mu.RLock()
-	prevMetric, hasPrev := o.prevMetrics[queueName]
-	o.mu.RUnlock()
-
 	now := time.Now()
-	var tasksPerSecond float64
 
-	if hasPrev {
-		// Calculate tasks/sec based on total completed count change
-		timeDelta := now.Sub(prevMetric.LastPollTime).Seconds()
-		if timeDelta > 0 {
-			completedDelta := totalCompleted - prevMetric.TotalCompleted
-			if completedDelta > 0 {
-				tasksPerSecond = float64(completedDelta) / timeDelta
-			}
-		}
+	// Get current queue state and stats
+	stats := queue.Stats()
+	currentState := queue.State()
+
+	// Get discovery totals
+	filesTotal := queue.GetFilesDiscoveredTotal()
+	foldersTotal := queue.GetFoldersDiscoveredTotal()
+	totalDiscovered := queue.GetTotalDiscovered()
+
+	// Get total pending and failed counts from stats bucket (O(1) lookup)
+	// The stats bucket is maintained by the output buffer during flush operations
+	totalPending := o.getTotalPendingCount(queueName)
+	totalFailed := o.getTotalFailedCount(queueName)
+
+	// Update internal metrics (state tracking)
+	o.updateInternalMetrics(queueName, queue, currentState, now)
+
+	// Calculate EMA-smoothed discovery rate
+	discoveryRate := o.calculateDiscoveryRate(queueName, filesTotal, foldersTotal, now)
+
+	// Build external metrics
+	metric := ExternalQueueMetrics{
+		FilesDiscoveredTotal:     filesTotal,
+		FoldersDiscoveredTotal:   foldersTotal,
+		DiscoveryRateItemsPerSec: discoveryRate,
+		TotalDiscovered:          totalDiscovered,
+		TotalPending:             totalPending,
+		TotalFailed:              totalFailed,
+		QueueStats:               stats,
+		Round:                    stats.Round,
 	}
-
-	metric := QueueObserverMetrics{
-		QueueStats:           stats,
-		AverageExecutionTime: avgExecutionTime,
-		TasksPerSecond:       tasksPerSecond,
-		TotalCompleted:       totalCompleted,
-		LastPollTime:         now,
-	}
-
-	// Store for next calculation
-	o.mu.Lock()
-	o.prevMetrics[queueName] = metric
-	o.mu.Unlock()
 
 	return &metric
 }
 
-// publishMetricsToBoltDB writes queue metrics to BoltDB in the queue-stats bucket.
+// calculateDiscoveryRate calculates EMA-smoothed discovery rate (items/sec).
+func (o *QueueObserver) calculateDiscoveryRate(queueName string, filesTotal, foldersTotal int64, now time.Time) float64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	prev, hasPrev := o.prevDiscoveryTotals[queueName]
+
+	if !hasPrev {
+		// First poll - initialize tracking
+		o.prevDiscoveryTotals[queueName] = struct {
+			files   int64
+			folders int64
+			time    time.Time
+		}{
+			files:   filesTotal,
+			folders: foldersTotal,
+			time:    now,
+		}
+		o.prevEMARates[queueName] = 0.0
+		return 0.0
+	}
+
+	// Calculate current instantaneous rate
+	timeDelta := now.Sub(prev.time).Seconds()
+	if timeDelta <= 0 {
+		return o.prevEMARates[queueName]
+	}
+
+	itemsDelta := (filesTotal - prev.files) + (foldersTotal - prev.folders)
+	currentRate := float64(itemsDelta) / timeDelta
+
+	// Update EMA: newEMA = alpha * currentRate + (1-alpha) * previousEMA
+	prevEMA := o.prevEMARates[queueName]
+	newEMA := emaAlpha*currentRate + (1-emaAlpha)*prevEMA
+
+	// Store for next calculation
+	o.prevEMARates[queueName] = newEMA
+	o.prevDiscoveryTotals[queueName] = struct {
+		files   int64
+		folders int64
+		time    time.Time
+	}{
+		files:   filesTotal,
+		folders: foldersTotal,
+		time:    now,
+	}
+
+	return newEMA
+}
+
+// updateInternalMetrics updates internal metrics by attributing time deltas to state buckets.
+func (o *QueueObserver) updateInternalMetrics(queueName string, queue *Queue, currentState QueueState, now time.Time) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	// Get or create internal metrics for this queue
+	internal, exists := o.internalMetrics[queueName]
+	if !exists {
+		internal = &InternalQueueMetrics{
+			LastState:           currentState,
+			LastStateChangeTime: now,
+		}
+		o.internalMetrics[queueName] = internal
+		return // First poll, just initialize
+	}
+
+	// Calculate time delta since last poll
+	delta := now.Sub(internal.LastStateChangeTime)
+	if delta <= 0 {
+		return
+	}
+
+	// Update wall clock time
+	internal.WallClockTime += delta
+
+	// Attribute delta to appropriate state bucket
+	stats := queue.Stats()
+	inProgressCount := stats.InProgress
+	pendingCount := stats.Pending
+
+	switch currentState {
+	case QueueStateRunning:
+		if inProgressCount > 0 {
+			// Actively processing tasks
+			internal.TimeProcessing += delta
+			internal.ActiveProcessingTime += delta
+		} else if pendingCount > 0 {
+			// Waiting for tasks to be leased
+			internal.TimeWaitingOnQueue += delta
+		} else {
+			// No work available
+			internal.TimeIdleNoWork += delta
+		}
+	case QueueStateWaiting:
+		// Waiting for coordinator (DST gating)
+		internal.TimePausedRoundBoundary += delta
+	case QueueStatePaused:
+		// Manually paused
+		internal.TimePausedRoundBoundary += delta
+	case QueueStateStopped, QueueStateCompleted:
+		// Queue is stopped or completed - don't attribute time
+		// (these states are terminal)
+	}
+
+	// Track tasks completed while active
+	if currentState == QueueStateRunning && inProgressCount > 0 {
+		// We're actively processing - track completed tasks
+		// Note: This is tracked per-poll, actual completion tracking happens in completeTask
+		// For now, we'll track this separately if needed
+	}
+
+	// Update state tracking
+	if internal.LastState != currentState {
+		// State changed - reset last state change time
+		internal.LastState = currentState
+		internal.LastStateChangeTime = now
+	} else {
+		// Same state - update last state change time for next delta calculation
+		internal.LastStateChangeTime = now
+	}
+}
+
+// getTotalPendingCount reads total pending count from stats bucket (O(1) lookup).
+// The stats bucket is maintained by the output buffer during flush operations.
+func (o *QueueObserver) getTotalPendingCount(queueName string) int {
+	if o.boltDB == nil {
+		return 0
+	}
+
+	queueType := getQueueType(queueName)
+	if queueType == "" {
+		return 0
+	}
+
+	// Get all levels for this queue type
+	levels, err := o.boltDB.GetAllLevels(queueType)
+	if err != nil {
+		return 0
+	}
+
+	// Sum pending counts across all levels using stats bucket (O(1) per level)
+	totalPending := 0
+	for _, level := range levels {
+		// Use GetBucketCount which reads from stats bucket for O(1) lookup
+		bucketPath := db.GetTraversalStatusBucketPath(queueType, level, db.StatusPending)
+		count, err := o.boltDB.GetBucketCount(bucketPath)
+		if err == nil {
+			totalPending += int(count)
+		}
+	}
+
+	return totalPending
+}
+
+// getTotalFailedCount reads total failed count from stats bucket (O(1) lookup).
+// The stats bucket is maintained by the output buffer during flush operations.
+func (o *QueueObserver) getTotalFailedCount(queueName string) int {
+	if o.boltDB == nil {
+		return 0
+	}
+
+	queueType := getQueueType(queueName)
+	if queueType == "" {
+		return 0
+	}
+
+	// Get all levels for this queue type
+	levels, err := o.boltDB.GetAllLevels(queueType)
+	if err != nil {
+		return 0
+	}
+
+	// Sum failed counts across all levels using stats bucket (O(1) per level)
+	totalFailed := 0
+	for _, level := range levels {
+		// Use GetBucketCount which reads from stats bucket for O(1) lookup
+		bucketPath := db.GetTraversalStatusBucketPath(queueType, level, db.StatusFailed)
+		count, err := o.boltDB.GetBucketCount(bucketPath)
+		if err == nil {
+			totalFailed += int(count)
+		}
+	}
+
+	return totalFailed
+}
+
+// publishMetricsToBoltDB writes external queue metrics to BoltDB in the queue-stats bucket.
+// Only external metrics are published - internal metrics remain in memory for autoscaling decisions.
 // Each queue's metrics are stored under a key like "src-traversal", "dst-traversal", etc.
-func (o *QueueObserver) publishMetricsToBoltDB(metricsMap map[string]QueueObserverMetrics) {
+func (o *QueueObserver) publishMetricsToBoltDB(metricsMap map[string]ExternalQueueMetrics) {
 	if o.boltDB == nil {
 		return
 	}
@@ -262,7 +501,7 @@ func (o *QueueObserver) publishMetricsToBoltDB(metricsMap map[string]QueueObserv
 		for queueName, metrics := range metricsMap {
 			// Determine the key based on queue name
 			// "src" -> "src-traversal", "dst" -> "dst-traversal", etc.
-			key := queueNameToStatsKey(queueName)
+			key := queueName + "-traversal"
 
 			// Marshal metrics to JSON
 			metricsJSON, err := json.Marshal(metrics)
@@ -290,20 +529,6 @@ func (o *QueueObserver) publishMetricsToBoltDB(metricsMap map[string]QueueObserv
 				fmt.Sprintf("Failed to publish metrics to BoltDB: %v", err),
 				"observer", "publish", "")
 		}
-	}
-}
-
-// queueNameToStatsKey converts a queue name to a stats key.
-// "src" -> "src-traversal", "dst" -> "dst-traversal", etc.
-func queueNameToStatsKey(queueName string) string {
-	switch queueName {
-	case "src":
-		return "src-traversal"
-	case "dst":
-		return "dst-traversal"
-	default:
-		// For other queue types, use as-is or add suffix
-		return queueName
 	}
 }
 

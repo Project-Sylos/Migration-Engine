@@ -298,10 +298,10 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 	for _, actualFile := range actualResult.Files {
 		matchKey := actualFile.Type + ":" + actualFile.DisplayName
 		if _, exists := expectedFileMap[matchKey]; !exists {
-			// File exists on dst but not src: mark as "NotOnSrc"
+			// File exists on dst but not src: mark as "not_on_src"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				File:   actualFile,
-				Status: "NotOnSrc",
+				Status: db.StatusNotOnSrc,
 				IsFile: true,
 				SrcID:  "", // No SRC node for items not on src
 			})

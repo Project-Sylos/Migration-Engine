@@ -95,6 +95,9 @@ type Queue struct {
 	avgInterval         time.Duration   // Interval for calculating averages
 	// Retry sweep specific fields
 	maxKnownDepth int // Maximum known depth from previous traversal (for retry sweep)
+	// Discovery tracking for metrics
+	filesDiscoveredTotal   int64 // Total files discovered (monotonic counter)
+	foldersDiscoveredTotal int64 // Total folders discovered (monotonic counter)
 }
 
 // NewQueue creates a new Queue instance.
@@ -566,19 +569,25 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 	parentPath := types.NormalizeLocationPath(task.LocationPath())
 	var childNodesToInsert []db.InsertOperation
 
-	// Log folder discovery with details
-	if logservice.LS != nil {
-		totalChildren := len(task.DiscoveredChildren)
-		if totalChildren > 0 {
-			foldersCount := 0
-			filesCount := 0
-			for _, child := range task.DiscoveredChildren {
-				if child.IsFile {
-					filesCount++
-				} else {
-					foldersCount++
-				}
+	// Log folder discovery with details and update discovery counters
+	totalChildren := len(task.DiscoveredChildren)
+	foldersCount := 0
+	filesCount := 0
+	if totalChildren > 0 {
+		for _, child := range task.DiscoveredChildren {
+			if child.IsFile {
+				filesCount++
+			} else {
+				foldersCount++
 			}
+		}
+		// Increment discovery counters (thread-safe)
+		q.mu.Lock()
+		q.filesDiscoveredTotal += int64(filesCount)
+		q.foldersDiscoveredTotal += int64(foldersCount)
+		q.mu.Unlock()
+
+		if logservice.LS != nil {
 			_ = logservice.LS.Log("debug",
 				fmt.Sprintf("Discovered %d total children (folders: %d, files: %d) from path %s",
 					totalChildren, foldersCount, filesCount, parentPath),

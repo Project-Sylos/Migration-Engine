@@ -438,7 +438,11 @@ func printQueueReport(qr *QueueReport) {
 // This is used by inspect_db to ensure we're counting actual nodes, not cached stats.
 func countNodesByScan(boltDB *db.DB, queueType string) (int, error) {
 	count := 0
-	err := boltDB.GetDB().View(func(tx *bolt.Tx) error {
+	boltDBInstance, err := boltDB.GetDB()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get database instance: %w", err)
+	}
+	err = boltDBInstance.View(func(tx *bolt.Tx) error {
 		bucket := db.GetNodesBucket(tx, queueType)
 		if bucket == nil {
 			return nil // Bucket doesn't exist, count is 0
@@ -458,7 +462,11 @@ func countNodesByScan(boltDB *db.DB, queueType string) (int, error) {
 // This is used by inspect_db to ensure we're counting actual nodes, not cached stats.
 func countStatusBucketByScan(boltDB *db.DB, queueType string, level int, status string) (int, error) {
 	count := 0
-	err := boltDB.GetDB().View(func(tx *bolt.Tx) error {
+	boltDBInstance, err := boltDB.GetDB()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get database instance: %w", err)
+	}
+	err = boltDBInstance.View(func(tx *bolt.Tx) error {
 		bucket := db.GetStatusBucket(tx, queueType, level, status)
 		if bucket == nil {
 			return nil // Bucket doesn't exist, count is 0

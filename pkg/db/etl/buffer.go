@@ -10,25 +10,36 @@ import (
 
 // nodeBuffer holds node rows with mutex protection
 type nodeBuffer struct {
-	mu       sync.Mutex
-	rows     []NodeRow
-	table    string
-	flushing bool
+	mu         sync.Mutex
+	rows       []NodeRow
+	table      string
+	flushing   bool
+	maxSize    int
+	resumeSize int
+	cond       *sync.Cond
 }
 
 // NewNodeBuffer creates a new node buffer
 func NewNodeBuffer(table string) *nodeBuffer {
-	return &nodeBuffer{
-		rows:  make([]NodeRow, 0, defaultBatchSize),
-		table: table,
+	nb := &nodeBuffer{
+		rows:       make([]NodeRow, 0, defaultBatchSize),
+		table:      table,
+		maxSize:    2 * defaultBatchSize,
+		resumeSize: defaultBatchSize,
 	}
+	nb.cond = sync.NewCond(&nb.mu)
+	return nb
 }
 
 // Add appends a row to the buffer (thread-safe)
+// Blocks if buffer size >= maxSize until buffer is drained below resumeSize
 func (nb *nodeBuffer) Add(row NodeRow) {
 	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	for len(nb.rows) >= nb.maxSize {
+		nb.cond.Wait()
+	}
 	nb.rows = append(nb.rows, row)
-	nb.mu.Unlock()
 }
 
 // Len returns the number of rows in the buffer (thread-safe)
@@ -71,6 +82,10 @@ func (nb *nodeBuffer) GetAndClear() []NodeRow {
 	batch := make([]NodeRow, len(nb.rows))
 	copy(batch, nb.rows)
 	nb.rows = make([]NodeRow, 0, defaultBatchSize)
+	// Wake workers if buffer is now at or below resumeSize
+	if len(nb.rows) <= nb.resumeSize {
+		nb.cond.Broadcast()
+	}
 	return batch
 }
 
@@ -87,28 +102,43 @@ func (nb *nodeBuffer) GetAndClearIfReady() []NodeRow {
 	copy(batch, nb.rows)
 	nb.rows = make([]NodeRow, 0, defaultBatchSize)
 	nb.flushing = true
+	// Wake workers if buffer is now at or below resumeSize
+	if len(nb.rows) <= nb.resumeSize {
+		nb.cond.Broadcast()
+	}
 	return batch
 }
 
 // logBuffer holds log entries with mutex protection and row numbers for ordering
 type logBuffer struct {
-	mu       sync.Mutex
-	entries  []LogRow
-	flushing bool
+	mu         sync.Mutex
+	entries    []LogRow
+	flushing   bool
+	maxSize    int
+	resumeSize int
+	cond       *sync.Cond
 }
 
 // NewLogBuffer creates a new log buffer
 func NewLogBuffer() *logBuffer {
-	return &logBuffer{
-		entries: make([]LogRow, 0, defaultBatchSize),
+	lb := &logBuffer{
+		entries:    make([]LogRow, 0, defaultBatchSize),
+		maxSize:    2 * defaultBatchSize,
+		resumeSize: defaultBatchSize,
 	}
+	lb.cond = sync.NewCond(&lb.mu)
+	return lb
 }
 
 // Add appends a log entry to the buffer (thread-safe)
+// Blocks if buffer size >= maxSize until buffer is drained below resumeSize
 func (lb *logBuffer) Add(entry LogRow) {
 	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	for len(lb.entries) >= lb.maxSize {
+		lb.cond.Wait()
+	}
 	lb.entries = append(lb.entries, entry)
-	lb.mu.Unlock()
 }
 
 // Len returns the number of entries in the buffer (thread-safe)
@@ -157,6 +187,11 @@ func (lb *logBuffer) GetAndClearSorted() []LogRow {
 		return batch[i].RowNum < batch[j].RowNum
 	})
 
+	// Wake workers if buffer is now at or below resumeSize
+	if len(lb.entries) <= lb.resumeSize {
+		lb.cond.Broadcast()
+	}
+
 	return batch
 }
 
@@ -179,6 +214,10 @@ func (lb *logBuffer) GetAndClearSortedIfReady() []LogRow {
 		return batch[i].RowNum < batch[j].RowNum
 	})
 
+	// Wake workers if buffer is now at or below resumeSize
+	if len(lb.entries) <= lb.resumeSize {
+		lb.cond.Broadcast()
+	}
+
 	return batch
 }
-

@@ -827,24 +827,29 @@ func migrateStats(boltDB *db.DB, duckDB *DuckDB) error {
 	}
 	defer appender.Close()
 
-	return boltDB.View(func(tx *bolt.Tx) error {
-		statsBucket := tx.Bucket([]byte("Traversal-Data"))
+	var rowCount int
+	err = boltDB.View(func(tx *bolt.Tx) error {
+		traversalBucket := tx.Bucket([]byte("Traversal-Data"))
+		if traversalBucket == nil {
+			return nil
+		}
+
+		statsBucket := traversalBucket.Bucket([]byte("STATS"))
 		if statsBucket == nil {
 			return nil
 		}
 
-		statsSubBucket := statsBucket.Bucket([]byte("STATS"))
-		if statsSubBucket == nil {
-			return nil
-		}
-
-		totalsBucket := statsSubBucket.Bucket([]byte("totals"))
-		if totalsBucket == nil {
-			return nil
-		}
-
-		cursor := totalsBucket.Cursor()
+		// Stats are stored directly in STATS bucket with keys like "SRC/nodes", "DST/nodes", etc.
+		// Skip the "queue-stats" sub-bucket (it's for queue statistics, not bucket counts)
+		cursor := statsBucket.Cursor()
 		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+			// Skip sub-buckets (like "queue-stats")
+			if v == nil {
+				// This is a sub-bucket, not a stat entry - skip it
+				continue
+			}
+
+			// Check if this is a valid stats entry (8-byte big-endian int64)
 			if len(v) != 8 {
 				continue
 			}
@@ -852,13 +857,32 @@ func migrateStats(boltDB *db.DB, duckDB *DuckDB) error {
 			// Decode big-endian int64
 			count := int64(binary.BigEndian.Uint64(v))
 
+			// Append to DuckDB (bucket_path, count)
 			if err := appender.AppendRow(string(k), count); err != nil {
 				return fmt.Errorf("failed to append stats row: %w", err)
 			}
+			rowCount++
 		}
 
 		return nil
 	})
+
+	if err != nil {
+		return err
+	}
+
+	// Explicitly flush the appender before closing
+	if err := appender.Flush(); err != nil {
+		return fmt.Errorf("failed to flush stats appender: %w", err)
+	}
+
+	if rowCount > 0 {
+		fmt.Printf("[ETL stats] Migrated %d stats entries\n", rowCount)
+	} else {
+		fmt.Printf("[ETL stats] No stats entries found (stats bucket may be empty)\n")
+	}
+
+	return nil
 }
 
 // migrateQueueStats migrates queue statistics

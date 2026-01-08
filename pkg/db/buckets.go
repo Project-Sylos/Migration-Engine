@@ -15,7 +15,7 @@ import (
 func (db *DB) GetMaxKnownDepth(queueType string) int {
 	maxDepth := -1
 
-	_ = db.db.View(func(tx *bolt.Tx) error {
+	_ = db.View(func(tx *bolt.Tx) error {
 		traversalBucket := tx.Bucket([]byte("Traversal-Data"))
 		if traversalBucket == nil {
 			return nil
@@ -52,7 +52,7 @@ func (db *DB) GetMaxKnownDepth(queueType string) int {
 	return maxDepth
 }
 
-// Status constants for both traversal and copy phases
+// Status constants for traversal phase
 const (
 	StatusPending    = "pending"
 	StatusSuccessful = "successful"
@@ -61,15 +61,20 @@ const (
 	StatusExcluded   = "excluded"   // Node is excluded from migration
 )
 
+// Copy status constants (SRC only)
+const (
+	CopyStatusPending    = "pending"
+	CopyStatusSuccessful = "successful"
+	CopyStatusSkipped    = "skipped" // Item already exists on dst, no copy needed
+	CopyStatusFailed     = "failed"
+)
+
 // Legacy constants for compatibility during migration
 const (
 	TraversalStatusPending    = StatusPending
 	TraversalStatusSuccessful = StatusSuccessful
 	TraversalStatusFailed     = StatusFailed
 	TraversalStatusNotOnSrc   = StatusNotOnSrc
-	CopyStatusPending         = StatusPending
-	CopyStatusSuccessful      = StatusSuccessful
-	CopyStatusFailed          = StatusFailed
 )
 
 // Bucket path constants
@@ -85,6 +90,8 @@ const (
 	SubBucketNodes              = "nodes"
 	SubBucketChildren           = "children"
 	SubBucketLevels             = "levels"
+	SubBucketTraversal          = "traversal" // Traversal status sub-bucket under levels
+	SubBucketCopy               = "copy"      // Copy status sub-bucket under levels (SRC only)
 	SubBucketStatusLookup       = "status-lookup"
 	SubBucketExclusionHolding   = "exclusion-holding"
 	SubBucketUnexclusionHolding = "unexclusion-holding"
@@ -122,16 +129,40 @@ func GetLevelBucketPath(queueType string, level int) []string {
 	return []string{TraversalDataBucket, queueType, SubBucketLevels, FormatLevel(level)}
 }
 
-// GetStatusBucketPath returns the bucket path for a specific status at a level.
-// Returns: ["Traversal-Data", "SRC", "levels", "00000001", "pending"]
-func GetStatusBucketPath(queueType string, level int, status string) []string {
-	return []string{TraversalDataBucket, queueType, SubBucketLevels, FormatLevel(level), status}
+// GetTraversalStatusBucketPath returns the bucket path for a specific traversal status at a level.
+// Returns: ["Traversal-Data", "SRC", "levels", "00000001", "traversal", "pending"]
+func GetTraversalStatusBucketPath(queueType string, level int, status string) []string {
+	return []string{TraversalDataBucket, queueType, SubBucketLevels, FormatLevel(level), SubBucketTraversal, status}
 }
 
-// GetStatusLookupBucketPath returns the bucket path for the status-lookup index at a level.
-// Returns: ["Traversal-Data", "SRC", "levels", "00000001", "status-lookup"]
+// GetCopyStatusBucketPath returns the bucket path for a specific copy status at a level (SRC only).
+// Returns: ["Traversal-Data", "SRC", "levels", "00000001", "copy", "pending"]
+func GetCopyStatusBucketPath(level int, status string) []string {
+	return []string{TraversalDataBucket, BucketSrc, SubBucketLevels, FormatLevel(level), SubBucketCopy, status}
+}
+
+// GetTraversalStatusLookupBucketPath returns the bucket path for the traversal status-lookup index at a level.
+// Returns: ["Traversal-Data", "SRC", "levels", "00000001", "traversal", "status-lookup"]
+func GetTraversalStatusLookupBucketPath(queueType string, level int) []string {
+	return []string{TraversalDataBucket, queueType, SubBucketLevels, FormatLevel(level), SubBucketTraversal, SubBucketStatusLookup}
+}
+
+// GetCopyStatusLookupBucketPath returns the bucket path for the copy status-lookup index at a level (SRC only).
+// Returns: ["Traversal-Data", "SRC", "levels", "00000001", "copy", "status-lookup"]
+func GetCopyStatusLookupBucketPath(level int) []string {
+	return []string{TraversalDataBucket, BucketSrc, SubBucketLevels, FormatLevel(level), SubBucketCopy, SubBucketStatusLookup}
+}
+
+// GetStatusBucketPath is deprecated - use GetTraversalStatusBucketPath instead.
+// Kept for backward compatibility during migration.
+func GetStatusBucketPath(queueType string, level int, status string) []string {
+	return GetTraversalStatusBucketPath(queueType, level, status)
+}
+
+// GetStatusLookupBucketPath is deprecated - use GetTraversalStatusLookupBucketPath instead.
+// Kept for backward compatibility during migration.
 func GetStatusLookupBucketPath(queueType string, level int) []string {
-	return []string{TraversalDataBucket, queueType, SubBucketLevels, FormatLevel(level), SubBucketStatusLookup}
+	return GetTraversalStatusLookupBucketPath(queueType, level)
 }
 
 // GetLogsBucketPath returns the bucket path for logs.
@@ -158,15 +189,15 @@ func GetUnexclusionHoldingBucketPath(queueType string) []string {
 	return []string{TraversalDataBucket, queueType, SubBucketUnexclusionHolding}
 }
 
-// EnsureLevelBucket creates a level bucket and its status sub-buckets if they don't exist.
+// EnsureLevelBucket creates a level bucket and its traversal/copy status sub-buckets if they don't exist.
 func EnsureLevelBucket(tx *bolt.Tx, queueType string, level int) error {
 	// Navigate through Traversal-Data -> queueType -> levels
-	traversalBucket := tx.Bucket([]byte(TraversalDataBucket))
-	if traversalBucket == nil {
+	rootBucket := tx.Bucket([]byte(TraversalDataBucket))
+	if rootBucket == nil {
 		return fmt.Errorf("Traversal-Data bucket not found")
 	}
 
-	topBucket := traversalBucket.Bucket([]byte(queueType))
+	topBucket := rootBucket.Bucket([]byte(queueType))
 	if topBucket == nil {
 		return fmt.Errorf("queue bucket %s not found in Traversal-Data", queueType)
 	}
@@ -183,23 +214,52 @@ func EnsureLevelBucket(tx *bolt.Tx, queueType string, level int) error {
 		return fmt.Errorf("failed to create level bucket %s: %w", levelStr, err)
 	}
 
-	// Create status sub-buckets
-	statuses := []string{StatusPending, StatusSuccessful, StatusFailed, StatusExcluded}
-	if queueType == BucketDst {
-		statuses = append(statuses, StatusNotOnSrc)
+	// Create traversal sub-bucket
+	traversalSubBucket, err := levelBucket.CreateBucketIfNotExists([]byte(SubBucketTraversal))
+	if err != nil {
+		return fmt.Errorf("failed to create traversal bucket: %w", err)
 	}
 
-	for _, status := range statuses {
-		if _, err := levelBucket.CreateBucketIfNotExists([]byte(status)); err != nil {
-			return fmt.Errorf("failed to create status bucket %s: %w", status, err)
+	// Create traversal status sub-buckets
+	traversalStatuses := []string{StatusPending, StatusSuccessful, StatusFailed, StatusExcluded}
+	if queueType == BucketDst {
+		traversalStatuses = append(traversalStatuses, StatusNotOnSrc)
+	}
+
+	for _, status := range traversalStatuses {
+		if _, err := traversalSubBucket.CreateBucketIfNotExists([]byte(status)); err != nil {
+			return fmt.Errorf("failed to create traversal status bucket %s: %w", status, err)
 		}
 	}
 
-	// Create status-lookup bucket (regular bucket, not nested bucket)
-	// This stores ULID -> status string mappings
-	lookupPath := GetStatusLookupBucketPath(queueType, level)
-	if _, err := getOrCreateBucket(tx, lookupPath); err != nil {
-		return fmt.Errorf("failed to create status-lookup bucket: %w", err)
+	// Create traversal status-lookup bucket (regular bucket, not nested bucket)
+	// This stores ULID -> traversal status string mappings
+	traversalLookupPath := GetTraversalStatusLookupBucketPath(queueType, level)
+	if _, err := getOrCreateBucket(tx, traversalLookupPath); err != nil {
+		return fmt.Errorf("failed to create traversal status-lookup bucket: %w", err)
+	}
+
+	// Create copy sub-bucket and status buckets (SRC only)
+	if queueType == BucketSrc {
+		copyBucket, err := levelBucket.CreateBucketIfNotExists([]byte(SubBucketCopy))
+		if err != nil {
+			return fmt.Errorf("failed to create copy bucket: %w", err)
+		}
+
+		// Create copy status sub-buckets
+		copyStatuses := []string{CopyStatusPending, CopyStatusSuccessful, CopyStatusSkipped, CopyStatusFailed}
+		for _, status := range copyStatuses {
+			if _, err := copyBucket.CreateBucketIfNotExists([]byte(status)); err != nil {
+				return fmt.Errorf("failed to create copy status bucket %s: %w", status, err)
+			}
+		}
+
+		// Create copy status-lookup bucket (regular bucket, not nested bucket)
+		// This stores ULID -> copy status string mappings
+		copyLookupPath := GetCopyStatusLookupBucketPath(level)
+		if _, err := getOrCreateBucket(tx, copyLookupPath); err != nil {
+			return fmt.Errorf("failed to create copy status-lookup bucket: %w", err)
+		}
 	}
 
 	return nil
@@ -215,18 +275,44 @@ func GetChildrenBucket(tx *bolt.Tx, queueType string) *bolt.Bucket {
 	return getBucket(tx, GetChildrenBucketPath(queueType))
 }
 
-// GetStatusBucket returns the status bucket for a specific level and status.
-func GetStatusBucket(tx *bolt.Tx, queueType string, level int, status string) *bolt.Bucket {
-	return getBucket(tx, GetStatusBucketPath(queueType, level, status))
+// GetTraversalStatusBucket returns the traversal status bucket for a specific level and status.
+func GetTraversalStatusBucket(tx *bolt.Tx, queueType string, level int, status string) *bolt.Bucket {
+	return getBucket(tx, GetTraversalStatusBucketPath(queueType, level, status))
 }
 
-// GetOrCreateStatusBucket returns or creates the status bucket for a specific level and status.
-func GetOrCreateStatusBucket(tx *bolt.Tx, queueType string, level int, status string) (*bolt.Bucket, error) {
+// GetOrCreateTraversalStatusBucket returns or creates the traversal status bucket for a specific level and status.
+func GetOrCreateTraversalStatusBucket(tx *bolt.Tx, queueType string, level int, status string) (*bolt.Bucket, error) {
 	// Ensure the level bucket exists first
 	if err := EnsureLevelBucket(tx, queueType, level); err != nil {
 		return nil, err
 	}
-	return getOrCreateBucket(tx, GetStatusBucketPath(queueType, level, status))
+	return getOrCreateBucket(tx, GetTraversalStatusBucketPath(queueType, level, status))
+}
+
+// GetCopyStatusBucket returns the copy status bucket for a specific level and status (SRC only).
+func GetCopyStatusBucket(tx *bolt.Tx, level int, status string) *bolt.Bucket {
+	return getBucket(tx, GetCopyStatusBucketPath(level, status))
+}
+
+// GetOrCreateCopyStatusBucket returns or creates the copy status bucket for a specific level and status (SRC only).
+func GetOrCreateCopyStatusBucket(tx *bolt.Tx, level int, status string) (*bolt.Bucket, error) {
+	// Ensure the level bucket exists first
+	if err := EnsureLevelBucket(tx, BucketSrc, level); err != nil {
+		return nil, err
+	}
+	return getOrCreateBucket(tx, GetCopyStatusBucketPath(level, status))
+}
+
+// GetStatusBucket is deprecated - use GetTraversalStatusBucket instead.
+// Kept for backward compatibility during migration.
+func GetStatusBucket(tx *bolt.Tx, queueType string, level int, status string) *bolt.Bucket {
+	return GetTraversalStatusBucket(tx, queueType, level, status)
+}
+
+// GetOrCreateStatusBucket is deprecated - use GetOrCreateTraversalStatusBucket instead.
+// Kept for backward compatibility during migration.
+func GetOrCreateStatusBucket(tx *bolt.Tx, queueType string, level int, status string) (*bolt.Bucket, error) {
+	return GetOrCreateTraversalStatusBucket(tx, queueType, level, status)
 }
 
 // GetLogsBucket returns the logs bucket.
@@ -244,31 +330,76 @@ func GetOrCreateQueueStatsBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
 	return getOrCreateBucket(tx, GetQueueStatsBucketPath())
 }
 
-// GetStatusLookupBucket returns the status-lookup bucket for a specific level.
-// This bucket stores ULID -> status string mappings.
-func GetStatusLookupBucket(tx *bolt.Tx, queueType string, level int) *bolt.Bucket {
-	return getBucket(tx, GetStatusLookupBucketPath(queueType, level))
+// GetTraversalStatusLookupBucket returns the traversal status-lookup bucket for a specific level.
+// This bucket stores ULID -> traversal status string mappings.
+func GetTraversalStatusLookupBucket(tx *bolt.Tx, queueType string, level int) *bolt.Bucket {
+	return getBucket(tx, GetTraversalStatusLookupBucketPath(queueType, level))
 }
 
-// GetOrCreateStatusLookupBucket returns or creates the status-lookup bucket for a specific level.
-// This bucket stores ULID -> status string mappings.
-func GetOrCreateStatusLookupBucket(tx *bolt.Tx, queueType string, level int) (*bolt.Bucket, error) {
+// GetOrCreateTraversalStatusLookupBucket returns or creates the traversal status-lookup bucket for a specific level.
+// This bucket stores ULID -> traversal status string mappings.
+func GetOrCreateTraversalStatusLookupBucket(tx *bolt.Tx, queueType string, level int) (*bolt.Bucket, error) {
 	// Ensure the level bucket exists first
 	if err := EnsureLevelBucket(tx, queueType, level); err != nil {
 		return nil, err
 	}
-	return getOrCreateBucket(tx, GetStatusLookupBucketPath(queueType, level))
+	return getOrCreateBucket(tx, GetTraversalStatusLookupBucketPath(queueType, level))
 }
 
-// UpdateStatusLookup updates the status-lookup index for a node ULID at a given level.
-// This should be called whenever a node's status changes.
+// GetCopyStatusLookupBucket returns the copy status-lookup bucket for a specific level (SRC only).
+// This bucket stores ULID -> copy status string mappings.
+func GetCopyStatusLookupBucket(tx *bolt.Tx, level int) *bolt.Bucket {
+	return getBucket(tx, GetCopyStatusLookupBucketPath(level))
+}
+
+// GetOrCreateCopyStatusLookupBucket returns or creates the copy status-lookup bucket for a specific level (SRC only).
+// This bucket stores ULID -> copy status string mappings.
+func GetOrCreateCopyStatusLookupBucket(tx *bolt.Tx, level int) (*bolt.Bucket, error) {
+	// Ensure the level bucket exists first
+	if err := EnsureLevelBucket(tx, BucketSrc, level); err != nil {
+		return nil, err
+	}
+	return getOrCreateBucket(tx, GetCopyStatusLookupBucketPath(level))
+}
+
+// GetStatusLookupBucket is deprecated - use GetTraversalStatusLookupBucket instead.
+// Kept for backward compatibility during migration.
+func GetStatusLookupBucket(tx *bolt.Tx, queueType string, level int) *bolt.Bucket {
+	return GetTraversalStatusLookupBucket(tx, queueType, level)
+}
+
+// GetOrCreateStatusLookupBucket is deprecated - use GetOrCreateTraversalStatusLookupBucket instead.
+// Kept for backward compatibility during migration.
+func GetOrCreateStatusLookupBucket(tx *bolt.Tx, queueType string, level int) (*bolt.Bucket, error) {
+	return GetOrCreateTraversalStatusLookupBucket(tx, queueType, level)
+}
+
+// UpdateTraversalStatusLookup updates the traversal status-lookup index for a node ULID at a given level.
+// This should be called whenever a node's traversal status changes.
 // nodeID is the ULID of the node (as []byte).
-func UpdateStatusLookup(tx *bolt.Tx, queueType string, level int, nodeID []byte, status string) error {
-	lookupBucket, err := GetOrCreateStatusLookupBucket(tx, queueType, level)
+func UpdateTraversalStatusLookup(tx *bolt.Tx, queueType string, level int, nodeID []byte, status string) error {
+	lookupBucket, err := GetOrCreateTraversalStatusLookupBucket(tx, queueType, level)
 	if err != nil {
-		return fmt.Errorf("failed to get status-lookup bucket: %w", err)
+		return fmt.Errorf("failed to get traversal status-lookup bucket: %w", err)
 	}
 	return lookupBucket.Put(nodeID, []byte(status))
+}
+
+// UpdateCopyStatusLookup updates the copy status-lookup index for a node ULID at a given level (SRC only).
+// This should be called whenever a node's copy status changes.
+// nodeID is the ULID of the node (as []byte).
+func UpdateCopyStatusLookup(tx *bolt.Tx, level int, nodeID []byte, status string) error {
+	lookupBucket, err := GetOrCreateCopyStatusLookupBucket(tx, level)
+	if err != nil {
+		return fmt.Errorf("failed to get copy status-lookup bucket: %w", err)
+	}
+	return lookupBucket.Put(nodeID, []byte(status))
+}
+
+// UpdateStatusLookup is deprecated - use UpdateTraversalStatusLookup instead.
+// Kept for backward compatibility during migration.
+func UpdateStatusLookup(tx *bolt.Tx, queueType string, level int, nodeID []byte, status string) error {
+	return UpdateTraversalStatusLookup(tx, queueType, level, nodeID, status)
 }
 
 // GetExclusionHoldingBucket returns the exclusion-holding bucket for a queue type.

@@ -149,11 +149,18 @@ The database is partitioned into two main areas:
     /path-to-ulid           → pathHash: ULID (path-based lookup for API)
     /levels
       /00000000
-        /pending            → ULID: empty (membership set)
-        /successful         → ULID: empty
-        /failed             → ULID: empty
-        /excluded           → ULID: empty
-        /status-lookup      → ULID: status string (reverse index)
+        /traversal
+          /pending            → ULID: empty (membership set)
+          /successful         → ULID: empty
+          /failed             → ULID: empty
+          /excluded           → ULID: empty
+          /status-lookup      → ULID: status string (reverse index)
+        /copy
+          /pending            → ULID: empty (membership set)
+          /successful         → ULID: empty
+          /skipped            → ULID: empty
+          /failed             → ULID: empty
+          /status-lookup      → ULID: status string (reverse index)
       /00000001/...
   /DST
     /nodes                  → ULID: NodeState JSON (canonical data)
@@ -162,12 +169,13 @@ The database is partitioned into two main areas:
     /path-to-ulid           → pathHash: ULID (path-based lookup for API)
     /levels
       /00000000
-        /pending
-        /successful
-        /failed
-        /not_on_src         → ULID: empty (DST-specific status)
-        /excluded           → ULID: empty
-        /status-lookup      → ULID: status string (reverse index)
+        /traversal
+          /pending
+          /successful
+          /failed
+          /not_on_src         → ULID: empty (DST-specific status)
+          /excluded           → ULID: empty
+          /status-lookup      → ULID: status string (reverse index)
       /00000001/...
   /STATS
     /totals                → bucketPath: int64 (bucket count statistics)
@@ -191,24 +199,42 @@ This partitioning separates traversal operations (discovery/scanning phase) from
 
 1. **Separation of Concerns**
    - Node data lives in `/nodes` (single source of truth)
-   - Status membership tracked in `/levels/{level}/{status}` buckets
-   - Status-lookup index in `/levels/{level}/status-lookup` provides reverse lookup (ULID → status)
+   - **Traversal status** membership tracked in `/levels/{level}/traversal/{status}` buckets (SRC and DST)
+   - **Copy status** membership tracked in `/levels/{level}/copy/{status}` buckets (SRC only)
+   - Separate status-lookup indexes in `/levels/{level}/traversal/status-lookup` and `/levels/{level}/copy/status-lookup` provide reverse lookup (ULID → status)
    - Tree relationships in `/children` buckets
    - Bidirectional join-lookup tables (`/src-to-dst` and `/dst-to-src`) map corresponding SRC and DST node ULIDs
    - Path-to-ULID lookup table (`/path-to-ulid`) maps path hashes to ULIDs for API path-based queries
    - Join tables enable efficient correlation without embedding references in node data
 
+   **Traversal Status** (SRC and DST):
+   - Answers: "Can I descend?", "Should I enqueue children?", "Did listing fail?", "Was this excluded?"
+   - Used by: traversal engine, retry/exclusion logic, UI tree expansion
+   - Statuses: `pending`, `successful`, `failed`, `excluded` (DST also has `not_on_src`)
+
+   **Copy Status** (SRC only):
+   - Answers: "Will data move?", "Is this already satisfied?", "Did copy fail?", "Was it skipped?"
+   - Used by: copy phase queueing, progress bars, audit & reporting, UI action-plan view
+   - Statuses: `pending`, `successful`, `skipped`, `failed`
+
 2. **Status Transitions are Atomic**
    Status transitions update multiple buckets atomically:
    ```go
+   // Traversal status transition:
    // 1. Update NodeState in /nodes bucket
-   // 2. Remove from old status bucket
-   // 3. Add to new status bucket
-   // 4. Update status-lookup index
+   // 2. Remove from old traversal status bucket
+   // 3. Add to new traversal status bucket
+   // 4. Update traversal status-lookup index
+   
+   // Copy status transition (SRC only):
+   // 1. Update NodeState in /nodes bucket
+   // 2. Remove from old copy status bucket
+   // 3. Add to new copy status bucket
+   // 4. Update copy status-lookup index
    ```
 
-3. **Status-Lookup Index**
-   - Each level has a `status-lookup` bucket that maps `ULID → status string`
+3. **Status-Lookup Indexes**
+   - Each level has separate `traversal/status-lookup` and `copy/status-lookup` buckets that map `ULID → status string`
    - Provides O(1) lookup to find which status bucket a node belongs to
    - Automatically maintained on every insert and status update
    - Enables efficient queries without scanning all status buckets

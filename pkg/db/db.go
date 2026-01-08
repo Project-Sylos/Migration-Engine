@@ -14,8 +14,9 @@ import (
 
 // DB wraps BoltDB instance with lifecycle management.
 type DB struct {
-	db     *bolt.DB
-	dbPath string
+	db          *bolt.DB
+	dbPath      string
+	requireOpen bool // If true, DB must be open (error if closed). If false, can auto-open.
 }
 
 // Options for BoltDB initialization
@@ -152,8 +153,35 @@ func (db *DB) initializeBuckets() error {
 }
 
 // GetDB returns the underlying BoltDB instance for direct operations.
-func (db *DB) GetDB() *bolt.DB {
-	return db.db
+// If DB is closed and RequireOpen=false, it will attempt to auto-open the DB.
+// If RequireOpen=true and DB is closed, it returns an error.
+func (db *DB) GetDB() (*bolt.DB, error) {
+	// Check if DB is open
+	if !db.IsOpen() {
+		// Try to auto-open if RequireOpen is false
+		if !db.requireOpen && db.dbPath != "" {
+			// Re-open the DB
+			boltDB, err := bolt.Open(db.dbPath, 0600, nil)
+			if err != nil {
+				return nil, fmt.Errorf("failed to auto-open database: %w", err)
+			}
+			db.db = boltDB
+		} else {
+			return nil, fmt.Errorf("database is not open")
+		}
+	}
+	return db.db, nil
+}
+
+// IsOpen returns true if the database is currently open.
+func (db *DB) IsOpen() bool {
+	return db.db != nil
+}
+
+// SetRequireOpen sets the RequireOpen flag for this DB instance.
+// When true, operations will fail if DB is closed. When false, operations can auto-open the DB.
+func (db *DB) SetRequireOpen(requireOpen bool) {
+	db.requireOpen = requireOpen
 }
 
 // Close closes the BoltDB instance.
@@ -190,12 +218,44 @@ func (db *DB) Path() string {
 }
 
 // Update executes a read-write transaction.
+// If DB is closed and RequireOpen=false, it will attempt to auto-open the DB.
+// If RequireOpen=true and DB is closed, it returns an error.
 func (db *DB) Update(fn func(*bolt.Tx) error) error {
+	// Check if DB is open
+	if !db.IsOpen() {
+		// Try to auto-open if RequireOpen is false
+		if !db.requireOpen && db.dbPath != "" {
+			// Re-open the DB
+			boltDB, err := bolt.Open(db.dbPath, 0600, nil)
+			if err != nil {
+				return fmt.Errorf("failed to auto-open database: %w", err)
+			}
+			db.db = boltDB
+		} else {
+			return fmt.Errorf("database is not open")
+		}
+	}
 	return db.db.Update(fn)
 }
 
 // View executes a read-only transaction.
+// If DB is closed and RequireOpen=false, it will attempt to auto-open the DB.
+// If RequireOpen=true and DB is closed, it returns an error.
 func (db *DB) View(fn func(*bolt.Tx) error) error {
+	// Check if DB is open
+	if !db.IsOpen() {
+		// Try to auto-open if RequireOpen is false
+		if !db.requireOpen && db.dbPath != "" {
+			// Re-open the DB
+			boltDB, err := bolt.Open(db.dbPath, 0600, nil)
+			if err != nil {
+				return fmt.Errorf("failed to auto-open database: %w", err)
+			}
+			db.db = boltDB
+		} else {
+			return fmt.Errorf("database is not open")
+		}
+	}
 	return db.db.View(fn)
 }
 

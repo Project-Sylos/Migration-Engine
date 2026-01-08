@@ -74,7 +74,7 @@ func SetPathToULIDMapping(tx *bolt.Tx, queueType string, path string, ulid strin
 func GetULIDFromPath(db *DB, queueType string, path string) (string, error) {
 	var ulid string
 
-	err := db.db.View(func(tx *bolt.Tx) error {
+	err := db.View(func(tx *bolt.Tx) error {
 		pathBucket := GetPathToULIDBucket(tx, queueType)
 		if pathBucket == nil {
 			return fmt.Errorf("path-to-ulid bucket not found for %s", queueType)
@@ -97,7 +97,7 @@ func GetULIDFromPath(db *DB, queueType string, path string) (string, error) {
 func GetULIDFromPathHash(db *DB, queueType string, pathHash string) (string, error) {
 	var ulid string
 
-	err := db.db.View(func(tx *bolt.Tx) error {
+	err := db.View(func(tx *bolt.Tx) error {
 		pathBucket := GetPathToULIDBucket(tx, queueType)
 		if pathBucket == nil {
 			return fmt.Errorf("path-to-ulid bucket not found for %s", queueType)
@@ -130,7 +130,7 @@ func DeletePathToULIDMapping(tx *bolt.Tx, queueType string, path string) error {
 func BatchGetULIDsFromPaths(db *DB, queueType string, paths []string) (map[string]string, error) {
 	results := make(map[string]string)
 
-	err := db.db.View(func(tx *bolt.Tx) error {
+	err := db.View(func(tx *bolt.Tx) error {
 		pathBucket := GetPathToULIDBucket(tx, queueType)
 		if pathBucket == nil {
 			return fmt.Errorf("path-to-ulid bucket not found for %s", queueType)
@@ -154,7 +154,7 @@ func BatchGetULIDsFromPaths(db *DB, queueType string, paths []string) (map[strin
 func BatchGetULIDsFromPathHashes(db *DB, queueType string, pathHashes []string) (map[string]string, error) {
 	results := make(map[string]string)
 
-	err := db.db.View(func(tx *bolt.Tx) error {
+	err := db.View(func(tx *bolt.Tx) error {
 		pathBucket := GetPathToULIDBucket(tx, queueType)
 		if pathBucket == nil {
 			return fmt.Errorf("path-to-ulid bucket not found for %s", queueType)
