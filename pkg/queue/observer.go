@@ -33,17 +33,27 @@ import (
 
 // ExternalQueueMetrics contains user-facing metrics published to BoltDB for API access.
 type ExternalQueueMetrics struct {
-	// Monotonic counters
+	// Monotonic counters (traversal phase)
 	FilesDiscoveredTotal   int64 `json:"files_discovered_total"`
 	FoldersDiscoveredTotal int64 `json:"folders_discovered_total"`
 
-	// EMA-smoothed rates (2-5 second window)
+	// EMA-smoothed rates (2-5 second window) - traversal phase
 	DiscoveryRateItemsPerSec float64 `json:"discovery_rate_items_per_sec"`
 
 	// Verification counts (for O(1) stats bucket lookups)
 	TotalDiscovered int64 `json:"total_discovered"` // files + folders
 	TotalPending    int   `json:"total_pending"`    // pending across all rounds (from DB)
 	TotalFailed     int   `json:"total_failed"`     // failed across all rounds
+
+	// Copy phase metrics (monotonic counters)
+	BytesTransferredTotal int64 `json:"bytes_transferred_total"`
+	FoldersCreatedTotal   int64 `json:"folders_created_total"`
+	FilesCreatedTotal     int64 `json:"files_created_total"`
+
+	// Copy phase rates (EMA-smoothed)
+	BytesPerSecond   float64 `json:"bytes_per_second"`
+	FoldersPerSecond float64 `json:"folders_per_second"`
+	FilesPerSecond   float64 `json:"files_per_second"`
 
 	// Current state (for API)
 	QueueStats
@@ -90,6 +100,13 @@ type QueueObserver struct {
 		folders int64
 		time    time.Time
 	} // Previous discovery totals and time for each queue
+	// Copy metrics tracking for delta calculation
+	prevCopyTotals map[string]struct {
+		bytes   int64
+		folders int64
+		files   int64
+		time    time.Time
+	} // Previous copy totals and time for each queue
 }
 
 const (
@@ -115,6 +132,12 @@ func NewQueueObserver(boltInstance *db.DB, updateInterval time.Duration) *QueueO
 		prevDiscoveryTotals: make(map[string]struct {
 			files   int64
 			folders int64
+			time    time.Time
+		}),
+		prevCopyTotals: make(map[string]struct {
+			bytes   int64
+			folders int64
+			files   int64
 			time    time.Time
 		}),
 	}
@@ -144,6 +167,7 @@ func (o *QueueObserver) UnregisterQueue(queueName string) {
 	delete(o.internalMetrics, queueName)
 	delete(o.prevEMARates, queueName)
 	delete(o.prevDiscoveryTotals, queueName)
+	delete(o.prevCopyTotals, queueName)
 }
 
 // Start begins the observer loop that publishes stats to BoltDB.
@@ -198,6 +222,12 @@ func (o *QueueObserver) Stop() {
 	o.prevDiscoveryTotals = make(map[string]struct {
 		files   int64
 		folders int64
+		time    time.Time
+	})
+	o.prevCopyTotals = make(map[string]struct {
+		bytes   int64
+		folders int64
+		files   int64
 		time    time.Time
 	})
 }
@@ -265,10 +295,15 @@ func (o *QueueObserver) pollQueue(queueName string, queue *Queue) *ExternalQueue
 	stats := queue.Stats()
 	currentState := queue.State()
 
-	// Get discovery totals
+	// Get discovery totals (traversal phase)
 	filesTotal := queue.GetFilesDiscoveredTotal()
 	foldersTotal := queue.GetFoldersDiscoveredTotal()
 	totalDiscovered := queue.GetTotalDiscovered()
+
+	// Get copy phase totals
+	bytesTransferredTotal := queue.GetBytesTransferredTotal()
+	foldersCreatedTotal := queue.GetFoldersCreatedTotal()
+	filesCreatedTotal := queue.GetFilesCreatedTotal()
 
 	// Get total pending and failed counts from stats bucket (O(1) lookup)
 	// The stats bucket is maintained by the output buffer during flush operations
@@ -278,8 +313,13 @@ func (o *QueueObserver) pollQueue(queueName string, queue *Queue) *ExternalQueue
 	// Update internal metrics (state tracking)
 	o.updateInternalMetrics(queueName, queue, currentState, now)
 
-	// Calculate EMA-smoothed discovery rate
+	// Calculate EMA-smoothed discovery rate (traversal phase)
 	discoveryRate := o.calculateDiscoveryRate(queueName, filesTotal, foldersTotal, now)
+
+	// Calculate copy phase rates (EMA-smoothed)
+	bytesPerSecond := o.calculateBytesPerSecond(queueName, bytesTransferredTotal, now)
+	foldersPerSecond := o.calculateFoldersPerSecond(queueName, foldersCreatedTotal, now)
+	filesPerSecond := o.calculateFilesPerSecond(queueName, filesCreatedTotal, now)
 
 	// Build external metrics
 	metric := ExternalQueueMetrics{
@@ -289,6 +329,12 @@ func (o *QueueObserver) pollQueue(queueName string, queue *Queue) *ExternalQueue
 		TotalDiscovered:          totalDiscovered,
 		TotalPending:             totalPending,
 		TotalFailed:              totalFailed,
+		BytesTransferredTotal:    bytesTransferredTotal,
+		FoldersCreatedTotal:      foldersCreatedTotal,
+		FilesCreatedTotal:        filesCreatedTotal,
+		BytesPerSecond:           bytesPerSecond,
+		FoldersPerSecond:         foldersPerSecond,
+		FilesPerSecond:           filesPerSecond,
 		QueueStats:               stats,
 		Round:                    stats.Round,
 	}
@@ -340,6 +386,165 @@ func (o *QueueObserver) calculateDiscoveryRate(queueName string, filesTotal, fol
 	}{
 		files:   filesTotal,
 		folders: foldersTotal,
+		time:    now,
+	}
+
+	return newEMA
+}
+
+// calculateBytesPerSecond calculates EMA-smoothed bytes/sec rate for copy phase.
+func (o *QueueObserver) calculateBytesPerSecond(queueName string, bytesTotal int64, now time.Time) float64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	prev, hasPrev := o.prevCopyTotals[queueName]
+
+	if !hasPrev {
+		// First poll - initialize tracking
+		o.prevCopyTotals[queueName] = struct {
+			bytes   int64
+			folders int64
+			files   int64
+			time    time.Time
+		}{
+			bytes:   bytesTotal,
+			folders: 0,
+			files:   0,
+			time:    now,
+		}
+		return 0.0
+	}
+
+	// Calculate current instantaneous rate
+	timeDelta := now.Sub(prev.time).Seconds()
+	if timeDelta <= 0 {
+		return 0.0
+	}
+
+	bytesDelta := bytesTotal - prev.bytes
+	currentRate := float64(bytesDelta) / timeDelta
+
+	// Update EMA: newEMA = alpha * currentRate + (1-alpha) * previousEMA
+	prevEMA := o.prevEMARates[queueName+"-bytes"]
+	newEMA := emaAlpha*currentRate + (1-emaAlpha)*prevEMA
+
+	// Store for next calculation
+	o.prevEMARates[queueName+"-bytes"] = newEMA
+	o.prevCopyTotals[queueName] = struct {
+		bytes   int64
+		folders int64
+		files   int64
+		time    time.Time
+	}{
+		bytes:   bytesTotal,
+		folders: prev.folders,
+		files:   prev.files,
+		time:    now,
+	}
+
+	return newEMA
+}
+
+// calculateFoldersPerSecond calculates EMA-smoothed folders/sec rate for copy phase.
+func (o *QueueObserver) calculateFoldersPerSecond(queueName string, foldersTotal int64, now time.Time) float64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	prev, hasPrev := o.prevCopyTotals[queueName]
+
+	if !hasPrev {
+		// First poll - initialize tracking
+		o.prevCopyTotals[queueName] = struct {
+			bytes   int64
+			folders int64
+			files   int64
+			time    time.Time
+		}{
+			bytes:   0,
+			folders: foldersTotal,
+			files:   0,
+			time:    now,
+		}
+		return 0.0
+	}
+
+	// Calculate current instantaneous rate
+	timeDelta := now.Sub(prev.time).Seconds()
+	if timeDelta <= 0 {
+		return 0.0
+	}
+
+	foldersDelta := foldersTotal - prev.folders
+	currentRate := float64(foldersDelta) / timeDelta
+
+	// Update EMA: newEMA = alpha * currentRate + (1-alpha) * previousEMA
+	prevEMA := o.prevEMARates[queueName+"-folders"]
+	newEMA := emaAlpha*currentRate + (1-emaAlpha)*prevEMA
+
+	// Store for next calculation
+	o.prevEMARates[queueName+"-folders"] = newEMA
+	o.prevCopyTotals[queueName] = struct {
+		bytes   int64
+		folders int64
+		files   int64
+		time    time.Time
+	}{
+		bytes:   prev.bytes,
+		folders: foldersTotal,
+		files:   prev.files,
+		time:    now,
+	}
+
+	return newEMA
+}
+
+// calculateFilesPerSecond calculates EMA-smoothed files/sec rate for copy phase.
+func (o *QueueObserver) calculateFilesPerSecond(queueName string, filesTotal int64, now time.Time) float64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	prev, hasPrev := o.prevCopyTotals[queueName]
+
+	if !hasPrev {
+		// First poll - initialize tracking
+		o.prevCopyTotals[queueName] = struct {
+			bytes   int64
+			folders int64
+			files   int64
+			time    time.Time
+		}{
+			bytes:   0,
+			folders: 0,
+			files:   filesTotal,
+			time:    now,
+		}
+		return 0.0
+	}
+
+	// Calculate current instantaneous rate
+	timeDelta := now.Sub(prev.time).Seconds()
+	if timeDelta <= 0 {
+		return 0.0
+	}
+
+	filesDelta := filesTotal - prev.files
+	currentRate := float64(filesDelta) / timeDelta
+
+	// Update EMA: newEMA = alpha * currentRate + (1-alpha) * previousEMA
+	prevEMA := o.prevEMARates[queueName+"-files"]
+	newEMA := emaAlpha*currentRate + (1-emaAlpha)*prevEMA
+
+	// Store for next calculation
+	o.prevEMARates[queueName+"-files"] = newEMA
+	o.prevCopyTotals[queueName] = struct {
+		bytes   int64
+		folders int64
+		files   int64
+		time    time.Time
+	}{
+		bytes:   prev.bytes,
+		folders: prev.folders,
+		files:   filesTotal,
 		time:    now,
 	}
 
@@ -500,8 +705,11 @@ func (o *QueueObserver) publishMetricsToBoltDB(metricsMap map[string]ExternalQue
 		// Write metrics for each queue
 		for queueName, metrics := range metricsMap {
 			// Determine the key based on queue name
-			// "src" -> "src-traversal", "dst" -> "dst-traversal", etc.
-			key := queueName + "-traversal"
+			// "src" -> "src-traversal", "dst" -> "dst-traversal", "copy" -> "copy", etc.
+			key := queueName
+			if queueName != "copy" {
+				key = queueName + "-traversal"
+			}
 
 			// Marshal metrics to JSON
 			metricsJSON, err := json.Marshal(metrics)

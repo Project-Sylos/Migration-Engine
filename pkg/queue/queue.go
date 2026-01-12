@@ -53,6 +53,7 @@ type QueueMode string
 const (
 	QueueModeTraversal QueueMode = "traversal" // Normal BFS traversal
 	QueueModeRetry     QueueMode = "retry"     // Retry failed tasks sweep
+	QueueModeCopy      QueueMode = "copy"      // Copy phase (folders then files)
 )
 
 const (
@@ -95,9 +96,15 @@ type Queue struct {
 	avgInterval         time.Duration   // Interval for calculating averages
 	// Retry sweep specific fields
 	maxKnownDepth int // Maximum known depth from previous traversal (for retry sweep)
+	// Copy phase specific fields
+	copyPass int // Current copy pass (1 for folders, 2 for files)
 	// Discovery tracking for metrics
 	filesDiscoveredTotal   int64 // Total files discovered (monotonic counter)
 	foldersDiscoveredTotal int64 // Total folders discovered (monotonic counter)
+	// Copy phase metrics tracking
+	bytesTransferredTotal int64 // Total bytes transferred (monotonic counter)
+	foldersCreatedTotal   int64 // Total folders created (monotonic counter)
+	filesCreatedTotal     int64 // Total files created (monotonic counter)
 }
 
 // NewQueue creates a new Queue instance.
@@ -167,6 +174,7 @@ func (q *Queue) GetPendingSet() map[string]struct{} {
 // InitializeWithContext sets up the queue with BoltDB, context, and filesystem adapter references.
 // Creates and starts workers immediately - they'll poll for tasks autonomously.
 // shutdownCtx is optional - if provided, workers will check for cancellation and exit on shutdown.
+// For copy mode, InitializeCopyWithContext should be used instead to provide both adapters.
 func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter types.FSAdapter, shutdownCtx context.Context) {
 	// Set BoltDB and shutdownCtx using setters
 	q.setBoltDB(boltInstance)
@@ -183,10 +191,10 @@ func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter types.FSAdapt
 	q.setOutputBuffer(outputBuffer)
 
 	// Create and start workers - they manage themselves
+
+	// Traversal or retry mode use traversal workers
 	for i := 0; i < workerCount; i++ {
-		var w Worker
-		// Traversal or retry mode use traversal workers
-		w = NewTraversalWorker(
+		w := NewTraversalWorker(
 			fmt.Sprintf("%s-worker-%d", q.name, i),
 			q,
 			boltInstance,
@@ -207,6 +215,45 @@ func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter types.FSAdapt
 	// Queues are initialized - tasks will be seeded externally or propagated through Complete()
 	if logservice.LS != nil {
 		_ = logservice.LS.Log("info", fmt.Sprintf("%s queue initialized", strings.ToUpper(q.name)), "queue", q.name, q.name)
+	}
+}
+
+// InitializeCopyWithContext sets up a copy queue with both source and destination adapters.
+// This is specifically for copy mode which requires both adapters.
+func (q *Queue) InitializeCopyWithContext(boltInstance *db.DB, srcAdapter, dstAdapter types.FSAdapter, shutdownCtx context.Context) {
+	// Set BoltDB and shutdownCtx using setters
+	q.setBoltDB(boltInstance)
+	q.setShutdownCtx(shutdownCtx)
+
+	// Get worker count from capacity
+	q.mu.RLock()
+	workerCount := cap(q.workers)
+	q.mu.RUnlock()
+
+	// Initialize output buffer for batched writes
+	outputBuffer := db.NewOutputBuffer(boltInstance, 10000, 3*time.Second)
+	q.setOutputBuffer(outputBuffer)
+
+	// Create and start copy workers
+	for i := 0; i < workerCount; i++ {
+		w := NewCopyWorker(
+			fmt.Sprintf("%s-worker-%d", q.name, i),
+			q,
+			boltInstance,
+			srcAdapter,
+			dstAdapter,
+			shutdownCtx,
+		)
+		q.AddWorker(w)
+		go w.Run()
+	}
+
+	// Start the queue's Run() method to coordinate pulling tasks and advancing rounds
+	go q.Run()
+
+	// Queues are initialized - tasks will be pulled from copy status buckets
+	if logservice.LS != nil {
+		_ = logservice.LS.Log("info", fmt.Sprintf("%s copy queue initialized", strings.ToUpper(q.name)), "queue", q.name, q.name)
 	}
 }
 
@@ -361,39 +408,17 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			return false
 		}
 
-		queueType := getQueueType(q.name)
 		mode := q.getMode()
 
 		// Mode-specific completion conditions
 		switch mode {
-		case QueueModeTraversal:
-			// Traversal: first pull with 0 entries → complete (exhausted all depths)
-			// Check if any pending tasks exist at current round
-			hasPending, err := boltDB.HasStatusBucketItems(queueType, currentRound, db.StatusPending)
-			if err != nil {
-				return false
-			}
+		case QueueModeTraversal, QueueModeRetry:
+			// Delegate to traversal/retry-specific completion check in mode_traversal.go
+			return q.CheckTraversalCompletion(currentRound, wasFirstPull)
 
-			// only end if we don't have any pending items and thi was our first pull of the round.
-			if !hasPending {
-				if !wasFirstPull {
-					return false
-				}
-				return q.markComplete("No pending tasks found for round %d - traversal complete (first pull)", currentRound)
-			}
-
-		case QueueModeRetry:
-			// Retry: use traversal rules past maxKnownDepth (exhausted all possible depths beyond known tree)
-			// Below maxKnownDepth, keep scanning all known levels
-			maxKnownDepth := q.getMaxKnownDepth()
-			if maxKnownDepth >= 0 && currentRound > maxKnownDepth {
-				// Past maxKnownDepth - apply traversal completion rules
-				hasPending, err1 := boltDB.HasStatusBucketItems(queueType, currentRound, db.StatusPending)
-				if err1 == nil && !hasPending && wasFirstPull {
-					return q.markComplete("Retry sweep complete - past maxKnownDepth (%d), no pending/failed tasks at round %d", maxKnownDepth, currentRound)
-				}
-			}
-			// At or below maxKnownDepth, or still have tasks - rounds will advance naturally
+		case QueueModeCopy:
+			// Delegate to copy-specific completion check in mode_copy.go
+			return q.CheckCopyCompletion(currentRound, wasFirstPull)
 		}
 
 		return false
@@ -406,7 +431,7 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			return false
 		}
 
-		// Check conditions after flush
+		// Soft check: verify in-memory state (after flush)
 		inProgressCount := q.getInProgressCount()
 		pendingBuffCount := q.getPendingCount()
 		lastPullWasPartial := q.getLastPullWasPartial()
@@ -414,6 +439,62 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 		// Round is complete if: no in-progress, no pending, and last pull was partial
 		if inProgressCount > 0 || pendingBuffCount > 0 || !lastPullWasPartial {
 			return false
+		}
+
+		// Hard check: verify BoltDB buckets are empty (mode-specific)
+		mode := q.getMode()
+		if mode == QueueModeCopy {
+			boltDB := q.getBoltDB()
+			if boltDB != nil {
+				copyPass := q.getCopyPass()
+				// Determine node type for current pass
+				nodeType := db.NodeTypeFolder
+				if copyPass == 2 {
+					nodeType = db.NodeTypeFile
+				}
+
+				// For copy mode: check if pending OR in-progress buckets have items for this round and node type
+				// Buckets are now split by node type, so no filtering needed!
+				hasPendingForPass := false
+				hasInProgressForPass := false
+
+				// Check pending bucket for this node type
+				hasPending, err1 := boltDB.HasCopyStatusBucketItems(currentRound, nodeType, db.CopyStatusPending)
+				if err1 == nil && hasPending {
+					hasPendingForPass = true
+				}
+
+				// Check in-progress bucket for this node type
+				hasInProgress, err2 := boltDB.HasCopyStatusBucketItems(currentRound, nodeType, db.CopyStatusInProgress)
+				if err2 == nil && hasInProgress {
+					hasInProgressForPass = true
+				}
+
+				if err1 == nil && err2 == nil {
+					if hasPendingForPass || hasInProgressForPass {
+						// Hard check failed: still have pending or in-progress tasks for this pass
+						// Reset lastPullWasPartial to false so normal pull logic can trigger
+						if hasInProgressForPass {
+							// Log in-progress tasks specifically - this is the issue we're debugging
+							fmt.Printf("[Copy Round Check] Round %d has in-progress tasks (pass %d, nodeType=%s) - cannot advance yet\n", currentRound, copyPass, nodeType)
+						}
+						q.setLastPullWasPartial(false)
+						return false
+					}
+				} else {
+					// Error checking buckets - be conservative and don't advance
+					// Errors logged via logservice if available
+					return false
+				}
+			} else {
+				// No BoltDB - can't do hard check
+				return false
+			}
+		}
+
+		// Both soft and hard checks passed - round is complete
+		if mode == QueueModeCopy {
+			fmt.Printf("[Copy Round Check] Round %d hard check passed: pending and in-progress buckets empty\n", currentRound)
 		}
 
 		// Round is complete - advance if requested
@@ -527,319 +608,37 @@ func (q *Queue) ReportTaskResult(task *TaskBase, result TaskExecutionResult) {
 
 // completeTask is the internal implementation for successful task completion.
 func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
-	// Record execution time delta
-	q.recordExecutionTime(executionDelta)
-	currentRound := task.Round
+	mode := q.getMode()
 
-	if q.boltDB == nil {
+	// Delegate to mode-specific implementation
+	if mode == QueueModeCopy {
+		q.completeCopyTask(task, executionDelta)
 		return
 	}
 
-	// Convert task to NodeState for BoltDB
-	state := taskToNodeState(task)
-	if state == nil {
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("error",
-				fmt.Sprintf("Complete() called with task that couldn't be converted to NodeState: %v", task),
-				"queue", q.name, q.name)
-		}
-		return
-	}
+	// Traversal and retry modes use the same completion logic
+	q.CompleteTraversalTask(task, executionDelta)
 
-	nodeID := state.ID
-	queueType := getQueueType(q.name)
-	nextRound := currentRound + 1
+}
 
-	// Remove the ULID from leased set (can do this early, doesn't affect pending count)
-	q.removeLeasedKey(nodeID)
+// completeCopyTask handles completion of copy tasks (folders or files).
+// Copy tasks don't discover children - they just update copy status and track metrics.
+func (q *Queue) completeCopyTask(task *TaskBase, executionDelta time.Duration) {
+	// Delegate to copy-specific implementation in mode_copy.go
+	q.CompleteCopyTask(task, executionDelta)
+}
 
-	task.Locked = false
-	task.Status = "successful"
-
-	// Increment completed count (even if failed, this is a "processed" counter)
-	q.incrementRoundStatsCompleted(currentRound)
-
-	// Record task completion in RoundInfo
-	q.recordTaskCompletion(currentRound, true)
-
-	// Note: We'll check for completion again at the end after all writes are done
-	// This early check helps catch completion as soon as possible
-
-	// Prepare child nodes for insertion
-	parentPath := types.NormalizeLocationPath(task.LocationPath())
-	var childNodesToInsert []db.InsertOperation
-
-	// Log folder discovery with details and update discovery counters
-	totalChildren := len(task.DiscoveredChildren)
-	foldersCount := 0
-	filesCount := 0
-	if totalChildren > 0 {
-		for _, child := range task.DiscoveredChildren {
-			if child.IsFile {
-				filesCount++
-			} else {
-				foldersCount++
-			}
-		}
-		// Increment discovery counters (thread-safe)
-		q.mu.Lock()
-		q.filesDiscoveredTotal += int64(filesCount)
-		q.foldersDiscoveredTotal += int64(foldersCount)
-		q.mu.Unlock()
-
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug",
-				fmt.Sprintf("Discovered %d total children (folders: %d, files: %d) from path %s",
-					totalChildren, foldersCount, filesCount, parentPath),
-				"queue", q.name, q.name)
-		}
-	}
-
-	// 2. Build map of existing children (ServiceID -> ULID) to avoid creating duplicates
-	existingChildrenMap := make(map[string]string) // ServiceID -> ULID
-	boltDB := q.getBoltDB()
-	if boltDB != nil {
-		if existingChildren, err := db.GetChildrenStatesByParentID(boltDB, queueType, nodeID); err == nil {
-			for _, existingChild := range existingChildren {
-				if existingChild != nil && existingChild.ServiceID != "" {
-					existingChildrenMap[existingChild.ServiceID] = existingChild.ID
-				}
-			}
-		}
-	}
-
-	// 3. Collect discovered children for insertion
-	for _, child := range task.DiscoveredChildren {
-		// For DST queues, skip folder children here - they'll be handled separately
-		if queueType == "DST" && !child.IsFile {
-			continue
-		}
-
-		// Get ServiceID from child
-		var childServiceID string
-		if child.IsFile {
-			childServiceID = child.File.ServiceID
-		} else {
-			childServiceID = child.Folder.ServiceID
-		}
-
-		// Check if child already exists - if so, reuse its ULID
-		existingULID, exists := existingChildrenMap[childServiceID]
-
-		childState := childResultToNodeStateWithID(child, parentPath, nextRound, queueType, nodeID, existingULID, exists)
-		if childState == nil {
-			continue
-		}
-
-		// Populate traversal status in the NodeState metadata
-		childState.TraversalStatus = child.Status
-
-		childNodesToInsert = append(childNodesToInsert, db.InsertOperation{
-			QueueType: queueType,
-			Level:     nextRound,
-			Status:    child.Status,
-			State:     childState,
-		})
-
-		// Queue path-to-ulid mapping for this child (for API path-based queries)
-		outputBuffer := q.getOutputBuffer()
-		if outputBuffer != nil && childState.Path != "" {
-			outputBuffer.AddPathToULIDMapping(queueType, childState.Path, childState.ID)
-		}
-
-		// For DST queue: queue lookup mapping if this child has a matching SRC node
-		if queueType == "DST" && child.SrcID != "" {
-			if outputBuffer != nil {
-				// Queue bidirectional lookup mapping: SrcID <-> DST node ID
-				outputBuffer.AddLookupMapping(child.SrcID, childState.ID)
-			}
-
-			// Update SRC node's CopyStatus if worker determined an update is needed
-			if child.SrcCopyStatus != "" {
-				// Get SRC node to get its depth and traversal status for the update
-				if srcNode, err := db.GetNodeState(boltDB, "SRC", child.SrcID); err == nil && srcNode != nil {
-					if outputBuffer != nil {
-						outputBuffer.AddCopyStatusUpdate("SRC", srcNode.Depth, srcNode.TraversalStatus, child.SrcID, child.SrcCopyStatus)
-					}
-				}
-			}
-		}
-
-		// Increment expected count for folder children (only folders need traversal)
-		if !child.IsFile {
-			q.incrementRoundStatsExpected(nextRound)
-		}
-	}
-
-	// 3. Handle DST queue special case: create tasks for child folders
-	// Note: ExpectedFolders/ExpectedFiles will be loaded later during PullTasks() batch loading
-	if q.name == "dst" {
-		type dstChildFolder struct {
-			folder        types.Folder
-			srcID         string
-			status        string // Preserve the original status from ChildResult
-			srcCopyStatus string // Preserve copy status update from worker
-		}
-		var childFolders []dstChildFolder
-		totalFolders := 0
-		pendingFolders := 0
-		for _, child := range task.DiscoveredChildren {
-			if !child.IsFile {
-				totalFolders++
-				// Process ALL folders regardless of status (Pending, NotOnSrc, Failed, etc.)
-				// Only pending folders will be traversed on the next round
-				if child.Status == db.StatusPending {
-					pendingFolders++
-				}
-				f := child.Folder
-				f.DepthLevel = nextRound
-				childFolders = append(childFolders, dstChildFolder{
-					folder:        f,
-					srcID:         child.SrcID,         // Preserve SrcID from ChildResult
-					status:        child.Status,        // Preserve the original status
-					srcCopyStatus: child.SrcCopyStatus, // Preserve copy status update from worker
-				})
-			}
-		}
-
-		tasksCreated := 0
-		for _, child := range childFolders {
-			// Check if this folder already exists (by ServiceID) and reuse its ULID
-			existingFolderULID, folderExists := existingChildrenMap[child.folder.ServiceID]
-
-			// Create task state for DST child (without ExpectedFolders/ExpectedFiles - loaded in PullTasks)
-			taskState := taskToNodeState(&TaskBase{
-				Type:   TaskTypeDstTraversal,
-				Folder: child.folder,
-				Round:  nextRound,
-			})
-			if taskState != nil {
-				// Reuse existing ULID if folder already exists
-				if folderExists && existingFolderULID != "" {
-					taskState.ID = existingFolderULID
-				}
-
-				// Set parent's ULID for database relationships
-				taskState.ParentID = nodeID
-				// Populate traversal status in the NodeState metadata using the original status
-				taskState.TraversalStatus = child.status
-				// Store SrcID in NodeState temporarily for BatchInsertNodes to create lookup mappings
-				// (BatchInsertNodes will handle storing in lookup tables)
-				if child.srcID != "" {
-					taskState.SrcID = child.srcID
-				}
-
-				childNodesToInsert = append(childNodesToInsert, db.InsertOperation{
-					QueueType: queueType,
-					Level:     nextRound,
-					Status:    child.status, // Use the original status from ChildResult
-					State:     taskState,
-				})
-
-				// Queue path-to-ulid mapping for DST child folder (for API path-based queries)
-				outputBuffer := q.getOutputBuffer()
-				if outputBuffer != nil && taskState.Path != "" {
-					outputBuffer.AddPathToULIDMapping(queueType, taskState.Path, taskState.ID)
-				}
-
-				// Queue lookup mapping if this child has a matching SRC node
-				if child.srcID != "" {
-					if outputBuffer != nil {
-						// Queue bidirectional lookup mapping: SrcID <-> DST node ID
-						outputBuffer.AddLookupMapping(child.srcID, taskState.ID)
-					}
-
-					// Update SRC node's CopyStatus if worker determined an update is needed
-					if child.srcCopyStatus != "" {
-						// Get SRC node to get its depth and traversal status for the update
-						if srcNode, err := db.GetNodeState(boltDB, "SRC", child.srcID); err == nil && srcNode != nil {
-							if outputBuffer != nil {
-								outputBuffer.AddCopyStatusUpdate("SRC", srcNode.Depth, srcNode.TraversalStatus, child.srcID, child.srcCopyStatus)
-							}
-						}
-					}
-				}
-
-				// Only increment round stats for pending folders (only those will be traversed)
-				if child.status == db.StatusPending {
-					q.incrementRoundStatsExpected(nextRound)
-				}
-				tasksCreated++
-			}
-		}
-	}
-
-	// Write to buffer instead of directly to database
-	outputBuffer := q.getOutputBuffer()
-	if outputBuffer != nil {
-		// Add all related operations atomically to prevent flushes between them
-		// This ensures status update and batch insert are written together
-		atomicOps := make([]db.WriteOperation, 0, 2)
-
-		// Add parent status update operation
-		atomicOps = append(atomicOps, &db.StatusUpdateOperation{
-			QueueType: queueType,
-			Level:     currentRound,
-			OldStatus: db.StatusPending,
-			NewStatus: db.StatusSuccessful,
-			NodeID:    nodeID,
-		})
-
-		// Add child inserts operation (if any)
-		// Lookup mappings are queued above when creating child states
-		if len(childNodesToInsert) > 0 {
-			atomicOps = append(atomicOps, &db.BatchInsertOperation{
-				Operations: childNodesToInsert,
-			})
-		}
-
-		// Add all operations atomically to prevent partial flushes
-		outputBuffer.AddMultiple(atomicOps)
-
-		// For SRC FOLDER tasks in retry mode: Queue DST cleanup (mark parent as pending, delete children)
-		// Only folders have children to clean up - files don't need this
-		if q.name == "src" && q.getMode() == QueueModeRetry && q.boltDB != nil && task.IsFolder() {
-			dstID, err := db.GetDstIDFromSrcID(q.boltDB, nodeID)
-			if err == nil && dstID != "" {
-				// Get DST node state to determine its depth and current status
-				dstState, err := db.GetNodeState(q.boltDB, "DST", dstID)
-				if err == nil && dstState != nil {
-					// Queue status update to mark DST parent as pending
-					oldStatus := dstState.TraversalStatus
-					if oldStatus == "" {
-						oldStatus = db.StatusSuccessful // Default assumption
-					}
-					outputBuffer.AddStatusUpdate("DST", dstState.Depth, oldStatus, db.StatusPending, dstID)
-
-					// Queue deletion of DST children using batch deletion
-					childIDs, err := db.GetChildrenIDsByParentID(q.boltDB, "DST", dstID)
-					if err == nil && len(childIDs) > 0 {
-						for _, childID := range childIDs {
-							// Get child state to know its depth and status for deletion
-							childState, err := db.GetNodeState(q.boltDB, "DST", childID)
-							if err == nil && childState != nil {
-								childStatus := childState.TraversalStatus
-								if childStatus == "" {
-									childStatus = db.StatusSuccessful
-								}
-								outputBuffer.AddNodeDeletion("DST", childID, childState.Depth, childStatus)
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// CRITICAL: Remove from in-progress LAST, after all buffer operations are queued.
-	// This prevents the Run() polling loop from seeing inProgressCount == 0 before
-	// the buffer operations are flushed, which could cause premature round advancement.
-	q.removeInProgress(nodeID)
-
-	// Run() polling loop will check round completion directly - no soft flags needed
+// failCopyTask handles failure of copy tasks.
+// Updates copy status to failed if max retries exceeded, or back to pending if retrying.
+func (q *Queue) failCopyTask(task *TaskBase, executionDelta time.Duration) {
+	// Delegate to copy-specific implementation in mode_copy.go
+	q.FailCopyTask(task, executionDelta)
 }
 
 // childResultToNodeStateWithID converts a ChildResult to NodeState, reusing existing ULID if provided.
+// parentPath is the root-relative path of the parent (e.g., "/items").
+// The child's path is computed from parentPath + child name to ensure it's always root-relative,
+// regardless of what the filesystem adapter returns in LocationPath.
 func childResultToNodeStateWithID(child ChildResult, parentPath string, depth int, queueType string, parentID string, existingULID string, useExisting bool) *db.NodeState {
 	// Use existing ULID if provided, otherwise generate new one
 	var nodeID string
@@ -861,11 +660,31 @@ func childResultToNodeStateWithID(child ChildResult, parentPath string, depth in
 	}
 
 	// Set CopyStatus to "pending" for all SRC children (will be updated during DST comparison)
+	// This ensures ALL SRC items start as pending, and DST comparison will update them to successful
+	// if they exist on both sides (and DST is newer for files)
 	var copyStatus string
 	if queueType == "SRC" {
 		copyStatus = db.CopyStatusPending
 	} else {
 		copyStatus = "" // DST nodes don't have copy status
+	}
+
+	// Compute root-relative path from parent path and child name
+	// This ensures paths are always root-relative, regardless of what the adapter returns
+	var rootRelativePath string
+	var childName string
+	if child.IsFile {
+		childName = child.File.DisplayName
+	} else {
+		childName = child.Folder.DisplayName
+	}
+
+	if parentPath == "/" {
+		// Child of root folder
+		rootRelativePath = "/" + childName
+	} else {
+		// Child of non-root folder
+		rootRelativePath = types.NormalizeLocationPath(parentPath + "/" + childName)
 	}
 
 	if child.IsFile {
@@ -877,7 +696,7 @@ func childResultToNodeStateWithID(child ChildResult, parentPath string, depth in
 			ParentServiceID: file.ParentId,  // Parent's FS identifier
 			ParentPath:      parentPath,
 			Name:            file.DisplayName,
-			Path:            types.NormalizeLocationPath(file.LocationPath),
+			Path:            rootRelativePath, // Use computed root-relative path
 			Type:            types.NodeTypeFile,
 			Size:            file.Size,
 			MTime:           file.LastUpdated,
@@ -896,7 +715,7 @@ func childResultToNodeStateWithID(child ChildResult, parentPath string, depth in
 		ParentServiceID: folder.ParentId,  // Parent's FS identifier
 		ParentPath:      parentPath,
 		Name:            folder.DisplayName,
-		Path:            types.NormalizeLocationPath(folder.LocationPath),
+		Path:            rootRelativePath, // Use computed root-relative path
 		Type:            types.NodeTypeFolder,
 		Size:            0,
 		MTime:           folder.LastUpdated,
@@ -946,6 +765,8 @@ func (q *Queue) pullTasksForMode(force bool) {
 	switch mode {
 	case QueueModeRetry:
 		q.PullRetryTasks(force)
+	case QueueModeCopy:
+		q.PullCopyTasks(force)
 	default: // QueueModeTraversal
 		q.PullTraversalTasks(force)
 	}
@@ -973,70 +794,16 @@ func (q *Queue) Fail(task *TaskBase) bool {
 
 // failTask is the internal implementation for failed task handling.
 func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
-	// Record execution time delta (even for failures)
-	q.recordExecutionTime(executionDelta)
-	currentRound := task.Round
-	nodeID := task.ID // Use ULID for tracking
-	maxRetries := q.getMaxRetries()
+	mode := q.getMode()
 
-	if logservice.LS != nil {
-		_ = logservice.LS.Log("debug",
-			fmt.Sprintf("Failing task: id=%s path=%s round=%d type=%s currentAttempts=%d maxRetries=%d",
-				nodeID, task.LocationPath(), currentRound, task.Type, task.Attempts, maxRetries),
-			"queue", q.name, q.name)
+	// Delegate to mode-specific implementation
+	if mode == QueueModeCopy {
+		q.failCopyTask(task, executionDelta)
+		return
 	}
 
-	task.Attempts++
-
-	// Check if we should retry
-	if task.Attempts < maxRetries {
-		task.Locked = false
-		// CRITICAL: Remove from in-progress BEFORE re-enqueuing to pending
-		// This ensures the task moves from in-progress to pending atomically
-		q.removeInProgress(nodeID)
-		q.enqueuePending(task) // Re-adds to tracked automatically
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug",
-				fmt.Sprintf("Retrying task: id=%s path=%s round=%d attempt=%d/%d",
-					nodeID, task.LocationPath(), currentRound, task.Attempts, maxRetries),
-				"queue", q.name, q.name)
-		}
-		return // Will retry - ReportTaskResult will handle pulling tasks
-	}
-
-	// Max retries reached - task is truly done
-	// Remove the ULID from leased set
-	if nodeID != "" {
-		q.removeLeasedKey(nodeID)
-	}
-
-	if logservice.LS != nil {
-		_ = logservice.LS.Log("error",
-			fmt.Sprintf("Failed to traverse folder %s (id=%s) after %d attempts (max retries exceeded) round=%d",
-				task.LocationPath(), nodeID, task.Attempts, currentRound),
-			"queue", q.name, q.name)
-	}
-
-	task.Locked = false
-	task.Status = "failed"
-
-	// Increment completed count
-	q.incrementRoundStatsCompleted(currentRound)
-
-	// Record task completion in RoundInfo (failed)
-	q.recordTaskCompletion(currentRound, false)
-
-	// Update traversal status to failed so leasing stops retrying this node.
-	outputBuffer := q.getOutputBuffer()
-	if nodeID != "" && outputBuffer != nil {
-		queueType := getQueueType(q.name)
-		outputBuffer.AddStatusUpdate(queueType, currentRound, db.StatusPending, db.StatusFailed, nodeID)
-	}
-
-	// CRITICAL: Remove from in-progress LAST, after all buffer operations are queued.
-	// This prevents the Run() polling loop from seeing inProgressCount == 0 before
-	// the buffer operations are flushed, which could cause premature round advancement.
-	q.removeInProgress(nodeID)
+	// Traversal and retry modes use the same failure logic
+	q.FailTraversalTask(task, executionDelta)
 }
 
 // InProgressCount returns the number of tasks currently being executed.
@@ -1143,6 +910,7 @@ func (q *Queue) Shutdown() {
 type RoundStats struct {
 	Expected  int // Expected tasks for this round (folder children inserted)
 	Completed int // Tasks completed in this round (successful + failed)
+	Failed    int // Tasks failed in this round
 }
 
 // Stats returns current queue statistics.
@@ -1413,25 +1181,38 @@ func (q *Queue) Run() {
 			roundToCheck := q.getRound()
 
 			// 1. Check queue completion (mode-specific)
-			// Check for final completion when: pullCount > 0 && itemsYielded == 0
-			if pullCount > 0 && itemsYielded == 0 && inProgressCount == 0 && pendingCount == 0 {
-				completed := q.checkCompletion(roundToCheck, CompletionCheckOptions{
-					CheckFinalCompletion: true,
-					WasFirstPull:         true,
-					FlushBuffer:          true,
-				})
-				if completed {
-					outputBuffer := q.getOutputBuffer()
-					if outputBuffer != nil {
-						outputBuffer.Stop()
+			// For copy mode: only check final completion after we've tried to advance and found no more rounds
+			// For traversal mode: check when pullCount > 0 && itemsYielded == 0 (no tasks at current round)
+			mode := q.getMode()
+			if mode != QueueModeCopy {
+				// For traversal/retry modes, check for final completion when: pullCount > 0 && itemsYielded == 0
+				if pullCount > 0 && itemsYielded == 0 && inProgressCount == 0 && pendingCount == 0 {
+					completed := q.checkCompletion(roundToCheck, CompletionCheckOptions{
+						CheckFinalCompletion: true,
+						WasFirstPull:         true,
+						FlushBuffer:          true,
+					})
+					if completed {
+						// Don't call Stop() here - let the outer loop handle cleanup
+						// The outer loop will detect QueueStateCompleted and stop the buffer
+						return
 					}
-					return
 				}
 			}
 
 			// 2. Check round completion (universal)
+			// Soft check: in-memory state only (fast, no DB access)
 			// Round complete when: no in-progress, no pending, last pull was partial
-			if inProgressCount == 0 && pendingCount == 0 && lastPullWasPartial {
+			roundCompleteSoft := inProgressCount == 0 && pendingCount == 0 && lastPullWasPartial
+
+			// For copy mode, also consider round complete if we pulled but got 0 items
+			// This means the current round has no tasks for the current pass - advance to next round
+			if mode == QueueModeCopy && pullCount > 0 && itemsYielded == 0 && inProgressCount == 0 && pendingCount == 0 {
+				roundCompleteSoft = true
+			}
+
+			// If soft check passes, do hard check (DB verification) in checkCompletion
+			if roundCompleteSoft {
 				q.checkCompletion(roundToCheck, CompletionCheckOptions{
 					CheckRoundComplete:     true,
 					AdvanceRoundIfComplete: true,
@@ -1451,6 +1232,7 @@ func (q *Queue) Run() {
 
 // advanceToNextRound advances the queue to the next round and cleans up old round queues.
 // Note: Round advancement is now free - gating only happens when STARTING a round (checked in Run()).
+// For copy mode, advances to the next round that has pending tasks for the current pass.
 func (q *Queue) advanceToNextRound() {
 	// No gating here - rounds advance freely
 	// Gating only happens when STARTING a round (checked in Run() outer loop)
@@ -1466,39 +1248,14 @@ func (q *Queue) advanceToNextRound() {
 		q.setState(QueueStateRunning)
 	}
 
-	// Advance round
-	currentRound := q.getRound()
-	newRound := currentRound + 1
-
-	// Get stats for logging
-	q.setRound(newRound)
-
-	// Reset lastPullWasPartial since we're advancing to a new round
-	q.setLastPullWasPartial(false)
-	// Initialize RoundInfo for the new round (will be created on first pull)
-	q.getRoundInfo(newRound) // Ensure it exists
-	// Initialize stats for the new round (if not already exists)
-	// Update coordinator when rounds advance
-	coordinator := q.getCoordinator()
-	if coordinator != nil {
-		switch q.name {
-		case "src":
-			coordinator.UpdateSrcRound(newRound)
-		case "dst":
-			coordinator.UpdateDstRound(newRound)
-		}
+	// Delegate to mode-specific round advancement
+	mode := q.getMode()
+	if mode == QueueModeCopy {
+		// Delegate to copy-specific round advancement in mode_copy.go
+		q.AdvanceCopyRound()
+		return
 	}
 
-	if logservice.LS != nil {
-		_ = logservice.LS.Log("info", fmt.Sprintf("Advanced to round %d", newRound), "queue", q.name, q.name)
-	}
-
-	// Pull tasks for the new round
-	// pullTasksForMode() will flush buffer first, then pull tasks
-	// Round completion will be detected naturally by checkCompletion() when:
-	// - inProgress == 0
-	// - pendingBuff == 0
-	// - lastPullWasPartial == true
-	// Then it will flush buffer and advance to next round
-	q.PullTasksIfNeeded(true)
+	// For traversal/retry modes, delegate to traversal-specific round advancement
+	q.AdvanceTraversalRound()
 }

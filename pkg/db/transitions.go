@@ -129,6 +129,86 @@ func UpdateNodeCopyStatusByID(db *DB, queueType string, level int, status string
 	return nodeState, nil
 }
 
+// UpdateNodeCopyStatusTransitionByID updates a node's copy status and moves it between copy status buckets using ULID.
+// This is similar to UpdateNodeStatusByID but for copy status (SRC only).
+// The node data remains in the nodes bucket; only the copy status membership changes.
+// Returns the updated NodeState.
+func UpdateNodeCopyStatusTransitionByID(db *DB, level int, oldCopyStatus, newCopyStatus string, nodeID string) (*NodeState, error) {
+	var nodeState *NodeState
+
+	err := db.Update(func(tx *bolt.Tx) error {
+		nodeIDBytes := []byte(nodeID)
+
+		// Get the node data from nodes bucket (SRC only for copy status)
+		nodesBucket := GetNodesBucket(tx, BucketSrc)
+		if nodesBucket == nil {
+			return fmt.Errorf("nodes bucket not found for SRC")
+		}
+
+		nodeData := nodesBucket.Get(nodeIDBytes)
+		if nodeData == nil {
+			return fmt.Errorf("node not found in nodes bucket: %s", nodeID)
+		}
+
+		// Deserialize and update copy status
+		ns, err := DeserializeNodeState(nodeData)
+		if err != nil {
+			return fmt.Errorf("failed to deserialize node state: %w", err)
+		}
+		ns.CopyStatus = newCopyStatus
+
+		// Serialize updated state back to nodes bucket
+		updatedData, err := ns.Serialize()
+		if err != nil {
+			return fmt.Errorf("failed to serialize node state: %w", err)
+		}
+
+		if err := nodesBucket.Put(nodeIDBytes, updatedData); err != nil {
+			return fmt.Errorf("failed to update node in nodes bucket: %w", err)
+		}
+
+		nodeState = ns
+
+		// Determine node type from NodeState for bucket routing
+		nodeType := NodeTypeFile
+		if ns.Type == "folder" {
+			nodeType = NodeTypeFolder
+		}
+
+		// Update copy status bucket membership
+		// Delete from old copy status bucket
+		oldBucket := GetCopyStatusBucket(tx, level, nodeType, oldCopyStatus)
+		if oldBucket != nil {
+			if err := oldBucket.Delete(nodeIDBytes); err != nil {
+				return fmt.Errorf("failed to delete from old copy status bucket: %w", err)
+			}
+		}
+
+		// Add to new copy status bucket
+		newBucket, err := GetOrCreateCopyStatusBucket(tx, level, nodeType, newCopyStatus)
+		if err != nil {
+			return fmt.Errorf("failed to get new copy status bucket: %w", err)
+		}
+
+		if err := newBucket.Put(nodeIDBytes, []byte{}); err != nil {
+			return fmt.Errorf("failed to add to new copy status bucket: %w", err)
+		}
+
+		// Update copy status-lookup index (no node type needed in lookup)
+		if err := UpdateCopyStatusLookup(tx, level, nodeIDBytes, newCopyStatus); err != nil {
+			return fmt.Errorf("failed to update copy status-lookup: %w", err)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return nodeState, nil
+}
+
 // SetNodeState stores a NodeState in the nodes bucket.
 // This is used for initial insertion or updates without state transitions.
 // nodeID is the ULID of the node (as []byte).

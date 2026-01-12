@@ -37,10 +37,11 @@ func getStatsBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
 	return bucket, nil
 }
 
-// updateBucketStats updates the count for a bucket path by the given delta.
+// UpdateBucketStatsInTx updates the count for a bucket path by the given delta within an existing transaction.
 // If the bucket path doesn't exist in stats, it's created with the delta value.
 // Delta can be positive (increment) or negative (decrement).
-func updateBucketStats(tx *bolt.Tx, bucketPath []string, delta int64) error {
+// This is the internal function that can be called from within an existing transaction.
+func UpdateBucketStatsInTx(tx *bolt.Tx, bucketPath []string, delta int64) error {
 	if len(bucketPath) == 0 {
 		return nil // Don't track empty paths
 	}
@@ -154,11 +155,12 @@ func (db *DB) EnsureStatsBucket() error {
 
 // UpdateBucketStats updates the count for a bucket path by the given delta.
 // Delta can be positive (increment) or negative (decrement).
-// This is a public wrapper around the internal updateBucketStats function.
+// This is a public wrapper that creates its own transaction.
 // Thread-safe (uses Update transaction).
+// For use within an existing transaction, use UpdateBucketStatsInTx instead.
 func (db *DB) UpdateBucketStats(bucketPath []string, delta int64) error {
 	return db.Update(func(tx *bolt.Tx) error {
-		return updateBucketStats(tx, bucketPath, delta)
+		return UpdateBucketStatsInTx(tx, bucketPath, delta)
 	})
 }
 

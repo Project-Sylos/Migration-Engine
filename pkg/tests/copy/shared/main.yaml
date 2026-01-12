@@ -1,0 +1,59 @@
+metadata:
+    migration_id: 01KESVV5D6RVPCNMCRGK5KQMQT
+    created_at: "2026-01-12T19:45:06Z"
+    last_modified: "2026-01-12T19:45:13Z"
+state:
+    status: Awaiting-Path-Review
+    last_round_src: 5
+    last_round_dst: 5
+services:
+    source:
+        type: spectra
+        name: Spectra Primary
+        root_id: root
+        root_path: /
+        root:
+            id: root
+            parent_id: ""
+            parent_path: ""
+            display_name: Spectra Root
+            location_path: /
+            last_updated: "2026-01-12T19:45:04.930Z"
+            depth_level: 0
+            type: folder
+    destination:
+        type: spectra
+        name: Spectra S1
+        root_id: root
+        root_path: /
+        root:
+            id: root
+            parent_id: ""
+            parent_path: ""
+            display_name: Spectra Root
+            location_path: /
+            last_updated: "2026-01-12T19:45:04.930Z"
+            depth_level: 0
+            type: folder
+    same_service_reference:
+        shared_instance: true
+        reference_to: destination
+service_configs:
+    spectra:
+        note: spectra config file not found, using defaults
+migration_options:
+    seed_roots: true
+    worker_count: 10
+    max_retries: 3
+    coordinator_lead: 4
+logging:
+    address: 127.0.0.1
+    port: 8081
+    level: debug
+database:
+    path: C:\Users\golde\OneDrive\Documents\GitHub\Sylos\Sylos-API\data\01KESVV5D6RVPCNMCRGK5KQMQT\01KESVV5D6RVPCNMCRGK5KQMQT.db
+    remove_existing: false
+    require_open: false
+verification:
+    allowpending: false
+    allownotonsrc: true

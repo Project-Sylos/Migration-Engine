@@ -128,6 +128,38 @@ func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation) error {
 			return fmt.Errorf("failed to update status-lookup: %w", err)
 		}
 
+		// 3.5. Add SRC nodes to copy status bucket (SRC only)
+		// ALL SRC nodes must be added to the copy status bucket, defaulting to "pending"
+		// This ensures they can be found by the copy phase queue
+		if op.QueueType == BucketSrc {
+			// Get copy status from NodeState, defaulting to CopyStatusPending if empty
+			copyStatus := op.State.CopyStatus
+			if copyStatus == "" {
+				copyStatus = CopyStatusPending
+			}
+
+			// Determine node type from NodeState for bucket routing
+			nodeType := NodeTypeFile
+			if op.State.Type == "folder" {
+				nodeType = NodeTypeFolder
+			}
+
+			// Add to copy status bucket
+			copyStatusBucket, err := GetOrCreateCopyStatusBucket(tx, op.Level, nodeType, copyStatus)
+			if err != nil {
+				return fmt.Errorf("failed to get copy status bucket: %w", err)
+			}
+
+			if err := copyStatusBucket.Put(nodeID, []byte{}); err != nil {
+				return fmt.Errorf("failed to add to copy status bucket: %w", err)
+			}
+
+			// Update copy status-lookup index
+			if err := UpdateCopyStatusLookup(tx, op.Level, nodeID, copyStatus); err != nil {
+				return fmt.Errorf("failed to update copy status-lookup: %w", err)
+			}
+		}
+
 		// 4. Update children index
 		if op.State.ParentID != "" {
 			childrenBucket := GetChildrenBucket(tx, op.QueueType)

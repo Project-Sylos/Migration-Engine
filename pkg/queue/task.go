@@ -16,6 +16,8 @@ const (
 	TaskTypeExclusion    = "exclusion"
 	TaskTypeUpload       = "upload"
 	TaskTypeCopy         = "copy"
+	TaskTypeCopyFolder   = "copy-folder" // Copy phase: create folder
+	TaskTypeCopyFile     = "copy-file"   // Copy phase: copy file with streaming
 )
 
 // TaskBase represents the foundational structure for all task types.
@@ -37,6 +39,10 @@ type TaskBase struct {
 	LeaseTime          time.Time         // Time when task was leased (for execution time tracking)
 	ExclusionMode      string            // Exclusion mode: "exclude" or "unexclude" (exclusion tasks only)
 	PreviousStatus     string            // Previous status before exclusion (for status bucket tracking)
+	// Copy phase specific fields
+	CopyPass         int    // Copy pass number (1 for folders, 2 for files)
+	BytesTransferred int64  // Bytes transferred for file copy tasks
+	DstParentID      string // Destination parent folder ID for creation
 }
 
 // ChildResult represents a discovered child node with its traversal status.

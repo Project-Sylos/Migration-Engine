@@ -47,6 +47,29 @@ func (q *Queue) getMaxKnownDepth() int {
 	return q.maxKnownDepth
 }
 
+func (q *Queue) getCopyPass() int {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.copyPass
+}
+
+// GetCopyPass returns the current copy pass (public getter).
+func (q *Queue) GetCopyPass() int {
+	return q.getCopyPass()
+}
+
+// SetCopyPass sets the current copy pass (public setter).
+func (q *Queue) SetCopyPass(pass int) {
+	q.setCopyPass(pass)
+}
+
+// SetWorkers sets the workers associated with this queue.
+func (q *Queue) SetWorkers(workers []Worker) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.workers = workers
+}
+
 func (q *Queue) getCoordinator() *QueueCoordinator {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
@@ -116,6 +139,27 @@ func (q *Queue) GetFoldersDiscoveredTotal() int64 {
 // GetTotalDiscovered returns the total number of items discovered (files + folders).
 func (q *Queue) GetTotalDiscovered() int64 {
 	return q.GetFilesDiscoveredTotal() + q.GetFoldersDiscoveredTotal()
+}
+
+// GetBytesTransferredTotal returns the total bytes transferred during copy phase.
+func (q *Queue) GetBytesTransferredTotal() int64 {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.bytesTransferredTotal
+}
+
+// GetFoldersCreatedTotal returns the total folders created during copy phase.
+func (q *Queue) GetFoldersCreatedTotal() int64 {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.foldersCreatedTotal
+}
+
+// GetFilesCreatedTotal returns the total files created during copy phase.
+func (q *Queue) GetFilesCreatedTotal() int64 {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.filesCreatedTotal
 }
 
 // GetTotalFailed returns the total number of failed tasks across all rounds.
@@ -221,6 +265,12 @@ func (q *Queue) setMaxKnownDepth(depth int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.maxKnownDepth = depth
+}
+
+func (q *Queue) setCopyPass(pass int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.copyPass = pass
 }
 
 // getRoundInfo returns the RoundInfo for the specified round, creating it if it doesn't exist.
@@ -410,6 +460,13 @@ func (q *Queue) incrementRoundStatsExpected(round int) {
 	defer q.mu.Unlock()
 	stats := q.getOrCreateRoundStatsUnlocked(round)
 	stats.Expected++
+}
+
+func (q *Queue) incrementRoundStatsFailed(round int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	stats := q.getOrCreateRoundStatsUnlocked(round)
+	stats.Failed++
 }
 
 // getOrCreateRoundStatsUnlocked is a helper used internally by other locked methods
