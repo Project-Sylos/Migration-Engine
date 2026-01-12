@@ -64,9 +64,16 @@ const (
 // Copy status constants (SRC only)
 const (
 	CopyStatusPending    = "pending"
+	CopyStatusInProgress = "in-progress" // Task is currently being processed
 	CopyStatusSuccessful = "successful"
 	CopyStatusSkipped    = "skipped" // Item already exists on dst, no copy needed
 	CopyStatusFailed     = "failed"
+)
+
+// Node type constants for copy status bucket organization
+const (
+	NodeTypeFolder = "folder"
+	NodeTypeFile   = "file"
 )
 
 // Legacy constants for compatibility during migration
@@ -136,9 +143,9 @@ func GetTraversalStatusBucketPath(queueType string, level int, status string) []
 }
 
 // GetCopyStatusBucketPath returns the bucket path for a specific copy status at a level (SRC only).
-// Returns: ["Traversal-Data", "SRC", "levels", "00000001", "copy", "pending"]
-func GetCopyStatusBucketPath(level int, status string) []string {
-	return []string{TraversalDataBucket, BucketSrc, SubBucketLevels, FormatLevel(level), SubBucketCopy, status}
+// Returns: ["Traversal-Data", "SRC", "levels", "00000001", "copy", "folder", "pending"]
+func GetCopyStatusBucketPath(level int, nodeType string, status string) []string {
+	return []string{TraversalDataBucket, BucketSrc, SubBucketLevels, FormatLevel(level), SubBucketCopy, nodeType, status}
 }
 
 // GetTraversalStatusLookupBucketPath returns the bucket path for the traversal status-lookup index at a level.
@@ -246,16 +253,26 @@ func EnsureLevelBucket(tx *bolt.Tx, queueType string, level int) error {
 			return fmt.Errorf("failed to create copy bucket: %w", err)
 		}
 
-		// Create copy status sub-buckets
-		copyStatuses := []string{CopyStatusPending, CopyStatusSuccessful, CopyStatusSkipped, CopyStatusFailed}
-		for _, status := range copyStatuses {
-			if _, err := copyBucket.CreateBucketIfNotExists([]byte(status)); err != nil {
-				return fmt.Errorf("failed to create copy status bucket %s: %w", status, err)
+		// Create folder and file type sub-buckets under copy
+		nodeTypes := []string{NodeTypeFolder, NodeTypeFile}
+		copyStatuses := []string{CopyStatusPending, CopyStatusInProgress, CopyStatusSuccessful, CopyStatusSkipped, CopyStatusFailed}
+		
+		for _, nodeType := range nodeTypes {
+			nodeTypeBucket, err := copyBucket.CreateBucketIfNotExists([]byte(nodeType))
+			if err != nil {
+				return fmt.Errorf("failed to create copy node type bucket %s: %w", nodeType, err)
+			}
+
+			// Create status buckets under each node type
+			for _, status := range copyStatuses {
+				if _, err := nodeTypeBucket.CreateBucketIfNotExists([]byte(status)); err != nil {
+					return fmt.Errorf("failed to create copy status bucket %s/%s: %w", nodeType, status, err)
+				}
 			}
 		}
 
 		// Create copy status-lookup bucket (regular bucket, not nested bucket)
-		// This stores ULID -> copy status string mappings
+		// This stores ULID -> copy status string mappings (no node type needed in lookup)
 		copyLookupPath := GetCopyStatusLookupBucketPath(level)
 		if _, err := getOrCreateBucket(tx, copyLookupPath); err != nil {
 			return fmt.Errorf("failed to create copy status-lookup bucket: %w", err)
@@ -289,18 +306,18 @@ func GetOrCreateTraversalStatusBucket(tx *bolt.Tx, queueType string, level int, 
 	return getOrCreateBucket(tx, GetTraversalStatusBucketPath(queueType, level, status))
 }
 
-// GetCopyStatusBucket returns the copy status bucket for a specific level and status (SRC only).
-func GetCopyStatusBucket(tx *bolt.Tx, level int, status string) *bolt.Bucket {
-	return getBucket(tx, GetCopyStatusBucketPath(level, status))
+// GetCopyStatusBucket returns the copy status bucket for a specific level, node type, and status (SRC only).
+func GetCopyStatusBucket(tx *bolt.Tx, level int, nodeType string, status string) *bolt.Bucket {
+	return getBucket(tx, GetCopyStatusBucketPath(level, nodeType, status))
 }
 
-// GetOrCreateCopyStatusBucket returns or creates the copy status bucket for a specific level and status (SRC only).
-func GetOrCreateCopyStatusBucket(tx *bolt.Tx, level int, status string) (*bolt.Bucket, error) {
+// GetOrCreateCopyStatusBucket returns or creates the copy status bucket for a specific level, node type, and status (SRC only).
+func GetOrCreateCopyStatusBucket(tx *bolt.Tx, level int, nodeType string, status string) (*bolt.Bucket, error) {
 	// Ensure the level bucket exists first
 	if err := EnsureLevelBucket(tx, BucketSrc, level); err != nil {
 		return nil, err
 	}
-	return getOrCreateBucket(tx, GetCopyStatusBucketPath(level, status))
+	return getOrCreateBucket(tx, GetCopyStatusBucketPath(level, nodeType, status))
 }
 
 // GetStatusBucket is deprecated - use GetTraversalStatusBucket instead.

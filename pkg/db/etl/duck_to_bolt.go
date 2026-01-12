@@ -591,15 +591,32 @@ func flushNodeBatchToBolt(boltDB *db.DB, batch []NodeRow, queueType string, stat
 
 				// 7. Write copy status buckets (SRC only)
 				if queueType == "SRC" && row.CopyStatus != "" {
-					copyStatusBucket, err := db.GetOrCreateCopyStatusBucket(tx, row.Depth, row.CopyStatus)
+					// Determine node type from row.Type
+					nodeType := db.NodeTypeFile
+					if row.Type == "folder" {
+						nodeType = db.NodeTypeFolder
+					}
+
+					copyStatusBucket, err := db.GetOrCreateCopyStatusBucket(tx, row.Depth, nodeType, row.CopyStatus)
 					if err != nil {
 						return fmt.Errorf("failed to get copy status bucket: %w", err)
 					}
+
+					// Check if node already exists in bucket (to avoid double-counting stats)
+					alreadyExists := copyStatusBucket.Get(nodeID) != nil
 					if err := copyStatusBucket.Put(nodeID, []byte{}); err != nil {
 						return fmt.Errorf("failed to add to copy status bucket: %w", err)
 					}
 
-					// Update copy status-lookup index
+					// Update stats only if this is a new entry
+					if !alreadyExists {
+						bucketPath := db.GetCopyStatusBucketPath(row.Depth, nodeType, row.CopyStatus)
+						if err := db.UpdateBucketStatsInTx(tx, bucketPath, 1); err != nil {
+							return fmt.Errorf("failed to update copy status stats: %w", err)
+						}
+					}
+
+					// Update copy status-lookup index (no node type needed in lookup)
 					if err := db.UpdateCopyStatusLookup(tx, row.Depth, nodeID, row.CopyStatus); err != nil {
 						return fmt.Errorf("failed to update copy status-lookup: %w", err)
 					}
@@ -760,8 +777,8 @@ func getOrCreateChildrenBucket(tx *bolt.Tx, queueType string) (*bolt.Bucket, err
 
 // rebuildCopyStatusBuckets rebuilds copy status buckets for SRC nodes
 func rebuildCopyStatusBuckets(duckDB *sql.DB, boltDB *db.DB) error {
-	// Query SRC nodes with their copy_status and depth
-	query := `SELECT id, depth, copy_status FROM src_nodes WHERE copy_status IS NOT NULL`
+	// Query SRC nodes with their copy_status, depth, and type
+	query := `SELECT id, depth, type, copy_status FROM src_nodes WHERE copy_status IS NOT NULL`
 
 	rows, err := duckDB.Query(query)
 	if err != nil {
@@ -772,55 +789,79 @@ func rebuildCopyStatusBuckets(duckDB *sql.DB, boltDB *db.DB) error {
 	type copyStatusData struct {
 		ID         string
 		Depth      int32
+		Type       string
 		CopyStatus string
 	}
 
 	var nodes []copyStatusData
 	for rows.Next() {
 		var node copyStatusData
-		if err := rows.Scan(&node.ID, &node.Depth, &node.CopyStatus); err != nil {
+		if err := rows.Scan(&node.ID, &node.Depth, &node.Type, &node.CopyStatus); err != nil {
 			continue
 		}
 		nodes = append(nodes, node)
 	}
 	rows.Close()
 
-	// Group by depth and copy_status for batch processing
-	statusMap := make(map[int]map[string][]string) // depth -> copy_status -> []nodeIDs
+	// Group by depth, type, and copy_status for batch processing
+	// depth -> type -> copy_status -> []nodeIDs
+	statusMap := make(map[int]map[string]map[string][]string)
 	for _, node := range nodes {
 		depth := int(node.Depth)
 		if statusMap[depth] == nil {
-			statusMap[depth] = make(map[string][]string)
+			statusMap[depth] = make(map[string]map[string][]string)
 		}
-		statusMap[depth][node.CopyStatus] = append(statusMap[depth][node.CopyStatus], node.ID)
+		if statusMap[depth][node.Type] == nil {
+			statusMap[depth][node.Type] = make(map[string][]string)
+		}
+		statusMap[depth][node.Type][node.CopyStatus] = append(statusMap[depth][node.Type][node.CopyStatus], node.ID)
 	}
 
 	// Rebuild copy status buckets
 	return boltDB.Update(func(tx *bolt.Tx) error {
-		for depth, statusGroups := range statusMap {
-			for copyStatus, nodeIDs := range statusGroups {
-				// Get or create copy status bucket
-				copyStatusBucket, err := db.GetOrCreateCopyStatusBucket(tx, depth, copyStatus)
-				if err != nil {
-					return fmt.Errorf("failed to get copy status bucket: %w", err)
+		for depth, typeGroups := range statusMap {
+			for nodeType, statusGroups := range typeGroups {
+				// Normalize node type
+				normalizedType := db.NodeTypeFile
+				if nodeType == "folder" {
+					normalizedType = db.NodeTypeFolder
 				}
 
-				// Add nodes to copy status bucket
-				for _, nodeID := range nodeIDs {
-					if err := copyStatusBucket.Put([]byte(nodeID), []byte{}); err != nil {
-						return fmt.Errorf("failed to add node to copy status bucket: %w", err)
+				for copyStatus, nodeIDs := range statusGroups {
+					// Get or create copy status bucket with node type
+					copyStatusBucket, err := db.GetOrCreateCopyStatusBucket(tx, depth, normalizedType, copyStatus)
+					if err != nil {
+						return fmt.Errorf("failed to get copy status bucket: %w", err)
 					}
-				}
 
-				// Update copy status-lookup index
-				copyLookupBucket, err := db.GetOrCreateCopyStatusLookupBucket(tx, depth)
-				if err != nil {
-					return fmt.Errorf("failed to get copy status-lookup bucket: %w", err)
-				}
+					// Add nodes to copy status bucket and update stats
+					for _, nodeID := range nodeIDs {
+						nodeIDBytes := []byte(nodeID)
+						// Check if already exists to avoid double-counting stats
+						alreadyExists := copyStatusBucket.Get(nodeIDBytes) != nil
+						if err := copyStatusBucket.Put(nodeIDBytes, []byte{}); err != nil {
+							return fmt.Errorf("failed to add node to copy status bucket: %w", err)
+						}
 
-				for _, nodeID := range nodeIDs {
-					if err := copyLookupBucket.Put([]byte(nodeID), []byte(copyStatus)); err != nil {
-						return fmt.Errorf("failed to update copy status-lookup: %w", err)
+						// Update stats only if this is a new entry
+						if !alreadyExists {
+							bucketPath := db.GetCopyStatusBucketPath(depth, normalizedType, copyStatus)
+							if err := db.UpdateBucketStatsInTx(tx, bucketPath, 1); err != nil {
+								return fmt.Errorf("failed to update copy status stats: %w", err)
+							}
+						}
+					}
+
+					// Update copy status-lookup index (no node type needed in lookup)
+					copyLookupBucket, err := db.GetOrCreateCopyStatusLookupBucket(tx, depth)
+					if err != nil {
+						return fmt.Errorf("failed to get copy status-lookup bucket: %w", err)
+					}
+
+					for _, nodeID := range nodeIDs {
+						if err := copyLookupBucket.Put([]byte(nodeID), []byte(copyStatus)); err != nil {
+							return fmt.Errorf("failed to update copy status-lookup: %w", err)
+						}
 					}
 				}
 			}

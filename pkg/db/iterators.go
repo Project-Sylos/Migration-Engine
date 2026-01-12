@@ -361,3 +361,95 @@ func BatchFetchWithKeys(db *DB, queueType string, level int, status string, limi
 func (db *DB) CountByPrefix(queueType string, level int, status string) (int, error) {
 	return db.CountStatusBucket(queueType, level, status)
 }
+
+// BatchFetchCopyTasks fetches up to limit NodeStates from a copy status bucket with their keys.
+// This is used for copy phase task leasing. Only works for SRC nodes (copy status is SRC only).
+func BatchFetchCopyTasks(db *DB, level int, nodeType string, copyStatus string, limit int) ([]FetchResult, error) {
+	var results []FetchResult
+
+	err := db.View(func(tx *bolt.Tx) error {
+		copyStatusBucket := GetCopyStatusBucket(tx, level, nodeType, copyStatus)
+		if copyStatusBucket == nil {
+			return nil // No items in this copy status
+		}
+
+		nodesBucket := GetNodesBucket(tx, BucketSrc)
+		if nodesBucket == nil {
+			return fmt.Errorf("nodes bucket not found for SRC")
+		}
+
+		cursor := copyStatusBucket.Cursor()
+		count := 0
+
+		for nodeIDBytes, _ := cursor.First(); nodeIDBytes != nil && count < limit; nodeIDBytes, _ = cursor.Next() {
+			// Get the node state from nodes bucket using ULID
+			nodeData := nodesBucket.Get(nodeIDBytes)
+			if nodeData == nil {
+				continue // Node was deleted
+			}
+
+			state, err := DeserializeNodeState(nodeData)
+			if err != nil {
+				continue // Skip invalid entries
+			}
+
+			// Use ULID as key for deduplication
+			keyStr := string(nodeIDBytes)
+
+			results = append(results, FetchResult{
+				Key:   keyStr,
+				State: state,
+			})
+			count++
+		}
+
+		return nil
+	})
+
+	return results, err
+}
+
+// HasCopyStatusBucketItems checks if a copy status bucket has any items.
+// Returns true if the bucket exists and has at least one item, false otherwise.
+// This is O(1) - it only checks for the first key without counting all items.
+func (db *DB) HasCopyStatusBucketItems(level int, nodeType string, copyStatus string) (bool, error) {
+	bucketPath := GetCopyStatusBucketPath(level, nodeType, copyStatus)
+	return db.HasItems(bucketPath)
+}
+
+// CountCopyStatusBucket returns the number of items in a copy status bucket.
+// Uses stats bucket for O(1) lookup. Falls back to cursor scan if stats unavailable.
+func (db *DB) CountCopyStatusBucket(level int, nodeType string, copyStatus string) (int, error) {
+	// Try stats first (fast path)
+	bucketPath := GetCopyStatusBucketPath(level, nodeType, copyStatus)
+	count, err := db.GetBucketCount(bucketPath)
+	if err == nil {
+		// Stats available - return count
+		return int(count), nil
+	}
+
+	// Fallback to cursor scan (slow path, but safe)
+	return db.countCopyStatusBucketSlow(level, nodeType, copyStatus)
+}
+
+// countCopyStatusBucketSlow performs a full cursor scan of a copy status bucket.
+// This is the fallback method when stats are unavailable.
+func (db *DB) countCopyStatusBucketSlow(level int, nodeType string, copyStatus string) (int, error) {
+	count := 0
+
+	err := db.View(func(tx *bolt.Tx) error {
+		bucket := GetCopyStatusBucket(tx, level, nodeType, copyStatus)
+		if bucket == nil {
+			return nil // Bucket doesn't exist, count is 0
+		}
+
+		cursor := bucket.Cursor()
+		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+			count++
+		}
+
+		return nil
+	})
+
+	return count, err
+}

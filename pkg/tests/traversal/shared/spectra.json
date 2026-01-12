@@ -6,7 +6,7 @@
     "min_files": 10,
     "max_files": 20,
     "seed": 0,
-    "db_path": "pkg/tests/traversal/shared/spectra.db"
+    "db_path": "C:\\Users\\golde\\OneDrive\\Documents\\GitHub\\Sylos\\Sylos-API\\data\\01KESVV5D6RVPCNMCRGK5KQMQT\\spectra.db"
   },
   "api": {
     "host": "localhost",
@@ -16,4 +16,3 @@
     "s1": 0.9
   }
 }
-

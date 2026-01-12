@@ -45,18 +45,25 @@ func (op *BatchInsertOperation) Execute(tx *bolt.Tx) error {
 	return BatchInsertNodesInTx(tx, op.Operations)
 }
 
-// CopyStatusOperation represents a copy status update (for future copy queue).
+// CopyStatusOperation represents a copy status update (for copy queue).
+// It updates both the node metadata and moves the node between copy status buckets.
 type CopyStatusOperation struct {
 	QueueType     string
 	Level         int
-	Status        string
-	NodeID        string // ULID of the node
+	OldCopyStatus string // Old copy status (for bucket transition)
 	NewCopyStatus string
+	NodeID        string // ULID of the node
 }
 
 // Execute performs the copy status update within a transaction.
+// Updates node metadata and moves node between copy status buckets.
 func (op *CopyStatusOperation) Execute(tx *bolt.Tx) error {
 	nodeID := []byte(op.NodeID)
+
+	// Only SRC nodes have copy status
+	if op.QueueType != BucketSrc {
+		return fmt.Errorf("copy status only applies to SRC nodes")
+	}
 
 	nodesBucket := GetNodesBucket(tx, op.QueueType)
 	if nodesBucket == nil {
@@ -82,6 +89,43 @@ func (op *CopyStatusOperation) Execute(tx *bolt.Tx) error {
 
 	if err := nodesBucket.Put(nodeID, updatedData); err != nil {
 		return fmt.Errorf("failed to update node: %w", err)
+	}
+
+	// Update copy status bucket membership if status actually changed
+	// Use op.OldCopyStatus for bucket operations (what we know the node was in)
+	// but check oldStatus != op.NewCopyStatus to avoid unnecessary updates
+	if op.OldCopyStatus != "" && op.OldCopyStatus != op.NewCopyStatus {
+		// Determine node type from NodeState for bucket routing
+		nodeType := NodeTypeFile
+		if ns.Type == "folder" {
+			nodeType = NodeTypeFolder
+		}
+
+		// Delete from old copy status bucket
+		oldBucket := GetCopyStatusBucket(tx, op.Level, nodeType, op.OldCopyStatus)
+		if oldBucket != nil {
+			if err := oldBucket.Delete(nodeID); err != nil {
+				fmt.Printf("[Buffer Execute] ERROR: Failed to delete from old bucket: %v\n", err)
+			}
+		} else {
+			fmt.Printf("[Buffer Execute] WARNING: Old bucket not found for level=%d, nodeType=%s, status=%s\n",
+				op.Level, nodeType, op.OldCopyStatus)
+		}
+
+		// Add to new copy status bucket
+		newBucket, err := GetOrCreateCopyStatusBucket(tx, op.Level, nodeType, op.NewCopyStatus)
+		if err != nil {
+			return fmt.Errorf("failed to get new copy status bucket: %w", err)
+		}
+
+		if err := newBucket.Put(nodeID, []byte{}); err != nil {
+			return fmt.Errorf("failed to add to new copy status bucket: %w", err)
+		}
+
+		// Update copy status-lookup index (no node type needed in lookup)
+		if err := UpdateCopyStatusLookup(tx, op.Level, nodeID, op.NewCopyStatus); err != nil {
+			return fmt.Errorf("failed to update copy status-lookup: %w", err)
+		}
 	}
 
 	return nil
@@ -307,6 +351,7 @@ type OutputBuffer struct {
 	stopChan    chan struct{}
 	wg          sync.WaitGroup
 	paused      bool
+	stopOnce    sync.Once // Ensures Stop() is idempotent
 }
 
 // NewOutputBuffer creates a new output buffer that will flush every N operations or every interval.
@@ -349,12 +394,32 @@ func (ob *OutputBuffer) AddBatchInsert(operations []InsertOperation) {
 	ob.Add(op)
 }
 
+// AddCreateNode adds a single node insert operation to the buffer.
+// This is a convenience method for inserting a single node without needing to create a batch.
+func (ob *OutputBuffer) AddCreateNode(queueType string, level int, status string, nodeState *NodeState) {
+	if nodeState == nil {
+		return
+	}
+	op := &BatchInsertOperation{
+		Operations: []InsertOperation{
+			{
+				QueueType: queueType,
+				Level:     level,
+				Status:    status,
+				State:     nodeState,
+			},
+		},
+	}
+	ob.Add(op)
+}
+
 // AddCopyStatusUpdate adds a copy status update operation to the buffer.
-func (ob *OutputBuffer) AddCopyStatusUpdate(queueType string, level int, status, nodeID, newCopyStatus string) {
+// This updates both node metadata and moves the node between copy status buckets.
+func (ob *OutputBuffer) AddCopyStatusUpdate(queueType string, level int, oldCopyStatus, nodeID, newCopyStatus string) {
 	op := &CopyStatusOperation{
 		QueueType:     queueType,
 		Level:         level,
-		Status:        status,
+		OldCopyStatus: oldCopyStatus,
 		NodeID:        nodeID,
 		NewCopyStatus: newCopyStatus,
 	}
@@ -477,6 +542,8 @@ func (ob *OutputBuffer) Flush() {
 	copy(batch, ob.operations)
 	ob.operations = make([]WriteOperation, 0, ob.batchSize)
 
+	// Flushing operations to BoltDB
+
 	// Execute all operations in a single transaction
 	// Lock is held during transaction to prevent concurrent additions to buffer
 	err := ob.db.Update(func(tx *bolt.Tx) error {
@@ -498,9 +565,9 @@ func (ob *OutputBuffer) Flush() {
 
 		// Apply all stats updates in one batch
 		for bucketPathStr, delta := range statsDeltas {
-			// Convert string path back to []string for updateBucketStats
+			// Convert string path back to []string for UpdateBucketStatsInTx
 			bucketPath := strings.Split(bucketPathStr, "/")
-			if err := updateBucketStats(tx, bucketPath, delta); err != nil {
+			if err := UpdateBucketStatsInTx(tx, bucketPath, delta); err != nil {
 				return fmt.Errorf("failed to update stats for %s: %w", bucketPathStr, err)
 			}
 		}
@@ -612,8 +679,35 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 			// Already processed in first pass, skip
 
 		case *CopyStatusOperation:
-			// Copy status updates don't change bucket counts, just node metadata
-			// No stats updates needed
+			// Copy status updates move nodes between copy status buckets
+			// Trust the operation's OldCopyStatus/NewCopyStatus fields - don't check bucket state
+			// This ensures stats stay accurate even if nodes were already moved in previous batches
+			if v.OldCopyStatus != "" && v.OldCopyStatus != v.NewCopyStatus {
+				nodeID := []byte(v.NodeID)
+				nodesBucket := GetNodesBucket(tx, v.QueueType)
+				if nodesBucket != nil {
+					nodeData := nodesBucket.Get(nodeID)
+					if nodeData != nil {
+						ns, err := DeserializeNodeState(nodeData)
+						if err == nil && ns != nil {
+							// Determine node type
+							nodeType := NodeTypeFile
+							if ns.Type == "folder" {
+								nodeType = NodeTypeFolder
+							}
+
+							// Always track the transition based on what the operation says
+							// Don't check bucket state - trust the operation
+							// This prevents stale stats when nodes were already moved
+							oldKey := fmt.Sprintf("SRC/%d/copy/%s/%s", v.Level, nodeType, v.OldCopyStatus)
+							oldStatusCounts[oldKey]++
+
+							newKey := fmt.Sprintf("SRC/%d/copy/%s/%s", v.Level, nodeType, v.NewCopyStatus)
+							newStatusCounts[newKey]++
+						}
+					}
+				}
+			}
 
 		case *ExclusionUpdateOperation:
 			// Exclusion updates don't change bucket counts, just node metadata
@@ -689,13 +783,22 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 	}
 
 	// Convert status update counts to bucket paths and apply deltas
+	// Handle both traversal status (3 parts: queueType/level/status) and copy status (5 parts: SRC/level/copy/nodeType/status)
 	for statusKey, count := range oldStatusCounts {
 		parts := strings.Split(statusKey, "/")
 		if len(parts) == 3 {
+			// Traversal status bucket: queueType/level/status
 			queueType := parts[0]
 			level, _ := strconv.Atoi(parts[1])
 			status := parts[2]
 			path := strings.Join(GetStatusBucketPath(queueType, level, status), "/")
+			deltas[path] -= count // Subtract from old status
+		} else if len(parts) == 5 && parts[2] == "copy" {
+			// Copy status bucket: SRC/level/copy/nodeType/status
+			level, _ := strconv.Atoi(parts[1])
+			nodeType := parts[3]
+			status := parts[4]
+			path := strings.Join(GetCopyStatusBucketPath(level, nodeType, status), "/")
 			deltas[path] -= count // Subtract from old status
 		}
 	}
@@ -703,10 +806,18 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 	for statusKey, count := range newStatusCounts {
 		parts := strings.Split(statusKey, "/")
 		if len(parts) == 3 {
+			// Traversal status bucket: queueType/level/status
 			queueType := parts[0]
 			level, _ := strconv.Atoi(parts[1])
 			status := parts[2]
 			path := strings.Join(GetStatusBucketPath(queueType, level, status), "/")
+			deltas[path] += count // Add to new status
+		} else if len(parts) == 5 && parts[2] == "copy" {
+			// Copy status bucket: SRC/level/copy/nodeType/status
+			level, _ := strconv.Atoi(parts[1])
+			nodeType := parts[3]
+			status := parts[4]
+			path := strings.Join(GetCopyStatusBucketPath(level, nodeType, status), "/")
 			deltas[path] += count // Add to new status
 		}
 	}
@@ -716,21 +827,24 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 
 // Stop gracefully stops the output buffer and flushes remaining operations.
 // Uses a timeout to prevent indefinite blocking if the flush loop is stuck.
+// This method is idempotent - it can be called multiple times safely.
 func (ob *OutputBuffer) Stop() {
-	close(ob.stopChan)
+	ob.stopOnce.Do(func() {
+		close(ob.stopChan)
 
-	// Wait for flush loop to finish, but with a timeout to prevent hanging
-	done := make(chan struct{}, 1)
-	go func() {
-		ob.wg.Wait()
-		done <- struct{}{}
-	}()
+		// Wait for flush loop to finish, but with a timeout to prevent hanging
+		done := make(chan struct{}, 1)
+		go func() {
+			ob.wg.Wait()
+			done <- struct{}{}
+		}()
 
-	select {
-	case <-done:
-		// Flush loop completed successfully
-	case <-time.After(2 * time.Second):
-		// Timeout - flush loop may be stuck or slow
-		// Continue anyway to prevent blocking the entire shutdown
-	}
+		select {
+		case <-done:
+			// Flush loop completed successfully
+		case <-time.After(2 * time.Second):
+			// Timeout - flush loop may be stuck or slow
+			// Continue anyway to prevent blocking the entire shutdown
+		}
+	})
 }

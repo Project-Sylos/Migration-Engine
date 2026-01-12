@@ -484,9 +484,9 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 
 		// Apply all stats updates in one batch
 		for bucketPathStr, delta := range statsDeltas {
-			// Convert string path back to []string for updateBucketStats
+			// Convert string path back to []string for UpdateBucketStatsInTx
 			bucketPath := strings.Split(bucketPathStr, "/")
-			if err := updateBucketStats(tx, bucketPath, delta); err != nil {
+			if err := UpdateBucketStatsInTx(tx, bucketPath, delta); err != nil {
 				return fmt.Errorf("failed to update stats for %s: %w", bucketPathStr, err)
 			}
 		}

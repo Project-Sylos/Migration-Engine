@@ -10,6 +10,8 @@ import (
 
 // taskToNodeState converts a TaskBase to a NodeState for BoltDB storage.
 // Uses existing ULID from task.ID if present, otherwise generates a new one.
+// Note: task.LocationPath should be root-relative (e.g., "/items/subfolder"), not absolute.
+// The Path field in NodeState stores root-relative paths relative to the migration root folder.
 func taskToNodeState(task *TaskBase) *db.NodeState {
 	var serviceID, parentServiceID, name, path, parentPath, nodeType string
 	var size int64
