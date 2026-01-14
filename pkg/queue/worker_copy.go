@@ -105,9 +105,8 @@ func (w *CopyWorker) Run() {
 		err := w.execute(task)
 		if err != nil {
 			// Task failed, let queue handle retry logic
-			fmt.Printf("[Copy Worker] TASK FAILED: path=%s, error=%v\n", task.LocationPath(), err)
 			if logservice.LS != nil {
-				_ = logservice.LS.Log("debug",
+				_ = logservice.LS.Log("error",
 					fmt.Sprintf("Copy worker task execution failed: path=%s round=%d pass=%d error=%v",
 						task.LocationPath(), task.Round, task.CopyPass, err),
 					"worker", w.id, w.queueName)
@@ -159,12 +158,6 @@ func (w *CopyWorker) createFolder(task *TaskBase) error {
 		return fmt.Errorf("task missing DstParentID (ServiceID) for %s", folder.LocationPath)
 	}
 
-	// Creating folder on destination
-	if logservice.LS != nil {
-		_ = logservice.LS.Log("debug",
-			fmt.Sprintf("Creating folder: path=%s dstParentServiceID=%s name=%s", folder.LocationPath, dstParentServiceID, folder.DisplayName),
-			"worker", w.id, w.queueName)
-	}
 
 	// Create folder on destination using ServiceID
 	// CreateFolder(parentIdentifier string, folderName string) (types.Folder, error)
@@ -177,12 +170,6 @@ func (w *CopyWorker) createFolder(task *TaskBase) error {
 	// Store created folder info in task for queue to process on completion
 	// The queue will create DST node entry and update join-lookup after task succeeds
 	task.Folder = createdFolder
-
-	if logservice.LS != nil {
-		_ = logservice.LS.Log("debug",
-			fmt.Sprintf("Created folder: path=%s newID=%s", createdFolder.LocationPath, createdFolder.ServiceID),
-			"worker", w.id, w.queueName)
-	}
 
 	return nil
 }
@@ -199,74 +186,57 @@ func (w *CopyWorker) copyFile(task *TaskBase) error {
 		return fmt.Errorf("task missing DstParentID (ServiceID) for file %s", file.LocationPath)
 	}
 
-	// Copying file from source to destination
-	if logservice.LS != nil {
-		_ = logservice.LS.Log("debug",
-			fmt.Sprintf("Copying file: path=%s size=%d dstParentServiceID=%s", file.LocationPath, file.Size, dstParentServiceID),
-			"worker", w.id, w.queueName)
+
+	// Get context for FS operations (use shutdownCtx if available, otherwise background)
+	ctx := w.shutdownCtx
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
-	// Step 3: Stream file from SRC to DST using chunked I/O
-	// Download from SRC using SRC ServiceID, upload to DST using DST parent ServiceID
-	// DownloadFile returns a ChunkedReader (implements io.ReadCloser) for efficient chunk-by-chunk reading
-	// UploadFile accepts an io.Reader for streaming uploads
-	// We use io.Pipe to connect the download and upload streams, allowing us to track bytes transferred
-
-	// Open download stream from source (returns ChunkedReader)
-	downloadStream, err := w.srcAdapter.DownloadFile(file.ServiceID)
+	// Step 1: Open source file for reading
+	// OpenRead returns an io.ReadCloser for streaming reads
+	srcReader, err := w.srcAdapter.OpenRead(ctx, file.ServiceID)
 	if err != nil {
-		return fmt.Errorf("failed to open download stream for %s: %w", file.LocationPath, err)
+		return fmt.Errorf("failed to open source file %s for reading: %w", file.LocationPath, err)
 	}
-	defer downloadStream.Close()
+	defer srcReader.Close()
 
-	// Create a pipe to stream data from download to upload
-	// This allows us to track bytes transferred while streaming chunk-by-chunk
-	pr, pw := io.Pipe()
-
-	// Track bytes transferred in a separate goroutine
-	// io.CopyBuffer works with ChunkedReader since it implements io.ReadCloser
-	// The ChunkedReader's Read() method will handle chunk boundaries internally
-	var bytesTransferred int64
-	var copyErr error
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-		// Copy from download stream (ChunkedReader) to pipe, tracking bytes
-		// ChunkedReader implements io.ReadCloser, so io.CopyBuffer works seamlessly
-		bytesTransferred, copyErr = io.CopyBuffer(pw, downloadStream, w.copyBuffer)
-		pw.CloseWithError(copyErr)
-	}()
-
-	// Upload file to destination (streaming from pipe)
-	// UploadFile will read from the pipe, which is being written to by the download goroutine
-	// This provides true streaming: chunks flow from source → pipe → destination without buffering entire file
-	uploadedFile, err := w.dstAdapter.UploadFile(dstParentServiceID, pr)
+	// Step 2: Create destination file with metadata
+	// CreateFile creates the file metadata and returns a types.File with ServiceID populated
+	createdFile, err := w.dstAdapter.CreateFile(ctx, dstParentServiceID, file.DisplayName, file.Size, nil)
 	if err != nil {
-		// Close pipe to stop the download goroutine
-		pr.Close()
-		<-done // Wait for download goroutine to finish
-		return fmt.Errorf("failed to upload file %s to parent %s: %w", file.DisplayName, dstParentServiceID, err)
+		return fmt.Errorf("failed to create destination file %s in parent %s: %w", file.DisplayName, dstParentServiceID, err)
 	}
 
-	// Wait for download goroutine to finish
-	<-done
-	if copyErr != nil && copyErr != io.EOF {
-		return fmt.Errorf("failed to stream file %s: %w", file.LocationPath, copyErr)
+	// Step 3: Open destination file for writing
+	// OpenWrite returns an io.WriteCloser for streaming writes
+	dstWriter, err := w.dstAdapter.OpenWrite(ctx, createdFile.ServiceID)
+	if err != nil {
+		return fmt.Errorf("failed to open destination file %s for writing: %w", createdFile.ServiceID, err)
+	}
+
+	// Step 4: Worker owns the copy loop - stream data directly from source to destination
+	// io.CopyBuffer handles the streaming efficiently with our buffer
+	bytesTransferred, err := io.CopyBuffer(dstWriter, srcReader, w.copyBuffer)
+	if err != nil {
+		// Close writer on copy error (may fail, but we already have the copy error)
+		_ = dstWriter.Close()
+		return fmt.Errorf("failed to copy file data for %s: %w", file.LocationPath, err)
+	}
+
+	// Step 5: Close writer to commit the upload
+	// Close() finalizes the upload - if it fails, the upload failed
+	// This is NOT deferred because we need to check the error to know if upload succeeded
+	if err := dstWriter.Close(); err != nil {
+		return fmt.Errorf("failed to commit upload for file %s: %w", file.DisplayName, err)
 	}
 
 	// Track bytes transferred
 	task.BytesTransferred = bytesTransferred
 
-	// Store uploaded file info in task for queue to process on completion
+	// Store created file info in task for queue to process on completion
 	// The queue will create DST node entry and update join-lookup after task succeeds
-	task.File = uploadedFile
-
-	if logservice.LS != nil {
-		_ = logservice.LS.Log("debug",
-			fmt.Sprintf("Copied file: path=%s bytes=%d newID=%s", uploadedFile.LocationPath, bytesTransferred, uploadedFile.ServiceID),
-			"worker", w.id, w.queueName)
-	}
+	task.File = createdFile
 
 	return nil
 }

@@ -28,6 +28,8 @@ type CopyPhaseConfig struct {
 	StartupDelay    time.Duration
 	ProgressTick    time.Duration
 	ShutdownContext context.Context
+	YAMLConfig      *MigrationConfigYAML // Optional: YAML config for status updates
+	ConfigPath      string               // Optional: Path to YAML config file for status updates
 }
 
 // RunCopyPhase executes the copy phase (two-pass: folders then files).
@@ -70,7 +72,6 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	// Use -1 as sentinel to indicate we haven't found any pending level yet
 	minLevel := -1
 	levels, err := boltDB.GetAllLevels("SRC")
-	fmt.Printf("[Copy Init] Found %d levels in SRC\n", len(levels))
 	if err == nil && len(levels) > 0 {
 		// Find minimum level with pending copy tasks (start with folders since pass 1 is folders)
 		for _, level := range levels {
@@ -79,41 +80,25 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 			}
 			// Check folder tasks (pass 1 starts with folders)
 			hasPending, err := boltDB.HasCopyStatusBucketItems(level, db.NodeTypeFolder, db.CopyStatusPending)
-			if err == nil {
-				count, countErr := boltDB.CountCopyStatusBucket(level, db.NodeTypeFolder, db.CopyStatusPending)
-				if countErr == nil {
-					fmt.Printf("[Copy Init] Level %d: hasPending=%v, count=%d (folders)\n", level, hasPending, count)
-				} else {
-					fmt.Printf("[Copy Init] Level %d: hasPending=%v, count=error(%v) (folders)\n", level, hasPending, countErr)
+			if err == nil && hasPending {
+				// First pending level found OR current level is smaller than what we've found
+				if minLevel == -1 || level < minLevel {
+					minLevel = level
 				}
-				if hasPending {
-					// First pending level found OR current level is smaller than what we've found
-					if minLevel == -1 || level < minLevel {
-						minLevel = level
-						fmt.Printf("[Copy Init] Set minLevel to %d\n", minLevel)
-					}
-				}
-			} else {
-				fmt.Printf("[Copy Init] Level %d: error checking pending=%v\n", level, err)
 			}
 		}
-	} else {
-		fmt.Printf("[Copy Init] Error getting levels or no levels found: err=%v, levels=%v\n", err, levels)
 	}
 
 	// If no pending levels found, default to level 1
 	if minLevel == -1 {
 		minLevel = 1
-		fmt.Printf("[Copy Init] No pending levels found, defaulting to level 1\n")
 	}
-	fmt.Printf("[Copy Init] Starting at round %d (pass 1: folders)\n", minLevel)
 	copyQueue.SetRound(minLevel) // Set initial round
 
 	// CRITICAL: Ensure root folder (level 0) has join-lookup mapping
 	// Items at level 1 will look up their parent (root) in the join-lookup table
 	// We need to ensure this mapping exists before starting the copy phase
 	// Use a single transaction to check and create the mapping to avoid deadlock
-	fmt.Printf("[Copy Init] Ensuring root folder join-lookup mapping exists\n")
 	err = boltDB.Update(func(tx *bolt.Tx) error {
 		// Get SRC root node
 		srcNodesBucket := db.GetNodesBucket(tx, "SRC")
@@ -166,8 +151,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		if joinBucket != nil {
 			existing := joinBucket.Get([]byte(srcRootID))
 			if existing != nil {
-				fmt.Printf("[Copy Init] Root join-lookup mapping already exists: SRC=%s → DST=%s\n", srcRootID, string(existing))
-				return nil
+				return nil // Mapping already exists
 			}
 		}
 
@@ -181,12 +165,20 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 			return fmt.Errorf("failed to store mapping: %w", err)
 		}
 
-		fmt.Printf("[Copy Init] Created root join-lookup mapping: SRC=%s → DST=%s\n", srcRootID, dstRootID)
 		return nil
 	})
 
 	if err != nil {
-		fmt.Printf("[Copy Init] ERROR: Failed to ensure root join-lookup mapping: %v\n", err)
+		// Log error but don't fail - join-lookup may already exist from traversal
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("warn", fmt.Sprintf("Failed to ensure root join-lookup mapping: %v", err), "migration", "copy", "copy")
+		}
+	}
+
+	// Update config: Copy phase started
+	if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
+		SetStatusCopyInProgress(cfg.YAMLConfig)
+		_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
 	}
 
 	// Initialize copy queue with both source and destination adapters
@@ -231,8 +223,16 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 					if copyPass == 2 {
 						passName = "files"
 					}
-					fmt.Printf("[Copy Phase - Pass %d (%s)] Round: %d, Pending: %d, In-Progress: %d, Total: %d\n",
-						copyPass, passName, lastStats.Round, lastStats.Pending, lastStats.InProgress, lastStats.TotalTracked)
+					// Get round stats for expected/completed counts (similar to traversal)
+					roundStats := copyQueue.RoundStats(lastStats.Round)
+					expected := 0
+					completed := 0
+					if roundStats != nil {
+						expected = roundStats.Expected
+						completed = roundStats.Completed
+					}
+					fmt.Printf("\r  Copy: Pass %d (%s) Round %d (Pending:%d InProgress:%d Workers:%d Expected:%d Completed:%d)   ",
+						copyPass, passName, lastStats.Round, lastStats.Pending, lastStats.InProgress, lastStats.Workers, expected, completed)
 				}
 			}
 		}
@@ -243,12 +243,28 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 
 	// Wait for copy phase completion
 	start := time.Now()
+	lastRound := minLevel // Initialize to starting round
+	tickCount := 0
 	for {
 		// Check for shutdown
 		if shutdownCtx != nil {
 			select {
 			case <-shutdownCtx.Done():
 				copyQueue.Pause()
+				stats := copyQueue.Stats()
+
+				// Update YAML config with suspended status
+				if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
+					status, statusErr := InspectMigrationStatus(boltDB)
+					if statusErr == nil {
+						// For copy phase, we only track one round (copy queue round)
+						// Use the current round for both src and dst in status update
+						currentRound := stats.Round
+						SetSuspendedStatus(cfg.YAMLConfig, status, currentRound, currentRound)
+						_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
+					}
+				}
+
 				return queue.QueueStats{}, fmt.Errorf("copy phase shutdown requested")
 			default:
 			}
@@ -260,6 +276,44 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 
 			// Stop progress ticker
 			progressTicker.Stop()
+
+			// Update config YAML with final state (fire-and-forget to avoid blocking)
+			if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+
+					done := make(chan error, 1)
+					go func() {
+						status, statusErr := InspectMigrationStatus(boltDB)
+						if statusErr != nil {
+							if logservice.LS != nil {
+								_ = logservice.LS.Log("warning", fmt.Sprintf("InspectMigrationStatus error: %v", statusErr), "migration", "copy", "copy")
+							}
+							done <- statusErr
+							return
+						}
+						// For copy phase, use current round for both src and dst
+						currentRound := stats.Round
+						UpdateConfigFromStatus(cfg.YAMLConfig, status, currentRound, currentRound)
+						SetStatusComplete(cfg.YAMLConfig)
+						done <- SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
+					}()
+
+					select {
+					case err := <-done:
+						if err != nil {
+							if logservice.LS != nil {
+								_ = logservice.LS.Log("warning", fmt.Sprintf("Config save failed: %v", err), "migration", "copy", "copy")
+							}
+						}
+					case <-ctx.Done():
+						if logservice.LS != nil {
+							_ = logservice.LS.Log("warning", "Config save timeout (fire-and-forget)", "migration", "copy", "copy")
+						}
+					}
+				}()
+			}
 
 			// Close log service
 			if logservice.LS != nil {
@@ -278,6 +332,27 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 
 			fmt.Printf("\nCopy phase complete! Duration: %v\n", time.Since(start))
 			return stats, nil
+		}
+
+		// Update config periodically (every 10 iterations) or on round advancement
+		// Track round advancement for YAML updates
+		currentRound := copyQueue.Round()
+		roundAdvanced := false
+		if currentRound != lastRound {
+			roundAdvanced = true
+			lastRound = currentRound
+		}
+
+		tickCount++
+		shouldUpdate := roundAdvanced || (tickCount%10 == 0)
+		if cfg.YAMLConfig != nil && cfg.ConfigPath != "" && shouldUpdate {
+			status, statusErr := InspectMigrationStatus(boltDB)
+			if statusErr == nil {
+				// For copy phase, use current round for both src and dst
+				UpdateConfigFromStatus(cfg.YAMLConfig, status, currentRound, currentRound)
+				// Save config (ignore errors to avoid disrupting migration)
+				_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
+			}
 		}
 
 		// Sleep briefly before checking again
