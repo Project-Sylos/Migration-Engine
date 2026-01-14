@@ -474,10 +474,6 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 					if hasPendingForPass || hasInProgressForPass {
 						// Hard check failed: still have pending or in-progress tasks for this pass
 						// Reset lastPullWasPartial to false so normal pull logic can trigger
-						if hasInProgressForPass {
-							// Log in-progress tasks specifically - this is the issue we're debugging
-							fmt.Printf("[Copy Round Check] Round %d has in-progress tasks (pass %d, nodeType=%s) - cannot advance yet\n", currentRound, copyPass, nodeType)
-						}
 						q.setLastPullWasPartial(false)
 						return false
 					}
@@ -493,10 +489,6 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 		}
 
 		// Both soft and hard checks passed - round is complete
-		if mode == QueueModeCopy {
-			fmt.Printf("[Copy Round Check] Round %d hard check passed: pending and in-progress buckets empty\n", currentRound)
-		}
-
 		// Round is complete - advance if requested
 		if opts.AdvanceRoundIfComplete {
 			q.advanceToNextRound()

@@ -152,3 +152,47 @@ func SetupCopyTest(cleanSpectraDB bool, removeMigrationDB bool) (*db.DB, types.F
 
 	return dbInstance, srcAdapter, dstAdapter, nil
 }
+
+// SetupLocalCopyTest sets up the database and adapters for local filesystem copy phase testing.
+// srcPath and dstPath are absolute paths to the source and destination directories.
+// removeMigrationDB controls whether to remove the migration database (use true for fresh test).
+// Returns the BoltDB instance, source adapter, destination adapter, and error.
+func SetupLocalCopyTest(srcPath, dstPath string, removeMigrationDB bool) (*db.DB, types.FSAdapter, types.FSAdapter, error) {
+	fmt.Printf("Setting up local filesystem copy test...\n")
+	fmt.Printf("  Source: %s\n", srcPath)
+	fmt.Printf("  Destination: %s\n", dstPath)
+
+	// Create LocalFS adapters
+	srcAdapter, err := fs.NewLocalFS(srcPath)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to create src adapter: %w", err)
+	}
+
+	dstAdapter, err := fs.NewLocalFS(dstPath)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to create dst adapter: %w", err)
+	}
+
+	// Verify source path exists and is accessible
+	if _, err := os.Stat(srcPath); err != nil {
+		return nil, nil, nil, fmt.Errorf("source path does not exist or is not accessible: %s (error: %w)", srcPath, err)
+	}
+
+	// Verify destination path exists and is accessible
+	// Note: PowerShell script should create this before running the test
+	if _, err := os.Stat(dstPath); err != nil {
+		return nil, nil, nil, fmt.Errorf("destination path does not exist or is not accessible: %s (error: %w)", dstPath, err)
+	}
+
+	// Open database - tests own the lifecycle
+	// Use pkg/tests/copy/shared/main_test.db for copy tests
+	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
+		Path:           "pkg/tests/copy/shared/main_test.db",
+		RemoveExisting: removeMigrationDB,
+	})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	return dbInstance, srcAdapter, dstAdapter, nil
+}

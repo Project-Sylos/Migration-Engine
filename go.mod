@@ -28,3 +28,5 @@ require (
 )
 
 replace github.com/Project-Sylos/Spectra => ../Spectra
+
+replace github.com/Project-Sylos/Sylos-FS => ../Sylos-FS
