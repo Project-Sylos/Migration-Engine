@@ -75,8 +75,11 @@ func (q *Queue) CheckCopyCompletion(currentRound int, wasFirstPull bool) bool {
 		}
 	}
 
-	// If no pending tasks for current pass and this was first pull, switch passes or complete
-	if !hasAnyPendingForPass && wasFirstPull {
+	// If no pending tasks in BoltDB, no in-progress tasks in BoltDB, no pending in memory,
+	// no in-progress in memory, and this was first pull, switch passes or complete
+	// CRITICAL: Must check both BoltDB AND memory state to avoid premature completion
+	// Tasks retrying are in-progress in BoltDB but pending in memory
+	if !hasAnyPendingForPass && !hasAnyInProgressForPass && q.getPendingCount() == 0 && q.getInProgressCount() == 0 && wasFirstPull {
 		if copyPass == 1 {
 			// Pass 1 (folders) complete - switch to pass 2 (files)
 			q.setCopyPass(2)
@@ -112,6 +115,7 @@ func (q *Queue) CheckCopyCompletion(currentRound int, wasFirstPull bool) bool {
 			return q.markComplete("Copy phase complete - both passes finished")
 		}
 	}
+
 	// Still have tasks for current pass - rounds will advance naturally
 	return false
 }
@@ -291,7 +295,6 @@ func (q *Queue) PullCopyTasks(force bool) {
 		nodeType = db.NodeTypeFile
 	}
 
-
 	// Scan pending status bucket for the specific node type
 	// Bucket is already filtered by node type, so no in-memory filtering needed!
 	var matchedBatch []db.FetchResult
@@ -357,7 +360,6 @@ func (q *Queue) PullCopyTasks(force bool) {
 		}
 		return
 	}
-
 
 	// Move tasks to in-progress status and create tasks
 	enqueueSuccessCount := 0
@@ -641,20 +643,18 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 
 	// Check if we should retry
 	if task.Attempts < maxRetries {
-		// Retry: move back to pending in BoltDB
-		// DON'T re-enqueue immediately - let the next pull cycle find it naturally
-		// This prevents duplicate status updates and ensures the attempt count persists
-		// DON'T add to buffer - let the next pull cycle handle it naturally
-		// This avoids hammering the DB with writes for intermediate failures
+		// Retry: re-enqueue to memory, DON'T write to BoltDB (stays as in-progress)
+		// This avoids unnecessary BoltDB writes and keeps the queue fast
 		task.Locked = false
 		q.removeInProgress(nodeID)
 
-		// Remove from leased set so it can be pulled again in the next cycle
+		// Remove from leased set so it can be pulled again
 		q.removeLeasedKey(nodeID)
 
-		// DO NOT add to buffer here - only on final failure
-		// DO NOT call enqueuePending here - the task will be pulled from BoltDB
-		// in the next cycle after the status update flushes to pending
+		// Re-enqueue to memory pending buffer (append, not insert at 0)
+		// The task stays as in-progress in BoltDB to avoid unnecessary writes
+		// It will be pulled from memory on the next worker cycle
+		q.enqueuePending(task)
 
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("debug",

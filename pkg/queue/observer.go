@@ -46,14 +46,14 @@ type ExternalQueueMetrics struct {
 	TotalFailed     int   `json:"total_failed"`     // failed across all rounds
 
 	// Copy phase metrics (monotonic counters)
-	BytesTransferredTotal int64 `json:"bytes_transferred_total"`
-	FoldersCreatedTotal   int64 `json:"folders_created_total"`
-	FilesCreatedTotal     int64 `json:"files_created_total"`
+	Folders int64 `json:"folders"` // Total folders created
+	Files   int64 `json:"files"`   // Total files created
+	Total   int64 `json:"total"`   // Total items (folders + files)
+	Bytes   int64 `json:"bytes"`   // Total bytes transferred
 
 	// Copy phase rates (EMA-smoothed)
-	BytesPerSecond   float64 `json:"bytes_per_second"`
-	FoldersPerSecond float64 `json:"folders_per_second"`
-	FilesPerSecond   float64 `json:"files_per_second"`
+	ItemsPerSecond float64 `json:"items_per_second"` // Items/sec (folders + files)
+	BytesPerSecond float64 `json:"bytes_per_second"` // Bytes/sec
 
 	// Current state (for API)
 	QueueStats
@@ -317,9 +317,11 @@ func (o *QueueObserver) pollQueue(queueName string, queue *Queue) *ExternalQueue
 	discoveryRate := o.calculateDiscoveryRate(queueName, filesTotal, foldersTotal, now)
 
 	// Calculate copy phase rates (EMA-smoothed)
+	itemsPerSecond := o.calculateItemsPerSecond(queueName, foldersCreatedTotal, filesCreatedTotal, now)
 	bytesPerSecond := o.calculateBytesPerSecond(queueName, bytesTransferredTotal, now)
-	foldersPerSecond := o.calculateFoldersPerSecond(queueName, foldersCreatedTotal, now)
-	filesPerSecond := o.calculateFilesPerSecond(queueName, filesCreatedTotal, now)
+
+	// Calculate total items (folders + files)
+	totalItems := foldersCreatedTotal + filesCreatedTotal
 
 	// Build external metrics
 	metric := ExternalQueueMetrics{
@@ -329,12 +331,12 @@ func (o *QueueObserver) pollQueue(queueName string, queue *Queue) *ExternalQueue
 		TotalDiscovered:          totalDiscovered,
 		TotalPending:             totalPending,
 		TotalFailed:              totalFailed,
-		BytesTransferredTotal:    bytesTransferredTotal,
-		FoldersCreatedTotal:      foldersCreatedTotal,
-		FilesCreatedTotal:        filesCreatedTotal,
+		Folders:                  foldersCreatedTotal,
+		Files:                    filesCreatedTotal,
+		Total:                    totalItems,
+		Bytes:                    bytesTransferredTotal,
+		ItemsPerSecond:           itemsPerSecond,
 		BytesPerSecond:           bytesPerSecond,
-		FoldersPerSecond:         foldersPerSecond,
-		FilesPerSecond:           filesPerSecond,
 		QueueStats:               stats,
 		Round:                    stats.Round,
 	}
@@ -445,8 +447,8 @@ func (o *QueueObserver) calculateBytesPerSecond(queueName string, bytesTotal int
 	return newEMA
 }
 
-// calculateFoldersPerSecond calculates EMA-smoothed folders/sec rate for copy phase.
-func (o *QueueObserver) calculateFoldersPerSecond(queueName string, foldersTotal int64, now time.Time) float64 {
+// calculateItemsPerSecond calculates EMA-smoothed items/sec rate for copy phase (folders + files).
+func (o *QueueObserver) calculateItemsPerSecond(queueName string, foldersTotal, filesTotal int64, now time.Time) float64 {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
@@ -462,27 +464,29 @@ func (o *QueueObserver) calculateFoldersPerSecond(queueName string, foldersTotal
 		}{
 			bytes:   0,
 			folders: foldersTotal,
-			files:   0,
+			files:   filesTotal,
 			time:    now,
 		}
+		o.prevEMARates[queueName+"-items"] = 0.0
 		return 0.0
 	}
 
 	// Calculate current instantaneous rate
 	timeDelta := now.Sub(prev.time).Seconds()
 	if timeDelta <= 0 {
-		return 0.0
+		return o.prevEMARates[queueName+"-items"]
 	}
 
-	foldersDelta := foldersTotal - prev.folders
-	currentRate := float64(foldersDelta) / timeDelta
+	// Calculate total items delta (folders + files)
+	itemsDelta := (foldersTotal - prev.folders) + (filesTotal - prev.files)
+	currentRate := float64(itemsDelta) / timeDelta
 
 	// Update EMA: newEMA = alpha * currentRate + (1-alpha) * previousEMA
-	prevEMA := o.prevEMARates[queueName+"-folders"]
+	prevEMA := o.prevEMARates[queueName+"-items"]
 	newEMA := emaAlpha*currentRate + (1-emaAlpha)*prevEMA
 
 	// Store for next calculation
-	o.prevEMARates[queueName+"-folders"] = newEMA
+	o.prevEMARates[queueName+"-items"] = newEMA
 	o.prevCopyTotals[queueName] = struct {
 		bytes   int64
 		folders int64
@@ -491,59 +495,6 @@ func (o *QueueObserver) calculateFoldersPerSecond(queueName string, foldersTotal
 	}{
 		bytes:   prev.bytes,
 		folders: foldersTotal,
-		files:   prev.files,
-		time:    now,
-	}
-
-	return newEMA
-}
-
-// calculateFilesPerSecond calculates EMA-smoothed files/sec rate for copy phase.
-func (o *QueueObserver) calculateFilesPerSecond(queueName string, filesTotal int64, now time.Time) float64 {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	prev, hasPrev := o.prevCopyTotals[queueName]
-
-	if !hasPrev {
-		// First poll - initialize tracking
-		o.prevCopyTotals[queueName] = struct {
-			bytes   int64
-			folders int64
-			files   int64
-			time    time.Time
-		}{
-			bytes:   0,
-			folders: 0,
-			files:   filesTotal,
-			time:    now,
-		}
-		return 0.0
-	}
-
-	// Calculate current instantaneous rate
-	timeDelta := now.Sub(prev.time).Seconds()
-	if timeDelta <= 0 {
-		return 0.0
-	}
-
-	filesDelta := filesTotal - prev.files
-	currentRate := float64(filesDelta) / timeDelta
-
-	// Update EMA: newEMA = alpha * currentRate + (1-alpha) * previousEMA
-	prevEMA := o.prevEMARates[queueName+"-files"]
-	newEMA := emaAlpha*currentRate + (1-emaAlpha)*prevEMA
-
-	// Store for next calculation
-	o.prevEMARates[queueName+"-files"] = newEMA
-	o.prevCopyTotals[queueName] = struct {
-		bytes   int64
-		folders int64
-		files   int64
-		time    time.Time
-	}{
-		bytes:   prev.bytes,
-		folders: prev.folders,
 		files:   filesTotal,
 		time:    now,
 	}
@@ -630,6 +581,35 @@ func (o *QueueObserver) getTotalPendingCount(queueName string) int {
 		return 0
 	}
 
+	// Handle copy phase separately
+	if queueName == "copy" {
+		// For copy phase, sum pending counts across all levels and both node types
+		levels, err := o.boltDB.GetAllLevels("SRC")
+		if err != nil {
+			return 0
+		}
+
+		totalPending := 0
+		for _, level := range levels {
+			// Sum pending for folders
+			bucketPath := db.GetCopyStatusBucketPath(level, db.NodeTypeFolder, db.CopyStatusPending)
+			count, err := o.boltDB.GetBucketCount(bucketPath)
+			if err == nil {
+				totalPending += int(count)
+			}
+
+			// Sum pending for files
+			bucketPath = db.GetCopyStatusBucketPath(level, db.NodeTypeFile, db.CopyStatusPending)
+			count, err = o.boltDB.GetBucketCount(bucketPath)
+			if err == nil {
+				totalPending += int(count)
+			}
+		}
+
+		return totalPending
+	}
+
+	// Traversal phase: use traversal status buckets
 	queueType := getQueueType(queueName)
 	if queueType == "" {
 		return 0
@@ -662,6 +642,35 @@ func (o *QueueObserver) getTotalFailedCount(queueName string) int {
 		return 0
 	}
 
+	// Handle copy phase separately
+	if queueName == "copy" {
+		// For copy phase, sum failed counts across all levels and both node types
+		levels, err := o.boltDB.GetAllLevels("SRC")
+		if err != nil {
+			return 0
+		}
+
+		totalFailed := 0
+		for _, level := range levels {
+			// Sum failed for folders
+			bucketPath := db.GetCopyStatusBucketPath(level, db.NodeTypeFolder, db.CopyStatusFailed)
+			count, err := o.boltDB.GetBucketCount(bucketPath)
+			if err == nil {
+				totalFailed += int(count)
+			}
+
+			// Sum failed for files
+			bucketPath = db.GetCopyStatusBucketPath(level, db.NodeTypeFile, db.CopyStatusFailed)
+			count, err = o.boltDB.GetBucketCount(bucketPath)
+			if err == nil {
+				totalFailed += int(count)
+			}
+		}
+
+		return totalFailed
+	}
+
+	// Traversal phase: use traversal status buckets
 	queueType := getQueueType(queueName)
 	if queueType == "" {
 		return 0

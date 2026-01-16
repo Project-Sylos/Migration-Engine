@@ -10,15 +10,25 @@ This is **not** an automated test. It is meant to be run alongside the UI + API 
 
 ## What the scripts do
 
-The scripts create two identical directory trees:
+The scripts create two **asymmetric** directory trees:
 
 ```
 sylos_retry_test/
-├── A/items   ← SRC-like (permission denied initially)
-└── B/items   ← DST-like (always accessible)
+├── A/items   ← SRC-like (permission denied initially, minimal structure)
+│   ├── file1.txt
+│   └── subfolder_a/
+│       └── file2.txt
+└── B/items   ← DST-like (always accessible, superset structure)
+    ├── file1.txt
+    ├── subfolder_a/
+    │   └── file2.txt
+    ├── subfolder_b/
+    │   └── file3.txt
+    └── extra_folder/
+        └── dst_extra.txt
 ```
 
-Both trees contain the same structure and files.
+B/items contains extra files and folders that don't exist in A/items, creating a realistic scenario where DST has items not yet discovered on SRC.
 Access to `A/items` is denied to simulate an admin-only or permission-restricted folder.
 
 ---
@@ -27,15 +37,19 @@ Access to `A/items` is denied to simulate an admin-only or permission-restricted
 
 ### `setup.ps1`
 
-Creates both folder trees and **denies access to `A/items` only**.
+Creates two **asymmetric** folder trees and **denies access to `A/items` only**.
 
 Use this **before** the initial Sylos traversal.
+
+**Structure:**
+* A/items (SRC): Minimal structure with `file1.txt` and `subfolder_a/file2.txt`
+* B/items (DST): Superset structure with all A/items content plus `subfolder_b/file3.txt` and `extra_folder/dst_extra.txt`
 
 **Effect:**
 
 * SRC cannot traverse `A/items`
 * DST fully traverses `B/items`
-* DST items may appear as `not_on_src`
+* DST items (`subfolder_b`, `extra_folder`) appear as `not_on_src` since they don't exist in A/items
 
 ---
 
@@ -46,6 +60,14 @@ Restores permissions on `A/items`.
 Run this **after** the initial traversal and **before** running a retry sweep.
 
 This simulates a user fixing permissions.
+
+---
+
+### `deny.ps1`
+
+Denies permissions on `A/items`.
+
+This is the opposite of `restore.ps1`. Use this to re-deny access after restoring it, allowing you to test multiple retry cycles without recreating the entire test directory.
 
 ---
 
@@ -72,7 +94,8 @@ Use this to reset state after testing.
 
    * SRC subtree is discovered
    * `not_on_src` DST items resolve correctly
-7. Run `cleanup.ps1`
+7. (Optional) To test another retry cycle: run `deny.ps1`, then `restore.ps1` again
+8. Run `cleanup.ps1`
 
 ---
 

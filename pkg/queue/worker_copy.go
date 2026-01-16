@@ -158,7 +158,6 @@ func (w *CopyWorker) createFolder(task *TaskBase) error {
 		return fmt.Errorf("task missing DstParentID (ServiceID) for %s", folder.LocationPath)
 	}
 
-
 	// Create folder on destination using ServiceID
 	// CreateFolder(parentIdentifier string, folderName string) (types.Folder, error)
 	// For LocalFS: parentIdentifier is a path, for SpectraFS: parentIdentifier is a ServiceID
@@ -185,7 +184,6 @@ func (w *CopyWorker) copyFile(task *TaskBase) error {
 	if dstParentServiceID == "" {
 		return fmt.Errorf("task missing DstParentID (ServiceID) for file %s", file.LocationPath)
 	}
-
 
 	// Get context for FS operations (use shutdownCtx if available, otherwise background)
 	ctx := w.shutdownCtx
