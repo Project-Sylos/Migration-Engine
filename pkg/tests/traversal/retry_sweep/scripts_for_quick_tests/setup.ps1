@@ -1,7 +1,7 @@
 # setup.ps1
-# Creates two identical folder trees:
-#   A/items  -> access denied (SRC-like)
-#   B/items  -> accessible (DST-like)
+# Creates two asymmetric folder trees:
+#   A/items  -> access denied (SRC-like, minimal structure)
+#   B/items  -> accessible (DST-like, superset structure with extra files/folders)
 
 $BaseDir = "$env:USERPROFILE\sylos_retry_test"
 $TreeA   = "$BaseDir\A\items"
@@ -20,20 +20,27 @@ Write-Host "Setting up retry-sweep dual-tree permission test..." -ForegroundColo
 # Clean slate
 Remove-Item $BaseDir -Recurse -Force -ErrorAction SilentlyContinue
 
-# Create folder trees
-$trees = @($TreeA, $TreeB)
+# Create asymmetric folder trees
 
-foreach ($tree in $trees) {
-    New-Item -ItemType Directory -Path $tree | Out-Null
-    New-Item -ItemType Directory -Path "$tree\subfolder_a" | Out-Null
-    New-Item -ItemType Directory -Path "$tree\subfolder_b" | Out-Null
+# Create A/items (SRC)
+New-Item -ItemType Directory -Path $TreeA | Out-Null
+New-Item -ItemType Directory -Path "$TreeA\subfolder_a" | Out-Null
+"test file 1" | Out-File "$TreeA\file1.txt"
+"test file 2" | Out-File "$TreeA\subfolder_a\file2.txt"
+# Only A/items has file1.txt and subfolder_a with a file
 
-    "test file 1" | Out-File "$tree\file1.txt"
-    "test file 2" | Out-File "$tree\subfolder_a\file2.txt"
-    "test file 3" | Out-File "$tree\subfolder_b\file3.txt"
-}
+# Create B/items (DST) with a superset structure
+New-Item -ItemType Directory -Path $TreeB | Out-Null
+New-Item -ItemType Directory -Path "$TreeB\subfolder_a" | Out-Null
+New-Item -ItemType Directory -Path "$TreeB\subfolder_b" | Out-Null
+New-Item -ItemType Directory -Path "$TreeB\extra_folder" | Out-Null
 
-Write-Host "Created identical folder trees A/items and B/items." -ForegroundColor Green
+"test file 1" | Out-File "$TreeB\file1.txt"
+"test file 2" | Out-File "$TreeB\subfolder_a\file2.txt"
+"test file 3" | Out-File "$TreeB\subfolder_b\file3.txt"
+"dst only file" | Out-File "$TreeB\extra_folder\dst_extra.txt"
+
+Write-Host "Created asymmetric folder trees: A/items (SRC) and B/items (DST)." -ForegroundColor Green
 
 # Deny access ONLY to A/items
 Write-Host "Denying access to A/items (SRC simulation)..." -ForegroundColor Yellow
