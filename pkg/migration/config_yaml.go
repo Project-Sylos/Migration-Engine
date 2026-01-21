@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/configs"
-	"github.com/Project-Sylos/Sylos-FS/pkg/fs"
-	"github.com/Project-Sylos/Sylos-FS/pkg/types"
+	"codeberg.org/Sylos/Migration-Engine/pkg/configs"
+	"codeberg.org/Sylos/Sylos-FS/pkg/fs"
+	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 	"gopkg.in/yaml.v3"
 )
 

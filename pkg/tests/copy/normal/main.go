@@ -8,8 +8,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
-	"github.com/Project-Sylos/Migration-Engine/pkg/tests/copy/shared"
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
+	"codeberg.org/Sylos/Migration-Engine/pkg/tests/copy/shared"
 )
 
 func main() {

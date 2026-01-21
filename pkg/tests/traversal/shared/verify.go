@@ -6,7 +6,7 @@ package shared
 import (
 	"fmt"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 )
 
 // PrintVerification prints the verification results in a formatted way.

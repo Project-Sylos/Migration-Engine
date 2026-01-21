@@ -9,11 +9,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
-	"github.com/Project-Sylos/Migration-Engine/pkg/tests/traversal/shared"
-	"github.com/Project-Sylos/Spectra/sdk"
-	"github.com/Project-Sylos/Sylos-FS/pkg/fs"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
+	"codeberg.org/Sylos/Migration-Engine/pkg/tests/traversal/shared"
+	"codeberg.org/Sylos/Spectra/sdk"
+	"codeberg.org/Sylos/Sylos-FS/pkg/fs"
 )
 
 func main() {

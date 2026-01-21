@@ -300,7 +300,7 @@ Metrics are updated every 200ms (configurable) during active migrations, allowin
 ### Opening a Database
 
 ```go
-import "github.com/Project-Sylos/Migration-Engine/pkg/db"
+import "codeberg.org/Sylos/Migration-Engine/pkg/db"
 
 opts := db.DefaultOptions()
 opts.Path = "/path/to/migration.db"

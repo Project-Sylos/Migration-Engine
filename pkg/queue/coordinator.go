@@ -6,7 +6,7 @@ package queue
 import (
 	"sync"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
+	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 )
 
 // YAMLUpdateCallback is a function that updates the YAML config file when rounds advance.

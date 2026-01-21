@@ -9,10 +9,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
-	"github.com/Project-Sylos/Migration-Engine/pkg/tests/copy/shared"
-	"github.com/Project-Sylos/Sylos-FS/pkg/fs"
-	"github.com/Project-Sylos/Sylos-FS/pkg/types"
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
+	"codeberg.org/Sylos/Migration-Engine/pkg/tests/copy/shared"
+	"codeberg.org/Sylos/Sylos-FS/pkg/fs"
+	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
 func main() {

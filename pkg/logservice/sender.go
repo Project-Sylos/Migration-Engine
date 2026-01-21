@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
 // LS is the global log service sender instance.

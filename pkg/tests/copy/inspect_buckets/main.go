@@ -4,7 +4,7 @@
 package main
 
 import (
-	"github.com/Project-Sylos/Migration-Engine/pkg/tests/copy/shared"
+	"codeberg.org/Sylos/Migration-Engine/pkg/tests/copy/shared"
 )
 
 func main() {

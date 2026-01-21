@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db/etl"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/etl"
 )
 
 func main() {

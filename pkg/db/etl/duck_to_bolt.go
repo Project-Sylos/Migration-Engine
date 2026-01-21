@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	_ "github.com/marcboeker/go-duckdb"
 	bolt "go.etcd.io/bbolt"
 )

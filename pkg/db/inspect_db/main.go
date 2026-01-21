@@ -13,9 +13,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/tests/traversal/shared"
-	"github.com/Project-Sylos/Spectra/sdk"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/tests/traversal/shared"
+	"codeberg.org/Sylos/Spectra/sdk"
 	bolt "go.etcd.io/bbolt"
 )
 

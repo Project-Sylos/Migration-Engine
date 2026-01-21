@@ -6,7 +6,7 @@ package queue
 import (
 	"time"
 
-	"github.com/Project-Sylos/Sylos-FS/pkg/types"
+	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
 // Task types

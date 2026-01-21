@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
-	"github.com/Project-Sylos/Sylos-FS/pkg/types"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
+	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
 // TraversalWorker executes traversal tasks by listing children and recording them to BoltDB.

@@ -8,8 +8,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
-	"github.com/Project-Sylos/Migration-Engine/pkg/tests/traversal/shared"
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
+	"codeberg.org/Sylos/Migration-Engine/pkg/tests/traversal/shared"
 )
 
 func main() {

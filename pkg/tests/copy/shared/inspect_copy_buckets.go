@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	bolt "go.etcd.io/bbolt"
 )
 

@@ -42,7 +42,7 @@ LogService (LS)
 
 ```go
 import (
-    "github.com/Project-Sylos/Migration-Engine/pkg/logservice"
+    "codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 )
 
 // Initialize global logger
@@ -86,7 +86,7 @@ sender.Log("info", "Message", "entity", "id", "queue")
 ### Basic Logging
 
 ```go
-import "github.com/Project-Sylos/Migration-Engine/pkg/logservice"
+import "codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 
 // Log a message
 err := logservice.LS.Log("info", "Migration started", "migration", "main", "")

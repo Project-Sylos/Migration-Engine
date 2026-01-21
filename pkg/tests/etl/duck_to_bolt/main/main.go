@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/db/etl"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/etl"
 	_ "github.com/marcboeker/go-duckdb"
 	bolt "go.etcd.io/bbolt"
 )

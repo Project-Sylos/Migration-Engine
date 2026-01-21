@@ -1,10 +1,10 @@
-module github.com/Project-Sylos/Migration-Engine
+module codeberg.org/Sylos/Migration-Engine
 
-go 1.24.2
+go 1.25.6
 
 require (
-	github.com/Project-Sylos/Spectra v0.2.56
-	github.com/Project-Sylos/Sylos-FS v0.1.2
+	codeberg.org/Sylos/Spectra v0.2.56
+	codeberg.org/Sylos/Sylos-FS v0.1.2
 	github.com/google/uuid v1.6.0
 	github.com/marcboeker/go-duckdb v1.7.0
 	github.com/oklog/ulid/v2 v2.1.1
@@ -27,6 +27,6 @@ require (
 	golang.org/x/xerrors v0.0.0-20220907171357-04be3eba64a2 // indirect
 )
 
-replace github.com/Project-Sylos/Spectra => ../Spectra
+replace codeberg.org/Sylos/Spectra => ../Spectra
 
-replace github.com/Project-Sylos/Sylos-FS => ../Sylos-FS
+replace codeberg.org/Sylos/Sylos-FS => ../Sylos-FS

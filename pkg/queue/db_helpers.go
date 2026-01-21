@@ -9,8 +9,8 @@ import (
 
 	bolt "go.etcd.io/bbolt"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Sylos-FS/pkg/types"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
 // LoadRootFolders returns root folder rows (depth_level=0) with traversal_status='Pending' from BoltDB.

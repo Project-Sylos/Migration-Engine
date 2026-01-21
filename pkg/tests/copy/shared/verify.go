@@ -6,8 +6,8 @@ package shared
 import (
 	"fmt"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 )
 
 // PrintCopyVerification prints the copy phase statistics in a formatted way.

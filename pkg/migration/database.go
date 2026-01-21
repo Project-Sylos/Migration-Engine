@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
 // DatabaseConfig defines how the migration engine should prepare its backing store.

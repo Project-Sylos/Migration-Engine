@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
 // BoltToDuckConfig configures the BoltDB to DuckDB migration

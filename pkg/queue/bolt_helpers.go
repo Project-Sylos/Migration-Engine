@@ -4,8 +4,8 @@
 package queue
 
 import (
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Sylos-FS/pkg/types"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
 // taskToNodeState converts a TaskBase to a NodeState for BoltDB storage.

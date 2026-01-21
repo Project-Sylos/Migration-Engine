@@ -6,7 +6,7 @@ package migration
 import (
 	"fmt"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
 // VerifyOptions define the expectations for post-migration validation.

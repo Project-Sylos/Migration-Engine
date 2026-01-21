@@ -11,14 +11,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
-	"github.com/Project-Sylos/Spectra/sdk"
-	"github.com/Project-Sylos/Sylos-FS/pkg/fs"
-	"github.com/Project-Sylos/Sylos-FS/pkg/types"
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
+	"codeberg.org/Sylos/Spectra/sdk"
+	"codeberg.org/Sylos/Sylos-FS/pkg/fs"
+	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
 type folderConfig struct {
-	ServiceID           string `json:"serviceId"`
+	ServiceID       string `json:"serviceId"`
 	ParentServiceID string `json:"parentServiceId"`
 	DisplayName     string `json:"displayName"`
 	LocationPath    string `json:"locationPath"`

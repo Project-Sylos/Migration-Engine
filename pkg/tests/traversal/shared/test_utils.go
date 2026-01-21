@@ -13,7 +13,7 @@ import (
 
 	bolt "go.etcd.io/bbolt"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
 // findNodeByPath is a test utility helper that finds a node by its path.
