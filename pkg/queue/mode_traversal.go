@@ -367,6 +367,20 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 					taskState.ID = existingFolderULID
 				}
 
+				// Compute root-relative path from parent path and child name
+				// This ensures paths are always root-relative, regardless of what the adapter returns
+				// (same logic as childResultToNodeStateWithID for files and SRC children)
+				var rootRelativePath string
+				if parentPath == "/" {
+					// Child of root folder
+					rootRelativePath = "/" + child.folder.DisplayName
+				} else {
+					// Child of non-root folder
+					rootRelativePath = types.NormalizeLocationPath(parentPath + "/" + child.folder.DisplayName)
+				}
+				taskState.Path = rootRelativePath
+				taskState.ParentPath = parentPath
+
 				taskState.ParentID = nodeID
 				taskState.TraversalStatus = child.status
 				if child.srcID != "" {
