@@ -16,6 +16,23 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
+// isEphemeralMode checks if the Spectra config file specifies ephemeral mode.
+func isEphemeralMode(configPath string) (bool, error) {
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		return false, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	var config struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.Unmarshal(configData, &config); err != nil {
+		return false, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	return config.Mode == "ephemeral", nil
+}
+
 // SetupSpectraFS creates a SpectraFS instance, handling DB cleanup appropriately.
 // Since each test run is a separate process, we can't rely on in-memory state.
 // Instead, we check if the DB file exists (from the config) and only clean it if explicitly requested.
@@ -87,12 +104,18 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 		return migration.Config{}, err
 	}
 
-	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary")
+	// Check if we're in ephemeral mode
+	isEphemeral, err := isEphemeralMode("pkg/tests/traversal/shared/spectra.json")
+	if err != nil {
+		return migration.Config{}, fmt.Errorf("failed to check mode: %w", err)
+	}
+
+	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary", isEphemeral)
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create src adapter: %w", err)
 	}
 
-	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1")
+	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1", isEphemeral)
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
 	}
@@ -130,6 +153,81 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 		LogLevel:        "trace",
 		StartupDelay:    1 * time.Second, // you should set this to 3 if you set skip listener to false to account for terminal opening delay
 		Verification:    migration.VerifyOptions{},
+	}
+
+	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {
+		return migration.Config{}, err
+	}
+
+	return cfg, nil
+}
+
+// SetupEphemeralTest assembles the Spectra-backed migration configuration using ephemeral mode.
+// Ephemeral mode doesn't persist data to a database, so no Spectra DB cleanup is needed.
+// removeMigrationDB controls whether to remove the migration database (use false for resumption tests).
+func SetupEphemeralTest(removeMigrationDB bool) (migration.Config, error) {
+	fmt.Println("Loading Spectra ephemeral configuration...")
+
+	// Create SpectraFS instance using ephemeral config (no DB cleanup needed for ephemeral mode)
+	spectraFS, err := sdk.New("pkg/tests/traversal/shared/spectra_ephemeral.json")
+	if err != nil {
+		return migration.Config{}, fmt.Errorf("failed to initialize Spectra in ephemeral mode: %w", err)
+	}
+
+	srcRoot, dstRoot, err := LoadSpectraRoots(spectraFS)
+	if err != nil {
+		return migration.Config{}, err
+	}
+
+	// Create adapters with ephemeral mode enabled.
+	// The adapter will pass depth parameter in ListChildren() calls when needed (ephemeral mode only).
+	// The adapter gets the parent node's depth via GetNode() and passes it to the SDK.
+	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary", true)
+	if err != nil {
+		return migration.Config{}, fmt.Errorf("failed to create src adapter: %w", err)
+	}
+
+	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1", true)
+	if err != nil {
+		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
+	}
+
+	// Open database - tests own the lifecycle
+	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
+		Path:           "pkg/tests/traversal/shared/main_test.db",
+		RemoveExisting: removeMigrationDB,
+	})
+	if err != nil {
+		return migration.Config{}, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	cfg := migration.Config{
+		DatabaseInstance: dbInstance,               // Tests provide DB instance
+		Runtime:          migration.ModeStandalone, // Tests use standalone mode (ME closes DB)
+		Database: migration.DatabaseConfig{
+			Path:           "pkg/tests/traversal/shared/main_test.db",
+			RemoveExisting: removeMigrationDB,
+		},
+		Source: migration.Service{
+			Name:    "Spectra-Primary",
+			Adapter: srcAdapter,
+		},
+		Destination: migration.Service{
+			Name:    "Spectra-S1",
+			Adapter: dstAdapter,
+		},
+		SeedRoots:       true,
+		WorkerCount:     10,
+		MaxRetries:      3,
+		CoordinatorLead: 4,
+		SkipListener:    true,
+		LogAddress:      "127.0.0.1:8081",
+		LogLevel:        "trace",
+		StartupDelay:    1 * time.Second, // you should set this to 3 if you set skip listener to false to account for terminal opening delay
+		Verification: migration.VerifyOptions{
+			AllowNotOnSrc: true, // Ephemeral mode allows divergent trees (nodes on dst but not src)
+		},
+		SkipAutoETLAfterTraversal: true, // Skip ETL for ephemeral tests - we only validate BoltDB, not DuckDB
 	}
 
 	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {

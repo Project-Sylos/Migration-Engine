@@ -72,6 +72,10 @@ type Config struct {
 	// If not provided, LetsMigrate will create one internally.
 	// Set this when using StartMigration for programmatic shutdown control.
 	ShutdownContext context.Context
+
+	// SkipAutoETLAfterTraversal if true, skips automatic ETL from BoltDB to DuckDB after traversal completes.
+	// Useful for tests or when ETL is not needed (e.g., ephemeral mode tests).
+	SkipAutoETLAfterTraversal bool
 }
 
 // Result captures the outcome of a migration run.
@@ -401,24 +405,25 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 			}
 		}
 		return RunMigration(MigrationConfig{
-			BoltDB:          boltDB,
-			BoltPath:        boltPath,
-			SrcAdapter:      cfg.Source.Adapter,
-			DstAdapter:      cfg.Destination.Adapter,
-			SrcRoot:         srcRoot,
-			DstRoot:         dstRoot,
-			SrcServiceName:  cfg.Source.Name,
-			WorkerCount:     cfg.WorkerCount,
-			MaxRetries:      cfg.MaxRetries,
-			CoordinatorLead: cfg.CoordinatorLead,
-			LogAddress:      cfg.LogAddress,
-			LogLevel:        cfg.LogLevel,
-			SkipListener:    cfg.SkipListener,
-			StartupDelay:    cfg.StartupDelay,
-			ProgressTick:    cfg.ProgressTick,
-			ConfigPath:      configPath,
-			YAMLConfig:      yamlCfg,
-			ShutdownContext: shutdownCtx,
+			BoltDB:                    boltDB,
+			BoltPath:                  boltPath,
+			SrcAdapter:                cfg.Source.Adapter,
+			DstAdapter:                cfg.Destination.Adapter,
+			SrcRoot:                   srcRoot,
+			DstRoot:                   dstRoot,
+			SrcServiceName:            cfg.Source.Name,
+			WorkerCount:               cfg.WorkerCount,
+			MaxRetries:                cfg.MaxRetries,
+			CoordinatorLead:           cfg.CoordinatorLead,
+			LogAddress:                cfg.LogAddress,
+			LogLevel:                  cfg.LogLevel,
+			SkipListener:              cfg.SkipListener,
+			StartupDelay:              cfg.StartupDelay,
+			ProgressTick:              cfg.ProgressTick,
+			ConfigPath:                configPath,
+			YAMLConfig:                yamlCfg,
+			ShutdownContext:           shutdownCtx,
+			SkipAutoETLAfterTraversal: cfg.SkipAutoETLAfterTraversal,
 		})
 	}
 
@@ -455,25 +460,26 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 				fmt.Println("Resuming migration from existing database state...")
 			}
 			runtime, runErr = RunMigration(MigrationConfig{
-				BoltDB:          boltDB,
-				BoltPath:        boltPath,
-				SrcAdapter:      cfg.Source.Adapter,
-				DstAdapter:      cfg.Destination.Adapter,
-				SrcRoot:         srcRoot,
-				DstRoot:         dstRoot,
-				SrcServiceName:  cfg.Source.Name,
-				WorkerCount:     cfg.WorkerCount,
-				MaxRetries:      cfg.MaxRetries,
-				CoordinatorLead: cfg.CoordinatorLead,
-				LogAddress:      cfg.LogAddress,
-				LogLevel:        cfg.LogLevel,
-				SkipListener:    cfg.SkipListener,
-				StartupDelay:    cfg.StartupDelay,
-				ProgressTick:    cfg.ProgressTick,
-				ResumeStatus:    &status,
-				ConfigPath:      configPath,
-				YAMLConfig:      yamlCfg,
-				ShutdownContext: shutdownCtx,
+				BoltDB:                    boltDB,
+				BoltPath:                  boltPath,
+				SrcAdapter:                cfg.Source.Adapter,
+				DstAdapter:                cfg.Destination.Adapter,
+				SrcRoot:                   srcRoot,
+				DstRoot:                   dstRoot,
+				SrcServiceName:            cfg.Source.Name,
+				WorkerCount:               cfg.WorkerCount,
+				MaxRetries:                cfg.MaxRetries,
+				CoordinatorLead:           cfg.CoordinatorLead,
+				LogAddress:                cfg.LogAddress,
+				LogLevel:                  cfg.LogLevel,
+				SkipListener:              cfg.SkipListener,
+				StartupDelay:              cfg.StartupDelay,
+				ProgressTick:              cfg.ProgressTick,
+				ResumeStatus:              &status,
+				ConfigPath:                configPath,
+				YAMLConfig:                yamlCfg,
+				ShutdownContext:           shutdownCtx,
+				SkipAutoETLAfterTraversal: cfg.SkipAutoETLAfterTraversal,
 			})
 		}
 	} else {
@@ -613,13 +619,15 @@ func normalizeRootFolder(folder types.Folder) (types.Folder, error) {
 // resuming would cause "node not found" errors because the migration DB has stale node IDs.
 func validateRootNodesExist(srcAdapter, dstAdapter types.FSAdapter, srcRoot, dstRoot types.Folder) error {
 	// Try to list children of the source root - if it doesn't exist, this will fail
-	_, err := srcAdapter.ListChildren(srcRoot.ServiceID)
+	// Root nodes are at depth 0
+	depth := 0
+	_, err := srcAdapter.ListChildren(srcRoot.ServiceID, &depth)
 	if err != nil {
 		return fmt.Errorf("source root node '%s' does not exist in filesystem: %w", srcRoot.ServiceID, err)
 	}
 
 	// Try to list children of the destination root - if it doesn't exist, this will fail
-	_, err = dstAdapter.ListChildren(dstRoot.ServiceID)
+	_, err = dstAdapter.ListChildren(dstRoot.ServiceID, &depth)
 	if err != nil {
 		return fmt.Errorf("destination root node '%s' does not exist in filesystem: %w", dstRoot.ServiceID, err)
 	}

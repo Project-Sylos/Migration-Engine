@@ -57,6 +57,23 @@ type adapterFactory struct {
 	spectra map[string]*sdk.SpectraFS
 }
 
+// isEphemeralMode checks if the Spectra config file specifies ephemeral mode.
+func isEphemeralMode(configPath string) (bool, error) {
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		return false, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	var config struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.Unmarshal(configData, &config); err != nil {
+		return false, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	return config.Mode == "ephemeral", nil
+}
+
 func newAdapterFactory() *adapterFactory {
 	return &adapterFactory{spectra: make(map[string]*sdk.SpectraFS)}
 }
@@ -147,7 +164,13 @@ func (f *adapterFactory) buildService(cfg adapterConfig) (migration.Service, typ
 			world = "primary"
 		}
 
-		adapter, err := fs.NewSpectraFS(spectraFS, rootID, world)
+		// Check if we're in ephemeral mode
+		isEphemeral, err := isEphemeralMode(configPath)
+		if err != nil {
+			return migration.Service{}, types.Folder{}, fmt.Errorf("failed to check mode: %w", err)
+		}
+
+		adapter, err := fs.NewSpectraFS(spectraFS, rootID, world, isEphemeral)
 		if err != nil {
 			return migration.Service{}, types.Folder{}, fmt.Errorf("spectra adapter: %w", err)
 		}

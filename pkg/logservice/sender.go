@@ -32,9 +32,9 @@ func InitGlobalLogger(dbInstance *db.DB, addr, level string) error {
 		return fmt.Errorf("failed to send test log: %w", err)
 	}
 
-	if err := LS.ClearConsole(); err != nil {
-		return fmt.Errorf("failed to send clear console log: %w", err)
-	}
+	// if err := LS.ClearConsole(); err != nil {
+	// 	return fmt.Errorf("failed to send clear console log: %w", err)
+	// }
 
 	return nil
 }

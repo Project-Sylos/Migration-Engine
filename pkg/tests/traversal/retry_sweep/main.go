@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -15,6 +16,23 @@ import (
 	"codeberg.org/Sylos/Spectra/sdk"
 	"codeberg.org/Sylos/Sylos-FS/pkg/fs"
 )
+
+// isEphemeralMode checks if the Spectra config file specifies ephemeral mode.
+func isEphemeralMode(configPath string) (bool, error) {
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		return false, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	var config struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.Unmarshal(configData, &config); err != nil {
+		return false, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	return config.Mode == "ephemeral", nil
+}
 
 func main() {
 	fmt.Println("=== Retry Sweep Test Runner ===")
@@ -55,12 +73,18 @@ func runTest() error {
 		return fmt.Errorf("failed to load Spectra roots: %w", err)
 	}
 
-	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary")
+	// Check if we're in ephemeral mode
+	isEphemeral, err := isEphemeralMode("pkg/tests/traversal/shared/spectra.json")
+	if err != nil {
+		return fmt.Errorf("failed to check mode: %w", err)
+	}
+
+	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary", isEphemeral)
 	if err != nil {
 		return fmt.Errorf("failed to create src adapter: %w", err)
 	}
 
-	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1")
+	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1", isEphemeral)
 	if err != nil {
 		return fmt.Errorf("failed to create dst adapter: %w", err)
 	}

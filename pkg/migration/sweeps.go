@@ -105,7 +105,7 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 			if boltPath == "" {
 				return RuntimeStats{}, fmt.Errorf("cannot derive DuckDB path: BoltDB path is not available")
 			}
-			duckDBPath = deriveDuckDBPath(boltPath, boltDB)
+			duckDBPath = deriveDuckDBPath(boltPath)
 			if duckDBPath == "" {
 				return RuntimeStats{}, fmt.Errorf("failed to derive DuckDB path from BoltDB path: %s", boltPath)
 			}

@@ -3,44 +3,75 @@
 # Copyright 2025 Sylos contributors
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-# Colors for output
-CYAN='\033[0;36m'
-YELLOW='\033[1;33m'
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-NC='\033[0m' # No Color
+clear
 
-echo -e "${CYAN}=== Sylos Migration Test Runner ===${NC}"
+echo "=== Sylos Migration Test Runner ==="
 echo ""
 
 # Clean up existing test databases
-echo -e "${YELLOW}Cleaning up test databases...${NC}"
-rm -f pkg/tests/bolt.db pkg/tests/bolt.yaml
-rm -f pkg/tests/migration_test.yaml
-echo -e "${GREEN}Cleanup complete${NC}"
+echo "Cleaning up test databases..."
+
+# Remove the BoltDB file if it exists
+if [ -f "pkg/tests/traversal/shared/main_test.db" ]; then
+    echo "Removing pkg/tests/traversal/shared/main_test.db file..."
+    rm -f "pkg/tests/traversal/shared/main_test.db"
+fi
+
+# Remove the migration config YAML file if it exists
+if [ -f "pkg/tests/traversal/shared/main_test.yaml" ]; then
+    echo "Removing pkg/tests/traversal/shared/main_test.yaml file..."
+    rm -f "pkg/tests/traversal/shared/main_test.yaml"
+fi
+
+# Remove the spectra.db file if it exists
+if [ -f "pkg/tests/traversal/shared/spectra_test.db" ]; then
+    echo "Removing pkg/tests/traversal/shared/spectra_test.db file..."
+    rm -f "pkg/tests/traversal/shared/spectra_test.db"
+fi
+
+echo "Cleanup complete"
 echo ""
 
 # Run the test
 startTime=$(date +%s)
 
-# Run the Go-based normal test runner
-go run pkg/tests/normal/main.go
+# Execute normal test runner
+go run pkg/tests/traversal/normal/main.go
+
 exitCode=$?
 
 endTime=$(date +%s)
 duration=$((endTime - startTime))
 
 echo ""
-echo -e "${CYAN}=== Test Summary ===${NC}"
+echo "=== Test Summary ==="
 echo "Duration: ${duration} seconds"
 
 if [ $exitCode -eq 0 ]; then
-    echo -e "${GREEN}Status: PASSED${NC}"
+    echo "Status: PASSED"
+    
+    # You can optionally enable the block below
+    # to verify the test and Spectra DBs with the inspector.
+    # NOTE: This will scan the entire migration and Spectra databases (O(n) runtime),
+    # so it could take a while on large datasets!
+    
+    # # Run DB inspector with Spectra comparison if test passed
+    # echo ""
+    # echo "=== Running DB Inspector with Spectra Comparison ==="
+    # # The normal test uses pkg/tests/normal/main_test.db (from shared.SetupTest)
+    # if [ -f "pkg/tests/traversal/shared/main_test.db" ]; then
+    #     go run cmd/inspect_db/main.go
+    #     inspectExitCode=$?
+    #     if [ $inspectExitCode -ne 0 ]; then
+    #         echo "⚠️  DB Inspector reported issues (exit code: $inspectExitCode)"
+    #     fi
+    # else
+    #     echo "⚠️  Database file not found (pkg/tests/traversal/shared/main_test.db), skipping inspection"
+    # fi
 else
-    echo -e "${RED}Status: FAILED${NC}"
+    echo "Status: FAILED"
 fi
 
 echo ""
 
 exit $exitCode
-

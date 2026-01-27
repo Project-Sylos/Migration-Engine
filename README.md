@@ -254,3 +254,34 @@ This partitioning separates traversal operations (discovery/scanning phase) from
    - Hierarchy is natural and navigable through parent-child ULID relationships
 
 See `pkg/db/README.md` for detailed documentation on the database layer.
+
+---
+
+## Documentation
+
+### Testing Guides
+
+- **[Ephemeral Mode Guide](./docs/EPHEMERAL_MODE_GUIDE.md)** - Complete integration guide for using Spectra's ephemeral mode for testing migrations without database persistence. Includes configuration examples, performance expectations, and troubleshooting.
+
+- **[Ephemeral Mode Quick Reference](./docs/EPHEMERAL_MODE_QUICK_REF.md)** - Quick reference for ephemeral mode configuration templates and common patterns.
+
+### Testing
+
+The Migration Engine includes comprehensive test suites:
+
+- **Traversal Tests**: `pkg/tests/traversal/`
+  - `normal/` - Standard persistent mode tests
+  - `ephemeral/` - Ephemeral mode tests (stateless, large-scale)
+  - `resumption/` - Resume interrupted migrations
+  - `retry_sweep/` - Retry failed tasks with permission changes
+
+- **Copy Tests**: `pkg/tests/copy/` - File content migration tests
+
+Run tests using the provided shell scripts:
+```bash
+# Linux/Mac
+./run.sh
+
+# Windows
+.\run.ps1
+```

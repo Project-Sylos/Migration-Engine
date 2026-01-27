@@ -126,8 +126,11 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 
 	folder := task.Folder
 
-	// List children using the filesystem adapter
-	result, err := w.fsAdapter.ListChildren(folder.ServiceID)
+	// List children using the filesystem adapter.
+	// Pass the folder's depth level - required for SpectraFS in ephemeral mode,
+	// optional for persistent mode and other adapters (they'll ignore it).
+	depth := folder.DepthLevel
+	result, err := w.fsAdapter.ListChildren(folder.ServiceID, &depth)
 	if err != nil {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("error",

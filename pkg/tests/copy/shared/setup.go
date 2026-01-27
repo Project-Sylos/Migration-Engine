@@ -17,6 +17,23 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
+// isEphemeralMode checks if the Spectra config file specifies ephemeral mode.
+func isEphemeralMode(configPath string) (bool, error) {
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		return false, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	var config struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.Unmarshal(configData, &config); err != nil {
+		return false, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	return config.Mode == "ephemeral", nil
+}
+
 // SetupSpectraFS creates a SpectraFS instance, handling DB cleanup appropriately.
 // Since each test run is a separate process, we can't rely on in-memory state.
 // Instead, we check if the DB file exists (from the config) and only clean it if explicitly requested.
@@ -130,12 +147,18 @@ func SetupCopyTest(cleanSpectraDB bool, removeMigrationDB bool) (*db.DB, types.F
 		return nil, nil, nil, err
 	}
 
-	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary")
+	// Check if we're in ephemeral mode
+	isEphemeral, err := isEphemeralMode("pkg/tests/copy/shared/spectra.json")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to check mode: %w", err)
+	}
+
+	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary", isEphemeral)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to create src adapter: %w", err)
 	}
 
-	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1")
+	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1", isEphemeral)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to create dst adapter: %w", err)
 	}

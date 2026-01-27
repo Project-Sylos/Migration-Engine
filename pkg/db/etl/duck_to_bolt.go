@@ -19,12 +19,8 @@ import (
 const (
 	// Default number of workers per queue type for DuckDB reads
 	defaultNumWorkersDuckToBolt = 8
-	// Batch size for BoltDB inserts (rows per transaction)
-	defaultBatchSizeDuckToBolt = 50000
 	// Stream batch size for distributing work to workers
 	streamBatchSizeDuckToBolt = 10000
-	// Performance reporting interval
-	statsReportIntervalDuckToBolt = 3 * time.Second
 )
 
 // DuckNodeRow represents a node row read from DuckDB
@@ -60,49 +56,6 @@ func parseTraversalStatus(duckStatus string) (traversalStatus string, explicitEx
 		// Regular status: pending, successful, failed, not_on_src
 		return duckStatus, false, false
 	}
-}
-
-// duckNodeRowToNodeState converts a DuckDB row to NodeState struct
-func duckNodeRowToNodeState(row DuckNodeRow, queueType string) (*db.NodeState, error) {
-	// Parse traversal status
-	traversalStatus, explicitExcluded, inheritedExcluded := parseTraversalStatus(row.TraversalStatus)
-
-	// Build NodeState
-	ns := &db.NodeState{
-		ID:                row.ID,
-		ServiceID:         row.ServiceID,
-		Name:              row.Name,
-		Path:              row.Path,
-		Type:              row.Type,
-		MTime:             row.MTime,
-		Depth:             int(row.Depth),
-		TraversalStatus:   traversalStatus,
-		ExplicitExcluded:  explicitExcluded,
-		InheritedExcluded: inheritedExcluded,
-	}
-
-	// Handle nullable fields
-	if row.ParentID.Valid {
-		ns.ParentID = row.ParentID.String
-	}
-	if row.ParentServiceID.Valid {
-		ns.ParentServiceID = row.ParentServiceID.String
-	}
-	if row.ParentPath.Valid {
-		ns.ParentPath = row.ParentPath.String
-	}
-
-	// Handle size (nullable)
-	if row.Size.Valid {
-		ns.Size = row.Size.Int64
-	}
-
-	// Handle copy status (SRC only, nullable)
-	if row.CopyStatus.Valid {
-		ns.CopyStatus = row.CopyStatus.String
-	}
-
-	return ns, nil
 }
 
 // MigrateDuckToBolt migrates data from DuckDB to BoltDB
@@ -398,12 +351,6 @@ func migrateNodesWorkerFromDuck(duckDB *sql.DB, nodeIDs []string, queueType stri
 	return nil
 }
 
-// nodeRowWithState holds both NodeRow and NodeState for the writer
-type nodeRowWithState struct {
-	Row   NodeRow
-	State *db.NodeState
-}
-
 // migrateNodesWriterFromDuck periodically flushes the buffer when threshold is reached
 func migrateNodesWriterFromDuck(buffer *nodeBuffer, boltDB *db.DB, queueType string, stats *ETLStats, workersDone <-chan struct{}) error {
 	ticker := time.NewTicker(500 * time.Millisecond)
@@ -419,7 +366,7 @@ func migrateNodesWriterFromDuck(buffer *nodeBuffer, boltDB *db.DB, queueType str
 					continue
 				}
 				batch := buffer.GetAndClear()
-				if batch == nil || len(batch) == 0 {
+				if len(batch) == 0 {
 					return nil
 				}
 				buffer.SetFlushing(true)
@@ -633,241 +580,6 @@ func flushNodeBatchToBolt(boltDB *db.DB, batch []NodeRow, queueType string, stat
 	}
 
 	return nil
-}
-
-// rebuildAuxiliaryStructures rebuilds children buckets, join-lookup tables, and path-to-ULID mappings
-func rebuildAuxiliaryStructures(duckDB *sql.DB, boltDB *db.DB, queueType string, tableName string) error {
-	// Query all nodes with their child_ids, path_hash, and join IDs
-	var joinColumn string
-	if tableName == "src_nodes" {
-		joinColumn = "dst_id"
-	} else {
-		joinColumn = "src_id"
-	}
-
-	query := fmt.Sprintf(`
-		SELECT id, parent_id, child_ids, path_hash, path, %s as join_id
-		FROM %s`, joinColumn, tableName)
-
-	rows, err := duckDB.Query(query)
-	if err != nil {
-		return fmt.Errorf("failed to query nodes for auxiliary structures: %w", err)
-	}
-	defer rows.Close()
-
-	type nodeAuxData struct {
-		ID       string
-		ParentID sql.NullString
-		ChildIDs sql.NullString
-		PathHash string
-		Path     string
-		JoinID   sql.NullString
-	}
-
-	var nodes []nodeAuxData
-	for rows.Next() {
-		var node nodeAuxData
-		if err := rows.Scan(&node.ID, &node.ParentID, &node.ChildIDs, &node.PathHash, &node.Path, &node.JoinID); err != nil {
-			continue
-		}
-		nodes = append(nodes, node)
-	}
-	rows.Close()
-
-	// Rebuild in batches within transactions
-	const batchSize = 10000
-	for i := 0; i < len(nodes); i += batchSize {
-		end := i + batchSize
-		if end > len(nodes) {
-			end = len(nodes)
-		}
-		batch := nodes[i:end]
-
-		if err := boltDB.Update(func(tx *bolt.Tx) error {
-			// Rebuild children buckets
-			childrenBucket, err := getOrCreateChildrenBucket(tx, queueType)
-			if err != nil {
-				return fmt.Errorf("failed to get children bucket: %w", err)
-			}
-
-			// Group children by parent (from child_ids JSON)
-			parentChildren := make(map[string][]string)
-			for _, node := range batch {
-				if node.ChildIDs.Valid && node.ChildIDs.String != "" {
-					var childIDs []string
-					if err := json.Unmarshal([]byte(node.ChildIDs.String), &childIDs); err == nil {
-						// The node.ID is the parent, childIDs are its children
-						parentChildren[node.ID] = childIDs
-					}
-				}
-			}
-
-			// Write children buckets
-			for parentID, childIDs := range parentChildren {
-				// Serialize and write
-				childrenData, err := db.SerializeStringSlice(childIDs)
-				if err != nil {
-					return fmt.Errorf("failed to serialize children: %w", err)
-				}
-				if err := childrenBucket.Put([]byte(parentID), childrenData); err != nil {
-					return fmt.Errorf("failed to write children bucket: %w", err)
-				}
-			}
-
-			// Rebuild path-to-ULID mappings
-			pathBucket, err := db.EnsurePathToULIDBucket(tx, queueType)
-			if err != nil {
-				return fmt.Errorf("failed to get path-to-ulid bucket: %w", err)
-			}
-
-			for _, node := range batch {
-				if node.PathHash != "" {
-					if err := pathBucket.Put([]byte(node.PathHash), []byte(node.ID)); err != nil {
-						return fmt.Errorf("failed to write path-to-ulid mapping: %w", err)
-					}
-				}
-			}
-
-			// Rebuild join-lookup tables
-			for _, node := range batch {
-				if node.JoinID.Valid && node.JoinID.String != "" {
-					if queueType == "SRC" {
-						// SRC -> DST mapping
-						srcToDstBucket, err := db.GetOrCreateSrcToDstBucket(tx)
-						if err != nil {
-							return fmt.Errorf("failed to get src-to-dst bucket: %w", err)
-						}
-						if err := srcToDstBucket.Put([]byte(node.ID), []byte(node.JoinID.String)); err != nil {
-							return fmt.Errorf("failed to write src-to-dst mapping: %w", err)
-						}
-					} else {
-						// DST -> SRC mapping
-						dstToSrcBucket, err := db.GetOrCreateDstToSrcBucket(tx)
-						if err != nil {
-							return fmt.Errorf("failed to get dst-to-src bucket: %w", err)
-						}
-						if err := dstToSrcBucket.Put([]byte(node.ID), []byte(node.JoinID.String)); err != nil {
-							return fmt.Errorf("failed to write dst-to-src mapping: %w", err)
-						}
-					}
-				}
-			}
-
-			return nil
-		}); err != nil {
-			return fmt.Errorf("failed to rebuild auxiliary structures: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// getOrCreateChildrenBucket gets or creates the children bucket
-func getOrCreateChildrenBucket(tx *bolt.Tx, queueType string) (*bolt.Bucket, error) {
-	traversalBucket := tx.Bucket([]byte("Traversal-Data"))
-	if traversalBucket == nil {
-		return nil, fmt.Errorf("Traversal-Data bucket not found")
-	}
-	topBucket := traversalBucket.Bucket([]byte(queueType))
-	if topBucket == nil {
-		return nil, fmt.Errorf("queue bucket %s not found", queueType)
-	}
-	return topBucket.CreateBucketIfNotExists([]byte("children"))
-}
-
-// rebuildCopyStatusBuckets rebuilds copy status buckets for SRC nodes
-func rebuildCopyStatusBuckets(duckDB *sql.DB, boltDB *db.DB) error {
-	// Query SRC nodes with their copy_status, depth, and type
-	query := `SELECT id, depth, type, copy_status FROM src_nodes WHERE copy_status IS NOT NULL`
-
-	rows, err := duckDB.Query(query)
-	if err != nil {
-		return fmt.Errorf("failed to query copy status: %w", err)
-	}
-	defer rows.Close()
-
-	type copyStatusData struct {
-		ID         string
-		Depth      int32
-		Type       string
-		CopyStatus string
-	}
-
-	var nodes []copyStatusData
-	for rows.Next() {
-		var node copyStatusData
-		if err := rows.Scan(&node.ID, &node.Depth, &node.Type, &node.CopyStatus); err != nil {
-			continue
-		}
-		nodes = append(nodes, node)
-	}
-	rows.Close()
-
-	// Group by depth, type, and copy_status for batch processing
-	// depth -> type -> copy_status -> []nodeIDs
-	statusMap := make(map[int]map[string]map[string][]string)
-	for _, node := range nodes {
-		depth := int(node.Depth)
-		if statusMap[depth] == nil {
-			statusMap[depth] = make(map[string]map[string][]string)
-		}
-		if statusMap[depth][node.Type] == nil {
-			statusMap[depth][node.Type] = make(map[string][]string)
-		}
-		statusMap[depth][node.Type][node.CopyStatus] = append(statusMap[depth][node.Type][node.CopyStatus], node.ID)
-	}
-
-	// Rebuild copy status buckets
-	return boltDB.Update(func(tx *bolt.Tx) error {
-		for depth, typeGroups := range statusMap {
-			for nodeType, statusGroups := range typeGroups {
-				// Normalize node type
-				normalizedType := db.NodeTypeFile
-				if nodeType == "folder" {
-					normalizedType = db.NodeTypeFolder
-				}
-
-				for copyStatus, nodeIDs := range statusGroups {
-					// Get or create copy status bucket with node type
-					copyStatusBucket, err := db.GetOrCreateCopyStatusBucket(tx, depth, normalizedType, copyStatus)
-					if err != nil {
-						return fmt.Errorf("failed to get copy status bucket: %w", err)
-					}
-
-					// Add nodes to copy status bucket and update stats
-					for _, nodeID := range nodeIDs {
-						nodeIDBytes := []byte(nodeID)
-						// Check if already exists to avoid double-counting stats
-						alreadyExists := copyStatusBucket.Get(nodeIDBytes) != nil
-						if err := copyStatusBucket.Put(nodeIDBytes, []byte{}); err != nil {
-							return fmt.Errorf("failed to add node to copy status bucket: %w", err)
-						}
-
-						// Update stats only if this is a new entry
-						if !alreadyExists {
-							bucketPath := db.GetCopyStatusBucketPath(depth, normalizedType, copyStatus)
-							if err := db.UpdateBucketStatsInTx(tx, bucketPath, 1); err != nil {
-								return fmt.Errorf("failed to update copy status stats: %w", err)
-							}
-						}
-					}
-
-					// Update copy status-lookup index (no node type needed in lookup)
-					copyLookupBucket, err := db.GetOrCreateCopyStatusLookupBucket(tx, depth)
-					if err != nil {
-						return fmt.Errorf("failed to get copy status-lookup bucket: %w", err)
-					}
-
-					for _, nodeID := range nodeIDs {
-						if err := copyLookupBucket.Put([]byte(nodeID), []byte(copyStatus)); err != nil {
-							return fmt.Errorf("failed to update copy status-lookup: %w", err)
-						}
-					}
-				}
-			}
-		}
-		return nil
-	})
 }
 
 // migrateStatsFromDuck migrates stats from DuckDB to BoltDB
@@ -1132,7 +844,7 @@ func migrateLogsWriterFromDuck(buffer *logBuffer, boltDB *db.DB, stats *ETLStats
 					continue
 				}
 				batch := buffer.GetAndClearSorted()
-				if batch == nil || len(batch) == 0 {
+				if len(batch) == 0 {
 					return nil
 				}
 				buffer.SetFlushing(true)

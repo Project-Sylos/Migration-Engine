@@ -69,6 +69,15 @@ func (d *DuckDB) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	var errs []error
+	
+	// Checkpoint before closing to ensure WAL is flushed and indexes are consistent
+	if d.db != nil {
+		if _, err := d.db.Exec("CHECKPOINT"); err != nil {
+			// Log but don't fail - checkpoint errors are not critical during close
+			fmt.Printf("[ETL] Warning: failed to checkpoint before close: %v\n", err)
+		}
+	}
+	
 	if d.conn != nil {
 		if err := d.conn.Close(); err != nil {
 			errs = append(errs, err)
@@ -305,6 +314,31 @@ func MigrateBoltToDuck(boltDB *db.DB, duckDBPath string, overwrite bool) error {
 		return fmt.Errorf("failed to create indexes: %w", err)
 	}
 
+	// ANALYZE tables to update statistics and stabilize indexes
+	fmt.Println("[ETL] Analyzing tables...")
+	if _, err := duckDB.db.Exec("ANALYZE src_nodes"); err != nil {
+		return fmt.Errorf("failed to analyze src_nodes: %w", err)
+	}
+	if _, err := duckDB.db.Exec("ANALYZE dst_nodes"); err != nil {
+		return fmt.Errorf("failed to analyze dst_nodes: %w", err)
+	}
+	if _, err := duckDB.db.Exec("ANALYZE stats"); err != nil {
+		return fmt.Errorf("failed to analyze stats: %w", err)
+	}
+	if _, err := duckDB.db.Exec("ANALYZE queue_stats"); err != nil {
+		return fmt.Errorf("failed to analyze queue_stats: %w", err)
+	}
+	if _, err := duckDB.db.Exec("ANALYZE logs"); err != nil {
+		return fmt.Errorf("failed to analyze logs: %w", err)
+	}
+
+	// CHECKPOINT to flush WAL and ensure index consistency
+	// This resolves UPDATE constraint violations from bulk Appender loading
+	fmt.Println("[ETL] Checkpointing database...")
+	if _, err := duckDB.db.Exec("CHECKPOINT"); err != nil {
+		return fmt.Errorf("failed to checkpoint database: %w", err)
+	}
+
 	elapsed := time.Since(startTime)
 	fmt.Printf("[ETL] Migration completed in %v\n", elapsed.Round(time.Second))
 
@@ -326,9 +360,10 @@ func dropTables(db *sql.DB) error {
 // createTables creates all table schemas without indexes
 func createTables(db *sql.DB) error {
 	// Create src_nodes table
+	// Note: id uses NOT NULL only (no PRIMARY KEY or UNIQUE constraints) to avoid DuckDB ART index bug #3249
 	srcNodesDDL := `
 		CREATE TABLE src_nodes (
-			id VARCHAR PRIMARY KEY,
+			id VARCHAR NOT NULL,
 			service_id VARCHAR,
 			parent_id VARCHAR,
 			parent_service_id VARCHAR,
@@ -351,9 +386,10 @@ func createTables(db *sql.DB) error {
 	}
 
 	// Create dst_nodes table
+	// Note: id uses NOT NULL only (no PRIMARY KEY or UNIQUE constraints) to avoid DuckDB ART index bug #3249
 	dstNodesDDL := `
 		CREATE TABLE dst_nodes (
-			id VARCHAR PRIMARY KEY,
+			id VARCHAR NOT NULL,
 			service_id VARCHAR,
 			parent_id VARCHAR,
 			parent_service_id VARCHAR,
@@ -376,9 +412,10 @@ func createTables(db *sql.DB) error {
 	}
 
 	// Create stats table
+	// Note: bucket_path uses NOT NULL only (no PRIMARY KEY or UNIQUE constraints) to avoid DuckDB ART index bug #3249
 	statsDDL := `
 		CREATE TABLE stats (
-			bucket_path VARCHAR PRIMARY KEY,
+			bucket_path VARCHAR NOT NULL,
 			count BIGINT
 		)
 	`
@@ -387,9 +424,10 @@ func createTables(db *sql.DB) error {
 	}
 
 	// Create queue_stats table
+	// Note: queue_key uses NOT NULL only (no PRIMARY KEY or UNIQUE constraints) to avoid DuckDB ART index bug #3249
 	queueStatsDDL := `
 		CREATE TABLE queue_stats (
-			queue_key VARCHAR PRIMARY KEY,
+			queue_key VARCHAR NOT NULL,
 			metrics_json VARCHAR
 		)
 	`
@@ -398,9 +436,10 @@ func createTables(db *sql.DB) error {
 	}
 
 	// Create logs table
+	// Note: id uses NOT NULL only (no PRIMARY KEY or UNIQUE constraints) to avoid DuckDB ART index bug #3249
 	logsDDL := `
 		CREATE TABLE logs (
-			id VARCHAR PRIMARY KEY,
+			id VARCHAR NOT NULL,
 			timestamp VARCHAR,
 			level VARCHAR,
 			entity VARCHAR,
@@ -489,9 +528,15 @@ func migrateNodes(boltDB *db.DB, duckDB *DuckDB, queueType string, numWorkers in
 	writerDone := make(chan error, 1)
 	workersDone := make(chan struct{})
 	go func() {
-		defer appender.Close()
 		duckDB.mu.Unlock()
-		writerDone <- migrateNodesWriter(buffer, appender, tableName, stats, workersDone)
+		err := migrateNodesWriter(buffer, appender, tableName, stats, workersDone)
+		
+		// Close appender BEFORE signaling completion to avoid race with index creation
+		if closeErr := appender.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("failed to close appender: %w", closeErr)
+		}
+		
+		writerDone <- err
 	}()
 
 	// Stream node IDs in batches from BoltDB
@@ -962,9 +1007,15 @@ func migrateLogs(boltDB *db.DB, duckDB *DuckDB, numWorkers int) error {
 	writerDone := make(chan error, 1)
 	workersDone := make(chan struct{})
 	go func() {
-		defer appender.Close()
 		duckDB.mu.Unlock()
-		writerDone <- migrateLogsWriter(buffer, appender, stats, workersDone)
+		err := migrateLogsWriter(buffer, appender, stats, workersDone)
+		
+		// Close appender BEFORE signaling completion to avoid race with index creation
+		if closeErr := appender.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("failed to close logs appender: %w", closeErr)
+		}
+		
+		writerDone <- err
 	}()
 
 	// Stream log entries in batches from BoltDB (chronological order)
@@ -1167,8 +1218,15 @@ func flushLogBatch(appender *duckdb.Appender, batch []LogRow, stats *ETLStats) e
 
 // createIndexes creates all indexes after ETL completes
 func createIndexes(db *sql.DB) error {
-	// Indexes for src_nodes
 	indexes := []string{
+		// Regular indexes on ID columns (UNIQUE constraints removed to avoid DuckDB ART index bug #3249)
+		"CREATE INDEX IF NOT EXISTS idx_src_nodes_id ON src_nodes(id)",
+		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_id ON dst_nodes(id)",
+		"CREATE INDEX IF NOT EXISTS idx_stats_bucket_path ON stats(bucket_path)",
+		"CREATE INDEX IF NOT EXISTS idx_queue_stats_queue_key ON queue_stats(queue_key)",
+		"CREATE INDEX IF NOT EXISTS idx_logs_id ON logs(id)",
+
+		// Regular indexes for src_nodes
 		"CREATE INDEX IF NOT EXISTS idx_src_nodes_path_hash ON src_nodes(path_hash)",
 		"CREATE INDEX IF NOT EXISTS idx_src_nodes_parent_id ON src_nodes(parent_id)",
 		"CREATE INDEX IF NOT EXISTS idx_src_nodes_depth ON src_nodes(depth)",
@@ -1176,7 +1234,7 @@ func createIndexes(db *sql.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_src_nodes_path ON src_nodes(path)",
 		"CREATE INDEX IF NOT EXISTS idx_src_nodes_dst_id ON src_nodes(dst_id)",
 
-		// Indexes for dst_nodes
+		// Regular indexes for dst_nodes
 		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_path_hash ON dst_nodes(path_hash)",
 		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_parent_id ON dst_nodes(parent_id)",
 		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_depth ON dst_nodes(depth)",
@@ -1197,5 +1255,6 @@ func createIndexes(db *sql.DB) error {
 		}
 	}
 
+	fmt.Println("[ETL] Indexes created successfully")
 	return nil
 }

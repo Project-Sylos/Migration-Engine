@@ -388,7 +388,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			// Run ETL from BoltDB to DuckDB if not skipped
 			if !cfg.SkipAutoETLAfterTraversal {
 				// Derive DuckDB path from BoltDB path
-				duckDBPath := deriveDuckDBPath(cfg.BoltPath, boltDB)
+				duckDBPath := deriveDuckDBPath(cfg.BoltPath)
 				if duckDBPath != "" {
 					if err := runETLBoltToDuckWithStatus(boltDB, duckDBPath, cfg.YAMLConfig, cfg.ConfigPath); err != nil {
 						// Log error but don't fail the migration - ETL is optional
@@ -472,7 +472,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				// Run ETL from BoltDB to DuckDB if not skipped
 				if !cfg.SkipAutoETLAfterTraversal {
 					// Derive DuckDB path from BoltDB path
-					duckDBPath := deriveDuckDBPath(cfg.BoltPath, boltDB)
+					duckDBPath := deriveDuckDBPath(cfg.BoltPath)
 					if duckDBPath != "" {
 						if err := runETLBoltToDuckWithStatus(boltDB, duckDBPath, cfg.YAMLConfig, cfg.ConfigPath); err != nil {
 							// Log error but don't fail the migration - ETL is optional
@@ -487,7 +487,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				// Run ETL from BoltDB to DuckDB if not skipped
 				if !cfg.SkipAutoETLAfterTraversal {
 					// Derive DuckDB path from BoltDB path
-					duckDBPath := deriveDuckDBPath(cfg.BoltPath, boltDB)
+					duckDBPath := deriveDuckDBPath(cfg.BoltPath)
 					if duckDBPath != "" {
 						if err := runETLBoltToDuckWithStatus(boltDB, duckDBPath, cfg.YAMLConfig, cfg.ConfigPath); err != nil {
 							// Log error but don't fail the migration - ETL is optional
@@ -618,7 +618,7 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 
 // deriveDuckDBPath derives the DuckDB path from the BoltDB path.
 // Returns empty string if BoltDB path is not available.
-func deriveDuckDBPath(boltPath string, boltDB *db.DB) string {
+func deriveDuckDBPath(boltPath string) string {
 	if boltPath != "" {
 		// Replace .db extension with -duck.db
 		if len(boltPath) > 3 && boltPath[len(boltPath)-3:] == ".db" {
