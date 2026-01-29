@@ -161,6 +161,8 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	// Set initial rounds to 0 for retry sweep
 	srcQueue.SetRound(0)
 	dstQueue.SetRound(0)
+	srcQueue.EnsureRoundExpectedFromStats()
+	dstQueue.EnsureRoundExpectedFromStats()
 
 	// Give queues a moment to start
 	time.Sleep(100 * time.Millisecond)

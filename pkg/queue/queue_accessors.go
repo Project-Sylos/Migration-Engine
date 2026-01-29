@@ -455,13 +455,6 @@ func (q *Queue) incrementRoundStatsCompleted(round int) {
 	stats.Completed++
 }
 
-func (q *Queue) incrementRoundStatsExpected(round int) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	stats := q.getOrCreateRoundStatsUnlocked(round)
-	stats.Expected++
-}
-
 func (q *Queue) incrementRoundStatsFailed(round int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -475,6 +468,50 @@ func (q *Queue) getOrCreateRoundStatsUnlocked(round int) *RoundStats {
 		q.roundStats[round] = &RoundStats{}
 	}
 	return q.roundStats[round]
+}
+
+// setExpectedFromStatsBucket sets roundStats[round].Expected from the stats bucket (O(1) lookup).
+// Round 0 for traversal/retry is always 1; otherwise uses pending count from BoltDB.
+// Used at the start of each round so Expected reflects actual DB state and survives restarts.
+func (q *Queue) setExpectedFromStatsBucket(round int) {
+	boltDB := q.getBoltDB()
+	if boltDB == nil {
+		return
+	}
+	mode := q.getMode()
+	var expected int
+	switch mode {
+	case QueueModeTraversal:
+		if round == 0 {
+			expected = 1
+		} else {
+			count, err := boltDB.CountStatusBucket(getQueueType(q.name), round, db.StatusPending)
+			if err == nil {
+				expected = count
+			}
+		}
+	case QueueModeRetry:
+		count, err := boltDB.CountStatusBucket(getQueueType(q.name), round, db.StatusPending)
+		if err == nil {
+			expected = count
+		}
+	case QueueModeCopy:
+		copyPass := q.getCopyPass()
+		nodeType := db.NodeTypeFolder
+		if copyPass == 2 {
+			nodeType = db.NodeTypeFile
+		}
+		count, err := boltDB.CountCopyStatusBucket(round, nodeType, db.CopyStatusPending)
+		if err == nil {
+			expected = count
+		}
+	default:
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	stats := q.getOrCreateRoundStatsUnlocked(round)
+	stats.Expected = expected
 }
 
 func (q *Queue) appendExecutionTimeDelta(delta time.Duration) {

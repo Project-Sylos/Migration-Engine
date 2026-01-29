@@ -105,6 +105,7 @@ func (q *Queue) CheckCopyCompletion(currentRound int, wasFirstPull bool) bool {
 			}
 
 			q.setRound(minLevel) // Set to minimum pending level for pass 2
+			q.setExpectedFromStatsBucket(minLevel)
 
 			if logservice.LS != nil {
 				_ = logservice.LS.Log("info", fmt.Sprintf("Copy pass 1 (folders) complete, switching to pass 2 (files) at round %d", minLevel), "queue", q.name, q.name)
@@ -214,6 +215,7 @@ func (q *Queue) AdvanceCopyRound() {
 
 	// Get stats for logging
 	q.setRound(newRound)
+	q.setExpectedFromStatsBucket(newRound)
 
 	passName := "folders"
 	if copyPass == 2 {

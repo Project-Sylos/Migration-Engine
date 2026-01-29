@@ -342,11 +342,15 @@ func (op *PathToULIDMappingOperation) Execute(tx *bolt.Tx) error {
 
 // OutputBuffer batches write operations for efficient database writes.
 // It supports three flush triggers: forced, size threshold, and time-based.
+// Backpressure: workers block when buffer reaches maxSize (2x batchSize) and resume when it drains.
 type OutputBuffer struct {
 	db          *DB
 	mu          sync.Mutex
+	cond        *sync.Cond   // Condition variable for backpressure signaling
 	operations  []WriteOperation
 	batchSize   int
+	maxSize     int          // Backpressure threshold (2 * batchSize)
+	resumeSize  int          // Resume threshold (batchSize)
 	flushTicker *time.Ticker
 	stopChan    chan struct{}
 	wg          sync.WaitGroup
@@ -355,15 +359,19 @@ type OutputBuffer struct {
 }
 
 // NewOutputBuffer creates a new output buffer that will flush every N operations or every interval.
+// Backpressure is applied when buffer reaches 2x batchSize; workers resume when it drains to batchSize.
 func NewOutputBuffer(db *DB, batchSize int, flushInterval time.Duration) *OutputBuffer {
 	ob := &OutputBuffer{
 		db:          db,
 		operations:  make([]WriteOperation, 0, batchSize),
 		batchSize:   batchSize,
+		maxSize:     2 * batchSize, // Backpressure threshold
+		resumeSize:  batchSize,     // Resume threshold
 		flushTicker: time.NewTicker(flushInterval),
 		stopChan:    make(chan struct{}),
 		paused:      false,
 	}
+	ob.cond = sync.NewCond(&ob.mu)
 
 	ob.wg.Add(1)
 	go ob.flushLoop()
@@ -493,6 +501,7 @@ func (ob *OutputBuffer) AddPathToULIDMapping(queueType string, path string, node
 
 // AddMultiple adds multiple operations to the buffer atomically.
 // This prevents flushes from happening between related operations (e.g., status update + batch insert).
+// Blocks if buffer is at or above maxSize (backpressure) until buffer is drained.
 // All operations are added before checking if a flush is needed.
 func (ob *OutputBuffer) AddMultiple(ops []WriteOperation) {
 	if len(ops) == 0 {
@@ -500,6 +509,10 @@ func (ob *OutputBuffer) AddMultiple(ops []WriteOperation) {
 	}
 
 	ob.mu.Lock()
+	// Block if buffer is at or above maxSize (backpressure)
+	for len(ob.operations) >= ob.maxSize {
+		ob.cond.Wait()
+	}
 	// Add all operations at once
 	ob.operations = append(ob.operations, ops...)
 	shouldFlush := len(ob.operations) >= ob.batchSize
@@ -511,9 +524,14 @@ func (ob *OutputBuffer) AddMultiple(ops []WriteOperation) {
 }
 
 // Add adds a write operation to the buffer. If batch size is reached, it triggers a flush.
+// Blocks if buffer is at or above maxSize (backpressure) until buffer is drained.
 // No deduplication happens here - that's done per-bucket during flush.
 func (ob *OutputBuffer) Add(op WriteOperation) {
 	ob.mu.Lock()
+	// Block if buffer is at or above maxSize (backpressure)
+	for len(ob.operations) >= ob.maxSize {
+		ob.cond.Wait()
+	}
 	ob.operations = append(ob.operations, op)
 	shouldFlush := len(ob.operations) >= ob.batchSize
 	ob.mu.Unlock()
@@ -541,6 +559,9 @@ func (ob *OutputBuffer) Flush() {
 	batch := make([]WriteOperation, len(ob.operations))
 	copy(batch, ob.operations)
 	ob.operations = make([]WriteOperation, 0, ob.batchSize)
+
+	// Wake any workers blocked by backpressure (buffer is now empty, below resumeSize)
+	ob.cond.Broadcast()
 
 	// Flushing operations to BoltDB
 

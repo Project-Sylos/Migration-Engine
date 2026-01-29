@@ -937,12 +937,10 @@ func (q *Queue) RoundStats(round int) *RoundStats {
 	return q.getRoundStats(round)
 }
 
-// IncrementExpected increments the expected task count for a specific round.
-// This is used to initialize Expected count (e.g., for root tasks).
-func (q *Queue) IncrementExpected(round int, count int) {
-	for i := 0; i < count; i++ {
-		q.incrementRoundStatsExpected(round)
-	}
+// EnsureRoundExpectedFromStats sets Expected for the current round from the stats bucket (O(1) lookup).
+// Call after SetRound (e.g. on init or resume) so Expected reflects actual pending count and survives restarts.
+func (q *Queue) EnsureRoundExpectedFromStats() {
+	q.setExpectedFromStatsBucket(q.getRound())
 }
 
 // AddWorker registers a worker with this queue for reference.

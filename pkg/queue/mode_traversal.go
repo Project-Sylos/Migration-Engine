@@ -322,11 +322,6 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 				}
 			}
 		}
-
-		// Increment expected count for folder children (only folders need traversal)
-		if !child.IsFile {
-			q.incrementRoundStatsExpected(nextRound)
-		}
 	}
 
 	// Handle DST queue special case: create tasks for child folders
@@ -418,11 +413,6 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 							}
 						}
 					}
-				}
-
-				// Only increment round stats for pending folders
-				if child.status == db.StatusPending {
-					q.incrementRoundStatsExpected(nextRound)
 				}
 			}
 		}
@@ -617,6 +607,7 @@ func (q *Queue) AdvanceTraversalRound() {
 
 	// Get stats for logging
 	q.setRound(newRound)
+	q.setExpectedFromStatsBucket(newRound)
 
 	// Reset lastPullWasPartial since we're advancing to a new round
 	q.setLastPullWasPartial(false)

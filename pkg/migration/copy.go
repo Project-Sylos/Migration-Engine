@@ -94,6 +94,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		minLevel = 1
 	}
 	copyQueue.SetRound(minLevel) // Set initial round
+	copyQueue.EnsureRoundExpectedFromStats()
 
 	// CRITICAL: Ensure root folder (level 0) has join-lookup mapping
 	// Items at level 1 will look up their parent (root) in the join-lookup table

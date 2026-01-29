@@ -584,13 +584,9 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 	srcQueue.SetRound(srcRound)
 	dstQueue.SetRound(dstRound)
 
-	// Initialize Expected count for round 0 (root task exists)
-	if srcRound == 0 {
-		srcQueue.IncrementExpected(0, 1)
-	}
-	if dstRound == 0 {
-		dstQueue.IncrementExpected(0, 1)
-	}
+	// Set Expected from stats bucket (O(1) per queue; round 0 = 1 for traversal)
+	srcQueue.EnsureRoundExpectedFromStats()
+	dstQueue.EnsureRoundExpectedFromStats()
 
 	// Update coordinator state
 	if coordinator != nil {
