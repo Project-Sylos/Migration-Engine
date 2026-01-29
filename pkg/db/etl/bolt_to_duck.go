@@ -10,6 +10,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -37,10 +39,39 @@ type DuckDB struct {
 	dbPath string
 }
 
-// OpenDuckDB opens or creates a DuckDB database
+// DuckDB configuration constants
+const (
+	// Default memory limit for DuckDB (prevents OOM on large ETL operations)
+	defaultMemoryLimit = "4GB"
+	// Number of threads for DuckDB (low to avoid contention during ETL)
+	defaultThreads = 2
+)
+
+// OpenDuckDB opens or creates a DuckDB database with memory and thread limits configured.
+// This prevents DuckDB from consuming excessive memory during large ETL operations.
 func OpenDuckDB(dbPath string) (*DuckDB, error) {
-	// Create connector first - this will be used for both sql.DB and Appender API
-	connector, err := duckdb.NewConnector(dbPath, nil)
+	// Use system temp directory for DuckDB spill files
+	tempDir := filepath.Join(os.TempDir(), "duckdb_temp")
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create temp directory for DuckDB: %w", err)
+	}
+
+	// Create connector with initialization function to configure memory limits
+	// This runs SET commands on each new connection before it's used
+	connector, err := duckdb.NewConnector(dbPath, func(execer driver.ExecerContext) error {
+		ctx := context.Background()
+		initQueries := []string{
+			fmt.Sprintf("SET memory_limit = '%s'", defaultMemoryLimit),
+			fmt.Sprintf("SET threads TO %d", defaultThreads),
+			fmt.Sprintf("SET temp_directory = '%s'", tempDir),
+		}
+		for _, query := range initQueries {
+			if _, err := execer.ExecContext(ctx, query, nil); err != nil {
+				return fmt.Errorf("failed to execute init query %q: %w", query, err)
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create DuckDB connector: %w", err)
 	}
@@ -56,6 +87,9 @@ func OpenDuckDB(dbPath string) (*DuckDB, error) {
 		connector.Close()
 		return nil, fmt.Errorf("failed to connect to DuckDB: %w", err)
 	}
+
+	fmt.Printf("[ETL] DuckDB opened with memory_limit=%s, threads=%d, temp_directory=%s\n",
+		defaultMemoryLimit, defaultThreads, tempDir)
 
 	return &DuckDB{
 		db:     sqlDB,
