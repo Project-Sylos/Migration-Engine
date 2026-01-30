@@ -104,34 +104,30 @@ func MigrateDuckToBolt(boltDB *db.DB, duckDBPath string) error {
 	return nil
 }
 
-// migrateNodesFromDuck migrates nodes from DuckDB to BoltDB using streaming worker pools
+// migrateNodesFromDuck migrates nodes from DuckDB to BoltDB using streaming worker pools.
+// Reads from separate SRC/DST table sets: {prefix}_nodes_core, {prefix}_nodes_status, etc.
 func migrateNodesFromDuck(duckDB *DuckDB, boltDB *db.DB, queueType string, numWorkers int) error {
-	// Determine table name
-	tableName := "src_nodes"
+	// Compute table prefix from queue type
+	prefix := "src"
 	if queueType == "DST" {
-		tableName = "dst_nodes"
+		prefix = "dst"
 	}
 
-	// Create buffer for this queue type (reuse NodeRow from bolt_to_duck.go)
-	buffer := NewNodeBuffer(tableName)
-
-	// Create stats tracker
+	buffer := NewNodeBuffer(prefix + "_nodes_core")
 	stats := newETLStats(queueType)
 
-	// Channel to stream batches of node IDs to workers
 	idBatches := make(chan []string, numWorkers*2)
 
 	var wg sync.WaitGroup
 	var workerErr error
 	var workerErrMu sync.Mutex
 
-	// Start workers
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for batch := range idBatches {
-				if err := migrateNodesWorkerFromDuck(duckDB.db, batch, queueType, tableName, buffer, stats); err != nil {
+				if err := migrateNodesWorkerFromDuck(duckDB.db, batch, queueType, prefix, buffer, stats); err != nil {
 					workerErrMu.Lock()
 					if workerErr == nil {
 						workerErr = err
@@ -142,15 +138,14 @@ func migrateNodesFromDuck(duckDB *DuckDB, boltDB *db.DB, queueType string, numWo
 		}()
 	}
 
-	// Start writer goroutine
 	writerDone := make(chan error, 1)
 	workersDone := make(chan struct{})
 	go func() {
 		writerDone <- migrateNodesWriterFromDuck(buffer, boltDB, queueType, stats, workersDone)
 	}()
 
-	// Stream node IDs in batches from DuckDB
-	query := fmt.Sprintf("SELECT id FROM %s", tableName)
+	// Stream node IDs from {prefix}_nodes_core (no queue filter needed - table is queue-specific)
+	query := fmt.Sprintf("SELECT id FROM %s_nodes_core", prefix)
 	rows, err := duckDB.db.Query(query)
 	if err != nil {
 		close(idBatches)
@@ -208,8 +203,9 @@ func migrateNodesFromDuck(duckDB *DuckDB, boltDB *db.DB, queueType string, numWo
 	return nil
 }
 
-// migrateNodesWorkerFromDuck processes a batch of node IDs and adds rows to buffer
-func migrateNodesWorkerFromDuck(duckDB *sql.DB, nodeIDs []string, queueType string, tableName string, buffer *nodeBuffer, stats *ETLStats) error {
+// migrateNodesWorkerFromDuck processes a batch of node IDs by joining the five narrow tables.
+// Uses prefixed table names (src_nodes_* or dst_nodes_*) based on the prefix parameter.
+func migrateNodesWorkerFromDuck(duckDB *sql.DB, nodeIDs []string, queueType string, prefix string, buffer *nodeBuffer, stats *ETLStats) error {
 	processed := int64(0)
 	defer func() {
 		stats.AddProcessed(processed)
@@ -219,28 +215,23 @@ func migrateNodesWorkerFromDuck(duckDB *sql.DB, nodeIDs []string, queueType stri
 		return nil
 	}
 
-	// Build query with IN clause - select appropriate join column based on table
-	// src_nodes has dst_id, dst_nodes has src_id
-	var joinColumn string
-	if tableName == "src_nodes" {
-		joinColumn = "dst_id"
-	} else {
-		joinColumn = "src_id"
-	}
-
+	// Join {prefix}_nodes_core + {prefix}_nodes_status + ... on path (path is unique per table)
 	query := fmt.Sprintf(`
-		SELECT id, service_id, parent_id, parent_service_id, parent_path, name, path, path_hash,
-		       child_ids, type, size, mtime, depth, traversal_status, copy_status, %s
-		FROM %s
-		WHERE id IN (`, joinColumn, tableName)
-
-	args := make([]interface{}, len(nodeIDs))
+		SELECT c.id, c.service_id, c.parent_id, c.parent_service_id, c.parent_path, t.name, c.path, c.path_hash,
+		       ch.child_ids, c.type, m.size, m.mtime, c.depth, s.traversal_status, s.copy_status, c.join_id
+		FROM %s_nodes_core c
+		JOIN %s_nodes_status s ON c.path = s.path
+		JOIN %s_nodes_metrics m ON c.path = m.path
+		JOIN %s_nodes_text t ON c.path = t.path
+		JOIN %s_nodes_children ch ON c.path = ch.path
+		WHERE c.id IN (`, prefix, prefix, prefix, prefix, prefix)
+	args := make([]interface{}, 0, len(nodeIDs))
 	for i, nodeID := range nodeIDs {
 		if i > 0 {
 			query += ", "
 		}
 		query += "?"
-		args[i] = nodeID
+		args = append(args, nodeID)
 	}
 	query += ")"
 
@@ -253,6 +244,9 @@ func migrateNodesWorkerFromDuck(duckDB *sql.DB, nodeIDs []string, queueType stri
 	for rows.Next() {
 		var row DuckNodeRow
 		var joinID sql.NullString
+		var childIDs sql.NullString
+		var size sql.NullInt64
+		var copyStatus sql.NullString
 
 		err := rows.Scan(
 			&row.ID,
@@ -263,31 +257,29 @@ func migrateNodesWorkerFromDuck(duckDB *sql.DB, nodeIDs []string, queueType stri
 			&row.Name,
 			&row.Path,
 			&row.PathHash,
-			&row.ChildIDs,
+			&childIDs,
 			&row.Type,
-			&row.Size,
+			&size,
 			&row.MTime,
 			&row.Depth,
 			&row.TraversalStatus,
-			&row.CopyStatus,
+			&copyStatus,
 			&joinID,
 		)
 		if err != nil {
-			continue // Skip invalid rows
+			continue
 		}
-
-		// Set the join ID in the appropriate field based on queue type
+		row.ChildIDs = childIDs
+		row.Size = size
+		row.CopyStatus = copyStatus
 		if joinID.Valid {
-			joinIDStr := joinID.String
 			if queueType == "SRC" {
-				row.DstID = sql.NullString{String: joinIDStr, Valid: true}
+				row.DstID = sql.NullString{String: joinID.String, Valid: true}
 			} else {
-				row.SrcID = sql.NullString{String: joinIDStr, Valid: true}
+				row.SrcID = sql.NullString{String: joinID.String, Valid: true}
 			}
 		}
 
-		// Store original traversal_status (we'll parse it again in the writer to get exclusion flags)
-		// Convert to NodeRow for buffer (reuse NodeRow struct from bolt_to_duck.go)
 		nodeRow := NodeRow{
 			ID:              row.ID,
 			ServiceID:       row.ServiceID,
@@ -302,13 +294,11 @@ func migrateNodesWorkerFromDuck(duckDB *sql.DB, nodeIDs []string, queueType stri
 			Size:            nil,
 			MTime:           row.MTime,
 			Depth:           int(row.Depth),
-			TraversalStatus: row.TraversalStatus, // Store original status, will parse in writer
+			TraversalStatus: row.TraversalStatus,
 			CopyStatus:      "",
 			DstID:           nil,
 			SrcID:           nil,
 		}
-
-		// Handle nullable fields
 		if row.ParentID.Valid {
 			nodeRow.ParentID = row.ParentID.String
 		}
@@ -329,17 +319,13 @@ func migrateNodesWorkerFromDuck(duckDB *sql.DB, nodeIDs []string, queueType stri
 			nodeRow.CopyStatus = row.CopyStatus.String
 		}
 		if row.DstID.Valid {
-			dstIDVal := row.DstID.String
-			nodeRow.DstID = &dstIDVal
+			v := row.DstID.String
+			nodeRow.DstID = &v
 		}
 		if row.SrcID.Valid {
-			srcIDVal := row.SrcID.String
-			nodeRow.SrcID = &srcIDVal
+			v := row.SrcID.String
+			nodeRow.SrcID = &v
 		}
-
-		// Store NodeState in a way the writer can access it
-		// We'll need to modify the buffer or pass NodeState separately
-		// For now, let's create a struct that holds both
 		buffer.Add(nodeRow)
 		processed++
 	}
@@ -347,7 +333,6 @@ func migrateNodesWorkerFromDuck(duckDB *sql.DB, nodeIDs []string, queueType stri
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("error iterating rows: %w", err)
 	}
-
 	return nil
 }
 

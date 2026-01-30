@@ -259,7 +259,7 @@ func verifyETLSampled(duckDB *sql.DB, boltDB *db.DB, sampleSize int) (*Verificat
 
 	// Sample nodes from DuckDB (source) and verify they exist in BoltDB (result)
 	fmt.Printf("  Sampling %d random SRC nodes from DuckDB...\n", sampleSize)
-	srcNodeIDs, err := getRandomNodeIDsFromDuck(duckDB, "src_nodes", sampleSize)
+	srcNodeIDs, err := getRandomNodeIDsFromDuck(duckDB, "SRC", sampleSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to sample SRC nodes from DuckDB: %w", err)
 	}
@@ -287,7 +287,7 @@ func verifyETLSampled(duckDB *sql.DB, boltDB *db.DB, sampleSize int) (*Verificat
 
 	// Sample nodes from DuckDB (source) and verify they exist in BoltDB (result)
 	fmt.Printf("  Sampling %d random DST nodes from DuckDB...\n", sampleSize)
-	dstNodeIDs, err := getRandomNodeIDsFromDuck(duckDB, "dst_nodes", sampleSize)
+	dstNodeIDs, err := getRandomNodeIDsFromDuck(duckDB, "DST", sampleSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to sample DST nodes from DuckDB: %w", err)
 	}
@@ -318,10 +318,14 @@ func verifyETLSampled(duckDB *sql.DB, boltDB *db.DB, sampleSize int) (*Verificat
 
 // Helper functions
 
-// getRandomNodeIDsFromDuck samples random node IDs from DuckDB table
-func getRandomNodeIDsFromDuck(duckDB *sql.DB, tableName string, sampleSize int) ([]string, error) {
-	// Get all IDs
-	rows, err := duckDB.Query(fmt.Sprintf("SELECT id FROM %s", tableName))
+// getRandomNodeIDsFromDuck samples random node IDs from DuckDB for the given queue ("SRC" or "DST").
+// Uses separate table names: src_nodes_core or dst_nodes_core.
+func getRandomNodeIDsFromDuck(duckDB *sql.DB, queueType string, sampleSize int) ([]string, error) {
+	prefix := "src"
+	if queueType == "DST" {
+		prefix = "dst"
+	}
+	rows, err := duckDB.Query(fmt.Sprintf("SELECT id FROM %s_nodes_core", prefix))
 	if err != nil {
 		return nil, fmt.Errorf("failed to query DuckDB node IDs: %w", err)
 	}

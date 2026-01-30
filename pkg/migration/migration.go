@@ -621,13 +621,13 @@ func validateRootNodesExist(srcAdapter, dstAdapter types.FSAdapter, srcRoot, dst
 	// Try to list children of the source root - if it doesn't exist, this will fail
 	// Root nodes are at depth 0
 	depth := 0
-	_, err := srcAdapter.ListChildren(srcRoot.ServiceID, &depth)
+	_, err := srcAdapter.ListChildren(srcRoot.ServiceID, &depth, srcRoot.LocationPath)
 	if err != nil {
 		return fmt.Errorf("source root node '%s' does not exist in filesystem: %w", srcRoot.ServiceID, err)
 	}
 
 	// Try to list children of the destination root - if it doesn't exist, this will fail
-	_, err = dstAdapter.ListChildren(dstRoot.ServiceID, &depth)
+	_, err = dstAdapter.ListChildren(dstRoot.ServiceID, &depth, dstRoot.LocationPath)
 	if err != nil {
 		return fmt.Errorf("destination root node '%s' does not exist in filesystem: %w", dstRoot.ServiceID, err)
 	}

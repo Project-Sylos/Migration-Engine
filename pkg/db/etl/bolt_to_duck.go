@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -24,7 +25,7 @@ const (
 	// Default number of workers per queue type
 	defaultNumWorkers = 8
 	// Batch size for DuckDB inserts (rows per transaction)
-	defaultBatchSize = 100000
+	defaultBatchSize = 50000
 	// Stream batch size for distributing work to workers
 	streamBatchSize = 10000
 	// Performance reporting interval
@@ -41,7 +42,8 @@ type DuckDB struct {
 
 // DuckDB configuration constants
 const (
-	// Default memory limit for DuckDB (prevents OOM on large ETL operations)
+	// Default memory limit for DuckDB. Ingestion is bounded by appender.Flush();
+	// index creation is the peak memory phase and needs headroom (e.g. 20M-row index build).
 	defaultMemoryLimit = "4GB"
 	// Number of threads for DuckDB (low to avoid contention during ETL)
 	defaultThreads = 2
@@ -342,19 +344,62 @@ func MigrateBoltToDuck(boltDB *db.DB, duckDBPath string, overwrite bool) error {
 		return fmt.Errorf("failed to migrate logs: %w", err)
 	}
 
+	// Use a dedicated connection for index creation so we can raise threads for this phase only
+	ctx := context.Background()
+	conn, err := duckDB.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get connection for index creation: %w", err)
+	}
+	defer conn.Close()
+
+	// CHECKPOINT before index creation to flush state and free memory for index builds
+	fmt.Println("[ETL] Checkpointing before index creation...")
+	if _, err := conn.ExecContext(ctx, "CHECKPOINT"); err != nil {
+		return fmt.Errorf("failed to checkpoint before index creation: %w", err)
+	}
+
+	// Raise memory limit and threads for index creation (increase memory 2GB -> 4GB)
+	indexThreads := runtime.NumCPU()
+	if indexThreads < 2 {
+		indexThreads = 2
+	}
+	if indexThreads > 16 {
+		indexThreads = 16
+	}
+	indexMemoryLimit := "4GB"
+
+	fmt.Printf("[ETL] Setting memory_limit to %s and threads to %d for index creation...\n", indexMemoryLimit, indexThreads)
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET memory_limit = '%s'", indexMemoryLimit)); err != nil {
+		return fmt.Errorf("failed to set memory_limit for index creation: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET threads TO %d", indexThreads)); err != nil {
+		return fmt.Errorf("failed to set threads for index creation: %w", err)
+	}
+
 	// Create indexes after all data is loaded
 	fmt.Println("[ETL] Creating indexes...")
-	if err := createIndexes(duckDB.db); err != nil {
+	if err := createIndexes(ctx, conn); err != nil {
 		return fmt.Errorf("failed to create indexes: %w", err)
+	}
+
+	// Restore threads and memory limit to default for any subsequent use of this connection
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET threads TO %d", defaultThreads)); err != nil {
+		return fmt.Errorf("failed to restore threads after index creation: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET memory_limit = '%s'", defaultMemoryLimit)); err != nil {
+		return fmt.Errorf("failed to restore memory_limit after index creation: %w", err)
 	}
 
 	// ANALYZE tables to update statistics and stabilize indexes
 	fmt.Println("[ETL] Analyzing tables...")
-	if _, err := duckDB.db.Exec("ANALYZE src_nodes"); err != nil {
-		return fmt.Errorf("failed to analyze src_nodes: %w", err)
+	nodeTables := []string{
+		"src_nodes_core", "src_nodes_status", "src_nodes_metrics", "src_nodes_text", "src_nodes_children",
+		"dst_nodes_core", "dst_nodes_status", "dst_nodes_metrics", "dst_nodes_text", "dst_nodes_children",
 	}
-	if _, err := duckDB.db.Exec("ANALYZE dst_nodes"); err != nil {
-		return fmt.Errorf("failed to analyze dst_nodes: %w", err)
+	for _, table := range nodeTables {
+		if _, err := duckDB.db.Exec(fmt.Sprintf("ANALYZE %s", table)); err != nil {
+			return fmt.Errorf("failed to analyze %s: %w", table, err)
+		}
 	}
 	if _, err := duckDB.db.Exec("ANALYZE stats"); err != nil {
 		return fmt.Errorf("failed to analyze stats: %w", err)
@@ -379,9 +424,17 @@ func MigrateBoltToDuck(boltDB *db.DB, duckDBPath string, overwrite bool) error {
 	return nil
 }
 
-// dropTables drops all tables if they exist
+// dropTables drops all tables if they exist.
+// Node data lives in separate SRC and DST table sets (5 tables each).
 func dropTables(db *sql.DB) error {
-	tables := []string{"src_nodes", "dst_nodes", "stats", "queue_stats", "logs"}
+	tables := []string{
+		// SRC tables (drop in reverse dependency order)
+		"src_nodes_children", "src_nodes_text", "src_nodes_metrics", "src_nodes_status", "src_nodes_core",
+		// DST tables (drop in reverse dependency order)
+		"dst_nodes_children", "dst_nodes_text", "dst_nodes_metrics", "dst_nodes_status", "dst_nodes_core",
+		// Other tables
+		"stats", "queue_stats", "logs",
+	}
 	for _, table := range tables {
 		query := fmt.Sprintf("DROP TABLE IF EXISTS %s", table)
 		if _, err := db.Exec(query); err != nil {
@@ -391,58 +444,90 @@ func dropTables(db *sql.DB) error {
 	return nil
 }
 
-// createTables creates all table schemas without indexes
-func createTables(db *sql.DB) error {
-	// Create src_nodes table
-	// Note: id uses NOT NULL only (no PRIMARY KEY or UNIQUE constraints) to avoid DuckDB ART index bug #3249
-	srcNodesDDL := `
-		CREATE TABLE src_nodes (
+// createNodeTablesForQueue creates the 5 narrow node tables for a given queue prefix (src or dst).
+// Path is the unique key within each table set.
+func createNodeTablesForQueue(db *sql.DB, prefix string) error {
+	// {prefix}_nodes_core: identity, joins, tree structure. Path is unique within this queue.
+	// join_id holds dst_id (for src tables) or src_id (for dst tables).
+	coreDDL := fmt.Sprintf(`
+		CREATE TABLE %s_nodes_core (
+			path VARCHAR NOT NULL,
 			id VARCHAR NOT NULL,
-			service_id VARCHAR,
-			parent_id VARCHAR,
-			parent_service_id VARCHAR,
 			parent_path VARCHAR,
-			name VARCHAR,
-			path VARCHAR,
-			path_hash VARCHAR,
-			child_ids VARCHAR,
+			parent_id VARCHAR,
+			service_id VARCHAR,
+			parent_service_id VARCHAR,
 			type VARCHAR,
-			size BIGINT,
-			mtime VARCHAR,
 			depth INTEGER,
-			traversal_status VARCHAR,
-			copy_status VARCHAR,
-			dst_id VARCHAR
+			path_hash VARCHAR,
+			join_id VARCHAR
 		)
-	`
-	if _, err := db.Exec(srcNodesDDL); err != nil {
-		return fmt.Errorf("failed to create src_nodes table: %w", err)
+	`, prefix)
+	if _, err := db.Exec(coreDDL); err != nil {
+		return fmt.Errorf("failed to create %s_nodes_core table: %w", prefix, err)
 	}
 
-	// Create dst_nodes table
-	// Note: id uses NOT NULL only (no PRIMARY KEY or UNIQUE constraints) to avoid DuckDB ART index bug #3249
-	dstNodesDDL := `
-		CREATE TABLE dst_nodes (
-			id VARCHAR NOT NULL,
-			service_id VARCHAR,
-			parent_id VARCHAR,
-			parent_service_id VARCHAR,
-			parent_path VARCHAR,
-			name VARCHAR,
-			path VARCHAR,
-			path_hash VARCHAR,
-			child_ids VARCHAR,
-			type VARCHAR,
-			size BIGINT,
-			mtime VARCHAR,
-			depth INTEGER,
+	// {prefix}_nodes_status: traversal and copy status only.
+	statusDDL := fmt.Sprintf(`
+		CREATE TABLE %s_nodes_status (
+			path VARCHAR NOT NULL,
 			traversal_status VARCHAR,
-			copy_status VARCHAR,
-			src_id VARCHAR
+			copy_status VARCHAR
 		)
-	`
-	if _, err := db.Exec(dstNodesDDL); err != nil {
-		return fmt.Errorf("failed to create dst_nodes table: %w", err)
+	`, prefix)
+	if _, err := db.Exec(statusDDL); err != nil {
+		return fmt.Errorf("failed to create %s_nodes_status table: %w", prefix, err)
+	}
+
+	// {prefix}_nodes_metrics: numeric and sortable fields.
+	metricsDDL := fmt.Sprintf(`
+		CREATE TABLE %s_nodes_metrics (
+			path VARCHAR NOT NULL,
+			size BIGINT,
+			mtime VARCHAR
+		)
+	`, prefix)
+	if _, err := db.Exec(metricsDDL); err != nil {
+		return fmt.Errorf("failed to create %s_nodes_metrics table: %w", prefix, err)
+	}
+
+	// {prefix}_nodes_text: searchable text. path_text duplicates path for LIKE/search use.
+	textDDL := fmt.Sprintf(`
+		CREATE TABLE %s_nodes_text (
+			path VARCHAR NOT NULL,
+			name VARCHAR,
+			path_text VARCHAR
+		)
+	`, prefix)
+	if _, err := db.Exec(textDDL); err != nil {
+		return fmt.Errorf("failed to create %s_nodes_text table: %w", prefix, err)
+	}
+
+	// {prefix}_nodes_children: children relationships.
+	childrenDDL := fmt.Sprintf(`
+		CREATE TABLE %s_nodes_children (
+			path VARCHAR NOT NULL,
+			child_ids VARCHAR
+		)
+	`, prefix)
+	if _, err := db.Exec(childrenDDL); err != nil {
+		return fmt.Errorf("failed to create %s_nodes_children table: %w", prefix, err)
+	}
+
+	return nil
+}
+
+// createTables creates all table schemas without indexes.
+// Node data is split into separate SRC and DST table sets (5 tables each).
+func createTables(db *sql.DB) error {
+	// Create SRC node tables
+	if err := createNodeTablesForQueue(db, "src"); err != nil {
+		return err
+	}
+
+	// Create DST node tables
+	if err := createNodeTablesForQueue(db, "dst"); err != nil {
+		return err
 	}
 
 	// Create stats table
@@ -491,7 +576,7 @@ func createTables(db *sql.DB) error {
 
 // transformTraversalStatus transforms NodeState status fields into traversal_status string
 func transformTraversalStatus(ns *db.NodeState) string {
-	// Check exclusion flags first
+	// Check exclusion flags firstStructural Sanity
 	if ns.ExplicitExcluded {
 		return "excluded_explicit"
 	}
@@ -511,21 +596,27 @@ func transformTraversalStatus(ns *db.NodeState) string {
 
 // nodeBuffer holds rows for a specific queue type with mutex protection
 
-// migrateNodes migrates nodes from BoltDB to DuckDB using streaming worker pools
+// nodeAppenders holds one appender per narrow node table for single-threaded write.
+type nodeAppenders struct {
+	core     *duckdb.Appender
+	status   *duckdb.Appender
+	metrics  *duckdb.Appender
+	text     *duckdb.Appender
+	children *duckdb.Appender
+}
+
+// migrateNodes migrates nodes from BoltDB to DuckDB using streaming worker pools.
+// Writes each node into five narrow tables: {prefix}_nodes_core, {prefix}_nodes_status, etc.
 func migrateNodes(boltDB *db.DB, duckDB *DuckDB, queueType string, numWorkers int) error {
-	// Determine table name
-	tableName := "src_nodes"
+	// Compute table prefix from queue type
+	prefix := "src"
 	if queueType == "DST" {
-		tableName = "dst_nodes"
+		prefix = "dst"
 	}
 
-	// Create buffer for this queue type
-	buffer := NewNodeBuffer(tableName)
-
-	// Create stats tracker
+	buffer := NewNodeBuffer(prefix + "_nodes_core")
 	stats := newETLStats(queueType)
 
-	// Channel to stream batches of node IDs to workers
 	idBatches := make(chan []string, numWorkers*2)
 
 	var wg sync.WaitGroup
@@ -549,27 +640,72 @@ func migrateNodes(boltDB *db.DB, duckDB *DuckDB, queueType string, numWorkers in
 		}()
 	}
 
-	// Start writer with reusable appender
+	// Create one appender per narrow table (single-threaded use)
 	duckDB.mu.Lock()
-	appender, err := duckdb.NewAppenderFromConn(duckDB.conn, "", tableName)
-	if err != nil {
+	appenders := &nodeAppenders{}
+	var err error
+	if appenders.core, err = duckdb.NewAppenderFromConn(duckDB.conn, "", prefix+"_nodes_core"); err != nil {
 		duckDB.mu.Unlock()
 		close(idBatches)
 		wg.Wait()
-		return fmt.Errorf("failed to create appender: %w", err)
+		return fmt.Errorf("failed to create %s_nodes_core appender: %w", prefix, err)
+	}
+	if appenders.status, err = duckdb.NewAppenderFromConn(duckDB.conn, "", prefix+"_nodes_status"); err != nil {
+		appenders.core.Close()
+		duckDB.mu.Unlock()
+		close(idBatches)
+		wg.Wait()
+		return fmt.Errorf("failed to create %s_nodes_status appender: %w", prefix, err)
+	}
+	if appenders.metrics, err = duckdb.NewAppenderFromConn(duckDB.conn, "", prefix+"_nodes_metrics"); err != nil {
+		appenders.status.Close()
+		appenders.core.Close()
+		duckDB.mu.Unlock()
+		close(idBatches)
+		wg.Wait()
+		return fmt.Errorf("failed to create %s_nodes_metrics appender: %w", prefix, err)
+	}
+	if appenders.text, err = duckdb.NewAppenderFromConn(duckDB.conn, "", prefix+"_nodes_text"); err != nil {
+		appenders.metrics.Close()
+		appenders.status.Close()
+		appenders.core.Close()
+		duckDB.mu.Unlock()
+		close(idBatches)
+		wg.Wait()
+		return fmt.Errorf("failed to create %s_nodes_text appender: %w", prefix, err)
+	}
+	if appenders.children, err = duckdb.NewAppenderFromConn(duckDB.conn, "", prefix+"_nodes_children"); err != nil {
+		appenders.text.Close()
+		appenders.metrics.Close()
+		appenders.status.Close()
+		appenders.core.Close()
+		duckDB.mu.Unlock()
+		close(idBatches)
+		wg.Wait()
+		return fmt.Errorf("failed to create %s_nodes_children appender: %w", prefix, err)
 	}
 
 	writerDone := make(chan error, 1)
 	workersDone := make(chan struct{})
 	go func() {
 		duckDB.mu.Unlock()
-		err := migrateNodesWriter(buffer, appender, tableName, stats, workersDone)
-		
-		// Close appender BEFORE signaling completion to avoid race with index creation
-		if closeErr := appender.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("failed to close appender: %w", closeErr)
+		err := migrateNodesWriter(buffer, appenders, stats, workersDone)
+		// Close all appenders before signaling completion
+		if e := appenders.children.Close(); e != nil && err == nil {
+			err = fmt.Errorf("failed to close %s_nodes_children appender: %w", prefix, e)
 		}
-		
+		if e := appenders.text.Close(); e != nil && err == nil {
+			err = fmt.Errorf("failed to close %s_nodes_text appender: %w", prefix, e)
+		}
+		if e := appenders.metrics.Close(); e != nil && err == nil {
+			err = fmt.Errorf("failed to close %s_nodes_metrics appender: %w", prefix, e)
+		}
+		if e := appenders.status.Close(); e != nil && err == nil {
+			err = fmt.Errorf("failed to close %s_nodes_status appender: %w", prefix, e)
+		}
+		if e := appenders.core.Close(); e != nil && err == nil {
+			err = fmt.Errorf("failed to close %s_nodes_core appender: %w", prefix, e)
+		}
 		writerDone <- err
 	}()
 
@@ -746,8 +882,9 @@ func migrateNodesWorker(boltDB *db.DB, nodeIDs []string, queueType string, buffe
 	})
 }
 
-// migrateNodesWriter periodically flushes the buffer when threshold is reached
-func migrateNodesWriter(buffer *nodeBuffer, appender *duckdb.Appender, tableName string, stats *ETLStats, workersDone <-chan struct{}) error {
+// migrateNodesWriter periodically flushes the buffer when threshold is reached.
+// Writes each batch to all five narrow node tables via appenders.
+func migrateNodesWriter(buffer *nodeBuffer, appenders *nodeAppenders, stats *ETLStats, workersDone <-chan struct{}) error {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -758,7 +895,6 @@ func migrateNodesWriter(buffer *nodeBuffer, appender *duckdb.Appender, tableName
 		select {
 		case <-workersDone:
 			// Workers are done, flush any remaining data before exiting
-			// Wait for any in-flight flush to complete
 			for {
 				if buffer.IsFlushing() {
 					time.Sleep(50 * time.Millisecond)
@@ -772,41 +908,32 @@ func migrateNodesWriter(buffer *nodeBuffer, appender *duckdb.Appender, tableName
 					return err
 				}
 				buffer.SetFlushing(true)
-
-				// Flush synchronously on final flush
-				if err := flushNodeBatch(appender, batch, tableName, stats); err != nil {
+				if err := flushNodeBatch(appenders, batch, stats); err != nil {
 					buffer.SetFlushing(false)
 					return err
 				}
-
 				buffer.SetFlushing(false)
 			}
 		case <-ticker.C:
-			// Snapshot + unlock + flush synchronously (appender is not thread-safe)
 			batch := buffer.GetAndClearIfReady()
 			if batch == nil {
-				// Report stats periodically
 				stats.report()
 				continue
 			}
-
-			// Flush synchronously (appender must be used from single goroutine)
-			if err := flushNodeBatch(appender, batch, tableName, stats); err != nil {
+			if err := flushNodeBatch(appenders, batch, stats); err != nil {
 				buffer.SetFlushing(false)
 				return err
 			}
-
 			buffer.SetFlushing(false)
-
-			// Report stats periodically
 			stats.report()
 		}
 	}
 }
 
-// flushNodeBatch flushes a batch of node rows using the appender
-// Chunks the batch to avoid blocking for too long
-func flushNodeBatch(appender *duckdb.Appender, batch []NodeRow, tableName string, stats *ETLStats) error {
+// flushNodeBatch flushes a batch of node rows into the five narrow node tables.
+// Chunks the batch to avoid blocking; flushes each appender after each chunk.
+// No queue column - table names already determine SRC vs DST.
+func flushNodeBatch(appenders *nodeAppenders, batch []NodeRow, stats *ETLStats) error {
 	const chunkSize = 10_000
 
 	for i := 0; i < len(batch); i += chunkSize {
@@ -814,82 +941,69 @@ func flushNodeBatch(appender *duckdb.Appender, batch []NodeRow, tableName string
 		if end > len(batch) {
 			end = len(batch)
 		}
+		chunk := batch[i:end]
 
-		for _, row := range batch[i:end] {
-			var err error
-
-			// Convert *int64 to interface{} (nil or int64) for DuckDB
-			var sizeValue interface{}
-			if row.Size != nil {
-				sizeValue = *row.Size
-			} else {
-				sizeValue = nil
-			}
-
-			// Convert int to int32 for DuckDB INTEGER type
-			depthValue := int32(row.Depth)
-
-			// Convert *string to interface{} (nil or string) for nullable join IDs
-			var dstIDValue interface{}
+		for _, row := range chunk {
+			// join_id: use whichever is set (DstID for SRC tables, SrcID for DST tables)
+			var joinID interface{}
 			if row.DstID != nil {
-				dstIDValue = *row.DstID
+				joinID = *row.DstID
+			} else if row.SrcID != nil {
+				joinID = *row.SrcID
 			} else {
-				dstIDValue = nil
+				joinID = nil
 			}
 
-			var srcIDValue interface{}
-			if row.SrcID != nil {
-				srcIDValue = *row.SrcID
-			} else {
-				srcIDValue = nil
+			// {prefix}_nodes_core: path, id, parent_path, parent_id, service_id, parent_service_id, type, depth, path_hash, join_id
+			if err := appenders.core.AppendRow(
+				row.Path,
+				row.ID,
+				row.ParentPath,
+				row.ParentID,
+				row.ServiceID,
+				row.ParentServiceID,
+				row.Type,
+				int32(row.Depth),
+				row.PathHash,
+				joinID,
+			); err != nil {
+				return fmt.Errorf("failed to append nodes_core row: %w", err)
 			}
 
-			if tableName == "src_nodes" {
-				err = appender.AppendRow(
-					row.ID,
-					row.ServiceID,
-					row.ParentID,
-					row.ParentServiceID,
-					row.ParentPath,
-					row.Name,
-					row.Path,
-					row.PathHash,
-					row.ChildIDs,
-					row.Type,
-					sizeValue,
-					row.MTime,
-					depthValue,
-					row.TraversalStatus,
-					row.CopyStatus,
-					dstIDValue,
-				)
-			} else {
-				err = appender.AppendRow(
-					row.ID,
-					row.ServiceID,
-					row.ParentID,
-					row.ParentServiceID,
-					row.ParentPath,
-					row.Name,
-					row.Path,
-					row.PathHash,
-					row.ChildIDs,
-					row.Type,
-					sizeValue,
-					row.MTime,
-					depthValue,
-					row.TraversalStatus,
-					row.CopyStatus,
-					srcIDValue,
-				)
+			// {prefix}_nodes_status: path, traversal_status, copy_status
+			if err := appenders.status.AppendRow(row.Path, row.TraversalStatus, row.CopyStatus); err != nil {
+				return fmt.Errorf("failed to append nodes_status row: %w", err)
 			}
-			if err != nil {
-				return fmt.Errorf("failed to append row: %w", err)
+
+			// {prefix}_nodes_metrics: path, size, mtime
+			var sizeVal interface{}
+			if row.Size != nil {
+				sizeVal = *row.Size
+			} else {
+				sizeVal = nil
+			}
+			if err := appenders.metrics.AppendRow(row.Path, sizeVal, row.MTime); err != nil {
+				return fmt.Errorf("failed to append nodes_metrics row: %w", err)
+			}
+
+			// {prefix}_nodes_text: path, name, path_text (path duplicate for LIKE/search)
+			if err := appenders.text.AppendRow(row.Path, row.Name, row.Path); err != nil {
+				return fmt.Errorf("failed to append nodes_text row: %w", err)
+			}
+
+			// {prefix}_nodes_children: path, child_ids
+			if err := appenders.children.AppendRow(row.Path, row.ChildIDs); err != nil {
+				return fmt.Errorf("failed to append nodes_children row: %w", err)
 			}
 		}
 
-		// Update stats after each chunk
-		stats.AddFlushed(int64(end - i))
+		// Flush all appenders after each chunk to release DuckDB's internal memory buffers
+		for _, ap := range []*duckdb.Appender{appenders.core, appenders.status, appenders.metrics, appenders.text, appenders.children} {
+			if err := ap.Flush(); err != nil {
+				return fmt.Errorf("failed to flush appender: %w", err)
+			}
+		}
+		stats.AddFlushed(int64(len(chunk)))
 	}
 
 	return nil
@@ -1243,6 +1357,12 @@ func flushLogBatch(appender *duckdb.Appender, batch []LogRow, stats *ETLStats) e
 			}
 		}
 
+		// Flush appender after each chunk to release DuckDB's internal memory buffers
+		// Without this, memory grows unbounded as rows accumulate in column vectors
+		if err := appender.Flush(); err != nil {
+			return fmt.Errorf("failed to flush appender: %w", err)
+		}
+
 		// Update stats after each chunk
 		stats.AddFlushed(int64(end - i))
 	}
@@ -1250,42 +1370,33 @@ func flushLogBatch(appender *duckdb.Appender, batch []LogRow, stats *ETLStats) e
 	return nil
 }
 
-// createIndexes creates all indexes after ETL completes
-func createIndexes(db *sql.DB) error {
+// createIndexes creates all indexes after ETL completes.
+// Indexes are created in order: core, status, metrics, text, children for each queue.
+// Caller must pass the same connection used for SET threads (so index creation uses that thread count).
+func createIndexes(ctx context.Context, conn *sql.Conn) error {
 	indexes := []string{
-		// Regular indexes on ID columns (UNIQUE constraints removed to avoid DuckDB ART index bug #3249)
-		"CREATE INDEX IF NOT EXISTS idx_src_nodes_id ON src_nodes(id)",
-		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_id ON dst_nodes(id)",
-		"CREATE INDEX IF NOT EXISTS idx_stats_bucket_path ON stats(bucket_path)",
-		"CREATE INDEX IF NOT EXISTS idx_queue_stats_queue_key ON queue_stats(queue_key)",
-		"CREATE INDEX IF NOT EXISTS idx_logs_id ON logs(id)",
 
-		// Regular indexes for src_nodes
-		"CREATE INDEX IF NOT EXISTS idx_src_nodes_path_hash ON src_nodes(path_hash)",
-		"CREATE INDEX IF NOT EXISTS idx_src_nodes_parent_id ON src_nodes(parent_id)",
-		"CREATE INDEX IF NOT EXISTS idx_src_nodes_depth ON src_nodes(depth)",
-		"CREATE INDEX IF NOT EXISTS idx_src_nodes_traversal_status ON src_nodes(traversal_status)",
-		"CREATE INDEX IF NOT EXISTS idx_src_nodes_path ON src_nodes(path)",
-		"CREATE INDEX IF NOT EXISTS idx_src_nodes_dst_id ON src_nodes(dst_id)",
+		// SRC anchor table only - satellite tables (status, metrics, text, children) are unindexed.
+		// DuckDB handles hash joins efficiently without indexes on join keys.
+		// Secondary indexes deferred to Part 2 after query shape analysis.
+		"CREATE INDEX IF NOT EXISTS idx_src_nodes_core_path ON src_nodes_core(path)",
+		"CREATE INDEX IF NOT EXISTS idx_src_nodes_core_id ON src_nodes_core(id)",
+		"CREATE INDEX IF NOT EXISTS idx_src_nodes_core_parent_path ON src_nodes_core(parent_path)",
 
-		// Regular indexes for dst_nodes
-		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_path_hash ON dst_nodes(path_hash)",
-		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_parent_id ON dst_nodes(parent_id)",
-		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_depth ON dst_nodes(depth)",
-		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_traversal_status ON dst_nodes(traversal_status)",
-		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_path ON dst_nodes(path)",
-		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_src_id ON dst_nodes(src_id)",
-
-		// Indexes for logs
-		"CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level)",
-		"CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp)",
-		"CREATE INDEX IF NOT EXISTS idx_logs_entity ON logs(entity)",
-		"CREATE INDEX IF NOT EXISTS idx_logs_queue ON logs(queue)",
+		// DST anchor table only
+		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_core_path ON dst_nodes_core(path)",
+		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_core_id ON dst_nodes_core(id)",
+		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_core_parent_path ON dst_nodes_core(parent_path)",
 	}
 
-	for _, idxSQL := range indexes {
-		if _, err := db.Exec(idxSQL); err != nil {
+	for i, idxSQL := range indexes {
+		if _, err := conn.ExecContext(ctx, idxSQL); err != nil {
 			return fmt.Errorf("failed to create index: %w", err)
+		}
+		// CHECKPOINT after each index to release memory before building the next
+		// (index creation is memory-heavy; this avoids OOM on large tables)
+		if _, err := conn.ExecContext(ctx, "CHECKPOINT"); err != nil {
+			return fmt.Errorf("failed to checkpoint after index %d: %w", i+1, err)
 		}
 	}
 

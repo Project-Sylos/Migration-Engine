@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	defaultBoltDBPath = "pkg/tests/etl/bolt_to_duck/main-bolt.db"
-	defaultDuckDBPath = "pkg/tests/etl/bolt_to_duck/main-duck.db"
+	defaultBoltDBPath = "/home/lmaup/Code/Codeberg/Sylos/Migration-Engine/pkg/tests/etl/bolt_to_duck/main_test.db"
+	defaultDuckDBPath = "/home/lmaup/Code/Codeberg/Sylos/Migration-Engine/pkg/tests/etl/bolt_to_duck/main_test-duck.db"
 	sampleSize        = 100 // Tier 2 sample size
 )
 
@@ -199,11 +199,11 @@ func verifyETLQuick(boltDB *db.DB, duckDB *sql.DB) (*VerificationResult, error) 
 	}
 
 	var srcDuckCount, dstDuckCount int
-	if err := duckDB.QueryRow("SELECT COUNT(*) FROM src_nodes").Scan(&srcDuckCount); err != nil {
-		return nil, fmt.Errorf("failed to count DuckDB src_nodes: %w", err)
+	if err := duckDB.QueryRow("SELECT COUNT(*) FROM src_nodes_core").Scan(&srcDuckCount); err != nil {
+		return nil, fmt.Errorf("failed to count DuckDB src_nodes_core: %w", err)
 	}
-	if err := duckDB.QueryRow("SELECT COUNT(*) FROM dst_nodes").Scan(&dstDuckCount); err != nil {
-		return nil, fmt.Errorf("failed to count DuckDB dst_nodes: %w", err)
+	if err := duckDB.QueryRow("SELECT COUNT(*) FROM dst_nodes_core").Scan(&dstDuckCount); err != nil {
+		return nil, fmt.Errorf("failed to count DuckDB dst_nodes_core: %w", err)
 	}
 
 	if srcBoltCount != srcDuckCount {
@@ -265,7 +265,7 @@ func verifyETLSampled(boltDB *db.DB, duckDB *sql.DB, sampleSize int) (*Verificat
 	fmt.Println("\n✓ Tier 2: Probabilistic Spot Checks")
 	fmt.Println("=====================================")
 
-	// Sample 100 nodes from SRC bucket and verify they exist in src_nodes table
+	// Sample nodes from SRC bucket and verify they exist in DuckDB (nodes_* tables)
 	fmt.Printf("  Sampling %d random SRC nodes...\n", sampleSize)
 	srcNodeIDs, err := getRandomNodeIDsFromBucket(boltDB, "SRC", sampleSize)
 	if err != nil {
@@ -273,28 +273,41 @@ func verifyETLSampled(boltDB *db.DB, duckDB *sql.DB, sampleSize int) (*Verificat
 	}
 
 	if len(srcNodeIDs) > 0 {
-		srcNodes, err := getDuckNodesBatch(duckDB, "src_nodes", srcNodeIDs)
+		srcNodes, err := getDuckNodesBatch(duckDB, "SRC", srcNodeIDs)
 		if err != nil {
-			return nil, fmt.Errorf("failed to batch fetch src_nodes: %w", err)
+			return nil, fmt.Errorf("failed to batch fetch DuckDB SRC nodes: %w", err)
 		}
 
 		missingCount := 0
+		compareErrors := 0
 		for _, nodeID := range srcNodeIDs {
-			if _, exists := srcNodes[nodeID]; !exists {
+			duckNode, exists := srcNodes[nodeID]
+			if !exists {
 				result.Tier2Passed = false
-				result.Errors = append(result.Errors, fmt.Sprintf("SRC node %s: not found in DuckDB src_nodes table", nodeID))
+				result.Errors = append(result.Errors, fmt.Sprintf("SRC node %s: not found in DuckDB src_nodes_core", nodeID))
 				missingCount++
+				continue
+			}
+			boltNode, err := getBoltNode(boltDB, "SRC", nodeID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get Bolt SRC node %s: %w", nodeID, err)
+			}
+			if err := compareNodes(boltNode, duckNode, nodeID, result); err != nil {
+				result.Tier2Passed = false
+				compareErrors++
 			}
 		}
 
-		if missingCount == 0 {
-			fmt.Printf("    ✓ All %d sampled SRC nodes found in DuckDB\n", len(srcNodeIDs))
-		} else {
+		if missingCount == 0 && compareErrors == 0 {
+			fmt.Printf("    ✓ All %d sampled SRC nodes found in DuckDB and match BoltDB\n", len(srcNodeIDs))
+		} else if missingCount > 0 {
 			fmt.Printf("    ✗ %d of %d sampled SRC nodes missing in DuckDB\n", missingCount, len(srcNodeIDs))
+		} else if compareErrors > 0 {
+			fmt.Printf("    ✗ %d of %d sampled SRC nodes had field mismatches\n", compareErrors, len(srcNodeIDs))
 		}
 	}
 
-	// Sample 100 nodes from DST bucket and verify they exist in dst_nodes table
+	// Sample nodes from DST bucket and verify they exist in DuckDB (nodes_* tables)
 	fmt.Printf("  Sampling %d random DST nodes...\n", sampleSize)
 	dstNodeIDs, err := getRandomNodeIDsFromBucket(boltDB, "DST", sampleSize)
 	if err != nil {
@@ -302,24 +315,37 @@ func verifyETLSampled(boltDB *db.DB, duckDB *sql.DB, sampleSize int) (*Verificat
 	}
 
 	if len(dstNodeIDs) > 0 {
-		dstNodes, err := getDuckNodesBatch(duckDB, "dst_nodes", dstNodeIDs)
+		dstNodes, err := getDuckNodesBatch(duckDB, "DST", dstNodeIDs)
 		if err != nil {
-			return nil, fmt.Errorf("failed to batch fetch dst_nodes: %w", err)
+			return nil, fmt.Errorf("failed to batch fetch DuckDB DST nodes: %w", err)
 		}
 
 		missingCount := 0
+		compareErrors := 0
 		for _, nodeID := range dstNodeIDs {
-			if _, exists := dstNodes[nodeID]; !exists {
+			duckNode, exists := dstNodes[nodeID]
+			if !exists {
 				result.Tier2Passed = false
-				result.Errors = append(result.Errors, fmt.Sprintf("DST node %s: not found in DuckDB dst_nodes table", nodeID))
+				result.Errors = append(result.Errors, fmt.Sprintf("DST node %s: not found in DuckDB dst_nodes_core", nodeID))
 				missingCount++
+				continue
+			}
+			boltNode, err := getBoltNode(boltDB, "DST", nodeID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get Bolt DST node %s: %w", nodeID, err)
+			}
+			if err := compareNodes(boltNode, duckNode, nodeID, result); err != nil {
+				result.Tier2Passed = false
+				compareErrors++
 			}
 		}
 
-		if missingCount == 0 {
-			fmt.Printf("    ✓ All %d sampled DST nodes found in DuckDB\n", len(dstNodeIDs))
-		} else {
+		if missingCount == 0 && compareErrors == 0 {
+			fmt.Printf("    ✓ All %d sampled DST nodes found in DuckDB and match BoltDB\n", len(dstNodeIDs))
+		} else if missingCount > 0 {
 			fmt.Printf("    ✗ %d of %d sampled DST nodes missing in DuckDB\n", missingCount, len(dstNodeIDs))
+		} else if compareErrors > 0 {
+			fmt.Printf("    ✗ %d of %d sampled DST nodes had field mismatches\n", compareErrors, len(dstNodeIDs))
 		}
 	}
 
@@ -390,32 +416,32 @@ func verifyStatusDistribution(boltDB *db.DB, duckDB *sql.DB, result *Verificatio
 		}
 	}
 
-	// Get status distribution from DuckDB
+	// Get status distribution from DuckDB (src_nodes_status / dst_nodes_status)
 	duckStatusCounts := make(map[string]map[string]int)
-	for _, tableName := range []string{"src_nodes", "dst_nodes"} {
-		queueType := "SRC"
-		if tableName == "dst_nodes" {
-			queueType = "DST"
-		}
+	for _, queueType := range []string{"SRC", "DST"} {
 		duckStatusCounts[queueType] = make(map[string]int)
-
+		tableName := "src_nodes_status"
+		if queueType == "DST" {
+			tableName = "dst_nodes_status"
+		}
 		rows, err := duckDB.Query(fmt.Sprintf("SELECT traversal_status, COUNT(*) FROM %s GROUP BY traversal_status", tableName))
 		if err != nil {
 			return fmt.Errorf("failed to query DuckDB status distribution: %w", err)
 		}
-		defer rows.Close()
-
 		for rows.Next() {
 			var status string
 			var count int
 			if err := rows.Scan(&status, &count); err != nil {
+				rows.Close()
 				return err
 			}
 			duckStatusCounts[queueType][status] = count
 		}
 		if err := rows.Err(); err != nil {
+			rows.Close()
 			return err
 		}
+		rows.Close()
 	}
 
 	// Compare distributions
@@ -433,11 +459,7 @@ func verifyStatusDistribution(boltDB *db.DB, duckDB *sql.DB, result *Verificatio
 			duckCount := duckStatusCounts[queueType][status]
 			if boltCount != duckCount {
 				result.Tier1Passed = false
-				tableName := "src_nodes"
-				if queueType == "DST" {
-					tableName = "dst_nodes"
-				}
-				result.Errors = append(result.Errors, fmt.Sprintf("%s status '%s' count mismatch: BoltDB=%d, DuckDB=%d", tableName, status, boltCount, duckCount))
+				result.Errors = append(result.Errors, fmt.Sprintf("nodes_status %s status '%s' count mismatch: BoltDB=%d, DuckDB=%d", queueType, status, boltCount, duckCount))
 			}
 		}
 	}
@@ -475,15 +497,14 @@ func verifyJoinCoverage(boltDB *db.DB, duckDB *sql.DB, result *VerificationResul
 		return err
 	}
 
-	// Count joins in DuckDB
+	// Count joins in DuckDB (src_nodes_core.join_id / dst_nodes_core.join_id)
 	var srcWithDstCount int
-	if err := duckDB.QueryRow("SELECT COUNT(*) FROM src_nodes WHERE dst_id IS NOT NULL").Scan(&srcWithDstCount); err != nil {
-		return fmt.Errorf("failed to count src_nodes with dst_id: %w", err)
+	if err := duckDB.QueryRow("SELECT COUNT(*) FROM src_nodes_core WHERE join_id IS NOT NULL").Scan(&srcWithDstCount); err != nil {
+		return fmt.Errorf("failed to count src_nodes_core with join_id: %w", err)
 	}
-
 	var dstWithSrcCount int
-	if err := duckDB.QueryRow("SELECT COUNT(*) FROM dst_nodes WHERE src_id IS NOT NULL").Scan(&dstWithSrcCount); err != nil {
-		return fmt.Errorf("failed to count dst_nodes with src_id: %w", err)
+	if err := duckDB.QueryRow("SELECT COUNT(*) FROM dst_nodes_core WHERE join_id IS NOT NULL").Scan(&dstWithSrcCount); err != nil {
+		return fmt.Errorf("failed to count dst_nodes_core with join_id: %w", err)
 	}
 
 	if srcToDstCount != srcWithDstCount {
@@ -501,42 +522,6 @@ func verifyJoinCoverage(boltDB *db.DB, duckDB *sql.DB, result *VerificationResul
 	}
 
 	return nil
-}
-
-func getRandomNodeIDs(boltDB *db.DB, sampleSize int) ([]string, error) {
-	var allIDs []string
-	err := boltDB.View(func(tx *bolt.Tx) error {
-		for _, queueType := range []string{"SRC", "DST"} {
-			nodesBucket := db.GetNodesBucket(tx, queueType)
-			if nodesBucket == nil {
-				continue
-			}
-			cursor := nodesBucket.Cursor()
-			for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
-				allIDs = append(allIDs, string(k))
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	if len(allIDs) == 0 {
-		return []string{}, nil
-	}
-
-	// Sample randomly
-	if len(allIDs) <= sampleSize {
-		return allIDs, nil
-	}
-
-	rand.Seed(time.Now().UnixNano())
-	rand.Shuffle(len(allIDs), func(i, j int) {
-		allIDs[i], allIDs[j] = allIDs[j], allIDs[i]
-	})
-
-	return allIDs[:sampleSize], nil
 }
 
 // getRandomNodeIDsFromBucket samples random node IDs from a specific queue type bucket
@@ -572,26 +557,6 @@ func getRandomNodeIDsFromBucket(boltDB *db.DB, queueType string, sampleSize int)
 	})
 
 	return allIDs[:sampleSize], nil
-}
-
-func findNodeQueueType(boltDB *db.DB, nodeID string) (string, error) {
-	var queueType string
-	err := boltDB.View(func(tx *bolt.Tx) error {
-		// Check SRC first
-		srcBucket := db.GetNodesBucket(tx, "SRC")
-		if srcBucket != nil && srcBucket.Get([]byte(nodeID)) != nil {
-			queueType = "SRC"
-			return nil
-		}
-		// Check DST
-		dstBucket := db.GetNodesBucket(tx, "DST")
-		if dstBucket != nil && dstBucket.Get([]byte(nodeID)) != nil {
-			queueType = "DST"
-			return nil
-		}
-		return fmt.Errorf("node not found in either queue")
-	})
-	return queueType, err
 }
 
 type nodeData struct {
@@ -678,29 +643,33 @@ func getBoltNode(boltDB *db.DB, queueType, nodeID string) (*nodeData, error) {
 	return node, nil
 }
 
-// getDuckNodesBatch fetches multiple nodes in a single query using IN clause
-func getDuckNodesBatch(duckDB *sql.DB, tableName string, nodeIDs []string) (map[string]*nodeData, error) {
+// getDuckNodesBatch fetches multiple nodes by joining the five narrow tables.
+// Uses separate SRC/DST table sets based on queueType ("SRC" or "DST").
+func getDuckNodesBatch(duckDB *sql.DB, queueType string, nodeIDs []string) (map[string]*nodeData, error) {
 	if len(nodeIDs) == 0 {
 		return make(map[string]*nodeData), nil
 	}
 
-	// Build query with IN clause using ? placeholders
-	// src_nodes has dst_id (not src_id), dst_nodes has src_id (not dst_id)
-	var joinColumn string
-	if tableName == "src_nodes" {
-		joinColumn = "dst_id"
-	} else {
-		joinColumn = "src_id"
+	// Compute table prefix from queue type
+	prefix := "src"
+	if queueType == "DST" {
+		prefix = "dst"
 	}
 
-	query := fmt.Sprintf("SELECT id, path, depth, traversal_status, copy_status, %s, child_ids FROM %s WHERE id IN (", joinColumn, tableName)
-	args := make([]interface{}, len(nodeIDs))
+	// JOIN on path only - path is unique within each table set
+	query := fmt.Sprintf(`
+		SELECT c.id, c.path, c.depth, s.traversal_status, s.copy_status, c.join_id, ch.child_ids
+		FROM %s_nodes_core c
+		JOIN %s_nodes_status s ON c.path = s.path
+		JOIN %s_nodes_children ch ON c.path = ch.path
+		WHERE c.id IN (`, prefix, prefix, prefix)
+	args := make([]interface{}, 0, len(nodeIDs))
 	for i, nodeID := range nodeIDs {
 		if i > 0 {
 			query += ", "
 		}
 		query += "?"
-		args[i] = nodeID
+		args = append(args, nodeID)
 	}
 	query += ")"
 
@@ -728,41 +697,23 @@ func getDuckNodesBatch(duckDB *sql.DB, tableName string, nodeIDs []string) (map[
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
-
-		// Set the join ID in the appropriate field based on table
 		if joinID.Valid {
-			if tableName == "src_nodes" {
+			if queueType == "SRC" {
 				node.DstID = joinID.String
 			} else {
 				node.SrcID = joinID.String
 			}
 		}
-
 		if childIDs.Valid {
 			node.ChildIDs = childIDs.String
 		}
-
 		nodes[node.ID] = &node
 	}
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating rows: %w", err)
 	}
-
 	return nodes, nil
-}
-
-// getDuckNode fetches a single node (kept for backwards compatibility if needed)
-func getDuckNode(duckDB *sql.DB, tableName, nodeID string) (*nodeData, error) {
-	nodes, err := getDuckNodesBatch(duckDB, tableName, []string{nodeID})
-	if err != nil {
-		return nil, err
-	}
-	node, ok := nodes[nodeID]
-	if !ok {
-		return nil, fmt.Errorf("node not found")
-	}
-	return node, nil
 }
 
 func compareNodes(boltNode, duckNode *nodeData, nodeID string, result *VerificationResult) error {

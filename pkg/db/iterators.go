@@ -195,6 +195,7 @@ func (db *DB) CountNodes(queueType string) (int, error) {
 	}
 
 	// Fallback to cursor scan (slow path, but safe)
+	fmt.Println("Fallback to cursor scan for countNodes")
 	return db.countNodesSlow(queueType)
 }
 
