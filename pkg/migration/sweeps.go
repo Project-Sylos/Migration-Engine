@@ -213,9 +213,9 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 						dstCompleted = dstRoundStats.Completed
 					}
 
-					fmt.Printf("\r  Retry Sweep - Src: Round %d (Pending:%d InProgress:%d Expected:%d Completed:%d) | Dst: Round %d (Pending:%d InProgress:%d Expected:%d Completed:%d)   ",
-						lastSrcStats.Round, lastSrcStats.Pending, lastSrcStats.InProgress, srcExpected, srcCompleted,
-						lastDstStats.Round, lastDstStats.Pending, lastDstStats.InProgress, dstExpected, dstCompleted)
+					fmt.Printf("\r  Retry Sweep - Src: Round %d (Expected:%d Completed:%d) | Dst: Round %d (Expected:%d Completed:%d)   ",
+						lastSrcStats.Round, srcExpected, srcCompleted,
+						lastDstStats.Round, dstExpected, dstCompleted)
 				}
 			case dstStats := <-dstStatsChan:
 				lastDstStats = &dstStats
@@ -237,9 +237,9 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 						dstCompleted = dstRoundStats.Completed
 					}
 
-					fmt.Printf("\r  Retry Sweep - Src: Round %d (Pending:%d InProgress:%d Expected:%d Completed:%d) | Dst: Round %d (Pending:%d InProgress:%d Expected:%d Completed:%d)   ",
-						lastSrcStats.Round, lastSrcStats.Pending, lastSrcStats.InProgress, srcExpected, srcCompleted,
-						lastDstStats.Round, lastDstStats.Pending, lastDstStats.InProgress, dstExpected, dstCompleted)
+					fmt.Printf("\r  Retry Sweep - Src: Round %d (Expected:%d Completed:%d) | Dst: Round %d (Expected:%d Completed:%d)   ",
+						lastSrcStats.Round, srcExpected, srcCompleted,
+						lastDstStats.Round, dstExpected, dstCompleted)
 				}
 			}
 		}

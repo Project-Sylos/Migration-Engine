@@ -7,7 +7,6 @@ require (
 	codeberg.org/Sylos/Sylos-FS v0.1.2
 	github.com/google/uuid v1.6.0
 	github.com/marcboeker/go-duckdb v1.7.0
-	github.com/oklog/ulid/v2 v2.1.1
 	go.etcd.io/bbolt v1.4.3
 	gopkg.in/yaml.v3 v3.0.1
 )

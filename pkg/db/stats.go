@@ -228,3 +228,28 @@ func (db *DB) GetAllQueueStats() (map[string][]byte, error) {
 	})
 	return allStats, err
 }
+
+// CompletedCountStatsBucketPath returns the stats bucket key path for the queue's total completed count.
+// Stored as a single key per queue (e.g. "SRC-completed", "DST-completed") in the STATS bucket.
+func CompletedCountStatsBucketPath(queueType string) []string {
+	return []string{queueType + "-completed"}
+}
+
+// SetCompletedCountInTx sets the total completed count for a queue in the stats bucket.
+// Called from OutputBuffer flush via SetCompletedCountOperation. Value is absolute, not a delta.
+func SetCompletedCountInTx(tx *bolt.Tx, queueType string, value int64) error {
+	statsBucket, err := getStatsBucket(tx)
+	if err != nil {
+		return err
+	}
+	key := bucketPathToString(CompletedCountStatsBucketPath(queueType))
+	valueBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(valueBytes, uint64(value))
+	return statsBucket.Put([]byte(key), valueBytes)
+}
+
+// GetTotalCompletedCount retrieves the total completed count for the queue from the stats bucket.
+// This is the monotonic counter incremented on each task success or final failure and pushed on flush.
+func (db *DB) GetTotalCompletedCount(queueType string) (int64, error) {
+	return db.GetBucketCount(CompletedCountStatsBucketPath(queueType))
+}

@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	defaultBoltDBPath = "/home/lmaup/Code/Codeberg/Sylos/Migration-Engine/pkg/tests/etl/bolt_to_duck/main_test.db"
-	defaultDuckDBPath = "/home/lmaup/Code/Codeberg/Sylos/Migration-Engine/pkg/tests/etl/bolt_to_duck/main_test-duck.db"
+	defaultBoltDBPath = "/home/lmaup/Code/Codeberg/Sylos/Migration-Engine/pkg/tests/etl/bolt_to_duck/main-bolt.db"
+	defaultDuckDBPath = "/home/lmaup/Code/Codeberg/Sylos/Migration-Engine/pkg/tests/etl/bolt_to_duck/main-bolt-duck.db"
 	sampleSize        = 100 // Tier 2 sample size
 )
 

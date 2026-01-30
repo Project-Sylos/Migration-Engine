@@ -9,10 +9,11 @@ import (
 )
 
 // taskToNodeState converts a TaskBase to a NodeState for BoltDB storage.
-// Uses existing ULID from task.ID if present, otherwise generates a new one.
+// Uses existing ID from task.ID if present, otherwise generates a deterministic ID
+// based on (queueType, nodeType, path) for race-safe deduplication.
 // Note: task.LocationPath should be root-relative (e.g., "/items/subfolder"), not absolute.
 // The Path field in NodeState stores root-relative paths relative to the migration root folder.
-func taskToNodeState(task *TaskBase) *db.NodeState {
+func taskToNodeState(task *TaskBase, queueType string) *db.NodeState {
 	var serviceID, parentServiceID, name, path, parentPath, nodeType string
 	var size int64
 	var mtime string
@@ -42,18 +43,15 @@ func taskToNodeState(task *TaskBase) *db.NodeState {
 		return nil
 	}
 
-	// Use existing ULID if present, otherwise generate a new one
+	// Use existing ID if present, otherwise generate a deterministic ID
+	// based on (queueType, nodeType, path) for race-safe deduplication
 	nodeID := task.ID
 	if nodeID == "" {
-		nodeID = db.GenerateNodeID()
-		if nodeID == "" {
-			// If ULID generation fails, return nil
-			return nil
-		}
+		nodeID = db.DeterministicNodeID(queueType, nodeType, path)
 	}
 
 	return &db.NodeState{
-		ID:              nodeID,          // ULID for database keys
+		ID:              nodeID,          // Deterministic ID for database keys
 		ServiceID:       serviceID,       // FS identifier for FS interactions
 		ParentID:        "",              // Will be looked up by parent path if needed
 		ParentServiceID: parentServiceID, // Parent's FS identifier
@@ -70,10 +68,10 @@ func taskToNodeState(task *TaskBase) *db.NodeState {
 // nodeStateToTask converts a NodeState back to a TaskBase.
 // Note: This reconstructs the task but doesn't restore DiscoveredChildren or ExpectedFolders/Files.
 // Those need to be populated separately if needed.
-// Preserves the ULID from NodeState for internal tracking.
+// Preserves the deterministic ID from NodeState for internal tracking.
 func nodeStateToTask(state *db.NodeState, taskType string) *TaskBase {
 	task := &TaskBase{
-		ID:    state.ID, // Preserve ULID for internal tracking
+		ID:    state.ID, // Preserve deterministic ID for internal tracking
 		Type:  taskType,
 		Round: state.Depth,
 	}

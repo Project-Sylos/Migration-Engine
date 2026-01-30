@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 )
 
 // ============================================================================
@@ -51,6 +52,22 @@ func (q *Queue) getCopyPass() int {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.copyPass
+}
+
+// getTasksCompletedTotal returns the number of tasks completed (success or final failure) for this queue.
+// Used by the output buffer to push the current value into the stats bucket on each flush.
+func (q *Queue) getTasksCompletedTotal() int64 {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.tasksCompletedTotal
+}
+
+// incrementTasksCompletedTotal increments the queue's completed-task counter.
+// Call once per task when it is marked successful or failed (past retries).
+func (q *Queue) incrementTasksCompletedTotal() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.tasksCompletedTotal++
 }
 
 // GetCopyPass returns the current copy pass (public getter).
@@ -398,6 +415,11 @@ func (q *Queue) setOutputBuffer(outputBuffer *db.OutputBuffer) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.outputBuffer = outputBuffer
+	if outputBuffer != nil {
+		outputBuffer.SetOnCompletedCountGetter(func() (string, int64) {
+			return getQueueType(q.name), q.getTasksCompletedTotal()
+		})
+	}
 }
 
 func (q *Queue) setStatsChan(ch chan QueueStats) {
@@ -571,9 +593,14 @@ func (q *Queue) enqueuePending(task *TaskBase) bool {
 	}
 	nodeID := task.ID
 	if nodeID == "" {
-		// Generate ULID if not present (for newly created tasks)
-		nodeID = db.GenerateNodeID()
-		task.ID = nodeID
+		// With deterministic IDs, task.ID should always be pre-computed
+		// This is a programming error if we reach here
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("error",
+				"enqueuePending called with empty task.ID - this indicates a bug in ID generation",
+				"queue", q.name, q.name)
+		}
+		return false
 	}
 
 	// Atomically check and add in a single lock
@@ -606,9 +633,15 @@ func (q *Queue) dequeuePending() *TaskBase {
 		q.pendingBuff = q.pendingBuff[1:]
 		nodeID := task.ID
 		if nodeID == "" {
-			// Generate ULID if not present
-			nodeID = db.GenerateNodeID()
-			task.ID = nodeID
+			// With deterministic IDs, task.ID should always be pre-computed
+			// Skip this task and log an error
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("error",
+					"dequeuePending found task with empty ID - this indicates a bug in ID generation",
+					"queue", q.name, q.name)
+			}
+			q.mu.Unlock()
+			continue
 		}
 
 		// Remove from pending set

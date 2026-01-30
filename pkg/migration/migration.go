@@ -577,10 +577,10 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 		// Build detailed error message showing what failed
 		report := result.Verification
 		errMsg := "migration failed: verification checks failed\n"
-		errMsg += fmt.Sprintf("  SRC: Total=%d Pending=%d Failed=%d\n",
-			report.SrcTotal, report.SrcPending, report.SrcFailed)
-		errMsg += fmt.Sprintf("  DST: Total=%d Pending=%d Failed=%d NotOnSrc=%d\n",
-			report.DstTotal, report.DstPending, report.DstFailed, report.DstNotOnSrc)
+		errMsg += fmt.Sprintf("  SRC: Total=%d Pending=%d Successful=%d Failed=%d Completed=%d\n",
+			report.SrcTotal, report.SrcPending, report.SrcSuccessful, report.SrcFailed, report.SrcCompleted)
+		errMsg += fmt.Sprintf("  DST: Total=%d Pending=%d Successful=%d Failed=%d NotOnSrc=%d Completed=%d\n",
+			report.DstTotal, report.DstPending, report.DstSuccessful, report.DstFailed, report.DstNotOnSrc, report.DstCompleted)
 
 		// Show which checks failed
 		if !cfg.Verification.AllowPending && (report.SrcPending > 0 || report.DstPending > 0) {

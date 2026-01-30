@@ -65,6 +65,7 @@ type LevelStatus struct {
 	Successful int
 	Failed     int
 	NotOnSrc   int
+	Completed  int64
 }
 
 type QueueReport struct {
@@ -75,6 +76,7 @@ type QueueReport struct {
 	TotalSuccessful int
 	TotalFailed     int
 	TotalNotOnSrc   int
+	TotalCompleted  int64
 	MinPendingLevel *int
 }
 
@@ -194,6 +196,9 @@ func inspectQueue(boltDB *db.DB, queueType string) (*QueueReport, error) {
 			levelStatus.NotOnSrc = int(notOnSrc)
 		}
 
+		// Per-level completed no longer tracked; total completed is a single queue-level counter below
+		levelStatus.Completed = 0
+
 		levelMap[level] = levelStatus
 		report.TotalPending += levelStatus.Pending
 		report.TotalSuccessful += levelStatus.Successful
@@ -210,6 +215,9 @@ func inspectQueue(boltDB *db.DB, queueType string) (*QueueReport, error) {
 			}
 		}
 	}
+
+	// Total completed: single queue-level counter (tasks marked successful or failed past retries)
+	report.TotalCompleted, _ = boltDB.GetTotalCompletedCount(queueType)
 
 	// Convert map to sorted slice
 	report.Levels = make([]LevelStatus, 0, len(levelMap))
@@ -246,6 +254,7 @@ func printReport(report *DatabaseReport, dbPath string) {
 	fmt.Printf("SRC Pending:         %d\n", report.Src.TotalPending)
 	fmt.Printf("SRC Successful:      %d\n", report.Src.TotalSuccessful)
 	fmt.Printf("SRC Failed:          %d\n", report.Src.TotalFailed)
+	fmt.Printf("SRC Completed:       %d (tasks completed: success or final failure)\n", report.Src.TotalCompleted)
 	if report.Src.MinPendingLevel != nil {
 		fmt.Printf("SRC Min Pending Level: %d\n", *report.Src.MinPendingLevel)
 	} else {
@@ -258,6 +267,7 @@ func printReport(report *DatabaseReport, dbPath string) {
 	fmt.Printf("DST Successful:      %d\n", report.Dst.TotalSuccessful)
 	fmt.Printf("DST Failed:          %d\n", report.Dst.TotalFailed)
 	fmt.Printf("DST Not On SRC:      %d\n", report.Dst.TotalNotOnSrc)
+	fmt.Printf("DST Completed:       %d (tasks completed: success or final failure)\n", report.Dst.TotalCompleted)
 	if report.Dst.MinPendingLevel != nil {
 		fmt.Printf("DST Min Pending Level: %d\n", *report.Dst.MinPendingLevel)
 	} else {

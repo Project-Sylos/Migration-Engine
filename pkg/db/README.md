@@ -314,17 +314,23 @@ defer database.Close()
 
 **Note:** The database automatically initializes the bucket structure on first open, including the stats bucket for O(1) count operations.
 
-### ULID-Based Keys
+### Deterministic Node IDs
 
-All internal operations use ULID (Universally Unique Lexicographically Sortable Identifier) for keys. ULIDs provide:
-- Unique identifiers without path dependencies
-- Lexicographically sortable (useful for ordering)
-- 26 characters (more compact than UUIDs)
-- Time-ordered (first 48 bits encode timestamp)
+All node IDs are generated deterministically from logical identity:
 
 ```go
-nodeID := db.GenerateNodeID() // Returns ULID string (e.g., "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+nodeID := db.DeterministicNodeID(queueType, nodeType, path)
+// Returns: "node:<16-char-hex>" (FNV-1a 64-bit hash)
+// Example: "node:a1b2c3d4e5f67890"
 ```
+
+**Canonical format:** `<queueType>|<nodeType>|<normalized_path>`
+
+**Benefits:**
+- Eliminates duplicate logical nodes - same path always produces same ID
+- Race-safe - multiple workers discovering the same node won't create duplicates
+- Idempotent - re-running traversal produces identical IDs
+- No external dependencies - uses Go stdlib `hash/fnv`
 
 **Note**: The `HashPath` function still exists for backward compatibility with test utilities, but is not used for internal operations.
 

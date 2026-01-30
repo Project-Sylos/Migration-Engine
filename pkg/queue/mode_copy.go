@@ -525,14 +525,12 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 		return
 	}
 
-	// Remove the ULID from leased set
-	q.removeLeasedKey(nodeID)
-
 	task.Locked = false
 	task.Status = "successful"
 
 	// Increment completed count
 	q.incrementRoundStatsCompleted(currentRound)
+	q.incrementTasksCompletedTotal()
 
 	// Record task completion in RoundInfo
 	q.recordTaskCompletion(currentRound, true)
@@ -555,9 +553,8 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 	}
 
 	// Create DST node entry and update join-lookup
-	// This maps SRC ULID → DST ULID consistently (not mixing ServiceID)
-	// Generate new ULID for DST node
-	dstULID := db.GenerateNodeID()
+	// Generate deterministic DST node ID from path (same path = same ID, race-safe)
+	dstNodeID := db.DeterministicNodeID("DST", srcNode.Type, srcNode.Path)
 
 	// Create DST node with ServiceID from created folder/file
 	var dstServiceID string
@@ -569,7 +566,7 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 
 	// Create DST node state
 	dstNode := &db.NodeState{
-		ID:              dstULID,
+		ID:              dstNodeID,
 		ServiceID:       dstServiceID,
 		ParentID:        "", // Will be populated later if needed
 		ParentServiceID: "", // Will be populated later if needed
@@ -587,9 +584,9 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 		outputBuffer.AddCreateNode("DST", currentRound, db.StatusSuccessful, dstNode)
 	}
 
-	// Map SRC ULID → DST ULID in join-lookup
+	// Map SRC ID → DST ID in join-lookup
 	if outputBuffer != nil {
-		outputBuffer.AddLookupMapping(nodeID, dstULID)
+		outputBuffer.AddLookupMapping(nodeID, dstNodeID)
 	}
 
 	// Track metrics based on task type
@@ -669,8 +666,9 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 		task.Locked = false
 		task.Status = "failed"
 
-		// Increment failed count
+		// Increment failed count and completed total
 		q.incrementRoundStatsFailed(currentRound)
+		q.incrementTasksCompletedTotal()
 		q.recordTaskCompletion(currentRound, false)
 
 		// Add to buffer only on final failure

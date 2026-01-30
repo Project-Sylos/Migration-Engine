@@ -210,9 +210,9 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 						dstCompleted = dstRoundStats.Completed
 					}
 
-					fmt.Printf("\r  Src: Round %d (Pending:%d InProgress:%d Workers:%d Expected:%d Completed:%d) | Dst: Round %d (Pending:%d InProgress:%d Workers:%d Expected:%d Completed:%d)   ",
-						lastSrcStats.Round, lastSrcStats.Pending, lastSrcStats.InProgress, lastSrcStats.Workers, srcExpected, srcCompleted,
-						lastDstStats.Round, lastDstStats.Pending, lastDstStats.InProgress, lastDstStats.Workers, dstExpected, dstCompleted)
+					fmt.Printf("\r  Src: Round %d (Expected:%d Completed:%d) | Dst: Round %d (Expected:%d Completed:%d)   ",
+						lastSrcStats.Round, srcExpected, srcCompleted,
+						lastDstStats.Round, dstExpected, dstCompleted)
 				}
 			case dstStats := <-dstStatsChan:
 				lastDstStats = &dstStats
@@ -235,9 +235,9 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 						dstCompleted = dstRoundStats.Completed
 					}
 
-					fmt.Printf("\r  Src: Round %d (Pending:%d InProgress:%d Workers:%d Expected:%d Completed:%d) | Dst: Round %d (Pending:%d InProgress:%d Workers:%d Expected:%d Completed:%d)   ",
-						lastSrcStats.Round, lastSrcStats.Pending, lastSrcStats.InProgress, lastSrcStats.Workers, srcExpected, srcCompleted,
-						lastDstStats.Round, lastDstStats.Pending, lastDstStats.InProgress, lastDstStats.Workers, dstExpected, dstCompleted)
+					fmt.Printf("\r  Src: Round %d (Expected:%d Completed:%d) | Dst: Round %d (Expected:%d Completed:%d)   ",
+						lastSrcStats.Round, srcExpected, srcCompleted,
+						lastDstStats.Round, dstExpected, dstCompleted)
 				}
 			}
 		}

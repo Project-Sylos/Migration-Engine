@@ -183,8 +183,10 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 		return
 	}
 
+	queueType := getQueueType(q.name)
+
 	// Convert task to NodeState for BoltDB
-	state := taskToNodeState(task)
+	state := taskToNodeState(task, queueType)
 	if state == nil {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("error",
@@ -195,17 +197,14 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 	}
 
 	nodeID := state.ID
-	queueType := getQueueType(q.name)
 	nextRound := currentRound + 1
-
-	// Remove the ULID from leased set (can do this early, doesn't affect pending count)
-	q.removeLeasedKey(nodeID)
 
 	task.Locked = false
 	task.Status = "successful"
 
 	// Increment completed count (even if failed, this is a "processed" counter)
 	q.incrementRoundStatsCompleted(currentRound)
+	q.incrementTasksCompletedTotal()
 
 	// Record task completion in RoundInfo
 	q.recordTaskCompletion(currentRound, true)
@@ -240,35 +239,18 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 		}
 	}
 
-	// Build map of existing children (ServiceID -> ULID) to avoid creating duplicates
-	existingChildrenMap := make(map[string]string) // ServiceID -> ULID
-	if existingChildren, err := db.GetChildrenStatesByParentID(boltDB, queueType, nodeID); err == nil {
-		for _, existingChild := range existingChildren {
-			if existingChild != nil && existingChild.ServiceID != "" {
-				existingChildrenMap[existingChild.ServiceID] = existingChild.ID
-			}
-		}
-	}
-
 	// Collect discovered children for insertion
+	// Deterministic IDs based on (queueType, nodeType, path) ensure no duplicates -
+	// the same logical node will always get the same ID, making this race-safe
 	for _, child := range task.DiscoveredChildren {
 		// For DST queues, skip folder children here - they'll be handled separately
 		if queueType == "DST" && !child.IsFile {
 			continue
 		}
 
-		// Get ServiceID from child
-		var childServiceID string
-		if child.IsFile {
-			childServiceID = child.File.ServiceID
-		} else {
-			childServiceID = child.Folder.ServiceID
-		}
-
-		// Check if child already exists - if so, reuse its ULID
-		existingULID, exists := existingChildrenMap[childServiceID]
-
-		childState := childResultToNodeStateWithID(child, parentPath, nextRound, queueType, nodeID, existingULID, exists)
+		// Create NodeState with deterministic ID (no need to check for existing children -
+		// deterministic IDs naturally dedupe at all layers)
+		childState := childResultToNodeState(child, parentPath, nextRound, queueType, nodeID)
 		if childState == nil {
 			continue
 		}
@@ -347,70 +329,67 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 		}
 
 		for _, child := range childFolders {
-			// Check if this folder already exists (by ServiceID) and reuse its ULID
-			existingFolderULID, folderExists := existingChildrenMap[child.folder.ServiceID]
+			// Compute root-relative path first (needed for deterministic ID generation)
+			var rootRelativePath string
+			if parentPath == "/" {
+				// Child of root folder
+				rootRelativePath = "/" + child.folder.DisplayName
+			} else {
+				// Child of non-root folder
+				rootRelativePath = types.NormalizeLocationPath(parentPath + "/" + child.folder.DisplayName)
+			}
 
-			// Create task state for DST child
-			taskState := taskToNodeState(&TaskBase{
-				Type:   TaskTypeDstTraversal,
-				Folder: child.folder,
-				Round:  nextRound,
+			// Generate deterministic ID from logical identity (queueType, nodeType, path)
+			// This eliminates duplicate logical nodes and makes traversal race-safe
+			deterministicID := db.DeterministicNodeID(queueType, types.NodeTypeFolder, rootRelativePath)
+
+			// Create task state for DST child folder
+			taskState := &db.NodeState{
+				ID:              deterministicID,
+				ServiceID:       child.folder.ServiceID,
+				ParentID:        nodeID,
+				ParentServiceID: child.folder.ParentId,
+				ParentPath:      parentPath,
+				Name:            child.folder.DisplayName,
+				Path:            rootRelativePath,
+				Type:            types.NodeTypeFolder,
+				Size:            0,
+				MTime:           child.folder.LastUpdated,
+				Depth:           nextRound,
+				TraversalStatus: child.status,
+			}
+			if child.srcID != "" {
+				taskState.SrcID = child.srcID
+			}
+
+			childNodesToInsert = append(childNodesToInsert, db.InsertOperation{
+				QueueType: queueType,
+				Level:     nextRound,
+				Status:    child.status,
+				State:     taskState,
 			})
-			if taskState != nil {
-				// Reuse existing ULID if folder already exists
-				if folderExists && existingFolderULID != "" {
-					taskState.ID = existingFolderULID
+
+			// Queue path-to-ulid mapping for DST child folder
+			outputBuffer := q.getOutputBuffer()
+			if outputBuffer != nil && taskState.Path != "" {
+				outputBuffer.AddPathToULIDMapping(queueType, taskState.Path, taskState.ID)
+			}
+
+			// Queue lookup mapping if this child has a matching SRC node
+			if child.srcID != "" {
+				if outputBuffer != nil {
+					outputBuffer.AddLookupMapping(child.srcID, taskState.ID)
 				}
 
-				// Compute root-relative path from parent path and child name
-				// This ensures paths are always root-relative, regardless of what the adapter returns
-				// (same logic as childResultToNodeStateWithID for files and SRC children)
-				var rootRelativePath string
-				if parentPath == "/" {
-					// Child of root folder
-					rootRelativePath = "/" + child.folder.DisplayName
-				} else {
-					// Child of non-root folder
-					rootRelativePath = types.NormalizeLocationPath(parentPath + "/" + child.folder.DisplayName)
-				}
-				taskState.Path = rootRelativePath
-				taskState.ParentPath = parentPath
-
-				taskState.ParentID = nodeID
-				taskState.TraversalStatus = child.status
-				if child.srcID != "" {
-					taskState.SrcID = child.srcID
-				}
-
-				childNodesToInsert = append(childNodesToInsert, db.InsertOperation{
-					QueueType: queueType,
-					Level:     nextRound,
-					Status:    child.status,
-					State:     taskState,
-				})
-
-				// Queue path-to-ulid mapping for DST child folder
-				outputBuffer := q.getOutputBuffer()
-				if outputBuffer != nil && taskState.Path != "" {
-					outputBuffer.AddPathToULIDMapping(queueType, taskState.Path, taskState.ID)
-				}
-
-				// Queue lookup mapping if this child has a matching SRC node
-				if child.srcID != "" {
-					if outputBuffer != nil {
-						outputBuffer.AddLookupMapping(child.srcID, taskState.ID)
-					}
-
-					// Update SRC node's CopyStatus if worker determined an update is needed
-					if child.srcCopyStatus != "" {
-						if srcNode, err := db.GetNodeState(boltDB, "SRC", child.srcID); err == nil && srcNode != nil {
-							if outputBuffer != nil {
-								oldCopyStatus := srcNode.CopyStatus
-								if oldCopyStatus == "" {
-									oldCopyStatus = db.CopyStatusPending
-								}
-								outputBuffer.AddCopyStatusUpdate("SRC", srcNode.Depth, oldCopyStatus, child.srcID, child.srcCopyStatus)
+				// Update SRC node's CopyStatus if worker determined an update is needed
+				if child.srcCopyStatus != "" {
+					if srcNode, err := db.GetNodeState(boltDB, "SRC", child.srcID); err == nil && srcNode != nil {
+						if outputBuffer != nil {
+							oldCopyStatus := srcNode.CopyStatus
+							if oldCopyStatus == "" {
+								oldCopyStatus = db.CopyStatusPending
 							}
+							outputBuffer.AddCopyStatusUpdate("SRC", srcNode.Depth, oldCopyStatus, child.srcID, child.srcCopyStatus)
 						}
 					}
 				}
@@ -511,10 +490,6 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 	}
 
 	// Max retries reached - task is truly done
-	if nodeID != "" {
-		q.removeLeasedKey(nodeID)
-	}
-
 	if logservice.LS != nil {
 		_ = logservice.LS.Log("error",
 			fmt.Sprintf("Failed to traverse folder %s (id=%s) after %d attempts (max retries exceeded) round=%d",
@@ -527,6 +502,7 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 
 	// Increment completed count
 	q.incrementRoundStatsCompleted(currentRound)
+	q.incrementTasksCompletedTotal()
 
 	// Record task completion in RoundInfo (failed)
 	q.recordTaskCompletion(currentRound, false)

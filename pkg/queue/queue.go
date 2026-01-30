@@ -105,6 +105,8 @@ type Queue struct {
 	bytesTransferredTotal int64 // Total bytes transferred (monotonic counter)
 	foldersCreatedTotal   int64 // Total folders created (monotonic counter)
 	filesCreatedTotal     int64 // Total files created (monotonic counter)
+	// Tasks completed total: incremented on every success or final failure, pushed to stats on flush
+	tasksCompletedTotal int64
 }
 
 // NewQueue creates a new Queue instance.
@@ -189,6 +191,11 @@ func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter types.FSAdapt
 	// Default: 1000 operations or 1 second interval
 	outputBuffer := db.NewOutputBuffer(boltInstance, 10000, 3*time.Second)
 	q.setOutputBuffer(outputBuffer)
+	outputBuffer.SetOnFlush(func(nodeIDs []string) {
+		for _, nodeID := range nodeIDs {
+			q.removeLeasedKey(nodeID)
+		}
+	})
 
 	// Create and start workers - they manage themselves
 
@@ -233,6 +240,11 @@ func (q *Queue) InitializeCopyWithContext(boltInstance *db.DB, srcAdapter, dstAd
 	// Initialize output buffer for batched writes
 	outputBuffer := db.NewOutputBuffer(boltInstance, 10000, 3*time.Second)
 	q.setOutputBuffer(outputBuffer)
+	outputBuffer.SetOnFlush(func(nodeIDs []string) {
+		for _, nodeID := range nodeIDs {
+			q.removeLeasedKey(nodeID)
+		}
+	})
 
 	// Create and start copy workers
 	for i := 0; i < workerCount; i++ {
@@ -346,10 +358,14 @@ func (q *Queue) Lease() *TaskBase {
 		if task != nil {
 			nodeID := task.ID
 			if nodeID == "" {
-				// Task doesn't have ULID - this shouldn't happen for tasks pulled from DB
-				// Generate one for safety (shouldn't happen in normal flow)
-				nodeID = db.GenerateNodeID()
-				task.ID = nodeID
+				// With deterministic IDs, task.ID should always be pre-computed
+				// This is a programming error if we reach here
+				if logservice.LS != nil {
+					_ = logservice.LS.Log("error",
+						"Lease found task with empty ID - this indicates a bug in ID generation",
+						"queue", q.name, q.name)
+				}
+				continue
 			}
 			task.Locked = true
 			task.LeaseTime = time.Now() // Record lease time for execution tracking
@@ -627,22 +643,37 @@ func (q *Queue) failCopyTask(task *TaskBase, executionDelta time.Duration) {
 	q.FailCopyTask(task, executionDelta)
 }
 
-// childResultToNodeStateWithID converts a ChildResult to NodeState, reusing existing ULID if provided.
+// childResultToNodeState converts a ChildResult to NodeState using deterministic ID generation.
 // parentPath is the root-relative path of the parent (e.g., "/items").
 // The child's path is computed from parentPath + child name to ensure it's always root-relative,
 // regardless of what the filesystem adapter returns in LocationPath.
-func childResultToNodeStateWithID(child ChildResult, parentPath string, depth int, queueType string, parentID string, existingULID string, useExisting bool) *db.NodeState {
-	// Use existing ULID if provided, otherwise generate new one
-	var nodeID string
-	if useExisting && existingULID != "" {
-		nodeID = existingULID
+// Node ID is deterministically computed from (queueType, nodeType, path) for race-safe deduplication.
+func childResultToNodeState(child ChildResult, parentPath string, depth int, queueType string, parentID string) *db.NodeState {
+	// Compute root-relative path from parent path and child name first
+	// (needed for deterministic ID generation)
+	var rootRelativePath string
+	var childName string
+	var nodeType string
+
+	if child.IsFile {
+		childName = child.File.DisplayName
+		nodeType = types.NodeTypeFile
 	} else {
-		nodeID = db.GenerateNodeID()
-		if nodeID == "" {
-			// If ULID generation fails, we can't proceed
-			return nil
-		}
+		childName = child.Folder.DisplayName
+		nodeType = types.NodeTypeFolder
 	}
+
+	if parentPath == "/" {
+		// Child of root folder
+		rootRelativePath = "/" + childName
+	} else {
+		// Child of non-root folder
+		rootRelativePath = types.NormalizeLocationPath(parentPath + "/" + childName)
+	}
+
+	// Generate deterministic ID from logical identity (queueType, nodeType, path)
+	// This eliminates duplicate logical nodes and makes traversal race-safe
+	nodeID := db.DeterministicNodeID(queueType, nodeType, rootRelativePath)
 
 	// Store SrcID temporarily in NodeState for BatchInsertNodes to create lookup mappings
 	// (BatchInsertNodes will handle storing in lookup tables, then SrcID can be removed from NodeState)
@@ -661,30 +692,12 @@ func childResultToNodeStateWithID(child ChildResult, parentPath string, depth in
 		copyStatus = "" // DST nodes don't have copy status
 	}
 
-	// Compute root-relative path from parent path and child name
-	// This ensures paths are always root-relative, regardless of what the adapter returns
-	var rootRelativePath string
-	var childName string
-	if child.IsFile {
-		childName = child.File.DisplayName
-	} else {
-		childName = child.Folder.DisplayName
-	}
-
-	if parentPath == "/" {
-		// Child of root folder
-		rootRelativePath = "/" + childName
-	} else {
-		// Child of non-root folder
-		rootRelativePath = types.NormalizeLocationPath(parentPath + "/" + childName)
-	}
-
 	if child.IsFile {
 		file := child.File
 		return &db.NodeState{
-			ID:              nodeID,         // ULID for database keys (reused if exists)
+			ID:              nodeID,         // Deterministic ID for database keys
 			ServiceID:       file.ServiceID, // FS identifier
-			ParentID:        parentID,       // Parent's ULID for database relationships
+			ParentID:        parentID,       // Parent's deterministic ID for database relationships
 			ParentServiceID: file.ParentId,  // Parent's FS identifier
 			ParentPath:      parentPath,
 			Name:            file.DisplayName,
@@ -701,9 +714,9 @@ func childResultToNodeStateWithID(child ChildResult, parentPath string, depth in
 
 	folder := child.Folder
 	return &db.NodeState{
-		ID:              nodeID,           // ULID for database keys (reused if exists)
+		ID:              nodeID,           // Deterministic ID for database keys
 		ServiceID:       folder.ServiceID, // FS identifier
-		ParentID:        parentID,         // Parent's ULID for database relationships
+		ParentID:        parentID,         // Parent's deterministic ID for database relationships
 		ParentServiceID: folder.ParentId,  // Parent's FS identifier
 		ParentPath:      parentPath,
 		Name:            folder.DisplayName,

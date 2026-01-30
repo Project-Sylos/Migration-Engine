@@ -131,6 +131,18 @@ func (op *CopyStatusOperation) Execute(tx *bolt.Tx) error {
 	return nil
 }
 
+// SetCompletedCountOperation sets the queue's total completed count in the stats bucket.
+// The value is the current in-memory counter from the queue (success + final-failure count).
+type SetCompletedCountOperation struct {
+	QueueType string
+	Value     int64
+}
+
+// Execute writes the completed count to the stats bucket.
+func (op *SetCompletedCountOperation) Execute(tx *bolt.Tx) error {
+	return SetCompletedCountInTx(tx, op.QueueType, op.Value)
+}
+
 // ExclusionUpdateOperation represents an exclusion state update for a node.
 type ExclusionUpdateOperation struct {
 	QueueType         string
@@ -356,6 +368,9 @@ type OutputBuffer struct {
 	wg          sync.WaitGroup
 	paused      bool
 	stopOnce    sync.Once // Ensures Stop() is idempotent
+	onFlush     func([]string)
+	// getCompletedCount is called at flush time to push the queue's current completed count into the batch.
+	getCompletedCount func() (queueType string, value int64)
 }
 
 // NewOutputBuffer creates a new output buffer that will flush every N operations or every interval.
@@ -377,6 +392,22 @@ func NewOutputBuffer(db *DB, batchSize int, flushInterval time.Duration) *Output
 	go ob.flushLoop()
 
 	return ob
+}
+
+// SetOnFlush registers a callback invoked after a successful flush with the list of flushed node IDs.
+// The callback runs on the flush caller's goroutine.
+func (ob *OutputBuffer) SetOnFlush(handler func([]string)) {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	ob.onFlush = handler
+}
+
+// SetOnCompletedCountGetter registers a getter that returns (queueType, completedCount) for this queue.
+// When Flush runs, the getter is called (without holding the buffer lock) and the value is written to the stats bucket.
+func (ob *OutputBuffer) SetOnCompletedCountGetter(getter func() (queueType string, value int64)) {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	ob.getCompletedCount = getter
 }
 
 // AddStatusUpdate adds a status update operation to the buffer.
@@ -547,12 +578,23 @@ func (ob *OutputBuffer) Add(op WriteOperation) {
 // Holds the lock during the entire transaction to prevent other goroutines
 // from adding operations to the buffer while the transaction is executing.
 // This ensures atomicity: either all operations in the snapshot are written, or none are.
-func (ob *OutputBuffer) Flush() {
+// Returns the list of node IDs that had completion-affecting writes flushed.
+func (ob *OutputBuffer) Flush() []string {
+	// Get completed-count op without holding ob.mu so the getter can acquire the queue lock (avoids deadlock).
 	ob.mu.Lock()
-	defer ob.mu.Unlock()
+	getter := ob.getCompletedCount
+	ob.mu.Unlock()
+	var completedOp WriteOperation
+	if getter != nil {
+		queueType, value := getter()
+		completedOp = &SetCompletedCountOperation{QueueType: queueType, Value: value}
+	}
+
+	ob.mu.Lock()
 
 	if len(ob.operations) == 0 {
-		return
+		ob.mu.Unlock()
+		return nil
 	}
 
 	// Take snapshot and clear buffer
@@ -560,13 +602,18 @@ func (ob *OutputBuffer) Flush() {
 	copy(batch, ob.operations)
 	ob.operations = make([]WriteOperation, 0, ob.batchSize)
 
+	// Prepend completed count so it's written with this batch
+	if completedOp != nil {
+		batch = append([]WriteOperation{completedOp}, batch...)
+	}
+
 	// Wake any workers blocked by backpressure (buffer is now empty, below resumeSize)
 	ob.cond.Broadcast()
 
-	// Flushing operations to BoltDB
+	handler := ob.onFlush
 
-	// Execute all operations in a single transaction
-	// Lock is held during transaction to prevent concurrent additions to buffer
+	// Flushing operations to BoltDB
+	var flushedIDs []string
 	err := ob.db.Update(func(tx *bolt.Tx) error {
 		// Ensure stats bucket exists
 		if _, err := getStatsBucket(tx); err != nil {
@@ -575,6 +622,7 @@ func (ob *OutputBuffer) Flush() {
 
 		// Compute stats deltas BEFORE executing writes (check what exists first)
 		statsDeltas := computeStatsDeltas(tx, batch)
+		flushedIDs = computeFlushedNodeIDs(tx, batch)
 
 		// Execute all operations in order
 		for i, op := range batch {
@@ -600,10 +648,18 @@ func (ob *OutputBuffer) Flush() {
 		// Log error with details
 		fmt.Printf("ERROR flushing output buffer (%d operations): %v\n", len(batch), err)
 		// Re-add operations to buffer for retry
-		ob.mu.Lock()
 		ob.operations = append(ob.operations, batch...)
 		ob.mu.Unlock()
+		return nil
 	}
+
+	ob.mu.Unlock()
+
+	if len(flushedIDs) > 0 && handler != nil {
+		handler(flushedIDs)
+	}
+
+	return flushedIDs
 }
 
 // flushLoop runs in a goroutine and periodically flushes the buffer.
@@ -652,6 +708,9 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 	// Collect all status updates first - group by old status and new status
 	oldStatusCounts := make(map[string]int64) // "queueType/level/status" -> count
 	newStatusCounts := make(map[string]int64) // "queueType/level/status" -> count
+	// Deduplicate status updates within the current batch to prevent stats overcount
+	seenOldStatus := make(map[string]struct{}) // "queueType/level/status/nodeID"
+	seenNewStatus := make(map[string]struct{}) // "queueType/level/status/nodeID"
 
 	// Track lookup mappings that will be created by BatchInsertOperations in this batch
 	// to avoid double-counting in LookupMappingOperation
@@ -680,24 +739,36 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 	for _, op := range operations {
 		switch v := op.(type) {
 		case *StatusUpdateOperation:
-			nodeID := []byte(v.NodeID)
+			nodeIDStr := v.NodeID
+			nodeID := []byte(nodeIDStr)
 
 			// Check if old status bucket has this entry
 			oldBucket := GetStatusBucket(tx, v.QueueType, v.Level, v.OldStatus)
 			if oldBucket != nil && oldBucket.Get(nodeID) != nil {
 				oldKey := fmt.Sprintf("%s/%d/%s", v.QueueType, v.Level, v.OldStatus)
-				oldStatusCounts[oldKey]++
+				oldStatusNodeKey := fmt.Sprintf("%s/%s", oldKey, nodeIDStr)
+				if _, seen := seenOldStatus[oldStatusNodeKey]; !seen {
+					oldStatusCounts[oldKey]++
+					seenOldStatus[oldStatusNodeKey] = struct{}{}
+				}
 			}
 
 			// Check if new status bucket already has this entry
 			newBucket := GetStatusBucket(tx, v.QueueType, v.Level, v.NewStatus)
 			if newBucket == nil || newBucket.Get(nodeID) == nil {
 				newKey := fmt.Sprintf("%s/%d/%s", v.QueueType, v.Level, v.NewStatus)
-				newStatusCounts[newKey]++
+				newStatusNodeKey := fmt.Sprintf("%s/%s", newKey, nodeIDStr)
+				if _, seen := seenNewStatus[newStatusNodeKey]; !seen {
+					newStatusCounts[newKey]++
+					seenNewStatus[newStatusNodeKey] = struct{}{}
+				}
 			}
 
 		case *BatchInsertOperation:
 			// Already processed in first pass, skip
+
+		case *SetCompletedCountOperation:
+			// Value is written directly in Execute(); no delta
 
 		case *CopyStatusOperation:
 			// Copy status updates move nodes between copy status buckets
@@ -844,6 +915,45 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 	}
 
 	return deltas
+}
+
+// computeFlushedNodeIDs returns the list of node IDs that have completion-affecting
+// writes in the current batch. These IDs are safe to release from the leased set
+// once the batch is successfully flushed.
+func computeFlushedNodeIDs(tx *bolt.Tx, operations []WriteOperation) []string {
+	seen := make(map[string]struct{})
+	var flushedIDs []string
+
+	for _, op := range operations {
+		switch v := op.(type) {
+		case *StatusUpdateOperation:
+			if v.NodeID == "" {
+				continue
+			}
+			nodeID := []byte(v.NodeID)
+			oldBucket := GetStatusBucket(tx, v.QueueType, v.Level, v.OldStatus)
+			if oldBucket != nil && oldBucket.Get(nodeID) != nil {
+				if _, exists := seen[v.NodeID]; !exists {
+					seen[v.NodeID] = struct{}{}
+					flushedIDs = append(flushedIDs, v.NodeID)
+				}
+			}
+
+		case *CopyStatusOperation:
+			if v.NodeID == "" {
+				continue
+			}
+			nodesBucket := GetNodesBucket(tx, v.QueueType)
+			if nodesBucket != nil && nodesBucket.Get([]byte(v.NodeID)) != nil {
+				if _, exists := seen[v.NodeID]; !exists {
+					seen[v.NodeID] = struct{}{}
+					flushedIDs = append(flushedIDs, v.NodeID)
+				}
+			}
+		}
+	}
+
+	return flushedIDs
 }
 
 // Stop gracefully stops the output buffer and flushes remaining operations.

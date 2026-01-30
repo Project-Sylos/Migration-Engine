@@ -232,8 +232,8 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 						expected = roundStats.Expected
 						completed = roundStats.Completed
 					}
-					fmt.Printf("\r  Copy: Pass %d (%s) Round %d (Pending:%d InProgress:%d Workers:%d Expected:%d Completed:%d)   ",
-						copyPass, passName, lastStats.Round, lastStats.Pending, lastStats.InProgress, lastStats.Workers, expected, completed)
+					fmt.Printf("\r  Copy: Pass %d (%s) Round %d (Expected:%d Completed:%d)   ",
+						copyPass, passName, lastStats.Round, expected, completed)
 				}
 			}
 		}
