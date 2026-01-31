@@ -92,7 +92,8 @@ func (q *Queue) PullRetryTasks(force bool) {
 		// For retry sweep up to maxKnownDepth, pull from current round
 		// All tasks should have been moved to pending before this sweep, so we only need to pull pending
 		queueType := getQueueType(q.name)
-		batch, err := db.BatchFetchWithKeys(boltDB, queueType, currentRound, db.StatusPending, defaultLeaseBatchSize)
+		batchSize := effectiveLeaseBatchSize()
+		batch, err := db.BatchFetchWithKeys(boltDB, queueType, currentRound, db.StatusPending, batchSize)
 		if err != nil {
 			if logservice.LS != nil {
 				_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to fetch retry batch from BoltDB: %v", err), "queue", q.name, q.name)
@@ -105,10 +106,38 @@ func (q *Queue) PullRetryTasks(force bool) {
 			taskType = TaskTypeDstTraversal
 		}
 
+		// For SRC: Batch-load retry DST cleanup (DST counterpart + children meta) for folder tasks
+		var retryDstCleanupMap map[string]*RetryDstCleanup
+		if q.name == "src" {
+			var srcFolderIDs []string
+			for _, item := range batch {
+				if q.isLeased(item.Key) {
+					continue
+				}
+				task := nodeStateToTask(item.State, taskType)
+				if task != nil && task.IsFolder() {
+					srcFolderIDs = append(srcFolderIDs, item.State.ID)
+				}
+			}
+			if len(srcFolderIDs) > 0 {
+				var err error
+				retryDstCleanupMap, err = BatchLoadRetryDstCleanup(boltDB, srcFolderIDs)
+				if err != nil {
+					if logservice.LS != nil {
+						_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to batch load retry DST cleanup: %v", err), "queue", q.name, q.name)
+					}
+					retryDstCleanupMap = make(map[string]*RetryDstCleanup)
+				}
+			} else {
+				retryDstCleanupMap = make(map[string]*RetryDstCleanup)
+			}
+		}
+
 		// For DST: Batch-load expected children (same as traversal mode)
 		var expectedFoldersMap map[string][]types.Folder
 		var expectedFilesMap map[string][]types.File
 		var srcIDMap map[string]map[string]string
+		var srcIDToMeta map[string]SrcNodeMeta
 		if q.name == "dst" {
 			// Collect DST parent IDs for batch loading
 			var dstParentIDs []string
@@ -127,7 +156,7 @@ func (q *Queue) PullRetryTasks(force bool) {
 			// Batch-load expected children
 			if len(dstParentIDs) > 0 {
 				var err error
-				expectedFoldersMap, expectedFilesMap, srcIDMap, err = BatchLoadExpectedChildrenByDSTIDs(boltDB, dstParentIDs, dstIDToPath)
+				expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta, err = BatchLoadExpectedChildrenByDSTIDs(boltDB, dstParentIDs, dstIDToPath)
 				if err != nil {
 					if logservice.LS != nil {
 						_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to batch load expected children in retry mode: %v", err), "queue", q.name, q.name)
@@ -135,11 +164,13 @@ func (q *Queue) PullRetryTasks(force bool) {
 					expectedFoldersMap = make(map[string][]types.Folder)
 					expectedFilesMap = make(map[string][]types.File)
 					srcIDMap = make(map[string]map[string]string)
+					srcIDToMeta = make(map[string]SrcNodeMeta)
 				}
 			} else {
 				expectedFoldersMap = make(map[string][]types.Folder)
 				expectedFilesMap = make(map[string][]types.File)
 				srcIDMap = make(map[string]map[string]string)
+				srcIDToMeta = make(map[string]SrcNodeMeta)
 			}
 		}
 
@@ -156,13 +187,28 @@ func (q *Queue) PullRetryTasks(force bool) {
 				task.ID = item.State.ID
 			}
 
-			// For DST folder tasks, populate ExpectedFolders/ExpectedFiles
+			// For SRC folder tasks in retry, attach preloaded DST cleanup data
+			if q.name == "src" && task != nil && task.IsFolder() && retryDstCleanupMap != nil {
+				if c, ok := retryDstCleanupMap[task.ID]; ok {
+					task.RetryDstCleanup = c
+				}
+			}
+
+			// For DST folder tasks, populate ExpectedFolders/ExpectedFiles and ExpectedSrcNodeMeta
 			if q.name == "dst" && task.IsFolder() {
 				dstID := item.State.ID
 				task.ExpectedFolders = expectedFoldersMap[dstID]
 				task.ExpectedFiles = expectedFilesMap[dstID]
 				if srcIDMap != nil {
 					task.ExpectedSrcIDMap = srcIDMap[dstID]
+				}
+				if srcIDToMeta != nil && task.ExpectedSrcIDMap != nil {
+					task.ExpectedSrcNodeMeta = make(map[string]SrcNodeMeta)
+					for _, srcID := range task.ExpectedSrcIDMap {
+						if meta, ok := srcIDToMeta[srcID]; ok {
+							task.ExpectedSrcNodeMeta[srcID] = meta
+						}
+					}
 				}
 			}
 
@@ -176,7 +222,7 @@ func (q *Queue) PullRetryTasks(force bool) {
 		// Track if pull was partial based on actual enqueued count
 		// Even if we enqueued 0 (all were leased), we still record the pull
 		// so the queue can properly advance rounds and check completion
-		wasPartial := len(batch) < defaultLeaseBatchSize
+		wasPartial := len(batch) < batchSize
 		q.setLastPullWasPartial(wasPartial)
 
 		// Record pull in RoundInfo

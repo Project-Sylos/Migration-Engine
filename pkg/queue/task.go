@@ -20,6 +20,27 @@ const (
 	TaskTypeCopyFile     = "copy-file"   // Copy phase: copy file with streaming
 )
 
+// SrcNodeMeta holds Depth and CopyStatus for an SRC node; used by DST tasks at completion to avoid per-child DB lookups.
+type SrcNodeMeta struct {
+	Depth      int
+	CopyStatus string
+}
+
+// RetryDstChild holds DST child node meta for retry DST cleanup; populated at pull to avoid per-child DB lookups.
+type RetryDstChild struct {
+	ID              string
+	Depth           int
+	TraversalStatus string
+}
+
+// RetryDstCleanup holds DST counterpart and its children meta for SRC folder tasks in retry mode; populated at pull.
+type RetryDstCleanup struct {
+	DstID       string
+	DstDepth    int
+	DstOldStatus string
+	Children    []RetryDstChild
+}
+
 // TaskBase represents the foundational structure for all task types.
 // Workers lease tasks, mark them Locked, and attempt execution.
 // Tasks are identified by ULID (ID) for internal tracking.
@@ -33,8 +54,10 @@ type TaskBase struct {
 	Status             string            // Execution result: "successful", "failed"
 	ExpectedFolders    []types.Folder    // Expected folders (dst tasks only)
 	ExpectedFiles      []types.File      // Expected files (dst tasks only)
-	ExpectedSrcIDMap   map[string]string // Map of Type+Name -> SRC node ID for matching (dst tasks only)
-	DiscoveredChildren []ChildResult     // Children discovered during execution
+	ExpectedSrcIDMap    map[string]string   // Map of Type+Name -> SRC node ID for matching (dst tasks only)
+	ExpectedSrcNodeMeta map[string]SrcNodeMeta // SRC node Depth/CopyStatus keyed by SRC ID (dst tasks only, populated at pull)
+	RetryDstCleanup     *RetryDstCleanup   // DST counterpart + children meta for SRC folder in retry mode (populated at pull)
+	DiscoveredChildren  []ChildResult      // Children discovered during execution
 	Round              int               // The round this task belongs to (for buffer coordination)
 	LeaseTime          time.Time         // Time when task was leased (for execution time tracking)
 	ExclusionMode      string            // Exclusion mode: "exclude" or "unexclude" (exclusion tasks only)

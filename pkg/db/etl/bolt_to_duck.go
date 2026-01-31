@@ -141,7 +141,6 @@ type NodeRow struct {
 	ParentPath      string
 	Name            string
 	Path            string
-	PathHash        string
 	ChildIDs        string // JSON array as string
 	Type            string
 	Size            *int64
@@ -338,12 +337,6 @@ func MigrateBoltToDuck(boltDB *db.DB, duckDBPath string, overwrite bool) error {
 		return fmt.Errorf("failed to migrate queue stats: %w", err)
 	}
 
-	// Migrate logs
-	fmt.Println("[ETL] Migrating logs...")
-	if err := migrateLogs(boltDB, duckDB, defaultNumWorkers); err != nil {
-		return fmt.Errorf("failed to migrate logs: %w", err)
-	}
-
 	// Use a dedicated connection for index creation so we can raise threads for this phase only
 	ctx := context.Background()
 	conn, err := duckDB.db.Conn(ctx)
@@ -393,8 +386,8 @@ func MigrateBoltToDuck(boltDB *db.DB, duckDBPath string, overwrite bool) error {
 	// ANALYZE tables to update statistics and stabilize indexes
 	fmt.Println("[ETL] Analyzing tables...")
 	nodeTables := []string{
-		"src_nodes_core", "src_nodes_status", "src_nodes_metrics", "src_nodes_text", "src_nodes_children",
-		"dst_nodes_core", "dst_nodes_status", "dst_nodes_metrics", "dst_nodes_text", "dst_nodes_children",
+		"src_nodes_ui", "src_nodes_children",
+		"dst_nodes_ui", "dst_nodes_children",
 	}
 	for _, table := range nodeTables {
 		if _, err := duckDB.db.Exec(fmt.Sprintf("ANALYZE %s", table)); err != nil {
@@ -425,13 +418,13 @@ func MigrateBoltToDuck(boltDB *db.DB, duckDBPath string, overwrite bool) error {
 }
 
 // dropTables drops all tables if they exist.
-// Node data lives in separate SRC and DST table sets (5 tables each).
+// Node data: primary UI table + children table per queue; stats, queue_stats, logs.
 func dropTables(db *sql.DB) error {
 	tables := []string{
-		// SRC tables (drop in reverse dependency order)
-		"src_nodes_children", "src_nodes_text", "src_nodes_metrics", "src_nodes_status", "src_nodes_core",
-		// DST tables (drop in reverse dependency order)
-		"dst_nodes_children", "dst_nodes_text", "dst_nodes_metrics", "dst_nodes_status", "dst_nodes_core",
+		// SRC tables
+		"src_nodes_children", "src_nodes_ui",
+		// DST tables
+		"dst_nodes_children", "dst_nodes_ui",
 		// Other tables
 		"stats", "queue_stats", "logs",
 	}
@@ -444,66 +437,36 @@ func dropTables(db *sql.DB) error {
 	return nil
 }
 
-// createNodeTablesForQueue creates the 5 narrow node tables for a given queue prefix (src or dst).
-// Path is the unique key within each table set.
-func createNodeTablesForQueue(db *sql.DB, prefix string) error {
-	// {prefix}_nodes_core: identity, joins, tree structure. Path is unique within this queue.
-	// join_id holds dst_id (for src tables) or src_id (for dst tables).
-	coreDDL := fmt.Sprintf(`
-		CREATE TABLE %s_nodes_core (
-			path VARCHAR NOT NULL,
-			id VARCHAR NOT NULL,
+// createPrimaryNodeTableForQueue creates the single primary UI table for a queue (src or dst).
+// path is the primary key; join_id holds counterpart node id (dst_id for src, src_id for dst).
+func createPrimaryNodeTableForQueue(db *sql.DB, prefix string) error {
+	// Note: PRIMARY KEY (path) used; if DuckDB ART bug #3249 hits, use path VARCHAR NOT NULL + CREATE UNIQUE INDEX.
+	uiDDL := fmt.Sprintf(`
+		CREATE TABLE %s_nodes_ui (
+			path VARCHAR PRIMARY KEY,
+			id VARCHAR,
 			parent_path VARCHAR,
 			parent_id VARCHAR,
 			service_id VARCHAR,
 			parent_service_id VARCHAR,
 			type VARCHAR,
+			name VARCHAR,
 			depth INTEGER,
-			path_hash VARCHAR,
+			traversal_status VARCHAR,
+			copy_status VARCHAR,
+			size BIGINT,
+			mtime VARCHAR,
 			join_id VARCHAR
 		)
 	`, prefix)
-	if _, err := db.Exec(coreDDL); err != nil {
-		return fmt.Errorf("failed to create %s_nodes_core table: %w", prefix, err)
+	if _, err := db.Exec(uiDDL); err != nil {
+		return fmt.Errorf("failed to create %s_nodes_ui table: %w", prefix, err)
 	}
+	return nil
+}
 
-	// {prefix}_nodes_status: traversal and copy status only.
-	statusDDL := fmt.Sprintf(`
-		CREATE TABLE %s_nodes_status (
-			path VARCHAR NOT NULL,
-			traversal_status VARCHAR,
-			copy_status VARCHAR
-		)
-	`, prefix)
-	if _, err := db.Exec(statusDDL); err != nil {
-		return fmt.Errorf("failed to create %s_nodes_status table: %w", prefix, err)
-	}
-
-	// {prefix}_nodes_metrics: numeric and sortable fields.
-	metricsDDL := fmt.Sprintf(`
-		CREATE TABLE %s_nodes_metrics (
-			path VARCHAR NOT NULL,
-			size BIGINT,
-			mtime VARCHAR
-		)
-	`, prefix)
-	if _, err := db.Exec(metricsDDL); err != nil {
-		return fmt.Errorf("failed to create %s_nodes_metrics table: %w", prefix, err)
-	}
-
-	// {prefix}_nodes_text: searchable text. path_text duplicates path for LIKE/search use.
-	textDDL := fmt.Sprintf(`
-		CREATE TABLE %s_nodes_text (
-			path VARCHAR NOT NULL,
-			name VARCHAR,
-			path_text VARCHAR
-		)
-	`, prefix)
-	if _, err := db.Exec(textDDL); err != nil {
-		return fmt.Errorf("failed to create %s_nodes_text table: %w", prefix, err)
-	}
-
-	// {prefix}_nodes_children: children relationships.
+// createChildrenTableForQueue creates the children table for a queue (path -> child_ids).
+func createChildrenTableForQueue(db *sql.DB, prefix string) error {
 	childrenDDL := fmt.Sprintf(`
 		CREATE TABLE %s_nodes_children (
 			path VARCHAR NOT NULL,
@@ -513,20 +476,24 @@ func createNodeTablesForQueue(db *sql.DB, prefix string) error {
 	if _, err := db.Exec(childrenDDL); err != nil {
 		return fmt.Errorf("failed to create %s_nodes_children table: %w", prefix, err)
 	}
-
 	return nil
 }
 
 // createTables creates all table schemas without indexes.
-// Node data is split into separate SRC and DST table sets (5 tables each).
+// Node data: one primary UI table + one children table per queue.
 func createTables(db *sql.DB) error {
-	// Create SRC node tables
-	if err := createNodeTablesForQueue(db, "src"); err != nil {
+	// Create SRC node tables (primary UI + children)
+	if err := createPrimaryNodeTableForQueue(db, "src"); err != nil {
 		return err
 	}
-
-	// Create DST node tables
-	if err := createNodeTablesForQueue(db, "dst"); err != nil {
+	if err := createChildrenTableForQueue(db, "src"); err != nil {
+		return err
+	}
+	// Create DST node tables (primary UI + children)
+	if err := createPrimaryNodeTableForQueue(db, "dst"); err != nil {
+		return err
+	}
+	if err := createChildrenTableForQueue(db, "dst"); err != nil {
 		return err
 	}
 
@@ -596,17 +563,14 @@ func transformTraversalStatus(ns *db.NodeState) string {
 
 // nodeBuffer holds rows for a specific queue type with mutex protection
 
-// nodeAppenders holds one appender per narrow node table for single-threaded write.
+// nodeAppenders holds one appender for the primary UI table and one for children per queue.
 type nodeAppenders struct {
-	core     *duckdb.Appender
-	status   *duckdb.Appender
-	metrics  *duckdb.Appender
-	text     *duckdb.Appender
+	ui       *duckdb.Appender
 	children *duckdb.Appender
 }
 
 // migrateNodes migrates nodes from BoltDB to DuckDB using streaming worker pools.
-// Writes each node into five narrow tables: {prefix}_nodes_core, {prefix}_nodes_status, etc.
+// Writes each node into primary UI table {prefix}_nodes_ui and children table {prefix}_nodes_children.
 func migrateNodes(boltDB *db.DB, duckDB *DuckDB, queueType string, numWorkers int) error {
 	// Compute table prefix from queue type
 	prefix := "src"
@@ -614,7 +578,7 @@ func migrateNodes(boltDB *db.DB, duckDB *DuckDB, queueType string, numWorkers in
 		prefix = "dst"
 	}
 
-	buffer := NewNodeBuffer(prefix + "_nodes_core")
+	buffer := NewNodeBuffer(prefix + "_nodes_ui")
 	stats := newETLStats(queueType)
 
 	idBatches := make(chan []string, numWorkers*2)
@@ -640,45 +604,18 @@ func migrateNodes(boltDB *db.DB, duckDB *DuckDB, queueType string, numWorkers in
 		}()
 	}
 
-	// Create one appender per narrow table (single-threaded use)
+	// Create one appender for primary UI table and one for children (single-threaded use)
 	duckDB.mu.Lock()
 	appenders := &nodeAppenders{}
 	var err error
-	if appenders.core, err = duckdb.NewAppenderFromConn(duckDB.conn, "", prefix+"_nodes_core"); err != nil {
+	if appenders.ui, err = duckdb.NewAppenderFromConn(duckDB.conn, "", prefix+"_nodes_ui"); err != nil {
 		duckDB.mu.Unlock()
 		close(idBatches)
 		wg.Wait()
-		return fmt.Errorf("failed to create %s_nodes_core appender: %w", prefix, err)
-	}
-	if appenders.status, err = duckdb.NewAppenderFromConn(duckDB.conn, "", prefix+"_nodes_status"); err != nil {
-		appenders.core.Close()
-		duckDB.mu.Unlock()
-		close(idBatches)
-		wg.Wait()
-		return fmt.Errorf("failed to create %s_nodes_status appender: %w", prefix, err)
-	}
-	if appenders.metrics, err = duckdb.NewAppenderFromConn(duckDB.conn, "", prefix+"_nodes_metrics"); err != nil {
-		appenders.status.Close()
-		appenders.core.Close()
-		duckDB.mu.Unlock()
-		close(idBatches)
-		wg.Wait()
-		return fmt.Errorf("failed to create %s_nodes_metrics appender: %w", prefix, err)
-	}
-	if appenders.text, err = duckdb.NewAppenderFromConn(duckDB.conn, "", prefix+"_nodes_text"); err != nil {
-		appenders.metrics.Close()
-		appenders.status.Close()
-		appenders.core.Close()
-		duckDB.mu.Unlock()
-		close(idBatches)
-		wg.Wait()
-		return fmt.Errorf("failed to create %s_nodes_text appender: %w", prefix, err)
+		return fmt.Errorf("failed to create %s_nodes_ui appender: %w", prefix, err)
 	}
 	if appenders.children, err = duckdb.NewAppenderFromConn(duckDB.conn, "", prefix+"_nodes_children"); err != nil {
-		appenders.text.Close()
-		appenders.metrics.Close()
-		appenders.status.Close()
-		appenders.core.Close()
+		appenders.ui.Close()
 		duckDB.mu.Unlock()
 		close(idBatches)
 		wg.Wait()
@@ -694,17 +631,8 @@ func migrateNodes(boltDB *db.DB, duckDB *DuckDB, queueType string, numWorkers in
 		if e := appenders.children.Close(); e != nil && err == nil {
 			err = fmt.Errorf("failed to close %s_nodes_children appender: %w", prefix, e)
 		}
-		if e := appenders.text.Close(); e != nil && err == nil {
-			err = fmt.Errorf("failed to close %s_nodes_text appender: %w", prefix, e)
-		}
-		if e := appenders.metrics.Close(); e != nil && err == nil {
-			err = fmt.Errorf("failed to close %s_nodes_metrics appender: %w", prefix, e)
-		}
-		if e := appenders.status.Close(); e != nil && err == nil {
-			err = fmt.Errorf("failed to close %s_nodes_status appender: %w", prefix, e)
-		}
-		if e := appenders.core.Close(); e != nil && err == nil {
-			err = fmt.Errorf("failed to close %s_nodes_core appender: %w", prefix, e)
+		if e := appenders.ui.Close(); e != nil && err == nil {
+			err = fmt.Errorf("failed to close %s_nodes_ui appender: %w", prefix, e)
 		}
 		writerDone <- err
 	}()
@@ -828,16 +756,6 @@ func migrateNodesWorker(boltDB *db.DB, nodeIDs []string, queueType string, buffe
 				// If joinData is nil, joinID stays nil (NULL in DuckDB)
 			}
 
-			// Compute path hash
-			/* TODO: This is already in the buckets but not a way to get it from the ULID or path itself, so we'll need to rework the bolt
-			buckets to include this. Maybe in the node entry itself perhaps.
-			This is wasteful to compute it here (again). For now this will work.
-			For my optimization nerds, make that change and update it here to
-			pull from wherever you are storing it in the buckets instead.
-			It's cheap to calculate during traversal, but not so cheap here.
-			*/
-			pathHash := db.HashPath(ns.Path)
-
 			// Transform status
 			traversalStatus := transformTraversalStatus(ns)
 
@@ -850,7 +768,6 @@ func migrateNodesWorker(boltDB *db.DB, nodeIDs []string, queueType string, buffe
 				ParentPath:      ns.ParentPath,
 				Name:            ns.Name,
 				Path:            ns.Path,
-				PathHash:        pathHash,
 				ChildIDs:        childIDs,
 				Type:            ns.Type,
 				MTime:           ns.MTime,
@@ -883,7 +800,7 @@ func migrateNodesWorker(boltDB *db.DB, nodeIDs []string, queueType string, buffe
 }
 
 // migrateNodesWriter periodically flushes the buffer when threshold is reached.
-// Writes each batch to all five narrow node tables via appenders.
+// Writes each batch to primary UI table and children table via appenders.
 func migrateNodesWriter(buffer *nodeBuffer, appenders *nodeAppenders, stats *ETLStats, workersDone <-chan struct{}) error {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -930,9 +847,8 @@ func migrateNodesWriter(buffer *nodeBuffer, appenders *nodeAppenders, stats *ETL
 	}
 }
 
-// flushNodeBatch flushes a batch of node rows into the five narrow node tables.
+// flushNodeBatch flushes a batch of node rows into the primary UI table and children table.
 // Chunks the batch to avoid blocking; flushes each appender after each chunk.
-// No queue column - table names already determine SRC vs DST.
 func flushNodeBatch(appenders *nodeAppenders, batch []NodeRow, stats *ETLStats) error {
 	const chunkSize = 10_000
 
@@ -944,7 +860,6 @@ func flushNodeBatch(appenders *nodeAppenders, batch []NodeRow, stats *ETLStats) 
 		chunk := batch[i:end]
 
 		for _, row := range chunk {
-			// join_id: use whichever is set (DstID for SRC tables, SrcID for DST tables)
 			var joinID interface{}
 			if row.DstID != nil {
 				joinID = *row.DstID
@@ -953,9 +868,15 @@ func flushNodeBatch(appenders *nodeAppenders, batch []NodeRow, stats *ETLStats) 
 			} else {
 				joinID = nil
 			}
+			var sizeVal interface{}
+			if row.Size != nil {
+				sizeVal = *row.Size
+			} else {
+				sizeVal = nil
+			}
 
-			// {prefix}_nodes_core: path, id, parent_path, parent_id, service_id, parent_service_id, type, depth, path_hash, join_id
-			if err := appenders.core.AppendRow(
+			// {prefix}_nodes_ui: path, id, parent_path, parent_id, service_id, parent_service_id, type, name, depth, traversal_status, copy_status, size, mtime, join_id
+			if err := appenders.ui.AppendRow(
 				row.Path,
 				row.ID,
 				row.ParentPath,
@@ -963,32 +884,15 @@ func flushNodeBatch(appenders *nodeAppenders, batch []NodeRow, stats *ETLStats) 
 				row.ServiceID,
 				row.ParentServiceID,
 				row.Type,
+				row.Name,
 				int32(row.Depth),
-				row.PathHash,
+				row.TraversalStatus,
+				row.CopyStatus,
+				sizeVal,
+				row.MTime,
 				joinID,
 			); err != nil {
-				return fmt.Errorf("failed to append nodes_core row: %w", err)
-			}
-
-			// {prefix}_nodes_status: path, traversal_status, copy_status
-			if err := appenders.status.AppendRow(row.Path, row.TraversalStatus, row.CopyStatus); err != nil {
-				return fmt.Errorf("failed to append nodes_status row: %w", err)
-			}
-
-			// {prefix}_nodes_metrics: path, size, mtime
-			var sizeVal interface{}
-			if row.Size != nil {
-				sizeVal = *row.Size
-			} else {
-				sizeVal = nil
-			}
-			if err := appenders.metrics.AppendRow(row.Path, sizeVal, row.MTime); err != nil {
-				return fmt.Errorf("failed to append nodes_metrics row: %w", err)
-			}
-
-			// {prefix}_nodes_text: path, name, path_text (path duplicate for LIKE/search)
-			if err := appenders.text.AppendRow(row.Path, row.Name, row.Path); err != nil {
-				return fmt.Errorf("failed to append nodes_text row: %w", err)
+				return fmt.Errorf("failed to append nodes_ui row: %w", err)
 			}
 
 			// {prefix}_nodes_children: path, child_ids
@@ -997,8 +901,7 @@ func flushNodeBatch(appenders *nodeAppenders, batch []NodeRow, stats *ETLStats) 
 			}
 		}
 
-		// Flush all appenders after each chunk to release DuckDB's internal memory buffers
-		for _, ap := range []*duckdb.Appender{appenders.core, appenders.status, appenders.metrics, appenders.text, appenders.children} {
+		for _, ap := range []*duckdb.Appender{appenders.ui, appenders.children} {
 			if err := ap.Flush(); err != nil {
 				return fmt.Errorf("failed to flush appender: %w", err)
 			}
@@ -1106,287 +1009,16 @@ func migrateQueueStats(boltDB *db.DB, duckDB *DuckDB) error {
 	})
 }
 
-// migrateLogs migrates log entries using streaming worker pools
-func migrateLogs(boltDB *db.DB, duckDB *DuckDB, numWorkers int) error {
-	// Create buffer for logs
-	buffer := NewLogBuffer()
-
-	// Create stats tracker
-	stats := newETLStats("logs")
-
-	// Channel to stream batches of log keys to workers
-	type logKeyBatch struct {
-		keys   []logKey
-		rowNum int // Starting row number for this batch
-	}
-	keyBatches := make(chan logKeyBatch, numWorkers*2)
-
-	var wg sync.WaitGroup
-	var workerErr error
-	var workerErrMu sync.Mutex
-
-	// Start workers
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for batch := range keyBatches {
-				if err := migrateLogsWorker(boltDB, batch.keys, batch.rowNum, buffer, stats); err != nil {
-					workerErrMu.Lock()
-					if workerErr == nil {
-						workerErr = err
-					}
-					workerErrMu.Unlock()
-				}
-			}
-		}()
-	}
-
-	// Start writer with reusable appender
-	duckDB.mu.Lock()
-	appender, err := duckdb.NewAppenderFromConn(duckDB.conn, "", "logs")
-	if err != nil {
-		duckDB.mu.Unlock()
-		close(keyBatches)
-		wg.Wait()
-		return fmt.Errorf("failed to create logs appender: %w", err)
-	}
-
-	writerDone := make(chan error, 1)
-	workersDone := make(chan struct{})
-	go func() {
-		duckDB.mu.Unlock()
-		err := migrateLogsWriter(buffer, appender, stats, workersDone)
-		
-		// Close appender BEFORE signaling completion to avoid race with index creation
-		if closeErr := appender.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("failed to close logs appender: %w", closeErr)
-		}
-		
-		writerDone <- err
-	}()
-
-	// Stream log entries in batches from BoltDB (chronological order)
-	streamErr := boltDB.View(func(tx *bolt.Tx) error {
-		logsBucket := db.GetLogsBucket(tx)
-		if logsBucket == nil {
-			return nil
-		}
-
-		levels := []string{"trace", "debug", "info", "warning", "error", "critical"}
-		var batch []logKey
-		rowNum := 0
-
-		// Iterate through levels in order, then through entries within each level
-		for _, level := range levels {
-			levelBucket := db.GetLogLevelBucket(tx, level)
-			if levelBucket == nil {
-				continue
-			}
-
-			cursor := levelBucket.Cursor()
-			for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
-				batch = append(batch, logKey{level: level, id: string(k)})
-
-				if len(batch) >= streamBatchSize {
-					keyBatches <- logKeyBatch{keys: batch, rowNum: rowNum}
-					rowNum += len(batch)
-					batch = make([]logKey, 0, streamBatchSize)
-				}
-			}
-		}
-
-		// Send remaining batch
-		if len(batch) > 0 {
-			keyBatches <- logKeyBatch{keys: batch, rowNum: rowNum}
-		}
-
-		return nil
-	})
-
-	close(keyBatches)
-
-	if streamErr != nil {
-		wg.Wait()
-		<-writerDone
-		return fmt.Errorf("failed to stream log keys: %w", streamErr)
-	}
-
-	// Wait for workers to finish
-	wg.Wait()
-	close(workersDone)
-
-	// Wait for writer to finish (writer will flush remaining data before exiting)
-	if err := <-writerDone; err != nil {
-		return fmt.Errorf("writer error: %w", err)
-	}
-
-	if workerErr != nil {
-		return fmt.Errorf("worker error: %w", workerErr)
-	}
-
-	stats.report()
-	totalFlushed := stats.GetTotalFlushed()
-	fmt.Printf("[ETL logs] Completed: %d log entries migrated\n", totalFlushed)
-
-	return nil
-}
-
-// logKey represents a log entry key (level + ID)
-type logKey struct {
-	level string
-	id    string
-}
-
-// migrateLogsWorker processes a batch of log keys and adds entries to buffer
-func migrateLogsWorker(boltDB *db.DB, logKeys []logKey, startRowNum int, buffer *logBuffer, stats *ETLStats) error {
-	processed := int64(0)
-	defer func() {
-		stats.AddProcessed(processed)
-	}()
-
-	return boltDB.View(func(tx *bolt.Tx) error {
-		for i, key := range logKeys {
-			levelBucket := db.GetLogLevelBucket(tx, key.level)
-			if levelBucket == nil {
-				continue
-			}
-
-			logData := levelBucket.Get([]byte(key.id))
-			if logData == nil {
-				continue
-			}
-
-			entry, err := db.DeserializeLogEntry(logData)
-			if err != nil {
-				continue
-			}
-
-			buffer.Add(LogRow{
-				Entry:  entry,
-				RowNum: startRowNum + i,
-			})
-			processed++
-		}
-
-		return nil
-	})
-}
-
-// migrateLogsWriter periodically flushes the buffer when threshold is reached
-func migrateLogsWriter(buffer *logBuffer, appender *duckdb.Appender, stats *ETLStats, workersDone <-chan struct{}) error {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	var flushErr error
-	var flushErrMu sync.Mutex
-
-	for {
-		select {
-		case <-workersDone:
-			// Workers are done, flush any remaining data before exiting
-			// Wait for any in-flight flush to complete
-			for {
-				if buffer.IsFlushing() {
-					time.Sleep(50 * time.Millisecond)
-					continue
-				}
-				batch := buffer.GetAndClearSorted()
-				if batch == nil {
-					flushErrMu.Lock()
-					err := flushErr
-					flushErrMu.Unlock()
-					return err
-				}
-				buffer.SetFlushing(true)
-
-				// Flush synchronously on final flush
-				if err := flushLogBatch(appender, batch, stats); err != nil {
-					buffer.SetFlushing(false)
-					return err
-				}
-
-				buffer.SetFlushing(false)
-			}
-		case <-ticker.C:
-			// Snapshot + unlock + flush synchronously (appender is not thread-safe)
-			batch := buffer.GetAndClearSortedIfReady()
-			if batch == nil {
-				// Report stats periodically
-				stats.report()
-				continue
-			}
-
-			// Flush synchronously (appender must be used from single goroutine)
-			if err := flushLogBatch(appender, batch, stats); err != nil {
-				buffer.SetFlushing(false)
-				return err
-			}
-
-			buffer.SetFlushing(false)
-
-			// Report stats periodically
-			stats.report()
-		}
-	}
-}
-
-// flushLogBatch flushes a batch of log entries using the appender
-// Chunks the batch to avoid blocking for too long
-func flushLogBatch(appender *duckdb.Appender, batch []LogRow, stats *ETLStats) error {
-	const chunkSize = 10_000
-
-	for i := 0; i < len(batch); i += chunkSize {
-		end := i + chunkSize
-		if end > len(batch) {
-			end = len(batch)
-		}
-
-		for _, logRow := range batch[i:end] {
-			entry := logRow.Entry
-			if err := appender.AppendRow(
-				entry.ID,
-				entry.Timestamp,
-				entry.Level,
-				entry.Entity,
-				entry.EntityID,
-				entry.Message,
-				entry.Queue,
-			); err != nil {
-				return fmt.Errorf("failed to append log row: %w", err)
-			}
-		}
-
-		// Flush appender after each chunk to release DuckDB's internal memory buffers
-		// Without this, memory grows unbounded as rows accumulate in column vectors
-		if err := appender.Flush(); err != nil {
-			return fmt.Errorf("failed to flush appender: %w", err)
-		}
-
-		// Update stats after each chunk
-		stats.AddFlushed(int64(end - i))
-	}
-
-	return nil
-}
-
-// createIndexes creates all indexes after ETL completes.
-// Indexes are created in order: core, status, metrics, text, children for each queue.
-// Caller must pass the same connection used for SET threads (so index creation uses that thread count).
+// createIndexes creates indexes on primary UI tables only (path is already PRIMARY KEY).
+// Indexes: parent_path, traversal_status, copy_status per queue. Secondary tables unindexed.
 func createIndexes(ctx context.Context, conn *sql.Conn) error {
 	indexes := []string{
-
-		// SRC anchor table only - satellite tables (status, metrics, text, children) are unindexed.
-		// DuckDB handles hash joins efficiently without indexes on join keys.
-		// Secondary indexes deferred to Part 2 after query shape analysis.
-		"CREATE INDEX IF NOT EXISTS idx_src_nodes_core_path ON src_nodes_core(path)",
-		"CREATE INDEX IF NOT EXISTS idx_src_nodes_core_id ON src_nodes_core(id)",
-		"CREATE INDEX IF NOT EXISTS idx_src_nodes_core_parent_path ON src_nodes_core(parent_path)",
-
-		// DST anchor table only
-		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_core_path ON dst_nodes_core(path)",
-		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_core_id ON dst_nodes_core(id)",
-		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_core_parent_path ON dst_nodes_core(parent_path)",
+		"CREATE INDEX IF NOT EXISTS idx_src_nodes_ui_parent_path ON src_nodes_ui(parent_path)",
+		"CREATE INDEX IF NOT EXISTS idx_src_nodes_ui_traversal_status ON src_nodes_ui(traversal_status)",
+		"CREATE INDEX IF NOT EXISTS idx_src_nodes_ui_copy_status ON src_nodes_ui(copy_status)",
+		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_ui_parent_path ON dst_nodes_ui(parent_path)",
+		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_ui_traversal_status ON dst_nodes_ui(traversal_status)",
+		"CREATE INDEX IF NOT EXISTS idx_dst_nodes_ui_copy_status ON dst_nodes_ui(copy_status)",
 	}
 
 	for i, idxSQL := range indexes {

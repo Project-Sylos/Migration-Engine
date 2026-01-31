@@ -15,6 +15,20 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
+// FlushTrigger indicates why a flush was triggered. Used for adaptive tuning.
+type FlushTrigger int
+
+const (
+	TriggerForce FlushTrigger = iota // Explicit flush (pull, advance, pause, stop)
+	TriggerTimer                     // Time-based flush from flushLoop
+	TriggerSize                      // Buffer reached batchSize in Add/AddMultiple
+)
+
+const (
+	maxFlushInterval = 60 * time.Second
+	maxBatchSize     = 20_000
+)
+
 // WriteOperation represents a buffered database write operation.
 // All operations must implement Execute() to perform the actual DB write.
 type WriteOperation interface {
@@ -50,6 +64,7 @@ func (op *BatchInsertOperation) Execute(tx *bolt.Tx) error {
 type CopyStatusOperation struct {
 	QueueType     string
 	Level         int
+	NodeType      string // "file" or "folder" (for stats delta without bucket lookup)
 	OldCopyStatus string // Old copy status (for bucket transition)
 	NewCopyStatus string
 	NodeID        string // ULID of the node
@@ -95,9 +110,9 @@ func (op *CopyStatusOperation) Execute(tx *bolt.Tx) error {
 	// Use op.OldCopyStatus for bucket operations (what we know the node was in)
 	// but check oldStatus != op.NewCopyStatus to avoid unnecessary updates
 	if op.OldCopyStatus != "" && op.OldCopyStatus != op.NewCopyStatus {
-		// Determine node type from NodeState for bucket routing
+		// Use op.NodeType for bucket routing (set at queue time to avoid bucket lookup)
 		nodeType := NodeTypeFile
-		if ns.Type == "folder" {
+		if op.NodeType == "folder" {
 			nodeType = NodeTypeFolder
 		}
 
@@ -354,6 +369,8 @@ func (op *PathToULIDMappingOperation) Execute(tx *bolt.Tx) error {
 
 // OutputBuffer batches write operations for efficient database writes.
 // It supports three flush triggers: forced, size threshold, and time-based.
+// Adaptive tuning: after timer-triggered flushes the interval doubles (cap 60s);
+// after size-triggered flushes batchSize increases by 50% (cap 100K).
 // Backpressure: workers block when buffer reaches maxSize (2x batchSize) and resume when it drains.
 type OutputBuffer struct {
 	db          *DB
@@ -363,7 +380,7 @@ type OutputBuffer struct {
 	batchSize   int
 	maxSize     int          // Backpressure threshold (2 * batchSize)
 	resumeSize  int          // Resume threshold (batchSize)
-	flushTicker *time.Ticker
+	flushInterval time.Duration // Current time-based flush interval (adaptive, cap 60s)
 	stopChan    chan struct{}
 	wg          sync.WaitGroup
 	paused      bool
@@ -375,16 +392,17 @@ type OutputBuffer struct {
 
 // NewOutputBuffer creates a new output buffer that will flush every N operations or every interval.
 // Backpressure is applied when buffer reaches 2x batchSize; workers resume when it drains to batchSize.
+// Interval and batchSize adapt over time (timer: double interval up to 60s; size: +50% batch up to 100K).
 func NewOutputBuffer(db *DB, batchSize int, flushInterval time.Duration) *OutputBuffer {
 	ob := &OutputBuffer{
-		db:          db,
-		operations:  make([]WriteOperation, 0, batchSize),
-		batchSize:   batchSize,
-		maxSize:     2 * batchSize, // Backpressure threshold
-		resumeSize:  batchSize,     // Resume threshold
-		flushTicker: time.NewTicker(flushInterval),
-		stopChan:    make(chan struct{}),
-		paused:      false,
+		db:             db,
+		operations:     make([]WriteOperation, 0, batchSize),
+		batchSize:      batchSize,
+		maxSize:        2 * batchSize, // Backpressure threshold
+		resumeSize:     batchSize,     // Resume threshold
+		flushInterval:  flushInterval,
+		stopChan:       make(chan struct{}),
+		paused:         false,
 	}
 	ob.cond = sync.NewCond(&ob.mu)
 
@@ -453,11 +471,12 @@ func (ob *OutputBuffer) AddCreateNode(queueType string, level int, status string
 }
 
 // AddCopyStatusUpdate adds a copy status update operation to the buffer.
-// This updates both node metadata and moves the node between copy status buckets.
-func (ob *OutputBuffer) AddCopyStatusUpdate(queueType string, level int, oldCopyStatus, nodeID, newCopyStatus string) {
+// nodeType is "file" or "folder" so stats deltas can be computed without bucket lookup.
+func (ob *OutputBuffer) AddCopyStatusUpdate(queueType string, level int, nodeType, oldCopyStatus, nodeID, newCopyStatus string) {
 	op := &CopyStatusOperation{
 		QueueType:     queueType,
 		Level:         level,
+		NodeType:      nodeType,
 		OldCopyStatus: oldCopyStatus,
 		NodeID:        nodeID,
 		NewCopyStatus: newCopyStatus,
@@ -550,7 +569,7 @@ func (ob *OutputBuffer) AddMultiple(ops []WriteOperation) {
 	ob.mu.Unlock()
 
 	if shouldFlush {
-		ob.Flush()
+		ob.flushWithTrigger(TriggerSize)
 	}
 }
 
@@ -568,18 +587,23 @@ func (ob *OutputBuffer) Add(op WriteOperation) {
 	ob.mu.Unlock()
 
 	if shouldFlush {
-		ob.Flush()
+		ob.flushWithTrigger(TriggerSize)
 	}
 }
 
-// Flush writes all buffered operations to BoltDB in a single transaction.
+// Flush writes all buffered operations to BoltDB in a single transaction (force trigger; no adaptation).
+func (ob *OutputBuffer) Flush() []string {
+	return ob.flushWithTrigger(TriggerForce)
+}
+
+// flushWithTrigger performs the flush and applies adaptive tuning based on trigger (Timer or Size).
+// Force trigger does not change interval or batch size.
 // Operations are executed in the order they were added to the buffer.
 // This is synchronous and blocks until the flush completes.
 // Holds the lock during the entire transaction to prevent other goroutines
 // from adding operations to the buffer while the transaction is executing.
-// This ensures atomicity: either all operations in the snapshot are written, or none are.
 // Returns the list of node IDs that had completion-affecting writes flushed.
-func (ob *OutputBuffer) Flush() []string {
+func (ob *OutputBuffer) flushWithTrigger(trigger FlushTrigger) []string {
 	// Get completed-count op without holding ob.mu so the getter can acquire the queue lock (avoids deadlock).
 	ob.mu.Lock()
 	getter := ob.getCompletedCount
@@ -653,6 +677,14 @@ func (ob *OutputBuffer) Flush() []string {
 		return nil
 	}
 
+	// Adaptive tuning after successful flush (only when we actually flushed ops)
+	switch trigger {
+	case TriggerTimer:
+		ob.maybeIncreaseTimerInterval()
+	case TriggerSize:
+		ob.maybeIncreaseBatchSize()
+	}
+
 	ob.mu.Unlock()
 
 	if len(flushedIDs) > 0 && handler != nil {
@@ -662,22 +694,54 @@ func (ob *OutputBuffer) Flush() []string {
 	return flushedIDs
 }
 
+// getFlushInterval returns the current time-based flush interval (caller must not hold ob.mu).
+func (ob *OutputBuffer) getFlushInterval() time.Duration {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	return ob.flushInterval
+}
+
+// maybeIncreaseTimerInterval doubles the flush interval, cap 60s. Call with ob.mu held (e.g. from flushWithTrigger).
+func (ob *OutputBuffer) maybeIncreaseTimerInterval() {
+	newInterval := ob.flushInterval * 2
+	if newInterval > maxFlushInterval {
+		newInterval = maxFlushInterval
+	}
+	if newInterval > ob.flushInterval {
+		ob.flushInterval = newInterval
+	}
+}
+
+// maybeIncreaseBatchSize increases batch size by 50%, cap 100K; updates maxSize and resumeSize. Call with ob.mu held.
+func (ob *OutputBuffer) maybeIncreaseBatchSize() {
+	newBatch := ob.batchSize * 3 / 2
+	if newBatch > maxBatchSize {
+		newBatch = maxBatchSize
+	}
+	if newBatch > ob.batchSize {
+		ob.batchSize = newBatch
+		ob.maxSize = 2 * ob.batchSize
+		ob.resumeSize = ob.batchSize
+	}
+}
+
 // flushLoop runs in a goroutine and periodically flushes the buffer.
+// Uses time.After(flushInterval) so the interval can adapt (timer-triggered flushes double it, cap 60s).
 func (ob *OutputBuffer) flushLoop() {
 	defer ob.wg.Done()
 
 	for {
+		interval := ob.getFlushInterval()
 		select {
-		case <-ob.flushTicker.C:
+		case <-time.After(interval):
 			ob.mu.Lock()
 			paused := ob.paused
 			ob.mu.Unlock()
 			if !paused {
-				ob.Flush()
+				ob.flushWithTrigger(TriggerTimer)
 			}
 		case <-ob.stopChan:
-			ob.flushTicker.Stop()
-			ob.Flush() // Final flush before stopping
+			ob.Flush() // Final flush before stopping (force, no adaptation)
 			return
 		}
 	}
@@ -715,6 +779,9 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 	// Track lookup mappings that will be created by BatchInsertOperations in this batch
 	// to avoid double-counting in LookupMappingOperation
 	batchInsertMappings := make(map[string]bool) // "srcID:dstID" -> true
+	seenPathToULID := make(map[string]struct{}) // "queueType/path" for in-batch dedupe
+	seenLookup     := make(map[string]struct{})  // "srcID:dstID" for in-batch dedupe
+	seenNodeDel    := make(map[string]struct{})   // "queueType/level/status/nodeID" and "queueType/nodeID" for in-batch dedupe
 
 	// First pass: process BatchInsertOperations and collect their mappings
 	for _, op := range operations {
@@ -735,33 +802,22 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 		}
 	}
 
-	// Second pass: process other operations, but skip LookupMappingOperation if already tracked
+	// Second pass: process other operations from op fields only (no bucket lookups)
 	for _, op := range operations {
 		switch v := op.(type) {
 		case *StatusUpdateOperation:
 			nodeIDStr := v.NodeID
-			nodeID := []byte(nodeIDStr)
-
-			// Check if old status bucket has this entry
-			oldBucket := GetStatusBucket(tx, v.QueueType, v.Level, v.OldStatus)
-			if oldBucket != nil && oldBucket.Get(nodeID) != nil {
-				oldKey := fmt.Sprintf("%s/%d/%s", v.QueueType, v.Level, v.OldStatus)
-				oldStatusNodeKey := fmt.Sprintf("%s/%s", oldKey, nodeIDStr)
-				if _, seen := seenOldStatus[oldStatusNodeKey]; !seen {
-					oldStatusCounts[oldKey]++
-					seenOldStatus[oldStatusNodeKey] = struct{}{}
-				}
+			oldKey := fmt.Sprintf("%s/%d/%s", v.QueueType, v.Level, v.OldStatus)
+			newKey := fmt.Sprintf("%s/%d/%s", v.QueueType, v.Level, v.NewStatus)
+			oldStatusNodeKey := fmt.Sprintf("%s/%s", oldKey, nodeIDStr)
+			newStatusNodeKey := fmt.Sprintf("%s/%s", newKey, nodeIDStr)
+			if _, seen := seenOldStatus[oldStatusNodeKey]; !seen {
+				oldStatusCounts[oldKey]++
+				seenOldStatus[oldStatusNodeKey] = struct{}{}
 			}
-
-			// Check if new status bucket already has this entry
-			newBucket := GetStatusBucket(tx, v.QueueType, v.Level, v.NewStatus)
-			if newBucket == nil || newBucket.Get(nodeID) == nil {
-				newKey := fmt.Sprintf("%s/%d/%s", v.QueueType, v.Level, v.NewStatus)
-				newStatusNodeKey := fmt.Sprintf("%s/%s", newKey, nodeIDStr)
-				if _, seen := seenNewStatus[newStatusNodeKey]; !seen {
-					newStatusCounts[newKey]++
-					seenNewStatus[newStatusNodeKey] = struct{}{}
-				}
+			if _, seen := seenNewStatus[newStatusNodeKey]; !seen {
+				newStatusCounts[newKey]++
+				seenNewStatus[newStatusNodeKey] = struct{}{}
 			}
 
 		case *BatchInsertOperation:
@@ -771,33 +827,23 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 			// Value is written directly in Execute(); no delta
 
 		case *CopyStatusOperation:
-			// Copy status updates move nodes between copy status buckets
-			// Trust the operation's OldCopyStatus/NewCopyStatus fields - don't check bucket state
-			// This ensures stats stay accurate even if nodes were already moved in previous batches
-			if v.OldCopyStatus != "" && v.OldCopyStatus != v.NewCopyStatus {
-				nodeID := []byte(v.NodeID)
-				nodesBucket := GetNodesBucket(tx, v.QueueType)
-				if nodesBucket != nil {
-					nodeData := nodesBucket.Get(nodeID)
-					if nodeData != nil {
-						ns, err := DeserializeNodeState(nodeData)
-						if err == nil && ns != nil {
-							// Determine node type
-							nodeType := NodeTypeFile
-							if ns.Type == "folder" {
-								nodeType = NodeTypeFolder
-							}
-
-							// Always track the transition based on what the operation says
-							// Don't check bucket state - trust the operation
-							// This prevents stale stats when nodes were already moved
-							oldKey := fmt.Sprintf("SRC/%d/copy/%s/%s", v.Level, nodeType, v.OldCopyStatus)
-							oldStatusCounts[oldKey]++
-
-							newKey := fmt.Sprintf("SRC/%d/copy/%s/%s", v.Level, nodeType, v.NewCopyStatus)
-							newStatusCounts[newKey]++
-						}
-					}
+			// Derive deltas from op fields only (NodeType set at queue time); dedupe by (key, nodeID)
+			if v.OldCopyStatus != "" && v.OldCopyStatus != v.NewCopyStatus && v.NodeType != "" {
+				nodeType := v.NodeType
+				if nodeType != "folder" {
+					nodeType = "file"
+				}
+				oldKey := fmt.Sprintf("SRC/%d/copy/%s/%s", v.Level, nodeType, v.OldCopyStatus)
+				newKey := fmt.Sprintf("SRC/%d/copy/%s/%s", v.Level, nodeType, v.NewCopyStatus)
+				oldCopyNodeKey := oldKey + "/" + v.NodeID
+				newCopyNodeKey := newKey + "/" + v.NodeID
+				if _, seen := seenOldStatus[oldCopyNodeKey]; !seen {
+					oldStatusCounts[oldKey]++
+					seenOldStatus[oldCopyNodeKey] = struct{}{}
+				}
+				if _, seen := seenNewStatus[newCopyNodeKey]; !seen {
+					newStatusCounts[newKey]++
+					seenNewStatus[newCopyNodeKey] = struct{}{}
 				}
 			}
 
@@ -810,64 +856,37 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 			// No stats updates needed
 
 		case *PathToULIDMappingOperation:
-			// Path-to-ULID mapping: check if entry already exists
-			pathToULIDPath := GetPathToULIDBucketPath(v.QueueType)
-			pathToULIDBucket := getBucket(tx, pathToULIDPath)
-			if pathToULIDBucket != nil {
-				pathHash := HashPath(v.Path)
-				pathHashBytes := []byte(pathHash)
-				// Only increment if entry doesn't exist
-				if pathToULIDBucket.Get(pathHashBytes) == nil {
-					pathToULIDPathStr := strings.Join(pathToULIDPath, "/")
-					deltas[pathToULIDPathStr]++
-				}
+			pathKey := v.QueueType + "/" + v.Path
+			if _, seen := seenPathToULID[pathKey]; !seen {
+				seenPathToULID[pathKey] = struct{}{}
+				pathToULIDPathStr := strings.Join(GetPathToULIDBucketPath(v.QueueType), "/")
+				deltas[pathToULIDPathStr]++
 			}
 
 		case *LookupMappingOperation:
-			// Check if this mapping was already tracked by a BatchInsertOperation in this batch
 			mappingKey := fmt.Sprintf("%s:%s", v.SrcID, v.DstID)
 			if batchInsertMappings[mappingKey] {
-				// Already tracked by batch insert, skip to avoid double-counting
 				continue
 			}
-
-			// Lookup mapping: check if entries already exist for both src-to-dst and dst-to-src
-			srcToDstPath := GetSrcToDstBucketPath()
-			srcToDstBucket := GetSrcToDstBucket(tx)
-			if srcToDstBucket != nil {
-				srcIDBytes := []byte(v.SrcID)
-				// Only increment if entry doesn't exist
-				if srcToDstBucket.Get(srcIDBytes) == nil {
-					srcToDstPathStr := strings.Join(srcToDstPath, "/")
-					deltas[srcToDstPathStr]++
-				}
+			if _, seen := seenLookup[mappingKey]; seen {
+				continue
 			}
-
-			dstToSrcPath := GetDstToSrcBucketPath()
-			dstToSrcBucket := GetDstToSrcBucket(tx)
-			if dstToSrcBucket != nil {
-				dstIDBytes := []byte(v.DstID)
-				// Only increment if entry doesn't exist
-				if dstToSrcBucket.Get(dstIDBytes) == nil {
-					dstToSrcPathStr := strings.Join(dstToSrcPath, "/")
-					deltas[dstToSrcPathStr]++
-				}
-			}
+			seenLookup[mappingKey] = struct{}{}
+			srcToDstPathStr := strings.Join(GetSrcToDstBucketPath(), "/")
+			dstToSrcPathStr := strings.Join(GetDstToSrcBucketPath(), "/")
+			deltas[srcToDstPathStr]++
+			deltas[dstToSrcPathStr]++
 
 		case *NodeDeletionOperation:
-			// Node deletion: subtract from status bucket and nodes bucket
-			nodeID := []byte(v.NodeID)
-
-			// Check if status bucket has this entry
-			statusBucket := GetStatusBucket(tx, v.QueueType, v.Level, v.Status)
-			if statusBucket != nil && statusBucket.Get(nodeID) != nil {
+			statusNodeKey := fmt.Sprintf("%s/%d/%s/%s", v.QueueType, v.Level, v.Status, v.NodeID)
+			if _, seen := seenNodeDel[statusNodeKey]; !seen {
+				seenNodeDel[statusNodeKey] = struct{}{}
 				statusKey := fmt.Sprintf("%s/%d/%s", v.QueueType, v.Level, v.Status)
 				oldStatusCounts[statusKey]++
 			}
-
-			// Always subtract from nodes bucket if node exists
-			nodesBucket := GetNodesBucket(tx, v.QueueType)
-			if nodesBucket != nil && nodesBucket.Get(nodeID) != nil {
+			nodesNodeKey := v.QueueType + "/" + v.NodeID
+			if _, seen := seenNodeDel[nodesNodeKey]; !seen {
+				seenNodeDel[nodesNodeKey] = struct{}{}
 				nodesPath := strings.Join(GetNodesBucketPath(v.QueueType), "/")
 				deltas[nodesPath]--
 			}

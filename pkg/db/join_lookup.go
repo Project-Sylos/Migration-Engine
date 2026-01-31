@@ -39,6 +39,29 @@ func GetDstIDFromSrcID(db *DB, srcID string) (string, error) {
 	return dstID, err
 }
 
+// BatchGetDstIDsFromSrcIDs retrieves DST node ULIDs for multiple SRC node ULIDs in one transaction.
+// Returns map[srcID]dstID; missing mappings are omitted from the map.
+func BatchGetDstIDsFromSrcIDs(db *DB, srcIDs []string) (map[string]string, error) {
+	result := make(map[string]string)
+	if len(srcIDs) == 0 {
+		return result, nil
+	}
+	err := db.View(func(tx *bolt.Tx) error {
+		bucket := GetSrcToDstBucket(tx)
+		if bucket == nil {
+			return nil
+		}
+		for _, srcID := range srcIDs {
+			value := bucket.Get([]byte(srcID))
+			if value != nil {
+				result[srcID] = string(value)
+			}
+		}
+		return nil
+	})
+	return result, err
+}
+
 // SetDstToSrcMapping stores a DST→SRC node mapping in the lookup table.
 // dstID is the ULID of the DST node, srcID is the ULID of the corresponding SRC node.
 func SetDstToSrcMapping(db *DB, dstID, srcID string) error {

@@ -104,14 +104,16 @@ func (w *CopyWorker) Run() {
 		// Execute the task (check for shutdown during execution if needed)
 		err := w.execute(task)
 		if err != nil {
-			// Task failed, let queue handle retry logic
+			// Record task error in main DB for cross-lookup (copy phase, SRC only)
+			if w.boltDB != nil {
+				_, _ = db.RecordTaskError(w.boltDB, "SRC", "copy", task.ID, err.Error(), task.Attempts, task.LocationPath())
+			}
 			if logservice.LS != nil {
 				_ = logservice.LS.Log("error",
 					fmt.Sprintf("Copy worker task execution failed: path=%s round=%d pass=%d error=%v",
 						task.LocationPath(), task.Round, task.CopyPass, err),
 					"worker", w.id, w.queueName)
 			}
-			// Report failure - queue will handle retry logic
 			w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
 			// Check if task was retried for logging
 			nodeID := task.ID

@@ -9,12 +9,14 @@ Write-Host ""
 
 # Clean up existing test databases
 Write-Host "Cleaning up test databases..." -ForegroundColor Yellow
+$mainDB = "pkg/tests/traversal/shared/main_test.db"
 
 # Remove the BoltDB file if it exists
-if (Test-Path "pkg/tests/traversal/shared/main_test.db") {
-    Write-Host "Removing pkg/tests/traversal/shared/main_test.db file..." -ForegroundColor Yellow
-    Remove-Item -Path "pkg/tests/traversal/shared/main_test.db" -Force -ErrorAction SilentlyContinue
+if (Test-Path $mainDB) {
+    Write-Host "Removing $mainDB file..." -ForegroundColor Yellow
+    Remove-Item -Path $mainDB -Force -ErrorAction SilentlyContinue
 }
+Remove-Item -Path ($mainDB -replace '\.db$','_logs.db') -Force -ErrorAction SilentlyContinue
 
 # Remove the migration config YAML file if it exists
 if (Test-Path "pkg/tests/traversal/shared/main_test.yaml") {

@@ -23,7 +23,7 @@ const (
 	streamBatchSizeDuckToBolt = 10000
 )
 
-// DuckNodeRow represents a node row read from DuckDB
+// DuckNodeRow represents a node row read from DuckDB (primary UI table; path_hash removed, computed from path when writing back to Bolt).
 type DuckNodeRow struct {
 	ID              string
 	ServiceID       string
@@ -32,7 +32,6 @@ type DuckNodeRow struct {
 	ParentPath      sql.NullString
 	Name            string
 	Path            string
-	PathHash        string
 	ChildIDs        sql.NullString // JSON array as string
 	Type            string
 	Size            sql.NullInt64
@@ -92,11 +91,6 @@ func MigrateDuckToBolt(boltDB *db.DB, duckDBPath string) error {
 		return fmt.Errorf("failed to migrate queue stats: %w", err)
 	}
 
-	// Migrate logs
-	fmt.Println("[ETL] Migrating logs...")
-	if err := migrateLogsFromDuck(duckDB, boltDB, defaultNumWorkersDuckToBolt); err != nil {
-		return fmt.Errorf("failed to migrate logs: %w", err)
-	}
 
 	elapsed := time.Since(startTime)
 	fmt.Printf("[ETL] Migration completed in %v\n", elapsed.Round(time.Second))
@@ -105,7 +99,7 @@ func MigrateDuckToBolt(boltDB *db.DB, duckDBPath string) error {
 }
 
 // migrateNodesFromDuck migrates nodes from DuckDB to BoltDB using streaming worker pools.
-// Reads from separate SRC/DST table sets: {prefix}_nodes_core, {prefix}_nodes_status, etc.
+// Reads from primary UI table {prefix}_nodes_ui and children table {prefix}_nodes_children.
 func migrateNodesFromDuck(duckDB *DuckDB, boltDB *db.DB, queueType string, numWorkers int) error {
 	// Compute table prefix from queue type
 	prefix := "src"
@@ -113,7 +107,7 @@ func migrateNodesFromDuck(duckDB *DuckDB, boltDB *db.DB, queueType string, numWo
 		prefix = "dst"
 	}
 
-	buffer := NewNodeBuffer(prefix + "_nodes_core")
+	buffer := NewNodeBuffer(prefix + "_nodes_ui")
 	stats := newETLStats(queueType)
 
 	idBatches := make(chan []string, numWorkers*2)
@@ -144,8 +138,8 @@ func migrateNodesFromDuck(duckDB *DuckDB, boltDB *db.DB, queueType string, numWo
 		writerDone <- migrateNodesWriterFromDuck(buffer, boltDB, queueType, stats, workersDone)
 	}()
 
-	// Stream node IDs from {prefix}_nodes_core (no queue filter needed - table is queue-specific)
-	query := fmt.Sprintf("SELECT id FROM %s_nodes_core", prefix)
+	// Stream node IDs from {prefix}_nodes_ui
+	query := fmt.Sprintf("SELECT id FROM %s_nodes_ui", prefix)
 	rows, err := duckDB.db.Query(query)
 	if err != nil {
 		close(idBatches)
@@ -203,8 +197,7 @@ func migrateNodesFromDuck(duckDB *DuckDB, boltDB *db.DB, queueType string, numWo
 	return nil
 }
 
-// migrateNodesWorkerFromDuck processes a batch of node IDs by joining the five narrow tables.
-// Uses prefixed table names (src_nodes_* or dst_nodes_*) based on the prefix parameter.
+// migrateNodesWorkerFromDuck processes a batch of node IDs by reading from primary UI table and joining children.
 func migrateNodesWorkerFromDuck(duckDB *sql.DB, nodeIDs []string, queueType string, prefix string, buffer *nodeBuffer, stats *ETLStats) error {
 	processed := int64(0)
 	defer func() {
@@ -215,16 +208,13 @@ func migrateNodesWorkerFromDuck(duckDB *sql.DB, nodeIDs []string, queueType stri
 		return nil
 	}
 
-	// Join {prefix}_nodes_core + {prefix}_nodes_status + ... on path (path is unique per table)
+	// SELECT from {prefix}_nodes_ui u LEFT JOIN {prefix}_nodes_children ch ON u.path = ch.path
 	query := fmt.Sprintf(`
-		SELECT c.id, c.service_id, c.parent_id, c.parent_service_id, c.parent_path, t.name, c.path, c.path_hash,
-		       ch.child_ids, c.type, m.size, m.mtime, c.depth, s.traversal_status, s.copy_status, c.join_id
-		FROM %s_nodes_core c
-		JOIN %s_nodes_status s ON c.path = s.path
-		JOIN %s_nodes_metrics m ON c.path = m.path
-		JOIN %s_nodes_text t ON c.path = t.path
-		JOIN %s_nodes_children ch ON c.path = ch.path
-		WHERE c.id IN (`, prefix, prefix, prefix, prefix, prefix)
+		SELECT u.id, u.service_id, u.parent_id, u.parent_service_id, u.parent_path, u.name, u.path,
+		       ch.child_ids, u.type, u.size, u.mtime, u.depth, u.traversal_status, u.copy_status, u.join_id
+		FROM %s_nodes_ui u
+		LEFT JOIN %s_nodes_children ch ON u.path = ch.path
+		WHERE u.id IN (`, prefix, prefix)
 	args := make([]interface{}, 0, len(nodeIDs))
 	for i, nodeID := range nodeIDs {
 		if i > 0 {
@@ -256,7 +246,6 @@ func migrateNodesWorkerFromDuck(duckDB *sql.DB, nodeIDs []string, queueType stri
 			&row.ParentPath,
 			&row.Name,
 			&row.Path,
-			&row.PathHash,
 			&childIDs,
 			&row.Type,
 			&size,
@@ -288,7 +277,6 @@ func migrateNodesWorkerFromDuck(duckDB *sql.DB, nodeIDs []string, queueType stri
 			ParentPath:      "",
 			Name:            row.Name,
 			Path:            row.Path,
-			PathHash:        row.PathHash,
 			ChildIDs:        "",
 			Type:            row.Type,
 			Size:            nil,
@@ -514,9 +502,10 @@ func flushNodeBatchToBolt(boltDB *db.DB, batch []NodeRow, queueType string, stat
 					}
 				}
 
-				// 6. Write path-to-ulid mapping
-				if row.PathHash != "" {
-					if err := pathBucket.Put([]byte(row.PathHash), nodeID); err != nil {
+				// 6. Write path-to-ulid mapping (compute hash from path; path_hash no longer stored in Duck)
+				if row.Path != "" {
+					pathHash := db.HashPath(row.Path)
+					if err := pathBucket.Put([]byte(pathHash), nodeID); err != nil {
 						return fmt.Errorf("failed to write path-to-ulid mapping: %w", err)
 					}
 				}
@@ -647,257 +636,5 @@ func migrateQueueStatsFromDuck(duckDB *DuckDB, boltDB *db.DB) error {
 		}
 
 		return rows.Err()
-	})
-}
-
-// migrateLogsFromDuck migrates logs from DuckDB to BoltDB
-func migrateLogsFromDuck(duckDB *DuckDB, boltDB *db.DB, numWorkers int) error {
-	// Create buffer for logs
-	buffer := NewLogBuffer()
-
-	// Create stats tracker
-	stats := newETLStats("logs")
-
-	// Channel to stream batches of log keys to workers
-	type logKeyBatch struct {
-		keys   []string
-		rowNum int // Starting row number for this batch
-	}
-	keyBatches := make(chan logKeyBatch, numWorkers*2)
-
-	var wg sync.WaitGroup
-	var workerErr error
-	var workerErrMu sync.Mutex
-
-	// Start workers
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for batch := range keyBatches {
-				if err := migrateLogsWorkerFromDuck(duckDB.db, batch.keys, batch.rowNum, buffer, stats); err != nil {
-					workerErrMu.Lock()
-					if workerErr == nil {
-						workerErr = err
-					}
-					workerErrMu.Unlock()
-				}
-			}
-		}()
-	}
-
-	// Start writer goroutine
-	writerDone := make(chan error, 1)
-	workersDone := make(chan struct{})
-	go func() {
-		writerDone <- migrateLogsWriterFromDuck(buffer, boltDB, stats, workersDone)
-	}()
-
-	// Stream log IDs in batches from DuckDB (ordered by timestamp or row_num if available)
-	query := `SELECT id FROM logs ORDER BY timestamp`
-	rows, err := duckDB.db.Query(query)
-	if err != nil {
-		close(keyBatches)
-		wg.Wait()
-		close(workersDone)
-		<-writerDone
-		return fmt.Errorf("failed to query log IDs: %w", err)
-	}
-
-	var batch []string
-	rowNum := 0
-	for rows.Next() {
-		var logID string
-		if err := rows.Scan(&logID); err != nil {
-			rows.Close()
-			close(keyBatches)
-			wg.Wait()
-			close(workersDone)
-			<-writerDone
-			return fmt.Errorf("failed to scan log ID: %w", err)
-		}
-
-		batch = append(batch, logID)
-
-		if len(batch) >= streamBatchSizeDuckToBolt {
-			keyBatches <- logKeyBatch{keys: batch, rowNum: rowNum}
-			rowNum += len(batch)
-			batch = make([]string, 0, streamBatchSizeDuckToBolt)
-		}
-	}
-	rows.Close()
-
-	// Send remaining batch
-	if len(batch) > 0 {
-		keyBatches <- logKeyBatch{keys: batch, rowNum: rowNum}
-	}
-
-	close(keyBatches)
-
-	// Wait for workers to finish
-	wg.Wait()
-	close(workersDone)
-
-	// Wait for writer to finish
-	if err := <-writerDone; err != nil {
-		return fmt.Errorf("writer error: %w", err)
-	}
-
-	if workerErr != nil {
-		return fmt.Errorf("worker error: %w", workerErr)
-	}
-
-	stats.report()
-	totalFlushed := stats.GetTotalFlushed()
-	fmt.Printf("[ETL logs] Completed: %d logs migrated\n", totalFlushed)
-
-	return nil
-}
-
-// migrateLogsWorkerFromDuck processes a batch of log IDs and adds entries to buffer
-func migrateLogsWorkerFromDuck(duckDB *sql.DB, logIDs []string, startRowNum int, buffer *logBuffer, stats *ETLStats) error {
-	processed := int64(0)
-	defer func() {
-		stats.AddProcessed(processed)
-	}()
-
-	if len(logIDs) == 0 {
-		return nil
-	}
-
-	// Build query with IN clause
-	query := `SELECT id, timestamp, level, entity, entity_id, message, queue FROM logs WHERE id IN (`
-	args := make([]interface{}, len(logIDs))
-	for i, logID := range logIDs {
-		if i > 0 {
-			query += ", "
-		}
-		query += "?"
-		args[i] = logID
-	}
-	query += ") ORDER BY timestamp"
-
-	rows, err := duckDB.Query(query, args...)
-	if err != nil {
-		return fmt.Errorf("failed to query logs: %w", err)
-	}
-	defer rows.Close()
-
-	rowNum := startRowNum
-	for rows.Next() {
-		var entry db.LogEntry
-		err := rows.Scan(
-			&entry.ID,
-			&entry.Timestamp,
-			&entry.Level,
-			&entry.Entity,
-			&entry.EntityID,
-			&entry.Message,
-			&entry.Queue,
-		)
-		if err != nil {
-			continue // Skip invalid rows
-		}
-
-		buffer.Add(LogRow{
-			Entry:  &entry,
-			RowNum: rowNum,
-		})
-		rowNum++
-		processed++
-	}
-
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("error iterating rows: %w", err)
-	}
-
-	return nil
-}
-
-// migrateLogsWriterFromDuck periodically flushes the buffer when threshold is reached
-func migrateLogsWriterFromDuck(buffer *logBuffer, boltDB *db.DB, stats *ETLStats, workersDone <-chan struct{}) error {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-workersDone:
-			// Workers are done, flush any remaining data before exiting
-			for {
-				if buffer.IsFlushing() {
-					time.Sleep(50 * time.Millisecond)
-					continue
-				}
-				batch := buffer.GetAndClearSorted()
-				if len(batch) == 0 {
-					return nil
-				}
-				buffer.SetFlushing(true)
-
-				// Flush synchronously
-				if err := flushLogBatchToBolt(boltDB, batch, stats); err != nil {
-					buffer.SetFlushing(false)
-					return err
-				}
-
-				buffer.SetFlushing(false)
-			}
-		case <-ticker.C:
-			// Snapshot + unlock + flush synchronously
-			batch := buffer.GetAndClearSortedIfReady()
-			if batch == nil {
-				// Report stats periodically
-				stats.report()
-				continue
-			}
-
-			// Flush synchronously
-			if err := flushLogBatchToBolt(boltDB, batch, stats); err != nil {
-				buffer.SetFlushing(false)
-				return err
-			}
-
-			buffer.SetFlushing(false)
-
-			// Report stats periodically
-			stats.report()
-		}
-	}
-}
-
-// flushLogBatchToBolt flushes a batch of log entries to BoltDB
-func flushLogBatchToBolt(boltDB *db.DB, batch []LogRow, stats *ETLStats) error {
-	if len(batch) == 0 {
-		return nil
-	}
-
-	return boltDB.Update(func(tx *bolt.Tx) error {
-		for _, logRow := range batch {
-			entry := logRow.Entry
-			if entry == nil {
-				continue
-			}
-
-			// Get or create log level bucket
-			levelBucket, err := db.GetOrCreateLogLevelBucket(tx, entry.Level)
-			if err != nil {
-				return fmt.Errorf("failed to get log level bucket: %w", err)
-			}
-
-			// Serialize log entry
-			data, err := db.SerializeLogEntry(*entry)
-			if err != nil {
-				return fmt.Errorf("failed to serialize log entry: %w", err)
-			}
-
-			// Write to bucket
-			if err := levelBucket.Put([]byte(entry.ID), data); err != nil {
-				return fmt.Errorf("failed to write log entry: %w", err)
-			}
-		}
-
-		stats.AddFlushed(int64(len(batch)))
-
-		return nil
 	})
 }

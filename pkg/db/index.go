@@ -209,6 +209,36 @@ func GetChildrenIDsByParentID(db *DB, queueType string, parentID string) ([]stri
 	return children, nil
 }
 
+// BatchGetChildrenIDsByParentIDs retrieves child ID lists for multiple parent IDs in one transaction.
+// Returns map[parentID][]childID; parents with no children have an empty slice.
+func BatchGetChildrenIDsByParentIDs(db *DB, queueType string, parentIDs []string) (map[string][]string, error) {
+	result := make(map[string][]string)
+	if len(parentIDs) == 0 {
+		return result, nil
+	}
+	err := db.View(func(tx *bolt.Tx) error {
+		childrenBucket := GetChildrenBucket(tx, queueType)
+		if childrenBucket == nil {
+			return fmt.Errorf("children bucket not found for %s", queueType)
+		}
+		for _, parentID := range parentIDs {
+			childrenData := childrenBucket.Get([]byte(parentID))
+			if childrenData == nil {
+				result[parentID] = nil
+				continue
+			}
+			var children []string
+			if err := json.Unmarshal(childrenData, &children); err != nil {
+				result[parentID] = nil
+				continue
+			}
+			result[parentID] = children
+		}
+		return nil
+	})
+	return result, err
+}
+
 // GetChildrenStatesByParentID retrieves the full NodeState for all children of a parent by parent ULID.
 func GetChildrenStatesByParentID(db *DB, queueType string, parentID string) ([]*NodeState, error) {
 	childIDs, err := GetChildrenIDsByParentID(db, queueType, parentID)
@@ -260,94 +290,57 @@ type InsertOperation struct {
 	State     *NodeState
 }
 
-// computeBatchInsertStatsDeltas analyzes insert operations and computes stats deltas.
-// Returns a map of bucket path (as string) -> delta count.
-// Simply counts all inserts and groups by bucket - one update per bucket.
-func computeBatchInsertStatsDeltas(tx *bolt.Tx, ops []InsertOperation) map[string]int64 {
+// computeBatchInsertStatsDeltas analyzes insert operations and computes stats deltas from op fields only (no bucket lookups).
+// Returns a map of bucket path (as string) -> delta count. Uses in-batch deduplication.
+func computeBatchInsertStatsDeltas(_ *bolt.Tx, ops []InsertOperation) map[string]int64 {
 	deltas := make(map[string]int64)
-
-	// Group by bucket path and count
-	nodesCounts := make(map[string]int64)    // queueType -> count
-	statusCounts := make(map[string]int64)   // "queueType/level/status" -> count
-	childrenCounts := make(map[string]int64) // queueType -> count of new parent entries
-	srcToDstCount := int64(0)                // Count of new src-to-dst entries
-	dstToSrcCount := int64(0)                // Count of new dst-to-src entries
-	// Deduplicate within the current batch to prevent stats overcount
-	// when multiple insert ops refer to the same logical node.
 	seenNodes := make(map[string]struct{})    // "queueType:nodeID"
-	seenStatus := make(map[string]struct{})   // "queueType:level:status:nodeID"
+	seenStatus := make(map[string]struct{})   // "queueType/level/status:nodeID"
 	seenChildren := make(map[string]struct{}) // "queueType:parentID"
-	seenSrcToDst := make(map[string]struct{}) // "srcID"
+	seenSrcToDst := make(map[string]struct{})  // "srcID"
 	seenDstToSrc := make(map[string]struct{}) // "dstID"
+
+	nodesCounts := make(map[string]int64)
+	statusCounts := make(map[string]int64)
+	childrenCounts := make(map[string]int64)
+	srcToDstCount := int64(0)
+	dstToSrcCount := int64(0)
 
 	for _, op := range ops {
 		if op.State == nil || op.State.ID == "" {
 			continue
 		}
-
 		nodeIDStr := op.State.ID
-		nodeID := []byte(nodeIDStr)
-		var parentID []byte
 
-		// ParentID must be set - no path-based lookup
-		if op.State.ParentID != "" {
-			parentID = []byte(op.State.ParentID)
-		}
-
-		// Check if node already exists - only count new nodes
 		nodeKey := op.QueueType + ":" + nodeIDStr
 		if _, seen := seenNodes[nodeKey]; !seen {
-			nodesBucket := GetNodesBucket(tx, op.QueueType)
-			if nodesBucket != nil && nodesBucket.Get(nodeID) == nil {
-				nodesCounts[op.QueueType]++
-			}
 			seenNodes[nodeKey] = struct{}{}
+			nodesCounts[op.QueueType]++
 		}
 
-		// Check if status entry already exists - only count new entries
 		statusKey := fmt.Sprintf("%s/%d/%s", op.QueueType, op.Level, op.Status)
-		statusNodeKey := fmt.Sprintf("%s:%s", statusKey, nodeIDStr)
+		statusNodeKey := statusKey + ":" + nodeIDStr
 		if _, seen := seenStatus[statusNodeKey]; !seen {
-			statusBucket := GetStatusBucket(tx, op.QueueType, op.Level, op.Status)
-			if statusBucket == nil || statusBucket.Get(nodeID) == nil {
-				statusCounts[statusKey]++
-			}
 			seenStatus[statusNodeKey] = struct{}{}
+			statusCounts[statusKey]++
 		}
 
-		// Check if children entry needs to be created
 		if op.State.ParentID != "" {
 			childrenKey := op.QueueType + ":" + op.State.ParentID
 			if _, seen := seenChildren[childrenKey]; !seen {
-				childrenBucket := GetChildrenBucket(tx, op.QueueType)
-				if childrenBucket != nil && childrenBucket.Get(parentID) == nil {
-					childrenCounts[op.QueueType]++
-				}
 				seenChildren[childrenKey] = struct{}{}
+				childrenCounts[op.QueueType]++
 			}
 		}
 
-		// Check if lookup mappings need to be created (for DST nodes with SrcID)
 		if op.QueueType == "DST" && op.State.SrcID != "" {
-			// Check dst-to-src bucket
 			if _, seen := seenDstToSrc[nodeIDStr]; !seen {
-				dstToSrcBucket := GetDstToSrcBucket(tx)
-				if dstToSrcBucket != nil && dstToSrcBucket.Get(nodeID) == nil {
-					dstToSrcCount++
-				}
 				seenDstToSrc[nodeIDStr] = struct{}{}
+				dstToSrcCount++
 			}
-
-			// Check src-to-dst bucket
 			if _, seen := seenSrcToDst[op.State.SrcID]; !seen {
-				srcToDstBucket := GetSrcToDstBucket(tx)
-				if srcToDstBucket != nil {
-					srcIDBytes := []byte(op.State.SrcID)
-					if srcToDstBucket.Get(srcIDBytes) == nil {
-						srcToDstCount++
-					}
-				}
 				seenSrcToDst[op.State.SrcID] = struct{}{}
+				srcToDstCount++
 			}
 		}
 	}

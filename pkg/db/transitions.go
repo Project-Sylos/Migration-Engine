@@ -267,6 +267,34 @@ func GetNodeState(db *DB, queueType string, nodeID string) (*NodeState, error) {
 	return nodeState, nil
 }
 
+// BatchGetNodeMeta retrieves Depth and TraversalStatus for multiple node IDs in one transaction.
+// Returns map[nodeID]NodeMeta; missing nodes are omitted from the map.
+func BatchGetNodeMeta(db *DB, queueType string, nodeIDs []string) (map[string]NodeMeta, error) {
+	result := make(map[string]NodeMeta)
+	if len(nodeIDs) == 0 {
+		return result, nil
+	}
+	err := db.View(func(tx *bolt.Tx) error {
+		nodesBucket := GetNodesBucket(tx, queueType)
+		if nodesBucket == nil {
+			return fmt.Errorf("nodes bucket not found for %s", queueType)
+		}
+		for _, nodeID := range nodeIDs {
+			nodeData := nodesBucket.Get([]byte(nodeID))
+			if nodeData == nil {
+				continue
+			}
+			ns, err := DeserializeNodeState(nodeData)
+			if err != nil {
+				continue // Skip bad entries
+			}
+			result[nodeID] = NodeMeta{Depth: ns.Depth, TraversalStatus: ns.TraversalStatus}
+		}
+		return nil
+	})
+	return result, err
+}
+
 // BatchUpdateNodeStatusByID updates multiple nodes from one status to another in a single transaction using ULIDs.
 func BatchUpdateNodeStatusByID(db *DB, queueType string, level int, oldStatus, newStatus string, nodeIDs []string) (map[string]*NodeState, error) {
 	results := make(map[string]*NodeState)

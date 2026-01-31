@@ -28,6 +28,19 @@ type NodeState struct {
 	Status            string `json:"status,omitempty"`   // Legacy: Comparison status for dst nodes
 	ExplicitExcluded  bool   `json:"explicit_excluded"`  // Set by API, not modified by engine
 	InheritedExcluded bool   `json:"inherited_excluded"` // Set by exclusion sweep engine
+	Errors            []ErrorRef `json:"errors,omitempty"` // Task error refs (id + phase) for O(1) lookup in errors bucket
+}
+
+// ErrorRef points to a task error entry in the errors bucket (phase sub-bucket, key = id).
+type ErrorRef struct {
+	ID    string `json:"id"`    // UUID of the error entry
+	Phase string `json:"phase"` // Sub-bucket: src_traversal, src_copy, dst_traversal, dst_copy
+}
+
+// NodeMeta holds Depth and TraversalStatus for batch lookups (e.g. retry DST cleanup).
+type NodeMeta struct {
+	Depth           int
+	TraversalStatus string
 }
 
 // Serialize converts NodeState to bytes for storage in BoltDB.

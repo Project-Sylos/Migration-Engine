@@ -80,7 +80,8 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		}
 	}
 
-	batch, err := db.BatchFetchWithKeys(boltDB, queueType, currentRound, db.StatusPending, defaultLeaseBatchSize)
+	batchSize := effectiveLeaseBatchSize()
+	batch, err := db.BatchFetchWithKeys(boltDB, queueType, currentRound, db.StatusPending, batchSize)
 
 	if err != nil {
 		if logservice.LS != nil {
@@ -94,6 +95,7 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	var expectedFoldersMap map[string][]types.Folder
 	var expectedFilesMap map[string][]types.File
 	var srcIDMap map[string]map[string]string // DST ULID -> (Type+Name -> SRC node ID)
+	var srcIDToMeta map[string]SrcNodeMeta   // SRC ID -> Depth/CopyStatus (for copy-status updates at completion)
 	if q.name == "dst" {
 		// First pass: collect all valid (not already leased) folder tasks and their DST parent ULIDs
 		var dstParentIDs []string
@@ -115,7 +117,7 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		// Uses lookup table to get SrcID from DST parent IDs, then loads SRC children
 		if len(dstParentIDs) > 0 {
 			var err error
-			expectedFoldersMap, expectedFilesMap, srcIDMap, err = BatchLoadExpectedChildrenByDSTIDs(boltDB, dstParentIDs, dstIDToPath)
+			expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta, err = BatchLoadExpectedChildrenByDSTIDs(boltDB, dstParentIDs, dstIDToPath)
 			if err != nil {
 				if logservice.LS != nil {
 					_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to batch load expected children: %v", err), "queue", q.name, q.name)
@@ -124,9 +126,11 @@ func (q *Queue) PullTraversalTasks(force bool) {
 				expectedFoldersMap = make(map[string][]types.Folder)
 				expectedFilesMap = make(map[string][]types.File)
 				srcIDMap = make(map[string]map[string]string)
+				srcIDToMeta = make(map[string]SrcNodeMeta)
 			}
 		} else {
 			srcIDMap = make(map[string]map[string]string)
+			srcIDToMeta = make(map[string]SrcNodeMeta)
 		}
 	}
 
@@ -142,7 +146,7 @@ func (q *Queue) PullTraversalTasks(force bool) {
 			task.ID = item.State.ID
 		}
 
-		// For DST folder tasks, populate ExpectedFolders/ExpectedFiles and SRC ID map from batch-loaded results
+		// For DST folder tasks, populate ExpectedFolders/ExpectedFiles, SRC ID map, and SRC node meta from batch-loaded results
 		if q.name == "dst" && task.IsFolder() {
 			// Use DST ULID to look up expected children
 			dstID := item.State.ID
@@ -152,6 +156,15 @@ func (q *Queue) PullTraversalTasks(force bool) {
 			task.ExpectedFiles = expectedFiles
 			if srcIDMap != nil {
 				task.ExpectedSrcIDMap = srcIDMap[dstID]
+			}
+			// Subset of srcIDToMeta for this task's expected SRC children (avoids per-child GetNodeState at completion)
+			if srcIDToMeta != nil && task.ExpectedSrcIDMap != nil {
+				task.ExpectedSrcNodeMeta = make(map[string]SrcNodeMeta)
+				for _, srcID := range task.ExpectedSrcIDMap {
+					if meta, ok := srcIDToMeta[srcID]; ok {
+						task.ExpectedSrcNodeMeta[srcID] = meta
+					}
+				}
 			}
 		}
 
@@ -163,7 +176,7 @@ func (q *Queue) PullTraversalTasks(force bool) {
 
 	// Track if this pull was partial (fewer tasks than requested)
 	// This signals we might have exhausted the current round
-	wasPartial := len(batch) < defaultLeaseBatchSize
+	wasPartial := len(batch) < batchSize
 	q.setLastPullWasPartial(wasPartial)
 
 	// Record pull in RoundInfo
@@ -230,13 +243,6 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 		q.filesDiscoveredTotal += int64(filesCount)
 		q.foldersDiscoveredTotal += int64(foldersCount)
 		q.mu.Unlock()
-
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug",
-				fmt.Sprintf("Discovered %d total children (folders: %d, files: %d) from path %s",
-					totalChildren, foldersCount, filesCount, parentPath),
-				"queue", q.name, q.name)
-		}
 	}
 
 	// Collect discovered children for insertion
@@ -278,29 +284,18 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 				outputBuffer.AddLookupMapping(child.SrcID, childState.ID)
 			}
 
-			// Update SRC node's CopyStatus if worker determined an update is needed
-			if child.SrcCopyStatus != "" {
-				// Get SRC node to get its depth and current copy status for the update
-				if srcNode, err := db.GetNodeState(boltDB, "SRC", child.SrcID); err == nil && srcNode != nil {
-					if outputBuffer != nil {
-						oldCopyStatus := srcNode.CopyStatus
-						if oldCopyStatus == "" {
-							oldCopyStatus = db.CopyStatusPending // Default to pending if not set
-						}
-						if logservice.LS != nil {
-							_ = logservice.LS.Log("debug",
-								fmt.Sprintf("DST comparison: queuing copy status update for SRC node %s: %s -> %s (level %d)",
-									child.SrcID, oldCopyStatus, child.SrcCopyStatus, srcNode.Depth),
-								"queue", q.name, q.name)
-						}
-						outputBuffer.AddCopyStatusUpdate("SRC", srcNode.Depth, oldCopyStatus, child.SrcID, child.SrcCopyStatus)
+			// Update SRC node's CopyStatus if worker determined an update is needed (use meta from pull, no DB lookup)
+			if child.SrcCopyStatus != "" && task.ExpectedSrcNodeMeta != nil {
+				if meta, ok := task.ExpectedSrcNodeMeta[child.SrcID]; ok && outputBuffer != nil {
+					oldCopyStatus := meta.CopyStatus
+					if oldCopyStatus == "" {
+						oldCopyStatus = db.CopyStatusPending
 					}
-				} else if err != nil {
-					if logservice.LS != nil {
-						_ = logservice.LS.Log("error",
-							fmt.Sprintf("Failed to get SRC node %s for copy status update: %v", child.SrcID, err),
-							"queue", q.name, q.name)
+					nodeType := "file"
+					if !child.IsFile {
+						nodeType = "folder"
 					}
+					outputBuffer.AddCopyStatusUpdate("SRC", meta.Depth, nodeType, oldCopyStatus, child.SrcID, child.SrcCopyStatus)
 				}
 			}
 		}
@@ -381,16 +376,15 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 					outputBuffer.AddLookupMapping(child.srcID, taskState.ID)
 				}
 
-				// Update SRC node's CopyStatus if worker determined an update is needed
-				if child.srcCopyStatus != "" {
-					if srcNode, err := db.GetNodeState(boltDB, "SRC", child.srcID); err == nil && srcNode != nil {
-						if outputBuffer != nil {
-							oldCopyStatus := srcNode.CopyStatus
-							if oldCopyStatus == "" {
-								oldCopyStatus = db.CopyStatusPending
-							}
-							outputBuffer.AddCopyStatusUpdate("SRC", srcNode.Depth, oldCopyStatus, child.srcID, child.srcCopyStatus)
+				// Update SRC node's CopyStatus if worker determined an update is needed (use meta from pull, no DB lookup)
+				if child.srcCopyStatus != "" && task.ExpectedSrcNodeMeta != nil {
+					if meta, ok := task.ExpectedSrcNodeMeta[child.srcID]; ok && outputBuffer != nil {
+						oldCopyStatus := meta.CopyStatus
+						if oldCopyStatus == "" {
+							oldCopyStatus = db.CopyStatusPending
 						}
+						// childFolders only contains folder children
+						outputBuffer.AddCopyStatusUpdate("SRC", meta.Depth, "folder", oldCopyStatus, child.srcID, child.srcCopyStatus)
 					}
 				}
 			}
@@ -421,29 +415,36 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 		// Add all operations atomically
 		outputBuffer.AddMultiple(atomicOps)
 
-		// For SRC FOLDER tasks in retry mode: Queue DST cleanup
+		// For SRC FOLDER tasks in retry mode: Queue DST cleanup (use preloaded RetryDstCleanup when present)
 		if q.name == "src" && q.getMode() == QueueModeRetry && task.IsFolder() {
-			dstID, err := db.GetDstIDFromSrcID(boltDB, nodeID)
-			if err == nil && dstID != "" {
-				dstState, err := db.GetNodeState(boltDB, "DST", dstID)
-				if err == nil && dstState != nil {
-					oldStatus := dstState.TraversalStatus
-					if oldStatus == "" {
-						oldStatus = db.StatusSuccessful
-					}
-					outputBuffer.AddStatusUpdate("DST", dstState.Depth, oldStatus, db.StatusPending, dstID)
-
-					// Queue deletion of DST children
-					childIDs, err := db.GetChildrenIDsByParentID(boltDB, "DST", dstID)
-					if err == nil && len(childIDs) > 0 {
-						for _, childID := range childIDs {
-							childState, err := db.GetNodeState(boltDB, "DST", childID)
-							if err == nil && childState != nil {
-								childStatus := childState.TraversalStatus
-								if childStatus == "" {
-									childStatus = db.StatusSuccessful
+			if task.RetryDstCleanup != nil {
+				c := task.RetryDstCleanup
+				outputBuffer.AddStatusUpdate("DST", c.DstDepth, c.DstOldStatus, db.StatusPending, c.DstID)
+				for _, ch := range c.Children {
+					outputBuffer.AddNodeDeletion("DST", ch.ID, ch.Depth, ch.TraversalStatus)
+				}
+			} else {
+				// Fallback when RetryDstCleanup was not populated (e.g. legacy path)
+				dstID, err := db.GetDstIDFromSrcID(boltDB, nodeID)
+				if err == nil && dstID != "" {
+					dstState, err := db.GetNodeState(boltDB, "DST", dstID)
+					if err == nil && dstState != nil {
+						oldStatus := dstState.TraversalStatus
+						if oldStatus == "" {
+							oldStatus = db.StatusSuccessful
+						}
+						outputBuffer.AddStatusUpdate("DST", dstState.Depth, oldStatus, db.StatusPending, dstID)
+						childIDs, err := db.GetChildrenIDsByParentID(boltDB, "DST", dstID)
+						if err == nil && len(childIDs) > 0 {
+							for _, childID := range childIDs {
+								childState, err := db.GetNodeState(boltDB, "DST", childID)
+								if err == nil && childState != nil {
+									childStatus := childState.TraversalStatus
+									if childStatus == "" {
+										childStatus = db.StatusSuccessful
+									}
+									outputBuffer.AddNodeDeletion("DST", childID, childState.Depth, childStatus)
 								}
-								outputBuffer.AddNodeDeletion("DST", childID, childState.Depth, childStatus)
 							}
 						}
 					}

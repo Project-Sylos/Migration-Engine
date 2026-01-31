@@ -89,7 +89,16 @@ const (
 	TraversalDataBucket = "Traversal-Data" // Root bucket for all traversal-related data
 	BucketSrc           = "SRC"
 	BucketDst           = "DST"
-	BucketLogs          = "LOGS" // Separate island, not under Traversal-Data
+	BucketLogs          = "LOGS"   // Separate island, not under Traversal-Data
+	BucketErrors        = "errors" // Task errors (traversal/copy failures); sub-buckets by phase
+)
+
+// Error phase sub-bucket names (under errors)
+const (
+	PhaseSrcTraversal = "src_traversal"
+	PhaseSrcCopy      = "src_copy"
+	PhaseDstTraversal = "dst_traversal"
+	PhaseDstCopy      = "dst_copy"
 )
 
 // Sub-bucket names
@@ -176,6 +185,17 @@ func GetStatusLookupBucketPath(queueType string, level int) []string {
 // Returns: ["LOGS"]
 func GetLogsBucketPath() []string {
 	return []string{BucketLogs}
+}
+
+// GetErrorsBucketPath returns the bucket path for the errors phase sub-bucket.
+// Phase must be one of PhaseSrcTraversal, PhaseSrcCopy, PhaseDstTraversal, PhaseDstCopy.
+func GetErrorsBucketPath(phase string) []string {
+	return []string{BucketErrors, phase}
+}
+
+// GetErrorsPhaseBucket returns the errors phase sub-bucket (read-only).
+func GetErrorsPhaseBucket(tx *bolt.Tx, phase string) *bolt.Bucket {
+	return getBucket(tx, GetErrorsBucketPath(phase))
 }
 
 // GetQueueStatsBucketPath returns the bucket path for queue statistics.

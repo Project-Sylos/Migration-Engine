@@ -14,8 +14,10 @@ Write-Host ""
 # Clean up existing test databases ONLY at the start for a fresh test
 # The DB will persist between Phase 1 (kill) and Phase 2 (resume)
 # Final cleanup happens at the end after verification
+$mainDB = "pkg/tests/traversal/shared/main_test.db"
 Write-Host "Cleaning up test databases for fresh test run..." -ForegroundColor Yellow
-Remove-Item -Path "pkg/tests/traversal/shared/main_test.db" -ErrorAction SilentlyContinue
+Remove-Item -Path $mainDB -ErrorAction SilentlyContinue
+Remove-Item -Path ($mainDB -replace '\.db$','_logs.db') -ErrorAction SilentlyContinue
 Remove-Item -Path "pkg/tests/traversal/shared/main_test.yaml" -ErrorAction SilentlyContinue
 Write-Host "Cleanup complete" -ForegroundColor Green
 Write-Host ""
@@ -170,7 +172,8 @@ if ($exitCode -eq 0) {
     # Clean up test databases after successful test completion
     Write-Host ""
     Write-Host "Cleaning up test databases after successful test..." -ForegroundColor Yellow
-    Remove-Item -Path "pkg/tests/traversal/shared/main_test.db" -ErrorAction SilentlyContinue
+    Remove-Item -Path $mainDB -ErrorAction SilentlyContinue
+    Remove-Item -Path ($mainDB -replace '\.db$','_logs.db') -ErrorAction SilentlyContinue
     Remove-Item -Path "pkg/tests/traversal/shared/main_test.yaml" -ErrorAction SilentlyContinue
     Write-Host "Cleanup complete" -ForegroundColor Green
 } else {

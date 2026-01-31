@@ -319,13 +319,13 @@ func verifyETLSampled(duckDB *sql.DB, boltDB *db.DB, sampleSize int) (*Verificat
 // Helper functions
 
 // getRandomNodeIDsFromDuck samples random node IDs from DuckDB for the given queue ("SRC" or "DST").
-// Uses separate table names: src_nodes_core or dst_nodes_core.
+// Uses primary UI tables: src_nodes_ui or dst_nodes_ui.
 func getRandomNodeIDsFromDuck(duckDB *sql.DB, queueType string, sampleSize int) ([]string, error) {
 	prefix := "src"
 	if queueType == "DST" {
 		prefix = "dst"
 	}
-	rows, err := duckDB.Query(fmt.Sprintf("SELECT id FROM %s_nodes_core", prefix))
+	rows, err := duckDB.Query(fmt.Sprintf("SELECT id FROM %s_nodes_ui", prefix))
 	if err != nil {
 		return nil, fmt.Errorf("failed to query DuckDB node IDs: %w", err)
 	}

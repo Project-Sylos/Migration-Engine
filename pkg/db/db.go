@@ -71,6 +71,45 @@ func Open(opts Options) (*DB, error) {
 	return database, nil
 }
 
+// OpenLogDB opens a Bolt DB that only has the LOGS bucket (for log persistence).
+// Use this for the dedicated log file (e.g. migration_logs.db). Path must be non-empty
+// or a temporary directory plus "logs.db" is used.
+func OpenLogDB(opts Options) (*DB, error) {
+	dbPath := opts.Path
+	if dbPath == "" {
+		tmpDir, err := os.MkdirTemp("", "sylos-bolt-*")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create temp directory for log db: %w", err)
+		}
+		dbPath = filepath.Join(tmpDir, "logs.db")
+	} else {
+		dir := filepath.Dir(dbPath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create bolt directory: %w", err)
+		}
+	}
+	boltDB, err := bolt.Open(dbPath, 0600, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open bolt db: %w", err)
+	}
+	database := &DB{db: boltDB, dbPath: dbPath}
+	if err := database.initializeLogBuckets(); err != nil {
+		boltDB.Close()
+		return nil, fmt.Errorf("failed to initialize log buckets: %w", err)
+	}
+	return database, nil
+}
+
+// initializeLogBuckets creates only the LOGS bucket (used by OpenLogDB).
+func (db *DB) initializeLogBuckets() error {
+	return db.Update(func(tx *bolt.Tx) error {
+		if _, err := tx.CreateBucketIfNotExists([]byte(BucketLogs)); err != nil {
+			return fmt.Errorf("failed to create LOGS bucket: %w", err)
+		}
+		return nil
+	})
+}
+
 // initializeBuckets creates the core bucket structure for migration data.
 // This is called once when the database is first opened.
 func (db *DB) initializeBuckets() error {
@@ -138,14 +177,20 @@ func (db *DB) initializeBuckets() error {
 			}
 		}
 
-		// Create LOGS bucket as separate top-level (its own island)
-		if _, err := tx.CreateBucketIfNotExists([]byte("LOGS")); err != nil {
-			return fmt.Errorf("failed to create LOGS bucket: %w", err)
-		}
-
 		// Initialize stats bucket (under Traversal-Data)
 		if err := initializeStatsBucket(tx); err != nil {
 			return fmt.Errorf("failed to initialize stats bucket: %w", err)
+		}
+
+		// Create errors bucket and phase sub-buckets (task traversal/copy errors)
+		errorsBucket, err := tx.CreateBucketIfNotExists([]byte(BucketErrors))
+		if err != nil {
+			return fmt.Errorf("failed to create errors bucket: %w", err)
+		}
+		for _, phase := range []string{PhaseSrcTraversal, PhaseSrcCopy, PhaseDstTraversal, PhaseDstCopy} {
+			if _, err := errorsBucket.CreateBucketIfNotExists([]byte(phase)); err != nil {
+				return fmt.Errorf("failed to create errors sub-bucket %s: %w", phase, err)
+			}
 		}
 
 		return nil
@@ -329,15 +374,10 @@ func (db *DB) IsTemporary() bool {
 // Returns an error if any structural issues are found.
 func (db *DB) ValidateCoreSchema() error {
 	return db.View(func(tx *bolt.Tx) error {
-		// Validate top-level buckets: Traversal-Data and LOGS
+		// Validate top-level bucket: Traversal-Data (LOGS live in separate log DB file)
 		traversalBucket := tx.Bucket([]byte("Traversal-Data"))
 		if traversalBucket == nil {
 			return fmt.Errorf("missing top-level bucket: Traversal-Data")
-		}
-
-		logsBucket := tx.Bucket([]byte(BucketLogs))
-		if logsBucket == nil {
-			return fmt.Errorf("missing top-level bucket: %s", BucketLogs)
 		}
 
 		// Validate STATS bucket under Traversal-Data

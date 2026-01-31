@@ -148,14 +148,14 @@ func LoadExpectedChildren(boltDB *db.DB, parentPath string, dstLevel int) ([]typ
 
 // BatchLoadExpectedChildrenByDSTIDs loads expected children for DST parent nodes using SrcID from DST NodeState.
 // Takes DST parent ULIDs, gets SrcID from each DST NodeState, then loads SRC children and maps them back to DST parents.
-// Returns maps keyed by DST ULID -> (folders, files), and a map of SRC node IDs keyed by Type+Name for matching.
-func BatchLoadExpectedChildrenByDSTIDs(boltDB *db.DB, dstParentIDs []string, dstIDToPath map[string]string) (map[string][]types.Folder, map[string][]types.File, map[string]map[string]string, error) {
+// Returns maps keyed by DST ULID -> (folders, files), a map of SRC node IDs keyed by Type+Name for matching, and srcIDToMeta (Depth/CopyStatus per SRC ID) for copy-status updates without per-child DB lookups.
+func BatchLoadExpectedChildrenByDSTIDs(boltDB *db.DB, dstParentIDs []string, dstIDToPath map[string]string) (map[string][]types.Folder, map[string][]types.File, map[string]map[string]string, map[string]SrcNodeMeta, error) {
 	if boltDB == nil {
-		return nil, nil, nil, fmt.Errorf("boltDB cannot be nil")
+		return nil, nil, nil, nil, fmt.Errorf("boltDB cannot be nil")
 	}
 
 	if len(dstParentIDs) == 0 {
-		return make(map[string][]types.Folder), make(map[string][]types.File), make(map[string]map[string]string), nil
+		return make(map[string][]types.Folder), make(map[string][]types.File), make(map[string]map[string]string), make(map[string]SrcNodeMeta), nil
 	}
 
 	// Initialize result maps (keyed by DST ULID)
@@ -163,6 +163,7 @@ func BatchLoadExpectedChildrenByDSTIDs(boltDB *db.DB, dstParentIDs []string, dst
 	resultFiles := make(map[string][]types.File)
 	// Map: DST ULID -> (Type+Name -> SRC node ID)
 	srcIDMap := make(map[string]map[string]string)
+	var srcIDToMeta map[string]SrcNodeMeta
 
 	// Single transaction to load all children
 	err := boltDB.View(func(tx *bolt.Tx) error {
@@ -348,12 +349,95 @@ func BatchLoadExpectedChildrenByDSTIDs(boltDB *db.DB, dstParentIDs []string, dst
 			}
 		}
 
+		// Build SRC ID -> (Depth, CopyStatus) for copy-status updates at completion without per-child GetNodeState
+		srcIDToMeta = make(map[string]SrcNodeMeta)
+		for childID, ns := range childStates {
+			meta := SrcNodeMeta{Depth: ns.Depth, CopyStatus: ns.CopyStatus}
+			if meta.CopyStatus == "" {
+				meta.CopyStatus = db.CopyStatusPending
+			}
+			srcIDToMeta[childID] = meta
+		}
+
 		return nil
 	})
 
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to batch load expected children: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to batch load expected children: %w", err)
 	}
 
-	return resultFolders, resultFiles, srcIDMap, nil
+	return resultFolders, resultFiles, srcIDMap, srcIDToMeta, nil
+}
+
+// BatchLoadRetryDstCleanup loads DST counterpart and children meta for SRC folder tasks in retry mode.
+// Returns map[srcID]*RetryDstCleanup so completion can queue DST status update and child deletions without per-child DB lookups.
+func BatchLoadRetryDstCleanup(boltDB *db.DB, srcIDs []string) (map[string]*RetryDstCleanup, error) {
+	out := make(map[string]*RetryDstCleanup)
+	if boltDB == nil || len(srcIDs) == 0 {
+		return out, nil
+	}
+	srcToDst, err := db.BatchGetDstIDsFromSrcIDs(boltDB, srcIDs)
+	if err != nil {
+		return nil, fmt.Errorf("batch get DST IDs from SRC IDs: %w", err)
+	}
+	if len(srcToDst) == 0 {
+		return out, nil
+	}
+	dstIDs := make([]string, 0, len(srcToDst))
+	for _, dstID := range srcToDst {
+		dstIDs = append(dstIDs, dstID)
+	}
+	dstMeta, err := db.BatchGetNodeMeta(boltDB, "DST", dstIDs)
+	if err != nil {
+		return nil, fmt.Errorf("batch get DST node meta: %w", err)
+	}
+	parentToChildren, err := db.BatchGetChildrenIDsByParentIDs(boltDB, "DST", dstIDs)
+	if err != nil {
+		return nil, fmt.Errorf("batch get DST children by parent: %w", err)
+	}
+	var allChildIDs []string
+	for _, childIDs := range parentToChildren {
+		allChildIDs = append(allChildIDs, childIDs...)
+	}
+	childMeta := make(map[string]db.NodeMeta)
+	if len(allChildIDs) > 0 {
+		childMeta, err = db.BatchGetNodeMeta(boltDB, "DST", allChildIDs)
+		if err != nil {
+			return nil, fmt.Errorf("batch get DST child meta: %w", err)
+		}
+	}
+	for srcID, dstID := range srcToDst {
+		meta, ok := dstMeta[dstID]
+		if !ok {
+			continue
+		}
+		oldStatus := meta.TraversalStatus
+		if oldStatus == "" {
+			oldStatus = db.StatusSuccessful
+		}
+		children := parentToChildren[dstID]
+		cleanupChildren := make([]RetryDstChild, 0, len(children))
+		for _, childID := range children {
+			cm, ok := childMeta[childID]
+			if !ok {
+				continue
+			}
+			childStatus := cm.TraversalStatus
+			if childStatus == "" {
+				childStatus = db.StatusSuccessful
+			}
+			cleanupChildren = append(cleanupChildren, RetryDstChild{
+				ID:              childID,
+				Depth:           cm.Depth,
+				TraversalStatus: childStatus,
+			})
+		}
+		out[srcID] = &RetryDstCleanup{
+			DstID:        dstID,
+			DstDepth:     meta.Depth,
+			DstOldStatus: oldStatus,
+			Children:     cleanupChildren,
+		}
+	}
+	return out, nil
 }

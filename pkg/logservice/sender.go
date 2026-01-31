@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,31 +21,58 @@ import (
 var LS *Sender
 
 // InitGlobalLogger initializes the global LS instance.
-// This should be called once during application startup.
-func InitGlobalLogger(dbInstance *db.DB, addr, level string) error {
-	sender, err := NewSender(dbInstance, addr, level)
+// Logs are persisted to a dedicated Bolt file derived from mainDB.Path() (e.g. migration.db -> migration_logs.db).
+// If mainDB.Path() is empty, log persistence is skipped (UDP only).
+func InitGlobalLogger(mainDB *db.DB, addr, level string) error {
+	var logDB *db.DB
+	if mainDB != nil {
+		logDBPath := deriveLogDBPath(mainDB.Path())
+		if logDBPath != "" {
+			var err error
+			logDB, err = db.OpenLogDB(db.Options{Path: logDBPath})
+			if err != nil {
+				return fmt.Errorf("failed to open log DB: %w", err)
+			}
+		}
+	}
+	sender, err := NewSender(logDB, addr, level)
 	if err != nil {
+		if logDB != nil {
+			_ = logDB.Close()
+		}
 		return fmt.Errorf("failed to initialize global logger: %w", err)
 	}
 	LS = sender
 
-	// send a test log on the global logger
 	if err := LS.Log("info", "Test log", "test", "test"); err != nil {
+		_ = LS.Close()
 		return fmt.Errorf("failed to send test log: %w", err)
 	}
-
-	// if err := LS.ClearConsole(); err != nil {
-	// 	return fmt.Errorf("failed to send clear console log: %w", err)
-	// }
-
 	return nil
 }
 
-// Sender transmits logs over UDP and writes them to the database.
+// deriveLogDBPath returns the path for the dedicated log DB file (e.g. migration.db -> migration_logs.db).
+// Returns empty string if mainPath is empty (no log persistence).
+func deriveLogDBPath(mainPath string) string {
+	mainPath = strings.TrimSpace(mainPath)
+	if mainPath == "" {
+		return ""
+	}
+	dir := filepath.Dir(mainPath)
+	base := filepath.Base(mainPath)
+	ext := filepath.Ext(base)
+	name := strings.TrimSuffix(base, ext)
+	if name == "" {
+		name = "migration"
+	}
+	return filepath.Join(dir, name+"_logs.db")
+}
+
+// Sender transmits logs over UDP and optionally writes them to a dedicated log DB.
 type Sender struct {
-	DB         *db.DB        // BoltDB handle for persistence
-	logBuffer  *db.LogBuffer // buffered log writer
-	Addr       string        // e.g. "127.0.0.1:1997"
+	logDB     *db.DB        // dedicated log Bolt DB (owned by Sender when set; closed in Close())
+	logBuffer *db.LogBuffer // buffered log writer (nil if logDB is nil)
+	Addr      string        // e.g. "127.0.0.1:1997"
 	Level      string        // threshold for UDP output
 	conn       net.Conn
 	minLevelIx int
@@ -74,8 +103,8 @@ func getLevelIndex(level string) int {
 }
 
 // NewSender initializes a new dual-channel sender.
-// dbInstance should be a BoltDB instance.
-func NewSender(dbInstance *db.DB, addr, level string) (*Sender, error) {
+// If logDB is non-nil, logs are persisted to it (dedicated log file). If nil, only UDP is used.
+func NewSender(logDB *db.DB, addr, level string) (*Sender, error) {
 	conn, err := net.Dial("udp", addr)
 	if err != nil {
 		return nil, err
@@ -86,23 +115,24 @@ func NewSender(dbInstance *db.DB, addr, level string) (*Sender, error) {
 	}
 	buf := new(bytes.Buffer)
 
-	// Create a log buffer that flushes every 500 entries or every 2 seconds
-	logBuffer := db.NewLogBuffer(dbInstance, 500, 2*time.Second)
+	var logBuffer *db.LogBuffer
+	if logDB != nil {
+		logBuffer = db.NewLogBuffer(logDB, 500, 2*time.Second)
+	}
 
 	return &Sender{
-		DB:         dbInstance,
-		logBuffer:  logBuffer,
-		Addr:       addr,
-		Level:      level,
-		conn:       conn,
+		logDB:     logDB,
+		logBuffer: logBuffer,
+		Addr:      addr,
+		Level:     level,
+		conn:      conn,
 		minLevelIx: minIx,
-		buf:        buf,
-		enc:        json.NewEncoder(buf),
+		buf:       buf,
+		enc:       json.NewEncoder(buf),
 	}, nil
 }
 
-// Log sends the message via UDP (if level >= threshold)
-// and writes it unconditionally to the logs table in the DB via the buffer.
+// Log sends the message via UDP (if level >= threshold) and optionally to the log DB via the buffer.
 // Safe for concurrent use.
 func (s *Sender) Log(level, message, entity, entityID string, queues ...string) error {
 	timestamp := time.Now()
@@ -112,17 +142,19 @@ func (s *Sender) Log(level, message, entity, entityID string, queues ...string) 
 		queue = queues[0]
 	}
 
-	// --- DB write (always, buffered) ---
-	id := db.GenerateLogID() // Generate UUID for log entry
-	s.logBuffer.Add(db.LogEntry{
-		ID:        id,
-		Timestamp: timestamp.Format(time.RFC3339Nano), // ISO8601 format
-		Level:     level,
-		Entity:    entity,
-		EntityID:  entityID,
-		Message:   message,
-		Queue:     queue,
-	})
+	// --- DB write (when log DB is set, buffered) ---
+	if s.logBuffer != nil {
+		id := db.GenerateLogID()
+		s.logBuffer.Add(db.LogEntry{
+			ID:        id,
+			Timestamp: timestamp.Format(time.RFC3339Nano),
+			Level:     level,
+			Entity:    entity,
+			EntityID:  entityID,
+			Message:   message,
+			Queue:     queue,
+		})
+	}
 
 	// --- UDP send (conditional) ---
 	levelIx := getLevelIndex(level)
@@ -175,14 +207,19 @@ func (s *Sender) ClearConsole() error {
 	return err
 }
 
-// Close terminates the UDP connection and stops the log buffer.
-// The log buffer Stop() has its own timeout to prevent blocking.
+// Close terminates the UDP connection, stops the log buffer, and closes the log DB if owned.
 func (s *Sender) Close() error {
 	if s.logBuffer != nil {
 		s.logBuffer.Stop()
+		s.logBuffer = nil
 	}
 	if s.conn != nil {
 		_ = s.conn.Close()
+		s.conn = nil
+	}
+	if s.logDB != nil {
+		_ = s.logDB.Close()
+		s.logDB = nil
 	}
 	return nil
 }

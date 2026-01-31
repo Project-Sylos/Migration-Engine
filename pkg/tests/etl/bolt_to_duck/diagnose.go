@@ -29,8 +29,8 @@ func main() {
 	}
 	defer db.Close()
 
-	// Check for duplicate paths in core tables only (status/children will mirror)
-	coreTables := []string{"src_nodes_core", "dst_nodes_core"}
+	// Check for duplicate paths in primary UI tables (path is PK; duplicates indicate ETL bug)
+	coreTables := []string{"src_nodes_ui", "dst_nodes_ui"}
 
 	foundDuplicates := false
 	sameIDDuplicates := false
@@ -150,17 +150,17 @@ func main() {
 	for _, id := range failingIDs {
 		fmt.Printf("\nNode ID: %s\n", id)
 
-		// Get path from core
+		// Get path from primary UI table
 		var path string
-		err := db.QueryRow("SELECT path FROM dst_nodes_core WHERE id = ?", id).Scan(&path)
+		err := db.QueryRow("SELECT path FROM dst_nodes_ui WHERE id = ?", id).Scan(&path)
 		if err != nil {
-			fmt.Printf("  Not found in dst_nodes_core\n")
+			fmt.Printf("  Not found in dst_nodes_ui\n")
 			continue
 		}
 		fmt.Printf("  Path: %s\n", path)
 
-		// Check status table for this path
-		rows, err := db.Query("SELECT traversal_status, copy_status FROM dst_nodes_status WHERE path = ?", path)
+		// Status is in same table (dst_nodes_ui)
+		rows, err := db.Query("SELECT traversal_status, copy_status FROM dst_nodes_ui WHERE path = ?", path)
 		if err != nil {
 			fmt.Printf("  Error querying status: %v\n", err)
 		} else {

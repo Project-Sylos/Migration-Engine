@@ -37,6 +37,7 @@ Write-Host "Cleaning up previous test files..." -ForegroundColor Yellow
 if (Test-Path $destDB) {
     Remove-Item -Path $destDB -Force -ErrorAction SilentlyContinue
 }
+Remove-Item -Path ($destDB -replace '\.db$','_logs.db') -Force -ErrorAction SilentlyContinue
 if (Test-Path $destYAML) {
     Remove-Item -Path $destYAML -Force -ErrorAction SilentlyContinue
 }

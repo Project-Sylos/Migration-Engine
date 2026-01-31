@@ -135,10 +135,14 @@ func (q *Queue) getMaxRetries() int {
 	return q.maxRetries
 }
 
+// getPullLowWM returns the low watermark for pulling more work: 25% of lease batch size, minimum 1.
 func (q *Queue) getPullLowWM() int {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	return q.pullLowWM
+	bs := effectiveLeaseBatchSize()
+	wm := bs / 4
+	if wm < 1 {
+		wm = 1
+	}
+	return wm
 }
 
 func (q *Queue) GetFilesDiscoveredTotal() int64 {
@@ -572,6 +576,10 @@ type QueueStateSnapshot struct {
 func (q *Queue) getStateSnapshot() QueueStateSnapshot {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
+	wm := effectiveLeaseBatchSize() / 4
+	if wm < 1 {
+		wm = 1
+	}
 	return QueueStateSnapshot{
 		State:              q.state,
 		Round:              q.round,
@@ -579,7 +587,7 @@ func (q *Queue) getStateSnapshot() QueueStateSnapshot {
 		InProgressCount:    len(q.inProgress),
 		Pulling:            q.pulling,
 		LastPullWasPartial: q.lastPullWasPartial,
-		PullLowWM:          q.pullLowWM,
+		PullLowWM:          wm,
 		BoltDB:             q.boltDB,
 		OutputBuffer:       q.outputBuffer,
 		Mode:               q.mode,

@@ -6,6 +6,7 @@ package queue
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
@@ -96,16 +97,12 @@ func (w *TraversalWorker) Run() {
 		// Execute the task (check for shutdown during execution if needed)
 		err := w.execute(task)
 		if err != nil {
-			// Task failed, let queue handle retry logic
-			if logservice.LS != nil {
-				_ = logservice.LS.Log("debug",
-					fmt.Sprintf("Worker task execution failed: path=%s round=%d error=%v",
-						task.LocationPath(), task.Round, err),
-					"worker", w.id, w.queueName)
+			// Record task error in main DB for cross-lookup (traversal phase)
+			if w.boltDB != nil {
+				queueType := strings.ToUpper(w.queueName)
+				_, _ = db.RecordTaskError(w.boltDB, queueType, "traversal", task.ID, err.Error(), task.Attempts, task.LocationPath())
 			}
-			// Report failure - queue will handle retry logic
 			w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
-			// Check if task was retried for logging
 			nodeID := task.ID
 			willRetry := w.queue.isInPendingSet(nodeID)
 			w.logError(task, err, willRetry)

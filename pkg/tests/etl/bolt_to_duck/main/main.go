@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	defaultBoltDBPath = "/home/lmaup/Code/Codeberg/Sylos/Migration-Engine/pkg/tests/etl/bolt_to_duck/main-bolt.db"
-	defaultDuckDBPath = "/home/lmaup/Code/Codeberg/Sylos/Migration-Engine/pkg/tests/etl/bolt_to_duck/main-bolt-duck.db"
+	defaultBoltDBPath = "/home/lmaup/Code/Codeberg/Sylos/Migration-Engine/pkg/tests/etl/bolt_to_duck/main_test.db"
+	defaultDuckDBPath = "/home/lmaup/Code/Codeberg/Sylos/Migration-Engine/pkg/tests/etl/bolt_to_duck/main_test-duck.db"
 	sampleSize        = 100 // Tier 2 sample size
 )
 
@@ -199,11 +199,11 @@ func verifyETLQuick(boltDB *db.DB, duckDB *sql.DB) (*VerificationResult, error) 
 	}
 
 	var srcDuckCount, dstDuckCount int
-	if err := duckDB.QueryRow("SELECT COUNT(*) FROM src_nodes_core").Scan(&srcDuckCount); err != nil {
-		return nil, fmt.Errorf("failed to count DuckDB src_nodes_core: %w", err)
+	if err := duckDB.QueryRow("SELECT COUNT(*) FROM src_nodes_ui").Scan(&srcDuckCount); err != nil {
+		return nil, fmt.Errorf("failed to count DuckDB src_nodes_ui: %w", err)
 	}
-	if err := duckDB.QueryRow("SELECT COUNT(*) FROM dst_nodes_core").Scan(&dstDuckCount); err != nil {
-		return nil, fmt.Errorf("failed to count DuckDB dst_nodes_core: %w", err)
+	if err := duckDB.QueryRow("SELECT COUNT(*) FROM dst_nodes_ui").Scan(&dstDuckCount); err != nil {
+		return nil, fmt.Errorf("failed to count DuckDB dst_nodes_ui: %w", err)
 	}
 
 	if srcBoltCount != srcDuckCount {
@@ -284,7 +284,7 @@ func verifyETLSampled(boltDB *db.DB, duckDB *sql.DB, sampleSize int) (*Verificat
 			duckNode, exists := srcNodes[nodeID]
 			if !exists {
 				result.Tier2Passed = false
-				result.Errors = append(result.Errors, fmt.Sprintf("SRC node %s: not found in DuckDB src_nodes_core", nodeID))
+				result.Errors = append(result.Errors, fmt.Sprintf("SRC node %s: not found in DuckDB src_nodes_ui", nodeID))
 				missingCount++
 				continue
 			}
@@ -326,7 +326,7 @@ func verifyETLSampled(boltDB *db.DB, duckDB *sql.DB, sampleSize int) (*Verificat
 			duckNode, exists := dstNodes[nodeID]
 			if !exists {
 				result.Tier2Passed = false
-				result.Errors = append(result.Errors, fmt.Sprintf("DST node %s: not found in DuckDB dst_nodes_core", nodeID))
+				result.Errors = append(result.Errors, fmt.Sprintf("DST node %s: not found in DuckDB dst_nodes_ui", nodeID))
 				missingCount++
 				continue
 			}
@@ -416,13 +416,13 @@ func verifyStatusDistribution(boltDB *db.DB, duckDB *sql.DB, result *Verificatio
 		}
 	}
 
-	// Get status distribution from DuckDB (src_nodes_status / dst_nodes_status)
+	// Get status distribution from DuckDB (src_nodes_ui / dst_nodes_ui)
 	duckStatusCounts := make(map[string]map[string]int)
 	for _, queueType := range []string{"SRC", "DST"} {
 		duckStatusCounts[queueType] = make(map[string]int)
-		tableName := "src_nodes_status"
+		tableName := "src_nodes_ui"
 		if queueType == "DST" {
-			tableName = "dst_nodes_status"
+			tableName = "dst_nodes_ui"
 		}
 		rows, err := duckDB.Query(fmt.Sprintf("SELECT traversal_status, COUNT(*) FROM %s GROUP BY traversal_status", tableName))
 		if err != nil {
@@ -497,14 +497,14 @@ func verifyJoinCoverage(boltDB *db.DB, duckDB *sql.DB, result *VerificationResul
 		return err
 	}
 
-	// Count joins in DuckDB (src_nodes_core.join_id / dst_nodes_core.join_id)
+	// Count joins in DuckDB (src_nodes_ui.join_id / dst_nodes_ui.join_id)
 	var srcWithDstCount int
-	if err := duckDB.QueryRow("SELECT COUNT(*) FROM src_nodes_core WHERE join_id IS NOT NULL").Scan(&srcWithDstCount); err != nil {
-		return fmt.Errorf("failed to count src_nodes_core with join_id: %w", err)
+	if err := duckDB.QueryRow("SELECT COUNT(*) FROM src_nodes_ui WHERE join_id IS NOT NULL").Scan(&srcWithDstCount); err != nil {
+		return fmt.Errorf("failed to count src_nodes_ui with join_id: %w", err)
 	}
 	var dstWithSrcCount int
-	if err := duckDB.QueryRow("SELECT COUNT(*) FROM dst_nodes_core WHERE join_id IS NOT NULL").Scan(&dstWithSrcCount); err != nil {
-		return fmt.Errorf("failed to count dst_nodes_core with join_id: %w", err)
+	if err := duckDB.QueryRow("SELECT COUNT(*) FROM dst_nodes_ui WHERE join_id IS NOT NULL").Scan(&dstWithSrcCount); err != nil {
+		return fmt.Errorf("failed to count dst_nodes_ui with join_id: %w", err)
 	}
 
 	if srcToDstCount != srcWithDstCount {
@@ -656,13 +656,12 @@ func getDuckNodesBatch(duckDB *sql.DB, queueType string, nodeIDs []string) (map[
 		prefix = "dst"
 	}
 
-	// JOIN on path only - path is unique within each table set
+	// Primary UI table + children (path is unique)
 	query := fmt.Sprintf(`
-		SELECT c.id, c.path, c.depth, s.traversal_status, s.copy_status, c.join_id, ch.child_ids
-		FROM %s_nodes_core c
-		JOIN %s_nodes_status s ON c.path = s.path
-		JOIN %s_nodes_children ch ON c.path = ch.path
-		WHERE c.id IN (`, prefix, prefix, prefix)
+		SELECT u.id, u.path, u.depth, u.traversal_status, u.copy_status, u.join_id, ch.child_ids
+		FROM %s_nodes_ui u
+		LEFT JOIN %s_nodes_children ch ON u.path = ch.path
+		WHERE u.id IN (`, prefix, prefix)
 	args := make([]interface{}, 0, len(nodeIDs))
 	for i, nodeID := range nodeIDs {
 		if i > 0 {

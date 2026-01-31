@@ -10,12 +10,14 @@ echo ""
 
 # Clean up existing test databases
 echo "Cleaning up test databases..."
+mainDB="pkg/tests/traversal/shared/main_test.db"
 
 # Remove the BoltDB file if it exists
-if [ -f "pkg/tests/traversal/shared/main_test.db" ]; then
-    echo "Removing pkg/tests/traversal/shared/main_test.db file..."
-    rm -f "pkg/tests/traversal/shared/main_test.db"
+if [ -f "$mainDB" ]; then
+    echo "Removing $mainDB file..."
+    rm -f "$mainDB"
 fi
+rm -f "${mainDB%.db}_logs.db"
 
 # Remove the migration config YAML file if it exists
 if [ -f "pkg/tests/traversal/shared/main_test.yaml" ]; then

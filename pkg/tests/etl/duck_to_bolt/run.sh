@@ -17,6 +17,7 @@ if [ -f "$boltDBPath" ]; then
     echo "Removing $boltDBPath file..."
     rm -f "$boltDBPath"
 fi
+rm -f "${boltDBPath%.db}_logs.db"
 
 echo "Cleanup complete"
 echo ""

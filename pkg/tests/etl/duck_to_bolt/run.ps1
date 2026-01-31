@@ -16,6 +16,7 @@ if (Test-Path $boltDBPath) {
     Write-Host "Removing $boltDBPath file..." -ForegroundColor Yellow
     Remove-Item -Path $boltDBPath -Force -ErrorAction SilentlyContinue
 }
+Remove-Item -Path ($boltDBPath -replace '\.db$','_logs.db') -Force -ErrorAction SilentlyContinue
 
 Write-Host "Cleanup complete" -ForegroundColor Green
 Write-Host ""

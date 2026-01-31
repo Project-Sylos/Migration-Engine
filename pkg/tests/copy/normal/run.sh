@@ -38,6 +38,7 @@ echo "Cleaning up previous test files..."
 if [ -f "$destDB" ]; then
     rm -f "$destDB"
 fi
+rm -f "${destDB%.db}_logs.db"
 if [ -f "$destYAML" ]; then
     rm -f "$destYAML"
 fi

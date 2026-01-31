@@ -299,6 +299,7 @@ func (q *Queue) PullCopyTasks(force bool) {
 
 	// Scan pending status bucket for the specific node type
 	// Bucket is already filtered by node type, so no in-memory filtering needed!
+	batchSize := effectiveLeaseBatchSize()
 	var matchedBatch []db.FetchResult
 	var hitEndOfBucket bool
 
@@ -345,13 +346,13 @@ func (q *Queue) PullCopyTasks(force bool) {
 			})
 
 			// Stop if we've collected enough
-			if len(matchedBatch) >= defaultLeaseBatchSize {
+			if len(matchedBatch) >= batchSize {
 				break
 			}
 		}
 
 		// We hit end of bucket if cursor finished before we collected enough items
-		hitEndOfBucket = len(matchedBatch) < defaultLeaseBatchSize
+		hitEndOfBucket = len(matchedBatch) < batchSize
 
 		return nil
 	})
@@ -442,7 +443,7 @@ func (q *Queue) PullCopyTasks(force bool) {
 			// ONLY queue status update if we successfully enqueued the task
 			// This prevents queueing status updates for already-leased or duplicate tasks
 			if outputBuffer != nil {
-				outputBuffer.AddCopyStatusUpdate("SRC", item.State.Depth, db.CopyStatusPending, item.State.ID, db.CopyStatusInProgress)
+				outputBuffer.AddCopyStatusUpdate("SRC", item.State.Depth, item.State.Type, db.CopyStatusPending, item.State.ID, db.CopyStatusInProgress)
 			}
 		}
 	}
@@ -549,7 +550,7 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 	// Update copy status: in-progress -> successful
 	outputBuffer := q.getOutputBuffer()
 	if outputBuffer != nil {
-		outputBuffer.AddCopyStatusUpdate("SRC", srcNode.Depth, db.CopyStatusInProgress, nodeID, db.CopyStatusSuccessful)
+		outputBuffer.AddCopyStatusUpdate("SRC", srcNode.Depth, srcNode.Type, db.CopyStatusInProgress, nodeID, db.CopyStatusSuccessful)
 	}
 
 	// Create DST node entry and update join-lookup
@@ -673,7 +674,7 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 
 		// Add to buffer only on final failure
 		if outputBuffer != nil {
-			outputBuffer.AddCopyStatusUpdate("SRC", srcNode.Depth, db.CopyStatusInProgress, nodeID, db.CopyStatusFailed)
+			outputBuffer.AddCopyStatusUpdate("SRC", srcNode.Depth, srcNode.Type, db.CopyStatusInProgress, nodeID, db.CopyStatusFailed)
 		}
 
 		q.removeInProgress(nodeID)

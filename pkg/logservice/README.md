@@ -1,6 +1,6 @@
 # Log Service Package
 
-The **Log Service** package provides asynchronous, dual-channel logging for the migration engine. It combines **real-time UDP logging** for live monitoring with **BoltDB persistence** for audit trails and analysis.
+The **Log Service** package provides asynchronous, dual-channel logging for the migration engine. It combines **real-time UDP logging** for live monitoring with **BoltDB persistence** in a **dedicated log file** (separate from the main migration DB).
 
 ---
 
@@ -9,11 +9,11 @@ The **Log Service** package provides asynchronous, dual-channel logging for the 
 The log service provides two independent channels:
 
 1. **UDP Channel**: Real-time network logging for monitoring tools (level-filtered)
-2. **Database Channel**: Persistent storage in BoltDB via a buffered writer (all logs, always enabled)
+2. **Database Channel**: Persistent storage in a **dedicated Bolt DB file** (e.g. `migration_logs.db` next to `migration.db`), via a buffered writer. Logs are **not** stored in the main migration DB and are **not** ETL'd to or from DuckDB.
 
 **Key benefits**:
-- **Non-blocking**: Buffered writes prevent log operations from slowing down migration
-- **Complete audit trail**: All logs are persisted to BoltDB for later analysis
+- **Non-blocking**: Buffered writes and a separate log file keep log I/O off the main DB hot path
+- **Complete audit trail**: All logs are persisted to the log DB for later analysis
 - **Real-time monitoring**: UDP stream enables live tracking via external tools
 - **Level filtering**: UDP channel respects minimum log level; database captures everything
 
@@ -26,12 +26,13 @@ Application Code
     ↓ (log call)
 LogService (LS)
     ├─→ UDP Socket ──→ Network (filtered by level)
-    └─→ LogBuffer ──→ BoltDB
+    └─→ LogBuffer ──→ Dedicated log Bolt DB (e.g. migration_logs.db)
 ```
 
 **Components**:
 - **`LogService`**: Singleton global logger; routes messages to both channels
-- **`LogBuffer`**: Batches log entries and flushes to BoltDB periodically
+- **Log DB**: Dedicated Bolt file (path derived from main DB path, e.g. `migration.db` → `migration_logs.db`). Opened and owned by the sender; closed on `Close()`.
+- **`LogBuffer`**: Batches log entries and flushes to the log DB periodically
 - **UDP Sender**: Async network writer (non-blocking)
 
 ---
@@ -55,15 +56,15 @@ logservice.LS.Log("info", "Migration started", "migration", "main", "src")
 ```
 
 **Parameters**:
-- `boltDB`: BoltDB instance (for persistence)
+- `mainDB`: Main migration Bolt DB; log file path is derived from `mainDB.Path()` (e.g. `migration.db` → `migration_logs.db`). If path is empty, log persistence is skipped (UDP only).
 - `address`: UDP address for network logging (format: "host:port")
 - `minLevel`: Minimum level for UDP logging ("trace", "debug", "info", "warning", "error", "critical")
 
 **Behavior**:
-- All logs are persisted to BoltDB regardless of level
+- When `mainDB.Path()` is non-empty, a dedicated log DB is opened and all logs are persisted there (not in the main DB)
 - Only logs >= `minLevel` are sent via UDP
 - If UDP fails, logging continues (non-blocking)
-- Sends a test log and clears console on initialization
+- Logs are **not** ETL'd to or from DuckDB; they remain in the log file only
 
 ### Manual Sender Creation
 

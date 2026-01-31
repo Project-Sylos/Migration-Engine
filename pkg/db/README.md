@@ -542,7 +542,7 @@ outputBuffer.AddBatchInsert(ops)
 outputBuffer.AddNodeDeletion("DST", nodeID, 1, db.StatusSuccessful)
 
 // Add copy status update
-outputBuffer.AddCopyStatusUpdate("SRC", 1, db.StatusSuccessful, nodeID, db.CopyStatusPending)
+outputBuffer.AddCopyStatusUpdate("SRC", 1, "file", db.StatusSuccessful, nodeID, db.CopyStatusPending)
 
 // Add join-lookup mapping (bidirectional: src-to-dst and dst-to-src)
 outputBuffer.AddLookupMapping(srcULID, dstULID)

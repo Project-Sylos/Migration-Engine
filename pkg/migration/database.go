@@ -6,6 +6,8 @@ package migration
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
@@ -25,15 +27,37 @@ type DatabaseConfig struct {
 	RequireOpen bool
 }
 
-// removeBoltDatabase removes a BoltDB file.
+// logDBPathFromMain derives the dedicated log DB path from the main DB path (e.g. main_test.db -> main_test_logs.db).
+func logDBPathFromMain(mainPath string) string {
+	mainPath = strings.TrimSpace(mainPath)
+	if mainPath == "" {
+		return ""
+	}
+	dir := filepath.Dir(mainPath)
+	base := filepath.Base(mainPath)
+	ext := filepath.Ext(base)
+	name := strings.TrimSuffix(base, ext)
+	if name == "" {
+		return ""
+	}
+	return filepath.Join(dir, name+"_logs.db")
+}
+
+// removeBoltDatabase removes a BoltDB file and its dedicated log DB file (if present).
 func removeBoltDatabase(path string) error {
 	if path == "" {
 		return nil
 	}
 
-	// Remove the database file
+	// Remove the main database file
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to remove database file %s: %w", path, err)
+	}
+
+	// Remove the dedicated log DB file (e.g. main_test_logs.db)
+	logPath := logDBPathFromMain(path)
+	if logPath != "" {
+		_ = os.Remove(logPath) // Ignore errors - log file might not exist
 	}
 
 	return nil

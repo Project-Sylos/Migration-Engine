@@ -15,8 +15,10 @@ echo ""
 # Clean up existing test databases ONLY at the start for a fresh test
 # The DB will persist between Phase 1 (kill) and Phase 2 (resume)
 # Final cleanup happens at the end after verification
+mainDB="pkg/tests/traversal/shared/main_test.db"
 echo "Cleaning up test databases for fresh test run..."
-rm -f "pkg/tests/traversal/shared/main_test.db"
+rm -f "$mainDB"
+rm -f "${mainDB%.db}_logs.db"
 rm -f "pkg/tests/traversal/shared/main_test.yaml"
 echo "Cleanup complete"
 echo ""
@@ -126,7 +128,8 @@ if [ $exitCode -eq 0 ]; then
     # Clean up test databases after successful test completion
     echo ""
     echo "Cleaning up test databases after successful test..."
-    rm -f "pkg/tests/traversal/shared/main_test.db"
+    rm -f "$mainDB"
+    rm -f "${mainDB%.db}_logs.db"
     rm -f "pkg/tests/traversal/shared/main_test.yaml"
     echo "Cleanup complete"
 else

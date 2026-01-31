@@ -57,9 +57,17 @@ const (
 )
 
 const (
-	defaultLeaseBatchSize    = 1000
-	defaultLeaseLowWatermark = 250
+	defaultLeaseBatchSize = 1000
+	maxLeaseBatchSize    = 20_000 // Upper bound for pull (lease) batch size
 )
+
+// effectiveLeaseBatchSize returns the lease batch size capped by maxLeaseBatchSize.
+func effectiveLeaseBatchSize() int {
+	if defaultLeaseBatchSize <= maxLeaseBatchSize {
+		return defaultLeaseBatchSize
+	}
+	return maxLeaseBatchSize
+}
 
 // Queue maintains round-based task queues for BFS traversal coordination.
 // It handles task leasing, retry logic, and cross-queue task propagation.
@@ -74,7 +82,6 @@ type Queue struct {
 	pendingSet         map[string]struct{}  // Fast lookup for pending buffer dedupe (keyed by ULID)
 	leasedKeys         map[string]struct{}  // ULIDs already pulled/leased - prevents duplicate pulls from stale views
 	pulling            bool                 // Indicates a pull operation is active
-	pullLowWM          int                  // Low watermark threshold for pulling more work
 	lastPullWasPartial bool                 // True if last pull returned fewer tasks than requested (partial batch)
 	maxRetries         int                  // Maximum retry attempts per task
 	round              int                  // Current BFS round/depth level
@@ -116,10 +123,9 @@ func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCo
 		mode:                QueueModeTraversal, // Default to traversal mode
 		state:               QueueStateRunning,
 		inProgress:          make(map[string]*TaskBase),
-		pendingBuff:         make([]*TaskBase, 0, defaultLeaseBatchSize),
+		pendingBuff:         make([]*TaskBase, 0, effectiveLeaseBatchSize()),
 		pendingSet:          make(map[string]struct{}),
 		leasedKeys:          make(map[string]struct{}),
-		pullLowWM:           defaultLeaseLowWatermark,
 		maxRetries:          maxRetries,
 		round:               0,
 		workers:             make([]Worker, 0, workerCount),
@@ -829,7 +835,7 @@ func (q *Queue) Clear() {
 
 	// Clear in-progress tracking
 	q.inProgress = make(map[string]*TaskBase)
-	q.pendingBuff = make([]*TaskBase, 0, defaultLeaseBatchSize)
+	q.pendingBuff = make([]*TaskBase, 0, effectiveLeaseBatchSize())
 	q.pendingSet = make(map[string]struct{})
 	q.pulling = false
 
