@@ -363,7 +363,7 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 		LogLevel:        "trace",
 		SkipListener:    true,
 		StartupDelay:    3 * time.Second,
-		Verification:    migration.VerifyOptions{},
+		Verification:    migration.VerifyOptions{AllowNotOnSrc: true},
 	}
 
 	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {

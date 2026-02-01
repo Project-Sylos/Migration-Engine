@@ -60,37 +60,40 @@ type TaskBase struct {
 
 ## BoltDB Storage Architecture
 
-All node state is stored in BoltDB using bucket hierarchies:
+All node state is stored in BoltDB using **level-sharded** bucket hierarchies under `Traversal-Data/{SRC|DST}/levels/<level>/`. There are no top-level global `nodes` or `children` buckets.
 
 ### Bucket Structure
 
 ```
-/SRC
-  /nodes                  → pathHash: NodeState JSON
-  /children               → parentHash: []childHash JSON
-  /levels
-    /00000001
-      /pending            → pathHash: empty (membership)
-      /successful         → pathHash: empty
-      /failed             → pathHash: empty
+/Traversal-Data/SRC/levels/<level>
+  /nodes                  → ULID: NodeState JSON
+  /children               → parentULID: []childULID JSON
+  /src-to-dst             → srcULID: dstULID (join lookup)
+  /traversal
+    /pending              → ULID: empty (membership)
+    /successful           → ULID: empty
+    /failed               → ULID: empty
+    /excluded             → ULID: empty
+    /status-lookup        → ULID: status string
+  /copy                   → (SRC only: folder|file → status buckets)
 
-/DST
-  (same structure + /not_on_src status)
+/Traversal-Data/DST/levels/<level>
+  (same shape with /dst-to-src and /not_on_src in traversal)
 ```
 
 ### Key Operations
 
-**Completion writes perform three operations atomically:**
+**Completion writes perform three operations atomically (within the level shard):**
 
 1. **Node Inserts** – New children discovered in the current round are inserted into:
-   - `/nodes` bucket (full NodeState data)
-   - `/levels/{nextRound}/pending` bucket (membership)
-   - `/children` bucket (parent-child relationship)
+   - `levels/<nextRound>/nodes` bucket (full NodeState data)
+   - `levels/<nextRound>/traversal/pending` bucket (membership)
+   - `levels/<nextRound>/children` bucket (parent-child relationship)
 
 2. **Status Updates** – Parent nodes transition from pending to successful:
-   - Update NodeState in `/nodes` bucket
-   - Remove from `/levels/{level}/pending`
-   - Add to `/levels/{level}/successful`
+   - Update NodeState in `levels/<level>/nodes` bucket
+   - Remove from `levels/<level>/traversal/pending`
+   - Add to `levels/<level>/traversal/successful`
 
 3. **Copy Updates** – Destination workers signal that src is newer:
    - Update CopyStatus field in NodeState metadata
@@ -287,9 +290,9 @@ The queue system supports two operating modes:
 
 **DST Cleanup Logic**:
 When a SRC folder task completes successfully in retry mode:
-1. Lookup corresponding DST node using join-lookup table (`src-to-dst`)
+1. Lookup corresponding DST node using join-lookup table (`levels/<level>/src-to-dst`)
 2. Mark DST parent as `pending` (queued via OutputBuffer)
-3. Query DST children bucket for child node IDs
+3. Query DST children bucket for child node IDs (`levels/<level>/children`)
 4. Delete all DST children (queued via OutputBuffer using `AddNodeDeletion`)
 5. DST queue will re-process the parent and discover fresh children
 

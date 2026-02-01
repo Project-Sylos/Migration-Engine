@@ -143,16 +143,21 @@ logBuffer := db.NewLogBuffer(boltDB, 500, 2*time.Second)
 
 ### Storage Structure
 
-All logs are written to BoltDB via a buffered writer (`db.LogBuffer`):
+All logs are written to BoltDB via a buffered writer (`db.LogBuffer`). Logs are **count-sharded** (e.g. 1M entries per shard). Each shard holds full log entries, level-index buckets, and a stats bucket for resume.
 
 ```
 /LOGS
-  /trace     → {uuid}: LogEntry JSON
-  /debug     → {uuid}: LogEntry JSON
-  /info      → {uuid}: LogEntry JSON
-  /warning   → {uuid}: LogEntry JSON
-  /error     → {uuid}: LogEntry JSON
-  /critical  → {uuid}: LogEntry JSON
+  /_meta              → current_shard, current_count (for resume)
+  /000000             → shard 0 (6-digit zero-padded shard ID)
+    /logs             → {uuid}: LogEntry JSON (full entries)
+    /trace            → {uuid}: empty (membership by level)
+    /debug
+    /info
+    /warning
+    /error
+    /critical
+    /stats            → count (entries in this shard)
+  /000001/...         → shard 1, ...
 ```
 
 **Log Entry Structure**:

@@ -139,56 +139,67 @@ BoltDB was chosen for its simplicity, reliability, and perfect fit with the BFS 
 
 The database is partitioned into two main areas:
 
-**Traversal-Data** (all traversal-related data):
+**Traversal-Data** (all traversal-related data, level-sharded):
+
+All node data, children, and join lookups for a given BFS level live under `levels/<level>/`. There are no top-level global `nodes`, `children`, or join buckets.
+
 ```
 /Traversal-Data
   /SRC
-    /nodes                  → ULID: NodeState JSON (canonical data)
-    /children               → parentULID: []childULID JSON (tree relationships)
-    /src-to-dst             → srcULID: dstULID (bidirectional join-lookup table)
     /levels
       /00000000
+        /nodes              → ULID: NodeState JSON (canonical data)
+        /children           → parentULID: []childULID JSON (tree relationships)
+        /src-to-dst         → srcULID: dstULID (join lookup for this level)
         /traversal
-          /pending            → ULID: empty (membership set)
-          /successful         → ULID: empty
-          /failed             → ULID: empty
-          /excluded           → ULID: empty
-          /status-lookup      → ULID: status string (reverse index)
+          /pending          → ULID: empty (membership set)
+          /successful       → ULID: empty
+          /failed           → ULID: empty
+          /excluded         → ULID: empty
+          /status-lookup    → ULID: status string (reverse index)
         /copy
-          /pending            → ULID: empty (membership set)
-          /successful         → ULID: empty
-          /skipped            → ULID: empty
-          /failed             → ULID: empty
-          /status-lookup      → ULID: status string (reverse index)
+          /folder|file      → /pending, /successful, /skipped, /failed, /status-lookup
       /00000001/...
+    /exclusion-holding      → path-hash: depth (exclusion hold)
+    /unexclusion-holding    → path-hash: depth (unexclusion hold)
   /DST
-    /nodes                  → ULID: NodeState JSON (canonical data)
-    /children               → parentULID: []childULID JSON (tree relationships)
-    /dst-to-src             → dstULID: srcULID (bidirectional join-lookup table)
     /levels
       /00000000
+        /nodes              → ULID: NodeState JSON
+        /children           → parentULID: []childULID JSON
+        /dst-to-src         → dstULID: srcULID (join lookup for this level)
         /traversal
           /pending
           /successful
           /failed
-          /not_on_src         → ULID: empty (DST-specific status)
-          /excluded           → ULID: empty
-          /status-lookup      → ULID: status string (reverse index)
+          /not_on_src       → ULID: empty (DST-specific)
+          /excluded
+          /status-lookup
       /00000001/...
+    /exclusion-holding
+    /unexclusion-holding
   /STATS
-    /totals                → bucketPath: int64 (bucket count statistics)
-    /queue-stats           → queueKey: QueueObserverMetrics JSON (queue metrics)
+    (key: bucketPath string) → int64 (bucket count; e.g. "SRC/levels/00000001/nodes")
+    /queue-stats             → queueKey: QueueObserverMetrics JSON (queue metrics)
 ```
 
-**LOGS** (separate island, not under Traversal-Data):
+**LOGS** (separate island, count-sharded):
+
+Logs are sharded by entry count (e.g. 1M entries per shard). Each shard holds full log entries and level-index buckets.
+
 ```
 /LOGS
-  /trace                 → uuid: LogEntry JSON
-  /debug                 → uuid: LogEntry JSON
-  /info                  → uuid: LogEntry JSON
-  /warning               → uuid: LogEntry JSON
-  /error                 → uuid: LogEntry JSON
-  /critical              → uuid: LogEntry JSON
+  /_meta                    → current_shard, current_count (for resume)
+  /000000                   → shard 0
+    /logs                   → uuid: LogEntry JSON (full entries)
+    /trace                  → uuid: empty (membership by level)
+    /debug
+    /info
+    /warning
+    /error
+    /critical
+    /stats                  → count (entries in this shard)
+  /000001/...               → shard 1, ...
 ```
 
 This partitioning separates traversal operations (discovery/scanning phase) from future copy operations, allowing the copy phase to have its own data structure under a separate root bucket.
@@ -196,12 +207,12 @@ This partitioning separates traversal operations (discovery/scanning phase) from
 ### Key Design Principles
 
 1. **Separation of Concerns**
-   - Node data lives in `/nodes` (single source of truth)
-   - **Traversal status** membership tracked in `/levels/{level}/traversal/{status}` buckets (SRC and DST)
-   - **Copy status** membership tracked in `/levels/{level}/copy/{status}` buckets (SRC only)
-   - Separate status-lookup indexes in `/levels/{level}/traversal/status-lookup` and `/levels/{level}/copy/status-lookup` provide reverse lookup (ULID → status)
-   - Tree relationships in `/children` buckets
-   - Bidirectional join-lookup tables (`/src-to-dst` and `/dst-to-src`) map corresponding SRC and DST node ULIDs
+   - All data for a given BFS level lives under **level shards**: `Traversal-Data/{SRC|DST}/levels/<level>/`
+   - Node data lives in `levels/<level>/nodes` (single source of truth per level)
+   - **Traversal status** membership in `levels/<level>/traversal/{status}` (SRC and DST)
+   - **Copy status** membership in `levels/<level>/copy/{type}/{status}` (SRC only)
+   - Status-lookup indexes in `levels/<level>/traversal/status-lookup` and `levels/<level>/copy/status-lookup` provide reverse lookup (ULID → status)
+   - Tree relationships in `levels/<level>/children`; join lookups in `levels/<level>/src-to-dst` (SRC) and `levels/<level>/dst-to-src` (DST)
    - Join tables enable efficient correlation without embedding references in node data
 
    **Traversal Status** (SRC and DST):
@@ -217,21 +228,21 @@ This partitioning separates traversal operations (discovery/scanning phase) from
 2. **Status Transitions are Atomic**
    Status transitions update multiple buckets atomically:
    ```go
-   // Traversal status transition:
-   // 1. Update NodeState in /nodes bucket
+   // Traversal status transition (within levels/<level>/):
+   // 1. Update NodeState in nodes bucket
    // 2. Remove from old traversal status bucket
    // 3. Add to new traversal status bucket
    // 4. Update traversal status-lookup index
    
-   // Copy status transition (SRC only):
-   // 1. Update NodeState in /nodes bucket
+   // Copy status transition (SRC only, within levels/<level>/):
+   // 1. Update NodeState in nodes bucket
    // 2. Remove from old copy status bucket
    // 3. Add to new copy status bucket
    // 4. Update copy status-lookup index
    ```
 
 3. **Status-Lookup Indexes**
-   - Each level has separate `traversal/status-lookup` and `copy/status-lookup` buckets that map `ULID → status string`
+   - Within each level shard, `traversal/status-lookup` and `copy/status-lookup` map `ULID → status string`
    - Provides O(1) lookup to find which status bucket a node belongs to
    - Automatically maintained on every insert and status update
    - Enables efficient queries without scanning all status buckets
@@ -239,10 +250,10 @@ This partitioning separates traversal operations (discovery/scanning phase) from
 4. **ULID-Based Keys and Lookup Tables**
    - All internal operations use ULID (Universally Unique Lexicographically Sortable Identifier) for keys
    - ULIDs provide unique, sortable identifiers without path dependencies
-   - **Bidirectional join-lookup tables** (`/src-to-dst` and `/dst-to-src`) map corresponding SRC ↔ DST node ULIDs
+   - **Bidirectional join-lookup tables** (`src-to-dst` and `dst-to-src` under each `levels/<level>/`) map corresponding SRC ↔ DST node ULIDs per level
      - Join tables are populated when DST children are discovered and matched to SRC children (by Type + Name)
      - This architecture replaces the legacy `SrcID` field that was previously embedded in DST NodeState
-     - Enables efficient lookups: given a SRC ULID, find the corresponding DST ULID (and vice versa)
+     - Enables efficient lookups: given a SRC ULID and level, find the corresponding DST ULID (and vice versa)
    - Matching between SRC and DST nodes is done by Type + Name, not path
    - Hierarchy is natural and navigable through parent-child ULID relationships
 

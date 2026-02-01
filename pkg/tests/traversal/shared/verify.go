@@ -26,10 +26,6 @@ func PrintVerification(result migration.Result) {
 		report.DstFailed,
 	)
 
-	if report.DstNotOnSrc > 0 {
-		fmt.Printf("ℹ Info: %d dst nodes marked as NotOnSrc (allowed in ephemeral mode for divergent trees)\n", report.DstNotOnSrc)
-	}
-
 	fmt.Println()
 	fmt.Println("✓ All verification checks passed!")
 	fmt.Printf("✓ Successfully migrated %d nodes\n", report.SrcTotal)

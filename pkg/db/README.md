@@ -39,15 +39,15 @@ The database is partitioned into two main areas:
 
 This partitioning separates traversal operations (discovery/scanning phase) from future copy operations, allowing the copy phase to have its own data structure under a separate root bucket.
 
-### Node Storage (`/SRC` and `/DST`)
+### Level-Sharded Storage (`/SRC` and `/DST`)
 
-Each queue type has three main sub-buckets:
+All traversal data for a given BFS level lives under **level shards**: `Traversal-Data/{SRC|DST}/levels/<level>/`. There are no top-level global `nodes`, `children`, or join buckets. Each level shard contains:
 
-#### 1. Nodes Bucket (`/nodes`)
+#### 1. Nodes Bucket (`levels/<level>/nodes`)
 
-**Path**: `/Traversal-Data/SRC/nodes/` or `/Traversal-Data/DST/nodes/`
+**Path**: `/Traversal-Data/SRC/levels/00000000/nodes/` (or DST, or another level)
 
-Stores the canonical node data. Key is the ULID, value is NodeState JSON.
+Stores the canonical node data for that level. Key is the ULID, value is NodeState JSON.
 
 ```
 ULID → NodeState JSON
@@ -60,29 +60,30 @@ ULID → NodeState JSON
   "type": "folder",
   "depth": 1,
   "traversal_status": "successful",
-  "src_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",  // For DST nodes: corresponding SRC node ULID
   ...
 }
 ```
 
-#### 2. Children Bucket (`/children`)
+(For DST nodes, corresponding SRC identity is resolved via the join-lookup table, not stored in NodeState.)
 
-**Path**: `/Traversal-Data/SRC/children/` or `/Traversal-Data/DST/children/`
+#### 2. Children Bucket (`levels/<level>/children`)
 
-Stores parent-child relationships. Key is parent ULID, value is array of child ULIDs.
+**Path**: `/Traversal-Data/SRC/levels/00000000/children/` (or DST, or another level)
+
+Stores parent-child relationships for nodes at this level. Key is parent ULID, value is array of child ULIDs.
 
 ```
 parentULID → []childULID JSON
 ["01ARZ3NDEKTSV4RRFFQ69G5FAV", "01ARZ3NDEKTSV4RRFFQ69G5FAW", "01ARZ3NDEKTSV4RRFFQ69G5FAX"]
 ```
 
-#### 3. Join-Lookup Tables (`/src-to-dst` and `/dst-to-src`)
+#### 3. Join-Lookup Tables (`levels/<level>/src-to-dst` and `levels/<level>/dst-to-src`)
 
-**Paths**: 
-- `/Traversal-Data/SRC/src-to-dst/`
-- `/Traversal-Data/DST/dst-to-src/`
+**Paths** (per level):
+- `/Traversal-Data/SRC/levels/<level>/src-to-dst/`  (SRC only)
+- `/Traversal-Data/DST/levels/<level>/dst-to-src/`  (DST only)
 
-Bidirectional mappings between corresponding SRC and DST nodes. These tables replace the legacy `SrcID` field that was previously embedded in DST NodeState.
+Bidirectional mappings between corresponding SRC and DST nodes at that level. These tables replace the legacy `SrcID` field that was previously embedded in DST NodeState.
 
 ```
 SRC: srcULID → dstULID
@@ -96,64 +97,58 @@ DST: dstULID → srcULID
 
 **Usage:**
 ```go
-// Find DST node corresponding to SRC node
-dstID, err := db.GetDstIDFromSrcID(boltDB, srcULID)
+// Find DST node corresponding to SRC node (level required)
+dstID, err := db.GetDstIDFromSrcID(boltDB, level, srcULID)
 
-// Find SRC node corresponding to DST node
-srcID, err := db.GetSrcIDFromDstID(boltDB, dstULID)
+// Find SRC node corresponding to DST node (level required)
+srcID, err := db.GetSrcIDFromDstID(boltDB, level, dstULID)
 
-// Set bidirectional mapping (usually done via OutputBuffer)
-err := db.SetSrcToDstMapping(tx, srcULID, dstULID)
-err := db.SetDstToSrcMapping(tx, dstULID, srcULID)
+// Set bidirectional mapping (each call uses its own transaction; or use OutputBuffer)
+err := db.SetSrcToDstMapping(database, level, srcULID, dstULID)
+err := db.SetDstToSrcMapping(database, level, dstULID, srcULID)
 ```
 
-#### 4. Levels Bucket (`/levels`)
+#### 4. Levels Bucket (`/levels`) – status and lookups per level
 
 **Path**: `/Traversal-Data/SRC/levels/` or `/Traversal-Data/DST/levels/`
 
-Organized by BFS depth level, with separate **traversal** and **copy** status sub-buckets (copy buckets exist only for SRC):
+Each level shard also contains **traversal** and **copy** status sub-buckets (copy exists only for SRC). Full structure per level:
 
-**SRC Structure:**
+**SRC level shard (e.g. `levels/00000000`):**
 ```
-/levels
-  /00000000              → Level 0 (root)
-    /traversal
-      /pending           → ULID: empty (membership set)
-      /successful        → ULID: empty (membership set)
-      /failed            → ULID: empty (membership set)
-      /excluded          → ULID: empty (membership set)
-      /status-lookup     → ULID: status string (reverse index)
-    /copy
-      /pending           → ULID: empty (membership set)
-      /successful        → ULID: empty (membership set)
-      /skipped           → ULID: empty (membership set)
-      /failed            → ULID: empty (membership set)
-      /status-lookup     → ULID: status string (reverse index)
-  /00000001              → Level 1
-    /traversal
-      ...
-    /copy
-      ...
-  /00000002              → Level 2
-    ...
+/levels/00000000
+  /nodes              → ULID: NodeState JSON
+  /children           → parentULID: []childULID JSON
+  /src-to-dst         → srcULID: dstULID
+  /traversal
+    /pending          → ULID: empty (membership set)
+    /successful       → ULID: empty
+    /failed           → ULID: empty
+    /excluded         → ULID: empty
+    /status-lookup    → ULID: status string (reverse index)
+  /copy
+    /folder           → /pending, /in-progress, /successful, /skipped, /failed
+    /file             → (same)
+    /status-lookup    → ULID: status string
+  /00000001           → Level 1 (same shape)
+  ...
 ```
 
-**DST Structure:**
+**DST level shard (e.g. `levels/00000000`):**
 ```
-/levels
-  /00000000              → Level 0 (root)
-    /traversal
-      /pending           → ULID: empty (membership set)
-      /successful        → ULID: empty (membership set)
-      /failed            → ULID: empty (membership set)
-      /not_on_src        → ULID: empty (membership set)
-      /excluded          → ULID: empty (membership set)
-      /status-lookup     → ULID: status string (reverse index)
-  /00000001              → Level 1
-    /traversal
-      ...
-  /00000002              → Level 2
-    ...
+/levels/00000000
+  /nodes              → ULID: NodeState JSON
+  /children           → parentULID: []childULID JSON
+  /dst-to-src         → dstULID: srcULID
+  /traversal
+    /pending
+    /successful
+    /failed
+    /not_on_src       → ULID: empty (DST-specific)
+    /excluded
+    /status-lookup
+  /00000001
+  ...
 ```
 
 **Note**: DST nodes do **not** have copy status buckets. Copy status is only relevant for SRC nodes.
@@ -178,42 +173,45 @@ Organized by BFS depth level, with separate **traversal** and **copy** status su
 
 ### Log Storage (`/LOGS`)
 
-Logs are organized by level in sub-buckets:
+Logs are **count-sharded** (e.g. 1M entries per shard). Each shard holds full log entries, level-index buckets, and a stats bucket for resume. The `_meta` bucket stores the current shard ID and count.
 
 ```
 /LOGS
-  /trace     → uuid: LogEntry JSON
-  /debug     → uuid: LogEntry JSON
-  /info      → uuid: LogEntry JSON
-  /warning   → uuid: LogEntry JSON
-  /error     → uuid: LogEntry JSON
-  /critical  → uuid: LogEntry JSON
+  /_meta              → current_shard (int64), current_count (int64) — for resume
+  /000000             → shard 0 (6-digit zero-padded shard ID)
+    /logs             → uuid: LogEntry JSON (full entries)
+    /trace            → uuid: empty (membership by level)
+    /debug
+    /info
+    /warning
+    /error
+    /critical
+    /stats            → "count": int64 (entries in this shard)
+  /000001             → shard 1
+    ...
 ```
 
-Each log entry is keyed by its UUID within the appropriate level bucket.
+Each log entry is stored in the current shard's `logs` bucket (keyed by UUID) and referenced in the level bucket (trace, debug, info, etc.) for level-based queries.
 
 ### Statistics Bucket (`/STATS`)
 
 **Path**: `/Traversal-Data/STATS/`
 
-Stores count statistics for all buckets and queue performance metrics:
+Stores count statistics and queue performance metrics:
 
 ```
 /STATS
-  /totals                → bucketPath: int64 (8-byte big-endian)
-    "SRC/nodes"                    → int64
-    "SRC/children"                 → int64
-    "SRC/levels/00000001/traversal/pending"  → int64
-    "SRC/levels/00000001/copy/pending"       → int64
-    "DST/levels/00000002/traversal/successful" → int64
-    "LOGS"                         → int64
+  (key: bucket path string) → int64 (8-byte big-endian)
+    e.g. "SRC/levels/00000000/nodes" → int64
+    e.g. "SRC/levels/00000001/traversal/pending" → int64
+    e.g. "DST/levels/00000002/traversal/successful" → int64
   /queue-stats           → queueKey: QueueObserverMetrics JSON
     "src-traversal"      → QueueObserverMetrics JSON
     "dst-traversal"      → QueueObserverMetrics JSON
     "copy"               → QueueObserverMetrics JSON (future)
 ```
 
-**Totals sub-bucket**: Stores count statistics for all buckets to enable O(1) count lookups without scanning. Statistics are automatically maintained during writes via `OutputBuffer` and can be manually synchronized using `SyncCounts()`.
+**Count keys**: Stored directly in the STATS bucket (no `totals` sub-bucket). Keys are bucket path strings (e.g. `SRC/levels/00000001/nodes`). Statistics are automatically maintained during writes via `OutputBuffer` and can be manually synchronized using `SyncCounts()`.
 
 **Queue-stats sub-bucket**: Stores real-time queue performance metrics published by the `QueueObserver`:
 - Queue statistics (pending, in-progress, workers, round, etc.)
@@ -320,12 +318,13 @@ updatedState, err := db.UpdateNodeStatusByID(database, "SRC", 1,
 // Get node state by ULID
 state, err := db.GetNodeState(database, "SRC", nodeID)
 
-// Get children of a node by parent ULID
+// Get children of a node by parent ULID (parent level required)
 parentID := "01ARZ3NDEKTSV4RRFFQ69G5FAW"  // Parent's ULID
-children, err := db.GetChildrenStatesByParentID(database, "SRC", parentID)
+parentLevel := 0  // Level of the parent (children live at parentLevel+1)
+children, err := db.GetChildrenStatesByParentID(database, "SRC", parentLevel, parentID)
 
 // Query status-lookup index (find which status bucket a node belongs to)
-lookupBucket := db.GetStatusLookupBucket(tx, "SRC", 1)
+lookupBucket := db.GetTraversalStatusLookupBucket(tx, "SRC", 1)
 nodeIDBytes := []byte(nodeID)  // Convert ULID string to bytes
 statusBytes := lookupBucket.Get(nodeIDBytes)
 status := string(statusBytes) // "pending", "successful", "failed", etc.
@@ -381,12 +380,11 @@ ops := []db.InsertOperation{
 err := db.BatchInsertNodes(database, ops)
 
 // Batch delete nodes (comprehensive cleanup)
-// Automatically deletes from:
-// - /nodes bucket
-// - status buckets (/levels/{level}/{status})
-// - status-lookup index
-// - parent's children list
-// - join-lookup tables (src-to-dst and dst-to-src)
+// Automatically deletes from (within the node's level shard):
+// - levels/<level>/nodes bucket
+// - levels/<level>/traversal|copy status buckets and status-lookup index
+// - parent's children list (levels/<parentLevel>/children)
+// - join-lookup tables (levels/<level>/src-to-dst, dst-to-src)
 // - node's own children list (if folder)
 // - stats bucket (decrements counts)
 deleteOps := []db.DeleteNodeOperation{
@@ -408,7 +406,7 @@ copyResults, err := db.BatchUpdateNodeCopyStatus(database, "SRC", 1,
 ### Log Operations
 
 ```go
-// Insert a log entry (automatically goes to correct level bucket)
+// Insert a log entry (buffered; written to current log shard)
 entry := db.LogEntry{
     ID:        db.GenerateLogID(),
     Timestamp: time.Now().Format(time.RFC3339Nano),
@@ -473,8 +471,8 @@ outputBuffer.AddNodeDeletion("DST", nodeID, 1, db.StatusSuccessful)
 // Add copy status update
 outputBuffer.AddCopyStatusUpdate("SRC", 1, "file", db.StatusSuccessful, nodeID, db.CopyStatusPending)
 
-// Add join-lookup mapping (bidirectional: src-to-dst and dst-to-src)
-outputBuffer.AddLookupMapping(srcULID, dstULID)
+// Add join-lookup mapping (bidirectional: src-to-dst and dst-to-src; level required)
+outputBuffer.AddLookupMapping(level, srcULID, dstULID)
 
 // Force flush (or wait for automatic flush on batch size or interval)
 outputBuffer.Flush()
@@ -499,8 +497,8 @@ outputBuffer.Resume()
 Batches log entries for efficient persistence:
 
 ```go
-// Create log buffer
-logBuffer := db.NewLogBuffer(database, 500, 2*time.Second)
+// Create log buffer (shardCap: max entries per log shard, e.g. db.DefaultLogShardCap)
+logBuffer := db.NewLogBuffer(database, 500, 2*time.Second, db.DefaultLogShardCap)
 defer logBuffer.Stop()
 
 // Add log entry (automatically flushed when batch size reached)
@@ -547,28 +545,27 @@ err := database.Update(func(tx *bolt.Tx) error {
 ## Bucket Helper Functions
 
 ```go
-// Get bucket paths
-nodesPath := db.GetNodesBucketPath("SRC")        // ["Traversal-Data", "SRC", "nodes"]
-childrenPath := db.GetChildrenBucketPath("SRC")  // ["Traversal-Data", "SRC", "children"]
-levelPath := db.GetLevelBucketPath("SRC", 1)     // ["Traversal-Data", "SRC", "levels", "00000001"]
+// Get bucket paths (level-sharded)
+nodesPath := db.GetNodesBucketPath("SRC", 0)        // ["Traversal-Data", "SRC", "levels", "00000000", "nodes"]
+childrenPath := db.GetChildrenBucketPath("SRC", 0)  // ["Traversal-Data", "SRC", "levels", "00000000", "children"]
+levelPath := db.GetLevelBucketPath("SRC", 1)        // ["Traversal-Data", "SRC", "levels", "00000001"]
 traversalStatusPath := db.GetTraversalStatusBucketPath("SRC", 1, db.StatusPending)
-copyStatusPath := db.GetCopyStatusBucketPath(1, db.CopyStatusPending) // SRC only
-// ["Traversal-Data", "SRC", "levels", "00000001", "pending"]
-lookupPath := db.GetStatusLookupBucketPath("SRC", 1)
-// ["Traversal-Data", "SRC", "levels", "00000001", "status-lookup"]
+copyStatusPath := db.GetCopyStatusBucketPath(1, "folder", db.CopyStatusPending) // SRC only
+lookupPath := db.GetTraversalStatusLookupBucketPath("SRC", 1)
+// ["Traversal-Data", "SRC", "levels", "00000001", "traversal", "status-lookup"]
 
-// Create level bucket with all status sub-buckets and status-lookup index
+// Create level bucket with nodes, children, join, traversal/copy status and status-lookup index
 err := db.EnsureLevelBucket(tx, "SRC", 1)
 
-// Get bucket within transaction
-nodesBucket := db.GetNodesBucket(tx, "SRC")
-statusBucket := db.GetStatusBucket(tx, "SRC", 1, db.StatusPending)
-lookupBucket := db.GetStatusLookupBucket(tx, "SRC", 1)
+// Get bucket within transaction (level required for nodes/children/status)
+nodesBucket := db.GetNodesBucket(tx, "SRC", 1)
+statusBucket := db.GetTraversalStatusBucket(tx, "SRC", 1, db.StatusPending)
+lookupBucket := db.GetTraversalStatusLookupBucket(tx, "SRC", 1)
 
 // Update status-lookup index (automatically called by insert/update functions)
 nodeID := "01ARZ3NDEKTSV4RRFFQ69G5FAV"  // ULID
 nodeIDBytes := []byte(nodeID)
-err := db.UpdateStatusLookup(tx, "SRC", 1, nodeIDBytes, db.StatusSuccessful)
+err := db.UpdateTraversalStatusLookup(tx, "SRC", 1, nodeIDBytes, db.StatusSuccessful)
 ```
 
 ---
@@ -605,12 +602,11 @@ const (
 BoltDB makes status transitions atomic and race-free:
 
 ```go
-// Atomic within single transaction:
-// 1. Update NodeState in /nodes bucket
+// Atomic within single transaction (within levels/<level>/):
+// 1. Update NodeState in nodes bucket
 // 2. Remove from old traversal status bucket
 // 3. Add to new traversal status bucket
 // 4. Update traversal status-lookup index
-// 4. Update status-lookup index
 // All four operations succeed or all fail
 ```
 
@@ -718,12 +714,12 @@ if state == nil {
 The stats bucket provides O(1) count lookups for all buckets and queue performance metrics:
 
 ```go
-// Get count for any bucket path (from /STATS/totals)
-count, err := database.GetBucketCount([]string{"SRC", "nodes"})
-count, err := database.GetBucketCount([]string{"SRC", "levels", "00000001", "pending"})
+// Get count for any bucket path (keys stored directly in STATS bucket)
+count, err := database.GetBucketCount([]string{"SRC", "levels", "00000000", "nodes"})
+count, err := database.GetBucketCount([]string{"SRC", "levels", "00000001", "traversal", "pending"})
 
 // Check if bucket has items
-hasItems, err := database.HasBucketItems([]string{"SRC", "nodes"})
+hasItems, err := database.HasBucketItems([]string{"SRC", "levels", "00000001", "nodes"})
 
 // Manually synchronize all stats (useful for recovery)
 err := database.SyncCounts()

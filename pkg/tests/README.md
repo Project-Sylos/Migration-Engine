@@ -55,12 +55,12 @@ This test exercises the happy-path traversal, queue coordination, verification, 
 **Phase 2: Prepare Retry**
 - Randomly selects a top-level folder (directly under root)
 - Marks the selected folder as `pending`
-- Performs comprehensive subtree deletion:
-  - Deletes all descendant nodes from `/nodes` bucket
-  - Removes entries from status buckets (`pending`, `successful`, `failed`, etc.)
-  - Clears status-lookup index entries
-  - Deletes parent-child relationships from `/children` bucket
-  - Removes join-lookup table entries (`src-to-dst`, `dst-to-src`)
+- Performs comprehensive subtree deletion (level-sharded):
+  - Deletes all descendant nodes from `levels/<level>/nodes` buckets
+  - Removes entries from level status buckets (`traversal/pending`, `successful`, etc.)
+  - Clears status-lookup index entries per level
+  - Deletes parent-child relationships from `levels/<level>/children` buckets
+  - Removes join-lookup table entries (`levels/<level>/src-to-dst`, `dst-to-src`)
   - Decrements stats bucket counts
 - Records expected counts for verification
 
@@ -98,7 +98,7 @@ powershell -File pkg/tests/retry_sweep/run.ps1
 ```
 
 This test validates:
-- Comprehensive subtree deletion (nodes, status, children, join tables, stats)
+- Comprehensive subtree deletion (level-sharded nodes, status, children, join tables, stats)
 - DST cleanup during SRC task completion in retry mode
 - No duplicate node creation during retry sweeps
 - Correct node counting and statistics

@@ -37,8 +37,8 @@ func runTest() error {
 	// srcPath := filepath.Join(homeDir, "Documents")
 	// dstPath := filepath.Join(homeDir, "Downloads")
 
-	srcPath := "/home"
-	dstPath := "/home"
+	srcPath := "/"
+	dstPath := "/"
 
 	// Normalize paths to absolute
 	srcPath, err = filepath.Abs(srcPath)
