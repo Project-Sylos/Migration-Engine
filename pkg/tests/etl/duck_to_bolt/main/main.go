@@ -360,15 +360,22 @@ func getRandomNodeIDsFromDuck(duckDB *sql.DB, queueType string, sampleSize int) 
 	return allIDs[:sampleSize], nil
 }
 
-// nodeExistsInBolt checks if a node exists in BoltDB
+// nodeExistsInBolt checks if a node exists in BoltDB (level-sharded)
 func nodeExistsInBolt(boltDB *db.DB, queueType, nodeID string) (bool, error) {
 	exists := false
 	err := boltDB.View(func(tx *bolt.Tx) error {
-		nodesBucket := db.GetNodesBucket(tx, queueType)
-		if nodesBucket == nil {
+		levels, _ := db.GetAllLevelsFromTx(tx, queueType)
+		if levels == nil {
 			return nil
 		}
-		exists = nodesBucket.Get([]byte(nodeID)) != nil
+		nodeIDBytes := []byte(nodeID)
+		for _, level := range levels {
+			nodesBucket := db.GetNodesBucket(tx, queueType, level)
+			if nodesBucket != nil && nodesBucket.Get(nodeIDBytes) != nil {
+				exists = true
+				return nil
+			}
+		}
 		return nil
 	})
 	return exists, err

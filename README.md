@@ -146,7 +146,6 @@ The database is partitioned into two main areas:
     /nodes                  → ULID: NodeState JSON (canonical data)
     /children               → parentULID: []childULID JSON (tree relationships)
     /src-to-dst             → srcULID: dstULID (bidirectional join-lookup table)
-    /path-to-ulid           → pathHash: ULID (path-based lookup for API)
     /levels
       /00000000
         /traversal
@@ -166,7 +165,6 @@ The database is partitioned into two main areas:
     /nodes                  → ULID: NodeState JSON (canonical data)
     /children               → parentULID: []childULID JSON (tree relationships)
     /dst-to-src             → dstULID: srcULID (bidirectional join-lookup table)
-    /path-to-ulid           → pathHash: ULID (path-based lookup for API)
     /levels
       /00000000
         /traversal
@@ -204,7 +202,6 @@ This partitioning separates traversal operations (discovery/scanning phase) from
    - Separate status-lookup indexes in `/levels/{level}/traversal/status-lookup` and `/levels/{level}/copy/status-lookup` provide reverse lookup (ULID → status)
    - Tree relationships in `/children` buckets
    - Bidirectional join-lookup tables (`/src-to-dst` and `/dst-to-src`) map corresponding SRC and DST node ULIDs
-   - Path-to-ULID lookup table (`/path-to-ulid`) maps path hashes to ULIDs for API path-based queries
    - Join tables enable efficient correlation without embedding references in node data
 
    **Traversal Status** (SRC and DST):
@@ -246,10 +243,6 @@ This partitioning separates traversal operations (discovery/scanning phase) from
      - Join tables are populated when DST children are discovered and matched to SRC children (by Type + Name)
      - This architecture replaces the legacy `SrcID` field that was previously embedded in DST NodeState
      - Enables efficient lookups: given a SRC ULID, find the corresponding DST ULID (and vice versa)
-   - **Path-to-ULID lookup table** (`/path-to-ulid`) maps path hashes to ULIDs
-     - Enables API to query nodes by path without scanning
-     - Path hashes are SHA-256 (64-char hex strings)
-     - Automatically maintained during insert/delete operations
    - Matching between SRC and DST nodes is done by Type + Name, not path
    - Hierarchy is natural and navigable through parent-child ULID relationships
 

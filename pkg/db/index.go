@@ -29,8 +29,8 @@ func InsertNodeWithIndex(db *DB, queueType string, level int, status string, sta
 			parentID = []byte(state.ParentID)
 		}
 
-		// 1. Insert into nodes bucket
-		nodesBucket := GetNodesBucket(tx, queueType)
+		// 1. Insert into nodes bucket (level-sharded)
+		nodesBucket := GetNodesBucket(tx, queueType, level)
 		if nodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}
@@ -64,9 +64,10 @@ func InsertNodeWithIndex(db *DB, queueType string, level int, status string, sta
 			return fmt.Errorf("failed to update status-lookup: %w", err)
 		}
 
-		// 4. Update parent's children list in children bucket
-		if state.ParentID != "" {
-			childrenBucket := GetChildrenBucket(tx, queueType)
+		// 4. Update parent's children list in children bucket (parent is at level-1)
+		if state.ParentID != "" && level > 0 {
+			parentLevel := level - 1
+			childrenBucket := GetChildrenBucket(tx, queueType, parentLevel)
 			if childrenBucket == nil {
 				return fmt.Errorf("children bucket not found for %s", queueType)
 			}
@@ -127,8 +128,8 @@ func DeleteNodeWithIndex(db *DB, queueType string, level int, status string, sta
 			parentID = []byte(state.ParentID)
 		}
 
-		// 1. Delete from nodes bucket
-		nodesBucket := GetNodesBucket(tx, queueType)
+		// 1. Delete from nodes bucket (level-sharded)
+		nodesBucket := GetNodesBucket(tx, queueType, level)
 		if nodesBucket != nil {
 			nodesBucket.Delete(nodeID) // Ignore errors
 		}
@@ -145,9 +146,10 @@ func DeleteNodeWithIndex(db *DB, queueType string, level int, status string, sta
 			lookupBucket.Delete(nodeID) // Ignore errors
 		}
 
-		// 4. Remove from parent's children list
-		if state.ParentID != "" {
-			childrenBucket := GetChildrenBucket(tx, queueType)
+		// 4. Remove from parent's children list (parent is at level-1)
+		if state.ParentID != "" && level > 0 {
+			parentLevel := level - 1
+			childrenBucket := GetChildrenBucket(tx, queueType, parentLevel)
 			if childrenBucket != nil {
 				var children []string
 				childrenData := childrenBucket.Get(parentID)
@@ -180,14 +182,14 @@ func DeleteNodeWithIndex(db *DB, queueType string, level int, status string, sta
 	})
 }
 
-// GetChildrenIDsByParentID retrieves the list of child ULIDs for a given parent ULID.
-func GetChildrenIDsByParentID(db *DB, queueType string, parentID string) ([]string, error) {
+// GetChildrenIDsByParentID retrieves the list of child ULIDs for a given parent ULID at the given parent level.
+func GetChildrenIDsByParentID(db *DB, queueType string, parentLevel int, parentID string) ([]string, error) {
 	var children []string
 
 	err := db.View(func(tx *bolt.Tx) error {
-		childrenBucket := GetChildrenBucket(tx, queueType)
+		childrenBucket := GetChildrenBucket(tx, queueType, parentLevel)
 		if childrenBucket == nil {
-			return fmt.Errorf("children bucket not found for %s", queueType)
+			return fmt.Errorf("children bucket not found for %s level %d", queueType, parentLevel)
 		}
 
 		childrenData := childrenBucket.Get([]byte(parentID))
@@ -209,17 +211,17 @@ func GetChildrenIDsByParentID(db *DB, queueType string, parentID string) ([]stri
 	return children, nil
 }
 
-// BatchGetChildrenIDsByParentIDs retrieves child ID lists for multiple parent IDs in one transaction.
+// BatchGetChildrenIDsByParentIDs retrieves child ID lists for multiple parent IDs at the given level in one transaction.
 // Returns map[parentID][]childID; parents with no children have an empty slice.
-func BatchGetChildrenIDsByParentIDs(db *DB, queueType string, parentIDs []string) (map[string][]string, error) {
+func BatchGetChildrenIDsByParentIDs(db *DB, queueType string, parentLevel int, parentIDs []string) (map[string][]string, error) {
 	result := make(map[string][]string)
 	if len(parentIDs) == 0 {
 		return result, nil
 	}
 	err := db.View(func(tx *bolt.Tx) error {
-		childrenBucket := GetChildrenBucket(tx, queueType)
+		childrenBucket := GetChildrenBucket(tx, queueType, parentLevel)
 		if childrenBucket == nil {
-			return fmt.Errorf("children bucket not found for %s", queueType)
+			return fmt.Errorf("children bucket not found for %s level %d", queueType, parentLevel)
 		}
 		for _, parentID := range parentIDs {
 			childrenData := childrenBucket.Get([]byte(parentID))
@@ -240,8 +242,9 @@ func BatchGetChildrenIDsByParentIDs(db *DB, queueType string, parentIDs []string
 }
 
 // GetChildrenStatesByParentID retrieves the full NodeState for all children of a parent by parent ULID.
-func GetChildrenStatesByParentID(db *DB, queueType string, parentID string) ([]*NodeState, error) {
-	childIDs, err := GetChildrenIDsByParentID(db, queueType, parentID)
+// parentLevel is the level of the parent; children are at parentLevel+1.
+func GetChildrenStatesByParentID(db *DB, queueType string, parentLevel int, parentID string) ([]*NodeState, error) {
+	childIDs, err := GetChildrenIDsByParentID(db, queueType, parentLevel, parentID)
 	if err != nil {
 		return nil, err
 	}
@@ -250,12 +253,13 @@ func GetChildrenStatesByParentID(db *DB, queueType string, parentID string) ([]*
 		return []*NodeState{}, nil
 	}
 
+	childLevel := parentLevel + 1
 	var children []*NodeState
 
 	err = db.View(func(tx *bolt.Tx) error {
-		nodesBucket := GetNodesBucket(tx, queueType)
+		nodesBucket := GetNodesBucket(tx, queueType, childLevel)
 		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found for %s", queueType)
+			return fmt.Errorf("nodes bucket not found for %s level %d", queueType, childLevel)
 		}
 
 		for _, childID := range childIDs {
@@ -291,20 +295,20 @@ type InsertOperation struct {
 }
 
 // computeBatchInsertStatsDeltas analyzes insert operations and computes stats deltas from op fields only (no bucket lookups).
-// Returns a map of bucket path (as string) -> delta count. Uses in-batch deduplication.
+// Returns a map of bucket path (as string) -> delta count. Uses in-batch deduplication. Level-sharded buckets keyed by path including level.
 func computeBatchInsertStatsDeltas(_ *bolt.Tx, ops []InsertOperation) map[string]int64 {
 	deltas := make(map[string]int64)
-	seenNodes := make(map[string]struct{})    // "queueType:nodeID"
+	seenNodes := make(map[string]struct{})    // "queueType/level:nodeID"
 	seenStatus := make(map[string]struct{})   // "queueType/level/status:nodeID"
-	seenChildren := make(map[string]struct{}) // "queueType:parentID"
-	seenSrcToDst := make(map[string]struct{})  // "srcID"
-	seenDstToSrc := make(map[string]struct{}) // "dstID"
+	seenChildren := make(map[string]struct{}) // "queueType/parentLevel:parentID"
+	seenSrcToDst := make(map[string]struct{}) // "level:srcID"
+	seenDstToSrc := make(map[string]struct{}) // "level:dstID"
 
-	nodesCounts := make(map[string]int64)
-	statusCounts := make(map[string]int64)
-	childrenCounts := make(map[string]int64)
-	srcToDstCount := int64(0)
-	dstToSrcCount := int64(0)
+	nodesCounts := make(map[string]int64)    // key "queueType/level"
+	statusCounts := make(map[string]int64)  // "queueType/level/status"
+	childrenCounts := make(map[string]int64) // key "queueType/parentLevel"
+	srcToDstCountByLevel := make(map[int]int64)
+	dstToSrcCountByLevel := make(map[int]int64)
 
 	for _, op := range ops {
 		if op.State == nil || op.State.ID == "" {
@@ -312,10 +316,11 @@ func computeBatchInsertStatsDeltas(_ *bolt.Tx, ops []InsertOperation) map[string
 		}
 		nodeIDStr := op.State.ID
 
-		nodeKey := op.QueueType + ":" + nodeIDStr
+		nodeKey := fmt.Sprintf("%s/%d:%s", op.QueueType, op.Level, nodeIDStr)
 		if _, seen := seenNodes[nodeKey]; !seen {
 			seenNodes[nodeKey] = struct{}{}
-			nodesCounts[op.QueueType]++
+			k := fmt.Sprintf("%s/%d", op.QueueType, op.Level)
+			nodesCounts[k]++
 		}
 
 		statusKey := fmt.Sprintf("%s/%d/%s", op.QueueType, op.Level, op.Status)
@@ -325,30 +330,39 @@ func computeBatchInsertStatsDeltas(_ *bolt.Tx, ops []InsertOperation) map[string
 			statusCounts[statusKey]++
 		}
 
-		if op.State.ParentID != "" {
-			childrenKey := op.QueueType + ":" + op.State.ParentID
+		if op.State.ParentID != "" && op.Level > 0 {
+			parentLevel := op.Level - 1
+			childrenKey := fmt.Sprintf("%s/%d:%s", op.QueueType, parentLevel, op.State.ParentID)
 			if _, seen := seenChildren[childrenKey]; !seen {
 				seenChildren[childrenKey] = struct{}{}
-				childrenCounts[op.QueueType]++
+				k := fmt.Sprintf("%s/%d", op.QueueType, parentLevel)
+				childrenCounts[k]++
 			}
 		}
 
 		if op.QueueType == "DST" && op.State.SrcID != "" {
-			if _, seen := seenDstToSrc[nodeIDStr]; !seen {
-				seenDstToSrc[nodeIDStr] = struct{}{}
-				dstToSrcCount++
+			dstKey := fmt.Sprintf("%d:%s", op.Level, nodeIDStr)
+			if _, seen := seenDstToSrc[dstKey]; !seen {
+				seenDstToSrc[dstKey] = struct{}{}
+				dstToSrcCountByLevel[op.Level]++
 			}
-			if _, seen := seenSrcToDst[op.State.SrcID]; !seen {
-				seenSrcToDst[op.State.SrcID] = struct{}{}
-				srcToDstCount++
+			srcKey := fmt.Sprintf("%d:%s", op.Level, op.State.SrcID)
+			if _, seen := seenSrcToDst[srcKey]; !seen {
+				seenSrcToDst[srcKey] = struct{}{}
+				srcToDstCountByLevel[op.Level]++
 			}
 		}
 	}
 
-	// Convert to bucket path strings
-	for queueType, count := range nodesCounts {
-		path := strings.Join(GetNodesBucketPath(queueType), "/")
-		deltas[path] += count
+	// Convert to bucket path strings (level-sharded)
+	for key, count := range nodesCounts {
+		parts := strings.Split(key, "/")
+		if len(parts) == 2 {
+			queueType := parts[0]
+			level, _ := strconv.Atoi(parts[1])
+			path := strings.Join(GetNodesBucketPath(queueType, level), "/")
+			deltas[path] += count
+		}
 	}
 
 	for statusKey, count := range statusCounts {
@@ -362,19 +376,27 @@ func computeBatchInsertStatsDeltas(_ *bolt.Tx, ops []InsertOperation) map[string
 		}
 	}
 
-	for queueType, count := range childrenCounts {
-		path := strings.Join(GetChildrenBucketPath(queueType), "/")
-		deltas[path] += count
+	for key, count := range childrenCounts {
+		parts := strings.Split(key, "/")
+		if len(parts) == 2 {
+			queueType := parts[0]
+			level, _ := strconv.Atoi(parts[1])
+			path := strings.Join(GetChildrenBucketPath(queueType, level), "/")
+			deltas[path] += count
+		}
 	}
 
-	// Add src-to-dst and dst-to-src stats deltas
-	if srcToDstCount > 0 {
-		srcToDstPath := GetSrcToDstBucketPath()
-		deltas[strings.Join(srcToDstPath, "/")] += srcToDstCount
+	for level, count := range srcToDstCountByLevel {
+		if count > 0 {
+			path := strings.Join(GetSrcToDstBucketPath(level), "/")
+			deltas[path] += count
+		}
 	}
-	if dstToSrcCount > 0 {
-		dstToSrcPath := GetDstToSrcBucketPath()
-		deltas[strings.Join(dstToSrcPath, "/")] += dstToSrcCount
+	for level, count := range dstToSrcCountByLevel {
+		if count > 0 {
+			path := strings.Join(GetDstToSrcBucketPath(level), "/")
+			deltas[path] += count
+		}
 	}
 
 	return deltas
@@ -397,12 +419,14 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 		statsDeltas := computeBatchInsertStatsDeltas(tx, ops)
 
 		// Execute all inserts
-		var nodesBucket *bolt.Bucket
-		var currentQueueType string
-
 		for _, op := range ops {
 			if op.State == nil || op.State.ID == "" {
 				return fmt.Errorf("node state must have ID (ULID)")
+			}
+
+			// Ensure level shard exists (e.g. level 0 for root seeding; created on demand)
+			if err := EnsureLevelBucket(tx, op.QueueType, op.Level); err != nil {
+				return fmt.Errorf("ensure level %d for %s: %w", op.Level, op.QueueType, err)
 			}
 
 			nodeID := []byte(op.State.ID)
@@ -413,13 +437,10 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 				parentID = []byte(op.State.ParentID)
 			}
 
-			// Get or cache nodes bucket
-			if currentQueueType != op.QueueType {
-				nodesBucket = GetNodesBucket(tx, op.QueueType)
-				if nodesBucket == nil {
-					return fmt.Errorf("nodes bucket not found for %s", op.QueueType)
-				}
-				currentQueueType = op.QueueType
+			// Get nodes bucket for this level (level-sharded)
+			nodesBucket := GetNodesBucket(tx, op.QueueType, op.Level)
+			if nodesBucket == nil {
+				return fmt.Errorf("nodes bucket not found for %s level %d", op.QueueType, op.Level)
 			}
 
 			if op.State.TraversalStatus == "" {
@@ -451,11 +472,12 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 				return fmt.Errorf("failed to update status-lookup: %w", err)
 			}
 
-			// 4. Update children index
-			if op.State.ParentID != "" {
-				childrenBucket := GetChildrenBucket(tx, op.QueueType)
+			// 4. Update children index (parent is at level op.Level-1)
+			if op.State.ParentID != "" && op.Level > 0 {
+				parentLevel := op.Level - 1
+				childrenBucket := GetChildrenBucket(tx, op.QueueType, parentLevel)
 				if childrenBucket == nil {
-					return fmt.Errorf("children bucket not found for %s", op.QueueType)
+					return fmt.Errorf("children bucket not found for %s level %d", op.QueueType, parentLevel)
 				}
 
 				var children []string
@@ -483,13 +505,13 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 			// For DST nodes, store DST→SRC and SRC→DST mappings
 			// Note: Stats deltas are already computed in computeBatchInsertStatsDeltas
 			if op.QueueType == "DST" && op.State.SrcID != "" {
-				// Store DST→SRC mapping
-				dstToSrcBucket, err := GetOrCreateDstToSrcBucket(tx)
+				// Store DST→SRC mapping at this level
+				dstToSrcBucket, err := GetOrCreateDstToSrcBucket(tx, op.Level)
 				if err == nil {
 					dstToSrcBucket.Put(nodeID, []byte(op.State.SrcID))
 				}
-				// Store SRC→DST mapping
-				srcToDstBucket, err := GetOrCreateSrcToDstBucket(tx)
+				// Store SRC→DST mapping at this level (SRC node at same depth)
+				srcToDstBucket, err := GetOrCreateSrcToDstBucket(tx, op.Level)
 				if err == nil {
 					srcIDBytes := []byte(op.State.SrcID)
 					srcToDstBucket.Put(srcIDBytes, nodeID)
@@ -523,45 +545,53 @@ func BatchDeleteNodes(db *DB, queueType string, nodeIDs []string) error {
 	}
 
 	return db.Update(func(tx *bolt.Tx) error {
-		nodesBucket := GetNodesBucket(tx, queueType)
-		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found for %s", queueType)
-		}
-
-		childrenBucket := GetChildrenBucket(tx, queueType)
-		if childrenBucket == nil {
-			return fmt.Errorf("children bucket not found for %s", queueType)
-		}
-
-		// Get join-lookup buckets
-		var srcToDstBucket, dstToSrcBucket *bolt.Bucket
-		switch queueType {
-		case "SRC":
-			srcToDstBucket = GetSrcToDstBucket(tx)
-		case "DST":
-			dstToSrcBucket = GetDstToSrcBucket(tx)
-		}
-
-		// Track parent updates and stats deltas
-		parentUpdates := make(map[string][]string) // parentID -> remaining children
-		statsDeltas := make(map[string]int64)      // bucket path -> delta
+		// Track parent updates per level: level -> parentID -> remaining children
+		parentUpdatesByLevel := make(map[int]map[string][]string)
+		statsDeltas := make(map[string]int64)
 
 		for _, nodeIDStr := range nodeIDs {
 			nodeID := []byte(nodeIDStr)
 
-			// Get node state to determine level and status
-			nodeData := nodesBucket.Get(nodeID)
-			if nodeData == nil {
-				continue // Node already deleted, skip
+			// We need to find the node to get its level - try levels 0..maxKnownDepth or scan
+			// For simplicity: get max depth and scan levels, or require level to be passed in.
+			// BatchDeleteNodes is called with nodeIDs - we don't have level. So we must find the node first.
+			// Option: iterate level buckets and look for nodeID in each level's nodes bucket.
+			var ns *NodeState
+			var nodeLevel int
+			var found bool
+			maxDepth := db.GetMaxKnownDepth(queueType)
+			for level := 0; level <= maxDepth && !found; level++ {
+				nodesBucket := GetNodesBucket(tx, queueType, level)
+				if nodesBucket == nil {
+					continue
+				}
+				nodeData := nodesBucket.Get(nodeID)
+				if nodeData != nil {
+					var err error
+					ns, err = DeserializeNodeState(nodeData)
+					if err != nil {
+						return fmt.Errorf("failed to deserialize node state for %s: %w", nodeIDStr, err)
+					}
+					nodeLevel = level
+					found = true
+					break
+				}
+			}
+			if !found || ns == nil {
+				continue // Node already deleted or not found, skip
 			}
 
-			ns, err := DeserializeNodeState(nodeData)
-			if err != nil {
-				return fmt.Errorf("failed to deserialize node state for %s: %w", nodeIDStr, err)
+			nodesBucket := GetNodesBucket(tx, queueType, nodeLevel)
+			if nodesBucket == nil {
+				return fmt.Errorf("nodes bucket not found for %s level %d", queueType, nodeLevel)
+			}
+			childrenBucket := GetChildrenBucket(tx, queueType, nodeLevel)
+			if childrenBucket == nil {
+				return fmt.Errorf("children bucket not found for %s level %d", queueType, nodeLevel)
 			}
 
 			// Determine current status from status-lookup
-			lookupBucket := GetStatusLookupBucket(tx, queueType, ns.Depth)
+			lookupBucket := GetStatusLookupBucket(tx, queueType, nodeLevel)
 			var currentStatus string
 			if lookupBucket != nil {
 				statusData := lookupBucket.Get(nodeID)
@@ -575,16 +605,16 @@ func BatchDeleteNodes(db *DB, queueType string, nodeIDs []string) error {
 				return fmt.Errorf("failed to delete from nodes bucket: %w", err)
 			}
 			// Decrement nodes bucket count
-			nodesPath := GetNodesBucketPath(queueType)
+			nodesPath := GetNodesBucketPath(queueType, nodeLevel)
 			statsDeltas[strings.Join(nodesPath, "/")]--
 
 			// 2. Delete from status bucket
 			if currentStatus != "" {
-				statusBucket := GetStatusBucket(tx, queueType, ns.Depth, currentStatus)
+				statusBucket := GetStatusBucket(tx, queueType, nodeLevel, currentStatus)
 				if statusBucket != nil {
 					statusBucket.Delete(nodeID) // Ignore errors
 					// Decrement status bucket count
-					statusPath := GetStatusBucketPath(queueType, ns.Depth, currentStatus)
+					statusPath := GetStatusBucketPath(queueType, nodeLevel, currentStatus)
 					statsDeltas[strings.Join(statusPath, "/")]--
 				}
 			}
@@ -594,69 +624,85 @@ func BatchDeleteNodes(db *DB, queueType string, nodeIDs []string) error {
 				lookupBucket.Delete(nodeID) // Ignore errors
 			}
 
-			// 4. Track parent for children list update
-			if ns.ParentID != "" {
-				if _, exists := parentUpdates[ns.ParentID]; !exists {
+			// 4. Track parent for children list update (parent is at nodeLevel-1)
+			if ns.ParentID != "" && nodeLevel > 0 {
+				parentLevel := nodeLevel - 1
+				parentChildrenBucket := GetChildrenBucket(tx, queueType, parentLevel)
+				if parentChildrenBucket == nil {
+					continue
+				}
+				if parentUpdatesByLevel[parentLevel] == nil {
+					parentUpdatesByLevel[parentLevel] = make(map[string][]string)
+				}
+				if _, exists := parentUpdatesByLevel[parentLevel][ns.ParentID]; !exists {
 					// Load current children list
 					parentID := []byte(ns.ParentID)
-					childrenData := childrenBucket.Get(parentID)
+					childrenData := parentChildrenBucket.Get(parentID)
 					if childrenData != nil {
 						var children []string
 						if err := json.Unmarshal(childrenData, &children); err == nil {
-							parentUpdates[ns.ParentID] = children
+							parentUpdatesByLevel[parentLevel][ns.ParentID] = children
 						}
 					} else {
-						parentUpdates[ns.ParentID] = []string{}
+						parentUpdatesByLevel[parentLevel][ns.ParentID] = []string{}
 					}
 				}
 				// Remove this child from the list
-				children := parentUpdates[ns.ParentID]
+				children := parentUpdatesByLevel[parentLevel][ns.ParentID]
 				filtered := make([]string, 0, len(children))
 				for _, c := range children {
 					if c != nodeIDStr {
 						filtered = append(filtered, c)
 					}
 				}
-				parentUpdates[ns.ParentID] = filtered
+				parentUpdatesByLevel[parentLevel][ns.ParentID] = filtered
 			}
 
-			// 5. Delete node's own children list (if folder)
+			// 5. Delete node's own children list (if folder) - children at this node's level
 			if ns.Type == "folder" {
 				if childrenBucket.Get(nodeID) != nil {
 					childrenBucket.Delete(nodeID)
 					// Decrement children bucket count
-					childrenPath := GetChildrenBucketPath(queueType)
+					childrenPath := GetChildrenBucketPath(queueType, nodeLevel)
 					statsDeltas[strings.Join(childrenPath, "/")]--
 				}
 			}
 
-			// 6. Delete from join-lookup tables
-			if queueType == "SRC" && srcToDstBucket != nil {
-				srcToDstBucket.Delete(nodeID)
-			} else if queueType == "DST" && dstToSrcBucket != nil {
-				dstToSrcBucket.Delete(nodeID)
-			}
-
-			// 7. Delete from path-to-ulid lookup table
-			if ns.Path != "" {
-				DeletePathToULIDMapping(tx, queueType, ns.Path) // Ignore errors
+			// 6. Delete from join-lookup tables (at this level)
+			switch queueType {
+			case "SRC":
+				srcToDstBucket := GetSrcToDstBucket(tx, nodeLevel)
+				if srcToDstBucket != nil {
+					srcToDstBucket.Delete(nodeID)
+				}
+			case "DST":
+				dstToSrcBucket := GetDstToSrcBucket(tx, nodeLevel)
+				if dstToSrcBucket != nil {
+					dstToSrcBucket.Delete(nodeID)
+				}
 			}
 		}
 
-		// Apply all parent children list updates
-		for parentIDStr, children := range parentUpdates {
-			parentID := []byte(parentIDStr)
-			if len(children) > 0 {
-				childrenData, err := json.Marshal(children)
-				if err != nil {
-					return fmt.Errorf("failed to marshal children list: %w", err)
+		// Apply all parent children list updates (per level)
+		for parentLevel, parentUpdates := range parentUpdatesByLevel {
+			childrenBucket := GetChildrenBucket(tx, queueType, parentLevel)
+			if childrenBucket == nil {
+				continue
+			}
+			for parentIDStr, children := range parentUpdates {
+				parentID := []byte(parentIDStr)
+				if len(children) > 0 {
+					childrenData, err := json.Marshal(children)
+					if err != nil {
+						return fmt.Errorf("failed to marshal children list: %w", err)
+					}
+					if err := childrenBucket.Put(parentID, childrenData); err != nil {
+						return fmt.Errorf("failed to update children list: %w", err)
+					}
+				} else {
+					// No children left, remove entry
+					childrenBucket.Delete(parentID)
 				}
-				if err := childrenBucket.Put(parentID, childrenData); err != nil {
-					return fmt.Errorf("failed to update children list: %w", err)
-				}
-			} else {
-				// No children left, remove entry
-				childrenBucket.Delete(parentID)
 			}
 		}
 

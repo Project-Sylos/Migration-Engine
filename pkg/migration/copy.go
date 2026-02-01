@@ -101,13 +101,12 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	// We need to ensure this mapping exists before starting the copy phase
 	// Use a single transaction to check and create the mapping to avoid deadlock
 	err = boltDB.Update(func(tx *bolt.Tx) error {
-		// Get SRC root node
-		srcNodesBucket := db.GetNodesBucket(tx, "SRC")
+		// Root is at level 0 (plan: level-sharded; root in levels/00000000/nodes)
+		srcNodesBucket := db.GetNodesBucket(tx, "SRC", 0)
 		if srcNodesBucket == nil {
-			return fmt.Errorf("SRC nodes bucket not found")
+			return fmt.Errorf("SRC nodes bucket not found for level 0")
 		}
 
-		// Find root node (depth 0)
 		var srcRootID, dstRootID string
 		cursor := srcNodesBucket.Cursor()
 		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
@@ -125,10 +124,9 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 			return fmt.Errorf("could not find SRC root node")
 		}
 
-		// Get DST root node
-		dstNodesBucket := db.GetNodesBucket(tx, "DST")
+		dstNodesBucket := db.GetNodesBucket(tx, "DST", 0)
 		if dstNodesBucket == nil {
-			return fmt.Errorf("DST nodes bucket not found")
+			return fmt.Errorf("DST nodes bucket not found for level 0")
 		}
 
 		cursor = dstNodesBucket.Cursor()
@@ -147,8 +145,8 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 			return fmt.Errorf("could not find DST root node")
 		}
 
-		// Check if mapping already exists
-		joinBucket := db.GetJoinLookupBucket(tx)
+		// Check if mapping already exists (root at level 0; SRC→DST)
+		joinBucket := db.GetSrcToDstBucket(tx, 0)
 		if joinBucket != nil {
 			existing := joinBucket.Get([]byte(srcRootID))
 			if existing != nil {
@@ -156,8 +154,8 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 			}
 		}
 
-		// Create mapping
-		joinBucket, err := db.GetOrCreateJoinLookupBucket(tx)
+		// Create mapping (root at level 0; SRC→DST)
+		joinBucket, err := db.GetOrCreateSrcToDstBucket(tx, 0)
 		if err != nil {
 			return fmt.Errorf("failed to get join-lookup bucket: %w", err)
 		}

@@ -581,7 +581,12 @@ func migrateNodes(boltDB *db.DB, duckDB *DuckDB, queueType string, numWorkers in
 	buffer := NewNodeBuffer(prefix + "_nodes_ui")
 	stats := newETLStats(queueType)
 
-	idBatches := make(chan []string, numWorkers*2)
+	// levelNodeBatch carries node IDs from a single level shard (level-scoped iteration)
+	type levelNodeBatch struct {
+		Level   int
+		NodeIDs []string
+	}
+	idBatches := make(chan levelNodeBatch, numWorkers*2)
 
 	var wg sync.WaitGroup
 	var workerErr error
@@ -593,7 +598,7 @@ func migrateNodes(boltDB *db.DB, duckDB *DuckDB, queueType string, numWorkers in
 		go func() {
 			defer wg.Done()
 			for batch := range idBatches {
-				if err := migrateNodesWorker(boltDB, batch, queueType, buffer, stats); err != nil {
+				if err := migrateNodesWorker(boltDB, batch.Level, batch.NodeIDs, queueType, buffer, stats); err != nil {
 					workerErrMu.Lock()
 					if workerErr == nil {
 						workerErr = err
@@ -637,29 +642,30 @@ func migrateNodes(boltDB *db.DB, duckDB *DuckDB, queueType string, numWorkers in
 		writerDone <- err
 	}()
 
-	// Stream node IDs in batches from BoltDB
+	// Stream node IDs from BoltDB by level shard (plan: iterate levels/*, then nodes per level)
 	streamErr := boltDB.View(func(tx *bolt.Tx) error {
-		nodesBucket := db.GetNodesBucket(tx, queueType)
-		if nodesBucket == nil {
-			return nil // No nodes to migrate
+		levels, err := db.GetAllLevelsFromTx(tx, queueType)
+		if err != nil || len(levels) == 0 {
+			return err
 		}
-
-		var batch []string
-		cursor := nodesBucket.Cursor()
-		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
-			batch = append(batch, string(k))
-
-			if len(batch) >= streamBatchSize {
-				idBatches <- batch
-				batch = make([]string, 0, streamBatchSize)
+		for _, level := range levels {
+			nodesBucket := db.GetNodesBucket(tx, queueType, level)
+			if nodesBucket == nil {
+				continue
+			}
+			var batch []string
+			cursor := nodesBucket.Cursor()
+			for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+				batch = append(batch, string(k))
+				if len(batch) >= streamBatchSize {
+					idBatches <- levelNodeBatch{Level: level, NodeIDs: batch}
+					batch = make([]string, 0, streamBatchSize)
+				}
+			}
+			if len(batch) > 0 {
+				idBatches <- levelNodeBatch{Level: level, NodeIDs: batch}
 			}
 		}
-
-		// Send remaining batch
-		if len(batch) > 0 {
-			idBatches <- batch
-		}
-
 		return nil
 	})
 
@@ -691,27 +697,27 @@ func migrateNodes(boltDB *db.DB, duckDB *DuckDB, queueType string, numWorkers in
 	return nil
 }
 
-// migrateNodesWorker processes a batch of node IDs and adds rows to buffer
-func migrateNodesWorker(boltDB *db.DB, nodeIDs []string, queueType string, buffer *nodeBuffer, stats *ETLStats) error {
+// migrateNodesWorker processes a batch of node IDs from a single level shard and adds rows to buffer
+func migrateNodesWorker(boltDB *db.DB, level int, nodeIDs []string, queueType string, buffer *nodeBuffer, stats *ETLStats) error {
 	processed := int64(0)
 	defer func() {
 		stats.AddProcessed(processed)
 	}()
 
 	return boltDB.View(func(tx *bolt.Tx) error {
-		nodesBucket := db.GetNodesBucket(tx, queueType)
+		nodesBucket := db.GetNodesBucket(tx, queueType, level)
 		if nodesBucket == nil {
 			return nil
 		}
 
-		childrenBucket := db.GetChildrenBucket(tx, queueType)
+		childrenBucket := db.GetChildrenBucket(tx, queueType, level)
 
-		// Get join lookup bucket
+		// Get join lookup bucket for this level
 		var joinBucket *bolt.Bucket
 		if queueType == "SRC" {
-			joinBucket = db.GetSrcToDstBucket(tx)
+			joinBucket = db.GetSrcToDstBucket(tx, level)
 		} else {
-			joinBucket = db.GetDstToSrcBucket(tx)
+			joinBucket = db.GetDstToSrcBucket(tx, level)
 		}
 
 		for _, nodeID := range nodeIDs {

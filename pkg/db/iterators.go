@@ -48,40 +48,37 @@ func (db *DB) IterateStatusBucket(queueType string, level int, status string, op
 	})
 }
 
-// IterateNodeStates iterates over all nodes in the nodes bucket.
+// IterateNodeStates iterates over all nodes in the nodes buckets (all level shards).
 // The callback receives the ULID (nodeID) and NodeState for each node.
 func (db *DB) IterateNodeStates(queueType string, opts IteratorOptions, fn func(nodeID []byte, state *NodeState) error) error {
+	levels, err := db.GetAllLevels(queueType)
+	if err != nil {
+		return err
+	}
 	return db.View(func(tx *bolt.Tx) error {
-		bucket := GetNodesBucket(tx, queueType)
-		if bucket == nil {
-			return fmt.Errorf("nodes bucket not found for %s", queueType)
+		totalCount := 0
+		for _, level := range levels {
+			bucket := GetNodesBucket(tx, queueType, level)
+			if bucket == nil {
+				continue
+			}
+			cursor := bucket.Cursor()
+			for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+				if opts.Limit > 0 && totalCount >= opts.Limit {
+					return nil
+				}
+				ns, err := DeserializeNodeState(v)
+				if err != nil {
+					return fmt.Errorf("failed to deserialize node state: %w", err)
+				}
+				keyCopy := make([]byte, len(k))
+				copy(keyCopy, k)
+				if err := fn(keyCopy, ns); err != nil {
+					return err
+				}
+				totalCount++
+			}
 		}
-
-		cursor := bucket.Cursor()
-		count := 0
-
-		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
-			if opts.Limit > 0 && count >= opts.Limit {
-				break
-			}
-
-			// Deserialize node state
-			ns, err := DeserializeNodeState(v)
-			if err != nil {
-				return fmt.Errorf("failed to deserialize node state: %w", err)
-			}
-
-			// Make a copy of the key
-			keyCopy := make([]byte, len(k))
-			copy(keyCopy, k)
-
-			if err := fn(keyCopy, ns); err != nil {
-				return err
-			}
-
-			count++
-		}
-
 		return nil
 	})
 }
@@ -183,42 +180,40 @@ func (db *DB) countStatusBucketSlow(queueType string, level int, status string) 
 	return count, err
 }
 
-// CountNodes returns the total number of nodes in the nodes bucket.
-// Uses stats bucket for O(1) lookup. Falls back to cursor scan if stats unavailable.
+// CountNodes returns the total number of nodes across all level-sharded nodes buckets.
+// Uses stats bucket for O(1) lookup per level when available. Falls back to cursor scan if stats unavailable.
 func (db *DB) CountNodes(queueType string) (int, error) {
-	// Try stats first (fast path)
-	bucketPath := GetNodesBucketPath(queueType)
-	count, err := db.GetBucketCount(bucketPath)
-	if err == nil {
-		// Stats available - return count
-		return int(count), nil
+	levels, err := db.GetAllLevels(queueType)
+	if err != nil {
+		return 0, err
 	}
-
-	// Fallback to cursor scan (slow path, but safe)
-	fmt.Println("Fallback to cursor scan for countNodes")
-	return db.countNodesSlow(queueType)
-}
-
-// countNodesSlow performs a full cursor scan of the nodes bucket.
-// This is the fallback method when stats are unavailable.
-func (db *DB) countNodesSlow(queueType string) (int, error) {
-	count := 0
-
-	err := db.View(func(tx *bolt.Tx) error {
-		bucket := GetNodesBucket(tx, queueType)
-		if bucket == nil {
+	total := int64(0)
+	for _, level := range levels {
+		bucketPath := GetNodesBucketPath(queueType, level)
+		count, err := db.GetBucketCount(bucketPath)
+		if err == nil {
+			total += count
+			continue
+		}
+		// Fallback: scan this level's nodes bucket
+		var levelCount int
+		err = db.View(func(tx *bolt.Tx) error {
+			bucket := GetNodesBucket(tx, queueType, level)
+			if bucket == nil {
+				return nil
+			}
+			cursor := bucket.Cursor()
+			for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+				levelCount++
+			}
 			return nil
+		})
+		if err != nil {
+			return 0, err
 		}
-
-		cursor := bucket.Cursor()
-		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
-			count++
-		}
-
-		return nil
-	})
-
-	return count, err
+		total += int64(levelCount)
+	}
+	return int(total), nil
 }
 
 // GetAllLevels returns all level numbers that exist for a queue type.
@@ -226,30 +221,43 @@ func (db *DB) GetAllLevels(queueType string) ([]int, error) {
 	var levels []int
 
 	err := db.View(func(tx *bolt.Tx) error {
-		levelsBucket := getBucket(tx, []string{TraversalDataBucket, queueType, SubBucketLevels})
-		if levelsBucket == nil {
-			return nil // No levels yet
-		}
-
-		cursor := levelsBucket.Cursor()
-		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
-			levelBucket := levelsBucket.Bucket(k)
-			if levelBucket == nil {
-				continue // Not a bucket
-			}
-
-			levelNum, err := ParseLevel(string(k))
-			if err != nil {
-				continue // Skip invalid level names
-			}
-
-			levels = append(levels, levelNum)
-		}
-
+		levels, _ = getAllLevelsFromTx(tx, queueType)
 		return nil
 	})
 
 	return levels, err
+}
+
+// GetAllLevelsFromTx returns all level numbers for a queue type within an existing transaction.
+// Used by ETL and other callers that already hold a tx.
+func GetAllLevelsFromTx(tx *bolt.Tx, queueType string) ([]int, error) {
+	return getAllLevelsFromTx(tx, queueType)
+}
+
+func getAllLevelsFromTx(tx *bolt.Tx, queueType string) ([]int, error) {
+	var levels []int
+
+	levelsBucket := getBucket(tx, []string{TraversalDataBucket, queueType, SubBucketLevels})
+	if levelsBucket == nil {
+		return nil, nil // No levels yet
+	}
+
+	cursor := levelsBucket.Cursor()
+	for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+		levelBucket := levelsBucket.Bucket(k)
+		if levelBucket == nil {
+			continue // Not a bucket
+		}
+
+		levelNum, err := ParseLevel(string(k))
+		if err != nil {
+			continue // Skip invalid level names
+		}
+
+		levels = append(levels, levelNum)
+	}
+
+	return levels, nil
 }
 
 // FindMinPendingLevel finds the minimum level that has pending items.
@@ -321,9 +329,9 @@ func BatchFetchWithKeys(db *DB, queueType string, level int, status string, limi
 			return nil // No items in this status
 		}
 
-		nodesBucket := GetNodesBucket(tx, queueType)
+		nodesBucket := GetNodesBucket(tx, queueType, level)
 		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found for %s", queueType)
+			return fmt.Errorf("nodes bucket not found for %s level %d", queueType, level)
 		}
 
 		cursor := statusBucket.Cursor()
@@ -374,9 +382,9 @@ func BatchFetchCopyTasks(db *DB, level int, nodeType string, copyStatus string, 
 			return nil // No items in this copy status
 		}
 
-		nodesBucket := GetNodesBucket(tx, BucketSrc)
+		nodesBucket := GetNodesBucket(tx, BucketSrc, level)
 		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found for SRC")
+			return fmt.Errorf("nodes bucket not found for SRC level %d", level)
 		}
 
 		cursor := copyStatusBucket.Cursor()

@@ -58,27 +58,41 @@ func RecordTaskError(db *DB, queueType, phase, nodeID, message string, attempt i
 			return fmt.Errorf("put task error: %w", err)
 		}
 
-		nodesBucket := GetNodesBucket(tx, queueType)
-		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found for %s", queueType)
+		// Find node in level shards (nodes are level-sharded)
+		levelsBucket := getBucket(tx, []string{TraversalDataBucket, queueType, SubBucketLevels})
+		if levelsBucket == nil {
+			return nil // No levels; error entry is still stored
 		}
-		nodeData := nodesBucket.Get([]byte(nodeID))
-		if nodeData == nil {
-			return nil // Node not found; error entry is still stored
+		nodeIDBytes := []byte(nodeID)
+		cursor := levelsBucket.Cursor()
+		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+			levelBucket := levelsBucket.Bucket(k)
+			if levelBucket == nil {
+				continue
+			}
+			nodesBucket := levelBucket.Bucket([]byte(SubBucketNodes))
+			if nodesBucket == nil {
+				continue
+			}
+			nodeData := nodesBucket.Get(nodeIDBytes)
+			if nodeData == nil {
+				continue
+			}
+			ns, err := DeserializeNodeState(nodeData)
+			if err != nil {
+				return fmt.Errorf("deserialize node state: %w", err)
+			}
+			if ns.Errors == nil {
+				ns.Errors = []ErrorRef{}
+			}
+			ns.Errors = append(ns.Errors, ErrorRef{ID: errorID, Phase: phaseKey})
+			updated, err := ns.Serialize()
+			if err != nil {
+				return fmt.Errorf("serialize node state: %w", err)
+			}
+			return nodesBucket.Put(nodeIDBytes, updated)
 		}
-		ns, err := DeserializeNodeState(nodeData)
-		if err != nil {
-			return fmt.Errorf("deserialize node state: %w", err)
-		}
-		if ns.Errors == nil {
-			ns.Errors = []ErrorRef{}
-		}
-		ns.Errors = append(ns.Errors, ErrorRef{ID: errorID, Phase: phaseKey})
-		updated, err := ns.Serialize()
-		if err != nil {
-			return fmt.Errorf("serialize node state: %w", err)
-		}
-		return nodesBucket.Put([]byte(nodeID), updated)
+		return nil // Node not found; error entry is still stored
 	})
 	if err != nil {
 		return "", err

@@ -107,76 +107,7 @@ err := db.SetSrcToDstMapping(tx, srcULID, dstULID)
 err := db.SetDstToSrcMapping(tx, dstULID, srcULID)
 ```
 
-#### 4. Path-to-ULID Lookup Table (`/path-to-ulid`)
-
-**Paths**:
-- `/Traversal-Data/SRC/path-to-ulid/`
-- `/Traversal-Data/DST/path-to-ulid/`
-
-Maps path hashes to ULIDs, enabling API to query nodes by path without scanning the entire nodes bucket.
-
-```
-pathHash (SHA-256) → ULID
-```
-
-**Purpose:**
-- Enable path-based queries for API endpoints
-- Maintain ULID as primary key while supporting user-friendly path queries
-- Automatically maintained during insert/delete operations
-
-**Usage:**
-```go
-// Hash a path (SHA-256)
-pathHash := db.HashPath("/parent/child")  // Returns 64-char hex string
-
-// Get ULID from path (hashes internally)
-ulid, err := db.GetULIDFromPath(boltDB, "SRC", "/parent/child")
-
-// Get ULID from pre-computed path hash
-ulid, err := db.GetULIDFromPathHash(boltDB, "SRC", pathHash)
-
-// Batch get ULIDs from multiple paths
-paths := []string{"/path1", "/path2", "/path3"}
-results, err := db.BatchGetULIDsFromPaths(boltDB, "SRC", paths)
-// results: map[string]string { "/path1": "ulid1", "/path2": "ulid2", ... }
-
-// Batch get ULIDs from pre-computed path hashes
-pathHashes := []string{hash1, hash2, hash3}
-results, err := db.BatchGetULIDsFromPathHashes(boltDB, "SRC", pathHashes)
-
-// Set mapping (automatically done during BatchInsertNodes)
-err := db.SetPathToULIDMapping(tx, "SRC", "/parent/child", ulid)
-
-// Delete mapping (automatically done during BatchDeleteNodes)
-err := db.DeletePathToULIDMapping(tx, "SRC", "/parent/child")
-```
-
-**API Integration:**
-```go
-// API receives path from user
-userPath := "/Projects/MyProject"
-
-// Hash the path
-pathHash := db.HashPath(userPath)
-
-// Query for ULID
-ulid, err := db.GetULIDFromPathHash(database, "SRC", pathHash)
-if err != nil {
-    return fmt.Errorf("path not found: %s", userPath)
-}
-
-// Now use ULID for all operations
-nodeState, err := db.GetNodeState(database, "SRC", ulid)
-children, err := db.GetChildrenIDsByParentID(database, "SRC", ulid)
-```
-
-**Notes:**
-- Path hashes are SHA-256 (64 hex characters)
-- Mappings are automatically created during `BatchInsertNodes`
-- Mappings are automatically deleted during `BatchDeleteNodes`
-- For bulk queries, use batch functions to reduce transaction overhead
-
-#### 5. Levels Bucket (`/levels`)
+#### 4. Levels Bucket (`/levels`)
 
 **Path**: `/Traversal-Data/SRC/levels/` or `/Traversal-Data/DST/levels/`
 
@@ -331,8 +262,6 @@ nodeID := db.DeterministicNodeID(queueType, nodeType, path)
 - Race-safe - multiple workers discovering the same node won't create duplicates
 - Idempotent - re-running traversal produces identical IDs
 - No external dependencies - uses Go stdlib `hash/fnv`
-
-**Note**: The `HashPath` function still exists for backward compatibility with test utilities, but is not used for internal operations.
 
 ### Join-Lookup Table Operations
 

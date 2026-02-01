@@ -117,7 +117,7 @@ func NewSender(logDB *db.DB, addr, level string) (*Sender, error) {
 
 	var logBuffer *db.LogBuffer
 	if logDB != nil {
-		logBuffer = db.NewLogBuffer(logDB, 500, 2*time.Second)
+		logBuffer = db.NewLogBuffer(logDB, 500, 2*time.Second, db.DefaultLogShardCap)
 	}
 
 	return &Sender{

@@ -659,38 +659,3 @@ func runETLBoltToDuckWithStatus(boltDB *db.DB, duckDBPath string, yamlCfg *Migra
 
 	return etl.RunBoltToDuck(cfg)
 }
-
-// runETLDuckToBoltWithStatus runs ETL from DuckDB to BoltDB with automatic status updates.
-// This is used before retry sweeps.
-func runETLDuckToBoltWithStatus(boltDB *db.DB, duckDBPath string, yamlCfg *MigrationConfigYAML, configPath string, maxKnownDepth int) error {
-	// Update status to ETL in progress
-	if yamlCfg != nil && configPath != "" {
-		SetStatusETLDuckToBoltInProgress(yamlCfg)
-		_ = SaveMigrationConfig(configPath, yamlCfg)
-	}
-
-	// Run ETL with status callbacks
-	cfg := etl.DuckToBoltConfig{
-		BoltDB:      boltDB,
-		DuckDBPath:  duckDBPath,
-		Overwrite:   true,
-		RequireOpen: true,
-		OnETLStart: func() error {
-			// Status already set above, but ensure it's saved
-			if yamlCfg != nil && configPath != "" {
-				return SaveMigrationConfig(configPath, yamlCfg)
-			}
-			return nil
-		},
-		OnETLComplete: func() error {
-			// Update status to Filters-Set (ready for retry) when ETL completes
-			if yamlCfg != nil && configPath != "" {
-				SetStatusFiltersSet(yamlCfg, true, maxKnownDepth)
-				return SaveMigrationConfig(configPath, yamlCfg)
-			}
-			return nil
-		},
-	}
-
-	return etl.RunDuckToBolt(cfg)
-}

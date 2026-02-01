@@ -396,18 +396,24 @@ func verifyStatusDistribution(boltDB *db.DB, duckDB *sql.DB, result *Verificatio
 	for _, queueType := range []string{"SRC", "DST"} {
 		boltStatusCounts[queueType] = make(map[string]int)
 		err := boltDB.View(func(tx *bolt.Tx) error {
-			nodesBucket := db.GetNodesBucket(tx, queueType)
-			if nodesBucket == nil {
+			levels, _ := db.GetAllLevelsFromTx(tx, queueType)
+			if levels == nil {
 				return nil
 			}
-			cursor := nodesBucket.Cursor()
-			for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
-				var ns db.NodeState
-				if err := json.Unmarshal(v, &ns); err != nil {
+			for _, level := range levels {
+				nodesBucket := db.GetNodesBucket(tx, queueType, level)
+				if nodesBucket == nil {
 					continue
 				}
-				status := transformTraversalStatus(&ns)
-				boltStatusCounts[queueType][status]++
+				cursor := nodesBucket.Cursor()
+				for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+					var ns db.NodeState
+					if err := json.Unmarshal(v, &ns); err != nil {
+						continue
+					}
+					status := transformTraversalStatus(&ns)
+					boltStatusCounts[queueType][status]++
+				}
 			}
 			return nil
 		})
@@ -476,19 +482,30 @@ func verifyJoinCoverage(boltDB *db.DB, duckDB *sql.DB, result *VerificationResul
 	srcToDstCount := 0
 	dstToSrcCount := 0
 	err := boltDB.View(func(tx *bolt.Tx) error {
-		srcToDstBucket := db.GetSrcToDstBucket(tx)
-		if srcToDstBucket != nil {
-			cursor := srcToDstBucket.Cursor()
-			for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
-				srcToDstCount++
+		levels, _ := db.GetAllLevelsFromTx(tx, "SRC")
+		if levels == nil {
+			levels = []int{}
+		}
+		for _, level := range levels {
+			srcToDstBucket := db.GetSrcToDstBucket(tx, level)
+			if srcToDstBucket != nil {
+				cursor := srcToDstBucket.Cursor()
+				for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+					srcToDstCount++
+				}
 			}
 		}
-
-		dstToSrcBucket := db.GetDstToSrcBucket(tx)
-		if dstToSrcBucket != nil {
-			cursor := dstToSrcBucket.Cursor()
-			for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
-				dstToSrcCount++
+		dstLevels, _ := db.GetAllLevelsFromTx(tx, "DST")
+		if dstLevels == nil {
+			dstLevels = []int{}
+		}
+		for _, level := range dstLevels {
+			dstToSrcBucket := db.GetDstToSrcBucket(tx, level)
+			if dstToSrcBucket != nil {
+				cursor := dstToSrcBucket.Cursor()
+				for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+					dstToSrcCount++
+				}
 			}
 		}
 		return nil
@@ -524,17 +541,23 @@ func verifyJoinCoverage(boltDB *db.DB, duckDB *sql.DB, result *VerificationResul
 	return nil
 }
 
-// getRandomNodeIDsFromBucket samples random node IDs from a specific queue type bucket
+// getRandomNodeIDsFromBucket samples random node IDs from a specific queue type (level-sharded)
 func getRandomNodeIDsFromBucket(boltDB *db.DB, queueType string, sampleSize int) ([]string, error) {
 	var allIDs []string
 	err := boltDB.View(func(tx *bolt.Tx) error {
-		nodesBucket := db.GetNodesBucket(tx, queueType)
-		if nodesBucket == nil {
+		levels, _ := db.GetAllLevelsFromTx(tx, queueType)
+		if levels == nil {
 			return nil
 		}
-		cursor := nodesBucket.Cursor()
-		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
-			allIDs = append(allIDs, string(k))
+		for _, level := range levels {
+			nodesBucket := db.GetNodesBucket(tx, queueType, level)
+			if nodesBucket == nil {
+				continue
+			}
+			cursor := nodesBucket.Cursor()
+			for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+				allIDs = append(allIDs, string(k))
+			}
 		}
 		return nil
 	})
@@ -571,26 +594,16 @@ type nodeData struct {
 }
 
 func getBoltNode(boltDB *db.DB, queueType, nodeID string) (*nodeData, error) {
-	var ns db.NodeState
-	err := boltDB.View(func(tx *bolt.Tx) error {
-		nodesBucket := db.GetNodesBucket(tx, queueType)
-		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found")
-		}
-		data := nodesBucket.Get([]byte(nodeID))
-		if data == nil {
-			return fmt.Errorf("node not found")
-		}
-		return json.Unmarshal(data, &ns)
-	})
-	if err != nil {
-		return nil, err
+	ns, err := db.GetNodeState(boltDB, queueType, nodeID)
+	if err != nil || ns == nil {
+		return nil, fmt.Errorf("node not found: %s", nodeID)
 	}
+	level := ns.Depth
 
-	// Get children
+	// Get children (at same level)
 	childIDs := []string{}
 	boltDB.View(func(tx *bolt.Tx) error {
-		childrenBucket := db.GetChildrenBucket(tx, queueType)
+		childrenBucket := db.GetChildrenBucket(tx, queueType, level)
 		if childrenBucket != nil {
 			childData := childrenBucket.Get([]byte(nodeID))
 			if childData != nil {
@@ -601,11 +614,11 @@ func getBoltNode(boltDB *db.DB, queueType, nodeID string) (*nodeData, error) {
 	})
 	childIDsJSON, _ := json.Marshal(childIDs)
 
-	// Get join ID
+	// Get join ID (per level)
 	var joinID string
 	boltDB.View(func(tx *bolt.Tx) error {
 		if queueType == "SRC" {
-			srcToDstBucket := db.GetSrcToDstBucket(tx)
+			srcToDstBucket := db.GetSrcToDstBucket(tx, level)
 			if srcToDstBucket != nil {
 				joinData := srcToDstBucket.Get([]byte(nodeID))
 				if joinData != nil {
@@ -613,7 +626,7 @@ func getBoltNode(boltDB *db.DB, queueType, nodeID string) (*nodeData, error) {
 				}
 			}
 		} else {
-			dstToSrcBucket := db.GetDstToSrcBucket(tx)
+			dstToSrcBucket := db.GetDstToSrcBucket(tx, level)
 			if dstToSrcBucket != nil {
 				joinData := dstToSrcBucket.Get([]byte(nodeID))
 				if joinData != nil {
@@ -628,7 +641,7 @@ func getBoltNode(boltDB *db.DB, queueType, nodeID string) (*nodeData, error) {
 		ID:              nodeID,
 		Path:            ns.Path,
 		Depth:           ns.Depth,
-		TraversalStatus: transformTraversalStatus(&ns),
+		TraversalStatus: transformTraversalStatus(ns),
 		CopyStatus:      ns.CopyStatus,
 		ChildIDs:        string(childIDsJSON),
 	}

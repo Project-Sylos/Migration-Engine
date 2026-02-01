@@ -88,13 +88,6 @@ func SeedRootTask(queueType string, rootFolder types.Folder, rootNodeID string, 
 		return fmt.Errorf("failed to seed root task to BoltDB for %s: %w", queueType, err)
 	}
 
-	// Create path-to-ulid mapping for root (for API path-based queries)
-	if err := boltDB.Update(func(tx *bolt.Tx) error {
-		return db.SetPathToULIDMapping(tx, queueType, state.Path, rootNodeID)
-	}); err != nil {
-		return fmt.Errorf("failed to create path-to-ulid mapping for root: %w", err)
-	}
-
 	if logservice.LS != nil {
 		_ = logservice.LS.Log(
 			"info",
@@ -234,13 +227,6 @@ func SeedRootTaskWithSrcID(queueType string, rootFolder types.Folder, rootNodeID
 
 	if err := db.BatchInsertNodes(boltDB, ops); err != nil {
 		return fmt.Errorf("failed to seed root task to BoltDB for %s: %w", queueType, err)
-	}
-
-	// Create path-to-ulid mapping for root (for API path-based queries)
-	if err := boltDB.Update(func(tx *bolt.Tx) error {
-		return db.SetPathToULIDMapping(tx, queueType, state.Path, rootNodeID)
-	}); err != nil {
-		return fmt.Errorf("failed to create path-to-ulid mapping for root: %w", err)
 	}
 
 	if logservice.LS != nil {

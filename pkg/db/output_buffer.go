@@ -80,7 +80,7 @@ func (op *CopyStatusOperation) Execute(tx *bolt.Tx) error {
 		return fmt.Errorf("copy status only applies to SRC nodes")
 	}
 
-	nodesBucket := GetNodesBucket(tx, op.QueueType)
+	nodesBucket := GetNodesBucket(tx, op.QueueType, op.Level)
 	if nodesBucket == nil {
 		return fmt.Errorf("nodes bucket not found for %s", op.QueueType)
 	}
@@ -161,6 +161,7 @@ func (op *SetCompletedCountOperation) Execute(tx *bolt.Tx) error {
 // ExclusionUpdateOperation represents an exclusion state update for a node.
 type ExclusionUpdateOperation struct {
 	QueueType         string
+	Level             int    // Level shard containing the node
 	NodeID            string // ULID of the node
 	InheritedExcluded bool
 }
@@ -169,7 +170,7 @@ type ExclusionUpdateOperation struct {
 func (op *ExclusionUpdateOperation) Execute(tx *bolt.Tx) error {
 	nodeID := []byte(op.NodeID)
 
-	nodesBucket := GetNodesBucket(tx, op.QueueType)
+	nodesBucket := GetNodesBucket(tx, op.QueueType, op.Level)
 	if nodesBucket == nil {
 		return fmt.Errorf("nodes bucket not found for %s", op.QueueType)
 	}
@@ -249,7 +250,7 @@ func (op *NodeDeletionOperation) Execute(tx *bolt.Tx) error {
 	nodeID := []byte(op.NodeID)
 
 	// Get node state to determine parent ID
-	nodesBucket := GetNodesBucket(tx, op.QueueType)
+	nodesBucket := GetNodesBucket(tx, op.QueueType, op.Level)
 	if nodesBucket == nil {
 		return fmt.Errorf("nodes bucket not found for %s", op.QueueType)
 	}
@@ -283,9 +284,13 @@ func (op *NodeDeletionOperation) Execute(tx *bolt.Tx) error {
 		lookupBucket.Delete(nodeID) // Ignore errors
 	}
 
-	// 4. Remove from parent's children list
+	// 4. Remove from parent's children list (parent is at level op.Level-1)
 	if ns.ParentID != "" {
-		childrenBucket := GetChildrenBucket(tx, op.QueueType)
+		parentLevel := op.Level - 1
+		if parentLevel < 0 {
+			parentLevel = 0
+		}
+		childrenBucket := GetChildrenBucket(tx, op.QueueType, parentLevel)
 		if childrenBucket != nil {
 			parentID := []byte(ns.ParentID)
 			childrenData := childrenBucket.Get(parentID)
@@ -318,8 +323,9 @@ func (op *NodeDeletionOperation) Execute(tx *bolt.Tx) error {
 	return nil
 }
 
-// LookupMappingOperation represents creation of a bidirectional lookup mapping between SRC and DST nodes.
+// LookupMappingOperation represents creation of a bidirectional lookup mapping between SRC and DST nodes at a given level.
 type LookupMappingOperation struct {
+	Level int    // Level shard for src-to-dst and dst-to-src buckets
 	SrcID string // ULID of the SRC node
 	DstID string // ULID of the DST node
 }
@@ -331,7 +337,7 @@ func (op *LookupMappingOperation) Execute(tx *bolt.Tx) error {
 	}
 
 	// Store DST→SRC mapping
-	dstToSrcBucket, err := GetOrCreateDstToSrcBucket(tx)
+	dstToSrcBucket, err := GetOrCreateDstToSrcBucket(tx, op.Level)
 	if err != nil {
 		return fmt.Errorf("failed to get dst-to-src bucket: %w", err)
 	}
@@ -340,7 +346,7 @@ func (op *LookupMappingOperation) Execute(tx *bolt.Tx) error {
 	}
 
 	// Store SRC→DST mapping
-	srcToDstBucket, err := GetOrCreateSrcToDstBucket(tx)
+	srcToDstBucket, err := GetOrCreateSrcToDstBucket(tx, op.Level)
 	if err != nil {
 		return fmt.Errorf("failed to get src-to-dst bucket: %w", err)
 	}
@@ -349,22 +355,6 @@ func (op *LookupMappingOperation) Execute(tx *bolt.Tx) error {
 	}
 
 	return nil
-}
-
-// PathToULIDMappingOperation represents a path hash → ULID mapping creation.
-type PathToULIDMappingOperation struct {
-	QueueType string // "SRC" or "DST"
-	Path      string // Full path to hash and map
-	NodeID    string // ULID of the node
-}
-
-// Execute performs the path-to-ulid mapping creation within a transaction.
-func (op *PathToULIDMappingOperation) Execute(tx *bolt.Tx) error {
-	if op.Path == "" || op.NodeID == "" {
-		return nil // Skip if either is empty
-	}
-
-	return SetPathToULIDMapping(tx, op.QueueType, op.Path, op.NodeID)
 }
 
 // OutputBuffer batches write operations for efficient database writes.
@@ -485,9 +475,10 @@ func (ob *OutputBuffer) AddCopyStatusUpdate(queueType string, level int, nodeTyp
 }
 
 // AddExclusionUpdate adds an exclusion state update operation to the buffer.
-func (ob *OutputBuffer) AddExclusionUpdate(queueType string, nodeID string, inheritedExcluded bool) {
+func (ob *OutputBuffer) AddExclusionUpdate(queueType string, level int, nodeID string, inheritedExcluded bool) {
 	op := &ExclusionUpdateOperation{
 		QueueType:         queueType,
+		Level:             level,
 		NodeID:            nodeID,
 		InheritedExcluded: inheritedExcluded,
 	}
@@ -525,26 +516,14 @@ func (ob *OutputBuffer) AddNodeDeletion(queueType string, nodeID string, level i
 }
 
 // AddLookupMapping adds a bidirectional lookup mapping operation to the buffer.
-func (ob *OutputBuffer) AddLookupMapping(srcID, dstID string) {
+func (ob *OutputBuffer) AddLookupMapping(level int, srcID, dstID string) {
 	if srcID == "" || dstID == "" {
 		return // Skip if either ID is empty
 	}
 	op := &LookupMappingOperation{
+		Level: level,
 		SrcID: srcID,
 		DstID: dstID,
-	}
-	ob.Add(op)
-}
-
-// AddPathToULIDMapping queues a path-to-ulid mapping creation.
-func (ob *OutputBuffer) AddPathToULIDMapping(queueType string, path string, nodeID string) {
-	if path == "" || nodeID == "" {
-		return // Skip if either is empty
-	}
-	op := &PathToULIDMappingOperation{
-		QueueType: queueType,
-		Path:      path,
-		NodeID:    nodeID,
 	}
 	ob.Add(op)
 }
@@ -779,7 +758,6 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 	// Track lookup mappings that will be created by BatchInsertOperations in this batch
 	// to avoid double-counting in LookupMappingOperation
 	batchInsertMappings := make(map[string]bool) // "srcID:dstID" -> true
-	seenPathToULID := make(map[string]struct{}) // "queueType/path" for in-batch dedupe
 	seenLookup     := make(map[string]struct{})  // "srcID:dstID" for in-batch dedupe
 	seenNodeDel    := make(map[string]struct{})   // "queueType/level/status/nodeID" and "queueType/nodeID" for in-batch dedupe
 
@@ -855,14 +833,6 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 			// Exclusion-holding bucket operations don't affect stats
 			// No stats updates needed
 
-		case *PathToULIDMappingOperation:
-			pathKey := v.QueueType + "/" + v.Path
-			if _, seen := seenPathToULID[pathKey]; !seen {
-				seenPathToULID[pathKey] = struct{}{}
-				pathToULIDPathStr := strings.Join(GetPathToULIDBucketPath(v.QueueType), "/")
-				deltas[pathToULIDPathStr]++
-			}
-
 		case *LookupMappingOperation:
 			mappingKey := fmt.Sprintf("%s:%s", v.SrcID, v.DstID)
 			if batchInsertMappings[mappingKey] {
@@ -872,8 +842,8 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 				continue
 			}
 			seenLookup[mappingKey] = struct{}{}
-			srcToDstPathStr := strings.Join(GetSrcToDstBucketPath(), "/")
-			dstToSrcPathStr := strings.Join(GetDstToSrcBucketPath(), "/")
+			srcToDstPathStr := strings.Join(GetSrcToDstBucketPath(v.Level), "/")
+			dstToSrcPathStr := strings.Join(GetDstToSrcBucketPath(v.Level), "/")
 			deltas[srcToDstPathStr]++
 			deltas[dstToSrcPathStr]++
 
@@ -887,7 +857,7 @@ func computeStatsDeltas(tx *bolt.Tx, operations []WriteOperation) map[string]int
 			nodesNodeKey := v.QueueType + "/" + v.NodeID
 			if _, seen := seenNodeDel[nodesNodeKey]; !seen {
 				seenNodeDel[nodesNodeKey] = struct{}{}
-				nodesPath := strings.Join(GetNodesBucketPath(v.QueueType), "/")
+				nodesPath := strings.Join(GetNodesBucketPath(v.QueueType, v.Level), "/")
 				deltas[nodesPath]--
 			}
 		}
@@ -962,7 +932,7 @@ func computeFlushedNodeIDs(tx *bolt.Tx, operations []WriteOperation) []string {
 			if v.NodeID == "" {
 				continue
 			}
-			nodesBucket := GetNodesBucket(tx, v.QueueType)
+			nodesBucket := GetNodesBucket(tx, v.QueueType, v.Level)
 			if nodesBucket != nil && nodesBucket.Get([]byte(v.NodeID)) != nil {
 				if _, exists := seen[v.NodeID]; !exists {
 					seen[v.NodeID] = struct{}{}

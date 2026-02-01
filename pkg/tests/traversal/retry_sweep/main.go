@@ -130,8 +130,8 @@ func runTest() error {
 
 	fmt.Printf("Selected SRC node: %s (depth: %d, type: %s)\n", selectedChild.Path, selectedChild.Depth, selectedChild.Type)
 
-	// Find corresponding DST node using join-lookup table
-	dstNodeID, err := db.GetDstIDFromSrcID(boltDB, selectedChild.ID)
+	// Find corresponding DST node using join-lookup table (per level)
+	dstNodeID, err := db.GetDstIDFromSrcID(boltDB, selectedChild.Depth, selectedChild.ID)
 	if err != nil {
 		return fmt.Errorf("failed to get DST node ID from SRC node: %w", err)
 	}

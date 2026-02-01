@@ -11,26 +11,35 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// LogBuffer is a lightweight buffer specifically for log entries.
-// It batches log inserts for improved performance while keeping the implementation simple.
+// LogBuffer is a shard-aware buffer for log entries (plan: count-based sharding, e.g. 1M per shard).
 type LogBuffer struct {
-	db          *DB
-	mu          sync.Mutex
-	entries     []LogEntry
-	batchSize   int
-	flushTicker *time.Ticker
-	stopChan    chan struct{}
-	wg          sync.WaitGroup
+	db                 *DB
+	mu                 sync.Mutex
+	entries            []LogEntry
+	batchSize          int
+	flushTicker        *time.Ticker
+	stopChan           chan struct{}
+	wg                 sync.WaitGroup
+	shardCap           int64   // Max entries per shard (e.g. 1_000_000)
+	currentShardID     int     // In-memory; restored from _meta on first flush
+	countInCurrentShard int64  // In-memory; restored from _meta on first flush
+	stateLoaded        bool   // True after first load from DB
 }
 
-// NewLogBuffer creates a new log buffer that will flush every N entries or every interval.
-func NewLogBuffer(db *DB, batchSize int, flushInterval time.Duration) *LogBuffer {
+// NewLogBuffer creates a new log buffer (shard-capable). Shards are created when count reaches shardCap.
+func NewLogBuffer(db *DB, batchSize int, flushInterval time.Duration, shardCap int64) *LogBuffer {
+	if shardCap <= 0 {
+		shardCap = DefaultLogShardCap
+	}
 	lb := &LogBuffer{
 		db:          db,
 		entries:     make([]LogEntry, 0, batchSize),
 		batchSize:   batchSize,
 		flushTicker: time.NewTicker(flushInterval),
 		stopChan:    make(chan struct{}),
+		shardCap:    shardCap,
+		currentShardID: 0,
+		countInCurrentShard: 0,
 	}
 
 	lb.wg.Add(1)
@@ -51,44 +60,80 @@ func (lb *LogBuffer) Add(entry LogEntry) {
 	}
 }
 
-// Flush writes all buffered entries to BoltDB in a single transaction.
+// Flush writes all buffered entries to the current log shard; advances shard when count >= shardCap.
 func (lb *LogBuffer) Flush() {
 	lb.mu.Lock()
 	if len(lb.entries) == 0 {
 		lb.mu.Unlock()
 		return
 	}
-
-	// Take snapshot and clear buffer
 	batch := lb.entries
 	lb.entries = make([]LogEntry, 0, lb.batchSize)
 	lb.mu.Unlock()
 
-	// Execute batch insert to BoltDB in a single transaction
+	var nextShardID int
+	var nextCount int64
 	err := lb.db.Update(func(tx *bolt.Tx) error {
-		for _, entry := range batch {
-			// Get or create the level-specific bucket
-			levelBucket, err := GetOrCreateLogLevelBucket(tx, entry.Level)
-			if err != nil {
-				return fmt.Errorf("failed to get log level bucket: %w", err)
-			}
+		shardID := lb.currentShardID
+		count := lb.countInCurrentShard
+		if !lb.stateLoaded {
+			sid, cnt, _ := GetCurrentLogShardAndCount(tx)
+			shardID = sid
+			count = cnt
+		}
 
-			// Serialize entry
+		logsBucket, err := GetOrCreateLogShardBucket(tx, shardID, LogShardLogsBucket)
+		if err != nil {
+			return err
+		}
+
+		for _, entry := range batch {
 			value, err := SerializeLogEntry(entry)
 			if err != nil {
-				return fmt.Errorf("failed to serialize log entry: %w", err)
+				return fmt.Errorf("serialize log entry: %w", err)
 			}
+			if err := logsBucket.Put([]byte(entry.ID), value); err != nil {
+				return fmt.Errorf("put log entry: %w", err)
+			}
+			levelBucket, err := GetOrCreateLogShardBucket(tx, shardID, entry.Level)
+			if err != nil {
+				return err
+			}
+			if err := levelBucket.Put([]byte(entry.ID), []byte{}); err != nil {
+				return fmt.Errorf("put log level membership: %w", err)
+			}
+		}
 
-			// Write to BoltDB using entry ID as key
-			if err := levelBucket.Put([]byte(entry.ID), value); err != nil {
-				return fmt.Errorf("failed to set log entry: %w", err)
+		newCount := count + int64(len(batch))
+		if err := WriteLogShardStats(tx, shardID, newCount); err != nil {
+			return err
+		}
+
+		if newCount >= lb.shardCap {
+			nextShardID = shardID + 1
+			nextCount = 0
+			if err := SetCurrentLogShardAndCount(tx, nextShardID, 0); err != nil {
+				return err
+			}
+		} else {
+			nextShardID = shardID
+			nextCount = newCount
+			if err := SetCurrentLogShardAndCount(tx, shardID, newCount); err != nil {
+				return err
 			}
 		}
 		return nil
 	})
 
+	if err == nil {
+		lb.mu.Lock()
+		lb.stateLoaded = true
+		lb.currentShardID = nextShardID
+		lb.countInCurrentShard = nextCount
+		lb.mu.Unlock()
+	}
+
 	if err != nil {
-		// Silently fail - logs are not critical
 		fmt.Printf("Error flushing log buffer: %v\n", err)
 	}
 }

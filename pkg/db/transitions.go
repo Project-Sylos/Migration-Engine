@@ -18,8 +18,8 @@ func UpdateNodeStatusByID(db *DB, queueType string, level int, oldStatus, newSta
 	err := db.Update(func(tx *bolt.Tx) error {
 		nodeIDBytes := []byte(nodeID)
 
-		// Get the node data from nodes bucket
-		nodesBucket := GetNodesBucket(tx, queueType)
+		// Get the node data from nodes bucket (level-sharded)
+		nodesBucket := GetNodesBucket(tx, queueType, level)
 		if nodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}
@@ -90,7 +90,7 @@ func UpdateNodeCopyStatusByID(db *DB, queueType string, level int, status string
 	err := db.Update(func(tx *bolt.Tx) error {
 		nodeIDBytes := []byte(nodeID)
 
-		nodesBucket := GetNodesBucket(tx, queueType)
+		nodesBucket := GetNodesBucket(tx, queueType, level)
 		if nodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}
@@ -139,8 +139,8 @@ func UpdateNodeCopyStatusTransitionByID(db *DB, level int, oldCopyStatus, newCop
 	err := db.Update(func(tx *bolt.Tx) error {
 		nodeIDBytes := []byte(nodeID)
 
-		// Get the node data from nodes bucket (SRC only for copy status)
-		nodesBucket := GetNodesBucket(tx, BucketSrc)
+		// Get the node data from nodes bucket (SRC only for copy status, level-sharded)
+		nodesBucket := GetNodesBucket(tx, BucketSrc, level)
 		if nodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found for SRC")
 		}
@@ -209,7 +209,7 @@ func UpdateNodeCopyStatusTransitionByID(db *DB, level int, oldCopyStatus, newCop
 	return nodeState, nil
 }
 
-// SetNodeState stores a NodeState in the nodes bucket.
+// SetNodeState stores a NodeState in the nodes bucket at the node's level (state.Depth).
 // This is used for initial insertion or updates without state transitions.
 // nodeID is the ULID of the node (as []byte).
 func SetNodeState(db *DB, queueType string, nodeID []byte, state *NodeState) error {
@@ -226,8 +226,9 @@ func SetNodeState(db *DB, queueType string, nodeID []byte, state *NodeState) err
 		return fmt.Errorf("failed to serialize node state: %w", err)
 	}
 
+	level := state.Depth
 	return db.Update(func(tx *bolt.Tx) error {
-		nodesBucket := GetNodesBucket(tx, queueType)
+		nodesBucket := GetNodesBucket(tx, queueType, level)
 		if nodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}
@@ -235,29 +236,35 @@ func SetNodeState(db *DB, queueType string, nodeID []byte, state *NodeState) err
 	})
 }
 
-// GetNodeState retrieves a NodeState from the nodes bucket by ULID.
-// GetNodeState retrieves a NodeState by ULID (as string).
+// GetNodeState retrieves a NodeState by ULID by scanning all level shards.
+// Use GetNodeStateAtLevel when the level is known for a faster lookup.
 func GetNodeState(db *DB, queueType string, nodeID string) (*NodeState, error) {
 	var nodeState *NodeState
 
-	err := db.View(func(tx *bolt.Tx) error {
-		nodesBucket := GetNodesBucket(tx, queueType)
-		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found for %s", queueType)
-		}
+	levels, err := db.GetAllLevels(queueType)
+	if err != nil {
+		return nil, err
+	}
 
-		nodeData := nodesBucket.Get([]byte(nodeID))
-		if nodeData == nil {
-			return nil // Not found
+	nodeIDBytes := []byte(nodeID)
+	err = db.View(func(tx *bolt.Tx) error {
+		for _, level := range levels {
+			nodesBucket := GetNodesBucket(tx, queueType, level)
+			if nodesBucket == nil {
+				continue
+			}
+			nodeData := nodesBucket.Get(nodeIDBytes)
+			if nodeData == nil {
+				continue
+			}
+			ns, err := DeserializeNodeState(nodeData)
+			if err != nil {
+				return fmt.Errorf("failed to deserialize node state: %w", err)
+			}
+			nodeState = ns
+			return nil
 		}
-
-		ns, err := DeserializeNodeState(nodeData)
-		if err != nil {
-			return fmt.Errorf("failed to deserialize node state: %w", err)
-		}
-
-		nodeState = ns
-		return nil
+		return nil // Not found in any level
 	})
 
 	if err != nil {
@@ -267,28 +274,42 @@ func GetNodeState(db *DB, queueType string, nodeID string) (*NodeState, error) {
 	return nodeState, nil
 }
 
-// BatchGetNodeMeta retrieves Depth and TraversalStatus for multiple node IDs in one transaction.
+// BatchGetNodeMeta retrieves Depth and TraversalStatus for multiple node IDs by scanning all level shards.
 // Returns map[nodeID]NodeMeta; missing nodes are omitted from the map.
 func BatchGetNodeMeta(db *DB, queueType string, nodeIDs []string) (map[string]NodeMeta, error) {
 	result := make(map[string]NodeMeta)
 	if len(nodeIDs) == 0 {
 		return result, nil
 	}
-	err := db.View(func(tx *bolt.Tx) error {
-		nodesBucket := GetNodesBucket(tx, queueType)
-		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found for %s", queueType)
-		}
-		for _, nodeID := range nodeIDs {
-			nodeData := nodesBucket.Get([]byte(nodeID))
-			if nodeData == nil {
+	need := make(map[string]struct{})
+	for _, id := range nodeIDs {
+		need[id] = struct{}{}
+	}
+	levels, err := db.GetAllLevels(queueType)
+	if err != nil {
+		return nil, err
+	}
+	err = db.View(func(tx *bolt.Tx) error {
+		for _, level := range levels {
+			nodesBucket := GetNodesBucket(tx, queueType, level)
+			if nodesBucket == nil {
 				continue
 			}
-			ns, err := DeserializeNodeState(nodeData)
-			if err != nil {
-				continue // Skip bad entries
+			for id := range need {
+				nodeData := nodesBucket.Get([]byte(id))
+				if nodeData == nil {
+					continue
+				}
+				ns, err := DeserializeNodeState(nodeData)
+				if err != nil {
+					continue
+				}
+				result[id] = NodeMeta{Depth: ns.Depth, TraversalStatus: ns.TraversalStatus}
+				delete(need, id)
+				if len(need) == 0 {
+					return nil
+				}
 			}
-			result[nodeID] = NodeMeta{Depth: ns.Depth, TraversalStatus: ns.TraversalStatus}
 		}
 		return nil
 	})
@@ -300,7 +321,7 @@ func BatchUpdateNodeStatusByID(db *DB, queueType string, level int, oldStatus, n
 	results := make(map[string]*NodeState)
 
 	err := db.Update(func(tx *bolt.Tx) error {
-		nodesBucket := GetNodesBucket(tx, queueType)
+		nodesBucket := GetNodesBucket(tx, queueType, level)
 		if nodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}
@@ -366,7 +387,7 @@ func BatchUpdateNodeCopyStatusByID(db *DB, queueType string, level int, status s
 	results := make(map[string]*NodeState)
 
 	err := db.Update(func(tx *bolt.Tx) error {
-		nodesBucket := GetNodesBucket(tx, queueType)
+		nodesBucket := GetNodesBucket(tx, queueType, level)
 		if nodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}

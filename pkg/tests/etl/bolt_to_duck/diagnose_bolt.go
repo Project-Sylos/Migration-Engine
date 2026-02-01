@@ -61,14 +61,18 @@ func main() {
 		startTime := time.Now()
 
 		err := boltDB.View(func(tx *bolt.Tx) error {
-			nodesBucket := db.GetNodesBucket(tx, queueType)
-			if nodesBucket == nil {
-				fmt.Printf("  No nodes bucket found for %s\n", queueType)
+			levels, _ := db.GetAllLevelsFromTx(tx, queueType)
+			if levels == nil {
+				fmt.Printf("  No levels found for %s\n", queueType)
 				return nil
 			}
-
-			cursor := nodesBucket.Cursor()
-			for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+			for _, level := range levels {
+				nodesBucket := db.GetNodesBucket(tx, queueType, level)
+				if nodesBucket == nil {
+					continue
+				}
+				cursor := nodesBucket.Cursor()
+				for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
 				nodeCount++
 
 				// Sample: only process every Nth node, up to sampleSize
@@ -98,6 +102,7 @@ func main() {
 				// Progress indicator every 10k samples
 				if sampledCount%10000 == 0 {
 					fmt.Printf("  ... sampled %d nodes (scanned %d)...\n", sampledCount, nodeCount)
+				}
 				}
 			}
 

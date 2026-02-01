@@ -114,26 +114,30 @@ func inspectQueue(boltDB *db.DB, queueType string) (*QueueReport, error) {
 		QueueType: queueType,
 	}
 
-	// Count total nodes using stats bucket
-	nodesPath := db.GetNodesBucketPath(queueType)
-	totalNodes, err := boltDB.GetBucketCount(nodesPath)
-	if err != nil {
-		// Stats might not exist, fall back to counting
-		totalNodesInt, countErr := boltDB.CountNodes(queueType)
-		if countErr != nil {
-			return nil, fmt.Errorf("failed to count nodes: %w", countErr)
-		}
-		totalNodes = int64(totalNodesInt)
-	}
-	report.TotalNodes = int(totalNodes)
-
-	// Get all levels
+	// Get all levels first (nodes are level-sharded)
 	levels, err := boltDB.GetAllLevels(queueType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get levels: %w", err)
 	}
 
-	// Sort levels
+	// Count total nodes by summing per-level (plan: level-sharded nodes)
+	var totalNodes int64
+	for _, level := range levels {
+		nodesPath := db.GetNodesBucketPath(queueType, level)
+		c, err := boltDB.GetBucketCount(nodesPath)
+		if err != nil {
+			continue
+		}
+		totalNodes += c
+	}
+	if totalNodes == 0 {
+		totalNodesInt, countErr := boltDB.CountNodes(queueType)
+		if countErr == nil {
+			totalNodes = int64(totalNodesInt)
+		}
+	}
+	report.TotalNodes = int(totalNodes)
+
 	sort.Ints(levels)
 
 	// Inspect each level using stats bucket

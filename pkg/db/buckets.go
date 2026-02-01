@@ -114,7 +114,6 @@ const (
 	SubBucketJoinLookup         = "join-lookup"
 	SubBucketSrcToDst           = "src-to-dst"
 	SubBucketDstToSrc           = "dst-to-src"
-	SubBucketPathToULID         = "path-to-ulid" // Path hash → ULID lookup
 )
 
 // FormatLevel formats a level number as an 8-digit zero-padded string.
@@ -127,16 +126,22 @@ func ParseLevel(levelStr string) (int, error) {
 	return strconv.Atoi(levelStr)
 }
 
-// GetNodesBucketPath returns the bucket path for the nodes bucket.
-// Returns: ["Traversal-Data", "SRC", "nodes"] or ["Traversal-Data", "DST", "nodes"]
-func GetNodesBucketPath(queueType string) []string {
-	return []string{TraversalDataBucket, queueType, SubBucketNodes}
+// GetLevelShardPath returns the bucket path for a level shard (under which nodes, children, traversal, copy, join live).
+// Returns: ["Traversal-Data", queueType, "levels", "00000000"]
+func GetLevelShardPath(queueType string, level int) []string {
+	return []string{TraversalDataBucket, queueType, SubBucketLevels, FormatLevel(level)}
 }
 
-// GetChildrenBucketPath returns the bucket path for the children bucket.
-// Returns: ["Traversal-Data", "SRC", "children"] or ["Traversal-Data", "DST", "children"]
-func GetChildrenBucketPath(queueType string) []string {
-	return []string{TraversalDataBucket, queueType, SubBucketChildren}
+// GetNodesBucketPath returns the bucket path for the nodes bucket at a given level (level-sharded).
+// Returns: ["Traversal-Data", "SRC", "levels", "00000000", "nodes"]
+func GetNodesBucketPath(queueType string, level int) []string {
+	return append(GetLevelShardPath(queueType, level), SubBucketNodes)
+}
+
+// GetChildrenBucketPath returns the bucket path for the children bucket at a given level (level-sharded).
+// Returns: ["Traversal-Data", "SRC", "levels", "00000000", "children"]
+func GetChildrenBucketPath(queueType string, level int) []string {
+	return append(GetLevelShardPath(queueType, level), SubBucketChildren)
 }
 
 // GetLevelBucketPath returns the bucket path for a specific level.
@@ -234,11 +239,32 @@ func EnsureLevelBucket(tx *bolt.Tx, queueType string, level int) error {
 		return fmt.Errorf("levels bucket not found in %s", queueType)
 	}
 
-	// Create the level bucket
+	// Create the level bucket (level shard: nodes, children, traversal, copy, join live under here)
 	levelStr := FormatLevel(level)
 	levelBucket, err := levelsBucket.CreateBucketIfNotExists([]byte(levelStr))
 	if err != nil {
 		return fmt.Errorf("failed to create level bucket %s: %w", levelStr, err)
+	}
+
+	// Create nodes bucket for this level (key-value: node ID -> NodeState)
+	if _, err := levelBucket.CreateBucketIfNotExists([]byte(SubBucketNodes)); err != nil {
+		return fmt.Errorf("failed to create nodes bucket for level %s: %w", levelStr, err)
+	}
+
+	// Create children bucket for this level (key-value: parent ID -> child IDs)
+	if _, err := levelBucket.CreateBucketIfNotExists([]byte(SubBucketChildren)); err != nil {
+		return fmt.Errorf("failed to create children bucket for level %s: %w", levelStr, err)
+	}
+
+	// Create join-lookup bucket for this level (SRC: src-to-dst, DST: dst-to-src)
+	if queueType == BucketSrc {
+		if _, err := levelBucket.CreateBucketIfNotExists([]byte(SubBucketSrcToDst)); err != nil {
+			return fmt.Errorf("failed to create src-to-dst bucket for level %s: %w", levelStr, err)
+		}
+	} else {
+		if _, err := levelBucket.CreateBucketIfNotExists([]byte(SubBucketDstToSrc)); err != nil {
+			return fmt.Errorf("failed to create dst-to-src bucket for level %s: %w", levelStr, err)
+		}
 	}
 
 	// Create traversal sub-bucket
@@ -302,14 +328,14 @@ func EnsureLevelBucket(tx *bolt.Tx, queueType string, level int) error {
 	return nil
 }
 
-// GetNodesBucket returns the nodes bucket for a queue type.
-func GetNodesBucket(tx *bolt.Tx, queueType string) *bolt.Bucket {
-	return getBucket(tx, GetNodesBucketPath(queueType))
+// GetNodesBucket returns the nodes bucket for a queue type at the given level (level-sharded).
+func GetNodesBucket(tx *bolt.Tx, queueType string, level int) *bolt.Bucket {
+	return getBucket(tx, GetNodesBucketPath(queueType, level))
 }
 
-// GetChildrenBucket returns the children bucket for a queue type.
-func GetChildrenBucket(tx *bolt.Tx, queueType string) *bolt.Bucket {
-	return getBucket(tx, GetChildrenBucketPath(queueType))
+// GetChildrenBucket returns the children bucket for a queue type at the given level (level-sharded).
+func GetChildrenBucket(tx *bolt.Tx, queueType string, level int) *bolt.Bucket {
+	return getBucket(tx, GetChildrenBucketPath(queueType, level))
 }
 
 // GetTraversalStatusBucket returns the traversal status bucket for a specific level and status.
@@ -493,56 +519,56 @@ func GetOrCreateHoldingBucket(tx *bolt.Tx, queueType string, mode string) (*bolt
 	}
 }
 
-// GetJoinLookupBucketPath returns the bucket path for the join-lookup bucket.
-// Returns: ["Traversal-Data", "DST", "join-lookup"]
-// This bucket maps DST node ULIDs to corresponding SRC node ULIDs (1:1 mapping).
-func GetJoinLookupBucketPath() []string {
-	return []string{TraversalDataBucket, BucketDst, SubBucketJoinLookup}
+// GetJoinLookupBucketPath returns the bucket path for the DST join-lookup (dst-to-src) at the given level.
+// Same as GetDstToSrcBucketPath(level). Kept for compatibility.
+func GetJoinLookupBucketPath(level int) []string {
+	return GetDstToSrcBucketPath(level)
 }
 
-// GetJoinLookupBucket returns the join-lookup bucket for DST→SRC node mapping.
-// Returns nil if the bucket doesn't exist.
-func GetJoinLookupBucket(tx *bolt.Tx) *bolt.Bucket {
-	return getBucket(tx, GetJoinLookupBucketPath())
+// GetJoinLookupBucket returns the join-lookup bucket for DST→SRC node mapping at the given level.
+func GetJoinLookupBucket(tx *bolt.Tx, level int) *bolt.Bucket {
+	return GetDstToSrcBucket(tx, level)
 }
 
-// GetOrCreateJoinLookupBucket returns or creates the join-lookup bucket for DST→SRC node mapping.
-func GetOrCreateJoinLookupBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
-	return getOrCreateBucket(tx, GetJoinLookupBucketPath())
+// GetOrCreateJoinLookupBucket returns or creates the join-lookup bucket for DST→SRC node mapping at the given level.
+func GetOrCreateJoinLookupBucket(tx *bolt.Tx, level int) (*bolt.Bucket, error) {
+	return GetOrCreateDstToSrcBucket(tx, level)
 }
 
-// GetSrcToDstBucketPath returns the bucket path for the src-to-dst lookup bucket.
-// Returns: ["Traversal-Data", "SRC", "src-to-dst"]
-// This bucket maps SRC node ULIDs to corresponding DST node ULIDs (1:1 mapping).
-func GetSrcToDstBucketPath() []string {
-	return []string{TraversalDataBucket, BucketSrc, SubBucketSrcToDst}
+// GetSrcToDstBucketPath returns the bucket path for the src-to-dst lookup bucket at the given level (level-sharded).
+// Returns: ["Traversal-Data", "SRC", "levels", "00000000", "src-to-dst"]
+func GetSrcToDstBucketPath(level int) []string {
+	return append(GetLevelShardPath(BucketSrc, level), SubBucketSrcToDst)
 }
 
-// GetSrcToDstBucket returns the src-to-dst lookup bucket for SRC→DST node mapping.
-// Returns nil if the bucket doesn't exist.
-func GetSrcToDstBucket(tx *bolt.Tx) *bolt.Bucket {
-	return getBucket(tx, GetSrcToDstBucketPath())
+// GetSrcToDstBucket returns the src-to-dst lookup bucket for SRC→DST node mapping at the given level.
+func GetSrcToDstBucket(tx *bolt.Tx, level int) *bolt.Bucket {
+	return getBucket(tx, GetSrcToDstBucketPath(level))
 }
 
-// GetOrCreateSrcToDstBucket returns or creates the src-to-dst lookup bucket for SRC→DST node mapping.
-func GetOrCreateSrcToDstBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
-	return getOrCreateBucket(tx, GetSrcToDstBucketPath())
+// GetOrCreateSrcToDstBucket returns or creates the src-to-dst lookup bucket for SRC→DST node mapping at the given level.
+func GetOrCreateSrcToDstBucket(tx *bolt.Tx, level int) (*bolt.Bucket, error) {
+	if err := EnsureLevelBucket(tx, BucketSrc, level); err != nil {
+		return nil, err
+	}
+	return getOrCreateBucket(tx, GetSrcToDstBucketPath(level))
 }
 
-// GetDstToSrcBucketPath returns the bucket path for the dst-to-src lookup bucket.
-// Returns: ["Traversal-Data", "DST", "dst-to-src"]
-// This bucket maps DST node ULIDs to corresponding SRC node ULIDs (1:1 mapping).
-func GetDstToSrcBucketPath() []string {
-	return []string{TraversalDataBucket, BucketDst, SubBucketDstToSrc}
+// GetDstToSrcBucketPath returns the bucket path for the dst-to-src lookup bucket at the given level (level-sharded).
+// Returns: ["Traversal-Data", "DST", "levels", "00000000", "dst-to-src"]
+func GetDstToSrcBucketPath(level int) []string {
+	return append(GetLevelShardPath(BucketDst, level), SubBucketDstToSrc)
 }
 
-// GetDstToSrcBucket returns the dst-to-src lookup bucket for DST→SRC node mapping.
-// Returns nil if the bucket doesn't exist.
-func GetDstToSrcBucket(tx *bolt.Tx) *bolt.Bucket {
-	return getBucket(tx, GetDstToSrcBucketPath())
+// GetDstToSrcBucket returns the dst-to-src lookup bucket for DST→SRC node mapping at the given level.
+func GetDstToSrcBucket(tx *bolt.Tx, level int) *bolt.Bucket {
+	return getBucket(tx, GetDstToSrcBucketPath(level))
 }
 
-// GetOrCreateDstToSrcBucket returns or creates the dst-to-src lookup bucket for DST→SRC node mapping.
-func GetOrCreateDstToSrcBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
-	return getOrCreateBucket(tx, GetDstToSrcBucketPath())
+// GetOrCreateDstToSrcBucket returns or creates the dst-to-src lookup bucket for DST→SRC node mapping at the given level.
+func GetOrCreateDstToSrcBucket(tx *bolt.Tx, level int) (*bolt.Bucket, error) {
+	if err := EnsureLevelBucket(tx, BucketDst, level); err != nil {
+		return nil, err
+	}
+	return getOrCreateBucket(tx, GetDstToSrcBucketPath(level))
 }

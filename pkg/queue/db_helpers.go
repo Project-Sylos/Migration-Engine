@@ -106,8 +106,8 @@ func LoadExpectedChildren(boltDB *db.DB, parentPath string, dstLevel int) ([]typ
 
 	normalizedParent := types.NormalizeLocationPath(parentPath)
 
-	// Use the children index for efficient O(k) lookup
-	children, err := db.GetChildrenStatesByParentID(boltDB, "SRC", normalizedParent)
+	// Use the children index for efficient O(k) lookup (parent at dstLevel, children list in that level shard)
+	children, err := db.GetChildrenStatesByParentID(boltDB, "SRC", dstLevel, normalizedParent)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to fetch children from index: %w", err)
 	}
@@ -165,119 +165,96 @@ func BatchLoadExpectedChildrenByDSTIDs(boltDB *db.DB, dstParentIDs []string, dst
 	srcIDMap := make(map[string]map[string]string)
 	var srcIDToMeta map[string]SrcNodeMeta
 
-	// Single transaction to load all children
+	// Single transaction; level-scoped buckets (plan: nodes/children/join under levels/<level>/)
 	err := boltDB.View(func(tx *bolt.Tx) error {
-		dstNodesBucket := db.GetNodesBucket(tx, "DST")
-		if dstNodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found for DST")
+		levels, _ := db.GetAllLevelsFromTx(tx, "DST")
+		if levels == nil {
+			levels = []int{}
 		}
 
-		srcChildrenBucket := db.GetChildrenBucket(tx, "SRC")
-		if srcChildrenBucket == nil {
-			return fmt.Errorf("children bucket not found for SRC")
-		}
-
-		srcNodesBucket := db.GetNodesBucket(tx, "SRC")
-		if srcNodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found for SRC")
-		}
-
-		// Step 1: Get SrcID from lookup table for each DST parent
-		// Map: DST ULID -> SRC parent ULID
+		// Step 1: For each DST parent find level and SrcID (dst-to-src is per level)
 		dstToSrcParent := make(map[string]string)
-		// Map: SRC parent ULID -> []DST ULIDs (multiple DST parents might map to same SRC parent)
 		srcParentToDSTs := make(map[string][]string)
+		srcParentLevel := make(map[string]int) // SRC parent ULID -> level (for children bucket)
 
-		// Get dst-to-src lookup bucket
-		dstToSrcBucket := db.GetDstToSrcBucket(tx)
-		if dstToSrcBucket == nil {
-			// Lookup bucket doesn't exist - initialize empty slices for all DST parents
+		for _, level := range levels {
+			dstNodesBucket := db.GetNodesBucket(tx, "DST", level)
+			dstToSrcBucket := db.GetDstToSrcBucket(tx, level)
+			if dstNodesBucket == nil || dstToSrcBucket == nil {
+				continue
+			}
 			for _, dstID := range dstParentIDs {
-				resultFolders[dstID] = []types.Folder{}
-				resultFiles[dstID] = []types.File{}
+				if _, done := dstToSrcParent[dstID]; done {
+					continue
+				}
+				dstIDBytes := []byte(dstID)
+				if dstNodesBucket.Get(dstIDBytes) == nil {
+					continue
+				}
+				srcParentIDBytes := dstToSrcBucket.Get(dstIDBytes)
+				if srcParentIDBytes == nil {
+					resultFolders[dstID] = []types.Folder{}
+					resultFiles[dstID] = []types.File{}
+					srcIDMap[dstID] = make(map[string]string)
+					dstToSrcParent[dstID] = ""
+					continue
+				}
+				srcParentID := string(srcParentIDBytes)
+				dstToSrcParent[dstID] = srcParentID
+				srcParentToDSTs[srcParentID] = append(srcParentToDSTs[srcParentID], dstID)
+				srcParentLevel[srcParentID] = level
 				srcIDMap[dstID] = make(map[string]string)
 			}
-			fmt.Println("Lookup bucket doesn't exist - initializing empty slices for all DST parents")
-			return nil // No mappings available
 		}
-
 		for _, dstID := range dstParentIDs {
-			dstIDBytes := []byte(dstID)
-			dstNodeData := dstNodesBucket.Get(dstIDBytes)
-			if dstNodeData == nil {
-				// DST node not found - initialize empty slices
+			if _, exists := resultFolders[dstID]; !exists {
 				resultFolders[dstID] = []types.Folder{}
 				resultFiles[dstID] = []types.File{}
 				srcIDMap[dstID] = make(map[string]string)
-				continue
 			}
-
-			_, err := db.DeserializeNodeState(dstNodeData)
-			if err != nil {
-				// Deserialization failed - initialize empty slices
-				resultFolders[dstID] = []types.Folder{}
-				resultFiles[dstID] = []types.File{}
-				srcIDMap[dstID] = make(map[string]string)
-				continue
-			}
-
-			// Get SrcID from lookup table directly within this transaction
-			srcParentIDBytes := dstToSrcBucket.Get(dstIDBytes)
-			if srcParentIDBytes == nil {
-				// No SrcID mapping found - initialize empty slices
-				resultFolders[dstID] = []types.Folder{}
-				resultFiles[dstID] = []types.File{}
-				srcIDMap[dstID] = make(map[string]string)
-				continue
-			}
-
-			srcParentID := string(srcParentIDBytes)
-			dstToSrcParent[dstID] = srcParentID
-			srcParentToDSTs[srcParentID] = append(srcParentToDSTs[srcParentID], dstID)
-			srcIDMap[dstID] = make(map[string]string)
 		}
 
-		// Step 2: Get all SRC child ULIDs for all SRC parents
-		// Map: SRC child ULID -> []DST parent ULIDs (a child might be shared by multiple DST parents)
+		// Step 2: Get SRC child ULIDs (children bucket per level)
 		srcChildIDToDSTParents := make(map[string][]string)
-		allSrcChildIDs := make(map[string]bool) // Set of all unique SRC child ULIDs
+		allSrcChildIDs := make(map[string]bool)
+		childIDToLevel := make(map[string]int)
 
 		for srcParentID, dstIDs := range srcParentToDSTs {
-			childrenData := srcChildrenBucket.Get([]byte(srcParentID))
-			if childrenData == nil {
-				// No children for this SRC parent - initialize empty slices for all corresponding DST parents
-				for _, dstID := range dstIDs {
-					if _, exists := resultFolders[dstID]; !exists {
-						resultFolders[dstID] = []types.Folder{}
-						resultFiles[dstID] = []types.File{}
-					}
-				}
+			level := srcParentLevel[srcParentID]
+			srcChildrenBucket := db.GetChildrenBucket(tx, "SRC", level)
+			if srcChildrenBucket == nil {
 				continue
 			}
-
+			childrenData := srcChildrenBucket.Get([]byte(srcParentID))
+			if childrenData == nil {
+				continue
+			}
 			var childIDs []string
 			if err := json.Unmarshal(childrenData, &childIDs); err != nil {
 				return fmt.Errorf("failed to unmarshal children list for SRC parent %s: %w", srcParentID, err)
 			}
-
-			// Associate each SRC child with all corresponding DST parents
+			childLevel := level + 1
 			for _, childID := range childIDs {
 				allSrcChildIDs[childID] = true
+				childIDToLevel[childID] = childLevel
 				srcChildIDToDSTParents[childID] = append(srcChildIDToDSTParents[childID], dstIDs...)
 			}
 		}
 
-		// Step 3: Fetch all unique SRC child NodeStates in one pass
+		// Step 3: Fetch SRC child NodeStates (nodes bucket per level)
 		childStates := make(map[string]*db.NodeState)
 		for childID := range allSrcChildIDs {
+			childLevel := childIDToLevel[childID]
+			srcNodesBucket := db.GetNodesBucket(tx, "SRC", childLevel)
+			if srcNodesBucket == nil {
+				continue
+			}
 			nodeData := srcNodesBucket.Get([]byte(childID))
 			if nodeData == nil {
-				continue // Child may have been deleted
+				continue
 			}
-
 			ns, err := db.DeserializeNodeState(nodeData)
 			if err != nil {
-				// Log but continue - don't fail entire batch for one bad node
 				continue
 			}
 			childStates[childID] = ns
@@ -376,9 +353,28 @@ func BatchLoadRetryDstCleanup(boltDB *db.DB, srcIDs []string) (map[string]*Retry
 	if boltDB == nil || len(srcIDs) == 0 {
 		return out, nil
 	}
-	srcToDst, err := db.BatchGetDstIDsFromSrcIDs(boltDB, srcIDs)
+	// Join lookup is per level; get SRC level per srcID then call BatchGetDstIDsFromSrcIDs per level
+	srcMeta, err := db.BatchGetNodeMeta(boltDB, "SRC", srcIDs)
 	if err != nil {
-		return nil, fmt.Errorf("batch get DST IDs from SRC IDs: %w", err)
+		return nil, fmt.Errorf("batch get SRC node meta: %w", err)
+	}
+	levelToSrcIDs := make(map[int][]string)
+	for _, id := range srcIDs {
+		meta, ok := srcMeta[id]
+		if !ok {
+			continue
+		}
+		levelToSrcIDs[meta.Depth] = append(levelToSrcIDs[meta.Depth], id)
+	}
+	srcToDst := make(map[string]string)
+	for level, ids := range levelToSrcIDs {
+		m, err := db.BatchGetDstIDsFromSrcIDs(boltDB, level, ids)
+		if err != nil {
+			return nil, fmt.Errorf("batch get DST IDs from SRC IDs: %w", err)
+		}
+		for k, v := range m {
+			srcToDst[k] = v
+		}
 	}
 	if len(srcToDst) == 0 {
 		return out, nil
@@ -391,9 +387,24 @@ func BatchLoadRetryDstCleanup(boltDB *db.DB, srcIDs []string) (map[string]*Retry
 	if err != nil {
 		return nil, fmt.Errorf("batch get DST node meta: %w", err)
 	}
-	parentToChildren, err := db.BatchGetChildrenIDsByParentIDs(boltDB, "DST", dstIDs)
-	if err != nil {
-		return nil, fmt.Errorf("batch get DST children by parent: %w", err)
+	// Children bucket is per level; group DST parents by level then call BatchGetChildrenIDsByParentIDs per level
+	levelToDstIDs := make(map[int][]string)
+	for _, id := range dstIDs {
+		meta, ok := dstMeta[id]
+		if !ok {
+			continue
+		}
+		levelToDstIDs[meta.Depth] = append(levelToDstIDs[meta.Depth], id)
+	}
+	parentToChildren := make(map[string][]string)
+	for level, ids := range levelToDstIDs {
+		m, err := db.BatchGetChildrenIDsByParentIDs(boltDB, "DST", level, ids)
+		if err != nil {
+			return nil, fmt.Errorf("batch get DST children by parent: %w", err)
+		}
+		for k, v := range m {
+			parentToChildren[k] = v
+		}
 	}
 	var allChildIDs []string
 	for _, childIDs := range parentToChildren {

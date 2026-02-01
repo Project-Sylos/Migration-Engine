@@ -443,16 +443,20 @@ func countNodesByScan(boltDB *db.DB, queueType string) (int, error) {
 		return 0, fmt.Errorf("failed to get database instance: %w", err)
 	}
 	err = boltDBInstance.View(func(tx *bolt.Tx) error {
-		bucket := db.GetNodesBucket(tx, queueType)
-		if bucket == nil {
-			return nil // Bucket doesn't exist, count is 0
+		levels, _ := db.GetAllLevelsFromTx(tx, queueType)
+		if levels == nil {
+			return nil
 		}
-
-		cursor := bucket.Cursor()
-		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
-			count++
+		for _, level := range levels {
+			bucket := db.GetNodesBucket(tx, queueType, level)
+			if bucket == nil {
+				continue
+			}
+			cursor := bucket.Cursor()
+			for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+				count++
+			}
 		}
-
 		return nil
 	})
 	return count, err

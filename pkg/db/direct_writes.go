@@ -12,8 +12,8 @@ import (
 // UpdateNodeStatusInTxByID updates a node's status within an existing transaction using ULID.
 // This is the preferred method - use ULID directly instead of path lookup.
 func UpdateNodeStatusInTxByID(tx *bolt.Tx, queueType string, level int, oldStatus, newStatus string, nodeID []byte) error {
-	// Get the node data from nodes bucket
-	nodesBucket := GetNodesBucket(tx, queueType)
+	// Get the node data from nodes bucket (level-sharded)
+	nodesBucket := GetNodesBucket(tx, queueType, level)
 	if nodesBucket == nil {
 		return fmt.Errorf("nodes bucket not found for %s", queueType)
 	}
@@ -73,12 +73,14 @@ func UpdateNodeStatusInTxByID(tx *bolt.Tx, queueType string, level int, oldStatu
 // Stats updates are handled separately by batch processing in output buffer flush.
 // SrcID is already populated in NodeState during matching, so no join-lookup needed.
 func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation) error {
-	var nodesBucket *bolt.Bucket
-	var currentQueueType string
-
 	for _, op := range operations {
 		if op.State == nil || op.State.ID == "" {
 			return fmt.Errorf("node state must have ID (ULID)")
+		}
+
+		// Ensure level shard exists (created on demand)
+		if err := EnsureLevelBucket(tx, op.QueueType, op.Level); err != nil {
+			return fmt.Errorf("ensure level %d for %s: %w", op.Level, op.QueueType, err)
 		}
 
 		// Ensure NodeState has the status field populated
@@ -94,13 +96,10 @@ func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation) error {
 			parentID = []byte(op.State.ParentID)
 		}
 
-		// Get or cache nodes bucket
-		if currentQueueType != op.QueueType {
-			nodesBucket = GetNodesBucket(tx, op.QueueType)
-			if nodesBucket == nil {
-				return fmt.Errorf("nodes bucket not found for %s", op.QueueType)
-			}
-			currentQueueType = op.QueueType
+		// Get nodes bucket for this level (level-sharded)
+		nodesBucket := GetNodesBucket(tx, op.QueueType, op.Level)
+		if nodesBucket == nil {
+			return fmt.Errorf("nodes bucket not found for %s level %d", op.QueueType, op.Level)
 		}
 
 		// 1. Insert into nodes bucket
@@ -160,11 +159,12 @@ func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation) error {
 			}
 		}
 
-		// 4. Update children index
-		if op.State.ParentID != "" {
-			childrenBucket := GetChildrenBucket(tx, op.QueueType)
+		// 4. Update children index (parent is at level op.Level-1)
+		if op.State.ParentID != "" && op.Level > 0 {
+			parentLevel := op.Level - 1
+			childrenBucket := GetChildrenBucket(tx, op.QueueType, parentLevel)
 			if childrenBucket == nil {
-				return fmt.Errorf("children bucket not found for %s", op.QueueType)
+				return fmt.Errorf("children bucket not found for %s level %d", op.QueueType, parentLevel)
 			}
 
 			// Get existing children list

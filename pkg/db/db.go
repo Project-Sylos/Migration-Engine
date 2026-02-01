@@ -120,60 +120,32 @@ func (db *DB) initializeBuckets() error {
 			return fmt.Errorf("failed to create Traversal-Data bucket: %w", err)
 		}
 
-		// Create SRC and DST buckets under Traversal-Data
+		// Create SRC and DST buckets under Traversal-Data.
+		// Only levels bucket at top level; nodes, children, join-lookup live under levels/<level>/ (created on demand).
 		for _, queueType := range []string{"SRC", "DST"} {
 			queueBucket, err := traversalBucket.CreateBucketIfNotExists([]byte(queueType))
 			if err != nil {
 				return fmt.Errorf("failed to create %s bucket: %w", queueType, err)
 			}
 
-			// Create nodes bucket
-			if _, err := queueBucket.CreateBucketIfNotExists([]byte("nodes")); err != nil {
-				return fmt.Errorf("failed to create Traversal-Data/%s/nodes bucket: %w", queueType, err)
-			}
-
-			// Create children bucket
-			if _, err := queueBucket.CreateBucketIfNotExists([]byte("children")); err != nil {
-				return fmt.Errorf("failed to create Traversal-Data/%s/children bucket: %w", queueType, err)
-			}
-
-			// Create levels bucket (individual level buckets created on demand)
+			// Create levels bucket (individual level shards created on demand via EnsureLevelBucket)
 			if _, err := queueBucket.CreateBucketIfNotExists([]byte("levels")); err != nil {
 				return fmt.Errorf("failed to create Traversal-Data/%s/levels bucket: %w", queueType, err)
 			}
 
+			// Create level 0 shard at init so root can be seeded and found (nodes, children, traversal, join under levels/00000000)
+			if err := EnsureLevelBucket(tx, queueType, 0); err != nil {
+				return fmt.Errorf("failed to create level 0 shard for %s: %w", queueType, err)
+			}
+
 			// Create exclusion-holding bucket (regular bucket, not nested)
-			// This stores path hash -> depth level mappings for exclusion intent queuing
 			if _, err := queueBucket.CreateBucketIfNotExists([]byte("exclusion-holding")); err != nil {
 				return fmt.Errorf("failed to create Traversal-Data/%s/exclusion-holding bucket: %w", queueType, err)
 			}
 
 			// Create unexclusion-holding bucket (regular bucket, not nested)
-			// This stores path hash -> depth level mappings for unexclusion intent queuing
 			if _, err := queueBucket.CreateBucketIfNotExists([]byte("unexclusion-holding")); err != nil {
 				return fmt.Errorf("failed to create Traversal-Data/%s/unexclusion-holding bucket: %w", queueType, err)
-			}
-
-			// Create path-to-ulid lookup bucket
-			// This stores path hash -> ULID mappings for API path-based queries
-			if _, err := queueBucket.CreateBucketIfNotExists([]byte("path-to-ulid")); err != nil {
-				return fmt.Errorf("failed to create Traversal-Data/%s/path-to-ulid bucket: %w", queueType, err)
-			}
-		}
-
-		// Create src-to-dst lookup bucket under SRC
-		srcBucket := traversalBucket.Bucket([]byte("SRC"))
-		if srcBucket != nil {
-			if _, err := srcBucket.CreateBucketIfNotExists([]byte("src-to-dst")); err != nil {
-				return fmt.Errorf("failed to create Traversal-Data/SRC/src-to-dst bucket: %w", err)
-			}
-		}
-
-		// Create dst-to-src lookup bucket under DST
-		dstBucket := traversalBucket.Bucket([]byte("DST"))
-		if dstBucket != nil {
-			if _, err := dstBucket.CreateBucketIfNotExists([]byte("dst-to-src")); err != nil {
-				return fmt.Errorf("failed to create Traversal-Data/DST/dst-to-src bucket: %w", err)
 			}
 		}
 
@@ -440,22 +412,23 @@ func (db *DB) ValidateCoreSchema() error {
 	})
 }
 
-// getRootNode returns the first node (key and value) in the "nodes" bucket for the given source ("src" or "dst").
-// Returns (key, value, error). If there are no nodes, key and value will be nil.
+// GetRootNode returns the first node (key and value) in the level-0 nodes bucket for the given source ("src" or "dst").
+// Root is always at level 0. Returns (key, value, error). If there are no nodes, key and value will be nil.
 func (db *DB) GetRootNode(queueType string) ([]byte, []byte, error) {
 	var key, value []byte
 
 	err := db.View(func(tx *bolt.Tx) error {
-		var b *bolt.Bucket
-
-		switch queueType {
-		case "SRC", "src":
-			b = getBucket(tx, []string{"Traversal-Data", "SRC", "nodes"})
-		case "DST", "dst":
-			b = getBucket(tx, []string{"Traversal-Data", "DST", "nodes"})
-		default:
+		qt := queueType
+		switch qt {
+		case "src":
+			qt = "SRC"
+		case "dst":
+			qt = "DST"
+		}
+		if qt != "SRC" && qt != "DST" {
 			return fmt.Errorf("invalid queue type: %s", queueType)
 		}
+		b := getBucket(tx, GetNodesBucketPath(qt, 0))
 
 		if b == nil {
 			return fmt.Errorf("nodes bucket not found for queue type: %s", queueType)

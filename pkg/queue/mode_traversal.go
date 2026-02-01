@@ -271,17 +271,12 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 			State:     childState,
 		})
 
-		// Queue path-to-ulid mapping for this child (for API path-based queries)
 		outputBuffer := q.getOutputBuffer()
-		if outputBuffer != nil && childState.Path != "" {
-			outputBuffer.AddPathToULIDMapping(queueType, childState.Path, childState.ID)
-		}
-
 		// For DST queue: queue lookup mapping if this child has a matching SRC node
 		if queueType == "DST" && child.SrcID != "" {
 			if outputBuffer != nil {
-				// Queue bidirectional lookup mapping: SrcID <-> DST node ID
-				outputBuffer.AddLookupMapping(child.SrcID, childState.ID)
+				// Queue bidirectional lookup mapping: SrcID <-> DST node ID (at nextRound level)
+				outputBuffer.AddLookupMapping(nextRound, child.SrcID, childState.ID)
 			}
 
 			// Update SRC node's CopyStatus if worker determined an update is needed (use meta from pull, no DB lookup)
@@ -364,16 +359,11 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 				State:     taskState,
 			})
 
-			// Queue path-to-ulid mapping for DST child folder
 			outputBuffer := q.getOutputBuffer()
-			if outputBuffer != nil && taskState.Path != "" {
-				outputBuffer.AddPathToULIDMapping(queueType, taskState.Path, taskState.ID)
-			}
-
 			// Queue lookup mapping if this child has a matching SRC node
 			if child.srcID != "" {
 				if outputBuffer != nil {
-					outputBuffer.AddLookupMapping(child.srcID, taskState.ID)
+					outputBuffer.AddLookupMapping(nextRound, child.srcID, taskState.ID)
 				}
 
 				// Update SRC node's CopyStatus if worker determined an update is needed (use meta from pull, no DB lookup)
@@ -425,8 +415,11 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 				}
 			} else {
 				// Fallback when RetryDstCleanup was not populated (e.g. legacy path)
-				dstID, err := db.GetDstIDFromSrcID(boltDB, nodeID)
-				if err == nil && dstID != "" {
+				// Join lookup is per level; get SRC node level then lookup
+				srcState, _ := db.GetNodeState(boltDB, "SRC", nodeID)
+				if srcState != nil {
+					dstID, err := db.GetDstIDFromSrcID(boltDB, srcState.Depth, nodeID)
+					if err == nil && dstID != "" {
 					dstState, err := db.GetNodeState(boltDB, "DST", dstID)
 					if err == nil && dstState != nil {
 						oldStatus := dstState.TraversalStatus
@@ -434,7 +427,7 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 							oldStatus = db.StatusSuccessful
 						}
 						outputBuffer.AddStatusUpdate("DST", dstState.Depth, oldStatus, db.StatusPending, dstID)
-						childIDs, err := db.GetChildrenIDsByParentID(boltDB, "DST", dstID)
+						childIDs, err := db.GetChildrenIDsByParentID(boltDB, "DST", dstState.Depth, dstID)
 						if err == nil && len(childIDs) > 0 {
 							for _, childID := range childIDs {
 								childState, err := db.GetNodeState(boltDB, "DST", childID)
@@ -448,6 +441,7 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 							}
 						}
 					}
+				}
 				}
 			}
 		}

@@ -377,7 +377,7 @@ func migrateNodesWriterFromDuck(buffer *nodeBuffer, boltDB *db.DB, queueType str
 
 // flushNodeBatchToBolt flushes a batch of node rows to BoltDB
 // Chunks the batch to avoid long-running transactions
-// Writes all buckets in one transaction per chunk: nodes, children, join-lookup, path-to-ulid, status buckets, copy status buckets
+// Writes all buckets in one transaction per chunk: nodes, children, join-lookup, status buckets, copy status buckets
 func flushNodeBatchToBolt(boltDB *db.DB, batch []NodeRow, queueType string, stats *ETLStats) error {
 	if len(batch) == 0 {
 		return nil
@@ -393,39 +393,42 @@ func flushNodeBatchToBolt(boltDB *db.DB, batch []NodeRow, queueType string, stat
 		chunk := batch[i:end]
 
 		if err := boltDB.Update(func(tx *bolt.Tx) error {
-			// Get buckets (should already exist after DB initialization)
-			nodesBucket := db.GetNodesBucket(tx, queueType)
-			if nodesBucket == nil {
-				return fmt.Errorf("nodes bucket not found for %s", queueType)
-			}
-
-			childrenBucket := db.GetChildrenBucket(tx, queueType)
-			if childrenBucket == nil {
-				return fmt.Errorf("children bucket not found for %s", queueType)
-			}
-
-			// Get join-lookup buckets
-			var srcToDstBucket, dstToSrcBucket *bolt.Bucket
-			var err error
-			if queueType == "SRC" {
-				srcToDstBucket, err = db.GetOrCreateSrcToDstBucket(tx)
-				if err != nil {
-					return fmt.Errorf("failed to get src-to-dst bucket: %w", err)
-				}
-			} else {
-				dstToSrcBucket, err = db.GetOrCreateDstToSrcBucket(tx)
-				if err != nil {
-					return fmt.Errorf("failed to get dst-to-src bucket: %w", err)
-				}
-			}
-
-			// Get path-to-ulid bucket
-			pathBucket, err := db.EnsurePathToULIDBucket(tx, queueType)
-			if err != nil {
-				return fmt.Errorf("failed to get path-to-ulid bucket: %w", err)
-			}
-
+			// Group rows by level (row.Depth) — plan: write into levels/<level>/ nodes, children, join
+			depthToRows := make(map[int][]NodeRow)
 			for _, row := range chunk {
+				depthToRows[row.Depth] = append(depthToRows[row.Depth], row)
+			}
+
+			for level, rowsAtLevel := range depthToRows {
+				if err := db.EnsureLevelBucket(tx, queueType, level); err != nil {
+					return fmt.Errorf("ensure level %d: %w", level, err)
+				}
+
+				nodesBucket := db.GetNodesBucket(tx, queueType, level)
+				if nodesBucket == nil {
+					return fmt.Errorf("nodes bucket not found for %s level %d", queueType, level)
+				}
+
+				childrenBucket := db.GetChildrenBucket(tx, queueType, level)
+				if childrenBucket == nil {
+					return fmt.Errorf("children bucket not found for %s level %d", queueType, level)
+				}
+
+				var srcToDstBucket, dstToSrcBucket *bolt.Bucket
+				var err error
+				if queueType == "SRC" {
+					srcToDstBucket, err = db.GetOrCreateSrcToDstBucket(tx, level)
+					if err != nil {
+						return fmt.Errorf("failed to get src-to-dst bucket: %w", err)
+					}
+				} else {
+					dstToSrcBucket, err = db.GetOrCreateDstToSrcBucket(tx, level)
+					if err != nil {
+						return fmt.Errorf("failed to get dst-to-src bucket: %w", err)
+					}
+				}
+
+				for _, row := range rowsAtLevel {
 				// Parse traversal status to get exclusion flags and normalized status
 				normalizedStatus, explicitExcluded, inheritedExcluded := parseTraversalStatus(row.TraversalStatus)
 
@@ -502,15 +505,7 @@ func flushNodeBatchToBolt(boltDB *db.DB, batch []NodeRow, queueType string, stat
 					}
 				}
 
-				// 6. Write path-to-ulid mapping (compute hash from path; path_hash no longer stored in Duck)
-				if row.Path != "" {
-					pathHash := db.HashPath(row.Path)
-					if err := pathBucket.Put([]byte(pathHash), nodeID); err != nil {
-						return fmt.Errorf("failed to write path-to-ulid mapping: %w", err)
-					}
-				}
-
-				// 7. Write copy status buckets (SRC only)
+				// 6. Write copy status buckets (SRC only)
 				if queueType == "SRC" && row.CopyStatus != "" {
 					// Determine node type from row.Type
 					nodeType := db.NodeTypeFile
@@ -541,6 +536,7 @@ func flushNodeBatchToBolt(boltDB *db.DB, batch []NodeRow, queueType string, stat
 					if err := db.UpdateCopyStatusLookup(tx, row.Depth, nodeID, row.CopyStatus); err != nil {
 						return fmt.Errorf("failed to update copy status-lookup: %w", err)
 					}
+				}
 				}
 			}
 

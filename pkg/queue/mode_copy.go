@@ -311,7 +311,7 @@ func (q *Queue) PullCopyTasks(force bool) {
 			return nil
 		}
 
-		nodesBucket := db.GetNodesBucket(tx, "SRC")
+		nodesBucket := db.GetNodesBucket(tx, "SRC", currentRound)
 		if nodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found for SRC")
 		}
@@ -405,8 +405,12 @@ func (q *Queue) PullCopyTasks(force bool) {
 			continue // Skip this item - cannot resolve parent
 		}
 
-		// Use join-lookup to find parent's DST ULID
-		dstParentULID, err := db.GetDstIDFromSrcID(boltDB, item.State.ParentID)
+		// Use join-lookup to find parent's DST ULID (parent is at level currentRound-1)
+		parentLevel := currentRound - 1
+		if parentLevel < 0 {
+			parentLevel = 0
+		}
+		dstParentULID, err := db.GetDstIDFromSrcID(boltDB, parentLevel, item.State.ParentID)
 		if err != nil {
 			// Critical error - missing parent lookup will cause task failure
 			if logservice.LS != nil {
@@ -585,9 +589,9 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 		outputBuffer.AddCreateNode("DST", currentRound, db.StatusSuccessful, dstNode)
 	}
 
-	// Map SRC ID → DST ID in join-lookup
+	// Map SRC ID → DST ID in join-lookup (same level as DST node creation)
 	if outputBuffer != nil {
-		outputBuffer.AddLookupMapping(nodeID, dstNodeID)
+		outputBuffer.AddLookupMapping(currentRound, nodeID, dstNodeID)
 	}
 
 	// Track metrics based on task type
