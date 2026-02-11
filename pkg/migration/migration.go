@@ -213,7 +213,7 @@ func StartMigration(cfg Config) *MigrationController {
 		cfgCopy := cfg
 		cfgCopy.ShutdownContext = shutdownCtx
 		cfgCopy.DatabaseInstance = database
-		result, err := letsMigrateWithContext(cfgCopy)
+		result, err := LetsMigrate(cfgCopy)
 		controller.result = &result
 		controller.err = err
 	}()
@@ -225,34 +225,18 @@ func StartMigration(cfg Config) *MigrationController {
 // This is the synchronous version - it blocks until the migration completes or is shutdown.
 // For programmatic shutdown control, use StartMigration instead.
 func LetsMigrate(cfg Config) (Result, error) {
-	// Create shutdown context if not provided
-	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
-	defer shutdownCancel()
+	if cfg.ShutdownContext == nil {
+		shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+		defer shutdownCancel()
+		go HandleShutdownSignals(shutdownCancel)
+		cfg.ShutdownContext = shutdownCtx
+	}
+	shutdownCtx := cfg.ShutdownContext
 
-	// Start signal handler in background goroutine
-	go HandleShutdownSignals(shutdownCancel)
-
-	cfg.ShutdownContext = shutdownCtx
-	return letsMigrateWithContext(cfg)
-}
-
-// letsMigrateWithContext is the internal implementation that accepts a shutdown context.
-func letsMigrateWithContext(cfg Config) (Result, error) {
 	var (
 		database *db.DB
 		err      error
 	)
-
-	// Use provided shutdown context, or create one if not provided
-	shutdownCtx := cfg.ShutdownContext
-	var shutdownCancel context.CancelFunc
-	if shutdownCtx == nil {
-		shutdownCtx, shutdownCancel = context.WithCancel(context.Background())
-		defer shutdownCancel()
-
-		// Start signal handler in background goroutine
-		go HandleShutdownSignals(shutdownCancel)
-	}
 
 	// Open DB if not provided
 	weOpenedDB := false

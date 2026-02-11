@@ -24,17 +24,6 @@ type DatabaseConfig struct {
 	RequireOpen bool
 }
 
-// removeDatabase removes the DuckDB file if present.
-func removeDatabase(path string) error {
-	if path == "" {
-		return nil
-	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to remove database file %s: %w", path, err)
-	}
-	return nil
-}
-
 // SetupDatabase opens a DuckDB database at cfg.Path. Returns the DB and whether it was fresh (true if new or removed).
 // The caller is responsible for closing the database when done.
 func SetupDatabase(cfg DatabaseConfig) (*db.DB, bool, error) {
@@ -44,8 +33,8 @@ func SetupDatabase(cfg DatabaseConfig) (*db.DB, bool, error) {
 
 	wasFresh := false
 	if cfg.RemoveExisting {
-		if err := removeDatabase(cfg.Path); err != nil {
-			return nil, false, err
+		if err := os.Remove(cfg.Path); err != nil && !os.IsNotExist(err) {
+			return nil, false, fmt.Errorf("failed to remove database file %s: %w", cfg.Path, err)
 		}
 		wasFresh = true
 	} else {

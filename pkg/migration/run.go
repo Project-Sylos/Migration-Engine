@@ -46,31 +46,6 @@ type RuntimeStats struct {
 	Dst      queue.QueueStats
 }
 
-// getQueueStats builds QueueStats from coordinator and DB stats (pending at current round).
-func getQueueStats(coordinator *queue.QueueCoordinator, database *db.DB) (queue.QueueStats, queue.QueueStats) {
-	srcRound := coordinator.GetSrcRound()
-	dstRound := coordinator.GetDstRound()
-
-	srcPending := 0
-	dstPending := 0
-	if database != nil {
-		c, _ := database.GetStatsCountAtDepth("SRC", srcRound, db.StatsKeyTraversalStatus(db.StatusPending))
-		srcPending = int(c)
-		c, _ = database.GetStatsCountAtDepth("DST", dstRound, db.StatsKeyTraversalStatus(db.StatusPending))
-		dstPending = int(c)
-	}
-
-	return queue.QueueStats{
-			Name:    "src",
-			Round:   srcRound,
-			Pending: srcPending,
-		}, queue.QueueStats{
-			Name:    "dst",
-			Round:   dstRound,
-			Pending: dstPending,
-		}
-}
-
 // RunMigration executes the migration traversal using the provided configuration.
 func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	weOpenedDB := false
@@ -281,7 +256,16 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				case <-cleanupCtx.Done():
 					// Timeout - skip cleanup and exit immediately
 					fmt.Printf("⚠️  Cleanup timeout - exiting immediately to prevent hang\n")
-					srcStats, dstStats := getQueueStats(coordinator, database)
+					srcRound := coordinator.GetSrcRound()
+					dstRound := coordinator.GetDstRound()
+					srcPending, dstPending := 0, 0
+					if database != nil {
+						c, _ := database.GetStatsCountAtDepth("SRC", srcRound, db.StatsKeyTraversalStatus(db.StatusPending))
+						srcPending = int(c)
+						c, _ = database.GetStatsCountAtDepth("DST", dstRound, db.StatsKeyTraversalStatus(db.StatusPending))
+						dstPending = int(c)
+					}
+					srcStats, dstStats := queue.QueueStats{Name: "src", Round: srcRound, Pending: srcPending}, queue.QueueStats{Name: "dst", Round: dstRound, Pending: dstPending}
 					return RuntimeStats{
 						Duration: time.Since(start),
 						Src:      srcStats,
@@ -290,7 +274,16 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				}
 
 				// Get stats directly (non-blocking)
-				srcStats, dstStats := getQueueStats(coordinator, database)
+				srcRound := coordinator.GetSrcRound()
+				dstRound := coordinator.GetDstRound()
+				srcPending, dstPending := 0, 0
+				if database != nil {
+					c, _ := database.GetStatsCountAtDepth("SRC", srcRound, db.StatsKeyTraversalStatus(db.StatusPending))
+					srcPending = int(c)
+					c, _ = database.GetStatsCountAtDepth("DST", dstRound, db.StatsKeyTraversalStatus(db.StatusPending))
+					dstPending = int(c)
+				}
+				srcStats, dstStats := queue.QueueStats{Name: "src", Round: srcRound, Pending: srcPending}, queue.QueueStats{Name: "dst", Round: dstRound, Pending: dstPending}
 
 				// DuckDB doesn't need checkpointing - data is already persisted
 
@@ -333,7 +326,16 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		if bothCompleted {
 
 			// Get stats directly (non-blocking)
-			srcStats, dstStats := getQueueStats(coordinator, database)
+			srcRound := coordinator.GetSrcRound()
+			dstRound := coordinator.GetDstRound()
+			srcPending, dstPending := 0, 0
+			if database != nil {
+				c, _ := database.GetStatsCountAtDepth("SRC", srcRound, db.StatsKeyTraversalStatus(db.StatusPending))
+				srcPending = int(c)
+				c, _ = database.GetStatsCountAtDepth("DST", dstRound, db.StatsKeyTraversalStatus(db.StatusPending))
+				dstPending = int(c)
+			}
+			srcStats, dstStats := queue.QueueStats{Name: "src", Round: srcRound, Pending: srcPending}, queue.QueueStats{Name: "dst", Round: dstRound, Pending: dstPending}
 
 			fmt.Println("\nMigration complete!")
 
@@ -413,7 +415,16 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			if coordinator.IsCompleted("both") {
 
 				// Get stats directly (non-blocking)
-				srcStats, dstStats := getQueueStats(coordinator, database)
+				srcRound := coordinator.GetSrcRound()
+				dstRound := coordinator.GetDstRound()
+				srcPending, dstPending := 0, 0
+				if database != nil {
+					c, _ := database.GetStatsCountAtDepth("SRC", srcRound, db.StatsKeyTraversalStatus(db.StatusPending))
+					srcPending = int(c)
+					c, _ = database.GetStatsCountAtDepth("DST", dstRound, db.StatsKeyTraversalStatus(db.StatusPending))
+					dstPending = int(c)
+				}
+				srcStats, dstStats := queue.QueueStats{Name: "src", Round: srcRound, Pending: srcPending}, queue.QueueStats{Name: "dst", Round: dstRound, Pending: dstPending}
 				fmt.Println("\nMigration complete!")
 
 				// Update config YAML with final state (fire-and-forget to avoid blocking)
@@ -476,8 +487,10 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				}, nil
 			}
 
-			// Get stats directly (non-blocking queries)
-			srcStats, dstStats := getQueueStats(coordinator, database)
+			// Get stats directly (non-blocking queries) - only Round is used for milestone detection
+			srcRound := coordinator.GetSrcRound()
+			dstRound := coordinator.GetDstRound()
+			srcStats, dstStats := queue.QueueStats{Round: srcRound}, queue.QueueStats{Round: dstRound}
 
 			// Stats are printed via the channel listener goroutine, not here
 			// This section only updates config YAML
