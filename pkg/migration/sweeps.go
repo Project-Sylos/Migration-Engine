@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	"codeberg.org/Sylos/Migration-Engine/pkg/db/etl"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
@@ -86,63 +85,22 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	// Create coordinator for round advancement gates (retry uses traversal-like coordination)
 	coordinator := queue.NewQueueCoordinator()
 
-	// Get max known depth from config or detect from levels bucket
+	// Get max known depth from config or detect from stats table
 	maxKnownDepth := cfg.MaxKnownDepth
 	if maxKnownDepth < 0 {
-		// Auto-detect from levels bucket
-		maxKnownDepth = boltDB.GetMaxKnownDepth(db.BucketSrc)
+		d, err := boltDB.GetMaxDepth("SRC")
+		if err == nil {
+			maxKnownDepth = d
+		}
 		if maxKnownDepth < 0 {
 			maxKnownDepth = 0 // Default to 0 if no levels found
 		}
 	}
 
-	// Run ETL from DuckDB to BoltDB if not skipped
-	if !cfg.SkipAutoETLBeforeRetry {
-		// Derive DuckDB path from BoltDB path if not provided
-		duckDBPath := cfg.DuckDBPath
-		if duckDBPath == "" {
-			boltPath := boltDB.Path()
-			if boltPath == "" {
-				return RuntimeStats{}, fmt.Errorf("cannot derive DuckDB path: BoltDB path is not available")
-			}
-			duckDBPath = deriveDuckDBPath(boltPath)
-			if duckDBPath == "" {
-				return RuntimeStats{}, fmt.Errorf("failed to derive DuckDB path from BoltDB path: %s", boltPath)
-			}
-		}
-
-		// Update status to ETL in progress
-		if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-			SetStatusETLDuckToBoltInProgress(cfg.YAMLConfig)
-			_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
-		}
-
-		// Run ETL with status callbacks
-		etlCfg := etl.DuckToBoltConfig{
-			BoltDB:      boltDB,
-			DuckDBPath:  duckDBPath,
-			Overwrite:   true,
-			RequireOpen: true,
-			OnETLStart: func() error {
-				// Status already set above, but ensure it's saved
-				if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-					return SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
-				}
-				return nil
-			},
-			OnETLComplete: func() error {
-				// Update status to Filters-Set (ready for retry) when ETL completes
-				if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-					SetStatusFiltersSet(cfg.YAMLConfig, true, maxKnownDepth)
-					return SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
-				}
-				return nil
-			},
-		}
-
-		if err := etl.RunDuckToBolt(etlCfg); err != nil {
-			return RuntimeStats{}, fmt.Errorf("failed to run ETL before retry sweep: %w", err)
-		}
+	// DuckDB-only: no ETL before retry; set status to Filters-Set (ready for retry) when YAML is provided.
+	if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
+		SetStatusFiltersSet(cfg.YAMLConfig, true, maxKnownDepth)
+		_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
 	}
 
 	// Create queues in retry mode
@@ -196,8 +154,8 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 			case srcStats := <-srcStatsChan:
 				lastSrcStats = &srcStats
 				if lastDstStats != nil {
-					srcRoundStats := srcQueue.RoundStats(lastSrcStats.Round)
-					dstRoundStats := dstQueue.RoundStats(lastDstStats.Round)
+					srcRoundStats := srcQueue.GetRoundStats(lastSrcStats.Round)
+					dstRoundStats := dstQueue.GetRoundStats(lastDstStats.Round)
 
 					srcExpected := 0
 					srcCompleted := 0
@@ -220,8 +178,8 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 			case dstStats := <-dstStatsChan:
 				lastDstStats = &dstStats
 				if lastSrcStats != nil {
-					srcRoundStats := srcQueue.RoundStats(lastSrcStats.Round)
-					dstRoundStats := dstQueue.RoundStats(lastDstStats.Round)
+					srcRoundStats := srcQueue.GetRoundStats(lastSrcStats.Round)
+					dstRoundStats := dstQueue.GetRoundStats(lastDstStats.Round)
 
 					srcExpected := 0
 					srcCompleted := 0

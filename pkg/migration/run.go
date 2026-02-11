@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	"codeberg.org/Sylos/Migration-Engine/pkg/db/etl"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
@@ -18,26 +17,26 @@ import (
 
 // MigrationConfig is the configuration passed to RunMigration.
 type MigrationConfig struct {
-	BoltDB                    *db.DB
-	BoltPath                  string
-	SrcAdapter                types.FSAdapter
-	DstAdapter                types.FSAdapter
-	SrcRoot                   types.Folder
-	DstRoot                   types.Folder
-	SrcServiceName            string
-	WorkerCount               int
-	MaxRetries                int
-	CoordinatorLead           int
-	LogAddress                string
-	LogLevel                  string
-	SkipListener              bool
-	StartupDelay              time.Duration
-	ProgressTick              time.Duration
-	ResumeStatus              *MigrationStatus
-	ConfigPath                string
-	YAMLConfig                *MigrationConfigYAML
-	ShutdownContext           context.Context
-	SkipAutoETLAfterTraversal bool // If true, skip automatic ETL from BoltDB to DuckDB after traversal completes
+	DB              *db.DB   // DuckDB instance (optional if DBPath is set)
+	DBPath          string   // Path to open DuckDB when DB is nil
+	SrcAdapter      types.FSAdapter
+	DstAdapter      types.FSAdapter
+	SrcRoot         types.Folder
+	DstRoot         types.Folder
+	SrcServiceName  string
+	WorkerCount     int
+	MaxRetries      int
+	CoordinatorLead int
+	LogAddress      string
+	LogLevel        string
+	SkipListener    bool
+	StartupDelay    time.Duration
+	ProgressTick    time.Duration
+	ResumeStatus    *MigrationStatus
+	ConfigPath      string
+	YAMLConfig      *MigrationConfigYAML
+	ShutdownContext context.Context
+	CloseWhenDone   bool // if true and we opened the DB, close it when RunMigration returns
 }
 
 // RuntimeStats captures execution statistics at the end of a migration run.
@@ -47,19 +46,18 @@ type RuntimeStats struct {
 	Dst      queue.QueueStats
 }
 
-// getQueueStats builds QueueStats from coordinator and queue queries (non-blocking)
-func getQueueStats(coordinator *queue.QueueCoordinator, boltDB *db.DB) (queue.QueueStats, queue.QueueStats) {
+// getQueueStats builds QueueStats from coordinator and DB stats (pending at current round).
+func getQueueStats(coordinator *queue.QueueCoordinator, database *db.DB) (queue.QueueStats, queue.QueueStats) {
 	srcRound := coordinator.GetSrcRound()
 	dstRound := coordinator.GetDstRound()
 
-	// Get pending counts from DB for current round (non-blocking, uses View transaction)
 	srcPending := 0
 	dstPending := 0
-	if boltDB != nil {
-		srcPendingCount, _ := boltDB.CountByPrefix("SRC", srcRound, db.StatusPending)
-		srcPending = srcPendingCount
-		dstPendingCount, _ := boltDB.CountByPrefix("DST", dstRound, db.StatusPending)
-		dstPending = dstPendingCount
+	if database != nil {
+		c, _ := database.GetStatsCountAtDepth("SRC", srcRound, db.StatsKeyTraversalStatus(db.StatusPending))
+		srcPending = int(c)
+		c, _ = database.GetStatsCountAtDepth("DST", dstRound, db.StatsKeyTraversalStatus(db.StatusPending))
+		dstPending = int(c)
 	}
 
 	return queue.QueueStats{
@@ -75,28 +73,22 @@ func getQueueStats(coordinator *queue.QueueCoordinator, boltDB *db.DB) (queue.Qu
 
 // RunMigration executes the migration traversal using the provided configuration.
 func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
-	// Use EnsureOpen to validate/ensure the DB is open
-	// For RunMigration, we default to RequireOpen=true (API mode) since MigrationConfig
-	// is typically used with pre-opened DBs. If BoltPath is provided and BoltDB is nil,
-	// we can auto-open in standalone mode.
-	requireOpen := cfg.BoltDB != nil // If BoltDB is provided, require it to be open
-	if cfg.BoltDB == nil && cfg.BoltPath == "" {
-		return RuntimeStats{}, fmt.Errorf("either BoltDB or BoltPath must be provided")
+	weOpenedDB := false
+	database := cfg.DB
+	if database == nil {
+		if cfg.DBPath == "" {
+			return RuntimeStats{}, fmt.Errorf("either DB or DBPath must be provided")
+		}
+		var err error
+		database, err = db.Open(db.Options{Path: cfg.DBPath})
+		if err != nil {
+			return RuntimeStats{}, fmt.Errorf("failed to open database: %w", err)
+		}
+		weOpenedDB = true
 	}
-
-	dbManager, err := db.EnsureOpen(cfg.BoltDB, cfg.BoltPath, requireOpen)
-	if err != nil {
-		return RuntimeStats{}, fmt.Errorf("failed to ensure database is open: %w", err)
-	}
-
-	boltDB := dbManager.GetDB()
-
-	// In standalone mode (we opened it), defer closing
-	if !requireOpen {
+	if weOpenedDB && cfg.CloseWhenDone {
 		defer func() {
-			if closeErr := db.CloseIfOwned(dbManager); closeErr != nil {
-				// Log but don't fail - DB close errors are non-fatal
-			}
+			_ = database.Close()
 		}()
 	}
 
@@ -125,7 +117,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		}
 		// Always initialize logger (sends to UDP and writes to DB)
 		// SkipListener only affects whether we start the listener terminal window
-		if err := logservice.InitGlobalLogger(boltDB, cfg.LogAddress, cfg.LogLevel); err != nil {
+		if err := logservice.InitGlobalLogger(database, cfg.LogAddress, cfg.LogLevel); err != nil {
 			return RuntimeStats{}, fmt.Errorf("failed to initialize logger: %w", err)
 		}
 	}
@@ -138,7 +130,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		coordinator.SetYAMLUpdateCallback(func(srcRound, dstRound int) {
 			// Thread-safe YAML update in background goroutine
 			go func() {
-				status, err := InspectMigrationStatus(boltDB)
+				status, err := InspectMigrationStatus(database)
 				if err == nil {
 					UpdateConfigFromStatus(cfg.YAMLConfig, status, srcRound, dstRound)
 					_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
@@ -149,12 +141,12 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 	// Create queues
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
-	srcQueue.InitializeWithContext(boltDB, cfg.SrcAdapter, cfg.ShutdownContext)
+	srcQueue.InitializeWithContext(database, cfg.SrcAdapter, cfg.ShutdownContext)
 	// Note: Queues clean themselves up when they complete (Run() exits when state=QueueStateCompleted)
 	// We only need to explicitly close for forced shutdowns, which is handled via Pause() + shutdown context
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
-	dstQueue.InitializeWithContext(boltDB, cfg.DstAdapter, cfg.ShutdownContext)
+	dstQueue.InitializeWithContext(database, cfg.DstAdapter, cfg.ShutdownContext)
 	// Note: Queues clean themselves up when they complete (Run() exits when state=QueueStateCompleted)
 	// We only need to explicitly close for forced shutdowns, which is handled via Pause() + shutdown context
 
@@ -166,8 +158,8 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	// Give queues a moment to start their Run() goroutines
 	time.Sleep(100 * time.Millisecond)
 
-	// Create observer for BoltDB stats publishing (200ms update interval)
-	observer := queue.NewQueueObserver(boltDB, 200*time.Millisecond)
+	// Create observer for database stats publishing (200ms update interval)
+	observer := queue.NewQueueObserver(database, 200*time.Millisecond)
 	observer.Start()      // Start observer loop immediately
 	defer observer.Stop() // Ensure observer is stopped on exit
 
@@ -193,8 +185,8 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				lastSrcStats = &srcStats
 				if lastDstStats != nil {
 					// Get round stats for full format
-					srcRoundStats := srcQueue.RoundStats(lastSrcStats.Round)
-					dstRoundStats := dstQueue.RoundStats(lastDstStats.Round)
+					srcRoundStats := srcQueue.GetRoundStats(lastSrcStats.Round)
+					dstRoundStats := dstQueue.GetRoundStats(lastDstStats.Round)
 
 					srcExpected := 0
 					srcCompleted := 0
@@ -218,8 +210,8 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				lastDstStats = &dstStats
 				if lastSrcStats != nil {
 					// Get round stats for full format
-					srcRoundStats := srcQueue.RoundStats(lastSrcStats.Round)
-					dstRoundStats := dstQueue.RoundStats(lastDstStats.Round)
+					srcRoundStats := srcQueue.GetRoundStats(lastSrcStats.Round)
+					dstRoundStats := dstQueue.GetRoundStats(lastDstStats.Round)
 
 					srcExpected := 0
 					srcCompleted := 0
@@ -245,7 +237,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 	// Update config: Traversal started
 	if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-		status, statusErr := InspectMigrationStatus(boltDB)
+		status, statusErr := InspectMigrationStatus(database)
 		if statusErr == nil {
 			UpdateConfigFromStatus(cfg.YAMLConfig, status, coordinator.GetSrcRound(), coordinator.GetDstRound())
 			SetStatusTraversalInProgress(cfg.YAMLConfig)
@@ -289,7 +281,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				case <-cleanupCtx.Done():
 					// Timeout - skip cleanup and exit immediately
 					fmt.Printf("⚠️  Cleanup timeout - exiting immediately to prevent hang\n")
-					srcStats, dstStats := getQueueStats(coordinator, boltDB)
+					srcStats, dstStats := getQueueStats(coordinator, database)
 					return RuntimeStats{
 						Duration: time.Since(start),
 						Src:      srcStats,
@@ -298,15 +290,15 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				}
 
 				// Get stats directly (non-blocking)
-				srcStats, dstStats := getQueueStats(coordinator, boltDB)
+				srcStats, dstStats := getQueueStats(coordinator, database)
 
-				// BoltDB doesn't need checkpointing - data is already persisted
+				// DuckDB doesn't need checkpointing - data is already persisted
 
 				// Update YAML config with suspended status and current state (with timeout)
 				if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
 					yamlDone := make(chan error, 1)
 					go func() {
-						status, statusErr := InspectMigrationStatus(boltDB)
+						status, statusErr := InspectMigrationStatus(database)
 						if statusErr == nil {
 							SetSuspendedStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
 							yamlDone <- SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
@@ -341,7 +333,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		if bothCompleted {
 
 			// Get stats directly (non-blocking)
-			srcStats, dstStats := getQueueStats(coordinator, boltDB)
+			srcStats, dstStats := getQueueStats(coordinator, database)
 
 			fmt.Println("\nMigration complete!")
 
@@ -355,7 +347,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 					done := make(chan error, 1)
 					go func() {
-						status, statusErr := InspectMigrationStatus(boltDB)
+						status, statusErr := InspectMigrationStatus(database)
 						if statusErr != nil {
 							fmt.Printf("ERROR: Failed to inspect migration status for YAML update: %v\n", statusErr)
 							if logservice.LS != nil {
@@ -383,21 +375,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 						}
 					}
 				}()
-			}
-
-			// Run ETL from BoltDB to DuckDB if not skipped
-			if !cfg.SkipAutoETLAfterTraversal {
-				// Derive DuckDB path from BoltDB path
-				duckDBPath := deriveDuckDBPath(cfg.BoltPath)
-				if duckDBPath != "" {
-					if err := runETLBoltToDuckWithStatus(boltDB, duckDBPath, cfg.YAMLConfig, cfg.ConfigPath); err != nil {
-						// Log error but don't fail the migration - ETL is optional
-						fmt.Printf("Warning: Failed to run ETL after traversal: %v\n", err)
-						if logservice.LS != nil {
-							_ = logservice.LS.Log("warning", fmt.Sprintf("ETL after traversal failed: %v", err), "migration", "run", "run")
-						}
-					}
-				}
 			}
 
 			// Stop progress ticker to prevent any more ticks
@@ -436,7 +413,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			if coordinator.IsCompleted("both") {
 
 				// Get stats directly (non-blocking)
-				srcStats, dstStats := getQueueStats(coordinator, boltDB)
+				srcStats, dstStats := getQueueStats(coordinator, database)
 				fmt.Println("\nMigration complete!")
 
 				// Update config YAML with final state (fire-and-forget to avoid blocking)
@@ -448,7 +425,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 						done := make(chan error, 1)
 						go func() {
-							status, statusErr := InspectMigrationStatus(boltDB)
+							status, statusErr := InspectMigrationStatus(database)
 							if statusErr != nil {
 								fmt.Printf("ERROR: Failed to inspect migration status for YAML update (ticker path): %v\n", statusErr)
 								done <- statusErr
@@ -467,36 +444,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 							fmt.Printf("ERROR: Config save timeout (5s) - YAML status may not be updated from Traversal-In-Progress (ticker path)\n")
 						}
 					}()
-				}
-
-				// Run ETL from BoltDB to DuckDB if not skipped
-				if !cfg.SkipAutoETLAfterTraversal {
-					// Derive DuckDB path from BoltDB path
-					duckDBPath := deriveDuckDBPath(cfg.BoltPath)
-					if duckDBPath != "" {
-						if err := runETLBoltToDuckWithStatus(boltDB, duckDBPath, cfg.YAMLConfig, cfg.ConfigPath); err != nil {
-							// Log error but don't fail the migration - ETL is optional
-							fmt.Printf("Warning: Failed to run ETL after traversal: %v\n", err)
-							if logservice.LS != nil {
-								_ = logservice.LS.Log("warning", fmt.Sprintf("ETL after traversal failed: %v", err), "migration", "run", "run")
-							}
-						}
-					}
-				}
-
-				// Run ETL from BoltDB to DuckDB if not skipped
-				if !cfg.SkipAutoETLAfterTraversal {
-					// Derive DuckDB path from BoltDB path
-					duckDBPath := deriveDuckDBPath(cfg.BoltPath)
-					if duckDBPath != "" {
-						if err := runETLBoltToDuckWithStatus(boltDB, duckDBPath, cfg.YAMLConfig, cfg.ConfigPath); err != nil {
-							// Log error but don't fail the migration - ETL is optional
-							fmt.Printf("Warning: Failed to run ETL after traversal: %v\n", err)
-							if logservice.LS != nil {
-								_ = logservice.LS.Log("warning", fmt.Sprintf("ETL after traversal failed: %v", err), "migration", "run", "run")
-							}
-						}
-					}
 				}
 
 				// Stop progress ticker to prevent any more ticks
@@ -530,7 +477,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			}
 
 			// Get stats directly (non-blocking queries)
-			srcStats, dstStats := getQueueStats(coordinator, boltDB)
+			srcStats, dstStats := getQueueStats(coordinator, database)
 
 			// Stats are printed via the channel listener goroutine, not here
 			// This section only updates config YAML
@@ -548,7 +495,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			shouldUpdate := roundAdvanced || (tickCount%10 == 0)
 
 			if cfg.YAMLConfig != nil && cfg.ConfigPath != "" && shouldUpdate {
-				status, statusErr := InspectMigrationStatus(boltDB)
+				status, statusErr := InspectMigrationStatus(database)
 				if statusErr == nil {
 					UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
 					// Save config (ignore errors to avoid disrupting migration)
@@ -578,7 +525,7 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 		dstRound = *cfg.YAMLConfig.State.LastRoundDst
 	}
 
-	// BoltDB is now the primary database - no SQLite seeding needed
+	// DuckDB is the primary database - no SQLite seeding needed
 
 	// Set queue rounds
 	srcQueue.SetRound(srcRound)
@@ -612,50 +559,3 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 	return nil
 }
 
-// deriveDuckDBPath derives the DuckDB path from the BoltDB path.
-// Returns empty string if BoltDB path is not available.
-func deriveDuckDBPath(boltPath string) string {
-	if boltPath != "" {
-		// Replace .db extension with -duck.db
-		if len(boltPath) > 3 && boltPath[len(boltPath)-3:] == ".db" {
-			return boltPath[:len(boltPath)-3] + "-duck.db"
-		}
-		return boltPath + "-duck.db"
-	}
-	// If no path available, can't derive DuckDB path
-	return ""
-}
-
-// runETLBoltToDuckWithStatus runs ETL from BoltDB to DuckDB with automatic status updates.
-func runETLBoltToDuckWithStatus(boltDB *db.DB, duckDBPath string, yamlCfg *MigrationConfigYAML, configPath string) error {
-	// Update status to ETL in progress
-	if yamlCfg != nil && configPath != "" {
-		SetStatusETLBoltToDuckInProgress(yamlCfg)
-		_ = SaveMigrationConfig(configPath, yamlCfg)
-	}
-
-	// Run ETL with status callbacks
-	cfg := etl.BoltToDuckConfig{
-		BoltDB:      boltDB,
-		DuckDBPath:  duckDBPath,
-		Overwrite:   true,
-		RequireOpen: true,
-		OnETLStart: func() error {
-			// Status already set above, but ensure it's saved
-			if yamlCfg != nil && configPath != "" {
-				return SaveMigrationConfig(configPath, yamlCfg)
-			}
-			return nil
-		},
-		OnETLComplete: func() error {
-			// Update status to Awaiting-Path-Review when ETL completes
-			if yamlCfg != nil && configPath != "" {
-				SetStatusAwaitingPathReview(yamlCfg)
-				return SaveMigrationConfig(configPath, yamlCfg)
-			}
-			return nil
-		},
-	}
-
-	return etl.RunBoltToDuck(cfg)
-}

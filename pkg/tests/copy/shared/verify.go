@@ -24,11 +24,11 @@ func PrintCopyVerification(stats queue.QueueStats) {
 // VerifyCopyCompletion verifies that all copy status buckets are in expected state.
 // Uses stats bucket for O(1) lookups instead of O(N) scans.
 // Checks that no pending copy tasks remain and reports successful/failed counts.
-func VerifyCopyCompletion(boltDB *db.DB) error {
+func VerifyCopyCompletion(database *db.DB) error {
 	fmt.Println("Verifying copy completion...")
 
 	// Get all levels
-	levels, err := boltDB.GetAllLevels("SRC")
+	levels, err := db.GetAllLevels(database, "SRC")
 	if err != nil {
 		return fmt.Errorf("failed to get levels: %w", err)
 	}
@@ -39,9 +39,7 @@ func VerifyCopyCompletion(boltDB *db.DB) error {
 	totalSkipped := int64(0)
 	totalInProgress := int64(0)
 
-	// Count buckets directly (like inspect tool) to ensure accuracy
-	// CountCopyStatusBucket tries stats first, then falls back to actual counting
-	// This ensures we get accurate counts even if stats are stale
+	// Count via GetCopyCountAtDepth (live src_nodes by depth/type/status) for accuracy
 	for _, level := range levels {
 		// Skip round 0 (root is not copied)
 		if level == 0 {
@@ -54,19 +52,19 @@ func VerifyCopyCompletion(boltDB *db.DB) error {
 
 		for _, nodeType := range nodeTypes {
 			for _, status := range copyStatuses {
-				count, err := boltDB.CountCopyStatusBucket(level, nodeType, status)
+				c, err := database.GetCopyCountAtDepth(level, nodeType, status)
 				if err == nil {
 					switch status {
 					case db.CopyStatusPending:
-						totalPending += int64(count)
+						totalPending += c
 					case db.CopyStatusSuccessful:
-						totalSuccessful += int64(count)
+						totalSuccessful += c
 					case db.CopyStatusFailed:
-						totalFailed += int64(count)
+						totalFailed += c
 					case db.CopyStatusSkipped:
-						totalSkipped += int64(count)
+						totalSkipped += c
 					case db.CopyStatusInProgress:
-						totalInProgress += int64(count)
+						totalInProgress += c
 					}
 				}
 			}

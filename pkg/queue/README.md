@@ -227,7 +227,7 @@ for _, item := range batch {
     task := nodeStateToTask(item.State, taskType)
     
     // Enqueue for workers
-    q.enqueuePending(task)
+    q.Add(task)
 }
 ```
 

@@ -33,19 +33,21 @@ type Service struct {
 }
 
 // Config aggregates all of the knobs required to run the migration engine once.
-// The DB must be provided via DatabaseInstance - the ME does not open or close it.
 type Config struct {
-	// DatabaseInstance is the BoltDB instance to use. REQUIRED - ME does not open the DB.
-	// The API/caller is responsible for opening and closing the database.
+	// DatabaseInstance is the DuckDB instance to use. If nil and Database.Path is set, the engine opens the DB.
+	// When CloseWhenDone is false (API), the caller keeps the connection after the engine returns.
 	DatabaseInstance *db.DB
+
+	// CloseWhenDone: when true (standalone/CLI), the engine closes the DB when the process finishes (only if it opened the DB).
+	// When false (API), the engine never closes the DB so the API keeps the connection.
+	CloseWhenDone bool
 
 	// Runtime determines lifecycle management mode.
 	// ModeAPISupervised (default): ME never closes DB - API owns lifecycle.
 	// ModeStandalone: ME may close DB on completion (for standalone/test mode only).
 	Runtime RuntimeMode
 
-	// Database config is kept for backward compatibility and for determining paths,
-	// but the ME does not use it to open the DB - that's the API's responsibility.
+	// Database config (path, etc.). If DatabaseInstance is nil, the engine opens db.Open at Database.Path.
 	Database DatabaseConfig
 
 	Source      Service
@@ -72,10 +74,6 @@ type Config struct {
 	// If not provided, LetsMigrate will create one internally.
 	// Set this when using StartMigration for programmatic shutdown control.
 	ShutdownContext context.Context
-
-	// SkipAutoETLAfterTraversal if true, skips automatic ETL from BoltDB to DuckDB after traversal completes.
-	// Useful for tests or when ETL is not needed (e.g., ephemeral mode tests).
-	SkipAutoETLAfterTraversal bool
 }
 
 // Result captures the outcome of a migration run.
@@ -88,15 +86,15 @@ type Result struct {
 
 // MigrationController provides programmatic control over a running migration.
 // It allows you to trigger force shutdown and check migration status.
-// Note: The controller may own the DB lifecycle in standalone mode (RequireOpen=false).
 type MigrationController struct {
 	shutdownCancel context.CancelFunc
 	shutdownCtx    context.Context
-	done           chan struct{}
-	result         *Result
-	err            error
-	boltDB         *db.DB        // Thread-safe - BoltDB operations handle their own locking
-	dbManager      *db.DBManager // Tracks DB ownership (nil if API owns it)
+	done          chan struct{}
+	result        *Result
+	err           error
+	database      *db.DB // DuckDB instance; same connection is used by API when CloseWhenDone is false
+	weOpenedDB    bool   // true if we opened the DB (instance was nil); used to decide whether to close
+	closeWhenDone bool   // if true and weOpenedDB, close DB on exit
 }
 
 // Shutdown triggers a force shutdown of the migration.
@@ -122,13 +120,11 @@ func (mc *MigrationController) Wait() (Result, error) {
 	return Result{}, mc.err
 }
 
-// GetDB returns the BoltDB instance used by this migration.
-// This allows the API to query the database for real-time statistics.
-// Returns nil if the database hasn't been initialized yet.
-// The database instance is thread-safe - BoltDB operations handle their own locking.
-// The API owns the DB lifecycle - do not close it through the controller.
+// GetDB returns the DuckDB instance used by this migration.
+// The API can keep using this connection after the engine returns when CloseWhenDone is false.
+// Returns nil if the database has not been initialized yet.
 func (mc *MigrationController) GetDB() *db.DB {
-	return mc.boltDB
+	return mc.database
 }
 
 // SetRootFolders assigns the source and destination root folders that will seed the migration queues.
@@ -180,43 +176,43 @@ func StartMigration(cfg Config) *MigrationController {
 		shutdownCancel: shutdownCancel,
 		shutdownCtx:    shutdownCtx,
 		done:           done,
+		closeWhenDone:  cfg.CloseWhenDone,
 	}
 
-	// Ensure DB is open using manager
-	dbManager, err := db.EnsureOpen(cfg.DatabaseInstance, cfg.Database.Path, cfg.Database.RequireOpen)
-	if err != nil {
-		controller.err = fmt.Errorf("failed to ensure database is open: %w", err)
-		close(done)
-		return controller
+	// Open DB if not provided
+	database := cfg.DatabaseInstance
+	if database == nil {
+		if cfg.Database.Path == "" {
+			controller.err = fmt.Errorf("database path cannot be empty when DatabaseInstance is nil")
+			close(done)
+			return controller
+		}
+		var err error
+		database, err = db.Open(db.Options{Path: cfg.Database.Path})
+		if err != nil {
+			controller.err = fmt.Errorf("failed to open database: %w", err)
+			close(done)
+			return controller
+		}
+		controller.weOpenedDB = true
 	}
-
-	// Store DB in controller
-	controller.boltDB = dbManager.GetDB()
-
-	// In standalone mode, we own the DB lifecycle and should close it on completion
-	if !cfg.Database.RequireOpen {
-		// Track manager for cleanup
-		controller.dbManager = dbManager
-	}
+	controller.database = database
 
 	// Run migration in goroutine
 	go func() {
 		defer close(done)
-		// In standalone mode, close DB if we opened it
-		if controller.dbManager != nil {
+		if controller.weOpenedDB && controller.closeWhenDone {
 			defer func() {
-				if closeErr := db.CloseIfOwned(controller.dbManager); closeErr != nil {
-					// Log but don't fail - DB close errors are non-fatal
+				if closeErr := controller.database.Close(); closeErr != nil {
 					if controller.err == nil {
 						controller.err = fmt.Errorf("failed to close database: %w", closeErr)
 					}
 				}
 			}()
 		}
-		// Pass the shutdown context to LetsMigrate
 		cfgCopy := cfg
 		cfgCopy.ShutdownContext = shutdownCtx
-		// Ensure DB is set (already validated above)
+		cfgCopy.DatabaseInstance = database
 		result, err := letsMigrateWithContext(cfgCopy)
 		controller.result = &result
 		controller.err = err
@@ -243,8 +239,8 @@ func LetsMigrate(cfg Config) (Result, error) {
 // letsMigrateWithContext is the internal implementation that accepts a shutdown context.
 func letsMigrateWithContext(cfg Config) (Result, error) {
 	var (
-		boltDB *db.DB
-		err    error
+		database *db.DB
+		err      error
 	)
 
 	// Use provided shutdown context, or create one if not provided
@@ -258,18 +254,24 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 		go HandleShutdownSignals(shutdownCancel)
 	}
 
-	// Ensure DB is open using manager
-	dbManager, err := db.EnsureOpen(cfg.DatabaseInstance, cfg.Database.Path, cfg.Database.RequireOpen)
-	if err != nil {
-		return Result{}, fmt.Errorf("failed to ensure database is open: %w", err)
+	// Open DB if not provided
+	weOpenedDB := false
+	if cfg.DatabaseInstance == nil {
+		if cfg.Database.Path == "" {
+			return Result{}, fmt.Errorf("database path cannot be empty when DatabaseInstance is nil")
+		}
+		var openErr error
+		database, openErr = db.Open(db.Options{Path: cfg.Database.Path})
+		if openErr != nil {
+			return Result{}, fmt.Errorf("failed to open database: %w", openErr)
+		}
+		weOpenedDB = true
+	} else {
+		database = cfg.DatabaseInstance
 	}
-	boltDB = dbManager.GetDB()
-
-	// In standalone mode, defer closing DB if we opened it
-	if !cfg.Database.RequireOpen {
+	if weOpenedDB && cfg.CloseWhenDone {
 		defer func() {
-			if closeErr := db.CloseIfOwned(dbManager); closeErr != nil {
-				// Log but don't fail - DB close errors are non-fatal
+			if closeErr := database.Close(); closeErr != nil {
 				if err == nil {
 					err = fmt.Errorf("failed to close database: %w", closeErr)
 				}
@@ -296,8 +298,6 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 		configPath = ConfigPathFromDatabasePath(cfg.Database.Path)
 	}
 
-	// ----------------- DETERMINE "wasFresh" LOGIC BASED ON YAML -----------------
-
 	var (
 		yamlCfg     *MigrationConfigYAML
 		status      MigrationStatus
@@ -312,7 +312,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	if yamlLoadErr != nil {
 		// YAML does not exist -> this is a fresh start
 		wasFresh = true
-		status, inspectErr = InspectMigrationStatus(boltDB)
+		status, inspectErr = InspectMigrationStatus(database)
 		if inspectErr != nil {
 			status = MigrationStatus{}
 		}
@@ -327,7 +327,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 			wasFresh = false
 		}
 		// Grab migration status from DB as well (for non-fresh runs)
-		status, inspectErr = InspectMigrationStatus(boltDB)
+		status, inspectErr = InspectMigrationStatus(database)
 		if inspectErr != nil {
 			status = MigrationStatus{}
 		}
@@ -377,19 +377,19 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	var runtime RuntimeStats
 	var runErr error
 
-	boltPath := cfg.Database.Path
-	if boltPath == "" {
-		boltPath = "migration.db"
+	dbPath := cfg.Database.Path
+	if dbPath == "" {
+		dbPath = "migration.db"
 	}
-	if abs, err := filepath.Abs(boltPath); err == nil {
-		boltPath = abs
+	if abs, err := filepath.Abs(dbPath); err == nil {
+		dbPath = abs
 	}
 
 	// Helper function to run fresh migration
 	runFreshMigration := func() (RuntimeStats, error) {
 		if cfg.SeedRoots {
-			// Seed root tasks to BoltDB
-			summary, err := SeedRootTasks(srcRoot, dstRoot, boltDB)
+			// Seed root tasks to database
+			summary, err := SeedRootTasks(srcRoot, dstRoot, database)
 			if err != nil {
 				fmt.Printf("Warning: failed to seed root tasks: %v\n", err)
 				return RuntimeStats{}, err
@@ -405,25 +405,25 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 			}
 		}
 		return RunMigration(MigrationConfig{
-			BoltDB:                    boltDB,
-			BoltPath:                  boltPath,
-			SrcAdapter:                cfg.Source.Adapter,
-			DstAdapter:                cfg.Destination.Adapter,
-			SrcRoot:                   srcRoot,
-			DstRoot:                   dstRoot,
-			SrcServiceName:            cfg.Source.Name,
-			WorkerCount:               cfg.WorkerCount,
-			MaxRetries:                cfg.MaxRetries,
-			CoordinatorLead:           cfg.CoordinatorLead,
-			LogAddress:                cfg.LogAddress,
-			LogLevel:                  cfg.LogLevel,
-			SkipListener:              cfg.SkipListener,
-			StartupDelay:              cfg.StartupDelay,
-			ProgressTick:              cfg.ProgressTick,
-			ConfigPath:                configPath,
-			YAMLConfig:                yamlCfg,
-			ShutdownContext:           shutdownCtx,
-			SkipAutoETLAfterTraversal: cfg.SkipAutoETLAfterTraversal,
+			DB:              database,
+			DBPath:          dbPath,
+			SrcAdapter:      cfg.Source.Adapter,
+			DstAdapter:      cfg.Destination.Adapter,
+			SrcRoot:         srcRoot,
+			DstRoot:         dstRoot,
+			SrcServiceName:  cfg.Source.Name,
+			WorkerCount:     cfg.WorkerCount,
+			MaxRetries:      cfg.MaxRetries,
+			CoordinatorLead: cfg.CoordinatorLead,
+			LogAddress:      cfg.LogAddress,
+			LogLevel:        cfg.LogLevel,
+			SkipListener:    cfg.SkipListener,
+			StartupDelay:    cfg.StartupDelay,
+			ProgressTick:    cfg.ProgressTick,
+			ConfigPath:      configPath,
+			YAMLConfig:      yamlCfg,
+			ShutdownContext: shutdownCtx,
+			CloseWhenDone:   cfg.CloseWhenDone,
 		})
 	}
 
@@ -460,26 +460,26 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 				fmt.Println("Resuming migration from existing database state...")
 			}
 			runtime, runErr = RunMigration(MigrationConfig{
-				BoltDB:                    boltDB,
-				BoltPath:                  boltPath,
-				SrcAdapter:                cfg.Source.Adapter,
-				DstAdapter:                cfg.Destination.Adapter,
-				SrcRoot:                   srcRoot,
-				DstRoot:                   dstRoot,
-				SrcServiceName:            cfg.Source.Name,
-				WorkerCount:               cfg.WorkerCount,
-				MaxRetries:                cfg.MaxRetries,
-				CoordinatorLead:           cfg.CoordinatorLead,
-				LogAddress:                cfg.LogAddress,
-				LogLevel:                  cfg.LogLevel,
-				SkipListener:              cfg.SkipListener,
-				StartupDelay:              cfg.StartupDelay,
-				ProgressTick:              cfg.ProgressTick,
-				ResumeStatus:              &status,
-				ConfigPath:                configPath,
-				YAMLConfig:                yamlCfg,
-				ShutdownContext:           shutdownCtx,
-				SkipAutoETLAfterTraversal: cfg.SkipAutoETLAfterTraversal,
+				DB:              database,
+				DBPath:          dbPath,
+				SrcAdapter:      cfg.Source.Adapter,
+				DstAdapter:      cfg.Destination.Adapter,
+				SrcRoot:         srcRoot,
+				DstRoot:         dstRoot,
+				SrcServiceName:  cfg.Source.Name,
+				WorkerCount:     cfg.WorkerCount,
+				MaxRetries:      cfg.MaxRetries,
+				CoordinatorLead: cfg.CoordinatorLead,
+				LogAddress:      cfg.LogAddress,
+				LogLevel:        cfg.LogLevel,
+				SkipListener:    cfg.SkipListener,
+				StartupDelay:    cfg.StartupDelay,
+				ProgressTick:    cfg.ProgressTick,
+				ResumeStatus:    &status,
+				ConfigPath:      configPath,
+				YAMLConfig:      yamlCfg,
+				ShutdownContext: shutdownCtx,
+				CloseWhenDone:   cfg.CloseWhenDone,
 			})
 		}
 	} else {
@@ -528,7 +528,7 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 		err    error
 	}, 1)
 	go func() {
-		report, err := VerifyMigration(boltDB, cfg.Verification)
+		report, err := VerifyMigration(database, cfg.Verification)
 		verifyDone <- struct {
 			report VerificationReport
 			err    error
@@ -558,12 +558,6 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 	// 2. The API also tries to close it
 	// 3. Verification or other code needs to log after migration completes
 
-	// ME does NOT close the database - API owns the lifecycle.
-	// Only close in standalone mode (debug/test guard) - API mode never closes.
-	if cfg.Runtime == ModeStandalone {
-		defer boltDB.Close()
-	}
-
 	// Return migration error if it occurred (verification ran for diagnostics)
 	if runErr != nil {
 		return result, runErr
@@ -577,10 +571,10 @@ func letsMigrateWithContext(cfg Config) (Result, error) {
 		// Build detailed error message showing what failed
 		report := result.Verification
 		errMsg := "migration failed: verification checks failed\n"
-		errMsg += fmt.Sprintf("  SRC: Total=%d Pending=%d Successful=%d Failed=%d Completed=%d\n",
-			report.SrcTotal, report.SrcPending, report.SrcSuccessful, report.SrcFailed, report.SrcCompleted)
-		errMsg += fmt.Sprintf("  DST: Total=%d Pending=%d Successful=%d Failed=%d NotOnSrc=%d Completed=%d\n",
-			report.DstTotal, report.DstPending, report.DstSuccessful, report.DstFailed, report.DstNotOnSrc, report.DstCompleted)
+		errMsg += fmt.Sprintf("  SRC: Total=%d Pending=%d Successful=%d Failed=%d\n",
+			report.SrcTotal, report.SrcPending, report.SrcSuccessful, report.SrcFailed)
+		errMsg += fmt.Sprintf("  DST: Total=%d Pending=%d Successful=%d Failed=%d NotOnSrc=%d\n",
+			report.DstTotal, report.DstPending, report.DstSuccessful, report.DstFailed, report.DstNotOnSrc)
 
 		// Show which checks failed
 		if !cfg.Verification.AllowPending && (report.SrcPending > 0 || report.DstPending > 0) {

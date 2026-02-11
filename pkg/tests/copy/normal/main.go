@@ -28,18 +28,18 @@ func runTest() error {
 	fmt.Println("📋 Phase 1: Setup")
 	fmt.Println("================")
 	// Setup adapters and open pre-provisioned DB (RemoveExisting: false)
-	boltDB, srcAdapter, dstAdapter, err := shared.SetupCopyTest(false, false)
+	database, srcAdapter, dstAdapter, err := shared.SetupCopyTest(false, false)
 	if err != nil {
 		return fmt.Errorf("setup failed: %w", err)
 	}
-	defer boltDB.Close()
+	defer database.Close()
 	fmt.Println()
 
 	fmt.Println("🚀 Phase 2: Copy Phase")
 	fmt.Println("======================")
 	// Run copy phase
 	stats, err := migration.RunCopyPhase(migration.CopyPhaseConfig{
-		BoltDB:          boltDB,
+		BoltDB:          database,
 		SrcAdapter:      srcAdapter,
 		DstAdapter:      dstAdapter,
 		WorkerCount:     10,
@@ -59,7 +59,7 @@ func runTest() error {
 	fmt.Println("✓ Phase 3: Verification")
 	fmt.Println("========================")
 	shared.PrintCopyVerification(stats)
-	if err := shared.VerifyCopyCompletion(boltDB); err != nil {
+	if err := shared.VerifyCopyCompletion(database); err != nil {
 		return fmt.Errorf("verification failed: %w", err)
 	}
 

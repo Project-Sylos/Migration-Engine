@@ -12,7 +12,6 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
-	bolt "go.etcd.io/bbolt"
 )
 
 // CopyPhaseConfig configures the copy phase execution.
@@ -33,7 +32,6 @@ type CopyPhaseConfig struct {
 }
 
 // RunCopyPhase executes the copy phase (two-pass: folders then files).
-// This should be called after traversal, review, and ETL back to BoltDB.
 func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	boltDB := cfg.BoltDB
 	if boltDB == nil {
@@ -71,7 +69,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	// Start at round 1 since round 0 (root) is skipped
 	// Use -1 as sentinel to indicate we haven't found any pending level yet
 	minLevel := -1
-	levels, err := boltDB.GetAllLevels("SRC")
+	levels, err := db.GetAllLevels(boltDB, "SRC")
 	if err == nil && len(levels) > 0 {
 		// Find minimum level with pending copy tasks (start with folders since pass 1 is folders)
 		for _, level := range levels {
@@ -79,8 +77,8 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 				continue // Skip round 0
 			}
 			// Check folder tasks (pass 1 starts with folders)
-			hasPending, err := boltDB.HasCopyStatusBucketItems(level, db.NodeTypeFolder, db.CopyStatusPending)
-			if err == nil && hasPending {
+			c, err := boltDB.GetCopyCountAtDepth(level, db.NodeTypeFolder, db.CopyStatusPending)
+			if err == nil && c > 0 {
 				// First pending level found OR current level is smaller than what we've found
 				if minLevel == -1 || level < minLevel {
 					minLevel = level
@@ -96,82 +94,28 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	copyQueue.SetRound(minLevel) // Set initial round
 	copyQueue.EnsureRoundExpectedFromStats()
 
-	// CRITICAL: Ensure root folder (level 0) has join-lookup mapping
-	// Items at level 1 will look up their parent (root) in the join-lookup table
-	// We need to ensure this mapping exists before starting the copy phase
-	// Use a single transaction to check and create the mapping to avoid deadlock
-	err = boltDB.Update(func(tx *bolt.Tx) error {
-		// Root is at level 0 (plan: level-sharded; root in levels/00000000/nodes)
-		srcNodesBucket := db.GetNodesBucket(tx, "SRC", 0)
-		if srcNodesBucket == nil {
-			return fmt.Errorf("SRC nodes bucket not found for level 0")
-		}
-
-		var srcRootID, dstRootID string
-		cursor := srcNodesBucket.Cursor()
-		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
-			if v == nil {
-				continue
-			}
-			srcNode, err := db.DeserializeNodeState(v)
-			if err == nil && srcNode != nil && srcNode.Depth == 0 {
-				srcRootID = srcNode.ID
-				break
-			}
-		}
-
-		if srcRootID == "" {
-			return fmt.Errorf("could not find SRC root node")
-		}
-
-		dstNodesBucket := db.GetNodesBucket(tx, "DST", 0)
-		if dstNodesBucket == nil {
-			return fmt.Errorf("DST nodes bucket not found for level 0")
-		}
-
-		cursor = dstNodesBucket.Cursor()
-		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
-			if v == nil {
-				continue
-			}
-			dstNode, err := db.DeserializeNodeState(v)
-			if err == nil && dstNode != nil && dstNode.Depth == 0 {
-				dstRootID = dstNode.ID
-				break
-			}
-		}
-
-		if dstRootID == "" {
-			return fmt.Errorf("could not find DST root node")
-		}
-
-		// Check if mapping already exists (root at level 0; SRC→DST)
-		joinBucket := db.GetSrcToDstBucket(tx, 0)
-		if joinBucket != nil {
-			existing := joinBucket.Get([]byte(srcRootID))
-			if existing != nil {
-				return nil // Mapping already exists
-			}
-		}
-
-		// Create mapping (root at level 0; SRC→DST)
-		joinBucket, err := db.GetOrCreateSrcToDstBucket(tx, 0)
-		if err != nil {
-			return fmt.Errorf("failed to get join-lookup bucket: %w", err)
-		}
-
-		if err := joinBucket.Put([]byte(srcRootID), []byte(dstRootID)); err != nil {
-			return fmt.Errorf("failed to store mapping: %w", err)
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		// Log error but don't fail - join-lookup may already exist from traversal
+	// CRITICAL: Ensure root folder (level 0) has join-lookup mapping (DuckDB: join_id on DST node).
+	srcID, _, srcOk := db.GetRootNode(boltDB, "SRC")
+	srcRootID := ""
+	if srcOk {
+		srcRootID = srcID
+	}
+	if srcRootID == "" {
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("warn", fmt.Sprintf("Failed to ensure root join-lookup mapping: %v", err), "migration", "copy", "copy")
+			_ = logservice.LS.Log("warn", fmt.Sprintf("Failed to ensure root join-lookup mapping: %v", fmt.Errorf("could not find SRC root node")), "migration", "copy", "copy")
 		}
+	} else {
+		dstID, _, dstOk := db.GetRootNode(boltDB, "DST")
+		dstRootID := ""
+		if dstOk {
+			dstRootID = dstID
+		}
+		if dstRootID == "" {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("warn", fmt.Sprintf("Failed to ensure root join-lookup mapping: %v", fmt.Errorf("could not find DST root node")), "migration", "copy", "copy")
+			}
+		}
+		// Join is by path; roots with path "/" are matched by path, no separate mapping needed.
 	}
 
 	// Update config: Copy phase started
@@ -223,7 +167,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 						passName = "files"
 					}
 					// Get round stats for expected/completed counts (similar to traversal)
-					roundStats := copyQueue.RoundStats(lastStats.Round)
+					roundStats := copyQueue.GetRoundStats(lastStats.Round)
 					expected := 0
 					completed := 0
 					if roundStats != nil {
@@ -335,7 +279,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 
 		// Update config periodically (every 10 iterations) or on round advancement
 		// Track round advancement for YAML updates
-		currentRound := copyQueue.Round()
+		currentRound := copyQueue.GetRound()
 		roundAdvanced := false
 		if currentRound != lastRound {
 			roundAdvanced = true

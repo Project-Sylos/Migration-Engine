@@ -10,22 +10,21 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
-	bolt "go.etcd.io/bbolt"
 )
 
 // CheckCopyCompletion checks if the copy phase should switch passes or complete.
 // Returns true if the queue should mark as complete, false otherwise.
 // This is called when advanceToNextRound can't find a next round for the current pass.
 func (q *Queue) CheckCopyCompletion(currentRound int, wasFirstPull bool) bool {
-	boltDB := q.getBoltDB()
-	if boltDB == nil {
+	database := q.getDatabase()
+	if database == nil {
 		return false
 	}
 
 	// Copy: must progress through all rounds up to maxKnownDepth in each pass
 	// Only switch from pass 1 to pass 2 after reaching maxKnownDepth
 	// This is similar to retry mode's pattern
-	copyPass := q.getCopyPass()
+	copyPass := q.GetCopyPass()
 	maxKnownDepth := q.getMaxKnownDepth()
 
 	// If we haven't reached maxKnownDepth yet, don't switch passes
@@ -36,7 +35,7 @@ func (q *Queue) CheckCopyCompletion(currentRound int, wasFirstPull bool) bool {
 
 	// We've reached or passed maxKnownDepth for current pass
 	// Now check if there are any pending or in-progress tasks for the current pass at any level
-	levels, err := boltDB.GetAllLevels("SRC")
+	levels, err := db.GetAllLevels(database, "SRC")
 	if err != nil {
 		return false
 	}
@@ -54,11 +53,12 @@ func (q *Queue) CheckCopyCompletion(currentRound int, wasFirstPull bool) bool {
 		if level == 0 {
 			continue // Skip round 0
 		}
-		hasPending, err := boltDB.HasCopyStatusBucketItems(level, nodeType, db.CopyStatusPending)
-		if err == nil && hasPending {
+		c, err := database.GetCopyCountAtDepth(level, nodeType, db.CopyStatusPending)
+		if err == nil && c > 0 {
 			hasAnyPendingForPass = true
 		}
-		hasInProgress, err := boltDB.HasCopyStatusBucketItems(level, nodeType, db.CopyStatusInProgress)
+		c2, err := database.GetCopyCountAtDepth(level, nodeType, db.CopyStatusInProgress)
+		hasInProgress := err == nil && c2 > 0
 		if err == nil && hasInProgress {
 			hasAnyInProgressForPass = true
 			inProgressLevels = append(inProgressLevels, level)
@@ -79,10 +79,10 @@ func (q *Queue) CheckCopyCompletion(currentRound int, wasFirstPull bool) bool {
 	// no in-progress in memory, and this was first pull, switch passes or complete
 	// CRITICAL: Must check both BoltDB AND memory state to avoid premature completion
 	// Tasks retrying are in-progress in BoltDB but pending in memory
-	if !hasAnyPendingForPass && !hasAnyInProgressForPass && q.getPendingCount() == 0 && q.getInProgressCount() == 0 && wasFirstPull {
+	if !hasAnyPendingForPass && !hasAnyInProgressForPass && q.GetPendingCount() == 0 && q.InProgressCount() == 0 && wasFirstPull {
 		if copyPass == 1 {
 			// Pass 1 (folders) complete - switch to pass 2 (files)
-			q.setCopyPass(2)
+			q.SetCopyPass(2)
 
 			// Find minimum level with pending file tasks for pass 2
 			minLevel := -1
@@ -90,8 +90,8 @@ func (q *Queue) CheckCopyCompletion(currentRound int, wasFirstPull bool) bool {
 				if level == 0 {
 					continue // Skip round 0
 				}
-				hasPending, err := boltDB.HasCopyStatusBucketItems(level, db.NodeTypeFile, db.CopyStatusPending)
-				if err == nil && hasPending {
+				c, err := database.GetCopyCountAtDepth(level, db.NodeTypeFile, db.CopyStatusPending)
+				if err == nil && c > 0 {
 					if minLevel == -1 || level < minLevel {
 						minLevel = level
 					}
@@ -104,7 +104,7 @@ func (q *Queue) CheckCopyCompletion(currentRound int, wasFirstPull bool) bool {
 				return q.markComplete("Copy phase complete - both passes finished (no files to copy)")
 			}
 
-			q.setRound(minLevel) // Set to minimum pending level for pass 2
+			q.SetRound(minLevel) // Set to minimum pending level for pass 2
 			q.setExpectedFromStatsBucket(minLevel)
 
 			if logservice.LS != nil {
@@ -124,8 +124,8 @@ func (q *Queue) CheckCopyCompletion(currentRound int, wasFirstPull bool) bool {
 // AdvanceCopyRound handles copy-specific round advancement logic.
 // Checks for pending tasks matching the current pass and advances to the next applicable round.
 func (q *Queue) AdvanceCopyRound() {
-	boltDB := q.getBoltDB()
-	if boltDB == nil {
+	database := q.getDatabase()
+	if database == nil {
 		return
 	}
 
@@ -136,11 +136,11 @@ func (q *Queue) AdvanceCopyRound() {
 		outputBuffer.Flush()
 	}
 
-	currentRound := q.getRound()
-	copyPass := q.getCopyPass()
+	currentRound := q.GetRound()
+	copyPass := q.GetCopyPass()
 
 	// Get all levels to check
-	levels, err := boltDB.GetAllLevels("SRC")
+	levels, err := db.GetAllLevels(database, "SRC")
 	if err != nil {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("error", fmt.Sprintf("Error getting levels: %v", err), "queue", q.name, q.name)
@@ -157,8 +157,8 @@ func (q *Queue) AdvanceCopyRound() {
 	// Check if current round still has pending tasks matching the current pass
 	currentRoundHasPending := false
 	if currentRound > 0 {
-		hasPending, err := boltDB.HasCopyStatusBucketItems(currentRound, nodeType, db.CopyStatusPending)
-		if err == nil && hasPending {
+		c, err := database.GetCopyCountAtDepth(currentRound, nodeType, db.CopyStatusPending)
+		if err == nil && c > 0 {
 			currentRoundHasPending = true
 		}
 	}
@@ -175,8 +175,8 @@ func (q *Queue) AdvanceCopyRound() {
 			if level <= currentRound || level == 0 {
 				continue // Skip current round, previous rounds, and round 0
 			}
-			hasPending, err := boltDB.HasCopyStatusBucketItems(level, nodeType, db.CopyStatusPending)
-			if err == nil && hasPending {
+			c, err := database.GetCopyCountAtDepth(level, nodeType, db.CopyStatusPending)
+			if err == nil && c > 0 {
 				newRound = level
 				break
 			}
@@ -214,7 +214,7 @@ func (q *Queue) AdvanceCopyRound() {
 	}
 
 	// Get stats for logging
-	q.setRound(newRound)
+	q.SetRound(newRound)
 	q.setExpectedFromStatsBucket(newRound)
 
 	passName := "folders"
@@ -234,8 +234,8 @@ func (q *Queue) AdvanceCopyRound() {
 // Pulls from SRC copy status buckets, filters by pass (folders vs files), and skips round 0.
 // Uses getter/setter methods - no direct mutex access.
 func (q *Queue) PullCopyTasks(force bool) {
-	boltDB := q.getBoltDB()
-	if boltDB == nil {
+	database := q.getDatabase()
+	if database == nil {
 		return
 	}
 
@@ -246,7 +246,7 @@ func (q *Queue) PullCopyTasks(force bool) {
 	}
 
 	// Don't pull if queue is completed
-	if q.getState() == QueueStateCompleted {
+	if q.State() == QueueStateCompleted {
 		return
 	}
 
@@ -289,7 +289,7 @@ func (q *Queue) PullCopyTasks(force bool) {
 	}
 
 	// Get current copy pass (1 for folders, 2 for files)
-	copyPass := q.getCopyPass()
+	copyPass := q.GetCopyPass()
 
 	// Determine node type for current pass
 	nodeType := db.NodeTypeFolder
@@ -297,69 +297,56 @@ func (q *Queue) PullCopyTasks(force bool) {
 		nodeType = db.NodeTypeFile
 	}
 
-	// Scan pending status bucket for the specific node type
-	// Bucket is already filtered by node type, so no in-memory filtering needed!
+	// Fetch pending copy tasks via keyset (copy_status = 'pending' in query; cursor is round-scoped).
 	batchSize := effectiveLeaseBatchSize()
-	var matchedBatch []db.FetchResult
-	var hitEndOfBucket bool
-
-	err := boltDB.View(func(tx *bolt.Tx) error {
-		// Get pending copy status bucket for this level and node type
-		copyStatusBucket := db.GetCopyStatusBucket(tx, currentRound, nodeType, db.CopyStatusPending)
-		if copyStatusBucket == nil {
-			hitEndOfBucket = true // No bucket = no items = hit end
-			return nil
-		}
-
-		nodesBucket := db.GetNodesBucket(tx, "SRC", currentRound)
-		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found for SRC")
-		}
-
-		cursor := copyStatusBucket.Cursor()
-		scannedCount := 0
-
-		for nodeIDBytes, _ := cursor.First(); nodeIDBytes != nil; nodeIDBytes, _ = cursor.Next() {
-			scannedCount++
-
-			// Skip if already leased
-			if q.isLeased(string(nodeIDBytes)) {
-				continue
-			}
-
-			// Get the node state
-			nodeData := nodesBucket.Get(nodeIDBytes)
-			if nodeData == nil {
-				continue // Node was deleted
-			}
-
-			state, err := db.DeserializeNodeState(nodeData)
-			if err != nil {
-				continue // Skip invalid entries
-			}
-
-			// No filtering needed - bucket already contains only the correct node type!
-			// Add to batch
-			matchedBatch = append(matchedBatch, db.FetchResult{
-				Key:   string(nodeIDBytes),
-				State: state,
-			})
-
-			// Stop if we've collected enough
-			if len(matchedBatch) >= batchSize {
-				break
-			}
-		}
-
-		// We hit end of bucket if cursor finished before we collected enough items
-		hitEndOfBucket = len(matchedBatch) < batchSize
-
-		return nil
-	})
-
+	results, err := db.ListNodesCopyKeyset(database, currentRound, nodeType, q.getCopyKeysetCursor(), batchSize)
 	if err != nil {
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to scan copy bucket: round=%d, error=%v", currentRound, err), "queue", q.name, q.name)
+			_ = logservice.LS.Log("error", fmt.Sprintf("Failed to fetch copy tasks: round=%d, error=%v", currentRound, err), "queue", q.name, q.name)
+		}
+		return
+	}
+	var matchedBatch []db.FetchResult
+	for _, r := range results {
+		if q.isLeased(r.Key) {
+			continue
+		}
+		matchedBatch = append(matchedBatch, r)
+		if len(matchedBatch) >= batchSize {
+			break
+		}
+	}
+	if len(matchedBatch) > 0 {
+		q.setCopyKeysetCursor(matchedBatch[len(matchedBatch)-1].Key)
+	}
+	hitEndOfBucket := len(results) < batchSize
+
+	// Batch resolve parent SRC ID -> DST ID -> DST node (ServiceID). No per-item DB reads.
+	parentIDSet := make(map[string]struct{})
+	for _, item := range matchedBatch {
+		if item.State.ParentID != "" {
+			parentIDSet[item.State.ParentID] = struct{}{}
+		}
+	}
+	parentIDs := make([]string, 0, len(parentIDSet))
+	for pid := range parentIDSet {
+		parentIDs = append(parentIDs, pid)
+	}
+	dstIDBySrcID, err := db.BatchGetDstIDsFromSrcIDs(database, parentIDs)
+	if err != nil {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("error", fmt.Sprintf("Batch parent lookup failed: %v", err), "queue", q.name, q.name)
+		}
+		return
+	}
+	dstParentIDs := make([]string, 0, len(dstIDBySrcID))
+	for _, dstID := range dstIDBySrcID {
+		dstParentIDs = append(dstParentIDs, dstID)
+	}
+	dstNodesByID, err := db.BatchGetNodesByID(database, "DST", dstParentIDs)
+	if err != nil {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("error", fmt.Sprintf("Batch DST node lookup failed: %v", err), "queue", q.name, q.name)
 		}
 		return
 	}
@@ -394,53 +381,31 @@ func (q *Queue) PullCopyTasks(force bool) {
 			task.ID = item.State.ID
 		}
 
-		// Resolve destination parent ServiceID using join-lookup
-		// Join-lookup maps SRC ULID → DST ULID, then load DST node to get ServiceID
-		// Copy phase starts at round 1, so all items should have a ParentID pointing to root (depth 0)
+		// Resolve destination parent ServiceID from batch lookups
 		if item.State.ParentID == "" {
-			// This should never happen for round 1+ items - indicates data corruption or traversal issue
 			if logservice.LS != nil {
 				_ = logservice.LS.Log("error", fmt.Sprintf("Item at round %d has empty ParentID (path=%s) - this should not happen", item.State.Depth, item.State.Path), "queue", q.name, q.name)
 			}
-			continue // Skip this item - cannot resolve parent
+			continue
 		}
-
-		// Use join-lookup to find parent's DST ULID (parent is at level currentRound-1)
-		parentLevel := currentRound - 1
-		if parentLevel < 0 {
-			parentLevel = 0
-		}
-		dstParentULID, err := db.GetDstIDFromSrcID(boltDB, parentLevel, item.State.ParentID)
-		if err != nil {
-			// Critical error - missing parent lookup will cause task failure
-			if logservice.LS != nil {
-				_ = logservice.LS.Log("error", fmt.Sprintf("Failed to join-lookup for parent %s of %s: %v", item.State.ParentID, item.State.Path, err), "queue", q.name, q.name)
-			}
-			continue // Skip this item - cannot resolve parent
-		}
+		dstParentULID := dstIDBySrcID[item.State.ParentID]
 		if dstParentULID == "" {
-			// Critical error - missing parent lookup will cause task failure
 			if logservice.LS != nil {
 				_ = logservice.LS.Log("warn", fmt.Sprintf("No join-lookup for parent %s of %s", item.State.ParentID, item.State.Path), "queue", q.name, q.name)
 			}
-			continue // Skip this item - cannot resolve parent
+			continue
 		}
-
-		// Load DST parent node to get ServiceID
-		dstParentNode, err := db.GetNodeState(boltDB, "DST", dstParentULID)
-		if err != nil || dstParentNode == nil {
-			// Critical error - missing DST parent will cause task failure
+		dstParentNode := dstNodesByID[dstParentULID]
+		if dstParentNode == nil {
 			if logservice.LS != nil {
 				_ = logservice.LS.Log("error", fmt.Sprintf("DST node not found for ULID %s (parent of %s)", dstParentULID, item.State.Path), "queue", q.name, q.name)
 			}
-			continue // Skip this item - cannot resolve parent
+			continue
 		}
-
-		// Extract ServiceID for adapter call
 		task.DstParentID = dstParentNode.ServiceID
 
 		// Enqueue task first - only proceed if enqueue succeeds
-		if q.enqueuePending(task) {
+		if q.Add(task) {
 			q.addLeasedKey(item.Key)
 			enqueueSuccessCount++
 
@@ -465,8 +430,9 @@ func (q *Queue) PullCopyTasks(force bool) {
 	wasPartial := hitEndOfBucket
 	q.setLastPullWasPartial(wasPartial)
 
-	// Record pull in RoundInfo
+	// Record pull in RoundInfo; after first pull we're no longer "first pull for round"
 	q.recordPull(currentRound, len(matchedBatch), wasPartial)
+	q.setFirstPullForRound(false)
 }
 
 // nodeStateToCopyTask converts a NodeState to a copy TaskBase.
@@ -525,8 +491,8 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 	currentRound := task.Round
 	nodeID := task.ID
 
-	boltDB := q.getBoltDB()
-	if boltDB == nil {
+	database := q.getDatabase()
+	if database == nil {
 		return
 	}
 
@@ -540,58 +506,49 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 	// Record task completion in RoundInfo
 	q.recordTaskCompletion(currentRound, true)
 
-	// Get node state to update copy status
-	srcNode, err := db.GetNodeState(boltDB, "SRC", nodeID)
-	if err != nil || srcNode == nil {
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("error",
-				fmt.Sprintf("Failed to get node state for copy task completion: %s, error: %v", nodeID, err),
-				"queue", q.name, q.name)
-		}
-		return
+	// Use only task fields (no DB read). Derive type/path/name/size/mtime from task.
+	taskType := types.NodeTypeFile
+	taskPath := task.LocationPath()
+	taskName := task.File.DisplayName
+	taskSize := task.File.Size
+	taskMTime := task.File.LastUpdated
+	if task.IsFolder() {
+		taskType = types.NodeTypeFolder
+		taskName = task.Folder.DisplayName
+		taskMTime = task.Folder.LastUpdated
 	}
 
 	// Update copy status: in-progress -> successful
 	outputBuffer := q.getOutputBuffer()
 	if outputBuffer != nil {
-		outputBuffer.AddCopyStatusUpdate("SRC", srcNode.Depth, srcNode.Type, db.CopyStatusInProgress, nodeID, db.CopyStatusSuccessful)
+		outputBuffer.AddCopyStatusUpdate("SRC", currentRound, taskType, db.CopyStatusInProgress, nodeID, db.CopyStatusSuccessful)
 	}
 
-	// Create DST node entry and update join-lookup
-	// Generate deterministic DST node ID from path (same path = same ID, race-safe)
-	dstNodeID := db.DeterministicNodeID("DST", srcNode.Type, srcNode.Path)
-
-	// Create DST node with ServiceID from created folder/file
+	// Create DST node entry and update join-lookup (deterministic ID from path)
+	dstNodeID := db.DeterministicNodeID("DST", taskType, taskPath)
 	var dstServiceID string
 	if task.IsFolder() {
 		dstServiceID = task.Folder.ServiceID
 	} else {
 		dstServiceID = task.File.ServiceID
 	}
-
-	// Create DST node state
 	dstNode := &db.NodeState{
 		ID:              dstNodeID,
 		ServiceID:       dstServiceID,
-		ParentID:        "", // Will be populated later if needed
-		ParentServiceID: "", // Will be populated later if needed
-		Name:            srcNode.Name,
-		Path:            srcNode.Path,
-		Type:            srcNode.Type,
-		Size:            srcNode.Size,
-		MTime:           srcNode.MTime,
-		Depth:           srcNode.Depth,
+		ParentID:        "",
+		ParentServiceID: "",
+		Name:            taskName,
+		Path:            taskPath,
+		Type:            taskType,
+		Size:            taskSize,
+		MTime:           taskMTime,
+		Depth:           currentRound,
 	}
 
 	// Queue the creation of the DST node as an output buffer operation.
 	// DST nodes use traversal status (not copy status) - mark as "successful" since it was just created
 	if outputBuffer != nil {
 		outputBuffer.AddCreateNode("DST", currentRound, db.StatusSuccessful, dstNode)
-	}
-
-	// Map SRC ID → DST ID in join-lookup (same level as DST node creation)
-	if outputBuffer != nil {
-		outputBuffer.AddLookupMapping(currentRound, nodeID, dstNodeID)
 	}
 
 	// Track metrics based on task type
@@ -611,8 +568,8 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 // FailCopyTask handles failure of copy tasks.
 // Updates copy status to failed if max retries exceeded, or back to pending if retrying.
 func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
-	boltDB := q.getBoltDB()
-	if boltDB == nil {
+	database := q.getDatabase()
+	if database == nil {
 		return
 	}
 
@@ -632,17 +589,11 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 
 	task.Attempts++
 
-	// Get node state to update copy status
-	srcNode, err := db.GetNodeState(boltDB, "SRC", nodeID)
-	if err != nil || srcNode == nil {
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("error",
-				fmt.Sprintf("Failed to get node state for copy task failure: %s, error: %v", nodeID, err),
-				"queue", q.name, q.name)
-		}
-		return
+	// Use only task fields for status update (no DB read)
+	taskType := types.NodeTypeFile
+	if task.IsFolder() {
+		taskType = types.NodeTypeFolder
 	}
-
 	outputBuffer := q.getOutputBuffer()
 
 	// Check if we should retry
@@ -658,7 +609,7 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 		// Re-enqueue to memory pending buffer (append, not insert at 0)
 		// The task stays as in-progress in BoltDB to avoid unnecessary writes
 		// It will be pulled from memory on the next worker cycle
-		q.enqueuePending(task)
+		q.Add(task)
 
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("debug",
@@ -678,7 +629,7 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 
 		// Add to buffer only on final failure
 		if outputBuffer != nil {
-			outputBuffer.AddCopyStatusUpdate("SRC", srcNode.Depth, srcNode.Type, db.CopyStatusInProgress, nodeID, db.CopyStatusFailed)
+			outputBuffer.AddCopyStatusUpdate("SRC", currentRound, taskType, db.CopyStatusInProgress, nodeID, db.CopyStatusFailed)
 		}
 
 		q.removeInProgress(nodeID)

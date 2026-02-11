@@ -14,12 +14,9 @@ Write-Host ""
 # Clean up existing test databases ONLY at the start for a fresh test
 # The DB will persist between Phase 1 (kill) and Phase 2 (resume)
 # Final cleanup happens at the end after verification
-$mainDB = "pkg/tests/traversal/shared/main_test.db"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Write-Host "Cleaning up test databases for fresh test run..." -ForegroundColor Yellow
-Remove-Item -Path $mainDB -ErrorAction SilentlyContinue
-Remove-Item -Path ($mainDB -replace '\.db$','_logs.db') -ErrorAction SilentlyContinue
-Remove-Item -Path "pkg/tests/traversal/shared/main_test.yaml" -ErrorAction SilentlyContinue
-Write-Host "Cleanup complete" -ForegroundColor Green
+& "$ScriptDir\..\shared\cleanup.ps1"
 Write-Host ""
 
 # Phase 1: Start migration and kill it midway
@@ -171,11 +168,7 @@ if ($exitCode -eq 0) {
     
     # Clean up test databases after successful test completion
     Write-Host ""
-    Write-Host "Cleaning up test databases after successful test..." -ForegroundColor Yellow
-    Remove-Item -Path $mainDB -ErrorAction SilentlyContinue
-    Remove-Item -Path ($mainDB -replace '\.db$','_logs.db') -ErrorAction SilentlyContinue
-    Remove-Item -Path "pkg/tests/traversal/shared/main_test.yaml" -ErrorAction SilentlyContinue
-    Write-Host "Cleanup complete" -ForegroundColor Green
+    & "$ScriptDir\..\shared\cleanup.ps1"
 } else {
     Write-Host "TEST FAILED - Migration resumption did not complete successfully" -ForegroundColor Red
     Write-Host "Test databases preserved for inspection" -ForegroundColor Yellow

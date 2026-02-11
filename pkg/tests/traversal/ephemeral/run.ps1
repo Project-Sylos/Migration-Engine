@@ -8,25 +8,8 @@ Write-Host "=== Sylos Migration Test Runner (Ephemeral Mode) ===" -ForegroundCol
 Write-Host ""
 
 # Clean up existing test databases
-Write-Host "Cleaning up test databases..." -ForegroundColor Yellow
-$mainDB = "pkg/tests/traversal/shared/main_test.db"
-
-# Remove the BoltDB file if it exists
-if (Test-Path $mainDB) {
-    Write-Host "Removing $mainDB file..." -ForegroundColor Yellow
-    Remove-Item -Path $mainDB -Force -ErrorAction SilentlyContinue
-}
-Remove-Item -Path ($mainDB -replace '\.db$','_logs.db') -Force -ErrorAction SilentlyContinue
-
-# Remove the migration config YAML file if it exists
-if (Test-Path "pkg/tests/traversal/shared/main_test.yaml") {
-    Write-Host "Removing pkg/tests/traversal/shared/main_test.yaml file..." -ForegroundColor Yellow
-    Remove-Item -Path "pkg/tests/traversal/shared/main_test.yaml" -Force -ErrorAction SilentlyContinue
-}
-
-# Note: Ephemeral mode doesn't use a Spectra DB, so no cleanup needed for spectra_test.db
-
-Write-Host "Cleanup complete" -ForegroundColor Green
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+& "$ScriptDir\..\shared\cleanup.ps1"
 Write-Host ""
 
 # Run the test

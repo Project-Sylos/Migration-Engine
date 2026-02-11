@@ -41,23 +41,8 @@ try {
 Write-Host ""
 
 # Clean up existing test databases
-Write-Host "Cleaning up test databases..." -ForegroundColor Yellow
-$mainDB = "pkg/tests/copy/shared/main_test.db"
-
-# Remove the BoltDB file if it exists
-if (Test-Path $mainDB) {
-    Write-Host "Removing $mainDB file..." -ForegroundColor Yellow
-    Remove-Item -Path $mainDB -Force -ErrorAction SilentlyContinue
-}
-Remove-Item -Path ($mainDB -replace '\.db$','_logs.db') -Force -ErrorAction SilentlyContinue
-
-# Remove the migration config YAML file if it exists
-if (Test-Path "pkg/tests/copy/shared/main_test.yaml") {
-    Write-Host "Removing pkg/tests/copy/shared/main_test.yaml file..." -ForegroundColor Yellow
-    Remove-Item -Path "pkg/tests/copy/shared/main_test.yaml" -Force -ErrorAction SilentlyContinue
-}
-
-Write-Host "Cleanup complete" -ForegroundColor Green
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+& "$ScriptDir\..\shared\cleanup.ps1"
 Write-Host ""
 
 # Set environment variables for source and destination paths

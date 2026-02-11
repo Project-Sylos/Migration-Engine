@@ -18,8 +18,8 @@ import (
 // RoundInfo tracks statistics and metadata for a specific BFS round.
 type RoundInfo struct {
 	Round           int       // Round number
-	PullCount       int       // Number of pull operations performed
-	ItemsYielded    int       // Total items pulled across all operations
+	PullCount       int       // Number of pull operations (queries) performed this round
+	ItemsYielded    int       // Pulled amount: total items actually returned from DB queries this round (like completed count but for pulls)
 	ExpectedCount   int       // Expected items from DB (if known)
 	TasksCompleted  int       // Successfully completed tasks
 	TasksFailed     int       // Failed tasks
@@ -58,7 +58,9 @@ const (
 
 const (
 	defaultLeaseBatchSize = 1000
-	maxLeaseBatchSize    = 20_000 // Upper bound for pull (lease) batch size
+	maxLeaseBatchSize     = 20_000 // Upper bound for pull (lease) batch size
+	// MaxSrcDstGap is the maximum allowed round gap (src - dst). When src exceeds dst + MaxSrcDstGap, src pauses pulling (Phase 6).
+	MaxSrcDstGap = 2
 )
 
 // effectiveLeaseBatchSize returns the lease batch size capped by maxLeaseBatchSize.
@@ -69,12 +71,101 @@ func effectiveLeaseBatchSize() int {
 	return maxLeaseBatchSize
 }
 
+// getQueueType returns "SRC" for "src", "DST" for "dst", "SRC" for "copy" (copy phase uses SRC table). Returns "" for unknown.
+func getQueueType(queueName string) string {
+	switch strings.ToLower(queueName) {
+	case "src":
+		return "SRC"
+	case "dst":
+		return "DST"
+	case "copy":
+		return "SRC"
+	default:
+		return ""
+	}
+}
+
+// taskToNodeState converts a TaskBase to NodeState for DB writes (e.g. child inserts).
+func taskToNodeState(task *TaskBase) *db.NodeState {
+	if task == nil {
+		return nil
+	}
+	path := task.LocationPath()
+	state := &db.NodeState{
+		ID:              task.ID,
+		Path:            path,
+		ParentPath:      "",
+		Depth:           task.Round,
+		TraversalStatus: db.StatusSuccessful,
+		Status:          db.StatusSuccessful,
+		Name:            "",
+	}
+	if task.IsFolder() {
+		state.Type = types.NodeTypeFolder
+		state.ServiceID = task.Folder.ServiceID
+		state.ParentServiceID = task.Folder.ParentId
+		state.ParentPath = task.Folder.ParentPath
+		state.MTime = task.Folder.LastUpdated
+		state.Name = task.Folder.DisplayName
+	} else {
+		state.Type = types.NodeTypeFile
+		state.ServiceID = task.File.ServiceID
+		state.ParentServiceID = task.File.ParentId
+		state.ParentPath = task.File.ParentPath
+		state.MTime = task.File.LastUpdated
+		state.Size = task.File.Size
+		state.Name = task.File.DisplayName
+	}
+	return state
+}
+
+// nodeStateToTask converts a NodeState to a traversal TaskBase (src-traversal or dst-traversal).
+func nodeStateToTask(state *db.NodeState, taskType string) *TaskBase {
+	if state == nil {
+		return nil
+	}
+	task := &TaskBase{
+		ID:        state.ID,
+		Type:      taskType,
+		Round:     state.Depth,
+		Attempts:  0,
+		Status:    "",
+		Locked:    false,
+		LeaseTime: time.Now(),
+	}
+	if state.Type == types.NodeTypeFolder {
+		task.Folder = types.Folder{
+			ServiceID:    state.ServiceID,
+			ParentId:     state.ParentServiceID,
+			ParentPath:   state.ParentPath,
+			DisplayName:  state.Name,
+			LocationPath: state.Path,
+			LastUpdated:  state.MTime,
+			DepthLevel:   state.Depth,
+			Type:         state.Type,
+		}
+	} else {
+		task.File = types.File{
+			ServiceID:    state.ServiceID,
+			ParentId:     state.ParentServiceID,
+			ParentPath:   state.ParentPath,
+			DisplayName:  state.Name,
+			LocationPath: state.Path,
+			LastUpdated:  state.MTime,
+			Size:         state.Size,
+			DepthLevel:   state.Depth,
+			Type:         state.Type,
+		}
+	}
+	return task
+}
+
 // Queue maintains round-based task queues for BFS traversal coordination.
 // It handles task leasing, retry logic, and cross-queue task propagation.
 // All operational state lives in BoltDB, flushed via per-queue buffers.
 type Queue struct {
 	name               string               // Queue name ("src" or "dst")
-	mode               QueueMode            // Operation mode (traversal/exclusion/retry)
+	mode               QueueMode            // Operation mode (traversal/retry/copy)
 	mu                 sync.RWMutex         // Protects all internal state
 	state              QueueState           // Lifecycle state (running/paused/stopped/completed/waiting)
 	inProgress         map[string]*TaskBase // Tasks currently being executed (keyed by ULID)
@@ -83,11 +174,12 @@ type Queue struct {
 	leasedKeys         map[string]struct{}  // ULIDs already pulled/leased - prevents duplicate pulls from stale views
 	pulling            bool                 // Indicates a pull operation is active
 	lastPullWasPartial bool                 // True if last pull returned fewer tasks than requested (partial batch)
+	firstPullForRound  bool                 // True if we haven't done the first pull for the current round
 	maxRetries         int                  // Maximum retry attempts per task
 	round              int                  // Current BFS round/depth level
 	roundInfoMap       map[int]*RoundInfo   // Per-round statistics and metadata (key: round number)
 	workers            []Worker             // Workers associated with this queue (for reference only)
-	boltDB             *db.DB               // BoltDB for operational queue storage
+	database            *db.DB               // Database for operational queue storage
 	coordinator        *QueueCoordinator    // Coordinator for round advancement gates (DST only)
 	outputBuffer       *db.OutputBuffer     // Buffer for batched write operations
 	// Round-based statistics for completion detection
@@ -114,6 +206,10 @@ type Queue struct {
 	filesCreatedTotal     int64 // Total files created (monotonic counter)
 	// Tasks completed total: incremented on every success or final failure, pushed to stats on flush
 	tasksCompletedTotal int64
+	// Keyset cursors for pagination (id > cursor ORDER BY id LIMIT n). Strictly round-scoped per queue; see resetThisQueueKeysetCursor.
+	srcKeysetCursor  string // SRC traversal/retry pull
+	dstKeysetCursor  string // DST traversal/retry pull
+	copyKeysetCursor string // Copy phase pull
 }
 
 // NewQueue creates a new Queue instance.
@@ -132,6 +228,7 @@ func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCo
 		roundStats:          make(map[int]*RoundStats),
 		roundInfoMap:        make(map[int]*RoundInfo), // Initialize round info map
 		coordinator:         coordinator,
+		firstPullForRound:   true,
 		executionTimeDeltas: make([]time.Duration, 0, 100), // Buffer capacity 100
 		avgInterval:         5 * time.Second,               // Calculate average every 5 seconds
 		lastAvgTime:         time.Now(),
@@ -139,54 +236,14 @@ func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCo
 	}
 }
 
-// SetMode sets the queue operation mode.
-func (q *Queue) SetMode(mode QueueMode) {
-	q.setMode(mode)
-}
-
-// SetMaxKnownDepth sets the maximum known depth for retry sweeps.
-// Only applicable when mode is QueueModeRetry.
-// Set to -1 to auto-detect from database, or a non-negative value to use a specific depth.
-func (q *Queue) SetMaxKnownDepth(depth int) {
-	q.setMaxKnownDepth(depth)
-}
-
-// GetMode returns the current queue mode (implements worker.QueueAccessor).
-func (q *Queue) GetMode() string {
-	return string(q.getMode())
-}
-
-// GetBoltDB returns the BoltDB instance (implements worker.QueueAccessor).
-func (q *Queue) GetBoltDB() interface{} {
-	return q.getBoltDB()
-}
-
-// GetOutputBuffer returns the output buffer (implements worker.QueueAccessor).
-func (q *Queue) GetOutputBuffer() interface{} {
-	return q.getOutputBuffer()
-}
-
-// GetPendingSet returns a copy of the pending set (implements worker.QueueAccessor).
-// This is thread-safe but returns a snapshot.
-func (q *Queue) GetPendingSet() map[string]struct{} {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	// Return a copy to avoid race conditions
-	result := make(map[string]struct{})
-	for k, v := range q.pendingSet {
-		result[k] = v
-	}
-	return result
-}
-
 // InitializeWithContext sets up the queue with BoltDB, context, and filesystem adapter references.
 // Creates and starts workers immediately - they'll poll for tasks autonomously.
 // shutdownCtx is optional - if provided, workers will check for cancellation and exit on shutdown.
 // For copy mode, InitializeCopyWithContext should be used instead to provide both adapters.
-func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter types.FSAdapter, shutdownCtx context.Context) {
-	// Set BoltDB and shutdownCtx using setters
-	q.setBoltDB(boltInstance)
-	q.setShutdownCtx(shutdownCtx)
+func (q *Queue) InitializeWithContext(database *db.DB, adapter types.FSAdapter, shutdownCtx context.Context) {
+	// Set database and shutdownCtx using setters
+	q.setDatabase(database)
+	q.SetShutdownContext(shutdownCtx)
 
 	// Get worker count from capacity (workers haven't been added yet, so length is 0)
 	q.mu.RLock()
@@ -195,7 +252,7 @@ func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter types.FSAdapt
 
 	// Initialize output buffer for batched writes
 	// Default: 1000 operations or 1 second interval
-	outputBuffer := db.NewOutputBuffer(boltInstance, 10000, 3*time.Second)
+	outputBuffer := db.NewOutputBuffer(database, 10000, 3*time.Second)
 	q.setOutputBuffer(outputBuffer)
 	outputBuffer.SetOnFlush(func(nodeIDs []string) {
 		for _, nodeID := range nodeIDs {
@@ -204,13 +261,11 @@ func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter types.FSAdapt
 	})
 
 	// Create and start workers - they manage themselves
-
-	// Traversal or retry mode use traversal workers
 	for i := 0; i < workerCount; i++ {
 		w := NewTraversalWorker(
 			fmt.Sprintf("%s-worker-%d", q.name, i),
 			q,
-			boltInstance,
+			database,
 			adapter,
 			q.name,
 			shutdownCtx,
@@ -218,9 +273,6 @@ func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter types.FSAdapt
 		q.AddWorker(w)
 		go w.Run()
 	}
-
-	// Coordinator handles round advancement gates for DST
-	// SRC just updates coordinator when it advances
 
 	// Start the queue's Run() method to coordinate pulling tasks and advancing rounds
 	go q.Run()
@@ -233,10 +285,10 @@ func (q *Queue) InitializeWithContext(boltInstance *db.DB, adapter types.FSAdapt
 
 // InitializeCopyWithContext sets up a copy queue with both source and destination adapters.
 // This is specifically for copy mode which requires both adapters.
-func (q *Queue) InitializeCopyWithContext(boltInstance *db.DB, srcAdapter, dstAdapter types.FSAdapter, shutdownCtx context.Context) {
-	// Set BoltDB and shutdownCtx using setters
-	q.setBoltDB(boltInstance)
-	q.setShutdownCtx(shutdownCtx)
+func (q *Queue) InitializeCopyWithContext(database *db.DB, srcAdapter, dstAdapter types.FSAdapter, shutdownCtx context.Context) {
+	// Set database and shutdownCtx using setters
+	q.setDatabase(database)
+	q.SetShutdownContext(shutdownCtx)
 
 	// Get worker count from capacity
 	q.mu.RLock()
@@ -244,7 +296,7 @@ func (q *Queue) InitializeCopyWithContext(boltInstance *db.DB, srcAdapter, dstAd
 	q.mu.RUnlock()
 
 	// Initialize output buffer for batched writes
-	outputBuffer := db.NewOutputBuffer(boltInstance, 10000, 3*time.Second)
+	outputBuffer := db.NewOutputBuffer(database, 10000, 3*time.Second)
 	q.setOutputBuffer(outputBuffer)
 	outputBuffer.SetOnFlush(func(nodeIDs []string) {
 		for _, nodeID := range nodeIDs {
@@ -257,7 +309,7 @@ func (q *Queue) InitializeCopyWithContext(boltInstance *db.DB, srcAdapter, dstAd
 		w := NewCopyWorker(
 			fmt.Sprintf("%s-worker-%d", q.name, i),
 			q,
-			boltInstance,
+			database,
 			srcAdapter,
 			dstAdapter,
 			shutdownCtx,
@@ -275,78 +327,37 @@ func (q *Queue) InitializeCopyWithContext(boltInstance *db.DB, srcAdapter, dstAd
 	}
 }
 
-// Initialize is a convenience wrapper that calls InitializeWithContext with nil shutdown context.
-func (q *Queue) Initialize(boltInstance *db.DB, adapter types.FSAdapter) {
-	q.InitializeWithContext(boltInstance, adapter, nil)
-}
-
-// SetShutdownContext sets the shutdown context for the queue.
-// This can be called before or after Initialize, and will affect all workers.
-func (q *Queue) SetShutdownContext(ctx context.Context) {
-	q.setShutdownCtx(ctx)
-}
-
 // Name returns the queue's name.
 func (q *Queue) Name() string {
 	return q.name
 }
 
-// Round returns the current BFS round.
-func (q *Queue) Round() int {
-	return q.getRound()
-}
-
 // IsExhausted returns true if the queue has finished all traversal or has been stopped.
 func (q *Queue) IsExhausted() bool {
-	state := q.getState()
+	state := q.State()
 	return state == QueueStateCompleted || state == QueueStateStopped
-}
-
-// State returns the current queue lifecycle state.
-func (q *Queue) State() QueueState {
-	return q.getState()
 }
 
 // IsPaused returns true if the queue is paused.
 func (q *Queue) IsPaused() bool {
-	return q.getState() == QueueStatePaused
+	return q.State() == QueueStatePaused
 }
 
 // Pause pauses the queue (workers will not lease new tasks).
 func (q *Queue) Pause() {
-	q.setState(QueueStatePaused)
-	outputBuffer := q.getOutputBuffer()
-	// Pause buffer (which will force-flush before pausing)
-	if outputBuffer != nil {
-		outputBuffer.Pause()
-	}
+	q.SetState(QueueStatePaused)
 }
 
 // Resume resumes the queue after a pause.
 func (q *Queue) Resume() {
-	q.setState(QueueStateRunning)
-	outputBuffer := q.getOutputBuffer()
-	// Resume buffer
-	if outputBuffer != nil {
-		outputBuffer.Resume()
-	}
-}
-
-// Add enqueues a task into the in-memory buffer only (no database writes).
-func (q *Queue) Add(task *TaskBase) bool {
-	return q.enqueuePending(task)
-}
-
-// SetRound sets the queue's current round. Used for resume operations.
-func (q *Queue) SetRound(round int) {
-	q.setRound(round)
+	q.SetState(QueueStateRunning)
 }
 
 // Lease attempts to lease a task for execution atomically.
 // Returns nil if no tasks are available, queue is paused, or completed.
 func (q *Queue) Lease() *TaskBase {
 	// Check if queue is completed before attempting to pull tasks
-	if q.getState() == QueueStateCompleted {
+	if q.State() == QueueStateCompleted {
 		return nil
 	}
 
@@ -354,9 +365,9 @@ func (q *Queue) Lease() *TaskBase {
 
 	for attempt := 0; attempt < 2; attempt++ {
 		// Block if paused, completed, or no DB (waiting doesn't block - rounds continue once started)
-		state := q.getState()
-		boltDB := q.getBoltDB()
-		if state == QueueStatePaused || state == QueueStateCompleted || boltDB == nil {
+		state := q.State()
+		database := q.getDatabase()
+		if state == QueueStatePaused || state == QueueStateCompleted || database == nil {
 			return nil
 		}
 
@@ -408,16 +419,16 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 	// Called when first pull returns 0 entries - decides if we're completely done
 	if opts.CheckFinalCompletion {
 		// Skip check if queue is in waiting state (DST gating)
-		queueState := q.getState()
+		queueState := q.State()
 		if queueState == QueueStateWaiting {
 			return false
 		}
 
 		// Check state and conditions after flush
-		inProgressCount := q.getInProgressCount()
-		pendingBuffCount := q.getPendingCount()
+		inProgressCount := q.InProgressCount()
+		pendingBuffCount := q.GetPendingCount()
 		wasFirstPull := opts.WasFirstPull
-		boltDB := q.getBoltDB()
+		database := q.getDatabase()
 
 		// If we have tasks in progress or in buffer, we're definitely not done
 		if inProgressCount > 0 || pendingBuffCount > 0 {
@@ -426,11 +437,11 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 
 		// Only check completion on first pull (prevents premature completion mid-round)
 
-		if boltDB == nil {
+		if database == nil {
 			return false
 		}
 
-		mode := q.getMode()
+		mode := q.GetMode()
 
 		// Mode-specific completion conditions
 		switch mode {
@@ -449,13 +460,13 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 	// For round completion check
 	if opts.CheckRoundComplete {
 		// Check state first
-		if q.getState() != QueueStateRunning {
+		if q.State() != QueueStateRunning {
 			return false
 		}
 
 		// Soft check: verify in-memory state (after flush)
-		inProgressCount := q.getInProgressCount()
-		pendingBuffCount := q.getPendingCount()
+		inProgressCount := q.InProgressCount()
+		pendingBuffCount := q.GetPendingCount()
 		lastPullWasPartial := q.getLastPullWasPartial()
 
 		// Round is complete if: no in-progress, no pending, and last pull was partial
@@ -464,11 +475,11 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 		}
 
 		// Hard check: verify BoltDB buckets are empty (mode-specific)
-		mode := q.getMode()
+		mode := q.GetMode()
 		if mode == QueueModeCopy {
-			boltDB := q.getBoltDB()
-			if boltDB != nil {
-				copyPass := q.getCopyPass()
+			database := q.getDatabase()
+			if database != nil {
+				copyPass := q.GetCopyPass()
 				// Determine node type for current pass
 				nodeType := db.NodeTypeFolder
 				if copyPass == 2 {
@@ -481,13 +492,14 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 				hasInProgressForPass := false
 
 				// Check pending bucket for this node type
-				hasPending, err1 := boltDB.HasCopyStatusBucketItems(currentRound, nodeType, db.CopyStatusPending)
-				if err1 == nil && hasPending {
+				c1, err1 := database.GetCopyCountAtDepth(currentRound, nodeType, db.CopyStatusPending)
+				if err1 == nil && c1 > 0 {
 					hasPendingForPass = true
 				}
 
 				// Check in-progress bucket for this node type
-				hasInProgress, err2 := boltDB.HasCopyStatusBucketItems(currentRound, nodeType, db.CopyStatusInProgress)
+				c2, err2 := database.GetCopyCountAtDepth(currentRound, nodeType, db.CopyStatusInProgress)
+				hasInProgress := err2 == nil && c2 > 0
 				if err2 == nil && hasInProgress {
 					hasInProgressForPass = true
 				}
@@ -525,7 +537,7 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 // markComplete marks the queue as completed and notifies the coordinator.
 // Returns true if successfully marked complete.
 func (q *Queue) markComplete(format string, args ...interface{}) bool {
-	state := q.getState()
+	state := q.State()
 	if state != QueueStateRunning && state != QueueStateWaiting {
 		return false
 	}
@@ -555,7 +567,20 @@ func (q *Queue) markComplete(format string, args ...interface{}) bool {
 	fmt.Printf("\n[%s Queue Complete] Tasks Processed: %d | Children Discovered: %d\n",
 		q.name, totalTasksProcessed, totalChildrenDiscovered)
 
-	q.setState(QueueStateCompleted)
+	q.SetState(QueueStateCompleted)
+
+	// Create node table indexes after hot path (traversal/copy) so writes are not slowed. Each index is O(n).
+	if database := q.getDatabase(); database != nil {
+		switch q.name {
+		case "src":
+			_ = db.EnsureNodeTableIndexes(database, "src_nodes")
+		case "dst":
+			_ = db.EnsureNodeTableIndexes(database, "dst_nodes")
+		case "copy":
+			_ = db.EnsureNodeTableIndexes(database, "src_nodes")
+			_ = db.EnsureNodeTableIndexes(database, "dst_nodes")
+		}
+	}
 
 	// Notify coordinator
 	coordinator := q.getCoordinator()
@@ -604,9 +629,9 @@ func (q *Queue) ReportTaskResult(task *TaskBase, result TaskExecutionResult) {
 	}
 
 	// Event-driven post-processing: check if we need to pull more tasks
-	pendingCount := q.getPendingCount()
+	pendingCount := q.GetPendingCount()
 	lastPullWasPartial := q.getLastPullWasPartial()
-	state := q.getState()
+	state := q.State()
 
 	// Only process if queue is running
 	if state != QueueStateRunning && state != QueueStateWaiting {
@@ -622,31 +647,17 @@ func (q *Queue) ReportTaskResult(task *TaskBase, result TaskExecutionResult) {
 
 // completeTask is the internal implementation for successful task completion.
 func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
-	mode := q.getMode()
+	mode := q.GetMode()
 
 	// Delegate to mode-specific implementation
 	if mode == QueueModeCopy {
-		q.completeCopyTask(task, executionDelta)
+		q.CompleteCopyTask(task, executionDelta)
 		return
 	}
 
 	// Traversal and retry modes use the same completion logic
 	q.CompleteTraversalTask(task, executionDelta)
 
-}
-
-// completeCopyTask handles completion of copy tasks (folders or files).
-// Copy tasks don't discover children - they just update copy status and track metrics.
-func (q *Queue) completeCopyTask(task *TaskBase, executionDelta time.Duration) {
-	// Delegate to copy-specific implementation in mode_copy.go
-	q.CompleteCopyTask(task, executionDelta)
-}
-
-// failCopyTask handles failure of copy tasks.
-// Updates copy status to failed if max retries exceeded, or back to pending if retrying.
-func (q *Queue) failCopyTask(task *TaskBase, executionDelta time.Duration) {
-	// Delegate to copy-specific implementation in mode_copy.go
-	q.FailCopyTask(task, executionDelta)
 }
 
 // childResultToNodeState converts a ChildResult to NodeState using deterministic ID generation.
@@ -738,13 +749,13 @@ func childResultToNodeState(child ChildResult, parentPath string, depth int, que
 }
 
 func (q *Queue) PullTasksIfNeeded(force bool) {
-	boltDB := q.getBoltDB()
-	if boltDB == nil {
+		database := q.getDatabase()
+		if database == nil {
 		return
 	}
 
 	// Don't pull if queue is paused or completed (waiting doesn't block pulls - rounds continue once started)
-	state := q.getState()
+	state := q.State()
 	if state == QueueStatePaused || state == QueueStateCompleted {
 		return
 	}
@@ -753,63 +764,45 @@ func (q *Queue) PullTasksIfNeeded(force bool) {
 	// We don't set it here because we need to know if it was the first pull when checking completion
 
 	if force {
-		q.pullTasksForMode(true)
+		mode := q.GetMode()
+		switch mode {
+		case QueueModeRetry:
+			q.PullRetryTasks(true)
+		case QueueModeCopy:
+			q.PullCopyTasks(true)
+		default: // QueueModeTraversal
+			q.PullTraversalTasks(true)
+		}
 		return
 	}
 
 	// Only pull if: queue is running, buffer is low, not already pulling, and last pull wasn't partial
 	// If last pull was partial, we might have exhausted this round - don't pull again until round advances
 	lastPullWasPartial := q.getLastPullWasPartial()
-	pendingCount := q.getPendingCount()
+	pendingCount := q.GetPendingCount()
 	pullLowWM := q.getPullLowWM()
 	pulling := q.getPulling()
 	needPull := state == QueueStateRunning && pendingCount <= pullLowWM && !pulling && !lastPullWasPartial
 	if needPull {
-		q.pullTasksForMode(false)
+		mode := q.GetMode()
+		switch mode {
+		case QueueModeRetry:
+			q.PullRetryTasks(false)
+		case QueueModeCopy:
+			q.PullCopyTasks(false)
+		default: // QueueModeTraversal
+			q.PullTraversalTasks(false)
+		}
 	}
-}
-
-// pullTasksForMode selects the appropriate pull method based on queue mode.
-func (q *Queue) pullTasksForMode(force bool) {
-	mode := q.getMode()
-
-	switch mode {
-	case QueueModeRetry:
-		q.PullRetryTasks(force)
-	case QueueModeCopy:
-		q.PullCopyTasks(force)
-	default: // QueueModeTraversal
-		q.PullTraversalTasks(force)
-	}
-}
-
-// Pull methods are now organized in separate files:
-// - PullTraversalTasks: mode_traversal.go
-// - PullExclusionTasks: mode_exclusion.go
-// - PullRetryTasks: mode_retry.go
-
-// enqueuePendingLocked and dequeuePendingLocked are now replaced by enqueuePending and dequeuePending
-// which use getters/setters internally. These functions are kept for backward compatibility
-// but should not be used directly - use enqueuePending and dequeuePending instead.
-
-// Fail is a public wrapper for backward compatibility.
-// New code should use ReportTaskResult instead.
-// Returns true if the task will be retried, false if max retries exceeded.
-func (q *Queue) Fail(task *TaskBase) bool {
-	q.ReportTaskResult(task, TaskExecutionResultFailed)
-	// Check if task was retried by checking if it's still in pending
-	nodeID := task.ID
-	willRetry := q.isInPendingSet(nodeID)
-	return willRetry
 }
 
 // failTask is the internal implementation for failed task handling.
 func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
-	mode := q.getMode()
+	mode := q.GetMode()
 
 	// Delegate to mode-specific implementation
 	if mode == QueueModeCopy {
-		q.failCopyTask(task, executionDelta)
+		q.FailCopyTask(task, executionDelta)
 		return
 	}
 
@@ -817,14 +810,9 @@ func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
 	q.FailTraversalTask(task, executionDelta)
 }
 
-// InProgressCount returns the number of tasks currently being executed.
-func (q *Queue) InProgressCount() int {
-	return q.getInProgressCount()
-}
-
 // TotalTracked returns the total number of tasks across all rounds (pending + in-progress).
 func (q *Queue) TotalTracked() int {
-	return q.getPendingCount() + q.getInProgressCount()
+	return q.GetPendingCount() + q.InProgressCount()
 }
 
 // Clear removes all tasks from BoltDB and resets in-progress tracking.
@@ -840,7 +828,7 @@ func (q *Queue) Clear() {
 	q.pulling = false
 
 	// BoltDB clearing would require deleting all buckets - typically not needed
-	// as BoltDB is ephemeral and cleaned up after ETL #2
+	// (DuckDB-only: no ETL.)
 }
 
 // Shutdown gracefully shuts down the queue.
@@ -883,7 +871,7 @@ func (q *Queue) publishStatsLoop() {
 	}
 
 	for range statsTick.C {
-		state := q.getState()
+		state := q.State()
 		// Exit if queue is completed or stopped
 		if state == QueueStateCompleted || state == QueueStateStopped {
 			return
@@ -950,16 +938,10 @@ func (q *Queue) Stats() QueueStats {
 	}
 }
 
-// RoundStats returns the statistics for a specific round.
-// Returns nil if the round has no stats yet.
-func (q *Queue) RoundStats(round int) *RoundStats {
-	return q.getRoundStats(round)
-}
-
 // EnsureRoundExpectedFromStats sets Expected for the current round from the stats bucket (O(1) lookup).
 // Call after SetRound (e.g. on init or resume) so Expected reflects actual pending count and survives restarts.
 func (q *Queue) EnsureRoundExpectedFromStats() {
-	q.setExpectedFromStatsBucket(q.getRound())
+	q.setExpectedFromStatsBucket(q.GetRound())
 }
 
 // AddWorker registers a worker with this queue for reference.
@@ -970,47 +952,17 @@ func (q *Queue) AddWorker(worker Worker) {
 	q.workers = append(q.workers, worker)
 }
 
-// Close stops the queue and cleans up resources.
-// Stops stats publishing loop and ensures clean shutdown.
-// If the queue is already completed, this is a no-op (queues clean themselves up on completion).
+// Close stops the queue and cleans up resources: stats publishing loop, output buffer, and sets state to Stopped if not already Completed or Stopped.
 func (q *Queue) Close() {
-	// Quick check - if already completed, nothing to do (queues clean themselves up)
-	state := q.getState()
-	hasStatsTick := q.getStatsTick() != nil
-	outputBuffer := q.getOutputBuffer()
-
-	if state == QueueStateCompleted {
-		// Still need to clean up stats ticker and buffer if they exist
-		if hasStatsTick {
-			statsTick := q.getStatsTick()
-			if statsTick != nil {
-				statsTick.Stop()
-				q.setStatsTick(nil)
-			}
-			q.setStatsChan(nil)
-		}
-		// Ensure buffer is stopped
-		if outputBuffer != nil {
-			outputBuffer.Stop()
-		}
-		return
-	}
-
-	// Queue not completed - clean up normally
+	state := q.State()
 	statsTick := q.getStatsTick()
 	if statsTick != nil {
 		statsTick.Stop()
 		q.setStatsTick(nil)
 	}
 	q.setStatsChan(nil)
-	closeOutputBuffer := q.getOutputBuffer()
 	if state != QueueStateCompleted && state != QueueStateStopped {
-		q.setState(QueueStateStopped)
-	}
-
-	// Ensure buffer is stopped and flushed
-	if closeOutputBuffer != nil {
-		closeOutputBuffer.Stop()
+		q.SetState(QueueStateStopped)
 	}
 }
 
@@ -1034,7 +986,7 @@ func (q *Queue) recordExecutionTime(delta time.Duration) {
 
 // calculateAverage calculates the average execution time and clears the buffer.
 func (q *Queue) calculateAverage() {
-	deltas := q.getExecutionTimeDeltas()
+	deltas := q.GetExecutionTimeDeltas()
 	if len(deltas) == 0 {
 		q.setAvgExecutionTime(0)
 		return
@@ -1051,14 +1003,9 @@ func (q *Queue) calculateAverage() {
 	q.clearExecutionTimeDeltas()
 }
 
-// GetAverageExecutionTime returns the current average task execution time.
-func (q *Queue) GetAverageExecutionTime() time.Duration {
-	return q.getAvgExecutionTime()
-}
-
 // GetExecutionTimeBufferSize returns the current size of the execution time buffer.
 func (q *Queue) GetExecutionTimeBufferSize() int {
-	return len(q.getExecutionTimeDeltas())
+	return len(q.GetExecutionTimeDeltas())
 }
 
 // GetTotalCompleted returns the total number of completed tasks across all rounds.
@@ -1079,11 +1026,10 @@ func (q *Queue) GetTotalCompleted() int {
 // for each round. The outer loop checks coordinator gates before starting each round (DST only).
 // The inner loop processes tasks until the round is complete.
 func (q *Queue) Run() {
-	// DST queue only operates in traversal mode - retry/exclusion/unexclusion are SRC-only
-	mode := q.getMode()
+	// DST queue runs traversal or retry; copy is the only mode DST skips
+	mode := q.GetMode()
 	if q.name == "dst" && !(mode == QueueModeTraversal || mode == QueueModeRetry) {
-		// Mark as completed immediately and exit
-		q.setState(QueueStateCompleted)
+		q.SetState(QueueStateCompleted)
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("info",
 				fmt.Sprintf("DST queue skipping non-traversal mode (%s) - marking as completed", mode),
@@ -1104,10 +1050,10 @@ func (q *Queue) Run() {
 			}
 		}
 
-		state := q.getState()
-		boltDB := q.getBoltDB()
+		state := q.State()
+		database := q.getDatabase()
 
-		if boltDB == nil {
+		if database == nil {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
@@ -1115,24 +1061,19 @@ func (q *Queue) Run() {
 		// If queue is completed or stopped, exit
 		if state == QueueStateCompleted || state == QueueStateStopped {
 			if logservice.LS != nil {
-				currentRound := q.getRound()
+				currentRound := q.GetRound()
 				_ = logservice.LS.Log("info",
 					fmt.Sprintf("Run() exiting - queue %s (round %d)", state, currentRound),
 					"queue", q.name, q.name)
-			}
-			// Stop output buffer when queue completes to prevent goroutine leak
-			outputBuffer := q.getOutputBuffer()
-			if outputBuffer != nil {
-				outputBuffer.Stop()
 			}
 			return
 		}
 
 		// Get current round
-		currentRound := q.getRound()
+		currentRound := q.GetRound()
 		coordinator := q.getCoordinator()
 
-		// GATE CHECK: Can we start processing this round? (DST only - SRC has no gates)
+		// GATE CHECK: Can we start processing this round? (DST only)
 		// This check happens IMMEDIATELY at the start of each iteration, before any task processing.
 		if q.name == "dst" && coordinator != nil {
 			canStartRound := coordinator.CanDstStartRound(currentRound)
@@ -1140,7 +1081,7 @@ func (q *Queue) Run() {
 			if !canStartRound {
 				// Still waiting - set state and sleep
 				if state != QueueStateWaiting {
-					q.setState(QueueStateWaiting)
+					q.SetState(QueueStateWaiting)
 				}
 				time.Sleep(50 * time.Millisecond)
 				continue // Loop back and check again
@@ -1148,7 +1089,7 @@ func (q *Queue) Run() {
 
 			// Green light - can start this round, ensure state is running
 			if state == QueueStateWaiting {
-				q.setState(QueueStateRunning)
+				q.SetState(QueueStateRunning)
 			}
 		}
 
@@ -1164,7 +1105,7 @@ func (q *Queue) Run() {
 				}
 			}
 
-			innerState := q.getState()
+			innerState := q.State()
 
 			// If paused, block here
 			if innerState == QueueStatePaused {
@@ -1174,31 +1115,27 @@ func (q *Queue) Run() {
 
 			// If stopped or completed, exit
 			if innerState == QueueStateStopped || innerState == QueueStateCompleted {
-				outputBuffer := q.getOutputBuffer()
-				if outputBuffer != nil {
-					outputBuffer.Stop()
-				}
 				return
 			}
 
 			// Get current state snapshot
-			inProgressCount := q.getInProgressCount()
-			pendingCount := q.getPendingCount()
+			inProgressCount := q.InProgressCount()
+			pendingCount := q.GetPendingCount()
 			lastPullWasPartial := q.getLastPullWasPartial()
 			pullCount := q.getCurrentRoundPullCount()
-			itemsYielded := q.getCurrentRoundItemsYielded()
-			roundToCheck := q.getRound()
+			pulledAmount := q.getCurrentRoundPulledAmount() // items actually returned from our DB queries this round
+			roundToCheck := q.GetRound()
 
 			// 1. Check queue completion (mode-specific)
-			// For copy mode: only check final completion after we've tried to advance and found no more rounds
-			// For traversal mode: check when pullCount > 0 && itemsYielded == 0 (no tasks at current round)
-			mode := q.getMode()
+			// Done when we've queried at least once (pullCount > 0) and pulled amount is 0 (queries returned nothing).
+			mode := q.GetMode()
 			if mode != QueueModeCopy {
-				// For traversal/retry modes, check for final completion when: pullCount > 0 && itemsYielded == 0
-				if pullCount > 0 && itemsYielded == 0 && inProgressCount == 0 && pendingCount == 0 {
+				// Traversal/retry: mark complete only when we queried and got 0 items, and first pull of round (prevents premature completion mid-round).
+				if pullCount > 0 && pulledAmount == 0 && inProgressCount == 0 && pendingCount == 0 {
+					wasFirstPull := (pullCount == 1) // first pull of this round returned 0 items
 					completed := q.checkCompletion(roundToCheck, CompletionCheckOptions{
 						CheckFinalCompletion: true,
-						WasFirstPull:         true,
+						WasFirstPull:         wasFirstPull,
 						FlushBuffer:          true,
 					})
 					if completed {
@@ -1214,9 +1151,8 @@ func (q *Queue) Run() {
 			// Round complete when: no in-progress, no pending, last pull was partial
 			roundCompleteSoft := inProgressCount == 0 && pendingCount == 0 && lastPullWasPartial
 
-			// For copy mode, also consider round complete if we pulled but got 0 items
-			// This means the current round has no tasks for the current pass - advance to next round
-			if mode == QueueModeCopy && pullCount > 0 && itemsYielded == 0 && inProgressCount == 0 && pendingCount == 0 {
+			// For copy mode, also consider round complete if we queried and pulled amount is 0 (no tasks for this pass at this round)
+			if mode == QueueModeCopy && pullCount > 0 && pulledAmount == 0 && inProgressCount == 0 && pendingCount == 0 {
 				roundCompleteSoft = true
 			}
 
@@ -1230,7 +1166,7 @@ func (q *Queue) Run() {
 			}
 
 			// Check if round advanced
-			if q.getRound() != currentRound {
+			if q.GetRound() != currentRound {
 				break // Round advanced, continue outer loop
 			}
 
@@ -1246,25 +1182,39 @@ func (q *Queue) advanceToNextRound() {
 	// No gating here - rounds advance freely
 	// Gating only happens when STARTING a round (checked in Run() outer loop)
 
+	// Flush buffer before seal so all status updates are in staging
 	outputBuffer := q.getOutputBuffer()
 	if outputBuffer != nil {
 		outputBuffer.Flush()
 	}
 
+	// Phase 5: onLevelSeal - merge staging to live, update stats, write completed count, drop staging, create new staging.
+	if database := q.getDatabase(); database != nil {
+		round := q.GetRound()
+		completed := int64(0)
+		if stats := q.GetRoundStats(round); stats != nil {
+			completed = int64(stats.Completed)
+		}
+		_ = database.RunUpdateWriterTx(func(w *db.Writer) error {
+			return w.ApplyStatusStagingAndDrop(round, getQueueType(q.name), completed)
+		})
+	}
+	// This queue's cursor must not survive its seal. Reset only this queue's cursor; other queues are independent.
+	q.resetThisQueueKeysetCursor()
+
 	// Ensure state is running if it was waiting
-	state := q.getState()
+	state := q.State()
 	if state == QueueStateWaiting {
-		q.setState(QueueStateRunning)
+		q.SetState(QueueStateRunning)
 	}
 
 	// Delegate to mode-specific round advancement
-	mode := q.getMode()
+	mode := q.GetMode()
 	if mode == QueueModeCopy {
-		// Delegate to copy-specific round advancement in mode_copy.go
 		q.AdvanceCopyRound()
 		return
 	}
 
-	// For traversal/retry modes, delegate to traversal-specific round advancement
+	// For traversal and retry modes, use the same round advancement (increment round, reset flags, pull)
 	q.AdvanceTraversalRound()
 }

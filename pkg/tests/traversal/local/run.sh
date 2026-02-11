@@ -9,23 +9,8 @@ echo "=== Sylos Migration Local Filesystem Test Runner ==="
 echo ""
 
 # Clean up existing test databases
-echo "Cleaning up test databases..."
-mainDB="pkg/tests/traversal/shared/main_test.db"
-
-# Remove the BoltDB file if it exists
-if [ -f "$mainDB" ]; then
-    echo "Removing $mainDB file..."
-    rm -f "$mainDB"
-fi
-rm -f "${mainDB%.db}_logs.db"
-
-# Remove the migration config YAML file if it exists
-if [ -f "pkg/tests/traversal/shared/main_test.yaml" ]; then
-    echo "Removing pkg/tests/traversal/shared/main_test.yaml file..."
-    rm -f "pkg/tests/traversal/shared/main_test.yaml"
-fi
-
-echo "Cleanup complete"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+bash "$SCRIPT_DIR/../shared/cleanup.sh"
 echo ""
 
 # Run the test

@@ -1,74 +1,27 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Retry Sweep Test Runner
 # Copyright 2025 Sylos contributors
 # SPDX-License-Identifier: LGPL-2.1-or-later
+# Test DB is DuckDB at pkg/tests/traversal/shared/main_test.db. If missing, it is generated (traversal from Spectra roots).
 
+set -e
 clear
 
 echo "=== Retry Sweep Test Runner ==="
 echo ""
 
-# Source files (user-provided pre-configured test data)
-sourceDB="pkg/tests/traversal/shared/main.db"
-sourceYAML="pkg/tests/traversal/shared/main.yaml"
-sourceSpectra="pkg/tests/traversal/shared/spectra.db"
-
-# Destination files (mutable test objects)
 destDB="pkg/tests/traversal/shared/main_test.db"
-destYAML="pkg/tests/traversal/shared/main_test.yaml"
-destSpectra="pkg/tests/traversal/shared/spectra_test.db"
 
-# Check if source files exist
-if [ ! -f "$sourceDB" ]; then
-    echo "❌ ERROR: Source database not found: $sourceDB"
-    echo "Please provide a pre-configured test database."
-    exit 1
+# Generate DuckDB if missing (same roots/setup as traversal shared; Spectra DBs not modified)
+if [ ! -f "$destDB" ]; then
+    echo "Test DB not found. Generating DuckDB (traversal from Spectra roots)..."
+    go run ./cmd/gen_traversal_test_db
+    echo ""
 fi
 
-if [ ! -f "$sourceYAML" ]; then
-    echo "⚠️  WARNING: Source YAML not found: $sourceYAML (continuing anyway)"
-fi
-
-if [ ! -f "$sourceSpectra" ]; then
-    echo "⚠️  WARNING: Source Spectra DB not found: $sourceSpectra (continuing anyway)"
-fi
-
-# Clean up previous test files
-echo "Cleaning up previous test files..."
-if [ -f "$destDB" ]; then
-    rm -f "$destDB"
-fi
-rm -f "${destDB%.db}_logs.db"
-if [ -f "$destYAML" ]; then
-    rm -f "$destYAML"
-fi
-if [ -f "$destSpectra" ]; then
-    rm -f "$destSpectra"
-fi
-
-# Copy source files to destination
-echo "Copying test files..."
-cp -f "$sourceDB" "$destDB"
-echo "  Copied: $sourceDB -> $destDB"
-
-if [ -f "$sourceYAML" ]; then
-    cp -f "$sourceYAML" "$destYAML"
-    echo "  Copied: $sourceYAML -> $destYAML"
-fi
-
-if [ -f "$sourceSpectra" ]; then
-    cp -f "$sourceSpectra" "$destSpectra"
-    echo "  Copied: $sourceSpectra -> $destSpectra"
-fi
-
-echo ""
-
-# Run the test
 startTime=$(date +%s)
-
 echo "Running retry sweep test..."
-go run pkg/tests/traversal/retry_sweep/main.go
-
+go run ./pkg/tests/traversal/retry_sweep/main.go
 exitCode=$?
 endTime=$(date +%s)
 duration=$((endTime - startTime))
@@ -76,13 +29,10 @@ duration=$((endTime - startTime))
 echo ""
 echo "=== Test Summary ==="
 echo "Duration: ${duration} seconds"
-
 if [ $exitCode -eq 0 ]; then
     echo "Status: PASSED"
 else
     echo "Status: FAILED"
 fi
-
 echo ""
-
 exit $exitCode

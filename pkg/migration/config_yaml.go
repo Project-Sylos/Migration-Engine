@@ -25,11 +25,11 @@ const (
 	StatusRootsSet                = "Roots-Set"                    // User has set root folders and services (initial state)
 	StatusFiltersSet              = "Filters-Set"                  // Filters configured, ready for traversal (also used for retry)
 	StatusTraversalInProgress     = "Traversal-In-Progress"        // Traversal is currently running
-	StatusPreparingPathReview     = "Preparing-Path-Review"        // Traversal complete, ready for ETL from BoltDB to DuckDB
-	StatusETLBoltToDuckInProgress = "ETL-Bolt-To-Duck-In-Progress" // ETL from BoltDB to DuckDB is currently running
-	StatusAwaitingPathReview      = "Awaiting-Path-Review"         // ETL complete, awaiting user review
-	StatusPreparingRetry          = "Preparing-For-Retry"          // Ready for retry sweep - ETL from DuckDB to BoltDB will start
-	StatusETLDuckToBoltInProgress = "ETL-Duck-To-Bolt-In-Progress" // ETL from DuckDB to BoltDB is currently running
+	StatusPreparingPathReview     = "Preparing-Path-Review"        // (legacy YAML key; DuckDB-only, no ETL)
+	StatusETLBoltToDuckInProgress = "ETL-Bolt-To-Duck-In-Progress" // (legacy YAML key; DuckDB-only, no ETL)
+	StatusAwaitingPathReview      = "Awaiting-Path-Review"         // (legacy YAML key; DuckDB-only, no ETL)
+	StatusPreparingRetry          = "Preparing-For-Retry"          // (legacy YAML key; DuckDB-only, no ETL)
+	StatusETLDuckToBoltInProgress = "ETL-Duck-To-Bolt-In-Progress" // (legacy YAML key; DuckDB-only, no ETL)
 	StatusCopyInProgress          = "Copy-In-Progress"             // Copy phase is currently running
 	StatusComplete                = "Complete"                     // Migration completed successfully
 	StatusSuspended               = "Suspended"                    // Migration suspended (can be resumed)
@@ -56,8 +56,10 @@ type MetadataConfig struct {
 }
 
 // StateConfig tracks the current migration checkpoint state.
+// DuckDB-only: active states are Roots-Set, Filters-Set, Traversal-In-Progress, Copy-In-Progress, Complete, Suspended.
+// ETL state names are kept for YAML compatibility but the engine no longer transitions to them.
 type StateConfig struct {
-	Status       string `yaml:"status"` // Roots-Set, Filters-Set, Traversal-In-Progress, Preparing-Path-Review, ETL-Bolt-To-Duck-In-Progress, Awaiting-Path-Review, Preparing-For-Retry, ETL-Duck-To-Bolt-In-Progress, Copy-In-Progress, Complete, Suspended
+	Status       string `yaml:"status"`
 	LastRoundSrc *int   `yaml:"last_round_src,omitempty"`
 	LastRoundDst *int   `yaml:"last_round_dst,omitempty"`
 	// Retry metadata (only set when Status = Filters-Set for retry)
@@ -350,15 +352,8 @@ func UpdateConfigFromStatus(yamlCfg *MigrationConfigYAML, status MigrationStatus
 	yamlCfg.State.LastRoundSrc = &srcRound
 	yamlCfg.State.LastRoundDst = &dstRound
 
-	// Auto-transition to Preparing-Path-Review only if traversal is in progress and completes successfully
-	// All other state transitions should be managed by the API
-	if yamlCfg.State.Status != StatusSuspended && yamlCfg.State.Status == StatusTraversalInProgress {
-		if status.IsComplete() {
-			yamlCfg.State.Status = StatusPreparingPathReview
-		}
-		// Note: If traversal fails or has pending work, status remains Traversal-In-Progress
-		// The API should handle error states and decide when to transition
-	}
+	// DuckDB-only: no ETL. When traversal completes, do not transition to ETL states.
+	// The API may transition to Copy-In-Progress when starting the copy phase.
 }
 
 // SetSuspendedStatus sets the YAML config status to "suspended" with current state.
@@ -421,56 +416,6 @@ func SetStatusTraversalInProgress(yamlCfg *MigrationConfigYAML) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	yamlCfg.Metadata.LastModified = now
 	yamlCfg.State.Status = StatusTraversalInProgress
-}
-
-// SetStatusAwaitingPathReview sets the migration status to "Awaiting-Path-Review".
-// Called when traversal completes successfully.
-func SetStatusAwaitingPathReview(yamlCfg *MigrationConfigYAML) {
-	if yamlCfg == nil {
-		return
-	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	yamlCfg.Metadata.LastModified = now
-	yamlCfg.State.Status = StatusAwaitingPathReview
-}
-
-// SetStatusPreparingRetry sets the migration status to "Preparing-For-Retry".
-// Called when API triggers retry sweep - signals that ETL from DuckDB to BoltDB will start.
-// After this status is set, the ETL process should call SetStatusETLDuckToBoltInProgress when it starts,
-// and then SetStatusFiltersSet(isRetry=true, maxKnownDepth) when ETL completes.
-func SetStatusPreparingRetry(yamlCfg *MigrationConfigYAML) {
-	if yamlCfg == nil {
-		return
-	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	yamlCfg.Metadata.LastModified = now
-	yamlCfg.State.Status = StatusPreparingRetry
-}
-
-// SetStatusETLBoltToDuckInProgress sets the migration status to "ETL-Bolt-To-Duck-In-Progress".
-// Called when ETL from BoltDB to DuckDB actually starts.
-// After ETL completes, the caller should call SetStatusAwaitingPathReview to transition
-// to Awaiting-Path-Review status.
-func SetStatusETLBoltToDuckInProgress(yamlCfg *MigrationConfigYAML) {
-	if yamlCfg == nil {
-		return
-	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	yamlCfg.Metadata.LastModified = now
-	yamlCfg.State.Status = StatusETLBoltToDuckInProgress
-}
-
-// SetStatusETLDuckToBoltInProgress sets the migration status to "ETL-Duck-To-Bolt-In-Progress".
-// Called when ETL from DuckDB to BoltDB actually starts.
-// After ETL completes, the caller should call SetStatusFiltersSet(isRetry=true, maxKnownDepth) to transition
-// back to Filters-Set status, signaling that the migration is ready to start the retry sweep.
-func SetStatusETLDuckToBoltInProgress(yamlCfg *MigrationConfigYAML) {
-	if yamlCfg == nil {
-		return
-	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	yamlCfg.Metadata.LastModified = now
-	yamlCfg.State.Status = StatusETLDuckToBoltInProgress
 }
 
 // SetStatusCopyInProgress sets the migration status to "Copy-In-Progress".

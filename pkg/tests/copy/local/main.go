@@ -92,15 +92,15 @@ func runTest() error {
 	// Reopen database (LetsMigrate closed it in ModeStandalone mode)
 	fmt.Println("🚀 Phase 3: Copy Phase")
 	fmt.Println("======================")
-	boltDB, srcAdapter, dstAdapter, err := shared.SetupLocalCopyTest(srcPath, dstPath, false) // Don't remove existing DB
+	database, srcAdapter, dstAdapter, err := shared.SetupLocalCopyTest(srcPath, dstPath, false) // Don't remove existing DB
 	if err != nil {
 		return fmt.Errorf("copy setup failed: %w", err)
 	}
-	defer boltDB.Close()
+	defer database.Close()
 
 	// Run copy phase
 	stats, err := migration.RunCopyPhase(migration.CopyPhaseConfig{
-		BoltDB:          boltDB,
+		BoltDB:          database,
 		SrcAdapter:      srcAdapter,
 		DstAdapter:      dstAdapter,
 		WorkerCount:     10,
@@ -121,7 +121,7 @@ func runTest() error {
 	fmt.Println("✓ Phase 4: Verification")
 	fmt.Println("========================")
 	shared.PrintCopyVerification(stats)
-	if err := shared.VerifyCopyCompletion(boltDB); err != nil {
+	if err := shared.VerifyCopyCompletion(database); err != nil {
 		return fmt.Errorf("verification failed: %w", err)
 	}
 

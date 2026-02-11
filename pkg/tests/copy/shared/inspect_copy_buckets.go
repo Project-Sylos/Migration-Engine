@@ -8,7 +8,6 @@ import (
 	"os"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	bolt "go.etcd.io/bbolt"
 )
 
 // InspectCopyBuckets opens the database and prints the first 10 items from each copy status bucket
@@ -25,7 +24,7 @@ func InspectCopyBuckets(dbPath string) error {
 	fmt.Println("==================================================================================")
 
 	// Get all levels from SRC
-	levels, err := dbInstance.GetAllLevels("SRC")
+	levels, err := db.GetAllLevels(dbInstance, "SRC")
 	if err != nil {
 		return fmt.Errorf("failed to get levels: %w", err)
 	}
@@ -49,58 +48,22 @@ func InspectCopyBuckets(dbPath string) error {
 	// Node types to check
 	nodeTypes := []string{db.NodeTypeFolder, db.NodeTypeFile}
 
-	// Iterate through each level
+	// Iterate through each level and print copy status counts (from live table via GetCopyCountAtDepth)
 	for _, level := range levels {
 		fmt.Printf("Level %d:\n", level)
 		fmt.Println("----------------------------------------------------------------------------------")
 
-		// Check each copy status bucket for both folders and files
 		for _, status := range copyStatuses {
 			fmt.Printf("  [%s]:\n", status)
 
 			for _, nodeType := range nodeTypes {
 				fmt.Printf("    [%s]: ", nodeType)
-
-				err := dbInstance.View(func(tx *bolt.Tx) error {
-					// Verify we're using the correct bucket path
-					bucketPath := db.GetCopyStatusBucketPath(level, nodeType, status)
-					fmt.Printf("(path: %v) ", bucketPath)
-
-					statusBucket := db.GetCopyStatusBucket(tx, level, nodeType, status)
-					if statusBucket == nil {
-						fmt.Printf("bucket does not exist\n")
-						return nil
-					}
-
-					// Count items and print first 10
-					cursor := statusBucket.Cursor()
-					count := 0
-					first10 := make([][]byte, 0, 10)
-
-					for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
-						count++
-						if len(first10) < 10 {
-							keyCopy := make([]byte, len(k))
-							copy(keyCopy, k)
-							first10 = append(first10, keyCopy)
-						}
-					}
-
-					fmt.Printf("total=%d", count)
-					if count > 0 {
-						fmt.Printf(", first 10 ULIDs:")
-						for i, ulid := range first10 {
-							fmt.Printf("\n      %d. %s", i+1, string(ulid))
-						}
-					}
-					fmt.Println()
-
-					return nil
-				})
-
+				count, err := dbInstance.GetCopyCountAtDepth(level, nodeType, status)
 				if err != nil {
 					fmt.Printf("ERROR: %v\n", err)
+					continue
 				}
+				fmt.Printf("total=%d\n", count)
 			}
 		}
 

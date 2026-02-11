@@ -19,7 +19,7 @@ import (
 type TraversalWorker struct {
 	id          string
 	queue       *Queue
-	boltDB      *db.DB
+	database    *db.DB
 	fsAdapter   types.FSAdapter
 	queueName   string          // "src" or "dst" for logging
 	isDst       bool            // true if this is a destination worker (performs comparison)
@@ -31,7 +31,7 @@ type TraversalWorker struct {
 func NewTraversalWorker(
 	id string,
 	queue *Queue,
-	boltInstance *db.DB,
+	database *db.DB,
 	adapter types.FSAdapter,
 	queueName string,
 	shutdownCtx context.Context,
@@ -39,7 +39,7 @@ func NewTraversalWorker(
 	return &TraversalWorker{
 		id:          id,
 		queue:       queue,
-		boltDB:      boltInstance,
+		database:    database,
 		fsAdapter:   adapter,
 		queueName:   queueName,
 		isDst:       queueName == "dst",
@@ -98,9 +98,11 @@ func (w *TraversalWorker) Run() {
 		err := w.execute(task)
 		if err != nil {
 			// Record task error in main DB for cross-lookup (traversal phase)
-			if w.boltDB != nil {
+			if w.database != nil {
 				queueType := strings.ToUpper(w.queueName)
-				_, _ = db.RecordTaskError(w.boltDB, queueType, "traversal", task.ID, err.Error(), task.Attempts, task.LocationPath())
+				_ = w.database.RunUpdateWriterTx(func(tx *db.Writer) error {
+					return tx.RecordTaskError(queueType, "traversal", task.ID, err.Error(), task.Attempts, task.LocationPath())
+				})
 			}
 			w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
 			nodeID := task.ID

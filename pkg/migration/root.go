@@ -17,33 +17,32 @@ type RootSeedSummary struct {
 	DstRoots int
 }
 
-// SeedRootTasks inserts the supplied source and destination root folders into BoltDB.
+// SeedRootTasks inserts the supplied source and destination root folders into the database.
 // The folders should already contain root-relative metadata (LocationPath="/", DepthLevel=0).
-func SeedRootTasks(srcRoot types.Folder, dstRoot types.Folder, boltDB *db.DB) (RootSeedSummary, error) {
-	if boltDB == nil {
-		return RootSeedSummary{}, fmt.Errorf("boltDB cannot be nil")
+func SeedRootTasks(srcRoot types.Folder, dstRoot types.Folder, database *db.DB) (RootSeedSummary, error) {
+	if database == nil {
+		return RootSeedSummary{}, fmt.Errorf("database cannot be nil")
 	}
 
 	if srcRoot.ServiceID == "" || dstRoot.ServiceID == "" {
 		return RootSeedSummary{}, fmt.Errorf("source and destination root folders must have a ServiceID")
 	}
 
-	if err := queue.SeedRootTasks(srcRoot, dstRoot, boltDB); err != nil {
+	if err := queue.SeedRootTasks(srcRoot, dstRoot, database); err != nil {
 		return RootSeedSummary{}, fmt.Errorf("failed to seed root tasks: %w", err)
 	}
 
 	var summary RootSeedSummary
-
-	// Count root tasks from BoltDB
-	srcCount, err := boltDB.CountByPrefix("SRC", 0, db.StatusPending)
-	if err == nil {
-		summary.SrcRoots = srcCount
+	// Stats for depth 0 are updated at seal; until then use counts from stats table or 1/1 after seeding roots
+	c, _ := database.GetStatsCountAtDepth("SRC", 0, db.StatsKeyTraversalStatus(db.StatusPending))
+	summary.SrcRoots = int(c)
+	if summary.SrcRoots == 0 {
+		summary.SrcRoots = 1 // we just inserted the root
 	}
-
-	dstCount, err := boltDB.CountByPrefix("DST", 0, db.StatusPending)
-	if err == nil {
-		summary.DstRoots = dstCount
+	c, _ = database.GetStatsCountAtDepth("DST", 0, db.StatsKeyTraversalStatus(db.StatusPending))
+	summary.DstRoots = int(c)
+	if summary.DstRoots == 0 {
+		summary.DstRoots = 1
 	}
-
 	return summary, nil
 }

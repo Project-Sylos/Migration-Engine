@@ -8,15 +8,15 @@
 // without disrupting queue operations.
 //
 // Usage:
-//   observer := queue.NewQueueObserver(boltDB, 200*time.Millisecond)
+//   observer := queue.NewQueueObserver(database, 200*time.Millisecond)
 //   observer.RegisterQueue("src", srcQueue)
 //   observer.RegisterQueue("dst", dstQueue)
 //   observer.Start()
 //   // Stats are published to /STATS/queue-stats bucket with keys like "src-traversal", "dst-traversal"
 //
 // Stats can be retrieved from BoltDB using:
-//   statsJSON, err := boltDB.GetQueueStats("src-traversal")
-//   allStats, err := boltDB.GetAllQueueStats()
+//   statsJSON, err := database.GetQueueStats("src-traversal")
+//   allStats, err := database.GetAllQueueStats()
 
 package queue
 
@@ -28,7 +28,6 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
-	bolt "go.etcd.io/bbolt"
 )
 
 // ExternalQueueMetrics contains user-facing metrics published to BoltDB for API access.
@@ -84,7 +83,7 @@ type InternalQueueMetrics struct {
 // Similar to QueueCoordinator, but focused on observability rather than coordination.
 type QueueObserver struct {
 	mu             sync.RWMutex
-	boltDB         *db.DB
+	database       *db.DB
 	queues         map[string]*Queue // Map of queue name -> queue reference
 	stopChan       chan struct{}
 	updateTicker   *time.Ticker
@@ -116,13 +115,13 @@ const (
 
 // NewQueueObserver creates a new observer that will publish stats to BoltDB.
 // updateInterval is how often stats are written to BoltDB (default: 200ms).
-func NewQueueObserver(boltInstance *db.DB, updateInterval time.Duration) *QueueObserver {
+func NewQueueObserver(database *db.DB, updateInterval time.Duration) *QueueObserver {
 	if updateInterval <= 0 {
 		updateInterval = 200 * time.Millisecond
 	}
 
 	return &QueueObserver{
-		boltDB:          boltInstance,
+		database:        database,
 		queues:          make(map[string]*Queue),
 		stopChan:        make(chan struct{}),
 		updateTicker:    time.NewTicker(updateInterval),
@@ -276,7 +275,7 @@ func (o *QueueObserver) observeLoop() {
 			}
 
 			// Publish all collected metrics to BoltDB
-			if len(metrics) > 0 && o.boltDB != nil {
+			if len(metrics) > 0 && o.database != nil {
 				o.publishMetricsToBoltDB(metrics)
 			}
 		}
@@ -577,30 +576,25 @@ func (o *QueueObserver) updateInternalMetrics(queueName string, queue *Queue, cu
 // getTotalPendingCount reads total pending count from stats bucket (O(1) lookup).
 // The stats bucket is maintained by the output buffer during flush operations.
 func (o *QueueObserver) getTotalPendingCount(queueName string) int {
-	if o.boltDB == nil {
+	if o.database == nil {
 		return 0
 	}
 
 	// Handle copy phase separately
 	if queueName == "copy" {
 		// For copy phase, sum pending counts across all levels and both node types
-		levels, err := o.boltDB.GetAllLevels("SRC")
+		levels, err := db.GetAllLevels(o.database, "SRC")
 		if err != nil {
 			return 0
 		}
 
 		totalPending := 0
 		for _, level := range levels {
-			// Sum pending for folders
-			bucketPath := db.GetCopyStatusBucketPath(level, db.NodeTypeFolder, db.CopyStatusPending)
-			count, err := o.boltDB.GetBucketCount(bucketPath)
+			count, err := o.database.GetCopyCountAtDepth(level, db.NodeTypeFolder, db.CopyStatusPending)
 			if err == nil {
 				totalPending += int(count)
 			}
-
-			// Sum pending for files
-			bucketPath = db.GetCopyStatusBucketPath(level, db.NodeTypeFile, db.CopyStatusPending)
-			count, err = o.boltDB.GetBucketCount(bucketPath)
+			count, err = o.database.GetCopyCountAtDepth(level, db.NodeTypeFile, db.CopyStatusPending)
 			if err == nil {
 				totalPending += int(count)
 			}
@@ -616,17 +610,15 @@ func (o *QueueObserver) getTotalPendingCount(queueName string) int {
 	}
 
 	// Get all levels for this queue type
-	levels, err := o.boltDB.GetAllLevels(queueType)
+	levels, err := db.GetAllLevels(o.database, queueType)
 	if err != nil {
 		return 0
 	}
 
-	// Sum pending counts across all levels using stats bucket (O(1) per level)
+	// Sum pending counts across all levels using stats table
 	totalPending := 0
 	for _, level := range levels {
-		// Use GetBucketCount which reads from stats bucket for O(1) lookup
-		bucketPath := db.GetTraversalStatusBucketPath(queueType, level, db.StatusPending)
-		count, err := o.boltDB.GetBucketCount(bucketPath)
+		count, err := o.database.GetStatsCountAtDepth(queueType, level, db.StatsKeyTraversalStatus(db.StatusPending))
 		if err == nil {
 			totalPending += int(count)
 		}
@@ -638,30 +630,25 @@ func (o *QueueObserver) getTotalPendingCount(queueName string) int {
 // getTotalFailedCount reads total failed count from stats bucket (O(1) lookup).
 // The stats bucket is maintained by the output buffer during flush operations.
 func (o *QueueObserver) getTotalFailedCount(queueName string) int {
-	if o.boltDB == nil {
+	if o.database == nil {
 		return 0
 	}
 
 	// Handle copy phase separately
 	if queueName == "copy" {
 		// For copy phase, sum failed counts across all levels and both node types
-		levels, err := o.boltDB.GetAllLevels("SRC")
+		levels, err := db.GetAllLevels(o.database, "SRC")
 		if err != nil {
 			return 0
 		}
 
 		totalFailed := 0
 		for _, level := range levels {
-			// Sum failed for folders
-			bucketPath := db.GetCopyStatusBucketPath(level, db.NodeTypeFolder, db.CopyStatusFailed)
-			count, err := o.boltDB.GetBucketCount(bucketPath)
+			count, err := o.database.GetCopyCountAtDepth(level, db.NodeTypeFolder, db.CopyStatusFailed)
 			if err == nil {
 				totalFailed += int(count)
 			}
-
-			// Sum failed for files
-			bucketPath = db.GetCopyStatusBucketPath(level, db.NodeTypeFile, db.CopyStatusFailed)
-			count, err = o.boltDB.GetBucketCount(bucketPath)
+			count, err = o.database.GetCopyCountAtDepth(level, db.NodeTypeFile, db.CopyStatusFailed)
 			if err == nil {
 				totalFailed += int(count)
 			}
@@ -677,17 +664,15 @@ func (o *QueueObserver) getTotalFailedCount(queueName string) int {
 	}
 
 	// Get all levels for this queue type
-	levels, err := o.boltDB.GetAllLevels(queueType)
+	levels, err := db.GetAllLevels(o.database, queueType)
 	if err != nil {
 		return 0
 	}
 
-	// Sum failed counts across all levels using stats bucket (O(1) per level)
+	// Sum failed counts across all levels using stats table
 	totalFailed := 0
 	for _, level := range levels {
-		// Use GetBucketCount which reads from stats bucket for O(1) lookup
-		bucketPath := db.GetTraversalStatusBucketPath(queueType, level, db.StatusFailed)
-		count, err := o.boltDB.GetBucketCount(bucketPath)
+		count, err := o.database.GetStatsCountAtDepth(queueType, level, db.StatsKeyTraversalStatus(db.StatusFailed))
 		if err == nil {
 			totalFailed += int(count)
 		}
@@ -700,27 +685,16 @@ func (o *QueueObserver) getTotalFailedCount(queueName string) int {
 // Only external metrics are published - internal metrics remain in memory for autoscaling decisions.
 // Each queue's metrics are stored under a key like "src-traversal", "dst-traversal", etc.
 func (o *QueueObserver) publishMetricsToBoltDB(metricsMap map[string]ExternalQueueMetrics) {
-	if o.boltDB == nil {
+	if o.database == nil {
 		return
 	}
 
-	err := o.boltDB.Update(func(tx *bolt.Tx) error {
-		// Get or create the queue-stats bucket
-		statsBucket, err := getQueueStatsBucket(tx)
-		if err != nil {
-			return err
-		}
-
-		// Write metrics for each queue
+	err := o.database.RunUpdateWriterTx(func(w *db.Writer) error {
 		for queueName, metrics := range metricsMap {
-			// Determine the key based on queue name
-			// "src" -> "src-traversal", "dst" -> "dst-traversal", "copy" -> "copy", etc.
 			key := queueName
 			if queueName != "copy" {
 				key = queueName + "-traversal"
 			}
-
-			// Marshal metrics to JSON
 			metricsJSON, err := json.Marshal(metrics)
 			if err != nil {
 				if logservice.LS != nil {
@@ -730,13 +704,10 @@ func (o *QueueObserver) publishMetricsToBoltDB(metricsMap map[string]ExternalQue
 				}
 				continue
 			}
-
-			// Write to BoltDB
-			if err := statsBucket.Put([]byte(key), metricsJSON); err != nil {
+			if err := w.WriteQueueStats(key, string(metricsJSON)); err != nil {
 				return fmt.Errorf("failed to write metrics for %s: %w", key, err)
 			}
 		}
-
 		return nil
 	})
 
@@ -747,10 +718,4 @@ func (o *QueueObserver) publishMetricsToBoltDB(metricsMap map[string]ExternalQue
 				"observer", "publish", "")
 		}
 	}
-}
-
-// getQueueStatsBucket returns the queue-stats bucket, creating it if needed.
-// This is a helper that uses the db package's bucket helpers.
-func getQueueStatsBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
-	return db.GetOrCreateQueueStatsBucket(tx)
 }

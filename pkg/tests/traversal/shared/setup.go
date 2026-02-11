@@ -220,14 +220,13 @@ func SetupEphemeralTest(removeMigrationDB bool) (migration.Config, error) {
 		WorkerCount:     10,
 		MaxRetries:      3,
 		CoordinatorLead: 4,
-		SkipListener:    true,
+		SkipListener:    false,
 		LogAddress:      "127.0.0.1:8081",
 		LogLevel:        "trace",
-		StartupDelay:    1 * time.Second, // you should set this to 3 if you set skip listener to false to account for terminal opening delay
+		StartupDelay:    3 * time.Second, // you should set this to 3 if you set skip listener to false to account for terminal opening delay
 		Verification: migration.VerifyOptions{
 			AllowNotOnSrc: true, // Ephemeral mode allows divergent trees (nodes on dst but not src)
 		},
-		SkipAutoETLAfterTraversal: true, // Skip ETL for ephemeral tests - we only validate BoltDB, not DuckDB
 	}
 
 	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {

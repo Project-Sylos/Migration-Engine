@@ -15,8 +15,8 @@ import (
 // PullTraversalTasks pulls traversal tasks from BoltDB for the current round.
 // Uses getter/setter methods - no direct mutex access.
 func (q *Queue) PullTraversalTasks(force bool) {
-	boltDB := q.getBoltDB()
-	if boltDB == nil {
+	database := q.getDatabase()
+	if database == nil {
 		return
 	}
 
@@ -27,7 +27,7 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	}
 
 	// Don't pull if queue is completed (prevents deadlock on coordinator gate)
-	if q.getState() == QueueStateCompleted {
+	if q.State() == QueueStateCompleted {
 		return
 	}
 
@@ -71,6 +71,13 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	currentRound := snapshot.Round
 	coordinator := q.getCoordinator()
 
+	// For SRC: Don't pull if we're too far ahead of DST (Phase 6 gating).
+	if q.name == "src" && coordinator != nil {
+		if currentRound > coordinator.GetDstRound()+MaxSrcDstGap {
+			return
+		}
+	}
+
 	// For DST: Check coordinator gate before pulling
 	if q.name == "dst" && coordinator != nil {
 		canStartRound := coordinator.CanDstStartRound(currentRound)
@@ -81,57 +88,40 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	}
 
 	batchSize := effectiveLeaseBatchSize()
-	batch, err := db.BatchFetchWithKeys(boltDB, queueType, currentRound, db.StatusPending, batchSize)
-
-	if err != nil {
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to fetch batch from BoltDB: %v", err), "queue", q.name, q.name)
-		}
-		// On error, don't change lastPullWasPartial - keep existing state
-		return
-	}
-
-	// Batch-load expected children for DST tasks
+	var batch []db.FetchResult
 	var expectedFoldersMap map[string][]types.Folder
 	var expectedFilesMap map[string][]types.File
 	var srcIDMap map[string]map[string]string // DST ULID -> (Type+Name -> SRC node ID)
 	var srcIDToMeta map[string]SrcNodeMeta   // SRC ID -> Depth/CopyStatus (for copy-status updates at completion)
+	var err error
+
 	if q.name == "dst" {
-		// First pass: collect all valid (not already leased) folder tasks and their DST parent ULIDs
-		var dstParentIDs []string
-		dstIDToPath := make(map[string]string) // DST ULID -> path (for mapping results back)
-		for _, item := range batch {
-			// Skip ULIDs we've already leased (prevents duplicate pulls from stale views)
-			if q.isLeased(item.Key) {
-				continue
-			}
-
-			task := nodeStateToTask(item.State, taskType)
-			if task.IsFolder() {
-				dstParentIDs = append(dstParentIDs, item.State.ID) // DST parent ULID
-				dstIDToPath[item.State.ID] = task.Folder.LocationPath
-			}
+		var childrenByDstID map[string][]*db.NodeState
+		batch, childrenByDstID, err = db.ListDstBatchWithSrcChildren(database, currentRound, q.getDstKeysetCursor(), batchSize, db.StatusPending)
+		if err == nil && len(batch) > 0 {
+			q.setDstKeysetCursor(batch[len(batch)-1].Key)
+			expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta = BuildExpectedMapsFromDstWithChildren(batch, childrenByDstID)
 		}
-
-		// Batch-load expected children for all folder tasks in one DB operation
-		// Uses lookup table to get SrcID from DST parent IDs, then loads SRC children
-		if len(dstParentIDs) > 0 {
-			var err error
-			expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta, err = BatchLoadExpectedChildrenByDSTIDs(boltDB, dstParentIDs, dstIDToPath)
-			if err != nil {
-				if logservice.LS != nil {
-					_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to batch load expected children: %v", err), "queue", q.name, q.name)
-				}
-				// Continue anyway - tasks will have empty expected children
-				expectedFoldersMap = make(map[string][]types.Folder)
-				expectedFilesMap = make(map[string][]types.File)
-				srcIDMap = make(map[string]map[string]string)
-				srcIDToMeta = make(map[string]SrcNodeMeta)
-			}
-		} else {
-			srcIDMap = make(map[string]map[string]string)
-			srcIDToMeta = make(map[string]SrcNodeMeta)
+		if err != nil {
+			batch = nil
 		}
+	} else {
+		batch, err = db.ListNodesByDepthKeyset(database, queueType, currentRound, q.getSrcKeysetCursor(), db.StatusPending, batchSize)
+		if err == nil && len(batch) > 0 {
+			q.setSrcKeysetCursor(batch[len(batch)-1].Key)
+		}
+	}
+	if err != nil {
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to fetch batch from BoltDB: %v", err), "queue", q.name, q.name)
+		}
+		return
+	}
+	if len(batch) == 0 && q.name == "dst" {
+		expectedFoldersMap = make(map[string][]types.Folder)
+		expectedFilesMap = make(map[string][]types.File)
+		srcIDMap = make(map[string]map[string]string)
+		srcIDToMeta = make(map[string]SrcNodeMeta)
 	}
 
 	for _, item := range batch {
@@ -169,7 +159,7 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		}
 
 		// Enqueue task - only mark as leased if enqueue succeeds
-		if q.enqueuePending(task) {
+		if q.Add(task) {
 			q.addLeasedKey(item.Key)
 		}
 	}
@@ -181,6 +171,7 @@ func (q *Queue) PullTraversalTasks(force bool) {
 
 	// Record pull in RoundInfo
 	q.recordPull(currentRound, len(batch), wasPartial)
+	q.setFirstPullForRound(false)
 
 }
 
@@ -191,15 +182,15 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 	q.recordExecutionTime(executionDelta)
 	currentRound := task.Round
 
-	boltDB := q.getBoltDB()
-	if boltDB == nil {
+	database := q.getDatabase()
+	if database == nil {
 		return
 	}
 
 	queueType := getQueueType(q.name)
 
 	// Convert task to NodeState for BoltDB
-	state := taskToNodeState(task, queueType)
+	state := taskToNodeState(task)
 	if state == nil {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("error",
@@ -274,11 +265,6 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 		outputBuffer := q.getOutputBuffer()
 		// For DST queue: queue lookup mapping if this child has a matching SRC node
 		if queueType == "DST" && child.SrcID != "" {
-			if outputBuffer != nil {
-				// Queue bidirectional lookup mapping: SrcID <-> DST node ID (at nextRound level)
-				outputBuffer.AddLookupMapping(nextRound, child.SrcID, childState.ID)
-			}
-
 			// Update SRC node's CopyStatus if worker determined an update is needed (use meta from pull, no DB lookup)
 			if child.SrcCopyStatus != "" && task.ExpectedSrcNodeMeta != nil {
 				if meta, ok := task.ExpectedSrcNodeMeta[child.SrcID]; ok && outputBuffer != nil {
@@ -362,9 +348,6 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 			outputBuffer := q.getOutputBuffer()
 			// Queue lookup mapping if this child has a matching SRC node
 			if child.srcID != "" {
-				if outputBuffer != nil {
-					outputBuffer.AddLookupMapping(nextRound, child.srcID, taskState.ID)
-				}
 
 				// Update SRC node's CopyStatus if worker determined an update is needed (use meta from pull, no DB lookup)
 				if child.srcCopyStatus != "" && task.ExpectedSrcNodeMeta != nil {
@@ -405,44 +388,12 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 		// Add all operations atomically
 		outputBuffer.AddMultiple(atomicOps)
 
-		// For SRC FOLDER tasks in retry mode: Queue DST cleanup (use preloaded RetryDstCleanup when present)
-		if q.name == "src" && q.getMode() == QueueModeRetry && task.IsFolder() {
-			if task.RetryDstCleanup != nil {
-				c := task.RetryDstCleanup
-				outputBuffer.AddStatusUpdate("DST", c.DstDepth, c.DstOldStatus, db.StatusPending, c.DstID)
-				for _, ch := range c.Children {
-					outputBuffer.AddNodeDeletion("DST", ch.ID, ch.Depth, ch.TraversalStatus)
-				}
-			} else {
-				// Fallback when RetryDstCleanup was not populated (e.g. legacy path)
-				// Join lookup is per level; get SRC node level then lookup
-				srcState, _ := db.GetNodeState(boltDB, "SRC", nodeID)
-				if srcState != nil {
-					dstID, err := db.GetDstIDFromSrcID(boltDB, srcState.Depth, nodeID)
-					if err == nil && dstID != "" {
-					dstState, err := db.GetNodeState(boltDB, "DST", dstID)
-					if err == nil && dstState != nil {
-						oldStatus := dstState.TraversalStatus
-						if oldStatus == "" {
-							oldStatus = db.StatusSuccessful
-						}
-						outputBuffer.AddStatusUpdate("DST", dstState.Depth, oldStatus, db.StatusPending, dstID)
-						childIDs, err := db.GetChildrenIDsByParentID(boltDB, "DST", dstState.Depth, dstID)
-						if err == nil && len(childIDs) > 0 {
-							for _, childID := range childIDs {
-								childState, err := db.GetNodeState(boltDB, "DST", childID)
-								if err == nil && childState != nil {
-									childStatus := childState.TraversalStatus
-									if childStatus == "" {
-										childStatus = db.StatusSuccessful
-									}
-									outputBuffer.AddNodeDeletion("DST", childID, childState.Depth, childStatus)
-								}
-							}
-						}
-					}
-				}
-				}
+		// For SRC FOLDER tasks in retry mode: Queue DST cleanup only when RetryDstCleanup was populated at pull (no DB reads here).
+		if q.name == "src" && q.GetMode() == QueueModeRetry && task.IsFolder() && task.RetryDstCleanup != nil {
+			c := task.RetryDstCleanup
+			outputBuffer.AddStatusUpdate("DST", c.DstDepth, c.DstOldStatus, db.StatusPending, c.DstID)
+			for _, ch := range c.Children {
+				outputBuffer.AddNodeDeletion("DST", ch.ID, ch.Depth, ch.TraversalStatus)
 			}
 		}
 	}
@@ -474,7 +425,7 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 		task.Locked = false
 		// Remove from in-progress BEFORE re-enqueuing to pending
 		q.removeInProgress(nodeID)
-		q.enqueuePending(task) // Re-adds to tracked automatically
+		q.Add(task) // Re-adds to tracked automatically
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("debug",
 				fmt.Sprintf("Retrying task: id=%s path=%s round=%d attempt=%d/%d",
@@ -516,22 +467,23 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 // CheckTraversalCompletion checks if traversal/retry phase should complete.
 // Returns true if the queue should mark as complete, false otherwise.
 func (q *Queue) CheckTraversalCompletion(currentRound int, wasFirstPull bool) bool {
-	boltDB := q.getBoltDB()
-	if boltDB == nil {
+	database := q.getDatabase()
+	if database == nil {
 		return false
 	}
 
 	queueType := getQueueType(q.name)
-	mode := q.getMode()
+	mode := q.GetMode()
 
 	switch mode {
 	case QueueModeTraversal:
 		// Traversal: first pull with 0 entries → complete (exhausted all depths)
 		// Check if any pending tasks exist at current round
-		hasPending, err := boltDB.HasStatusBucketItems(queueType, currentRound, db.StatusPending)
+		c, err := database.GetStatsCountAtDepth(queueType, currentRound, db.StatsKeyTraversalStatus(db.StatusPending))
 		if err != nil {
 			return false
 		}
+		hasPending := c > 0
 
 		// Only end if we don't have any pending items and this was our first pull of the round
 		if !hasPending {
@@ -546,7 +498,8 @@ func (q *Queue) CheckTraversalCompletion(currentRound int, wasFirstPull bool) bo
 		maxKnownDepth := q.getMaxKnownDepth()
 		if maxKnownDepth >= 0 && currentRound > maxKnownDepth {
 			// Past maxKnownDepth - apply traversal completion rules
-			hasPending, err1 := boltDB.HasStatusBucketItems(queueType, currentRound, db.StatusPending)
+			c, err1 := database.GetStatsCountAtDepth(queueType, currentRound, db.StatsKeyTraversalStatus(db.StatusPending))
+			hasPending := err1 == nil && c > 0
 			if err1 == nil && !hasPending && wasFirstPull {
 				return q.markComplete("Retry sweep complete - past maxKnownDepth (%d), no pending/failed tasks at round %d", maxKnownDepth, currentRound)
 			}
@@ -567,21 +520,23 @@ func (q *Queue) AdvanceTraversalRound() {
 	}
 
 	// Ensure state is running if it was waiting
-	state := q.getState()
+	state := q.State()
 	if state == QueueStateWaiting {
-		q.setState(QueueStateRunning)
+		q.SetState(QueueStateRunning)
 	}
 
 	// Advance round by 1 for traversal/retry modes
-	currentRound := q.getRound()
+	currentRound := q.GetRound()
 	newRound := currentRound + 1
 
 	// Get stats for logging
-	q.setRound(newRound)
+	q.SetRound(newRound)
 	q.setExpectedFromStatsBucket(newRound)
 
 	// Reset lastPullWasPartial since we're advancing to a new round
 	q.setLastPullWasPartial(false)
+	// firstPullForRound is set to true in setRound (above)
+	// This queue's keyset cursor is reset in setRound and after this queue's seal (resetThisQueueKeysetCursor)
 	// Initialize RoundInfo for the new round (will be created on first pull)
 	q.getRoundInfo(newRound) // Ensure it exists
 

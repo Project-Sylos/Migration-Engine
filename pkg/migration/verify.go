@@ -24,15 +24,12 @@ type VerificationReport struct {
 	SrcFailed     int
 	DstFailed     int
 	DstNotOnSrc   int
-	SrcSuccessful int   // Count of successful SRC nodes
-	DstSuccessful int   // Count of successful DST nodes
-	SrcCompleted  int64 // Tasks completed (success or final failure) — not compared to bucket counts; some nodes are inserted as successful (e.g. files)
-	DstCompleted  int64 // Tasks completed (success or final failure) — not compared to bucket counts
+	SrcSuccessful int // Count of successful SRC nodes
+	DstSuccessful int // Count of successful DST nodes
 }
 
 // Success returns true when the report satisfies the supplied VerifyOptions.
-// Additionally, migration will not be considered successful unless at least one node was actually moved/traversed.
-// Completed count is not compared to successful+failed: some nodes (e.g. files) are inserted directly as successful.
+// Migration is not considered successful unless at least one node was actually moved/traversed.
 func (r VerificationReport) Success(opts VerifyOptions) bool {
 	if !opts.AllowPending && (r.SrcPending > 0 || r.DstPending > 0) {
 		return false
@@ -47,24 +44,21 @@ func (r VerificationReport) Success(opts VerifyOptions) bool {
 	return true
 }
 
-// VerifyMigration inspects BoltDB for pending, failed, or missing nodes and returns a report.
-// In addition to previous checks, also verifies that at least one file/folder (not just roots) was migrated.
-func VerifyMigration(boltDB *db.DB, opts VerifyOptions) (VerificationReport, error) {
-	if boltDB == nil {
-		return VerificationReport{}, fmt.Errorf("boltDB cannot be nil")
+// VerifyMigration inspects the DuckDB node tables and stats for pending, failed, or missing nodes and returns a report.
+func VerifyMigration(database *db.DB, opts VerifyOptions) (VerificationReport, error) {
+	if database == nil {
+		return VerificationReport{}, fmt.Errorf("database cannot be nil")
 	}
 
 	report := VerificationReport{}
 
-	// Count all src nodes
-	srcTotal, err := boltDB.CountNodes("SRC")
+	srcTotal, err := db.CountNodes(database, "SRC")
 	if err != nil {
 		return VerificationReport{}, fmt.Errorf("failed to count src nodes: %w", err)
 	}
 	report.SrcTotal = srcTotal
 
-	// Count all dst nodes
-	dstTotal, err := boltDB.CountNodes("DST")
+	dstTotal, err := db.CountNodes(database, "DST")
 	if err != nil {
 		return VerificationReport{}, fmt.Errorf("failed to count dst nodes: %w", err)
 	}
@@ -74,69 +68,23 @@ func VerifyMigration(boltDB *db.DB, opts VerifyOptions) (VerificationReport, err
 		return report, fmt.Errorf("no nodes discovered - migration did not run")
 	}
 
-	// Count pending, failed, and not_on_src nodes across all levels
-	srcLevels, err := boltDB.GetAllLevels("SRC")
-	if err != nil {
-		return VerificationReport{}, fmt.Errorf("failed to get src levels: %w", err)
-	}
+	// Status totals from src_stats
+	c, _ := database.GetStatsCount("SRC", db.StatsKeyTraversalStatus(db.StatusPending))
+	report.SrcPending = int(c)
+	c, _ = database.GetStatsCount("SRC", db.StatsKeyTraversalStatus(db.StatusFailed))
+	report.SrcFailed = int(c)
+	c, _ = database.GetStatsCount("SRC", db.StatsKeyTraversalStatus(db.StatusSuccessful))
+	report.SrcSuccessful = int(c)
 
-	var srcPendingCount, srcFailedCount, srcSuccessfulCount int
-	for _, level := range srcLevels {
-		pendingCount, _ := boltDB.CountStatusBucket("SRC", level, db.StatusPending)
-		srcPendingCount += pendingCount
-
-		failedCount, _ := boltDB.CountStatusBucket("SRC", level, db.StatusFailed)
-		srcFailedCount += failedCount
-
-		successfulCount, _ := boltDB.CountStatusBucket("SRC", level, db.StatusSuccessful)
-		srcSuccessfulCount += successfulCount
-	}
-	report.SrcPending = srcPendingCount
-	report.SrcFailed = srcFailedCount
-	report.SrcSuccessful = srcSuccessfulCount
-
-	// Get completed count (tasks that transitioned out of pending)
-	srcCompleted, _ := boltDB.GetTotalCompletedCount("SRC")
-	report.SrcCompleted = srcCompleted
-
-	// Count dst nodes
-	dstLevels, err := boltDB.GetAllLevels("DST")
-	if err != nil {
-		return VerificationReport{}, fmt.Errorf("failed to get dst levels: %w", err)
-	}
-
-	var dstPendingCount, dstFailedCount, dstNotOnSrcCount, dstSuccessfulCount int
-	for _, level := range dstLevels {
-		pendingCount, _ := boltDB.CountStatusBucket("DST", level, db.StatusPending)
-		dstPendingCount += pendingCount
-
-		failedCount, _ := boltDB.CountStatusBucket("DST", level, db.StatusFailed)
-		dstFailedCount += failedCount
-
-		notOnSrcCount, _ := boltDB.CountStatusBucket("DST", level, db.StatusNotOnSrc)
-		dstNotOnSrcCount += notOnSrcCount
-
-		successfulCount, _ := boltDB.CountStatusBucket("DST", level, db.StatusSuccessful)
-		dstSuccessfulCount += successfulCount
-	}
-	report.DstPending = dstPendingCount
-	report.DstFailed = dstFailedCount
-	report.DstNotOnSrc = dstNotOnSrcCount
-	report.DstSuccessful = dstSuccessfulCount
-
-	// Get completed count (tasks that transitioned out of pending)
-	dstCompleted, _ := boltDB.GetTotalCompletedCount("DST")
-	report.DstCompleted = dstCompleted
-
-	// Calculate number of actually moved nodes (excluding root, which is level 0)
-	// Only count successful dst traversals at depth > 0
-	var movedCount int
-	for _, level := range dstLevels {
-		if level > 0 {
-			successCount, _ := boltDB.CountStatusBucket("DST", level, db.StatusSuccessful)
-			movedCount += successCount
-		}
-	}
+	// Status totals from dst_stats
+	c, _ = database.GetStatsCount("DST", db.StatsKeyTraversalStatus(db.StatusPending))
+	report.DstPending = int(c)
+	c, _ = database.GetStatsCount("DST", db.StatsKeyTraversalStatus(db.StatusFailed))
+	report.DstFailed = int(c)
+	c, _ = database.GetStatsCount("DST", db.StatsKeyTraversalStatus(db.StatusNotOnSrc))
+	report.DstNotOnSrc = int(c)
+	c, _ = database.GetStatsCount("DST", db.StatsKeyTraversalStatus(db.StatusSuccessful))
+	report.DstSuccessful = int(c)
 
 	return report, nil
 }

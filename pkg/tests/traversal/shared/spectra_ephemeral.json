@@ -1,7 +1,7 @@
 {
   "mode": "ephemeral",
   "seed": {
-    "max_depth": 6,
+    "max_depth": 5,
     "max_folders": 50,
     "folder_backoff_factor": 0.8,
     "folder_depth_decay_factor": 0.80,

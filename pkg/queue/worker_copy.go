@@ -24,7 +24,7 @@ const (
 type CopyWorker struct {
 	id          string
 	queue       *Queue
-	boltDB      *db.DB
+	database    *db.DB
 	srcAdapter  types.FSAdapter // Source adapter for reading files
 	dstAdapter  types.FSAdapter // Destination adapter for writing files/folders
 	queueName   string          // "copy" for logging
@@ -37,7 +37,7 @@ type CopyWorker struct {
 func NewCopyWorker(
 	id string,
 	queue *Queue,
-	boltInstance *db.DB,
+	database *db.DB,
 	srcAdapter types.FSAdapter,
 	dstAdapter types.FSAdapter,
 	shutdownCtx context.Context,
@@ -45,7 +45,7 @@ func NewCopyWorker(
 	return &CopyWorker{
 		id:          id,
 		queue:       queue,
-		boltDB:      boltInstance,
+		database:    database,
 		srcAdapter:  srcAdapter,
 		dstAdapter:  dstAdapter,
 		queueName:   "copy",
@@ -105,8 +105,10 @@ func (w *CopyWorker) Run() {
 		err := w.execute(task)
 		if err != nil {
 			// Record task error in main DB for cross-lookup (copy phase, SRC only)
-			if w.boltDB != nil {
-				_, _ = db.RecordTaskError(w.boltDB, "SRC", "copy", task.ID, err.Error(), task.Attempts, task.LocationPath())
+			if w.database != nil {
+				_ = w.database.RunUpdateWriterTx(func(tx *db.Writer) error {
+					return tx.RecordTaskError("SRC", "copy", task.ID, err.Error(), task.Attempts, task.LocationPath())
+				})
 			}
 			if logservice.LS != nil {
 				_ = logservice.LS.Log("error",

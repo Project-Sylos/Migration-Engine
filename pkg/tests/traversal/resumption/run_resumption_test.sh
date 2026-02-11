@@ -15,12 +15,9 @@ echo ""
 # Clean up existing test databases ONLY at the start for a fresh test
 # The DB will persist between Phase 1 (kill) and Phase 2 (resume)
 # Final cleanup happens at the end after verification
-mainDB="pkg/tests/traversal/shared/main_test.db"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 echo "Cleaning up test databases for fresh test run..."
-rm -f "$mainDB"
-rm -f "${mainDB%.db}_logs.db"
-rm -f "pkg/tests/traversal/shared/main_test.yaml"
-echo "Cleanup complete"
+bash "$SCRIPT_DIR/../shared/cleanup.sh"
 echo ""
 
 # Phase 1: Start migration and kill it midway
@@ -127,11 +124,7 @@ if [ $exitCode -eq 0 ]; then
     
     # Clean up test databases after successful test completion
     echo ""
-    echo "Cleaning up test databases after successful test..."
-    rm -f "$mainDB"
-    rm -f "${mainDB%.db}_logs.db"
-    rm -f "pkg/tests/traversal/shared/main_test.yaml"
-    echo "Cleanup complete"
+    bash "$SCRIPT_DIR/../shared/cleanup.sh"
 else
     echo "TEST FAILED - Migration resumption did not complete successfully"
     echo "Test databases preserved for inspection"

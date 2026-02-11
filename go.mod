@@ -5,11 +5,11 @@ go 1.25.6
 require (
 	codeberg.org/Sylos/Spectra v0.2.56
 	codeberg.org/Sylos/Sylos-FS v0.1.2
-	github.com/google/uuid v1.6.0
 	github.com/marcboeker/go-duckdb v1.7.0
-	go.etcd.io/bbolt v1.4.3
 	gopkg.in/yaml.v3 v3.0.1
 )
+
+require github.com/google/uuid v1.6.0 // indirect
 
 require (
 	github.com/apache/arrow/go/v14 v14.0.2 // indirect
@@ -20,6 +20,7 @@ require (
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.18 // indirect
 	github.com/zeebo/xxh3 v1.0.2 // indirect
+	go.etcd.io/bbolt v1.4.3 // indirect; indirect (required by Spectra)
 	golang.org/x/mod v0.13.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/tools v0.14.0 // indirect

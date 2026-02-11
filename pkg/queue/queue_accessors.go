@@ -18,19 +18,22 @@ import (
 
 // Getters (read-only, use RLock)
 
-func (q *Queue) getState() QueueState {
+// State returns the current queue lifecycle state.
+func (q *Queue) State() QueueState {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.state
 }
 
-func (q *Queue) getRound() int {
+// GetRound returns the current BFS round.
+func (q *Queue) GetRound() int {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.round
 }
 
-func (q *Queue) getMode() QueueMode {
+// GetMode returns the current queue mode.
+func (q *Queue) GetMode() QueueMode {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.mode
@@ -48,18 +51,11 @@ func (q *Queue) getMaxKnownDepth() int {
 	return q.maxKnownDepth
 }
 
-func (q *Queue) getCopyPass() int {
+// GetCopyPass returns the current copy pass.
+func (q *Queue) GetCopyPass() int {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.copyPass
-}
-
-// getTasksCompletedTotal returns the number of tasks completed (success or final failure) for this queue.
-// Used by the output buffer to push the current value into the stats bucket on each flush.
-func (q *Queue) getTasksCompletedTotal() int64 {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	return q.tasksCompletedTotal
 }
 
 // incrementTasksCompletedTotal increments the queue's completed-task counter.
@@ -70,14 +66,11 @@ func (q *Queue) incrementTasksCompletedTotal() {
 	q.tasksCompletedTotal++
 }
 
-// GetCopyPass returns the current copy pass (public getter).
-func (q *Queue) GetCopyPass() int {
-	return q.getCopyPass()
-}
-
-// SetCopyPass sets the current copy pass (public setter).
+// SetCopyPass sets the current copy pass.
 func (q *Queue) SetCopyPass(pass int) {
-	q.setCopyPass(pass)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.copyPass = pass
 }
 
 // SetWorkers sets the workers associated with this queue.
@@ -93,10 +86,10 @@ func (q *Queue) getCoordinator() *QueueCoordinator {
 	return q.coordinator
 }
 
-func (q *Queue) getBoltDB() *db.DB {
+func (q *Queue) getDatabase() *db.DB {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
-	return q.boltDB
+	return q.database
 }
 
 func (q *Queue) getOutputBuffer() *db.OutputBuffer {
@@ -111,13 +104,15 @@ func (q *Queue) getShutdownCtx() context.Context {
 	return q.shutdownCtx
 }
 
-func (q *Queue) getInProgressCount() int {
+// InProgressCount returns the number of tasks currently being executed.
+func (q *Queue) InProgressCount() int {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return len(q.inProgress)
 }
 
-func (q *Queue) getPendingCount() int {
+// GetPendingCount returns the number of tasks in the pending buffer.
+func (q *Queue) GetPendingCount() int {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return len(q.pendingBuff)
@@ -127,6 +122,12 @@ func (q *Queue) getLastPullWasPartial() bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.lastPullWasPartial
+}
+
+func (q *Queue) setFirstPullForRound(value bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.firstPullForRound = value
 }
 
 func (q *Queue) getMaxRetries() int {
@@ -143,6 +144,59 @@ func (q *Queue) getPullLowWM() int {
 		wm = 1
 	}
 	return wm
+}
+
+// Keyset cursors are strictly round-scoped per queue. Each queue (src, dst, copy) has its own cursor and runtime;
+// we only reset the cursor for the queue that advanced or changed mode. Resets: round advance (setRound), mode switch (setMode), and immediately after that queue's seal (ApplyStatusStagingAndDrop).
+
+func (q *Queue) getSrcKeysetCursor() string {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.srcKeysetCursor
+}
+
+func (q *Queue) setSrcKeysetCursor(cursor string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.srcKeysetCursor = cursor
+}
+
+func (q *Queue) getDstKeysetCursor() string {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.dstKeysetCursor
+}
+
+func (q *Queue) setDstKeysetCursor(cursor string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.dstKeysetCursor = cursor
+}
+
+func (q *Queue) getCopyKeysetCursor() string {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.copyKeysetCursor
+}
+
+func (q *Queue) setCopyKeysetCursor(cursor string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.copyKeysetCursor = cursor
+}
+
+// resetThisQueueKeysetCursor clears only this queue's keyset cursor. Call when this queue's round advances (setRound), mode changes (setMode), or immediately after this queue's seal. Other queues' cursors are untouched—each queue has its own batching and runtime.
+func (q *Queue) resetThisQueueKeysetCursor() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	switch q.name {
+	case "src":
+		q.srcKeysetCursor = ""
+	case "dst":
+		q.dstKeysetCursor = ""
+	case "copy":
+		q.copyKeysetCursor = ""
+	}
 }
 
 func (q *Queue) GetFilesDiscoveredTotal() int64 {
@@ -211,7 +265,8 @@ func (q *Queue) isInPendingSet(nodeID string) bool {
 	return exists
 }
 
-func (q *Queue) getRoundStats(round int) *RoundStats {
+// GetRoundStats returns the statistics for a specific round. Returns nil if the round has no stats yet.
+func (q *Queue) GetRoundStats(round int) *RoundStats {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.roundStats[round]
@@ -229,16 +284,17 @@ func (q *Queue) getStatsTick() *time.Ticker {
 	return q.statsTick
 }
 
-func (q *Queue) getAvgExecutionTime() time.Duration {
+// GetAverageExecutionTime returns the current average task execution time.
+func (q *Queue) GetAverageExecutionTime() time.Duration {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.avgExecutionTime
 }
 
-func (q *Queue) getExecutionTimeDeltas() []time.Duration {
+// GetExecutionTimeDeltas returns a copy of the execution time deltas buffer.
+func (q *Queue) GetExecutionTimeDeltas() []time.Duration {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
-	// Return a copy to avoid race conditions
 	result := make([]time.Duration, len(q.executionTimeDeltas))
 	copy(result, q.executionTimeDeltas)
 	return result
@@ -258,22 +314,43 @@ func (q *Queue) getAvgInterval() time.Duration {
 
 // Setters (write, use Lock)
 
-func (q *Queue) setState(state QueueState) {
+// SetState sets the queue lifecycle state.
+func (q *Queue) SetState(state QueueState) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.state = state
 }
 
-func (q *Queue) setRound(round int) {
+// SetRound sets the queue's current round. Used for resume operations.
+func (q *Queue) SetRound(round int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.round = round
+	q.firstPullForRound = true // next pull for this round is the first (used for "first pull with 0 items → complete")
+	switch q.name {
+	case "src":
+		q.srcKeysetCursor = ""
+	case "dst":
+		q.dstKeysetCursor = ""
+	case "copy":
+		q.copyKeysetCursor = ""
+	}
 }
 
-func (q *Queue) setMode(mode QueueMode) {
+// SetMode sets the queue mode (traversal, retry, or copy).
+func (q *Queue) SetMode(mode QueueMode) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.mode = mode
+	q.firstPullForRound = true // first pull in new mode counts as first for completion logic
+	switch q.name {
+	case "src":
+		q.srcKeysetCursor = ""
+	case "dst":
+		q.dstKeysetCursor = ""
+	case "copy":
+		q.copyKeysetCursor = ""
+	}
 }
 
 func (q *Queue) setPulling(pulling bool) {
@@ -282,16 +359,11 @@ func (q *Queue) setPulling(pulling bool) {
 	q.pulling = pulling
 }
 
-func (q *Queue) setMaxKnownDepth(depth int) {
+// SetMaxKnownDepth sets the maximum depth for traversal/copy. Set to -1 to auto-detect.
+func (q *Queue) SetMaxKnownDepth(depth int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.maxKnownDepth = depth
-}
-
-func (q *Queue) setCopyPass(pass int) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.copyPass = pass
 }
 
 // getRoundInfo returns the RoundInfo for the specified round, creating it if it doesn't exist.
@@ -380,7 +452,7 @@ func (q *Queue) recordTaskCompletion(round int, success bool) {
 
 // Convenience getters for current round
 func (q *Queue) getCurrentRoundPullCount() int {
-	currentRound := q.getRound()
+	currentRound := q.GetRound()
 	info := q.getRoundInfoReadOnly(currentRound)
 	if info == nil {
 		return 0
@@ -388,8 +460,10 @@ func (q *Queue) getCurrentRoundPullCount() int {
 	return info.PullCount
 }
 
-func (q *Queue) getCurrentRoundItemsYielded() int {
-	currentRound := q.getRound()
+// getCurrentRoundPulledAmount returns the number of items actually pulled from the DB (returned by our queries) this round.
+// Used with pull count for completion: if pullCount > 0 && pulledAmount == 0 then we queried but found nothing (round/queue done).
+func (q *Queue) getCurrentRoundPulledAmount() int {
+	currentRound := q.GetRound()
 	info := q.getRoundInfoReadOnly(currentRound)
 	if info == nil {
 		return 0
@@ -403,27 +477,23 @@ func (q *Queue) setLastPullWasPartial(value bool) {
 	q.lastPullWasPartial = value
 }
 
-func (q *Queue) setShutdownCtx(ctx context.Context) {
+// SetShutdownContext sets the shutdown context for the queue.
+func (q *Queue) SetShutdownContext(ctx context.Context) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.shutdownCtx = ctx
 }
 
-func (q *Queue) setBoltDB(boltDB *db.DB) {
+func (q *Queue) setDatabase(database *db.DB) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.boltDB = boltDB
+	q.database = database
 }
 
 func (q *Queue) setOutputBuffer(outputBuffer *db.OutputBuffer) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.outputBuffer = outputBuffer
-	if outputBuffer != nil {
-		outputBuffer.SetOnCompletedCountGetter(func() (string, int64) {
-			return getQueueType(q.name), q.getTasksCompletedTotal()
-		})
-	}
 }
 
 func (q *Queue) setStatsChan(ch chan QueueStats) {
@@ -496,48 +566,50 @@ func (q *Queue) getOrCreateRoundStatsUnlocked(round int) *RoundStats {
 	return q.roundStats[round]
 }
 
-// setExpectedFromStatsBucket sets roundStats[round].Expected from the stats bucket (O(1) lookup).
-// Round 0 for traversal/retry is always 1; otherwise uses pending count from BoltDB.
+// setExpectedFromStatsBucket sets roundStats[round].Expected from the stats table (key 'expected').
+// First tries GetExpectedAtDepth; if missing or 0, computes from pending count and writes to stats.
 // Used at the start of each round so Expected reflects actual DB state and survives restarts.
 func (q *Queue) setExpectedFromStatsBucket(round int) {
-	boltDB := q.getBoltDB()
-	if boltDB == nil {
+	database := q.getDatabase()
+	if database == nil {
 		return
 	}
-	mode := q.getMode()
-	var expected int
-	switch mode {
-	case QueueModeTraversal:
-		if round == 0 {
-			expected = 1
-		} else {
-			count, err := boltDB.CountStatusBucket(getQueueType(q.name), round, db.StatusPending)
-			if err == nil {
-				expected = count
+	queueType := getQueueType(q.name)
+	mode := q.GetMode()
+	var expected int64
+	// Try fast read from stats first
+	expected, _ = database.GetStatsCountAtDepth(queueType, round, db.StatsKeyExpected)
+	if expected == 0 {
+		// Compute from live table (stats for this depth may not exist yet when advancing to a new round) and write back
+		switch mode {
+		case QueueModeTraversal:
+			if round == 0 {
+				expected = 1
+			} else {
+				expected, _ = database.GetPendingTraversalCountAtDepthFromLive(queueType, round)
 			}
+		case QueueModeRetry:
+			expected, _ = database.GetPendingTraversalCountAtDepthFromLive(queueType, round)
+		case QueueModeCopy:
+			copyPass := q.GetCopyPass()
+			nodeType := db.NodeTypeFolder
+			if copyPass == 2 {
+				nodeType = db.NodeTypeFile
+			}
+			expected, _ = database.GetCopyCountAtDepth(round, nodeType, db.CopyStatusPending)
+		default:
+			return
 		}
-	case QueueModeRetry:
-		count, err := boltDB.CountStatusBucket(getQueueType(q.name), round, db.StatusPending)
-		if err == nil {
-			expected = count
+		if expected > 0 {
+			_ = database.RunUpdateWriterTx(func(w *db.Writer) error {
+				return w.SetStatsCountForDepth(queueType, round, db.StatsKeyExpected, expected)
+			})
 		}
-	case QueueModeCopy:
-		copyPass := q.getCopyPass()
-		nodeType := db.NodeTypeFolder
-		if copyPass == 2 {
-			nodeType = db.NodeTypeFile
-		}
-		count, err := boltDB.CountCopyStatusBucket(round, nodeType, db.CopyStatusPending)
-		if err == nil {
-			expected = count
-		}
-	default:
-		return
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	stats := q.getOrCreateRoundStatsUnlocked(round)
-	stats.Expected = expected
+	stats.Expected = int(expected)
 }
 
 func (q *Queue) appendExecutionTimeDelta(delta time.Duration) {
@@ -567,8 +639,9 @@ type QueueStateSnapshot struct {
 	InProgressCount    int
 	Pulling            bool
 	LastPullWasPartial bool
+	FirstPullForRound  bool
 	PullLowWM          int
-	BoltDB             *db.DB
+	Database           *db.DB
 	OutputBuffer       *db.OutputBuffer
 	Mode               QueueMode
 }
@@ -587,15 +660,16 @@ func (q *Queue) getStateSnapshot() QueueStateSnapshot {
 		InProgressCount:    len(q.inProgress),
 		Pulling:            q.pulling,
 		LastPullWasPartial: q.lastPullWasPartial,
+		FirstPullForRound:  q.firstPullForRound,
 		PullLowWM:          wm,
-		BoltDB:             q.boltDB,
+		Database:           q.database,
 		OutputBuffer:       q.outputBuffer,
 		Mode:               q.mode,
 	}
 }
 
-// enqueuePending atomically enqueues a task to the pending buffer
-func (q *Queue) enqueuePending(task *TaskBase) bool {
+// Add enqueues a task into the pending buffer. Returns false if task is nil, has empty ID, or is already in progress/pending.
+func (q *Queue) Add(task *TaskBase) bool {
 	if task == nil {
 		return false
 	}

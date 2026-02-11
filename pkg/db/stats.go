@@ -4,252 +4,228 @@
 package db
 
 import (
-	"encoding/binary"
+	"context"
+	"database/sql"
 	"fmt"
-	"strings"
-
-	bolt "go.etcd.io/bbolt"
 )
 
-const (
-	// StatsBucketName is the name of the top-level stats bucket
-	StatsBucketName = "STATS"
-)
-
-// bucketPathToString converts a bucket path array to a canonical string representation.
-// Example: ["SRC", "levels", "00000001", "pending"] -> "SRC/levels/00000001/pending"
-func bucketPathToString(bucketPath []string) string {
-	return strings.Join(bucketPath, "/")
+// StatsKeyTraversalStatus returns the src_stats/dst_stats key for traversal status. Valid statuses: pending, successful, failed, not_on_src (DST only).
+func StatsKeyTraversalStatus(status string) string {
+	return fmt.Sprintf("traversal/%s", status)
 }
 
-// getStatsBucket returns the stats bucket, creating it if it doesn't exist.
-// Stats bucket is under Traversal-Data/STATS
-func getStatsBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
-	// Navigate through Traversal-Data -> STATS
-	traversalBucket, err := tx.CreateBucketIfNotExists([]byte("Traversal-Data"))
-	if err != nil {
-		return nil, fmt.Errorf("failed to get Traversal-Data bucket: %w", err)
-	}
-	bucket, err := traversalBucket.CreateBucketIfNotExists([]byte(StatsBucketName))
-	if err != nil {
-		return nil, fmt.Errorf("failed to get stats bucket: %w", err)
-	}
-	return bucket, nil
+// StatsKeyCopyStatus returns the src_stats key for copy status (src_nodes only). Valid statuses: pending, successful, failed.
+func StatsKeyCopyStatus(status string) string {
+	return fmt.Sprintf("copy/%s", status)
 }
 
-// UpdateBucketStatsInTx updates the count for a bucket path by the given delta within an existing transaction.
-// If the bucket path doesn't exist in stats, it's created with the delta value.
-// Delta can be positive (increment) or negative (decrement).
-// This is the internal function that can be called from within an existing transaction.
-func UpdateBucketStatsInTx(tx *bolt.Tx, bucketPath []string, delta int64) error {
-	if len(bucketPath) == 0 {
-		return nil // Don't track empty paths
-	}
+// StatsKeyExpected is the stats key for expected count at a depth (set at round start).
+const StatsKeyExpected = "expected"
 
-	statsBucket, err := getStatsBucket(tx)
+// StatsKeyCompleted is the stats key for completed count at a depth (written at seal).
+const StatsKeyCompleted = "completed"
+
+// GetStatsCount returns the total count for the given key across all depths from src_stats or dst_stats (table = "SRC" or "DST"). E.g. "all pending items total in src_nodes" = GetStatsCount("SRC", StatsKeyTraversalStatus("pending")).
+func (db *DB) GetStatsCount(table, key string) (int64, error) {
+	if key == "" {
+		return 0, nil
+	}
+	tbl := tableSrcStats
+	if table == "DST" {
+		tbl = tableDstStats
+	}
+	conn, err := db.GetDB()
 	if err != nil {
-		return err
+		return 0, err
 	}
-
-	key := bucketPathToString(bucketPath)
-	keyBytes := []byte(key)
-
-	// Get current count (defaults to 0 if not exists)
-	var currentCount int64
-	existingValue := statsBucket.Get(keyBytes)
-	if existingValue != nil {
-		currentCount = int64(binary.BigEndian.Uint64(existingValue))
+	ctx := context.Background()
+	var n sql.NullInt64
+	err = conn.QueryRowContext(ctx, "SELECT COALESCE(SUM(count), 0) FROM "+tbl+" WHERE key = $1", key).Scan(&n)
+	if err == sql.ErrNoRows {
+		return 0, nil
 	}
-
-	// Compute new count
-	newCount := currentCount + delta
-
-	// Update or delete stats entry
-	if newCount < 0 {
-		// Count should never go negative - this indicates a bug
-		// For safety, set to 0 and log (but don't fail the transaction)
-		newCount = 0
+	if err != nil {
+		return 0, err
 	}
+	if n.Valid {
+		return n.Int64, nil
+	}
+	return 0, nil
+}
 
-	if newCount == 0 {
-		// Remove stats entry if count is zero (cleanup)
-		if err := statsBucket.Delete(keyBytes); err != nil {
-			return fmt.Errorf("failed to delete stats entry: %w", err)
-		}
+// GetStatsCountAtDepth returns the count for (depth, key) from src_stats or dst_stats.
+func (db *DB) GetStatsCountAtDepth(table string, depth int, key string) (int64, error) {
+	if key == "" {
+		return 0, nil
+	}
+	tbl := tableSrcStats
+	if table == "DST" {
+		tbl = tableDstStats
+	}
+	conn, err := db.GetDB()
+	if err != nil {
+		return 0, err
+	}
+	ctx := context.Background()
+	var n sql.NullInt64
+	err = conn.QueryRowContext(ctx, "SELECT count FROM "+tbl+" WHERE depth = $1 AND key = $2", depth, key).Scan(&n)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if n.Valid {
+		return n.Int64, nil
+	}
+	return 0, nil
+}
+
+// GetCopyCountAtDepth returns the count of nodes in src_nodes at the given depth and copy_status; if nodeType != "", filters by type (e.g. "folder" or "file").
+func (db *DB) GetCopyCountAtDepth(depth int, nodeType string, copyStatus string) (int64, error) {
+	conn, err := db.GetDB()
+	if err != nil {
+		return 0, err
+	}
+	ctx := context.Background()
+	var q string
+	var args []interface{}
+	if nodeType == "" {
+		q = `SELECT COUNT(*)::BIGINT FROM src_nodes WHERE depth = $1 AND copy_status = $2`
+		args = []interface{}{depth, copyStatus}
 	} else {
-		// Store new count as 8-byte big-endian int64
-		valueBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(valueBytes, uint64(newCount))
-		if err := statsBucket.Put(keyBytes, valueBytes); err != nil {
-			return fmt.Errorf("failed to update stats entry: %w", err)
-		}
+		q = `SELECT COUNT(*)::BIGINT FROM src_nodes WHERE depth = $1 AND type = $2 AND copy_status = $3`
+		args = []interface{}{depth, nodeType, copyStatus}
 	}
-
-	return nil
-}
-
-// getBucketCount retrieves the count for a bucket path from the stats bucket.
-// Returns 0 if the bucket path doesn't exist in stats.
-func getBucketCount(tx *bolt.Tx, bucketPath []string) (int64, error) {
-	if len(bucketPath) == 0 {
-		return 0, nil
-	}
-
-	// Navigate through Traversal-Data -> STATS
-	traversalBucket := tx.Bucket([]byte("Traversal-Data"))
-	if traversalBucket == nil {
-		// Traversal-Data bucket doesn't exist yet - return 0 (safe default)
-		return 0, nil
-	}
-	statsBucket := traversalBucket.Bucket([]byte(StatsBucketName))
-	if statsBucket == nil {
-		// Stats bucket doesn't exist yet - return 0 (safe default)
-		return 0, nil
-	}
-
-	key := bucketPathToString(bucketPath)
-	keyBytes := []byte(key)
-
-	value := statsBucket.Get(keyBytes)
-	if value == nil {
-		return 0, nil
-	}
-
-	if len(value) != 8 {
-		return 0, fmt.Errorf("invalid stats value length: expected 8 bytes, got %d", len(value))
-	}
-
-	count := int64(binary.BigEndian.Uint64(value))
-	return count, nil
-}
-
-// initializeStatsBucket creates the stats bucket and queue-stats sub-bucket if they don't exist.
-// Called during database initialization.
-func initializeStatsBucket(tx *bolt.Tx) error {
-	statsBucket, err := getStatsBucket(tx)
+	var n sql.NullInt64
+	err = conn.QueryRowContext(ctx, q, args...).Scan(&n)
 	if err != nil {
-		return err
+		return 0, err
 	}
-
-	// Create queue-stats sub-bucket for queue statistics
-	if _, err := statsBucket.CreateBucketIfNotExists([]byte("queue-stats")); err != nil {
-		return fmt.Errorf("failed to create queue-stats bucket: %w", err)
+	if n.Valid {
+		return n.Int64, nil
 	}
-
-	return nil
+	return 0, nil
 }
 
-// EnsureStatsBucket ensures the stats bucket exists.
-// This is a public API that can be called before operations that need stats.
-func (db *DB) EnsureStatsBucket() error {
-	return db.Update(func(tx *bolt.Tx) error {
-		_, err := getStatsBucket(tx)
-		if err != nil {
-			return err
-		}
-		// Also ensure queue-stats bucket exists
-		_, err = GetOrCreateQueueStatsBucket(tx)
-		return err
-	})
-}
-
-// UpdateBucketStats updates the count for a bucket path by the given delta.
-// Delta can be positive (increment) or negative (decrement).
-// This is a public wrapper that creates its own transaction.
-// Thread-safe (uses Update transaction).
-// For use within an existing transaction, use UpdateBucketStatsInTx instead.
-func (db *DB) UpdateBucketStats(bucketPath []string, delta int64) error {
-	return db.Update(func(tx *bolt.Tx) error {
-		return UpdateBucketStatsInTx(tx, bucketPath, delta)
-	})
-}
-
-// GetBucketCount retrieves the count for a bucket path from the stats bucket.
-// This is the public API for reading stats. Returns 0 if stats don't exist.
-// Thread-safe (uses View transaction).
-func (db *DB) GetBucketCount(bucketPath []string) (int64, error) {
-	var count int64
-	err := db.View(func(tx *bolt.Tx) error {
-		var err error
-		count, err = getBucketCount(tx, bucketPath)
-		return err
-	})
-	return count, err
-}
-
-// HasBucketItems is a convenience wrapper that checks if a bucket has any items.
-// Returns true if count > 0, false otherwise.
-func (db *DB) HasBucketItems(bucketPath []string) (bool, error) {
-	count, err := db.GetBucketCount(bucketPath)
+// GetMaxDepth returns the maximum depth present in the stats table for the given table ("SRC" or "DST"). Used as stop condition for retry sweep.
+func (db *DB) GetMaxDepth(table string) (int, error) {
+	tbl := tableSrcStats
+	if table == "DST" {
+		tbl = tableDstStats
+	}
+	conn, err := db.GetDB()
 	if err != nil {
-		return false, err
+		return 0, err
 	}
-	return count > 0, nil
+	ctx := context.Background()
+	var d sql.NullInt64
+	err = conn.QueryRowContext(ctx, "SELECT MAX(depth) FROM "+tbl).Scan(&d)
+	if err != nil || !d.Valid {
+		return 0, err
+	}
+	return int(d.Int64), nil
 }
 
-// GetQueueStats retrieves queue statistics from the queue-stats bucket.
-// Returns the JSON-encoded stats for the specified queue key (e.g., "src-traversal", "dst-traversal").
-// Returns nil if the stats don't exist.
+// GetPendingTraversalCountAtDepthFromLive returns the count of nodes at the given depth with traversal_status = 'pending' from the live nodes table. Use when advancing to a new round (stats for that depth may not exist yet).
+func (db *DB) GetPendingTraversalCountAtDepthFromLive(table string, depth int) (int64, error) {
+	t := tableSrcNodes
+	if table == "DST" {
+		t = tableDstNodes
+	}
+	conn, err := db.GetDB()
+	if err != nil {
+		return 0, err
+	}
+	ctx := context.Background()
+	var n sql.NullInt64
+	err = conn.QueryRowContext(ctx,
+		`SELECT COUNT(*)::BIGINT FROM `+t+` WHERE depth = $1 AND COALESCE(traversal_status, '') = 'pending'`,
+		depth,
+	).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	if n.Valid {
+		return n.Int64, nil
+	}
+	return 0, nil
+}
+
+// StatsRow is one row from src_stats or dst_stats (depth, key, count). For breakdown by level.
+type StatsRow struct {
+	Depth int
+	Key   string
+	Count int64
+}
+
+// GetStatsBreakdown returns all (depth, key, count) rows for the table so callers can see e.g. "level 4 has X pending". Order: depth, key.
+func (db *DB) GetStatsBreakdown(table string) ([]StatsRow, error) {
+	tbl := tableSrcStats
+	if table == "DST" {
+		tbl = tableDstStats
+	}
+	conn, err := db.GetDB()
+	if err != nil {
+		return nil, err
+	}
+	ctx := context.Background()
+	rows, err := conn.QueryContext(ctx, "SELECT depth, key, count FROM "+tbl+" ORDER BY depth, key")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []StatsRow
+	for rows.Next() {
+		var r StatsRow
+		if err := rows.Scan(&r.Depth, &r.Key, &r.Count); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// GetQueueStats returns the metrics JSON for the queue key from queue_stats table.
 func (db *DB) GetQueueStats(queueKey string) ([]byte, error) {
-	var stats []byte
-	err := db.View(func(tx *bolt.Tx) error {
-		queueStatsBucket := GetQueueStatsBucket(tx)
-		if queueStatsBucket == nil {
-			return nil // Bucket doesn't exist, return nil stats
-		}
-
-		value := queueStatsBucket.Get([]byte(queueKey))
-		if value != nil {
-			stats = make([]byte, len(value))
-			copy(stats, value)
-		}
-		return nil
-	})
-	return stats, err
-}
-
-// GetAllQueueStats retrieves all queue statistics from the queue-stats bucket.
-// Returns a map of queue key -> JSON-encoded stats.
-func (db *DB) GetAllQueueStats() (map[string][]byte, error) {
-	allStats := make(map[string][]byte)
-	err := db.View(func(tx *bolt.Tx) error {
-		queueStatsBucket := GetQueueStatsBucket(tx)
-		if queueStatsBucket == nil {
-			return nil // Bucket doesn't exist, return empty map
-		}
-
-		cursor := queueStatsBucket.Cursor()
-		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
-			stats := make([]byte, len(value))
-			copy(stats, value)
-			allStats[string(key)] = stats
-		}
-		return nil
-	})
-	return allStats, err
-}
-
-// CompletedCountStatsBucketPath returns the stats bucket key path for the queue's total completed count.
-// Stored as a single key per queue (e.g. "SRC-completed", "DST-completed") in the STATS bucket.
-func CompletedCountStatsBucketPath(queueType string) []string {
-	return []string{queueType + "-completed"}
-}
-
-// SetCompletedCountInTx sets the total completed count for a queue in the stats bucket.
-// Called from OutputBuffer flush via SetCompletedCountOperation. Value is absolute, not a delta.
-func SetCompletedCountInTx(tx *bolt.Tx, queueType string, value int64) error {
-	statsBucket, err := getStatsBucket(tx)
+	conn, err := db.GetDB()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	key := bucketPathToString(CompletedCountStatsBucketPath(queueType))
-	valueBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(valueBytes, uint64(value))
-	return statsBucket.Put([]byte(key), valueBytes)
+	ctx := context.Background()
+	var js sql.NullString
+	err = conn.QueryRowContext(ctx, "SELECT metrics_json FROM queue_stats WHERE queue_key = $1", queueKey).Scan(&js)
+	if err == sql.ErrNoRows || !js.Valid {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return []byte(js.String), nil
 }
 
-// GetTotalCompletedCount retrieves the total completed count for the queue from the stats bucket.
-// This is the monotonic counter incremented on each task success or final failure and pushed on flush.
-func (db *DB) GetTotalCompletedCount(queueType string) (int64, error) {
-	return db.GetBucketCount(CompletedCountStatsBucketPath(queueType))
+// GetAllQueueStats returns all queue stats from queue_stats table.
+func (db *DB) GetAllQueueStats() (map[string][]byte, error) {
+	conn, err := db.GetDB()
+	if err != nil {
+		return nil, err
+	}
+	ctx := context.Background()
+	rows, err := conn.QueryContext(ctx, "SELECT queue_key, metrics_json FROM queue_stats")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	allStats := make(map[string][]byte)
+	for rows.Next() {
+		var key string
+		var js sql.NullString
+		if err := rows.Scan(&key, &js); err != nil {
+			return nil, err
+		}
+		if js.Valid {
+			allStats[key] = []byte(js.String)
+		}
+	}
+	return allStats, rows.Err()
 }
