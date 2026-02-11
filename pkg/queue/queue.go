@@ -57,8 +57,8 @@ const (
 )
 
 const (
-	defaultLeaseBatchSize = 1000
-	maxLeaseBatchSize     = 20_000 // Upper bound for pull (lease) batch size
+	defaultLeaseBatchSize = 10_000
+	maxLeaseBatchSize     = 100_000 // Upper bound for pull (lease) batch size
 	// MaxSrcDstGap is the maximum allowed round gap (src - dst). When src exceeds dst + MaxSrcDstGap, src pauses pulling (Phase 6).
 	MaxSrcDstGap = 2
 )

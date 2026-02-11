@@ -18,7 +18,7 @@ func BootstrapRootStats(d *DB) error {
 }
 
 // InsertRootNode inserts the root node (path "/", depth 0) into the given table.
-// Uses appender connection with explicit commit so pulls (same conn) see the root immediately.
+// Uses appender conn so pulls (same conn via GetDBForPulls) see the root immediately.
 func InsertRootNode(d *DB, table string, state *NodeState) error {
 	if state == nil {
 		return nil

@@ -83,7 +83,7 @@ func (aw *queueAppenderWriter) appendNode(table string, n *NodeState) error {
 	}
 	rowArgs := []driver.Value{
 		n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath,
-		n.Type, n.Size, n.MTime, int64(n.Depth), traversalStatus, n.CopyStatus, n.Excluded, n.Errors,
+		n.Type, n.Size, n.MTime, int32(n.Depth), traversalStatus, n.CopyStatus, n.Excluded, n.Errors,
 	}
 	switch table {
 	case "DST":

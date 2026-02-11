@@ -354,6 +354,8 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 		database.AddNodes(childNodesToInsert)
 	}
 
+	// fmt.Printf("Added %d child nodes to DB buffers\n", len(childNodesToInsert))
+
 	// For SRC FOLDER tasks in retry mode: Queue DST cleanup only when RetryDstCleanup was populated at pull (no DB reads here).
 	if q.name == "src" && q.GetMode() == QueueModeRetry && task.IsFolder() && task.RetryDstCleanup != nil {
 		c := task.RetryDstCleanup

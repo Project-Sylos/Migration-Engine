@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
@@ -51,8 +52,11 @@ func runTest() error {
 	fmt.Println("================")
 
 	// Load pre-configured test database (should be copied by PowerShell script)
-	// Path is relative to where the script is run from (project root)
-	dbPath := "pkg/tests/traversal/shared/main_test.db"
+	// Absolute path to avoid split-brain across connections
+	dbPath, err := filepath.Abs("pkg/tests/traversal/shared/main_test.db")
+	if err != nil {
+		return fmt.Errorf("failed to resolve DB path: %w", err)
+	}
 	database, _, err := migration.SetupDatabase(migration.DatabaseConfig{
 		Path:           dbPath,
 		RemoveExisting: false, // Use existing pre-configured DB

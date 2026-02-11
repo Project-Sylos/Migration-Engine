@@ -4,12 +4,14 @@
 package db
 
 import (
+	"context"
+	"fmt"
 	"sync"
 	"time"
 )
 
-const defaultBatchSize = 10000
-const defaultFlushInterval = 3 * time.Second
+const defaultBatchSize = 100_000
+const defaultFlushInterval = 30 * time.Second
 
 // srcStagingRow holds coalesced traversal and copy status for a node in src_staging.
 type srcStagingRow struct {
@@ -60,38 +62,27 @@ func (sb *stagingBuffer) flushLoop() {
 	}
 }
 
-func (sb *stagingBuffer) addTraversal(nodeID, newStatus string) {
-	if nodeID == "" {
-		return
-	}
+func (sb *stagingBuffer) addTraversal(nodeID, newTraversal string) {
 	sb.mu.Lock()
+	defer sb.mu.Unlock()
 	if sb.table == "SRC" {
 		r := sb.srcRows[nodeID]
-		r.traversal = newStatus
+		r.traversal = newTraversal
 		sb.srcRows[nodeID] = r
 	} else {
-		sb.dstRows[nodeID] = newStatus
-	}
-	n := len(sb.srcRows) + len(sb.dstRows)
-	sb.mu.Unlock()
-	if n >= sb.batchSize {
-		sb.Flush()
+		sb.dstRows[nodeID] = newTraversal
 	}
 }
 
-func (sb *stagingBuffer) addCopy(nodeID, newStatus string) {
-	if nodeID == "" || sb.table != "SRC" {
+func (sb *stagingBuffer) addCopy(nodeID, newCopyStatus string) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	if sb.table != "SRC" {
 		return
 	}
-	sb.mu.Lock()
 	r := sb.srcRows[nodeID]
-	r.copy = newStatus
+	r.copy = newCopyStatus
 	sb.srcRows[nodeID] = r
-	n := len(sb.srcRows)
-	sb.mu.Unlock()
-	if n >= sb.batchSize {
-		sb.Flush()
-	}
 }
 
 func (sb *stagingBuffer) Flush() {
@@ -107,22 +98,21 @@ func (sb *stagingBuffer) Flush() {
 	}
 	sb.mu.Unlock()
 
-	var flushedIDs []string
-	queueType := sb.table
-	if len(srcRows) > 0 || len(dstRows) > 0 {
-		for id := range srcRows {
-			flushedIDs = append(flushedIDs, id)
-		}
-		for id := range dstRows {
-			flushedIDs = append(flushedIDs, id)
-		}
-		err := sb.db.runStagingFlush(queueType, srcRows, dstRows)
-		if err != nil {
-			return
-		}
+	if len(srcRows) == 0 && len(dstRows) == 0 {
+		return
 	}
-	if sb.onFlush != nil && len(flushedIDs) > 0 {
-		sb.onFlush(flushedIDs)
+	if err := sb.db.runStagingFlush(sb.table, srcRows, dstRows); err != nil {
+		return
+	}
+	if sb.onFlush != nil {
+		ids := make([]string, 0, len(srcRows)+len(dstRows))
+		for k := range srcRows {
+			ids = append(ids, k)
+		}
+		for k := range dstRows {
+			ids = append(ids, k)
+		}
+		sb.onFlush(ids)
 	}
 }
 
@@ -136,33 +126,29 @@ func (sb *stagingBuffer) Stop() {
 	close(sb.stopCh)
 }
 
-// nodesBuffer buffers node inserts for src_nodes or dst_nodes. Flushes to appender; never checkpoints.
+// nodesBuffer buffers node inserts for src_nodes or dst_nodes.
 type nodesBuffer struct {
-	table     string // "SRC" or "DST"
-	db        *DB
-	batchSize int
-	interval  time.Duration
-	mu        sync.Mutex
-	nodes     []*NodeState
-	stopCh    chan struct{}
-	onFlush   func(nodeIDs []string)
+	table   string // "SRC" or "DST"
+	db      *DB
+	nodes   []*NodeState
+	mu      sync.Mutex
+	stopCh  chan struct{}
+	onFlush func(nodeIDs []string)
 }
 
 func newNodesBuffer(db *DB, table string) *nodesBuffer {
 	nb := &nodesBuffer{
-		table:     table,
-		db:        db,
-		batchSize: defaultBatchSize,
-		interval:  defaultFlushInterval,
-		nodes:     make([]*NodeState, 0, 256),
-		stopCh:    make(chan struct{}),
+		table:  table,
+		db:     db,
+		nodes:  make([]*NodeState, 0, 256),
+		stopCh: make(chan struct{}),
 	}
 	go nb.flushLoop()
 	return nb
 }
 
 func (nb *nodesBuffer) flushLoop() {
-	ticker := time.NewTicker(nb.interval)
+	ticker := time.NewTicker(defaultFlushInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -175,44 +161,18 @@ func (nb *nodesBuffer) flushLoop() {
 }
 
 func (nb *nodesBuffer) Add(n *NodeState, status string) {
-	if n == nil {
-		return
-	}
-	if n.TraversalStatus == "" {
-		n.TraversalStatus = status
-	}
-	if n.Status == "" {
-		n.Status = n.TraversalStatus
-	}
-	nb.mu.Lock()
-	nb.nodes = append(nb.nodes, n)
-	count := len(nb.nodes)
-	nb.mu.Unlock()
-	if count >= nb.batchSize {
-		nb.Flush()
-	}
+	nb.AddBatch([]*NodeState{n}, status)
 }
 
-func (nb *nodesBuffer) AddBatch(nodes []*NodeState, status string) {
+func (nb *nodesBuffer) AddBatch(nodes []*NodeState, _ string) {
 	if len(nodes) == 0 {
 		return
 	}
 	nb.mu.Lock()
-	for _, n := range nodes {
-		if n == nil {
-			continue
-		}
-		if n.TraversalStatus == "" {
-			n.TraversalStatus = status
-		}
-		if n.Status == "" {
-			n.Status = n.TraversalStatus
-		}
-		nb.nodes = append(nb.nodes, n)
-	}
+	nb.nodes = append(nb.nodes, nodes...)
 	count := len(nb.nodes)
 	nb.mu.Unlock()
-	if count >= nb.batchSize {
+	if count >= defaultBatchSize {
 		nb.Flush()
 	}
 }
@@ -237,6 +197,16 @@ func (nb *nodesBuffer) Flush() {
 	if nb.onFlush != nil {
 		nb.onFlush(flushedIDs)
 	}
+
+	// Instrumentation: verify live count after flush (single conn, no cross-connection test)
+	tbl := tableName(nb.table)
+	if pullConn, err := nb.db.GetDBForPulls(nb.table); err == nil {
+		var n int
+		if qerr := pullConn.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM "+tbl).Scan(&n); qerr == nil {
+			fmt.Printf("LIVE COUNT AFTER FLUSH (%s): %d (flushed %d)\n", tbl, n, len(flushedIDs))
+		}
+	}
+	fmt.Printf("Flushing %s items: %d\n", nb.table, len(flushedIDs))
 }
 
 func (nb *nodesBuffer) SetOnFlush(fn func(nodeIDs []string)) {

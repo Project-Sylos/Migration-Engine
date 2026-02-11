@@ -177,9 +177,13 @@ func setupTraversalConfig(srcPath, dstPath string) (migration.Config, error) {
 		Type:         types.NodeTypeFolder,
 	}
 
-	// Open database - use copy/shared DB path
+	// Open database - use copy/shared DB path (absolute to avoid split-brain across connections)
+	dbPath, err := filepath.Abs("pkg/tests/copy/shared/main_test.db")
+	if err != nil {
+		return migration.Config{}, fmt.Errorf("failed to resolve DB path: %w", err)
+	}
 	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           "pkg/tests/copy/shared/main_test.db",
+		Path:           dbPath,
 		RemoveExisting: true, // Clean DB for fresh traversal
 	})
 	if err != nil {
@@ -190,7 +194,7 @@ func setupTraversalConfig(srcPath, dstPath string) (migration.Config, error) {
 		DatabaseInstance: dbInstance,
 		Runtime:          migration.ModeStandalone, // Will close DB after traversal
 		Database: migration.DatabaseConfig{
-			Path:           "pkg/tests/copy/shared/main_test.db",
+			Path:           dbPath,
 			RemoveExisting: true,
 		},
 		Source: migration.Service{

@@ -23,15 +23,12 @@ func DefaultOptions() Options {
 	return Options{Path: ":memory:"}
 }
 
-// DB is the DuckDB-backed database handle. Per-queue appender connections; shared update connection; table-scoped buffers.
+// DB is the DuckDB-backed database handle. Single physical connection for all DB operations (schema, appender writes, pulls, merge, checkpoint).
 type DB struct {
-	path           string
-	conn           *sql.DB    // read-only; schema is created on this connection first
-	srcAppenderConn *sql.DB   // SRC staging + nodes
-	dstAppenderConn *sql.DB   // DST staging + nodes (+ src_staging for copy updates)
-	updateConn     *sql.DB    // merge, stats, deletes
-	writeMu        sync.Mutex // one global mutex for all DB writes
-	checkpointMu   sync.Mutex // serializes CHECKPOINT; only one connection runs it since it's a global DB op
+	path        string
+	conn        *sql.DB    // single connection for all operations
+	writeMu     sync.Mutex // one global mutex for all DB writes
+	checkpointMu sync.Mutex // serializes CHECKPOINT; only one connection runs it since it's a global DB op
 
 	// Table-scoped buffers (DB-owned, not queue-owned)
 	srcStagingBuffer *stagingBuffer
@@ -65,34 +62,10 @@ func Open(opts Options) (*DB, error) {
 			return nil, err
 		}
 	}
-	srcAppenderConn, err := sql.Open("duckdb", path)
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	srcAppenderConn.SetMaxOpenConns(1)
-	dstAppenderConn, err := sql.Open("duckdb", path)
-	if err != nil {
-		_ = conn.Close()
-		_ = srcAppenderConn.Close()
-		return nil, err
-	}
-	dstAppenderConn.SetMaxOpenConns(1)
-	updateConn, err := sql.Open("duckdb", path)
-	if err != nil {
-		_ = conn.Close()
-		_ = srcAppenderConn.Close()
-		_ = dstAppenderConn.Close()
-		return nil, err
-	}
-	updateConn.SetMaxOpenConns(1)
 
 	d := &DB{
-		path:            path,
-		conn:            conn,
-		srcAppenderConn: srcAppenderConn,
-		dstAppenderConn: dstAppenderConn,
-		updateConn:      updateConn,
+		path: path,
+		conn: conn,
 	}
 	d.srcStagingBuffer = newStagingBuffer(d, "SRC")
 	d.dstStagingBuffer = newStagingBuffer(d, "DST")
@@ -137,15 +110,6 @@ func (db *DB) Close() error {
 	if db.dstNodesBuffer != nil {
 		db.dstNodesBuffer.Stop()
 	}
-	if db.srcAppenderConn != nil {
-		_ = db.srcAppenderConn.Close()
-	}
-	if db.dstAppenderConn != nil {
-		_ = db.dstAppenderConn.Close()
-	}
-	if db.updateConn != nil {
-		_ = db.updateConn.Close()
-	}
 	return db.conn.Close()
 }
 
@@ -171,12 +135,9 @@ func (db *DB) GetDB() (*sql.DB, error) {
 	return db.conn, nil
 }
 
-// GetDBForPulls returns the appender connection for pull queries. queueType is "SRC" or "DST".
+// GetDBForPulls returns the main connection for pull queries. queueType is "SRC" or "DST" (both use same conn).
 func (db *DB) GetDBForPulls(queueType string) (*sql.DB, error) {
-	if queueType == "DST" {
-		return db.dstAppenderConn, nil
-	}
-	return db.srcAppenderConn, nil
+	return db.conn, nil
 }
 
 // SetOnFlush sets the callback for leased-key removal when buffers flush. queueType is "SRC" or "DST".
@@ -246,14 +207,14 @@ func (db *DB) AddNodes(ops []InsertOperation) {
 	}
 }
 
-// AddNodeDeletion deletes a node immediately via updateConn (retry DST cleanup).
+// AddNodeDeletion deletes a node immediately (retry DST cleanup).
 func (db *DB) AddNodeDeletion(table, nodeID string) error {
 	return db.RunUpdateWriterTx(func(w *Writer) error {
 		return w.DeleteNode(table, nodeID)
 	})
 }
 
-// AddNodeDeletions deletes multiple nodes via updateConn.
+// AddNodeDeletions deletes multiple nodes.
 func (db *DB) AddNodeDeletions(deletions []NodeDeletion) error {
 	if len(deletions) == 0 {
 		return nil
@@ -287,12 +248,12 @@ func (db *DB) FlushTablesForQueue(queueType string) {
 	}
 }
 
-// RunUpdateWriterTx runs fn inside a transaction on the update connection.
+// RunUpdateWriterTx runs fn inside a transaction on the main connection.
 func (db *DB) RunUpdateWriterTx(fn func(w *Writer) error) error {
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
 	ctx := context.Background()
-	tx, err := db.updateConn.BeginTx(ctx, nil)
+	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -304,16 +265,12 @@ func (db *DB) RunUpdateWriterTx(fn func(w *Writer) error) error {
 	return tx.Commit()
 }
 
-// RunAppenderWriterTx runs fn inside a transaction on the queue's appender connection.
+// RunAppenderWriterTx runs fn inside a transaction on the main connection.
 func (db *DB) RunAppenderWriterTx(queueType string, fn func(w *Writer) error) error {
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
-	conn := db.srcAppenderConn
-	if queueType == "DST" {
-		conn = db.dstAppenderConn
-	}
 	ctx := context.Background()
-	tx, err := conn.BeginTx(ctx, nil)
+	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -325,17 +282,12 @@ func (db *DB) RunAppenderWriterTx(queueType string, fn func(w *Writer) error) er
 	return tx.Commit()
 }
 
-// runStagingFlush writes staging rows to the DB via the appropriate appender conn.
-// queueType determines which conn to use. srcRows is for src_staging; dstRows for dst_staging.
+// runStagingFlush writes staging rows to the DB. queueType determines which staging appenders to create (SRC vs DST).
 func (db *DB) runStagingFlush(queueType string, srcRows map[string]srcStagingRow, dstRows map[string]string) error {
 	if len(srcRows) == 0 && len(dstRows) == 0 {
 		return nil
 	}
-	conn := db.srcAppenderConn
-	if queueType == "DST" {
-		conn = db.dstAppenderConn
-	}
-	return db.runAppenderTxConn(conn, queueType, false, func(aw appenderFlusher) error {
+	return db.runAppenderTxConn(db.conn, queueType, false, func(aw appenderFlusher) error {
 		for nodeID, r := range srcRows {
 			if err := aw.appendSrcStaging(nodeID, r.traversal, r.copy); err != nil {
 				return err
@@ -350,14 +302,12 @@ func (db *DB) runStagingFlush(queueType string, srcRows map[string]srcStagingRow
 	})
 }
 
-// runNodesFlush writes node rows to the DB via the appropriate appender conn.
+// runNodesFlush writes node rows via native DuckDB Appender (same path as staging). Bypasses SQL execution overhead.
 func (db *DB) runNodesFlush(table string, nodes []*NodeState) error {
-	conn := db.srcAppenderConn
-	if table == "DST" {
-		conn = db.dstAppenderConn
+	if len(nodes) == 0 {
+		return nil
 	}
-	queueType := table
-	return db.runAppenderTxConn(conn, queueType, true, func(aw appenderFlusher) error {
+	return db.runAppenderTxConn(db.conn, table, true, func(aw appenderFlusher) error {
 		for _, n := range nodes {
 			if err := aw.appendNode(table, n); err != nil {
 				return err

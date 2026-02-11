@@ -210,7 +210,7 @@ This ensures DST stays at least 3 rounds behind SRC (or waits for SRC completion
 ### Batch Fetching
 
 ```go
-// Pull up to 1000 tasks from /SRC/levels/{round}/pending
+// Pull up to N tasks from /SRC/levels/{round}/pending
 batch, err := db.BatchFetchWithKeys(boltDB, queueType, currentRound, db.StatusPending, defaultLeaseBatchSize)
 
 // For each item in batch:

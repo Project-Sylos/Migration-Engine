@@ -172,8 +172,12 @@ func SetupCopyTestConfig(cleanSpectraDB bool, removeMigrationDB bool) (migration
 		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
 	}
 
+	dbPath, err := filepath.Abs("pkg/tests/copy/shared/main_test.db")
+	if err != nil {
+		return migration.Config{}, fmt.Errorf("failed to resolve DB path: %w", err)
+	}
 	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           "pkg/tests/copy/shared/main_test.db",
+		Path:           dbPath,
 		RemoveExisting: removeMigrationDB,
 	})
 	if err != nil {
@@ -184,7 +188,7 @@ func SetupCopyTestConfig(cleanSpectraDB bool, removeMigrationDB bool) (migration
 		DatabaseInstance: dbInstance,
 		Runtime:          migration.ModeStandalone,
 		Database: migration.DatabaseConfig{
-			Path:           "pkg/tests/copy/shared/main_test.db",
+			Path:           dbPath,
 			RemoveExisting: removeMigrationDB,
 		},
 		Source: migration.Service{
@@ -245,10 +249,13 @@ func SetupLocalCopyTest(srcPath, dstPath string, removeMigrationDB bool) (*db.DB
 		return nil, nil, nil, fmt.Errorf("destination path does not exist or is not accessible: %s (error: %w)", dstPath, err)
 	}
 
-	// Open database - tests own the lifecycle
-	// Use pkg/tests/copy/shared/main_test.db for copy tests
+	// Open database - tests own the lifecycle (absolute path to avoid split-brain across connections)
+	dbPath, err := filepath.Abs("pkg/tests/copy/shared/main_test.db")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to resolve DB path: %w", err)
+	}
 	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           "pkg/tests/copy/shared/main_test.db",
+		Path:           dbPath,
 		RemoveExisting: removeMigrationDB,
 	})
 	if err != nil {
