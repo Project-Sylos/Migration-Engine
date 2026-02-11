@@ -92,11 +92,6 @@ func (q *Queue) getDatabase() *db.DB {
 	return q.database
 }
 
-func (q *Queue) getOutputBuffer() *db.OutputBuffer {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	return q.outputBuffer
-}
 
 func (q *Queue) getShutdownCtx() context.Context {
 	q.mu.RLock()
@@ -490,12 +485,6 @@ func (q *Queue) setDatabase(database *db.DB) {
 	q.database = database
 }
 
-func (q *Queue) setOutputBuffer(outputBuffer *db.OutputBuffer) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.outputBuffer = outputBuffer
-}
-
 func (q *Queue) setStatsChan(ch chan QueueStats) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -642,7 +631,6 @@ type QueueStateSnapshot struct {
 	FirstPullForRound  bool
 	PullLowWM          int
 	Database           *db.DB
-	OutputBuffer       *db.OutputBuffer
 	Mode               QueueMode
 }
 
@@ -663,7 +651,6 @@ func (q *Queue) getStateSnapshot() QueueStateSnapshot {
 		FirstPullForRound:  q.firstPullForRound,
 		PullLowWM:          wm,
 		Database:           q.database,
-		OutputBuffer:       q.outputBuffer,
 		Mode:               q.mode,
 	}
 }

@@ -131,10 +131,7 @@ func (q *Queue) AdvanceCopyRound() {
 
 	// Flush buffer before advancing to ensure all pending writes (like DST node creation)
 	// are persisted before the next round's tasks try to read them
-	outputBuffer := q.getOutputBuffer()
-	if outputBuffer != nil {
-		outputBuffer.Flush()
-	}
+	database.FlushTablesForQueue(getQueueType(q.name))
 
 	currentRound := q.GetRound()
 	copyPass := q.GetCopyPass()
@@ -253,7 +250,6 @@ func (q *Queue) PullCopyTasks(force bool) {
 	// Set pulling flag early and defer clearing it
 	// This ensures only one thread can execute the pull logic at a time
 	q.setPulling(true)
-	outputBuffer := q.getOutputBuffer()
 
 	// Always clear pulling flag when done
 	defer func() {
@@ -262,9 +258,7 @@ func (q *Queue) PullCopyTasks(force bool) {
 
 	// Force-flush buffer before pulling tasks to ensure we don't pull tasks
 	// that are waiting in the buffer to be written
-	if outputBuffer != nil {
-		outputBuffer.Flush()
-	}
+	database.FlushTablesForQueue(getQueueType(q.name))
 
 	// Get state snapshot
 	snapshot := q.getStateSnapshot()
@@ -411,17 +405,15 @@ func (q *Queue) PullCopyTasks(force bool) {
 
 			// ONLY queue status update if we successfully enqueued the task
 			// This prevents queueing status updates for already-leased or duplicate tasks
-			if outputBuffer != nil {
-				outputBuffer.AddCopyStatusUpdate("SRC", item.State.Depth, item.State.Type, db.CopyStatusPending, item.State.ID, db.CopyStatusInProgress)
-			}
+			database.AddCopyToStaging(item.State.ID, db.CopyStatusInProgress)
 		}
 	}
 
 	// This ensures the status updates are written to BoltDB before any hard checks run
 	// Without this flush, hard checks will still see tasks in the pending bucket
 	// Only flush if we actually enqueued tasks (enqueueSuccessCount > 0)
-	if outputBuffer != nil && enqueueSuccessCount > 0 {
-		outputBuffer.Flush()
+	if enqueueSuccessCount > 0 {
+		database.FlushTablesForQueue(getQueueType(q.name))
 	}
 
 	// Track if this pull was partial
@@ -519,10 +511,8 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 	}
 
 	// Update copy status: in-progress -> successful
-	outputBuffer := q.getOutputBuffer()
-	if outputBuffer != nil {
-		outputBuffer.AddCopyStatusUpdate("SRC", currentRound, taskType, db.CopyStatusInProgress, nodeID, db.CopyStatusSuccessful)
-	}
+	database.AddCopyToStaging(nodeID, db.CopyStatusSuccessful)
+
 
 	// Create DST node entry and update join-lookup (deterministic ID from path)
 	dstNodeID := db.DeterministicNodeID("DST", taskType, taskPath)
@@ -545,11 +535,10 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 		Depth:           currentRound,
 	}
 
-	// Queue the creation of the DST node as an output buffer operation.
+	// Queue the creation of the DST node (DB-owned buffer)
 	// DST nodes use traversal status (not copy status) - mark as "successful" since it was just created
-	if outputBuffer != nil {
-		outputBuffer.AddCreateNode("DST", currentRound, db.StatusSuccessful, dstNode)
-	}
+	database.AddNode("DST", dstNode, db.StatusSuccessful)
+
 
 	// Track metrics based on task type
 	q.mu.Lock()
@@ -590,12 +579,6 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 	task.Attempts++
 
 	// Use only task fields for status update (no DB read)
-	taskType := types.NodeTypeFile
-	if task.IsFolder() {
-		taskType = types.NodeTypeFolder
-	}
-	outputBuffer := q.getOutputBuffer()
-
 	// Check if we should retry
 	if task.Attempts < maxRetries {
 		// Retry: re-enqueue to memory, DON'T write to BoltDB (stays as in-progress)
@@ -628,9 +611,8 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 		q.recordTaskCompletion(currentRound, false)
 
 		// Add to buffer only on final failure
-		if outputBuffer != nil {
-			outputBuffer.AddCopyStatusUpdate("SRC", currentRound, taskType, db.CopyStatusInProgress, nodeID, db.CopyStatusFailed)
-		}
+		database.AddCopyToStaging(nodeID, db.CopyStatusFailed)
+
 
 		q.removeInProgress(nodeID)
 

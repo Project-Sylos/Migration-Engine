@@ -34,7 +34,6 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	// Set pulling flag early and defer clearing it
 	// This ensures only one thread can execute the pull logic at a time
 	q.setPulling(true)
-	outputBuffer := q.getOutputBuffer()
 
 	// Always clear pulling flag when done
 	defer func() {
@@ -43,9 +42,7 @@ func (q *Queue) PullTraversalTasks(force bool) {
 
 	// Force-flush buffer before pulling tasks to ensure we don't pull tasks
 	// that are waiting in the buffer to be written
-	if outputBuffer != nil {
-		outputBuffer.Flush()
-	}
+	database.FlushTablesForQueue(getQueueType(q.name))
 
 	queueType := getQueueType(q.name)
 	taskType := TaskTypeSrcTraversal
@@ -262,21 +259,12 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 			State:     childState,
 		})
 
-		outputBuffer := q.getOutputBuffer()
 		// For DST queue: queue lookup mapping if this child has a matching SRC node
 		if queueType == "DST" && child.SrcID != "" {
 			// Update SRC node's CopyStatus if worker determined an update is needed (use meta from pull, no DB lookup)
 			if child.SrcCopyStatus != "" && task.ExpectedSrcNodeMeta != nil {
-				if meta, ok := task.ExpectedSrcNodeMeta[child.SrcID]; ok && outputBuffer != nil {
-					oldCopyStatus := meta.CopyStatus
-					if oldCopyStatus == "" {
-						oldCopyStatus = db.CopyStatusPending
-					}
-					nodeType := "file"
-					if !child.IsFile {
-						nodeType = "folder"
-					}
-					outputBuffer.AddCopyStatusUpdate("SRC", meta.Depth, nodeType, oldCopyStatus, child.SrcID, child.SrcCopyStatus)
+				if _, ok := task.ExpectedSrcNodeMeta[child.SrcID]; ok {
+					database.AddCopyToStaging(child.SrcID, child.SrcCopyStatus)
 				}
 			}
 		}
@@ -345,57 +333,36 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 				State:     taskState,
 			})
 
-			outputBuffer := q.getOutputBuffer()
 			// Queue lookup mapping if this child has a matching SRC node
 			if child.srcID != "" {
-
 				// Update SRC node's CopyStatus if worker determined an update is needed (use meta from pull, no DB lookup)
 				if child.srcCopyStatus != "" && task.ExpectedSrcNodeMeta != nil {
-					if meta, ok := task.ExpectedSrcNodeMeta[child.srcID]; ok && outputBuffer != nil {
-						oldCopyStatus := meta.CopyStatus
-						if oldCopyStatus == "" {
-							oldCopyStatus = db.CopyStatusPending
-						}
-						// childFolders only contains folder children
-						outputBuffer.AddCopyStatusUpdate("SRC", meta.Depth, "folder", oldCopyStatus, child.srcID, child.srcCopyStatus)
+					if _, ok := task.ExpectedSrcNodeMeta[child.srcID]; ok {
+						database.AddCopyToStaging(child.srcID, child.srcCopyStatus)
 					}
 				}
 			}
 		}
 	}
 
-	// Write to buffer
-	outputBuffer := q.getOutputBuffer()
-	if outputBuffer != nil {
-		atomicOps := make([]db.WriteOperation, 0, 2)
+	// Write to DB buffers (DB-owned, table-scoped)
+	// Parent status update
+	database.AddToStaging(queueType, nodeID, db.StatusSuccessful)
 
-		// Add parent status update operation
-		atomicOps = append(atomicOps, &db.StatusUpdateOperation{
-			QueueType: queueType,
-			Level:     currentRound,
-			OldStatus: db.StatusPending,
-			NewStatus: db.StatusSuccessful,
-			NodeID:    nodeID,
-		})
+	// Child inserts
+	if len(childNodesToInsert) > 0 {
+		database.AddNodes(childNodesToInsert)
+	}
 
-		// Add child inserts operation (if any)
-		if len(childNodesToInsert) > 0 {
-			atomicOps = append(atomicOps, &db.BatchInsertOperation{
-				Operations: childNodesToInsert,
-			})
+	// For SRC FOLDER tasks in retry mode: Queue DST cleanup only when RetryDstCleanup was populated at pull (no DB reads here).
+	if q.name == "src" && q.GetMode() == QueueModeRetry && task.IsFolder() && task.RetryDstCleanup != nil {
+		c := task.RetryDstCleanup
+		database.AddToStaging("DST", c.DstID, db.StatusPending)
+		deletions := make([]db.NodeDeletion, 0, len(c.Children))
+		for _, ch := range c.Children {
+			deletions = append(deletions, db.NodeDeletion{Table: "DST", NodeID: ch.ID})
 		}
-
-		// Add all operations atomically
-		outputBuffer.AddMultiple(atomicOps)
-
-		// For SRC FOLDER tasks in retry mode: Queue DST cleanup only when RetryDstCleanup was populated at pull (no DB reads here).
-		if q.name == "src" && q.GetMode() == QueueModeRetry && task.IsFolder() && task.RetryDstCleanup != nil {
-			c := task.RetryDstCleanup
-			outputBuffer.AddStatusUpdate("DST", c.DstDepth, c.DstOldStatus, db.StatusPending, c.DstID)
-			for _, ch := range c.Children {
-				outputBuffer.AddNodeDeletion("DST", ch.ID, ch.Depth, ch.TraversalStatus)
-			}
-		}
+		_ = database.AddNodeDeletions(deletions)
 	}
 
 	// Remove from in-progress LAST
@@ -454,10 +421,10 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 	q.recordTaskCompletion(currentRound, false)
 
 	// Update traversal status to failed
-	outputBuffer := q.getOutputBuffer()
-	if nodeID != "" && outputBuffer != nil {
-		queueType := getQueueType(q.name)
-		outputBuffer.AddStatusUpdate(queueType, currentRound, db.StatusPending, db.StatusFailed, nodeID)
+	if nodeID != "" {
+		if database := q.getDatabase(); database != nil {
+			database.AddToStaging(getQueueType(q.name), nodeID, db.StatusFailed)
+		}
 	}
 
 	// Remove from in-progress LAST
@@ -514,9 +481,8 @@ func (q *Queue) CheckTraversalCompletion(currentRound int, wasFirstPull bool) bo
 // For traversal/retry modes, simply increments the round by 1.
 func (q *Queue) AdvanceTraversalRound() {
 	// Flush buffer before advancing
-	outputBuffer := q.getOutputBuffer()
-	if outputBuffer != nil {
-		outputBuffer.Flush()
+	if database := q.getDatabase(); database != nil {
+		database.FlushTablesForQueue(getQueueType(q.name))
 	}
 
 	// Ensure state is running if it was waiting

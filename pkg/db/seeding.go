@@ -18,13 +18,13 @@ func BootstrapRootStats(d *DB) error {
 }
 
 // InsertRootNode inserts the root node (path "/", depth 0) into the given table.
-// Uses RunUpdateWriterTx with a direct single-row INSERT (not appender) for immediate turnaround.
+// Uses appender connection with explicit commit so pulls (same conn) see the root immediately.
 func InsertRootNode(d *DB, table string, state *NodeState) error {
 	if state == nil {
 		return nil
 	}
 	t := tableName(table)
-	return d.RunUpdateWriterTx(func(w *Writer) error {
+	return d.RunAppenderWriterTx(table, func(w *Writer) error {
 		traversalStatus := state.TraversalStatus
 		if traversalStatus == "" {
 			traversalStatus = state.Status

@@ -93,6 +93,8 @@ func SeedRootTasks(srcRoot types.Folder, dstRoot types.Folder, database *db.DB) 
 		return fmt.Errorf("failed to seed dst root: %w", err)
 	}
 
+	_ = database.Checkpoint()
+
 	if logservice.LS != nil {
 		_ = logservice.LS.Log(
 			"info",

@@ -40,10 +40,8 @@ func (q *Queue) PullRetryTasks(force bool) {
 
 	// Force-flush buffer before pulling tasks to ensure we don't pull tasks
 	// that are waiting in the buffer to be written
-	outputBuffer := q.getOutputBuffer()
-	if outputBuffer != nil {
-		outputBuffer.Flush()
-	}
+	database.FlushTablesForQueue(getQueueType(q.name))
+
 
 	// Get state snapshot
 	snapshot := q.getStateSnapshot()

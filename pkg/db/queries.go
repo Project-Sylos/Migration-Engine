@@ -6,7 +6,6 @@ package db
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"strconv"
 	"strings"
 )
@@ -18,9 +17,13 @@ func tableName(table string) string {
 	return tableSrcNodes
 }
 
-// GetNodeByID returns the node by id from the given table.
+// GetNodeByID returns the node by id from the given table. Uses pull conn so we see appender-written data.
 func GetNodeByID(d *DB, table, id string) (*NodeState, error) {
-	conn, err := d.GetDB()
+	queueType := table
+	if queueType != "SRC" && queueType != "DST" {
+		queueType = "SRC"
+	}
+	conn, err := d.GetDBForPulls(queueType)
 	if err != nil {
 		return nil, err
 	}
@@ -46,9 +49,13 @@ func GetNodeByID(d *DB, table, id string) (*NodeState, error) {
 	return &n, nil
 }
 
-// GetNodeByPath returns the node by path from the given table.
+// GetNodeByPath returns the node by path from the given table. Uses pull conn so we see appender-written data.
 func GetNodeByPath(d *DB, table, path string) (*NodeState, error) {
-	conn, err := d.GetDB()
+	queueType := table
+	if queueType != "SRC" && queueType != "DST" {
+		queueType = "SRC"
+	}
+	conn, err := d.GetDBForPulls(queueType)
 	if err != nil {
 		return nil, err
 	}
@@ -171,9 +178,13 @@ func GetChildrenIDsByParentID(d *DB, table, parentID string, limit int) ([]strin
 
 // ListNodesByDepthKeyset returns nodes at the given depth, ordered by id, after afterID, limit rows.
 // If statusFilter is non-empty, only rows with traversal_status = statusFilter are returned (e.g. StatusPending).
-// Uses update conn so pulls see the same data as writes (roots, node inserts).
+// Uses pull conn so pulls see the same data as writes (roots, node inserts).
 func ListNodesByDepthKeyset(d *DB, table string, depth int, afterID, statusFilter string, limit int) ([]FetchResult, error) {
-	conn, err := d.GetDBForPulls()
+	queueType := table
+	if queueType != "SRC" && queueType != "DST" {
+		queueType = "SRC"
+	}
+	conn, err := d.GetDBForPulls(queueType)
 	if err != nil {
 		return nil, err
 	}
@@ -182,14 +193,14 @@ func ListNodesByDepthKeyset(d *DB, table string, depth int, afterID, statusFilte
 	var rows *sql.Rows
 	if statusFilter != "" {
 		if afterID == "" {
-			fmt.Printf("[ListNodesByDepthKeyset] table=%s depth=%d afterID=%q statusFilter=%q limit=%d\n  SQL: SELECT ... FROM %s WHERE depth = $1 AND traversal_status = $2 ORDER BY id LIMIT $3  ($1=%d $2=%q $3=%d)\n", t, depth, afterID, statusFilter, limit, t, depth, statusFilter, limit)
+			// fmt.Printf("[ListNodesByDepthKeyset] table=%s depth=%d afterID=%q statusFilter=%q limit=%d\n  SQL: SELECT ... FROM %s WHERE depth = $1 AND traversal_status = $2 ORDER BY id LIMIT $3  ($1=%d $2=%q $3=%d)\n", t, depth, afterID, statusFilter, limit, t, depth, statusFilter, limit)
 			rows, err = conn.QueryContext(ctx,
 				`SELECT id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth, traversal_status, copy_status, excluded, errors
 				 FROM `+t+` WHERE depth = $1 AND traversal_status = $2 ORDER BY id LIMIT $3`,
 				depth, statusFilter, limit,
 			)
 		} else {
-			fmt.Printf("[ListNodesByDepthKeyset] table=%s depth=%d afterID=%q statusFilter=%q limit=%d\n  SQL: SELECT ... FROM %s WHERE depth = $1 AND traversal_status = $2 AND id > $3 ORDER BY id LIMIT $4  ($1=%d $2=%q $3=%q $4=%d)\n", t, depth, afterID, statusFilter, limit, t, depth, statusFilter, afterID, limit)
+			// fmt.Printf("[ListNodesByDepthKeyset] table=%s depth=%d afterID=%q statusFilter=%q limit=%d\n  SQL: SELECT ... FROM %s WHERE depth = $1 AND traversal_status = $2 AND id > $3 ORDER BY id LIMIT $4  ($1=%d $2=%q $3=%q $4=%d)\n", t, depth, afterID, statusFilter, limit, t, depth, statusFilter, afterID, limit)
 			rows, err = conn.QueryContext(ctx,
 				`SELECT id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth, traversal_status, copy_status, excluded, errors
 				 FROM `+t+` WHERE depth = $1 AND traversal_status = $2 AND id > $3 ORDER BY id LIMIT $4`,
@@ -198,14 +209,14 @@ func ListNodesByDepthKeyset(d *DB, table string, depth int, afterID, statusFilte
 		}
 	} else {
 		if afterID == "" {
-			fmt.Printf("[ListNodesByDepthKeyset] table=%s depth=%d afterID=%q statusFilter=(none) limit=%d\n  SQL: SELECT ... FROM %s WHERE depth = $1 ORDER BY id LIMIT $2  ($1=%d $2=%d)\n", t, depth, afterID, limit, t, depth, limit)
+			// fmt.Printf("[ListNodesByDepthKeyset] table=%s depth=%d afterID=%q statusFilter=(none) limit=%d\n  SQL: SELECT ... FROM %s WHERE depth = $1 ORDER BY id LIMIT $2  ($1=%d $2=%d)\n", t, depth, afterID, limit, t, depth, limit)
 			rows, err = conn.QueryContext(ctx,
 				`SELECT id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth, traversal_status, copy_status, excluded, errors
 				 FROM `+t+` WHERE depth = $1 ORDER BY id LIMIT $2`,
 				depth, limit,
 			)
 		} else {
-			fmt.Printf("[ListNodesByDepthKeyset] table=%s depth=%d afterID=%q statusFilter=(none) limit=%d\n  SQL: SELECT ... FROM %s WHERE depth = $1 AND id > $2 ORDER BY id LIMIT $3  ($1=%d $2=%q $3=%d)\n", t, depth, afterID, limit, t, depth, afterID, limit)
+			// fmt.Printf("[ListNodesByDepthKeyset] table=%s depth=%d afterID=%q statusFilter=(none) limit=%d\n  SQL: SELECT ... FROM %s WHERE depth = $1 AND id > $2 ORDER BY id LIMIT $3  ($1=%d $2=%q $3=%d)\n", t, depth, afterID, limit, t, depth, afterID, limit)
 			rows, err = conn.QueryContext(ctx,
 				`SELECT id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth, traversal_status, copy_status, excluded, errors
 				 FROM `+t+` WHERE depth = $1 AND id > $2 ORDER BY id LIMIT $3`,
@@ -235,9 +246,9 @@ func ListNodesByDepthKeyset(d *DB, table string, depth int, afterID, statusFilte
 }
 
 // ListNodesCopyKeyset returns src_nodes at depth for copy phase with copy_status = 'pending', ordered by id, after afterID, limit. Optional nodeType filter (folder/file or "" for both).
-// Uses update conn so pulls see the same data as writes.
+// Uses pull conn so pulls see the same data as writes.
 func ListNodesCopyKeyset(d *DB, depth int, nodeType, afterID string, limit int) ([]FetchResult, error) {
-	conn, err := d.GetDBForPulls()
+	conn, err := d.GetDBForPulls("SRC")
 	if err != nil {
 		return nil, err
 	}
@@ -369,9 +380,13 @@ func CountExcluded(d *DB, table string) (int, error) {
 	return n, nil
 }
 
-// CountNodes returns the total number of nodes in the given table (src_nodes or dst_nodes). Live table count, not from stats.
+// CountNodes returns the total number of nodes in the given table (src_nodes or dst_nodes). Live table count, not from stats. Uses pull conn so we see appender-written data.
 func CountNodes(d *DB, table string) (int, error) {
-	conn, err := d.GetDB()
+	queueType := table
+	if queueType != "SRC" && queueType != "DST" {
+		queueType = "SRC"
+	}
+	conn, err := d.GetDBForPulls(queueType)
 	if err != nil {
 		return 0, err
 	}
@@ -450,9 +465,9 @@ func BatchGetNodeMeta(d *DB, table string, ids []string) (map[string]NodeMeta, e
 
 // ListDstBatchWithSrcChildren returns the next batch of DST nodes at depth (keyset afterID, limit) and their SRC children (join by parent_path = d.path) in one query. Optional traversalStatus filter (e.g. StatusPending).
 // Returns DST rows as []FetchResult and per-DST-ID SRC children as map[string][]*NodeState. Cursor must be round-scoped; reset on round advance, mode switch, and after seal.
-// Uses update conn so pulls see the same data as writes.
+// Uses DST pull conn so pulls see the same data as writes.
 func ListDstBatchWithSrcChildren(d *DB, depth int, afterID string, limit int, traversalStatus string) ([]FetchResult, map[string][]*NodeState, error) {
-	conn, err := d.GetDBForPulls()
+	conn, err := d.GetDBForPulls("DST")
 	if err != nil {
 		return nil, nil, err
 	}

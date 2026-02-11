@@ -181,7 +181,6 @@ type Queue struct {
 	workers            []Worker             // Workers associated with this queue (for reference only)
 	database            *db.DB               // Database for operational queue storage
 	coordinator        *QueueCoordinator    // Coordinator for round advancement gates (DST only)
-	outputBuffer       *db.OutputBuffer     // Buffer for batched write operations
 	// Round-based statistics for completion detection
 	roundStats  map[int]*RoundStats // Per-round statistics (key: round number, value: stats for that round)
 	shutdownCtx context.Context     // Context for shutdown signaling (optional)
@@ -250,11 +249,8 @@ func (q *Queue) InitializeWithContext(database *db.DB, adapter types.FSAdapter, 
 	workerCount := cap(q.workers) // Get the worker count we preallocated for
 	q.mu.RUnlock()
 
-	// Initialize output buffer for batched writes
-	// Default: 1000 operations or 1 second interval
-	outputBuffer := db.NewOutputBuffer(database, 10000, 3*time.Second)
-	q.setOutputBuffer(outputBuffer)
-	outputBuffer.SetOnFlush(func(nodeIDs []string) {
+	// Register flush callback for leased-key removal (DB owns buffers)
+	database.SetOnFlush(getQueueType(q.name), func(nodeIDs []string) {
 		for _, nodeID := range nodeIDs {
 			q.removeLeasedKey(nodeID)
 		}
@@ -295,10 +291,8 @@ func (q *Queue) InitializeCopyWithContext(database *db.DB, srcAdapter, dstAdapte
 	workerCount := cap(q.workers)
 	q.mu.RUnlock()
 
-	// Initialize output buffer for batched writes
-	outputBuffer := db.NewOutputBuffer(database, 10000, 3*time.Second)
-	q.setOutputBuffer(outputBuffer)
-	outputBuffer.SetOnFlush(func(nodeIDs []string) {
+	// Register flush callback for leased-key removal (DB owns buffers)
+	database.SetOnFlush(getQueueType(q.name), func(nodeIDs []string) {
 		for _, nodeID := range nodeIDs {
 			q.removeLeasedKey(nodeID)
 		}
@@ -410,9 +404,10 @@ type CompletionCheckOptions struct {
 // Returns true if queue was marked as completed, false otherwise.
 func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) bool {
 	// Flush buffer first (if requested) to ensure all writes are persisted before checking
-	outputBuffer := q.getOutputBuffer()
-	if opts.FlushBuffer && outputBuffer != nil {
-		outputBuffer.Flush()
+	if opts.FlushBuffer {
+		if database := q.getDatabase(); database != nil {
+			database.FlushTablesForQueue(getQueueType(q.name))
+		}
 	}
 
 	// For traversal/sweep completion check (handles all modes)
@@ -1182,14 +1177,14 @@ func (q *Queue) advanceToNextRound() {
 	// No gating here - rounds advance freely
 	// Gating only happens when STARTING a round (checked in Run() outer loop)
 
-	// Flush buffer before seal so all status updates are in staging
-	outputBuffer := q.getOutputBuffer()
-	if outputBuffer != nil {
-		outputBuffer.Flush()
+	database := q.getDatabase()
+	if database != nil {
+		// Flush buffer before seal so all status updates are in staging
+		database.FlushTablesForQueue(getQueueType(q.name))
 	}
 
 	// Phase 5: onLevelSeal - merge staging to live, update stats, write completed count, drop staging, create new staging.
-	if database := q.getDatabase(); database != nil {
+	if database != nil {
 		round := q.GetRound()
 		completed := int64(0)
 		if stats := q.GetRoundStats(round); stats != nil {
@@ -1198,6 +1193,7 @@ func (q *Queue) advanceToNextRound() {
 		_ = database.RunUpdateWriterTx(func(w *db.Writer) error {
 			return w.ApplyStatusStagingAndDrop(round, getQueueType(q.name), completed)
 		})
+		_ = database.Checkpoint()
 	}
 	// This queue's cursor must not survive its seal. Reset only this queue's cursor; other queues are independent.
 	q.resetThisQueueKeysetCursor()
