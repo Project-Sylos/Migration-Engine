@@ -5,11 +5,13 @@ package db
 
 // EnsureNodeTableIndexes creates indexes on the given node table (e.g. "src_nodes", "dst_nodes") for path, parent_path, traversal_status, and copy_status.
 // Call only after traversal (and copy) for that queue is complete; each index is O(n) over the table. Idempotent (CREATE INDEX IF NOT EXISTS).
+// Boosts threads to 12 during indexing for faster builds, then restores to 4.
 func EnsureNodeTableIndexes(db *DB, table string) error {
 	conn, err := db.GetDB()
 	if err != nil {
 		return err
 	}
+
 	indexes := []struct {
 		name   string
 		column string

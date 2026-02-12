@@ -76,15 +76,25 @@ func (aw *queueAppenderWriter) appendDstStaging(nodeID, newTraversal string) err
 	return aw.dstStaging.AppendRow(nodeID, newTraversal)
 }
 
-func (aw *queueAppenderWriter) appendNode(table string, n *NodeState) error {
+func (aw *queueAppenderWriter) appendNode(table string, n *NodeState, rowArgs []driver.Value) error {
 	traversalStatus := n.TraversalStatus
 	if traversalStatus == "" {
 		traversalStatus = n.Status
 	}
-	rowArgs := []driver.Value{
-		n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath,
-		n.Type, n.Size, n.MTime, int32(n.Depth), traversalStatus, n.CopyStatus, n.Excluded, n.Errors,
-	}
+	rowArgs[0] = n.ID
+	rowArgs[1] = n.ServiceID
+	rowArgs[2] = n.ParentID
+	rowArgs[3] = n.ParentServiceID
+	rowArgs[4] = n.Path
+	rowArgs[5] = n.ParentPath
+	rowArgs[6] = n.Type
+	rowArgs[7] = n.Size
+	rowArgs[8] = n.MTime
+	rowArgs[9] = int32(n.Depth)
+	rowArgs[10] = traversalStatus
+	rowArgs[11] = n.CopyStatus
+	rowArgs[12] = n.Excluded
+	rowArgs[13] = n.Errors
 	switch table {
 	case "DST":
 		if aw.dstNodes != nil {

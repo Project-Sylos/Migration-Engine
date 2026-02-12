@@ -25,36 +25,75 @@ func GenerateLogID() int64 {
 	return time.Now().UnixNano()
 }
 
-// DefaultLogShardCap is the default capacity per shard in the log buffer.
-const DefaultLogShardCap = 256
-
 // LogBuffer buffers log entries and flushes them to the DB logs table.
+// Back-pressure: at 2x batch size, Add blocks until a flush completes.
+// Flushing guard: only one in-flight flush; getAndClearIfReady returns nil if already flushing.
 type LogBuffer struct {
-	db       *DB
-	entries  []LogEntry
-	mu       sync.Mutex
-	interval time.Duration
-	stopCh   chan struct{}
-	stopped  int32
+	db        *DB
+	entries   []LogEntry
+	batchSize int
+	mu        sync.Mutex
+	cond      *sync.Cond
+	flushing  bool
+	slots     chan struct{}
+	interval  time.Duration
+	stopCh    chan struct{}
+	stopped   int32
 }
 
 // NewLogBuffer creates a log buffer that flushes to the main DB's logs table.
-func NewLogBuffer(db *DB, batchSize int, interval time.Duration, _ int) *LogBuffer {
+func NewLogBuffer(db *DB, batchSize int, interval time.Duration) *LogBuffer {
+	hardCap := batchSize * 2
 	lb := &LogBuffer{
-		db:       db,
-		entries:  make([]LogEntry, 0, batchSize),
-		interval: interval,
-		stopCh:   make(chan struct{}),
+		db:        db,
+		entries:   make([]LogEntry, 0, batchSize),
+		batchSize: batchSize,
+		slots:     make(chan struct{}, hardCap),
+		interval:  interval,
+		stopCh:    make(chan struct{}),
+	}
+	lb.cond = sync.NewCond(&lb.mu)
+	for i := 0; i < hardCap; i++ {
+		lb.slots <- struct{}{}
 	}
 	go lb.flushLoop()
 	return lb
 }
 
+func (lb *LogBuffer) getAndClearIfReady() []LogEntry {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	if lb.flushing || len(lb.entries) < lb.batchSize {
+		return nil
+	}
+	batch := lb.entries
+	lb.entries = make([]LogEntry, 0, cap(lb.entries))
+	lb.flushing = true
+	lb.cond.Broadcast()
+	return batch
+}
+
+func (lb *LogBuffer) setFlushingDone() {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	lb.flushing = false
+	lb.cond.Broadcast()
+}
+
 // Add adds an entry to the buffer.
 func (lb *LogBuffer) Add(e LogEntry) {
+	hardCap := lb.batchSize * 2
+	<-lb.slots
 	lb.mu.Lock()
+	for len(lb.entries) >= hardCap {
+		lb.cond.Wait()
+	}
 	lb.entries = append(lb.entries, e)
+	count := len(lb.entries)
 	lb.mu.Unlock()
+	if count >= lb.batchSize {
+		lb.Flush()
+	}
 }
 
 func (lb *LogBuffer) flushLoop() {
@@ -72,13 +111,12 @@ func (lb *LogBuffer) flushLoop() {
 
 // Flush writes buffered entries to the logs table.
 func (lb *LogBuffer) Flush() {
-	lb.mu.Lock()
-	batch := lb.entries
-	lb.entries = make([]LogEntry, 0, cap(lb.entries))
-	lb.mu.Unlock()
+	batch := lb.getAndClearIfReady()
 	if len(batch) == 0 {
 		return
 	}
+	defer lb.setFlushingDone()
+	n := len(batch)
 	_ = lb.db.RunUpdateWriterTx(func(w *Writer) error {
 		for _, e := range batch {
 			if err := w.InsertLog(e.ID, e.Level, e.Message, e.Entity, e.Entity, e.EntityID, e.Queue); err != nil {
@@ -87,6 +125,9 @@ func (lb *LogBuffer) Flush() {
 		}
 		return nil
 	})
+	for i := 0; i < n; i++ {
+		lb.slots <- struct{}{}
+	}
 }
 
 // Stop stops the flush loop. Does not close the DB.

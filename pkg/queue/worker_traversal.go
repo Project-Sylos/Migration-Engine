@@ -192,9 +192,9 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 	}
 
 	// log discovered children count 
-	if logservice.LS != nil {
-		_ = logservice.LS.Log("info", fmt.Sprintf("Discovered %d children for task %s", len(task.DiscoveredChildren), task.ID), "worker", w.id, w.queueName)
-	}
+	// if logservice.LS != nil {
+	// 	_ = logservice.LS.Log("info", fmt.Sprintf("Discovered %d children for task %s", len(task.DiscoveredChildren), task.ID), "worker", w.id, w.queueName)
+	// }
 	
 	return nil
 }

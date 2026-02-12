@@ -337,6 +337,14 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			}
 			srcStats, dstStats := queue.QueueStats{Name: "src", Round: srcRound, Pending: srcPending}, queue.QueueStats{Name: "dst", Round: dstRound, Pending: dstPending}
 
+			// Create node table indexes before declaring complete (avoids blocking DST while SRC builds indexes)
+			if database != nil {
+				fmt.Println("\nCreating indexes... this may take a bit.")
+				_ = logservice.LS.Log("info", "Creating indexes... this may take a bit.", "migration", "run", "run")
+				_ = db.EnsureNodeTableIndexes(database, "src_nodes")
+				_ = db.EnsureNodeTableIndexes(database, "dst_nodes")
+			}
+
 			fmt.Println("\nMigration complete!")
 
 			// Update config YAML with final state (fire-and-forget to avoid blocking)
@@ -425,6 +433,15 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 					dstPending = int(c)
 				}
 				srcStats, dstStats := queue.QueueStats{Name: "src", Round: srcRound, Pending: srcPending}, queue.QueueStats{Name: "dst", Round: dstRound, Pending: dstPending}
+
+				// Create node table indexes before declaring complete
+				if database != nil {
+					fmt.Println("\nCreating indexes... this may take a bit.")
+					_ = logservice.LS.Log("info", "Creating indexes... this may take a bit.", "migration", "run", "run")
+					_ = db.EnsureNodeTableIndexes(database, "src_nodes")
+					_ = db.EnsureNodeTableIndexes(database, "dst_nodes")
+				}
+
 				fmt.Println("\nMigration complete!")
 
 				// Update config YAML with final state (fire-and-forget to avoid blocking)

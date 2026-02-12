@@ -61,6 +61,8 @@ const (
 	maxLeaseBatchSize     = 100_000 // Upper bound for pull (lease) batch size
 	// MaxSrcDstGap is the maximum allowed round gap (src - dst). When src exceeds dst + MaxSrcDstGap, src pauses pulling (Phase 6).
 	MaxSrcDstGap = 2
+	// stagingEarlyMergeThreshold: after this many task completions, merge staging into live to reduce memory on pathological wide rounds.
+	stagingEarlyMergeThreshold = 1_000_000
 )
 
 // effectiveLeaseBatchSize returns the lease batch size capped by maxLeaseBatchSize.
@@ -205,6 +207,8 @@ type Queue struct {
 	filesCreatedTotal     int64 // Total files created (monotonic counter)
 	// Tasks completed total: incremented on every success or final failure, pushed to stats on flush
 	tasksCompletedTotal int64
+	// completedSinceLastEarlyMerge: SRC traversal/retry only; when >= threshold, merge staging and reset
+	completedSinceLastEarlyMerge int64
 	// Keyset cursors for pagination (id > cursor ORDER BY id LIMIT n). Strictly round-scoped per queue; see resetThisQueueKeysetCursor.
 	srcKeysetCursor  string // SRC traversal/retry pull
 	dstKeysetCursor  string // DST traversal/retry pull
@@ -563,19 +567,6 @@ func (q *Queue) markComplete(format string, args ...interface{}) bool {
 		q.name, totalTasksProcessed, totalChildrenDiscovered)
 
 	q.SetState(QueueStateCompleted)
-
-	// Create node table indexes after hot path (traversal/copy) so writes are not slowed. Each index is O(n).
-	if database := q.getDatabase(); database != nil {
-		switch q.name {
-		case "src":
-			_ = db.EnsureNodeTableIndexes(database, "src_nodes")
-		case "dst":
-			_ = db.EnsureNodeTableIndexes(database, "dst_nodes")
-		case "copy":
-			_ = db.EnsureNodeTableIndexes(database, "src_nodes")
-			_ = db.EnsureNodeTableIndexes(database, "dst_nodes")
-		}
-	}
 
 	// Notify coordinator
 	coordinator := q.getCoordinator()

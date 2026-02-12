@@ -4,14 +4,13 @@
 package db
 
 import (
-	"context"
-	"fmt"
 	"sync"
 	"time"
 )
 
-const defaultBatchSize = 100_000
+const defaultBatchSize = 50_000
 const defaultFlushInterval = 30 * time.Second
+const backPressureHardCapMultiple = 2 // block writes when buffer reaches 2x batch size
 
 // srcStagingRow holds coalesced traversal and copy status for a node in src_staging.
 type srcStagingRow struct {
@@ -19,202 +18,269 @@ type srcStagingRow struct {
 	copy      string
 }
 
-// stagingBuffer buffers status updates for a staging table. Flushes to appender; never checkpoints.
-type stagingBuffer struct {
-	table      string // "SRC" or "DST"
-	db         *DB
-	batchSize  int
-	interval   time.Duration
-	mu         sync.Mutex
-	srcRows    map[string]srcStagingRow // nodeID -> row (src_staging has traversal + copy)
-	dstRows    map[string]string        // nodeID -> newTraversalStatus (dst_staging)
-	stopCh     chan struct{}
-	onFlush    func(nodeIDs []string)
+// BufferKind identifies what the buffer stores (staging status vs node inserts).
+type bufferKind int
+
+const (
+	bufferKindStaging bufferKind = iota
+	bufferKindNodes
+)
+
+// writeBuffer is the unified buffer for staging and nodes. Only the data shape and write path differ.
+type writeBuffer struct {
+	table     string
+	db        *DB
+	kind      bufferKind
+	batchSize int
+	interval  time.Duration
+	mu        sync.Mutex
+	cond      *sync.Cond
+	flushing  bool
+	slots     chan struct{}
+	stopCh    chan struct{}
+	onFlush   func(nodeIDs []string)
+
+	// kind-specific storage
+	srcRows   map[string]srcStagingRow
+	dstRows   map[string]string
+	nodes     []*NodeState
 }
 
-func newStagingBuffer(db *DB, table string) *stagingBuffer {
-	sb := &stagingBuffer{
+func newWriteBuffer(db *DB, table string, kind bufferKind) *writeBuffer {
+	hardCap := defaultBatchSize * backPressureHardCapMultiple
+	wb := &writeBuffer{
 		table:     table,
 		db:        db,
+		kind:      kind,
 		batchSize: defaultBatchSize,
 		interval:  defaultFlushInterval,
+		slots:     make(chan struct{}, hardCap),
 		stopCh:    make(chan struct{}),
 	}
-	if table == "SRC" {
-		sb.srcRows = make(map[string]srcStagingRow)
-	} else {
-		sb.dstRows = make(map[string]string)
+	wb.cond = sync.NewCond(&wb.mu)
+	for i := 0; i < hardCap; i++ {
+		wb.slots <- struct{}{}
 	}
-	go sb.flushLoop()
-	return sb
+	if kind == bufferKindStaging {
+		if table == "SRC" {
+			wb.srcRows = make(map[string]srcStagingRow)
+		} else {
+			wb.dstRows = make(map[string]string)
+		}
+	} else {
+		wb.nodes = make([]*NodeState, 0, 256)
+	}
+	go wb.flushLoop()
+	return wb
 }
 
-func (sb *stagingBuffer) flushLoop() {
-	ticker := time.NewTicker(sb.interval)
+func (wb *writeBuffer) flushLoop() {
+	ticker := time.NewTicker(wb.interval)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-sb.stopCh:
+		case <-wb.stopCh:
 			return
 		case <-ticker.C:
-			sb.Flush()
+			wb.Flush()
 		}
 	}
 }
 
-func (sb *stagingBuffer) addTraversal(nodeID, newTraversal string) {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-	if sb.table == "SRC" {
-		r := sb.srcRows[nodeID]
+func (wb *writeBuffer) count() int {
+	if wb.kind == bufferKindStaging {
+		if wb.table == "SRC" {
+			return len(wb.srcRows)
+		}
+		return len(wb.dstRows)
+	}
+	return len(wb.nodes)
+}
+
+func (wb *writeBuffer) getAndClearIfReady(force bool) (batch any, n int) {
+	wb.mu.Lock()
+	defer wb.mu.Unlock()
+	for wb.flushing {
+		wb.cond.Wait()
+	}
+	n = wb.count()
+	if n == 0 || (!force && n < wb.batchSize) {
+		return nil, 0
+	}
+	if wb.kind == bufferKindStaging {
+		var src map[string]srcStagingRow
+		var dst map[string]string
+		if wb.table == "SRC" {
+			src = wb.srcRows
+			wb.srcRows = make(map[string]srcStagingRow)
+		} else {
+			dst = wb.dstRows
+			wb.dstRows = make(map[string]string)
+		}
+		wb.flushing = true
+		wb.cond.Broadcast()
+		return stagingBatch{src: src, dst: dst}, n
+	}
+	nodes := wb.nodes
+	wb.nodes = make([]*NodeState, 0, cap(wb.nodes))
+	wb.flushing = true
+	wb.cond.Broadcast()
+	return nodes, n
+}
+
+func (wb *writeBuffer) setFlushingDone() {
+	wb.mu.Lock()
+	defer wb.mu.Unlock()
+	wb.flushing = false
+	wb.cond.Broadcast()
+}
+
+func (wb *writeBuffer) runFlush(batch any, n int) []string {
+	if wb.kind == bufferKindStaging {
+		sb := batch.(stagingBatch)
+		_ = wb.db.runStagingFlush(wb.table, sb.src, sb.dst)
+		ids := make([]string, 0, n)
+		for k := range sb.src {
+			ids = append(ids, k)
+		}
+		for k := range sb.dst {
+			ids = append(ids, k)
+		}
+		return ids
+	}
+	nodes := batch.([]*NodeState)
+	_ = wb.db.runNodesFlush(wb.table, nodes)
+	ids := make([]string, 0, len(nodes))
+	for _, nd := range nodes {
+		ids = append(ids, nd.ID)
+	}
+	return ids
+}
+
+type stagingBatch struct {
+	src map[string]srcStagingRow
+	dst map[string]string
+}
+
+func (wb *writeBuffer) Flush() {
+	batch, n := wb.getAndClearIfReady(false)
+	if n == 0 {
+		return
+	}
+	defer wb.setFlushingDone()
+	ids := wb.runFlush(batch, n)
+	if wb.onFlush != nil {
+		wb.onFlush(ids)
+	}
+	for i := 0; i < n; i++ {
+		wb.slots <- struct{}{}
+	}
+}
+
+func (wb *writeBuffer) ForceFlush() {
+	batch, n := wb.getAndClearIfReady(true)
+	if n == 0 {
+		return
+	}
+	defer wb.setFlushingDone()
+	ids := wb.runFlush(batch, n)
+	if wb.onFlush != nil {
+		wb.onFlush(ids)
+	}
+	for i := 0; i < n; i++ {
+		wb.slots <- struct{}{}
+	}
+}
+
+func (wb *writeBuffer) SetOnFlush(fn func(nodeIDs []string)) {
+	wb.mu.Lock()
+	defer wb.mu.Unlock()
+	wb.onFlush = fn
+}
+
+func (wb *writeBuffer) Stop() {
+	close(wb.stopCh)
+}
+
+func (wb *writeBuffer) checkFlushAfterAdd(count int) {
+	if count >= wb.batchSize {
+		wb.Flush()
+	}
+}
+
+// --- staging add methods ---
+
+func (wb *writeBuffer) addTraversal(nodeID, newTraversal string) {
+	hardCap := wb.batchSize * backPressureHardCapMultiple
+	<-wb.slots
+	wb.mu.Lock()
+	for (wb.table == "SRC" && len(wb.srcRows) >= hardCap) || (wb.table == "DST" && len(wb.dstRows) >= hardCap) {
+		wb.cond.Wait()
+	}
+	var count int
+	var wasNew bool
+	if wb.table == "SRC" {
+		_, existed := wb.srcRows[nodeID]
+		r := wb.srcRows[nodeID]
 		r.traversal = newTraversal
-		sb.srcRows[nodeID] = r
+		wb.srcRows[nodeID] = r
+		count = len(wb.srcRows)
+		wasNew = !existed
 	} else {
-		sb.dstRows[nodeID] = newTraversal
+		_, existed := wb.dstRows[nodeID]
+		wb.dstRows[nodeID] = newTraversal
+		count = len(wb.dstRows)
+		wasNew = !existed
 	}
+	wb.mu.Unlock()
+	if !wasNew {
+		wb.slots <- struct{}{}
+	}
+	wb.checkFlushAfterAdd(count)
 }
 
-func (sb *stagingBuffer) addCopy(nodeID, newCopyStatus string) {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-	if sb.table != "SRC" {
+func (wb *writeBuffer) addCopy(nodeID, newCopyStatus string) {
+	if wb.table != "SRC" {
 		return
 	}
-	r := sb.srcRows[nodeID]
+	hardCap := wb.batchSize * backPressureHardCapMultiple
+	<-wb.slots
+	wb.mu.Lock()
+	for len(wb.srcRows) >= hardCap {
+		wb.cond.Wait()
+	}
+	_, existed := wb.srcRows[nodeID]
+	r := wb.srcRows[nodeID]
 	r.copy = newCopyStatus
-	sb.srcRows[nodeID] = r
-}
-
-func (sb *stagingBuffer) Flush() {
-	sb.mu.Lock()
-	var srcRows map[string]srcStagingRow
-	var dstRows map[string]string
-	if sb.table == "SRC" {
-		srcRows = sb.srcRows
-		sb.srcRows = make(map[string]srcStagingRow)
-	} else {
-		dstRows = sb.dstRows
-		sb.dstRows = make(map[string]string)
+	wb.srcRows[nodeID] = r
+	count := len(wb.srcRows)
+	wb.mu.Unlock()
+	if existed {
+		wb.slots <- struct{}{}
 	}
-	sb.mu.Unlock()
-
-	if len(srcRows) == 0 && len(dstRows) == 0 {
-		return
-	}
-	if err := sb.db.runStagingFlush(sb.table, srcRows, dstRows); err != nil {
-		return
-	}
-	if sb.onFlush != nil {
-		ids := make([]string, 0, len(srcRows)+len(dstRows))
-		for k := range srcRows {
-			ids = append(ids, k)
-		}
-		for k := range dstRows {
-			ids = append(ids, k)
-		}
-		sb.onFlush(ids)
-	}
+	wb.checkFlushAfterAdd(count)
 }
 
-func (sb *stagingBuffer) SetOnFlush(fn func(nodeIDs []string)) {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-	sb.onFlush = fn
+// --- nodes add methods ---
+
+func (wb *writeBuffer) addNode(n *NodeState, _ string) {
+	wb.addNodeBatch([]*NodeState{n})
 }
 
-func (sb *stagingBuffer) Stop() {
-	close(sb.stopCh)
-}
-
-// nodesBuffer buffers node inserts for src_nodes or dst_nodes.
-type nodesBuffer struct {
-	table   string // "SRC" or "DST"
-	db      *DB
-	nodes   []*NodeState
-	mu      sync.Mutex
-	stopCh  chan struct{}
-	onFlush func(nodeIDs []string)
-}
-
-func newNodesBuffer(db *DB, table string) *nodesBuffer {
-	nb := &nodesBuffer{
-		table:  table,
-		db:     db,
-		nodes:  make([]*NodeState, 0, 256),
-		stopCh: make(chan struct{}),
-	}
-	go nb.flushLoop()
-	return nb
-}
-
-func (nb *nodesBuffer) flushLoop() {
-	ticker := time.NewTicker(defaultFlushInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-nb.stopCh:
-			return
-		case <-ticker.C:
-			nb.Flush()
-		}
-	}
-}
-
-func (nb *nodesBuffer) Add(n *NodeState, status string) {
-	nb.AddBatch([]*NodeState{n}, status)
-}
-
-func (nb *nodesBuffer) AddBatch(nodes []*NodeState, _ string) {
+func (wb *writeBuffer) addNodeBatch(nodes []*NodeState) {
 	if len(nodes) == 0 {
 		return
 	}
-	nb.mu.Lock()
-	nb.nodes = append(nb.nodes, nodes...)
-	count := len(nb.nodes)
-	nb.mu.Unlock()
-	if count >= defaultBatchSize {
-		nb.Flush()
+	hardCap := defaultBatchSize * backPressureHardCapMultiple
+	for i := 0; i < len(nodes); i++ {
+		<-wb.slots
 	}
-}
-
-func (nb *nodesBuffer) Flush() {
-	nb.mu.Lock()
-	nodes := nb.nodes
-	nb.nodes = make([]*NodeState, 0, cap(nb.nodes))
-	nb.mu.Unlock()
-
-	if len(nodes) == 0 {
-		return
+	wb.mu.Lock()
+	for len(wb.nodes) >= hardCap {
+		wb.cond.Wait()
 	}
-	flushedIDs := make([]string, 0, len(nodes))
-	for _, n := range nodes {
-		flushedIDs = append(flushedIDs, n.ID)
-	}
-	err := nb.db.runNodesFlush(nb.table, nodes)
-	if err != nil {
-		return
-	}
-	if nb.onFlush != nil {
-		nb.onFlush(flushedIDs)
-	}
-
-	// Instrumentation: verify live count after flush (single conn, no cross-connection test)
-	tbl := tableName(nb.table)
-	if pullConn, err := nb.db.GetDBForPulls(nb.table); err == nil {
-		var n int
-		if qerr := pullConn.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM "+tbl).Scan(&n); qerr == nil {
-			fmt.Printf("LIVE COUNT AFTER FLUSH (%s): %d (flushed %d)\n", tbl, n, len(flushedIDs))
-		}
-	}
-	fmt.Printf("Flushing %s items: %d\n", nb.table, len(flushedIDs))
-}
-
-func (nb *nodesBuffer) SetOnFlush(fn func(nodeIDs []string)) {
-	nb.mu.Lock()
-	defer nb.mu.Unlock()
-	nb.onFlush = fn
-}
-
-func (nb *nodesBuffer) Stop() {
-	close(nb.stopCh)
+	wb.nodes = append(wb.nodes, nodes...)
+	count := len(wb.nodes)
+	wb.mu.Unlock()
+	wb.checkFlushAfterAdd(count)
 }

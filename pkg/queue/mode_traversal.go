@@ -206,6 +206,7 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 	// Increment completed count (even if failed, this is a "processed" counter)
 	q.incrementRoundStatsCompleted(currentRound)
 	q.incrementTasksCompletedTotal()
+	q.maybeMergeStagingEarlyOnTaskComplete()
 
 	// Record task completion in RoundInfo
 	q.recordTaskCompletion(currentRound, true)
@@ -418,6 +419,7 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 	// Increment completed count
 	q.incrementRoundStatsCompleted(currentRound)
 	q.incrementTasksCompletedTotal()
+	q.maybeMergeStagingEarlyOnTaskComplete()
 
 	// Record task completion in RoundInfo (failed)
 	q.recordTaskCompletion(currentRound, false)

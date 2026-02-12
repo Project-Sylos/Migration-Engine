@@ -31,10 +31,10 @@ type DB struct {
 	checkpointMu sync.Mutex // serializes CHECKPOINT; only one connection runs it since it's a global DB op
 
 	// Table-scoped buffers (DB-owned, not queue-owned)
-	srcStagingBuffer *stagingBuffer
-	dstStagingBuffer *stagingBuffer
-	srcNodesBuffer   *nodesBuffer
-	dstNodesBuffer   *nodesBuffer
+	srcStagingBuffer *writeBuffer
+	dstStagingBuffer *writeBuffer
+	srcNodesBuffer   *writeBuffer
+	dstNodesBuffer   *writeBuffer
 
 	// Flush callbacks per queue for leased-key removal
 	onFlushSRC func(nodeIDs []string)
@@ -52,6 +52,15 @@ func Open(opts Options) (*DB, error) {
 		return nil, err
 	}
 	conn.SetMaxOpenConns(1)
+	// Limit DuckDB memory and threads to avoid OOM during stress testing
+	if _, err := conn.Exec("PRAGMA memory_limit='4GB'"); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if _, err := conn.Exec("PRAGMA threads=12"); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	if err := initSchemaConn(conn); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -67,10 +76,10 @@ func Open(opts Options) (*DB, error) {
 		path: path,
 		conn: conn,
 	}
-	d.srcStagingBuffer = newStagingBuffer(d, "SRC")
-	d.dstStagingBuffer = newStagingBuffer(d, "DST")
-	d.srcNodesBuffer = newNodesBuffer(d, "SRC")
-	d.dstNodesBuffer = newNodesBuffer(d, "DST")
+	d.srcStagingBuffer = newWriteBuffer(d, "SRC", bufferKindStaging)
+	d.dstStagingBuffer = newWriteBuffer(d, "DST", bufferKindStaging)
+	d.srcNodesBuffer = newWriteBuffer(d, "SRC", bufferKindNodes)
+	d.dstNodesBuffer = newWriteBuffer(d, "DST", bufferKindNodes)
 	return d, nil
 }
 
@@ -172,9 +181,9 @@ func (db *DB) AddCopyToStaging(nodeID, newCopyStatus string) {
 // AddNode buffers a node insert for src_nodes or dst_nodes.
 func (db *DB) AddNode(table string, n *NodeState, status string) {
 	if table == "DST" {
-		db.dstNodesBuffer.Add(n, status)
+		db.dstNodesBuffer.addNode(n, status)
 	} else {
-		db.srcNodesBuffer.Add(n, status)
+		db.srcNodesBuffer.addNode(n, status)
 	}
 }
 
@@ -182,28 +191,21 @@ func (db *DB) AddNode(table string, n *NodeState, status string) {
 func (db *DB) AddNodes(ops []InsertOperation) {
 	var srcNodes []*NodeState
 	var dstNodes []*NodeState
-	var srcStatus, dstStatus string
 	for _, op := range ops {
 		if op.State == nil {
 			continue
 		}
-		st := op.Status
-		if st == "" {
-			st = op.State.TraversalStatus
-		}
 		if op.QueueType == "DST" {
 			dstNodes = append(dstNodes, op.State)
-			dstStatus = st
 		} else {
 			srcNodes = append(srcNodes, op.State)
-			srcStatus = st
 		}
 	}
 	if len(srcNodes) > 0 {
-		db.srcNodesBuffer.AddBatch(srcNodes, srcStatus)
+		db.srcNodesBuffer.addNodeBatch(srcNodes)
 	}
 	if len(dstNodes) > 0 {
-		db.dstNodesBuffer.AddBatch(dstNodes, dstStatus)
+		db.dstNodesBuffer.addNodeBatch(dstNodes)
 	}
 }
 
@@ -236,16 +238,56 @@ type NodeDeletion struct {
 }
 
 // FlushTablesForQueue flushes the buffers for the tables that queue writes to.
+// Uses ForceFlush to persist partial batches before pull/round advance.
 // SRC: src_staging + src_nodes. DST: dst_staging + dst_nodes + src_staging.
 func (db *DB) FlushTablesForQueue(queueType string) {
 	if queueType == "DST" {
-		db.srcStagingBuffer.Flush() // DST writes copy updates to src_staging
-		db.dstStagingBuffer.Flush()
-		db.dstNodesBuffer.Flush()
+		db.srcStagingBuffer.ForceFlush() // DST writes copy updates to src_staging
+		db.dstStagingBuffer.ForceFlush()
+		db.dstNodesBuffer.ForceFlush()
 	} else {
-		db.srcStagingBuffer.Flush()
-		db.srcNodesBuffer.Flush()
+		db.srcStagingBuffer.ForceFlush()
+		db.srcNodesBuffer.ForceFlush()
 	}
+}
+
+// GetStagingRowCount returns the total number of rows in src_staging + dst_staging.
+func (db *DB) GetStagingRowCount() (int64, error) {
+	conn, err := db.GetDB()
+	if err != nil {
+		return 0, err
+	}
+	ctx := context.Background()
+	var n sql.NullInt64
+	err = conn.QueryRowContext(ctx,
+		`SELECT (SELECT COUNT(*) FROM src_staging) + (SELECT COUNT(*) FROM dst_staging)`).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	if n.Valid {
+		return n.Int64, nil
+	}
+	return 0, nil
+}
+
+// MaybeMergeStagingEarly merges staging into live and clears it when row count exceeds threshold.
+// Use for pathological wide rounds (e.g. Spectra stress) to prevent unbounded staging growth.
+// Pass table="" to skip writing completed count (we are mid-round).
+// Returns true if a merge was performed.
+func (db *DB) MaybeMergeStagingEarly(round int, threshold int64) (bool, error) {
+	count, err := db.GetStagingRowCount()
+	if err != nil || count <= threshold {
+		return false, err
+	}
+	db.FlushTablesForQueue("SRC")
+	db.FlushTablesForQueue("DST")
+	err = db.RunUpdateWriterTx(func(w *Writer) error {
+		return w.ApplyStatusStagingAndDrop(round, "", 0)
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // RunUpdateWriterTx runs fn inside a transaction on the main connection.
@@ -303,13 +345,15 @@ func (db *DB) runStagingFlush(queueType string, srcRows map[string]srcStagingRow
 }
 
 // runNodesFlush writes node rows via native DuckDB Appender (same path as staging). Bypasses SQL execution overhead.
+// Preallocates a single []driver.Value per flush and reuses it for every row to avoid 50k-100k allocations.
 func (db *DB) runNodesFlush(table string, nodes []*NodeState) error {
 	if len(nodes) == 0 {
 		return nil
 	}
+	rowArgs := make([]driver.Value, 14)
 	return db.runAppenderTxConn(db.conn, table, true, func(aw appenderFlusher) error {
 		for _, n := range nodes {
-			if err := aw.appendNode(table, n); err != nil {
+			if err := aw.appendNode(table, n, rowArgs); err != nil {
 				return err
 			}
 		}
@@ -318,10 +362,11 @@ func (db *DB) runNodesFlush(table string, nodes []*NodeState) error {
 }
 
 // appenderFlusher abstracts the per-queue appender for staging and node flushes.
+// appendNode receives a preallocated rowArgs slice (length 14) to avoid per-row allocations.
 type appenderFlusher interface {
 	appendSrcStaging(nodeID, traversal, copy string) error
 	appendDstStaging(nodeID, newTraversal string) error
-	appendNode(table string, n *NodeState) error
+	appendNode(table string, n *NodeState, rowArgs []driver.Value) error
 }
 
 // runAppenderTxConn runs fn with an appender on the given connection. stagingOnly=true means only staging appenders are created.

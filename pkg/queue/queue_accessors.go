@@ -66,6 +66,31 @@ func (q *Queue) incrementTasksCompletedTotal() {
 	q.tasksCompletedTotal++
 }
 
+// maybeMergeStagingEarlyOnTaskComplete is called after each SRC traversal/retry task completion.
+// When completedSinceLastEarlyMerge reaches the threshold, merges staging into live to reduce memory on pathological wide rounds.
+func (q *Queue) maybeMergeStagingEarlyOnTaskComplete() {
+	if q.name != "src" {
+		return
+	}
+	if mode := q.GetMode(); mode != QueueModeTraversal && mode != QueueModeRetry {
+		return
+	}
+	database := q.getDatabase()
+	if database == nil {
+		return
+	}
+	q.mu.Lock()
+	q.completedSinceLastEarlyMerge++
+	if q.completedSinceLastEarlyMerge < stagingEarlyMergeThreshold {
+		q.mu.Unlock()
+		return
+	}
+	q.completedSinceLastEarlyMerge = 0
+	round := q.round
+	q.mu.Unlock()
+	_, _ = database.MaybeMergeStagingEarly(round, stagingEarlyMergeThreshold)
+}
+
 // SetCopyPass sets the current copy pass.
 func (q *Queue) SetCopyPass(pass int) {
 	q.mu.Lock()

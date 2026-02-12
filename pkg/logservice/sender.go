@@ -14,6 +14,8 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
+const defaultBatchSize = 20_000
+
 // LS is the global log service sender instance.
 // It must be initialized via InitGlobalLogger before use.
 var LS *Sender
@@ -83,7 +85,7 @@ func NewSender(logDB *db.DB, addr, level string) (*Sender, error) {
 
 	var logBuffer *db.LogBuffer
 	if logDB != nil {
-		logBuffer = db.NewLogBuffer(logDB, 500, 2*time.Second, db.DefaultLogShardCap)
+		logBuffer = db.NewLogBuffer(logDB, defaultBatchSize, 10*time.Second)
 	}
 
 	return &Sender{
