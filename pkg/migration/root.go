@@ -34,12 +34,18 @@ func SeedRootTasks(srcRoot types.Folder, dstRoot types.Folder, database *db.DB) 
 
 	var summary RootSeedSummary
 	// Stats for depth 0 are updated at seal; until then use counts from stats table or 1/1 after seeding roots
-	c, _ := database.GetStatsCountAtDepth("SRC", 0, db.StatsKeyTraversalStatus(db.StatusPending))
+	c, err := database.GetStatsCountAtDepth("SRC", 0, db.StatsKeyTraversalStatus(db.StatusPending))
+	if err != nil {
+		return RootSeedSummary{}, fmt.Errorf("failed to get stats count at depth: %w", err)
+	}
 	summary.SrcRoots = int(c)
 	if summary.SrcRoots == 0 {
 		summary.SrcRoots = 1 // we just inserted the root
 	}
-	c, _ = database.GetStatsCountAtDepth("DST", 0, db.StatsKeyTraversalStatus(db.StatusPending))
+	c, err = database.GetStatsCountAtDepth("DST", 0, db.StatsKeyTraversalStatus(db.StatusPending))
+	if err != nil {
+		return RootSeedSummary{}, fmt.Errorf("failed to get stats count at depth: %w", err)
+	}
 	summary.DstRoots = int(c)
 	if summary.DstRoots == 0 {
 		summary.DstRoots = 1

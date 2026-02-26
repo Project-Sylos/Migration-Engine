@@ -73,7 +73,10 @@ func SetupSpectraFS(configPath string, cleanDB bool) (*sdk.SpectraFS, error) {
 			}
 			// Also try to remove lock files (Windows-specific: .db.lock)
 			lockPath := dbPath + ".lock"
-			_ = os.Remove(lockPath) // Ignore errors - lock file might not exist
+			err := os.Remove(lockPath) // Ignore errors - lock file might not exist
+			if err != nil {
+				fmt.Println("error removing lock file", err)
+			}
 		}
 	}
 

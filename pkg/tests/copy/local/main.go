@@ -100,7 +100,7 @@ func runTest() error {
 
 	// Run copy phase
 	stats, err := migration.RunCopyPhase(migration.CopyPhaseConfig{
-		BoltDB:          database,
+		DuckDB:          database,
 		SrcAdapter:      srcAdapter,
 		DstAdapter:      dstAdapter,
 		WorkerCount:     10,

@@ -164,14 +164,14 @@ func nodeStateToTask(state *db.NodeState, taskType string) *TaskBase {
 
 // Queue maintains round-based task queues for BFS traversal coordination.
 // It handles task leasing, retry logic, and cross-queue task propagation.
-// All operational state lives in BoltDB, flushed via per-queue buffers.
+// All operational state lives in DuckDB, flushed via per-queue buffers.
 type Queue struct {
 	name               string               // Queue name ("src" or "dst")
 	mode               QueueMode            // Operation mode (traversal/retry/copy)
 	mu                 sync.RWMutex         // Protects all internal state
 	state              QueueState           // Lifecycle state (running/paused/stopped/completed/waiting)
 	inProgress         map[string]*TaskBase // Tasks currently being executed (keyed by ULID)
-	pendingBuff        []*TaskBase          // Local task buffer fetched from BoltDB
+	pendingBuff        []*TaskBase          // Local task buffer fetched from DuckDB
 	pendingSet         map[string]struct{}  // Fast lookup for pending buffer dedupe (keyed by ULID)
 	leasedKeys         map[string]struct{}  // ULIDs already pulled/leased - prevents duplicate pulls from stale views
 	pulling            bool                 // Indicates a pull operation is active
@@ -181,7 +181,7 @@ type Queue struct {
 	round              int                  // Current BFS round/depth level
 	roundInfoMap       map[int]*RoundInfo   // Per-round statistics and metadata (key: round number)
 	workers            []Worker             // Workers associated with this queue (for reference only)
-	database            *db.DB               // Database for operational queue storage
+	database           *db.DB               // Database for operational queue storage
 	coordinator        *QueueCoordinator    // Coordinator for round advancement gates (DST only)
 	// Round-based statistics for completion detection
 	roundStats  map[int]*RoundStats // Per-round statistics (key: round number, value: stats for that round)
@@ -239,7 +239,7 @@ func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCo
 	}
 }
 
-// InitializeWithContext sets up the queue with BoltDB, context, and filesystem adapter references.
+// InitializeWithContext sets up the queue with DuckDB, context, and filesystem adapter references.
 // Creates and starts workers immediately - they'll poll for tasks autonomously.
 // shutdownCtx is optional - if provided, workers will check for cancellation and exit on shutdown.
 // For copy mode, InitializeCopyWithContext should be used instead to provide both adapters.
@@ -279,7 +279,10 @@ func (q *Queue) InitializeWithContext(database *db.DB, adapter types.FSAdapter, 
 
 	// Queues are initialized - tasks will be seeded externally or propagated through Complete()
 	if logservice.LS != nil {
-		_ = logservice.LS.Log("info", fmt.Sprintf("%s queue initialized", strings.ToUpper(q.name)), "queue", q.name, q.name)
+		err := logservice.LS.Log("info", fmt.Sprintf("%s queue initialized", strings.ToUpper(q.name)), "queue", q.name, q.name)
+		if err != nil {
+			fmt.Println("error logging", err)
+		}
 	}
 }
 
@@ -321,7 +324,10 @@ func (q *Queue) InitializeCopyWithContext(database *db.DB, srcAdapter, dstAdapte
 
 	// Queues are initialized - tasks will be pulled from copy status buckets
 	if logservice.LS != nil {
-		_ = logservice.LS.Log("info", fmt.Sprintf("%s copy queue initialized", strings.ToUpper(q.name)), "queue", q.name, q.name)
+		err := logservice.LS.Log("info", fmt.Sprintf("%s copy queue initialized", strings.ToUpper(q.name)), "queue", q.name, q.name)
+		if err != nil {
+			fmt.Println("error logging", err)
+		}
 	}
 }
 
@@ -376,9 +382,12 @@ func (q *Queue) Lease() *TaskBase {
 				// With deterministic IDs, task.ID should always be pre-computed
 				// This is a programming error if we reach here
 				if logservice.LS != nil {
-					_ = logservice.LS.Log("error",
+					err := logservice.LS.Log("error",
 						"Lease found task with empty ID - this indicates a bug in ID generation",
 						"queue", q.name, q.name)
+					if err != nil {
+						fmt.Println("error logging", err)
+					}
 				}
 				continue
 			}
@@ -473,7 +482,7 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			return false
 		}
 
-		// Hard check: verify BoltDB buckets are empty (mode-specific)
+		// Hard check: verify DuckDB buckets are empty (mode-specific)
 		mode := q.GetMode()
 		if mode == QueueModeCopy {
 			database := q.getDatabase()
@@ -516,7 +525,7 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 					return false
 				}
 			} else {
-				// No BoltDB - can't do hard check
+				// No DuckDB - can't do hard check
 				return false
 			}
 		}
@@ -555,11 +564,17 @@ func (q *Queue) markComplete(format string, args ...interface{}) bool {
 
 	if logservice.LS != nil {
 		message := fmt.Sprintf(format, args...)
-		_ = logservice.LS.Log("info", message, "queue", q.name, q.name)
-		_ = logservice.LS.Log("info",
+		err := logservice.LS.Log("info", message, "queue", q.name, q.name)
+		if err != nil {
+			fmt.Println("error logging", err)
+		}
+		err = logservice.LS.Log("info",
 			fmt.Sprintf("Queue %s completion stats: %d tasks processed, %d children discovered",
 				q.name, totalTasksProcessed, totalChildrenDiscovered),
 			"queue", q.name, q.name)
+		if err != nil {
+			fmt.Println("error logging", err)
+		}
 	}
 
 	// Also print to stdout for test visibility
@@ -607,9 +622,12 @@ func (q *Queue) ReportTaskResult(task *TaskBase, result TaskExecutionResult) {
 		q.failTask(task, executionDelta)
 	default:
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("error",
+			err := logservice.LS.Log("error",
 				fmt.Sprintf("ReportTaskResult called with unknown result: %s", result),
 				"queue", q.name, q.name)
+			if err != nil {
+				fmt.Println("error logging", err)
+			}
 		}
 		return
 	}
@@ -735,8 +753,8 @@ func childResultToNodeState(child ChildResult, parentPath string, depth int, que
 }
 
 func (q *Queue) PullTasksIfNeeded(force bool) {
-		database := q.getDatabase()
-		if database == nil {
+	database := q.getDatabase()
+	if database == nil {
 		return
 	}
 
@@ -801,7 +819,7 @@ func (q *Queue) TotalTracked() int {
 	return q.GetPendingCount() + q.InProgressCount()
 }
 
-// Clear removes all tasks from BoltDB and resets in-progress tracking.
+// Clear removes all tasks from DuckDB and resets in-progress tracking.
 // Note: This is a destructive operation - use with caution.
 func (q *Queue) Clear() {
 	q.mu.Lock()
@@ -813,7 +831,7 @@ func (q *Queue) Clear() {
 	q.pendingSet = make(map[string]struct{})
 	q.pulling = false
 
-	// BoltDB clearing would require deleting all buckets - typically not needed
+	// DuckDB clearing would require deleting all buckets - typically not needed
 	// (DuckDB-only: no ETL.)
 }
 
@@ -839,7 +857,7 @@ func (q *Queue) SetStatsChannel(ch chan QueueStats) {
 	}
 }
 
-// SetObserver registers this queue with an observer for BoltDB stats publishing.
+// SetObserver registers this queue with an observer for DuckDB stats publishing.
 // The observer will poll this queue directly for statistics.
 func (q *Queue) SetObserver(observer *QueueObserver) {
 	if observer != nil {
@@ -1017,9 +1035,12 @@ func (q *Queue) Run() {
 	if q.name == "dst" && !(mode == QueueModeTraversal || mode == QueueModeRetry) {
 		q.SetState(QueueStateCompleted)
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("info",
+			err := logservice.LS.Log("info",
 				fmt.Sprintf("DST queue skipping non-traversal mode (%s) - marking as completed", mode),
 				"queue", q.name, q.name)
+			if err != nil {
+				fmt.Println("error logging", err)
+			}
 		}
 		return
 	}
@@ -1048,9 +1069,12 @@ func (q *Queue) Run() {
 		if state == QueueStateCompleted || state == QueueStateStopped {
 			if logservice.LS != nil {
 				currentRound := q.GetRound()
-				_ = logservice.LS.Log("info",
+				err := logservice.LS.Log("info",
 					fmt.Sprintf("Run() exiting - queue %s (round %d)", state, currentRound),
 					"queue", q.name, q.name)
+				if err != nil {
+					fmt.Println("error logging", err)
+				}
 			}
 			return
 		}
@@ -1181,10 +1205,16 @@ func (q *Queue) advanceToNextRound() {
 		if stats := q.GetRoundStats(round); stats != nil {
 			completed = int64(stats.Completed)
 		}
-		_ = database.RunUpdateWriterTx(func(w *db.Writer) error {
+		err := database.RunUpdateWriterTx(func(w *db.Writer) error {
 			return w.ApplyStatusStagingAndDrop(round, getQueueType(q.name), completed)
 		})
-		_ = database.Checkpoint()
+		if err != nil {
+			fmt.Println("error running update writer tx", err)
+		}
+		err = database.Checkpoint()
+		if err != nil {
+			fmt.Println("error checkpointing", err)
+		}
 	}
 	// This queue's cursor must not survive its seal. Reset only this queue's cursor; other queues are independent.
 	q.resetThisQueueKeysetCursor()

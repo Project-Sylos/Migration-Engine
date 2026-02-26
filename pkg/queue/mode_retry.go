@@ -109,7 +109,10 @@ func (q *Queue) PullRetryTasks(force bool) {
 		}
 		if err != nil {
 			if logservice.LS != nil {
-				_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to fetch retry batch: %v", err), "queue", q.name, q.name)
+				err := logservice.LS.Log("debug", fmt.Sprintf("Failed to fetch retry batch: %v", err), "queue", q.name, q.name)
+				if err != nil {
+					fmt.Println("error logging", err)
+				}
 			}
 			return
 		}
@@ -143,7 +146,10 @@ func (q *Queue) PullRetryTasks(force bool) {
 				retryDstCleanupMap, loadErr = BatchLoadRetryDstCleanup(database, srcFolderIDs)
 				if loadErr != nil {
 					if logservice.LS != nil {
-						_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to batch load retry DST cleanup: %v", loadErr), "queue", q.name, q.name)
+						err := logservice.LS.Log("debug", fmt.Sprintf("Failed to batch load retry DST cleanup: %v", loadErr), "queue", q.name, q.name)
+						if err != nil {
+							fmt.Println("error logging", err)
+						}
 					}
 					retryDstCleanupMap = make(map[string]*RetryDstCleanup)
 				}

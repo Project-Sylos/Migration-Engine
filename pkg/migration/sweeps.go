@@ -17,7 +17,7 @@ import (
 // Gotta, sweep sweep sweep!!! 🧹🧹🧹
 // SweepConfig is the configuration for running retry sweeps.
 type SweepConfig struct {
-	BoltDB          *db.DB
+	DuckDB          *db.DB
 	SrcAdapter      types.FSAdapter
 	DstAdapter      types.FSAdapter
 	WorkerCount     int
@@ -30,8 +30,8 @@ type SweepConfig struct {
 	ShutdownContext context.Context
 	// For retry sweeps only
 	MaxKnownDepth          int    // Maximum known depth from previous traversal (-1 to auto-detect)
-	SkipAutoETLBeforeRetry bool   // If true, skip automatic ETL from DuckDB to BoltDB before retry sweep
-	DuckDBPath             string // Optional: Path to DuckDB file (auto-derived from BoltDB path if empty and ETL is enabled)
+	SkipAutoETLBeforeRetry bool   // If true, skip automatic ETL from DuckDB to DuckDB before retry sweep
+	DuckDBPath             string // Optional: Path to DuckDB file (auto-derived from DuckDB path if empty and ETL is enabled)
 }
 
 // RunRetrySweep runs a retry sweep to re-process failed or pending tasks from a previous traversal.
@@ -44,7 +44,7 @@ type SweepConfig struct {
 // Example:
 //
 //	config := migration.SweepConfig{
-//	    BoltDB:        dbInstance,
+//	    DuckDB:        dbInstance,
 //	    SrcAdapter:    srcAdapter,
 //	    DstAdapter:    dstAdapter,
 //	    WorkerCount:   10,
@@ -53,14 +53,14 @@ type SweepConfig struct {
 //	}
 //	stats, err := migration.RunRetrySweep(config)
 func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
-	if cfg.BoltDB == nil {
-		return RuntimeStats{}, fmt.Errorf("boltDB cannot be nil")
+	if cfg.DuckDB == nil {
+		return RuntimeStats{}, fmt.Errorf("duckDB cannot be nil")
 	}
 	if cfg.SrcAdapter == nil || cfg.DstAdapter == nil {
 		return RuntimeStats{}, fmt.Errorf("source and destination adapters must be provided")
 	}
 
-	boltDB := cfg.BoltDB
+	duckDB := cfg.DuckDB
 
 	// Initialize log service if address is provided
 	if cfg.LogAddress != "" {
@@ -75,7 +75,7 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 				time.Sleep(startupDelay)
 			}
 		}
-		if err := logservice.InitGlobalLogger(boltDB, cfg.LogAddress, cfg.LogLevel); err != nil {
+		if err := logservice.InitGlobalLogger(duckDB, cfg.LogAddress, cfg.LogLevel); err != nil {
 			return RuntimeStats{}, fmt.Errorf("failed to initialize logger: %w", err)
 		}
 	}
@@ -86,7 +86,7 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	// Get max known depth from config or detect from stats table
 	maxKnownDepth := cfg.MaxKnownDepth
 	if maxKnownDepth < 0 {
-		d, err := boltDB.GetMaxDepth("SRC")
+		d, err := duckDB.GetMaxDepth("SRC")
 		if err == nil {
 			maxKnownDepth = d
 		}
@@ -99,14 +99,14 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
 	srcQueue.SetMode(queue.QueueModeRetry)
 	srcQueue.SetMaxKnownDepth(maxKnownDepth)
-	srcQueue.InitializeWithContext(boltDB, cfg.SrcAdapter, cfg.ShutdownContext)
+	srcQueue.InitializeWithContext(duckDB, cfg.SrcAdapter, cfg.ShutdownContext)
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
 	dstQueue.SetMode(queue.QueueModeRetry)
 	if cfg.MaxKnownDepth >= 0 {
 		dstQueue.SetMaxKnownDepth(cfg.MaxKnownDepth)
 	}
-	dstQueue.InitializeWithContext(boltDB, cfg.DstAdapter, cfg.ShutdownContext)
+	dstQueue.InitializeWithContext(duckDB, cfg.DstAdapter, cfg.ShutdownContext)
 
 	// Set initial rounds to 0 for retry sweep
 	srcQueue.SetRound(0)
@@ -123,7 +123,7 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	dstQueue.PullTasksIfNeeded(true)
 
 	// Create observer for stats publishing
-	observer := queue.NewQueueObserver(boltDB, 200*time.Millisecond)
+	observer := queue.NewQueueObserver(duckDB, 200*time.Millisecond)
 	observer.Start()
 	defer observer.Stop()
 
@@ -244,7 +244,10 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 
 				closeDone := make(chan struct{}, 1)
 				go func() {
-					_ = logservice.LS.Close()
+					err := logservice.LS.Close()
+					if err != nil {
+						fmt.Println("error closing logger", err)
+					}
 					closeDone <- struct{}{}
 				}()
 
@@ -277,7 +280,10 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 
 					closeDone := make(chan struct{}, 1)
 					go func() {
-						_ = logservice.LS.Close()
+						err := logservice.LS.Close()
+						if err != nil {
+							fmt.Println("error closing logger", err)
+						}
 						closeDone <- struct{}{}
 					}()
 

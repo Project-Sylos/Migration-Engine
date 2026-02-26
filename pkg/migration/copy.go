@@ -16,7 +16,7 @@ import (
 
 // CopyPhaseConfig configures the copy phase execution.
 type CopyPhaseConfig struct {
-	BoltDB          *db.DB
+	DuckDB          *db.DB
 	SrcAdapter      types.FSAdapter
 	DstAdapter      types.FSAdapter
 	WorkerCount     int
@@ -31,9 +31,9 @@ type CopyPhaseConfig struct {
 
 // RunCopyPhase executes the copy phase (two-pass: folders then files).
 func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
-	boltDB := cfg.BoltDB
-	if boltDB == nil {
-		return queue.QueueStats{}, fmt.Errorf("BoltDB must be provided")
+	duckDB := cfg.DuckDB
+	if duckDB == nil {
+		return queue.QueueStats{}, fmt.Errorf("DuckDB must be provided")
 	}
 
 	if cfg.SrcAdapter == nil || cfg.DstAdapter == nil {
@@ -53,7 +53,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 				time.Sleep(startupDelay)
 			}
 		}
-		if err := logservice.InitGlobalLogger(boltDB, cfg.LogAddress, cfg.LogLevel); err != nil {
+		if err := logservice.InitGlobalLogger(duckDB, cfg.LogAddress, cfg.LogLevel); err != nil {
 			return queue.QueueStats{}, fmt.Errorf("failed to initialize logger: %w", err)
 		}
 	}
@@ -67,7 +67,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	// Start at round 1 since round 0 (root) is skipped
 	// Use -1 as sentinel to indicate we haven't found any pending level yet
 	minLevel := -1
-	levels, err := db.GetAllLevels(boltDB, "SRC")
+	levels, err := db.GetAllLevels(duckDB, "SRC")
 	if err == nil && len(levels) > 0 {
 		// Find minimum level with pending copy tasks (start with folders since pass 1 is folders)
 		for _, level := range levels {
@@ -75,7 +75,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 				continue // Skip round 0
 			}
 			// Check folder tasks (pass 1 starts with folders)
-			c, err := boltDB.GetCopyCountAtDepth(level, db.NodeTypeFolder, db.CopyStatusPending)
+			c, err := duckDB.GetCopyCountAtDepth(level, db.NodeTypeFolder, db.CopyStatusPending)
 			if err == nil && c > 0 {
 				// First pending level found OR current level is smaller than what we've found
 				if minLevel == -1 || level < minLevel {
@@ -92,28 +92,39 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	copyQueue.SetRound(minLevel) // Set initial round
 	copyQueue.EnsureRoundExpectedFromStats()
 
+	// Set max known depth from DB so copy completion and round advancement know the full depth range.
+	// Must be set before any tasks are pulled or completion checks run.
+	if maxDepth, err := duckDB.GetMaxDepth("SRC"); err == nil {
+		copyQueue.SetMaxKnownDepth(maxDepth)
+	}
+
 	// CRITICAL: Ensure root folder (level 0) has join-lookup mapping (DuckDB: join_id on DST node).
-	srcID, _, srcOk := db.GetRootNode(boltDB, "SRC")
+	srcID, _, srcOk := db.GetRootNode(duckDB, "SRC")
 	srcRootID := ""
 	if srcOk {
 		srcRootID = srcID
 	}
 	if srcRootID == "" {
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("warn", fmt.Sprintf("Failed to ensure root join-lookup mapping: %v", fmt.Errorf("could not find SRC root node")), "migration", "copy", "copy")
+			err := logservice.LS.Log("warn", fmt.Sprintf("Failed to ensure root join-lookup mapping: %v", fmt.Errorf("could not find SRC root node")), "migration", "copy", "copy")
+			if err != nil {
+				fmt.Println("error logging", err)
+			}
 		}
 	} else {
-		dstID, _, dstOk := db.GetRootNode(boltDB, "DST")
+		dstID, _, dstOk := db.GetRootNode(duckDB, "DST")
 		dstRootID := ""
 		if dstOk {
 			dstRootID = dstID
 		}
 		if dstRootID == "" {
 			if logservice.LS != nil {
-				_ = logservice.LS.Log("warn", fmt.Sprintf("Failed to ensure root join-lookup mapping: %v", fmt.Errorf("could not find DST root node")), "migration", "copy", "copy")
+				err := logservice.LS.Log("warn", fmt.Sprintf("Failed to ensure root join-lookup mapping: %v", fmt.Errorf("could not find DST root node")), "migration", "copy", "copy")
+				if err != nil {
+					fmt.Println("error logging", err)
+				}
 			}
 		}
-		// Join is by path; roots with path "/" are matched by path, no separate mapping needed.
 	}
 
 	// Initialize copy queue with both source and destination adapters
@@ -121,10 +132,10 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	if shutdownCtx == nil {
 		shutdownCtx = context.Background()
 	}
-	copyQueue.InitializeCopyWithContext(boltDB, cfg.SrcAdapter, cfg.DstAdapter, shutdownCtx)
+	copyQueue.InitializeCopyWithContext(duckDB, cfg.SrcAdapter, cfg.DstAdapter, shutdownCtx)
 
 	// Create observer for stats publishing
-	observer := queue.NewQueueObserver(boltDB, 200*time.Millisecond)
+	observer := queue.NewQueueObserver(duckDB, 200*time.Millisecond)
 	observer.Start()
 	defer observer.Stop()
 
@@ -204,7 +215,10 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 				defer closeCancel()
 				closeDone := make(chan struct{}, 1)
 				go func() {
-					_ = logservice.LS.Close()
+					err := logservice.LS.Close()
+					if err != nil {
+						fmt.Println("error closing logger", err)
+					}
 					closeDone <- struct{}{}
 				}()
 				select {
@@ -219,15 +233,11 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 
 		// Track round advancement for runtime observability.
 		currentRound := copyQueue.GetRound()
-		roundAdvanced := false
 		if currentRound != lastRound {
-			roundAdvanced = true
 			lastRound = currentRound
 		}
 
 		tickCount++
-		_ = roundAdvanced
-		_ = tickCount
 
 		// Sleep briefly before checking again
 		time.Sleep(100 * time.Millisecond)

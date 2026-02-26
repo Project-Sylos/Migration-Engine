@@ -30,7 +30,10 @@ func InitGlobalLogger(mainDB *db.DB, addr, level string) error {
 	LS = sender
 
 	if err := LS.Log("info", "Test log", "test", "test"); err != nil {
-		_ = LS.Close()
+		err = LS.Close()
+		if err != nil {
+			return fmt.Errorf("failed to close logger: %w", err)
+		}
 		return fmt.Errorf("failed to send test log: %w", err)
 	}
 	return nil
@@ -191,7 +194,10 @@ func (s *Sender) Close() error {
 		s.logBuffer = nil
 	}
 	if s.conn != nil {
-		_ = s.conn.Close()
+		err := s.conn.Close()
+		if err != nil {
+			return fmt.Errorf("failed to close UDP connection: %w", err)
+		}
 		s.conn = nil
 	}
 	s.logDB = nil

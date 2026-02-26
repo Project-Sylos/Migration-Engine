@@ -34,7 +34,10 @@ func newQueueAppenderWriter(driverConn driver.Conn, queueType string, nodesInclu
 		if nodesIncluded {
 			aw.srcNodes, err = duckdb.NewAppenderFromConn(driverConn, "", tableSrcNodes)
 			if err != nil {
-				_ = aw.srcStaging.Close()
+				err := aw.srcStaging.Close()
+				if err != nil {
+					return nil, err
+				}
 				return nil, err
 			}
 		}
@@ -48,15 +51,23 @@ func newQueueAppenderWriter(driverConn driver.Conn, queueType string, nodesInclu
 	}
 	aw.dstStaging, err = duckdb.NewAppenderFromConn(driverConn, "", tableDstStaging)
 	if err != nil {
-		_ = aw.srcStaging.Close()
+		err := aw.srcStaging.Close()
+		if err != nil {
+			return nil, err
+		}
 		return nil, err
 	}
 	if nodesIncluded {
 		aw.dstNodes, err = duckdb.NewAppenderFromConn(driverConn, "", tableDstNodes)
 		if err != nil {
-			_ = aw.srcStaging.Close()
-			_ = aw.dstStaging.Close()
-			return nil, err
+			err = aw.srcStaging.Close()
+			if err != nil {
+				return nil, err
+			}
+			err = aw.dstStaging.Close()
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	return aw, nil

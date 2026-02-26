@@ -12,7 +12,7 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
-// PullTraversalTasks pulls traversal tasks from BoltDB for the current round.
+// PullTraversalTasks pulls traversal tasks from DuckDB for the current round.
 // Uses getter/setter methods - no direct mutex access.
 func (q *Queue) PullTraversalTasks(force bool) {
 	database := q.getDatabase()
@@ -90,7 +90,7 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	var expectedFoldersMap map[string][]types.Folder
 	var expectedFilesMap map[string][]types.File
 	var srcIDMap map[string]map[string]string // DST ULID -> (Type+Name -> SRC node ID)
-	var srcIDToMeta map[string]SrcNodeMeta   // SRC ID -> Depth/CopyStatus (for copy-status updates at completion)
+	var srcIDToMeta map[string]SrcNodeMeta    // SRC ID -> Depth/CopyStatus (for copy-status updates at completion)
 	var err error
 
 	if q.name == "dst" {
@@ -111,7 +111,10 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	}
 	if err != nil {
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to fetch batch from BoltDB: %v", err), "queue", q.name, q.name)
+			err := logservice.LS.Log("debug", fmt.Sprintf("Failed to fetch batch from DuckDB: %v", err), "queue", q.name, q.name)
+			if err != nil {
+				fmt.Println("error logging", err)
+			}
 		}
 		return
 	}
@@ -187,13 +190,16 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 
 	queueType := getQueueType(q.name)
 
-	// Convert task to NodeState for BoltDB
+	// Convert task to NodeState for DuckDB
 	state := taskToNodeState(task)
 	if state == nil {
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("error",
+			err := logservice.LS.Log("error",
 				fmt.Sprintf("Complete() called with task that couldn't be converted to NodeState: %v", task),
 				"queue", q.name, q.name)
+			if err != nil {
+				fmt.Println("error logging", err)
+			}
 		}
 		return
 	}
@@ -366,7 +372,10 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 		for _, ch := range c.Children {
 			deletions = append(deletions, db.NodeDeletion{Table: "DST", NodeID: ch.ID})
 		}
-		_ = database.AddNodeDeletions(deletions)
+		err := database.AddNodeDeletions(deletions)
+		if err != nil {
+			fmt.Println("error adding node deletions", err)
+		}
 	}
 
 	// Remove from in-progress LAST
@@ -383,10 +392,13 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 	maxRetries := q.getMaxRetries()
 
 	if logservice.LS != nil {
-		_ = logservice.LS.Log("debug",
+		err := logservice.LS.Log("debug",
 			fmt.Sprintf("Failing task: id=%s path=%s round=%d type=%s currentAttempts=%d maxRetries=%d",
 				nodeID, task.LocationPath(), currentRound, task.Type, task.Attempts, maxRetries),
 			"queue", q.name, q.name)
+		if err != nil {
+			fmt.Println("error logging", err)
+		}
 	}
 
 	task.Attempts++
@@ -398,20 +410,26 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 		q.removeInProgress(nodeID)
 		q.Add(task) // Re-adds to tracked automatically
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("debug",
+			err := logservice.LS.Log("debug",
 				fmt.Sprintf("Retrying task: id=%s path=%s round=%d attempt=%d/%d",
 					nodeID, task.LocationPath(), currentRound, task.Attempts, maxRetries),
 				"queue", q.name, q.name)
+			if err != nil {
+				fmt.Println("error logging", err)
+			}
 		}
 		return // Will retry
 	}
 
 	// Max retries reached - task is truly done
 	if logservice.LS != nil {
-		_ = logservice.LS.Log("error",
+		err := logservice.LS.Log("error",
 			fmt.Sprintf("Failed to traverse folder %s (id=%s) after %d attempts (max retries exceeded) round=%d",
 				task.LocationPath(), nodeID, task.Attempts, currentRound),
 			"queue", q.name, q.name)
+		if err != nil {
+			fmt.Println("error logging", err)
+		}
 	}
 
 	task.Locked = false
@@ -523,7 +541,10 @@ func (q *Queue) AdvanceTraversalRound() {
 	}
 
 	if logservice.LS != nil {
-		_ = logservice.LS.Log("info", fmt.Sprintf("Advanced to round %d", newRound), "queue", q.name, q.name)
+		err := logservice.LS.Log("info", fmt.Sprintf("Advanced to round %d", newRound), "queue", q.name, q.name)
+		if err != nil {
+			fmt.Println("error logging", err)
+		}
 	}
 
 	// Pull tasks for the new round

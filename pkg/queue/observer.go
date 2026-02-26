@@ -4,7 +4,7 @@
 // Package queue provides the QueueObserver for collecting and publishing queue statistics.
 //
 // The QueueObserver polls queues directly at regular intervals (default: 200ms) and publishes
-// metrics to BoltDB. This allows external APIs to poll BoltDB for real-time queue statistics
+// metrics to DuckDB. This allows external APIs to poll DuckDB for real-time queue statistics
 // without disrupting queue operations.
 //
 // Usage:
@@ -14,7 +14,7 @@
 //   observer.Start()
 //   // Stats are published to /STATS/queue-stats bucket with keys like "src-traversal", "dst-traversal"
 //
-// Stats can be retrieved from BoltDB using:
+// Stats can be retrieved from DuckDB using:
 //   statsJSON, err := database.GetQueueStats("src-traversal")
 //   allStats, err := database.GetAllQueueStats()
 
@@ -30,7 +30,7 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 )
 
-// ExternalQueueMetrics contains user-facing metrics published to BoltDB for API access.
+// ExternalQueueMetrics contains user-facing metrics published to DuckDB for API access.
 type ExternalQueueMetrics struct {
 	// Monotonic counters (traversal phase)
 	FilesDiscoveredTotal   int64 `json:"files_discovered_total"`
@@ -79,7 +79,7 @@ type InternalQueueMetrics struct {
 	LastStateChangeTime time.Time
 }
 
-// QueueObserver collects statistics from queues by polling them directly and publishes them to BoltDB periodically.
+// QueueObserver collects statistics from queues by polling them directly and publishes them to DuckDB periodically.
 // Similar to QueueCoordinator, but focused on observability rather than coordination.
 type QueueObserver struct {
 	mu             sync.RWMutex
@@ -113,8 +113,8 @@ const (
 	emaAlpha = 0.2
 )
 
-// NewQueueObserver creates a new observer that will publish stats to BoltDB.
-// updateInterval is how often stats are written to BoltDB (default: 200ms).
+// NewQueueObserver creates a new observer that will publish stats to DuckDB.
+// updateInterval is how often stats are written to DuckDB (default: 200ms).
 func NewQueueObserver(database *db.DB, updateInterval time.Duration) *QueueObserver {
 	if updateInterval <= 0 {
 		updateInterval = 200 * time.Millisecond
@@ -169,7 +169,7 @@ func (o *QueueObserver) UnregisterQueue(queueName string) {
 	delete(o.prevCopyTotals, queueName)
 }
 
-// Start begins the observer loop that publishes stats to BoltDB.
+// Start begins the observer loop that publishes stats to DuckDB.
 // This is called automatically when the first queue is registered, but can be called manually.
 func (o *QueueObserver) Start() {
 	o.mu.Lock()
@@ -231,7 +231,7 @@ func (o *QueueObserver) Stop() {
 	})
 }
 
-// observeLoop is the main loop that polls queues directly and publishes metrics to BoltDB.
+// observeLoop is the main loop that polls queues directly and publishes metrics to DuckDB.
 func (o *QueueObserver) observeLoop() {
 	defer func() {
 		o.mu.Lock()
@@ -274,9 +274,9 @@ func (o *QueueObserver) observeLoop() {
 				}
 			}
 
-			// Publish all collected metrics to BoltDB
+			// Publish all collected metrics to DuckDB
 			if len(metrics) > 0 && o.database != nil {
-				o.publishMetricsToBoltDB(metrics)
+				o.publishMetricsToDuckDB(metrics)
 			}
 		}
 	}
@@ -681,10 +681,10 @@ func (o *QueueObserver) getTotalFailedCount(queueName string) int {
 	return totalFailed
 }
 
-// publishMetricsToBoltDB writes external queue metrics to BoltDB in the queue-stats bucket.
+// publishMetricsToDuckDB writes external queue metrics to DuckDB in the queue-stats bucket.
 // Only external metrics are published - internal metrics remain in memory for autoscaling decisions.
 // Each queue's metrics are stored under a key like "src-traversal", "dst-traversal", etc.
-func (o *QueueObserver) publishMetricsToBoltDB(metricsMap map[string]ExternalQueueMetrics) {
+func (o *QueueObserver) publishMetricsToDuckDB(metricsMap map[string]ExternalQueueMetrics) {
 	if o.database == nil {
 		return
 	}
@@ -698,9 +698,12 @@ func (o *QueueObserver) publishMetricsToBoltDB(metricsMap map[string]ExternalQue
 			metricsJSON, err := json.Marshal(metrics)
 			if err != nil {
 				if logservice.LS != nil {
-					_ = logservice.LS.Log("error",
+					err := logservice.LS.Log("error",
 						fmt.Sprintf("Failed to marshal metrics for queue %s: %v", queueName, err),
 						"observer", "publish", "")
+					if err != nil {
+						fmt.Println("error logging", err)
+					}
 				}
 				continue
 			}
@@ -713,9 +716,12 @@ func (o *QueueObserver) publishMetricsToBoltDB(metricsMap map[string]ExternalQue
 
 	if err != nil {
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("error",
-				fmt.Sprintf("Failed to publish metrics to BoltDB: %v", err),
+			err := logservice.LS.Log("error",
+				fmt.Sprintf("Failed to publish metrics to DuckDB: %v", err),
 				"observer", "publish", "")
+			if err != nil {
+				fmt.Println("error logging", err)
+			}
 		}
 	}
 }

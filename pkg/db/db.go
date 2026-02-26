@@ -54,20 +54,32 @@ func Open(opts Options) (*DB, error) {
 	conn.SetMaxOpenConns(1)
 	// Limit DuckDB memory and threads to avoid OOM during stress testing
 	if _, err := conn.Exec("PRAGMA memory_limit='4GB'"); err != nil {
-		_ = conn.Close()
+		err := conn.Close()
+		if err != nil {
+			return nil, err
+		}
 		return nil, err
 	}
 	if _, err := conn.Exec("PRAGMA threads=12"); err != nil {
-		_ = conn.Close()
+		err := conn.Close()
+		if err != nil {
+			return nil, err
+		}
 		return nil, err
 	}
 	if err := initSchemaConn(conn); err != nil {
-		_ = conn.Close()
+		err := conn.Close()
+		if err != nil {
+			return nil, err
+		}
 		return nil, err
 	}
 	if path != ":memory:" {
 		if _, err := conn.Exec("CHECKPOINT"); err != nil {
-			_ = conn.Close()
+			err := conn.Close()
+			if err != nil {
+				return nil, err
+			}
 			return nil, err
 		}
 	}
@@ -302,7 +314,10 @@ func (db *DB) RunUpdateWriterTx(fn func(w *Writer) error) error {
 	}
 	w := &Writer{tx: tx}
 	if err := fn(w); err != nil {
-		_ = tx.Rollback()
+		err := tx.Rollback()
+		if err != nil {
+			return err
+		}
 		return err
 	}
 	return tx.Commit()
@@ -319,7 +334,10 @@ func (db *DB) RunAppenderWriterTx(queueType string, fn func(w *Writer) error) er
 	}
 	w := &Writer{tx: tx}
 	if err := fn(w); err != nil {
-		_ = tx.Rollback()
+		err := tx.Rollback()
+		if err != nil {
+			return err
+		}
 		return err
 	}
 	return tx.Commit()
@@ -385,11 +403,17 @@ func (db *DB) runAppenderTxConn(conn *sql.DB, queueType string, nodesIncluded bo
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, srcStagingDDL()); err != nil {
-		_ = tx.Rollback()
+		err := tx.Rollback()
+		if err != nil {
+			return err
+		}
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, dstStagingDDL()); err != nil {
-		_ = tx.Rollback()
+		err := tx.Rollback()
+		if err != nil {
+			return err
+		}
 		return err
 	}
 	var fnErr error
@@ -410,7 +434,10 @@ func (db *DB) runAppenderTxConn(conn *sql.DB, queueType string, nodesIncluded bo
 		return aw.Flush()
 	})
 	if err != nil {
-		_ = tx.Rollback()
+		err := tx.Rollback()
+		if err != nil {
+			return err
+		}
 		if fnErr != nil {
 			return fnErr
 		}

@@ -68,13 +68,22 @@ func InspectMigrationStatus(database *db.DB) (MigrationStatus, error) {
 	status.DstTotal = dstTotal
 
 	// Pending/failed totals from src_stats
-	c, _ := database.GetStatsCount("SRC", db.StatsKeyTraversalStatus(db.StatusPending))
+	c, err := database.GetStatsCount("SRC", db.StatsKeyTraversalStatus(db.StatusPending))
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("failed to get stats count: %w", err)
+	}
 	status.SrcPending = int(c)
-	c, _ = database.GetStatsCount("SRC", db.StatsKeyTraversalStatus(db.StatusFailed))
+	c, err = database.GetStatsCount("SRC", db.StatsKeyTraversalStatus(db.StatusFailed))
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("failed to get stats count: %w", err)
+	}
 	status.SrcFailed = int(c)
 
 	// Min pending depth for SRC from stats breakdown
-	breakdown, _ := database.GetStatsBreakdown("SRC")
+	breakdown, err := database.GetStatsBreakdown("SRC")
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("failed to get stats breakdown: %w", err)
+	}
 	for _, row := range breakdown {
 		if row.Key == db.StatsKeyTraversalStatus(db.StatusPending) && row.Count > 0 {
 			if status.MinPendingDepthSrc == nil || row.Depth < *status.MinPendingDepthSrc {
@@ -85,13 +94,22 @@ func InspectMigrationStatus(database *db.DB) (MigrationStatus, error) {
 	}
 
 	// Pending/failed totals from dst_stats
-	c, _ = database.GetStatsCount("DST", db.StatsKeyTraversalStatus(db.StatusPending))
+	c, err = database.GetStatsCount("DST", db.StatsKeyTraversalStatus(db.StatusPending))
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("failed to get stats count: %w", err)
+	}
 	status.DstPending = int(c)
-	c, _ = database.GetStatsCount("DST", db.StatsKeyTraversalStatus(db.StatusFailed))
+	c, err = database.GetStatsCount("DST", db.StatsKeyTraversalStatus(db.StatusFailed))
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("failed to get stats count: %w", err)
+	}
 	status.DstFailed = int(c)
 
 	// Min pending depth for DST from stats breakdown
-	breakdown, _ = database.GetStatsBreakdown("DST")
+	breakdown, err = database.GetStatsBreakdown("DST")
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("failed to get stats breakdown: %w", err)
+	}
 	for _, row := range breakdown {
 		if row.Key == db.StatsKeyTraversalStatus(db.StatusPending) && row.Count > 0 {
 			if status.MinPendingDepthDst == nil || row.Depth < *status.MinPendingDepthDst {

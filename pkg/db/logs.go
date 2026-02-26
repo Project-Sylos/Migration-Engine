@@ -4,6 +4,7 @@
 package db
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -117,7 +118,7 @@ func (lb *LogBuffer) Flush() {
 	}
 	defer lb.setFlushingDone()
 	n := len(batch)
-	_ = lb.db.RunUpdateWriterTx(func(w *Writer) error {
+	err := lb.db.RunUpdateWriterTx(func(w *Writer) error {
 		for _, e := range batch {
 			if err := w.InsertLog(e.ID, e.Level, e.Message, e.Entity, e.Entity, e.EntityID, e.Queue); err != nil {
 				return err
@@ -125,6 +126,10 @@ func (lb *LogBuffer) Flush() {
 		}
 		return nil
 	})
+	if err != nil {
+		fmt.Println("error running update writer tx", err)
+		return
+	}
 	for i := 0; i < n; i++ {
 		lb.slots <- struct{}{}
 	}

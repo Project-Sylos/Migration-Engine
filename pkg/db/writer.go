@@ -38,8 +38,14 @@ func (w *Writer) AppenderInsert(table string, nodes []*NodeState) error {
 
 // ensureStaging creates src_staging and dst_staging if they do not exist (on the Tx).
 func (w *Writer) ensureStaging() error {
-	_, _ = w.tx.Exec(srcStagingDDL())
-	_, _ = w.tx.Exec(dstStagingDDL())
+	_, err := w.tx.Exec(srcStagingDDL())
+	if err != nil {
+		return err
+	}
+	_, err = w.tx.Exec(dstStagingDDL())
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -100,7 +106,10 @@ func (w *Writer) RecomputeStatsForDepth(table string, depth int) error {
 	if table == "DST" {
 		statsTbl = tableDstStats
 	}
-	_, _ = w.tx.ExecContext(ctx, `DELETE FROM `+statsTbl+` WHERE depth = $1`, depth)
+	_, err := w.tx.ExecContext(ctx, `DELETE FROM `+statsTbl+` WHERE depth = $1`, depth)
+	if err != nil {
+		return err
+	}
 	rows, err := w.tx.QueryContext(ctx,
 		`SELECT COALESCE(traversal_status, '') AS status, COUNT(*)::BIGINT FROM `+t+` WHERE depth = $1 GROUP BY traversal_status`, depth)
 	if err != nil {
@@ -190,8 +199,14 @@ func (w *Writer) ApplyStatusStagingAndDrop(depth int, table string, completed in
 	}
 
 	// 4) Clear staging tables for next level (DELETE is quick; tables stay in place)
-	_, _ = w.tx.ExecContext(ctx, `DELETE FROM src_staging`)
-	_, _ = w.tx.ExecContext(ctx, `DELETE FROM dst_staging`)
+	_, err = w.tx.ExecContext(ctx, `DELETE FROM src_staging`)
+	if err != nil {
+		return err
+	}
+	_, err = w.tx.ExecContext(ctx, `DELETE FROM dst_staging`)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 

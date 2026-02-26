@@ -4,6 +4,7 @@
 package queue
 
 import (
+	"fmt"
 	"context"
 	"time"
 
@@ -88,7 +89,10 @@ func (q *Queue) maybeMergeStagingEarlyOnTaskComplete() {
 	q.completedSinceLastEarlyMerge = 0
 	round := q.round
 	q.mu.Unlock()
-	_, _ = database.MaybeMergeStagingEarly(round, stagingEarlyMergeThreshold)
+	_, err := database.MaybeMergeStagingEarly(round, stagingEarlyMergeThreshold)
+	if err != nil {
+		fmt.Println("error merging staging early", err)
+	}
 }
 
 // SetCopyPass sets the current copy pass.
@@ -592,7 +596,11 @@ func (q *Queue) setExpectedFromStatsBucket(round int) {
 	mode := q.GetMode()
 	var expected int64
 	// Try fast read from stats first
-	expected, _ = database.GetStatsCountAtDepth(queueType, round, db.StatsKeyExpected)
+	expected, err := database.GetStatsCountAtDepth(queueType, round, db.StatsKeyExpected)
+	if err != nil {
+		fmt.Println("error getting stats count at depth", err)
+		return
+	}
 	if expected == 0 {
 		// Compute from live table (stats for this depth may not exist yet when advancing to a new round) and write back
 		switch mode {
@@ -600,24 +608,44 @@ func (q *Queue) setExpectedFromStatsBucket(round int) {
 			if round == 0 {
 				expected = 1
 			} else {
-				expected, _ = database.GetPendingTraversalCountAtDepthFromLive(queueType, round)
+				expected, err = database.GetPendingTraversalCountAtDepthFromLive(queueType, round)
+				if err != nil {
+					fmt.Println("error getting pending traversal count at depth from live", err)
+					return
+				}
 			}
 		case QueueModeRetry:
-			expected, _ = database.GetPendingTraversalCountAtDepthFromLive(queueType, round)
+			expected, err = database.GetPendingTraversalCountAtDepthFromLive(queueType, round)
+			if err != nil {
+				fmt.Println("error getting pending traversal count at depth from live", err)
+				return
+			}
 		case QueueModeCopy:
 			copyPass := q.GetCopyPass()
 			nodeType := db.NodeTypeFolder
 			if copyPass == 2 {
 				nodeType = db.NodeTypeFile
 			}
-			expected, _ = database.GetCopyCountAtDepth(round, nodeType, db.CopyStatusPending)
+			expected, err = database.GetCopyCountAtDepth(round, nodeType, db.CopyStatusPending)
+			if err != nil {
+				fmt.Println("error getting copy count at depth", err)
+				return
+			}
 		default:
 			return
 		}
 		if expected > 0 {
-			_ = database.RunUpdateWriterTx(func(w *db.Writer) error {
+			err = database.RunUpdateWriterTx(func(w *db.Writer) error {
+				if err != nil {
+					fmt.Println("error running update writer tx", err)
+					return err
+				}
 				return w.SetStatsCountForDepth(queueType, round, db.StatsKeyExpected, expected)
 			})
+			if err != nil {
+				fmt.Println("error setting stats count for depth", err)
+				return
+			}
 		}
 	}
 	q.mu.Lock()
@@ -690,9 +718,12 @@ func (q *Queue) Add(task *TaskBase) bool {
 		// With deterministic IDs, task.ID should always be pre-computed
 		// This is a programming error if we reach here
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("error",
+			err := logservice.LS.Log("error",
 				"enqueuePending called with empty task.ID - this indicates a bug in ID generation",
 				"queue", q.name, q.name)
+			if err != nil {
+				fmt.Println("error logging", err)
+			}
 		}
 		return false
 	}
@@ -730,9 +761,12 @@ func (q *Queue) dequeuePending() *TaskBase {
 			// With deterministic IDs, task.ID should always be pre-computed
 			// Skip this task and log an error
 			if logservice.LS != nil {
-				_ = logservice.LS.Log("error",
+				err := logservice.LS.Log("error",
 					"dequeuePending found task with empty ID - this indicates a bug in ID generation",
 					"queue", q.name, q.name)
+				if err != nil {
+					fmt.Println("error logging", err)
+				}
 			}
 			q.mu.Unlock()
 			continue

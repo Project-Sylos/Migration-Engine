@@ -4,6 +4,7 @@
 package db
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -138,7 +139,11 @@ func (wb *writeBuffer) setFlushingDone() {
 func (wb *writeBuffer) runFlush(batch any, n int) []string {
 	if wb.kind == bufferKindStaging {
 		sb := batch.(stagingBatch)
-		_ = wb.db.runStagingFlush(wb.table, sb.src, sb.dst)
+		err := wb.db.runStagingFlush(wb.table, sb.src, sb.dst)
+		if err != nil {
+			fmt.Println("error running staging flush", err)
+			return nil
+		}
 		ids := make([]string, 0, n)
 		for k := range sb.src {
 			ids = append(ids, k)
@@ -149,7 +154,11 @@ func (wb *writeBuffer) runFlush(batch any, n int) []string {
 		return ids
 	}
 	nodes := batch.([]*NodeState)
-	_ = wb.db.runNodesFlush(wb.table, nodes)
+	err := wb.db.runNodesFlush(wb.table, nodes)
+	if err != nil {
+		fmt.Println("error running nodes flush", err)
+		return nil
+	}
 	ids := make([]string, 0, len(nodes))
 	for _, nd := range nodes {
 		ids = append(ids, nd.ID)

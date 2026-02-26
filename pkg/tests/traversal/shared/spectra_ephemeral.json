@@ -1,5 +1,5 @@
 {
-  "mode": "ephemeral",
+  "mode": "persistent",
   "seed": {
     "max_depth": 5,
     "max_folders": 50,
@@ -11,14 +11,13 @@
     "seed": 40,
     "file_binary_seed": 0,
     "enable_cache": false,
-    "diverging_tree_mode": true
+    "diverging_tree_mode": false
   },
   "api": {
     "host": "localhost",
     "port": 8086
   },
   "secondary_tables": {
-    "s1": 0.7,
-    "s2": 0.3
+    "s1": 0.9
   }
 }

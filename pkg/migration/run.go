@@ -236,9 +236,17 @@ func snapshotTraversalQueueStats(database *db.DB, coordinator *queue.QueueCoordi
 	dstRound := coordinator.GetRound("dst")
 	srcPending := 0
 	dstPending := 0
-	c, _ := database.GetStatsCountAtDepth("SRC", srcRound, db.StatsKeyTraversalStatus(db.StatusPending))
+	c, err := database.GetStatsCountAtDepth("SRC", srcRound, db.StatsKeyTraversalStatus(db.StatusPending))
+	if err != nil {
+		fmt.Println("error getting stats count at depth", err)
+		return queue.QueueStats{}, queue.QueueStats{}
+	}
 	srcPending = int(c)
-	c, _ = database.GetStatsCountAtDepth("DST", dstRound, db.StatsKeyTraversalStatus(db.StatusPending))
+	c, err = database.GetStatsCountAtDepth("DST", dstRound, db.StatsKeyTraversalStatus(db.StatusPending))
+	if err != nil {
+		fmt.Println("error getting stats count at depth", err)
+		return queue.QueueStats{}, queue.QueueStats{}
+	}
 	dstPending = int(c)
 	srcStats := queue.QueueStats{Name: "src", Round: srcRound, Pending: srcPending}
 	dstStats := queue.QueueStats{Name: "dst", Round: dstRound, Pending: dstPending}
@@ -248,9 +256,18 @@ func snapshotTraversalQueueStats(database *db.DB, coordinator *queue.QueueCoordi
 func completeTraversalRun(database *db.DB, coordinator *queue.QueueCoordinator, progressTicker *time.Ticker, start time.Time) RuntimeStats {
 	srcStats, dstStats := snapshotTraversalQueueStats(database, coordinator)
 	fmt.Println("\nCreating indexes... this may take a bit.")
-	_ = logservice.LS.Log("info", "Creating indexes... this may take a bit.", "migration", "run", "run")
-	_ = db.EnsureNodeTableIndexes(database, "src_nodes")
-	_ = db.EnsureNodeTableIndexes(database, "dst_nodes")
+	err := logservice.LS.Log("info", "Creating indexes... this may take a bit.", "migration", "run", "run")
+	if err != nil {
+		fmt.Println("error logging", err)
+	}
+	err = db.EnsureNodeTableIndexes(database, "src_nodes")
+	if err != nil {
+		fmt.Println("error ensuring node table indexes", err)
+	}
+	err = db.EnsureNodeTableIndexes(database, "dst_nodes")
+	if err != nil {
+		fmt.Println("error ensuring node table indexes", err)
+	}
 	fmt.Println("\nMigration complete!")
 	progressTicker.Stop()
 	closeGlobalLoggerWithTimeout(1 * time.Second)
@@ -269,7 +286,10 @@ func closeGlobalLoggerWithTimeout(timeout time.Duration) {
 	defer closeCancel()
 	closeDone := make(chan struct{}, 1)
 	go func() {
-		_ = logservice.LS.Close()
+		err := logservice.LS.Close()
+		if err != nil {
+			fmt.Println("error closing global logger", err)
+		}
 		closeDone <- struct{}{}
 	}()
 	select {
@@ -315,11 +335,14 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 	// DST will check coordinator when it needs to advance
 
 	if logservice.LS != nil {
-		_ = logservice.LS.Log("info",
+		err := logservice.LS.Log("info",
 			fmt.Sprintf("Initialized queues: src round %d, dst round %d", srcRound, dstRound),
 			"migration",
 			"init",
 		)
+		if err != nil {
+			fmt.Println("error logging", err)
+		}
 	}
 
 	return nil

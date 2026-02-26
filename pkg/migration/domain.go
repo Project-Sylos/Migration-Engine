@@ -244,7 +244,7 @@ func (m *Migration) StartCopy() (queue.QueueStats, error) {
 	runCtx := m.beginRun(lastCfg.ShutdownContext)
 	defer m.endRun()
 	stats, err := RunCopyPhase(CopyPhaseConfig{
-		BoltDB:          m.manager.db,
+		DuckDB:          m.manager.db,
 		SrcAdapter:      lastCfg.Source.Adapter,
 		DstAdapter:      lastCfg.Destination.Adapter,
 		WorkerCount:     lastCfg.WorkerCount,
@@ -300,7 +300,7 @@ func (m *Migration) RunRetrySweep(opts RetrySweepOptions) (RuntimeStats, error) 
 	}
 
 	stats, err := RunRetrySweep(SweepConfig{
-		BoltDB:       m.manager.db,
+		DuckDB:       m.manager.db,
 		SrcAdapter:   lastCfg.Source.Adapter,
 		DstAdapter:   lastCfg.Destination.Adapter,
 		WorkerCount:  workerCount,

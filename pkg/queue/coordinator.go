@@ -4,6 +4,7 @@
 package queue
 
 import (
+	"fmt"
 	"sync"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
@@ -76,9 +77,12 @@ func (c *QueueCoordinator) MarkCompleted(which string) {
 		default:
 			whichMsg = which
 		}
-		_ = logservice.LS.Log("debug",
+		err := logservice.LS.Log("debug",
 			"Coordinator: "+whichMsg+" marked as completed",
 			"coordinator", "mark", "coordinator")
+		if err != nil {
+			fmt.Println("error logging", err)
+		}
 	}
 }
 

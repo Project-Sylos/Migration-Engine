@@ -101,23 +101,23 @@ func runTest() error {
 	fmt.Printf("Spectra DB node count: %d\n", spectraNodeCount)
 
 	// Count nodes in database BEFORE any mutations (baseline check)
-	boltNodeCountInitial, err := db.CountNodes(database, "SRC")
+	duckNodeCountInitial, err := db.CountNodes(database, "SRC")
 	if err != nil {
 		return fmt.Errorf("failed to count initial SRC nodes: %w", err)
 	}
-	fmt.Printf("Database SRC node count (initial): %d\n", boltNodeCountInitial)
+	fmt.Printf("Database SRC node count (initial): %d\n", duckNodeCountInitial)
 
 	// Count DST nodes too for comparison
-	boltNodeCountDST, err := db.CountNodes(database, "DST")
+	duckNodeCountDST, err := db.CountNodes(database, "DST")
 	if err != nil {
 		return fmt.Errorf("failed to count initial DST nodes: %w", err)
 	}
-	fmt.Printf("Database DST node count (initial): %d\n", boltNodeCountDST)
+	fmt.Printf("Database DST node count (initial): %d\n", duckNodeCountDST)
 
 	// Check if counts match
-	if boltNodeCountInitial != spectraNodeCount {
+	if duckNodeCountInitial != spectraNodeCount {
 		fmt.Printf("⚠️  WARNING: Initial SRC count (%d) does not match Spectra count (%d) - difference: %d\n",
-			boltNodeCountInitial, spectraNodeCount, boltNodeCountInitial-spectraNodeCount)
+			duckNodeCountInitial, spectraNodeCount, duckNodeCountInitial-spectraNodeCount)
 	}
 
 	// Get root path (should be "/")
@@ -194,24 +194,24 @@ func runTest() error {
 	}
 
 	// Count nodes in database after deletion
-	boltNodeCountSRCBefore, err := db.CountNodes(database, "SRC")
+	duckNodeCountSRCBefore, err := db.CountNodes(database, "SRC")
 	if err != nil {
 		return fmt.Errorf("failed to count SRC nodes: %w", err)
 	}
-	fmt.Printf("Database SRC node count after deletion: %d\n", boltNodeCountSRCBefore)
+	fmt.Printf("Database SRC node count after deletion: %d\n", duckNodeCountSRCBefore)
 
-	boltNodeCountDSTBefore, err := db.CountNodes(database, "DST")
+	duckNodeCountDSTBefore, err := db.CountNodes(database, "DST")
 	if err != nil {
 		return fmt.Errorf("failed to count DST nodes: %w", err)
 	}
-	fmt.Printf("Database DST node count after deletion: %d\n", boltNodeCountDSTBefore)
+	fmt.Printf("Database DST node count after deletion: %d\n", duckNodeCountDSTBefore)
 
 	fmt.Println("\n🚀 Phase 3: Run Retry Sweep")
 	fmt.Println("============================")
 
 	// Run retry sweep
 	sweepConfig := migration.SweepConfig{
-		BoltDB:          database,
+		DuckDB:          database,
 		SrcAdapter:      srcAdapter,
 		DstAdapter:      dstAdapter,
 		WorkerCount:     10,
@@ -240,32 +240,32 @@ func runTest() error {
 	fmt.Println("========================")
 
 	// Count nodes in database after retry sweep
-	boltNodeCountSRCAfter, err := db.CountNodes(database, "SRC")
+	duckNodeCountSRCAfter, err := db.CountNodes(database, "SRC")
 	if err != nil {
 		return fmt.Errorf("failed to count SRC nodes after sweep: %w", err)
 	}
-	fmt.Printf("Database SRC node count after retry sweep: %d\n", boltNodeCountSRCAfter)
+	fmt.Printf("Database SRC node count after retry sweep: %d\n", duckNodeCountSRCAfter)
 
-	boltNodeCountDSTAfter, err := db.CountNodes(database, "DST")
+	duckNodeCountDSTAfter, err := db.CountNodes(database, "DST")
 	if err != nil {
 		return fmt.Errorf("failed to count DST nodes after sweep: %w", err)
 	}
-	fmt.Printf("Database DST node count after retry sweep: %d\n", boltNodeCountDSTAfter)
+	fmt.Printf("Database DST node count after retry sweep: %d\n", duckNodeCountDSTAfter)
 
 	// Verify that we found all SRC nodes again
 	expectedSRCCount := spectraNodeCount
-	if boltNodeCountSRCAfter != expectedSRCCount {
+	if duckNodeCountSRCAfter != expectedSRCCount {
 		return fmt.Errorf("SRC node count mismatch: expected %d (from Spectra), got %d",
-			expectedSRCCount, boltNodeCountSRCAfter)
+			expectedSRCCount, duckNodeCountSRCAfter)
 	}
 
 	fmt.Printf("✅ SRC node count matches Spectra DB: %d nodes\n", expectedSRCCount)
 
 	// Verify that DST was also restored to original count
-	expectedDSTCount := boltNodeCountDST // Original DST count before deletion
-	if boltNodeCountDSTAfter != expectedDSTCount {
+	expectedDSTCount := duckNodeCountDST // Original DST count before deletion
+	if duckNodeCountDSTAfter != expectedDSTCount {
 		return fmt.Errorf("DST node count mismatch: expected %d (original count), got %d (after retry sweep)",
-			expectedDSTCount, boltNodeCountDSTAfter)
+			expectedDSTCount, duckNodeCountDSTAfter)
 	}
 
 	fmt.Printf("✅ DST node count matches original: %d nodes\n", expectedDSTCount)

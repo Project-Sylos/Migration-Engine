@@ -74,7 +74,10 @@ func SetupSpectraFS(configPath string, cleanDB bool) (*sdk.SpectraFS, error) {
 			}
 			// Also try to remove lock files (Windows-specific: .db.lock)
 			lockPath := dbPath + ".lock"
-			_ = os.Remove(lockPath) // Ignore errors - lock file might not exist
+			err := os.Remove(lockPath) // Ignore errors - lock file might not exist
+			if err != nil {
+				fmt.Println("error removing lock file", err)
+			}
 		}
 	}
 
@@ -217,7 +220,7 @@ func SetupCopyTestConfig(cleanSpectraDB bool, removeMigrationDB bool) (migration
 // SetupLocalCopyTest sets up the database and adapters for local filesystem copy phase testing.
 // srcPath and dstPath are absolute paths to the source and destination directories.
 // removeMigrationDB controls whether to remove the migration database (use true for fresh test).
-// Returns the BoltDB instance, source adapter, destination adapter, and error.
+// Returns the DuckDB instance, source adapter, destination adapter, and error.
 func SetupLocalCopyTest(srcPath, dstPath string, removeMigrationDB bool) (*db.DB, types.FSAdapter, types.FSAdapter, error) {
 	fmt.Printf("Setting up local filesystem copy test...\n")
 	fmt.Printf("  Source: %s\n", srcPath)

@@ -1,12 +1,18 @@
 {
+  "mode": "persistent",
   "seed": {
-    "max_depth": 4,
-    "min_folders": 4,
-    "max_folders": 8,
-    "min_files": 10,
-    "max_files": 20,
-    "seed": 0,
-    "db_path": "C:\\Users\\golde\\OneDrive\\Documents\\GitHub\\Sylos\\Sylos-API\\data\\01KESVV5D6RVPCNMCRGK5KQMQT\\spectra.db"
+    "max_depth": 5,
+    "max_folders": 50,
+    "folder_backoff_factor": 0.8,
+    "folder_depth_decay_factor": 0.80,
+    "max_files": 50,
+    "file_backoff_factor": 0.8,
+    "file_depth_decay_factor": 0.80,
+    "seed": 40,
+    "file_binary_seed": 0,
+    "db_path": "./pkg/tests/traversal/shared/spectra.db",
+    "enable_cache": false,
+    "diverging_tree_mode": false
   },
   "api": {
     "host": "localhost",
