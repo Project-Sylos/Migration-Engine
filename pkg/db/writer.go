@@ -219,6 +219,25 @@ func (w *Writer) SetNodeTraversalStatus(table, nodeID, status string) error {
 	return w.RecomputeStatsForDepth(table, depth)
 }
 
+// SetNodeCopyStatus updates a SRC node's copy_status on the live table and recomputes stats for that depth.
+func (w *Writer) SetNodeCopyStatus(table, nodeID, status string) error {
+	if table != "SRC" {
+		return nil
+	}
+	ctx := context.Background()
+	t := tableName(table)
+	var depth int
+	err := w.tx.QueryRowContext(ctx, `SELECT depth FROM `+t+` WHERE id = $1`, nodeID).Scan(&depth)
+	if err != nil {
+		return err
+	}
+	_, err = w.tx.ExecContext(ctx, `UPDATE `+t+` SET copy_status = $1 WHERE id = $2`, status, nodeID)
+	if err != nil {
+		return err
+	}
+	return w.RecomputeStatsForDepth(table, depth)
+}
+
 // SetNodeExcluded updates a node's excluded flag on the live table. No stats update (schema has no excluded key in stats).
 func (w *Writer) SetNodeExcluded(table, nodeID string, excluded bool) error {
 	t := tableName(table)

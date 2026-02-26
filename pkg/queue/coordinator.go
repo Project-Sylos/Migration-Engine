@@ -9,20 +9,15 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 )
 
-// YAMLUpdateCallback is a function that updates the YAML config file when rounds advance.
-// It's called from a background goroutine to avoid blocking.
-type YAMLUpdateCallback func(srcRound, dstRound int)
-
 // QueueCoordinator manages round advancement gates for dual-BFS traversal.
 // It enforces the invariant: "DST cannot advance to round N until SRC has completed rounds N and N+1."
 // This is a simple gate - queues manage themselves, coordinator only controls when DST can advance.
 type QueueCoordinator struct {
-	mu           sync.RWMutex
-	srcRound     int                // Current SRC round
-	srcDone      bool               // SRC has completed traversal
-	dstRound     int                // Current DST round
-	dstDone      bool               // DST has completed traversal
-	yamlUpdateCB YAMLUpdateCallback // Optional callback for YAML updates on round advance
+	mu       sync.RWMutex
+	srcRound int  // Current SRC round
+	srcDone  bool // SRC has completed traversal
+	dstRound int  // Current DST round
+	dstDone  bool // DST has completed traversal
 }
 
 // NewQueueCoordinator creates a new coordinator.
@@ -35,52 +30,18 @@ func NewQueueCoordinator() *QueueCoordinator {
 	}
 }
 
-// SetYAMLUpdateCallback sets a callback function that will be invoked (in a background goroutine)
-// whenever a round advances. This allows automatic YAML config updates.
-func (c *QueueCoordinator) SetYAMLUpdateCallback(cb YAMLUpdateCallback) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.yamlUpdateCB = cb
-}
-
 // UpdateSrcRound updates SRC's current round.
 func (c *QueueCoordinator) UpdateSrcRound(round int) {
 	c.mu.Lock()
-	oldRound := c.srcRound
 	c.srcRound = round
-	cb := c.yamlUpdateCB
 	c.mu.Unlock()
-
-	// If round changed and we have a callback, update YAML in background
-	if oldRound != round && cb != nil {
-		go func() {
-			c.mu.RLock()
-			srcR := c.srcRound
-			dstR := c.dstRound
-			c.mu.RUnlock()
-			cb(srcR, dstR)
-		}()
-	}
 }
 
 // UpdateDstRound updates DST's current round.
 func (c *QueueCoordinator) UpdateDstRound(round int) {
 	c.mu.Lock()
-	oldRound := c.dstRound
 	c.dstRound = round
-	cb := c.yamlUpdateCB
 	c.mu.Unlock()
-
-	// If round changed and we have a callback, update YAML in background
-	if oldRound != round && cb != nil {
-		go func() {
-			c.mu.RLock()
-			srcR := c.srcRound
-			dstR := c.dstRound
-			c.mu.RUnlock()
-			cb(srcR, dstR)
-		}()
-	}
 }
 
 // GetSrcRound returns SRC's current round.
@@ -102,7 +63,6 @@ func (c *QueueCoordinator) MarkSrcCompleted() {
 	c.mu.Lock()
 	c.srcDone = true
 	c.mu.Unlock()
-	// Log outside of lock to avoid deadlock
 	if logservice.LS != nil {
 		_ = logservice.LS.Log("debug",
 			"Coordinator: SRC marked as completed",
@@ -115,7 +75,6 @@ func (c *QueueCoordinator) MarkDstCompleted() {
 	c.mu.Lock()
 	c.dstDone = true
 	c.mu.Unlock()
-	// Log outside of lock to avoid deadlock
 	if logservice.LS != nil {
 		_ = logservice.LS.Log("debug",
 			"Coordinator: DST marked as completed",
@@ -152,15 +111,10 @@ func (c *QueueCoordinator) CanDstStartRound(targetRound int) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	// If SRC is done, DST can always proceed at full speed (unless DST is also done)
-	// This allows DST to catch up and finish as quickly as possible once SRC completes
 	if c.srcDone {
 		return !c.dstDone
 	}
 
-	// DST can start round N if SRC has completed rounds N and N+1
-	// SRC completes round N when it advances to N+1, completes round N+1 when it advances to N+2
-	// So DST can start round N if SRC is at round N+2 or higher
 	requiredSrcRound := targetRound + 2
 	return c.srcRound >= requiredSrcRound && !c.dstDone
 }

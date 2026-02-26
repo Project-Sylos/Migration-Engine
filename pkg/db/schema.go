@@ -4,12 +4,13 @@
 package db
 
 const (
-	tableSrcNodes       = "src_nodes"
-	tableDstNodes       = "dst_nodes"
-	tableSrcStats       = "src_stats"
-	tableDstStats       = "dst_stats"
-	tableSrcStaging     = "src_staging"
-	tableDstStaging     = "dst_staging"
+	tableSrcNodes   = "src_nodes"
+	tableDstNodes   = "dst_nodes"
+	tableSrcStats   = "src_stats"
+	tableDstStats   = "dst_stats"
+	tableSrcStaging = "src_staging"
+	tableDstStaging = "dst_staging"
+	tableMigrations = "migrations"
 )
 
 // nodeTableDDL returns CREATE TABLE for src_nodes or dst_nodes.
@@ -94,6 +95,18 @@ func taskErrorsTableDDL() string {
 		attempts INTEGER,
 		path VARCHAR,
 		created_at TIMESTAMP DEFAULT current_timestamp
+	)`
+}
+
+func migrationsTableDDL() string {
+	return `CREATE TABLE IF NOT EXISTS migrations (
+		migration_id VARCHAR PRIMARY KEY,
+		name VARCHAR NOT NULL,
+		phase VARCHAR NOT NULL,
+		created_at TIMESTAMP NOT NULL,
+		updated_at TIMESTAMP NOT NULL,
+		service_metadata_json VARCHAR,
+		root_config_json VARCHAR
 	)`
 }
 

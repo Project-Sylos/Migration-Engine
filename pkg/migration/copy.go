@@ -27,8 +27,6 @@ type CopyPhaseConfig struct {
 	StartupDelay    time.Duration
 	ProgressTick    time.Duration
 	ShutdownContext context.Context
-	YAMLConfig      *MigrationConfigYAML // Optional: YAML config for status updates
-	ConfigPath      string               // Optional: Path to YAML config file for status updates
 }
 
 // RunCopyPhase executes the copy phase (two-pass: folders then files).
@@ -118,12 +116,6 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		// Join is by path; roots with path "/" are matched by path, no separate mapping needed.
 	}
 
-	// Update config: Copy phase started
-	if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-		SetStatusCopyInProgress(cfg.YAMLConfig)
-		_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
-	}
-
 	// Initialize copy queue with both source and destination adapters
 	shutdownCtx := cfg.ShutdownContext
 	if shutdownCtx == nil {
@@ -194,20 +186,6 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 			select {
 			case <-shutdownCtx.Done():
 				copyQueue.Pause()
-				stats := copyQueue.Stats()
-
-				// Update YAML config with suspended status
-				if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-					status, statusErr := InspectMigrationStatus(boltDB)
-					if statusErr == nil {
-						// For copy phase, we only track one round (copy queue round)
-						// Use the current round for both src and dst in status update
-						currentRound := stats.Round
-						SetSuspendedStatus(cfg.YAMLConfig, status, currentRound, currentRound)
-						_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
-					}
-				}
-
 				return queue.QueueStats{}, fmt.Errorf("copy phase shutdown requested")
 			default:
 			}
@@ -219,44 +197,6 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 
 			// Stop progress ticker
 			progressTicker.Stop()
-
-			// Update config YAML with final state (fire-and-forget to avoid blocking)
-			if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-				go func() {
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer cancel()
-
-					done := make(chan error, 1)
-					go func() {
-						status, statusErr := InspectMigrationStatus(boltDB)
-						if statusErr != nil {
-							if logservice.LS != nil {
-								_ = logservice.LS.Log("warning", fmt.Sprintf("InspectMigrationStatus error: %v", statusErr), "migration", "copy", "copy")
-							}
-							done <- statusErr
-							return
-						}
-						// For copy phase, use current round for both src and dst
-						currentRound := stats.Round
-						UpdateConfigFromStatus(cfg.YAMLConfig, status, currentRound, currentRound)
-						SetStatusComplete(cfg.YAMLConfig)
-						done <- SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
-					}()
-
-					select {
-					case err := <-done:
-						if err != nil {
-							if logservice.LS != nil {
-								_ = logservice.LS.Log("warning", fmt.Sprintf("Config save failed: %v", err), "migration", "copy", "copy")
-							}
-						}
-					case <-ctx.Done():
-						if logservice.LS != nil {
-							_ = logservice.LS.Log("warning", "Config save timeout (fire-and-forget)", "migration", "copy", "copy")
-						}
-					}
-				}()
-			}
 
 			// Close log service
 			if logservice.LS != nil {
@@ -277,8 +217,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 			return stats, nil
 		}
 
-		// Update config periodically (every 10 iterations) or on round advancement
-		// Track round advancement for YAML updates
+		// Track round advancement for runtime observability.
 		currentRound := copyQueue.GetRound()
 		roundAdvanced := false
 		if currentRound != lastRound {
@@ -287,16 +226,8 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		}
 
 		tickCount++
-		shouldUpdate := roundAdvanced || (tickCount%10 == 0)
-		if cfg.YAMLConfig != nil && cfg.ConfigPath != "" && shouldUpdate {
-			status, statusErr := InspectMigrationStatus(boltDB)
-			if statusErr == nil {
-				// For copy phase, use current round for both src and dst
-				UpdateConfigFromStatus(cfg.YAMLConfig, status, currentRound, currentRound)
-				// Save config (ignore errors to avoid disrupting migration)
-				_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
-			}
-		}
+		_ = roundAdvanced
+		_ = tickCount
 
 		// Sleep briefly before checking again
 		time.Sleep(100 * time.Millisecond)

@@ -1,16 +1,22 @@
 # Migration Package
 
-The **migration** package provides the core orchestration logic for the Migration Engine, including configuration management, state tracking, and the main migration execution flow.
+Note: this package is currently in transition to an engine-centric lifecycle model.
+For the latest architecture and API usage guidance, start with:
+
+- `docs/ENGINE_ARCHITECTURE_OVERVIEW.md`
+- `docs/API_USAGE_GUIDE.md`
+- `docs/ENGINE_API_CUTOVER.md`
+
+The **migration** package orchestrates the Migration Engine: it prepares or accepts the database (`pkg/db`), builds config (including YAML state), runs traversal and copy via `pkg/queue`, and performs verification. All persistence uses a single database instance (`*db.DB`, DuckDB).
 
 ---
 
 ## Overview
 
-The migration package coordinates the entire migration lifecycle:
-- **Configuration Management** - YAML-based config files for serializing/deserializing migration state
-- **State Tracking** - Monitors migration progress, rounds, and completion status
-- **Execution Orchestration** - Coordinates queue setup, traversal, and verification
-- **Resume Support** - Ability to pause and resume migrations from saved state
+- **Database**: Uses `*db.DB` from `pkg/db`—either opened by the engine at `Database.Path` or supplied by the caller (`Config.DatabaseInstance`). The same DB holds nodes, staging, stats, and logs for traversal and copy.
+- **Configuration**: YAML config files serialize/deserialize migration state (roots, status, options); config path defaults to `{Database.Path}.yaml` (e.g. `migration.duckdb.yaml`).
+- **State and verification**: `InspectMigrationStatus(database)` and `VerifyMigration(database, opts)` read from the DB’s node and stats tables (see `pkg/db`).
+- **Execution**: Coordinates queue setup, root seeding, traversal, copy (when applicable), and verification; supports resume from saved YAML state.
 
 ---
 
@@ -22,6 +28,8 @@ The `Config` struct aggregates all parameters required to run a migration:
 
 ```go
 type Config struct {
+    DatabaseInstance *db.DB  // If nil, engine opens DB at Database.Path
+    CloseWhenDone    bool    // If true and engine opened the DB, close it when done
     Database         DatabaseConfig
     Source           Service
     Destination      Service
@@ -32,7 +40,7 @@ type Config struct {
     LogAddress       string
     LogLevel         string
     Verification     VerifyOptions
-    // ... additional fields
+    // ... (ConfigPath, YAMLConfig, ShutdownContext, etc.)
 }
 ```
 
@@ -43,8 +51,8 @@ Represents a filesystem service participating in the migration:
 ```go
 type Service struct {
     Name    string
-    Adapter fsservices.FSAdapter
-    Root    fsservices.Folder
+    Adapter types.FSAdapter  // From Sylos-FS; must be provided by caller
+    Root    types.Folder    // Source or destination root folder
 }
 ```
 
@@ -59,11 +67,11 @@ result, err := migration.LetsMigrate(cfg)
 ```
 
 This function:
-1. Sets up or opens the BoltDB database
-2. Inspects existing migration state
+1. Opens the database (if `Config.DatabaseInstance` is nil, opens at `Config.Database.Path` via `db.Open`)
+2. Loads YAML config if present and inspects DB state via `InspectMigrationStatus(database)`
 3. Decides whether to run fresh or resume
-4. Executes traversal
-5. Runs verification
+4. Seeds roots (if needed), runs traversal (and copy when applicable) using the same DB
+5. Runs verification against the DB
 6. Returns results
 
 **Note:** This function blocks until the migration completes or is shutdown. It automatically handles SIGINT/SIGTERM signals for graceful shutdown.
@@ -85,10 +93,11 @@ result, err := controller.Wait()
 ```
 
 **MigrationController** provides:
-- `Shutdown()` - Triggers force shutdown, checkpoints DB, saves YAML with "suspended" status
-- `Wait()` - Blocks until migration completes, returns result and error
-- `Result()` - Returns the migration result (nil if not complete)
-- `Error()` - Returns any error that occurred
+- `Shutdown()` – Triggers force shutdown, checkpoints the database, saves YAML with "suspended" status
+- `GetDB()` – Returns the `*db.DB` in use (caller can keep using it when the engine does not close it)
+- `Wait()` – Blocks until migration completes, returns result and error
+- `Result()` – Returns the migration result (nil if not complete)
+- `Error()` – Returns any error that occurred
 
 **Use Cases:**
 - Programmatic shutdown control
@@ -104,19 +113,15 @@ The migration package includes a comprehensive YAML-based configuration system t
 ### Automatic State Persistence
 
 The config YAML is automatically saved at critical milestones:
-- **Root Selection** - When `SetRootFolders()` is called
-- **Roots Seeded** - After root tasks are seeded into BoltDB
-- **Traversal Started** - When queues are initialized and ready
-- **Round Advancement** - When source or destination rounds advance
-- **Traversal Complete** - When migration finishes
+- **Root selection** – When `SetRootFolders()` is called
+- **Roots seeded** – After root tasks are seeded into the database
+- **Traversal started** – When queues are initialized and ready
+- **Round advancement** – When source or destination rounds advance
+- **Traversal complete** – When migration finishes
 
-### Config File Location
+### Config file location
 
-By default, the config YAML is stored alongside the database file:
-- Database: `migration.db`
-- Config: `migration.db.yaml`
-
-You can specify a custom path via `DatabaseConfig.ConfigPath`.
+By default, the config YAML path is derived from the database path: `{Database.Path}.yaml` (e.g. `migration.duckdb` → `migration.duckdb.yaml`). Override with `DatabaseConfig.ConfigPath`.
 
 ### Serialization (Save)
 
@@ -188,7 +193,7 @@ The YAML config includes:
 - **Service Configs** - Embedded service-specific configs (e.g., spectra.json)
 - **Migration Options** - Worker count, retries, coordinator lead, etc.
 - **Logging** - Log service address, port, and level
-- **Database** - BoltDB file path and settings
+- **Database** – Database file path and settings (path, config path, etc.)
 - **Verification** - Verification options
 - **Extensions** - Unstructured fields for future extensions
 
@@ -220,9 +225,9 @@ cfg := migration.Config{
 result, err := migration.LetsMigrate(cfg)
 ```
 
-### 2. Resume Migration
+### 2. Resume migration
 
-When you open an existing BoltDB database, `LetsMigrate` automatically detects pending work and resumes:
+When the database file already exists and/or YAML config exists, `LetsMigrate` inspects state and resumes if there is pending work:
 
 ```go
 // Same config, but database already exists with state
@@ -275,10 +280,10 @@ type MigrationStatus struct {
 
 ### InspectMigrationStatus
 
-Query the current migration state from BoltDB:
+Query the current migration state from the database (node counts and stats tables in `pkg/db`):
 
 ```go
-status, err := migration.InspectMigrationStatus(boltDB)
+status, err := migration.InspectMigrationStatus(database)
 if status.HasPending() {
     fmt.Println("Migration has pending work")
 }
@@ -287,10 +292,7 @@ if status.IsComplete() {
 }
 ```
 
-The status inspection queries BoltDB bucket counts:
-- Iterates all levels for each queue
-- Counts nodes in each status bucket (pending, successful, failed)
-- Finds minimum pending level
+Implementation uses `db.CountNodes`, `database.GetStatsCount`, and `database.GetStatsBreakdown` for SRC and DST.
 
 ---
 
@@ -301,49 +303,46 @@ After migration completes, verification checks the results:
 ```go
 verifyOpts := migration.VerifyOptions{
     AllowPending:  false,
-    AllowFailed:   false,
     AllowNotOnSrc: true,
 }
 
-report, err := migration.VerifyMigration(boltDB, verifyOpts)
+report, err := migration.VerifyMigration(database, verifyOpts)
 if report.Success(verifyOpts) {
     fmt.Println("Migration verified successfully")
 }
 ```
 
-Verification queries BoltDB to count:
-- Total nodes in each queue
-- Nodes in each status across all levels
-- Nodes successfully moved (excluding root level)
+Verification reads from the same database: node counts and stats tables to report totals, pending, failed, successful, and (for DST) not-on-src.
 
 ---
 
-## Database Management
+## Database management
+
+### Relationship with pkg/db
+
+The migration package never opens or closes the database by itself unless you use it in “standalone” mode (no `DatabaseInstance` provided). It expects a DuckDB instance from `pkg/db`: either you pass `Config.DatabaseInstance` (already opened) or you set `Config.Database.Path` and the engine calls `db.Open(db.Options{Path: cfg.Database.Path})`. All traversal, copy, status, and verification use that single `*db.DB` (same node tables, staging, stats, and logs as described in `pkg/db`).
 
 ### SetupDatabase
 
-Creates a new BoltDB database:
+Opens the database at the given path (creates if missing). Caller is responsible for closing it when done.
 
 ```go
-db, wasFresh, err := migration.SetupDatabase(migration.DatabaseConfig{
-    Path:           "migration.db",
+database, wasFresh, err := migration.SetupDatabase(migration.DatabaseConfig{
+    Path:           "migration.duckdb",
     RemoveExisting: false,
 })
 ```
 
 ### DatabaseConfig
 
-Configures BoltDB behavior:
-
 ```go
 type DatabaseConfig struct {
-    Path           string // BoltDB file path
-    RemoveExisting bool   // Delete existing file before creating
-    ConfigPath     string // Optional: custom YAML config path
+    Path           string // DuckDB file path (e.g. migration.duckdb)
+    RemoveExisting bool   // If true, delete existing file before creating
+    ConfigPath     string // Optional: custom YAML config path; default is {Path}.yaml
+    RequireOpen    bool   // If true (API mode), DB instance must already be provided
 }
 ```
-
-**Note:** BoltDB uses a single file for the entire database, making cleanup straightforward.
 
 ---
 
@@ -385,17 +384,7 @@ if err != nil {
 
 ---
 
-## BoltDB Benefits for Migration
-
-1. **Atomic Resumption** - Bucket structure naturally represents current state
-2. **Race-Free Operations** - Single-writer guarantees consistent status transitions
-3. **Predictable Queries** - Counting and iteration are deterministic
-4. **Simple Cleanup** - Just delete the single database file
-5. **Crash Resilience** - ACID transactions guarantee consistency
-
----
-
-## Retry Sweeps
+## Retry sweeps
 
 Retry sweeps allow re-processing of failed or pending nodes to discover new or changed content. This is useful for:
 - Recovering from transient failures
@@ -405,7 +394,7 @@ Retry sweeps allow re-processing of failed or pending nodes to discover new or c
 ### How Retry Sweeps Work
 
 1. **Mark Nodes for Retry**: Change node status from `successful` to `pending` (or leave as `failed`)
-2. **Delete Subtree Data**: Remove all descendant nodes and their metadata from BoltDB
+2. **Delete subtree data**: Remove all descendant nodes and their metadata from the database (via `pkg/db` Writer)
 3. **Run Retry Sweep**: Execute migration in retry mode (`QueueModeRetry`)
 4. **Re-discover Content**: Queues re-traverse marked subtrees as if doing fresh traversal
 
@@ -430,16 +419,11 @@ Retry sweeps allow re-processing of failed or pending nodes to discover new or c
 To prevent node duplication and maintain consistency, DST cleanup happens **during SRC task completion**, not during pull:
 
 ```go
-// In completeTask() for SRC folder tasks in retry mode:
+// In completeTask() for SRC folder tasks in retry mode (database is *db.DB):
 if q.name == "src" && q.getMode() == QueueModeRetry && task.IsFolder() {
-    // Find corresponding DST node via join-lookup table
-    dstID, err := db.GetDstIDFromSrcID(boltDB, srcNodeID)
-    
-    // Mark DST parent as pending (via OutputBuffer)
+    dstID, err := db.GetDstIDFromSrcID(database, srcNodeID)
     outputBuffer.AddStatusUpdate("DST", dstDepth, oldStatus, db.StatusPending, dstID)
-    
-    // Delete all DST children (via OutputBuffer)
-    childIDs, err := db.GetChildrenIDsByParentID(boltDB, "DST", dstID)
+    childIDs, err := db.GetChildrenIDsByParentID(database, "DST", dstID)
     for _, childID := range childIDs {
         outputBuffer.AddNodeDeletion("DST", childID, childDepth, childStatus)
     }

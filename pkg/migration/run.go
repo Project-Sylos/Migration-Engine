@@ -17,8 +17,8 @@ import (
 
 // MigrationConfig is the configuration passed to RunMigration.
 type MigrationConfig struct {
-	DB              *db.DB   // DuckDB instance (optional if DBPath is set)
-	DBPath          string   // Path to open DuckDB when DB is nil
+	DB              *db.DB // DuckDB instance (required; manager-owned)
+	DBPath          string // Reserved for compatibility; ignored when DB is set
 	SrcAdapter      types.FSAdapter
 	DstAdapter      types.FSAdapter
 	SrcRoot         types.Folder
@@ -33,10 +33,7 @@ type MigrationConfig struct {
 	StartupDelay    time.Duration
 	ProgressTick    time.Duration
 	ResumeStatus    *MigrationStatus
-	ConfigPath      string
-	YAMLConfig      *MigrationConfigYAML
 	ShutdownContext context.Context
-	CloseWhenDone   bool // if true and we opened the DB, close it when RunMigration returns
 }
 
 // RuntimeStats captures execution statistics at the end of a migration run.
@@ -48,23 +45,9 @@ type RuntimeStats struct {
 
 // RunMigration executes the migration traversal using the provided configuration.
 func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
-	weOpenedDB := false
 	database := cfg.DB
 	if database == nil {
-		if cfg.DBPath == "" {
-			return RuntimeStats{}, fmt.Errorf("either DB or DBPath must be provided")
-		}
-		var err error
-		database, err = db.Open(db.Options{Path: cfg.DBPath})
-		if err != nil {
-			return RuntimeStats{}, fmt.Errorf("failed to open database: %w", err)
-		}
-		weOpenedDB = true
-	}
-	if weOpenedDB && cfg.CloseWhenDone {
-		defer func() {
-			_ = database.Close()
-		}()
+		return RuntimeStats{}, fmt.Errorf("migration DB is required")
 	}
 
 	if cfg.SrcAdapter == nil || cfg.DstAdapter == nil {
@@ -100,20 +83,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	// Create coordinator for round advancement gates
 	coordinator := queue.NewQueueCoordinator()
 
-	// Set up YAML update callback for automatic config updates on round advance
-	if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-		coordinator.SetYAMLUpdateCallback(func(srcRound, dstRound int) {
-			// Thread-safe YAML update in background goroutine
-			go func() {
-				status, err := InspectMigrationStatus(database)
-				if err == nil {
-					UpdateConfigFromStatus(cfg.YAMLConfig, status, srcRound, dstRound)
-					_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
-				}
-			}()
-		})
-	}
-
 	// Create queues
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
 	srcQueue.InitializeWithContext(database, cfg.SrcAdapter, cfg.ShutdownContext)
@@ -125,7 +94,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	// Note: Queues clean themselves up when they complete (Run() exits when state=QueueStateCompleted)
 	// We only need to explicitly close for forced shutdowns, which is handled via Pause() + shutdown context
 
-	// Initialize queues from YAML config state
+	// Initialize queues with resume state if available
 	if err := initializeQueues(cfg, srcQueue, dstQueue, coordinator); err != nil {
 		return RuntimeStats{}, err
 	}
@@ -158,67 +127,13 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			select {
 			case srcStats := <-srcStatsChan:
 				lastSrcStats = &srcStats
-				if lastDstStats != nil {
-					// Get round stats for full format
-					srcRoundStats := srcQueue.GetRoundStats(lastSrcStats.Round)
-					dstRoundStats := dstQueue.GetRoundStats(lastDstStats.Round)
-
-					srcExpected := 0
-					srcCompleted := 0
-					if srcRoundStats != nil {
-						srcExpected = srcRoundStats.Expected
-						srcCompleted = srcRoundStats.Completed
-					}
-
-					dstExpected := 0
-					dstCompleted := 0
-					if dstRoundStats != nil {
-						dstExpected = dstRoundStats.Expected
-						dstCompleted = dstRoundStats.Completed
-					}
-
-					fmt.Printf("\r  Src: Round %d (Expected:%d Completed:%d) | Dst: Round %d (Expected:%d Completed:%d)   ",
-						lastSrcStats.Round, srcExpected, srcCompleted,
-						lastDstStats.Round, dstExpected, dstCompleted)
-				}
+				printTraversalProgress(srcQueue, dstQueue, lastSrcStats, lastDstStats)
 			case dstStats := <-dstStatsChan:
 				lastDstStats = &dstStats
-				if lastSrcStats != nil {
-					// Get round stats for full format
-					srcRoundStats := srcQueue.GetRoundStats(lastSrcStats.Round)
-					dstRoundStats := dstQueue.GetRoundStats(lastDstStats.Round)
-
-					srcExpected := 0
-					srcCompleted := 0
-					if srcRoundStats != nil {
-						srcExpected = srcRoundStats.Expected
-						srcCompleted = srcRoundStats.Completed
-					}
-
-					dstExpected := 0
-					dstCompleted := 0
-					if dstRoundStats != nil {
-						dstExpected = dstRoundStats.Expected
-						dstCompleted = dstRoundStats.Completed
-					}
-
-					fmt.Printf("\r  Src: Round %d (Expected:%d Completed:%d) | Dst: Round %d (Expected:%d Completed:%d)   ",
-						lastSrcStats.Round, srcExpected, srcCompleted,
-						lastDstStats.Round, dstExpected, dstCompleted)
-				}
+				printTraversalProgress(srcQueue, dstQueue, lastSrcStats, lastDstStats)
 			}
 		}
 	}()
-
-	// Update config: Traversal started
-	if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-		status, statusErr := InspectMigrationStatus(database)
-		if statusErr == nil {
-			UpdateConfigFromStatus(cfg.YAMLConfig, status, coordinator.GetSrcRound(), coordinator.GetDstRound())
-			SetStatusTraversalInProgress(cfg.YAMLConfig)
-			_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
-		}
-	}
 
 	// Ensure ProgressTick is positive (default to 1 second if not set)
 	progressTick := cfg.ProgressTick
@@ -228,11 +143,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	progressTicker := time.NewTicker(progressTick)
 	defer progressTicker.Stop()
 	start := time.Now()
-
-	// Track last known rounds to detect actual advancement
-	lastSrcRound := -1
-	lastDstRound := -1
-	tickCount := 0
 
 	for {
 		// Check for force shutdown (context cancellation)
@@ -256,16 +166,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				case <-cleanupCtx.Done():
 					// Timeout - skip cleanup and exit immediately
 					fmt.Printf("⚠️  Cleanup timeout - exiting immediately to prevent hang\n")
-					srcRound := coordinator.GetSrcRound()
-					dstRound := coordinator.GetDstRound()
-					srcPending, dstPending := 0, 0
-					if database != nil {
-						c, _ := database.GetStatsCountAtDepth("SRC", srcRound, db.StatsKeyTraversalStatus(db.StatusPending))
-						srcPending = int(c)
-						c, _ = database.GetStatsCountAtDepth("DST", dstRound, db.StatsKeyTraversalStatus(db.StatusPending))
-						dstPending = int(c)
-					}
-					srcStats, dstStats := queue.QueueStats{Name: "src", Round: srcRound, Pending: srcPending}, queue.QueueStats{Name: "dst", Round: dstRound, Pending: dstPending}
+					srcStats, dstStats := snapshotTraversalQueueStats(database, coordinator)
 					return RuntimeStats{
 						Duration: time.Since(start),
 						Src:      srcStats,
@@ -274,40 +175,9 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				}
 
 				// Get stats directly (non-blocking)
-				srcRound := coordinator.GetSrcRound()
-				dstRound := coordinator.GetDstRound()
-				srcPending, dstPending := 0, 0
-				if database != nil {
-					c, _ := database.GetStatsCountAtDepth("SRC", srcRound, db.StatsKeyTraversalStatus(db.StatusPending))
-					srcPending = int(c)
-					c, _ = database.GetStatsCountAtDepth("DST", dstRound, db.StatsKeyTraversalStatus(db.StatusPending))
-					dstPending = int(c)
-				}
-				srcStats, dstStats := queue.QueueStats{Name: "src", Round: srcRound, Pending: srcPending}, queue.QueueStats{Name: "dst", Round: dstRound, Pending: dstPending}
+				srcStats, dstStats := snapshotTraversalQueueStats(database, coordinator)
 
 				// DuckDB doesn't need checkpointing - data is already persisted
-
-				// Update YAML config with suspended status and current state (with timeout)
-				if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-					yamlDone := make(chan error, 1)
-					go func() {
-						status, statusErr := InspectMigrationStatus(database)
-						if statusErr == nil {
-							SetSuspendedStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
-							yamlDone <- SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
-						} else {
-							yamlDone <- statusErr
-						}
-					}()
-					select {
-					case err := <-yamlDone:
-						if err != nil {
-							fmt.Printf("Warning: failed to save YAML config during shutdown: %v\n", err)
-						}
-					case <-cleanupCtx.Done():
-						fmt.Printf("⚠️  YAML save timeout - skipping config save\n")
-					}
-				}
 
 				return RuntimeStats{
 					Duration: time.Since(start),
@@ -324,235 +194,101 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		bothCompleted := coordinator.IsCompleted("both")
 
 		if bothCompleted {
-
-			// Get stats directly (non-blocking)
-			srcRound := coordinator.GetSrcRound()
-			dstRound := coordinator.GetDstRound()
-			srcPending, dstPending := 0, 0
-			if database != nil {
-				c, _ := database.GetStatsCountAtDepth("SRC", srcRound, db.StatsKeyTraversalStatus(db.StatusPending))
-				srcPending = int(c)
-				c, _ = database.GetStatsCountAtDepth("DST", dstRound, db.StatsKeyTraversalStatus(db.StatusPending))
-				dstPending = int(c)
-			}
-			srcStats, dstStats := queue.QueueStats{Name: "src", Round: srcRound, Pending: srcPending}, queue.QueueStats{Name: "dst", Round: dstRound, Pending: dstPending}
-
-			// Create node table indexes before declaring complete (avoids blocking DST while SRC builds indexes)
-			if database != nil {
-				fmt.Println("\nCreating indexes... this may take a bit.")
-				_ = logservice.LS.Log("info", "Creating indexes... this may take a bit.", "migration", "run", "run")
-				_ = db.EnsureNodeTableIndexes(database, "src_nodes")
-				_ = db.EnsureNodeTableIndexes(database, "dst_nodes")
-			}
-
-			fmt.Println("\nMigration complete!")
-
-			// Update config YAML with final state (fire-and-forget to avoid blocking)
-			if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-				// Fire-and-forget - don't block completion on config save
-				go func() {
-					// Use a context with timeout to prevent indefinite blocking
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer cancel()
-
-					done := make(chan error, 1)
-					go func() {
-						status, statusErr := InspectMigrationStatus(database)
-						if statusErr != nil {
-							fmt.Printf("ERROR: Failed to inspect migration status for YAML update: %v\n", statusErr)
-							if logservice.LS != nil {
-								_ = logservice.LS.Log("warning", fmt.Sprintf("InspectMigrationStatus error: %v", statusErr), "migration", "run", "run")
-							}
-							done <- statusErr
-							return
-						}
-						UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
-						done <- SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
-					}()
-
-					select {
-					case err := <-done:
-						if err != nil {
-							fmt.Printf("ERROR: Failed to save migration config YAML: %v\n", err)
-							if logservice.LS != nil {
-								_ = logservice.LS.Log("warning", fmt.Sprintf("Config save failed: %v", err), "migration", "run", "run")
-							}
-						}
-					case <-ctx.Done():
-						fmt.Printf("ERROR: Config save timeout (5s) - YAML status may not be updated from Traversal-In-Progress\n")
-						if logservice.LS != nil {
-							_ = logservice.LS.Log("warning", "Config save timeout (fire-and-forget)", "migration", "run", "run")
-						}
-					}
-				}()
-			}
-
-			// Stop progress ticker to prevent any more ticks
-			progressTicker.Stop()
-
-			// Close log service before returning (flush logs) - with timeout to prevent hanging
-			if logservice.LS != nil {
-				// Use a timeout context to prevent indefinite blocking
-				closeCtx, closeCancel := context.WithTimeout(context.Background(), 1*time.Second)
-				defer closeCancel()
-
-				closeDone := make(chan struct{}, 1)
-				go func() {
-					_ = logservice.LS.Close()
-					closeDone <- struct{}{}
-				}()
-
-				select {
-				case <-closeDone:
-				case <-closeCtx.Done():
-					// Timeout - log service close is taking too long, continue anyway
-					// (flushes should only take a few ms, so 1s timeout is generous)
-				}
-			}
-
-			return RuntimeStats{
-				Duration: time.Since(start),
-				Src:      srcStats,
-				Dst:      dstStats,
-			}, nil
+			return completeTraversalRun(database, coordinator, progressTicker, start), nil
 		}
 
 		select {
 		case <-progressTicker.C:
 			// Re-check exhaustion from coordinator (queues might have completed during tick)
 			if coordinator.IsCompleted("both") {
-
-				// Get stats directly (non-blocking)
-				srcRound := coordinator.GetSrcRound()
-				dstRound := coordinator.GetDstRound()
-				srcPending, dstPending := 0, 0
-				if database != nil {
-					c, _ := database.GetStatsCountAtDepth("SRC", srcRound, db.StatsKeyTraversalStatus(db.StatusPending))
-					srcPending = int(c)
-					c, _ = database.GetStatsCountAtDepth("DST", dstRound, db.StatsKeyTraversalStatus(db.StatusPending))
-					dstPending = int(c)
-				}
-				srcStats, dstStats := queue.QueueStats{Name: "src", Round: srcRound, Pending: srcPending}, queue.QueueStats{Name: "dst", Round: dstRound, Pending: dstPending}
-
-				// Create node table indexes before declaring complete
-				if database != nil {
-					fmt.Println("\nCreating indexes... this may take a bit.")
-					_ = logservice.LS.Log("info", "Creating indexes... this may take a bit.", "migration", "run", "run")
-					_ = db.EnsureNodeTableIndexes(database, "src_nodes")
-					_ = db.EnsureNodeTableIndexes(database, "dst_nodes")
-				}
-
-				fmt.Println("\nMigration complete!")
-
-				// Update config YAML with final state (fire-and-forget to avoid blocking)
-				if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-					// Fire-and-forget - don't block completion on config save
-					go func() {
-						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-						defer cancel()
-
-						done := make(chan error, 1)
-						go func() {
-							status, statusErr := InspectMigrationStatus(database)
-							if statusErr != nil {
-								fmt.Printf("ERROR: Failed to inspect migration status for YAML update (ticker path): %v\n", statusErr)
-								done <- statusErr
-								return
-							}
-							UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
-							done <- SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
-						}()
-
-						select {
-						case err := <-done:
-							if err != nil {
-								fmt.Printf("ERROR: Failed to save migration config YAML (ticker path): %v\n", err)
-							}
-						case <-ctx.Done():
-							fmt.Printf("ERROR: Config save timeout (5s) - YAML status may not be updated from Traversal-In-Progress (ticker path)\n")
-						}
-					}()
-				}
-
-				// Stop progress ticker to prevent any more ticks
-				progressTicker.Stop()
-
-				// Close log service before returning (flush logs) - with timeout to prevent hanging
-				if logservice.LS != nil {
-					// Use a timeout context to prevent indefinite blocking
-					closeCtx, closeCancel := context.WithTimeout(context.Background(), 1*time.Second)
-					defer closeCancel()
-
-					closeDone := make(chan struct{}, 1)
-					go func() {
-						_ = logservice.LS.Close()
-						closeDone <- struct{}{}
-					}()
-
-					select {
-					case <-closeDone:
-					case <-closeCtx.Done():
-						// Timeout - log service close is taking too long, continue anyway
-						// (flushes should only take a few ms, so 1s timeout is generous)
-					}
-				}
-
-				return RuntimeStats{
-					Duration: time.Since(start),
-					Src:      srcStats,
-					Dst:      dstStats,
-				}, nil
-			}
-
-			// Get stats directly (non-blocking queries) - only Round is used for milestone detection
-			srcRound := coordinator.GetSrcRound()
-			dstRound := coordinator.GetDstRound()
-			srcStats, dstStats := queue.QueueStats{Round: srcRound}, queue.QueueStats{Round: dstRound}
-
-			// Stats are printed via the channel listener goroutine, not here
-			// This section only updates config YAML
-
-			// Update config YAML when rounds actually advance (milestone detection)
-			roundAdvanced := false
-			if srcStats.Round != lastSrcRound || dstStats.Round != lastDstRound {
-				roundAdvanced = true
-				lastSrcRound = srcStats.Round
-				lastDstRound = dstStats.Round
-			}
-
-			tickCount++
-			// Update config on round advancement or periodically (every 10 ticks)
-			shouldUpdate := roundAdvanced || (tickCount%10 == 0)
-
-			if cfg.YAMLConfig != nil && cfg.ConfigPath != "" && shouldUpdate {
-				status, statusErr := InspectMigrationStatus(database)
-				if statusErr == nil {
-					UpdateConfigFromStatus(cfg.YAMLConfig, status, srcStats.Round, dstStats.Round)
-					// Save config (ignore errors to avoid disrupting migration)
-					_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
-				}
+				return completeTraversalRun(database, coordinator, progressTicker, start), nil
 			}
 
 		default:
-			// Debug: Log when taking default case
-			if bothCompleted {
-			}
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
 }
 
-// initializeQueues sets up src/dst queues from YAML config state.
-// Reads last_round_src/dst from config, sets queue rounds.
+func printTraversalProgress(srcQueue, dstQueue *queue.Queue, lastSrcStats, lastDstStats *queue.QueueStats) {
+	if lastSrcStats == nil || lastDstStats == nil {
+		return
+	}
+	srcRoundStats := srcQueue.GetRoundStats(lastSrcStats.Round)
+	dstRoundStats := dstQueue.GetRoundStats(lastDstStats.Round)
+	srcExpected, srcCompleted := 0, 0
+	if srcRoundStats != nil {
+		srcExpected = srcRoundStats.Expected
+		srcCompleted = srcRoundStats.Completed
+	}
+	dstExpected, dstCompleted := 0, 0
+	if dstRoundStats != nil {
+		dstExpected = dstRoundStats.Expected
+		dstCompleted = dstRoundStats.Completed
+	}
+	fmt.Printf("\r  Src: Round %d (Expected:%d Completed:%d) | Dst: Round %d (Expected:%d Completed:%d)   ",
+		lastSrcStats.Round, srcExpected, srcCompleted,
+		lastDstStats.Round, dstExpected, dstCompleted)
+}
+
+func snapshotTraversalQueueStats(database *db.DB, coordinator *queue.QueueCoordinator) (queue.QueueStats, queue.QueueStats) {
+	srcRound := coordinator.GetSrcRound()
+	dstRound := coordinator.GetDstRound()
+	srcPending := 0
+	dstPending := 0
+	c, _ := database.GetStatsCountAtDepth("SRC", srcRound, db.StatsKeyTraversalStatus(db.StatusPending))
+	srcPending = int(c)
+	c, _ = database.GetStatsCountAtDepth("DST", dstRound, db.StatsKeyTraversalStatus(db.StatusPending))
+	dstPending = int(c)
+	srcStats := queue.QueueStats{Name: "src", Round: srcRound, Pending: srcPending}
+	dstStats := queue.QueueStats{Name: "dst", Round: dstRound, Pending: dstPending}
+	return srcStats, dstStats
+}
+
+func completeTraversalRun(database *db.DB, coordinator *queue.QueueCoordinator, progressTicker *time.Ticker, start time.Time) RuntimeStats {
+	srcStats, dstStats := snapshotTraversalQueueStats(database, coordinator)
+	fmt.Println("\nCreating indexes... this may take a bit.")
+	_ = logservice.LS.Log("info", "Creating indexes... this may take a bit.", "migration", "run", "run")
+	_ = db.EnsureNodeTableIndexes(database, "src_nodes")
+	_ = db.EnsureNodeTableIndexes(database, "dst_nodes")
+	fmt.Println("\nMigration complete!")
+	progressTicker.Stop()
+	closeGlobalLoggerWithTimeout(1 * time.Second)
+	return RuntimeStats{
+		Duration: time.Since(start),
+		Src:      srcStats,
+		Dst:      dstStats,
+	}
+}
+
+func closeGlobalLoggerWithTimeout(timeout time.Duration) {
+	if logservice.LS == nil {
+		return
+	}
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), timeout)
+	defer closeCancel()
+	closeDone := make(chan struct{}, 1)
+	go func() {
+		_ = logservice.LS.Close()
+		closeDone <- struct{}{}
+	}()
+	select {
+	case <-closeDone:
+	case <-closeCtx.Done():
+	}
+}
+
+// initializeQueues sets up src/dst queues from runtime DB resume state.
 func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queue.Queue, coordinator *queue.QueueCoordinator) error {
-	// Parse state from YAML config
 	srcRound := 0
 	dstRound := 0
-	if cfg.YAMLConfig != nil && cfg.YAMLConfig.State.LastRoundSrc != nil {
-		srcRound = *cfg.YAMLConfig.State.LastRoundSrc
-	}
-	if cfg.YAMLConfig != nil && cfg.YAMLConfig.State.LastRoundDst != nil {
-		dstRound = *cfg.YAMLConfig.State.LastRoundDst
+	if cfg.ResumeStatus != nil {
+		if cfg.ResumeStatus.MinPendingDepthSrc != nil {
+			srcRound = *cfg.ResumeStatus.MinPendingDepthSrc
+		}
+		if cfg.ResumeStatus.MinPendingDepthDst != nil {
+			dstRound = *cfg.ResumeStatus.MinPendingDepthDst
+		}
 	}
 
 	// DuckDB is the primary database - no SQLite seeding needed
@@ -588,4 +324,3 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 
 	return nil
 }
-

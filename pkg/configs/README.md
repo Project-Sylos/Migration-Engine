@@ -7,11 +7,12 @@ The **configs** package provides utilities for loading and parsing JSON configur
 ## Overview
 
 The configs package defines structured types and loader functions for:
-- **Buffer Configuration** - Batch size and flush interval settings for buffered operations
-- **Log Service Configuration** - UDP logging address, port, and minimum log level
-- **Spectra Configuration** - Spectra filesystem simulator settings including root IDs and instance configuration
 
-All configuration files are expected to be located in the `pkg/configs/` directory by default, though loaders accept a config directory path parameter for flexibility.
+- **Buffer Configuration** – Batch size and flush interval for buffered appender and staging-table writes (see `pkg/db`)
+- **Log Service Configuration** – UDP logging address, port, and minimum log level
+- **Spectra Configuration** – Spectra filesystem simulator settings (root IDs, instance configuration)
+
+Configuration files are expected under a config directory (e.g. `pkg/configs/`); loaders accept a `configDir` path for flexibility.
 
 ---
 
@@ -19,7 +20,7 @@ All configuration files are expected to be located in the `pkg/configs/` directo
 
 ### BufferConfig
 
-Manages buffer settings for different tables/operations:
+Maps table names to batch size and flush interval for buffered writes (e.g. staging and node tables in `pkg/db`):
 
 ```go
 type BufferTableConfig struct {
@@ -37,12 +38,11 @@ if err != nil {
     return err
 }
 
-// Access buffer config for a specific table
-tableCfg := cfg["logs"] // Example: get config for "logs" table
+tableCfg := cfg["logs"] // e.g. config for "logs" table
 batchSize := tableCfg.BatchSize
 ```
 
-**Expected file:** `buffers.json` (not currently present in repository)
+**Expected file:** `buffers.json` (optional; not present in repository by default)
 
 ---
 
@@ -65,7 +65,6 @@ if err != nil {
     return err
 }
 
-// Use config to initialize log service
 logAddress := fmt.Sprintf("%s:%d", cfg.Address, cfg.Port)
 ```
 
@@ -103,13 +102,13 @@ if err != nil {
     return err
 }
 
-// Use config to initialize Spectra adapters
 srcAdapter := fsservices.NewSpectraFS(spectraInstance, cfg.SrcRootID, "primary")
 ```
 
 **Configuration file:** `spectra.json`
 
-**Expected structure:**
+The loader expects the Spectra section under a `"spectra"` key:
+
 ```json
 {
     "spectra": {
@@ -122,93 +121,70 @@ srcAdapter := fsservices.NewSpectraFS(spectraInstance, cfg.SrcRootID, "primary")
 }
 ```
 
-**Note:** The actual `spectra.json` file in the repository contains seed data and API configuration, which appears to be used by the Spectra simulator itself rather than the Migration Engine's config loader.
+The `spectra.json` in the repository may also contain seed and API configuration used by the Spectra simulator itself; the Migration Engine only reads the `spectra` block via `LoadSpectraConfig`.
 
 ---
 
 ## Loader Functions
 
-All loader functions follow a consistent pattern:
+All loaders follow the same pattern:
 
-### LoadBufferConfig
-
-```go
-func LoadBufferConfig(configDir string) (BufferConfig, error)
-```
-
-Loads buffer configuration from `{configDir}/buffers.json`.
-
-### LoadLogServiceConfig
-
-```go
-func LoadLogServiceConfig(configDir string) (LogServiceConfig, error)
-```
-
-Loads log service configuration from `{configDir}/log_service.json`.
-
-### LoadSpectraConfig
-
-```go
-func LoadSpectraConfig(configDir string) (SpectraConfig, error)
-```
-
-Loads Spectra configuration from `{configDir}/spectra.json`. The JSON file should wrap the Spectra config in a `"spectra"` key.
+| Function | File | Description |
+|----------|------|-------------|
+| `LoadBufferConfig(configDir string) (BufferConfig, error)` | `buffers.json` | Buffer batch and flush settings per table |
+| `LoadLogServiceConfig(configDir string) (LogServiceConfig, error)` | `log_service.json` | UDP log service |
+| `LoadSpectraConfig(configDir string) (SpectraConfig, error)` | `spectra.json` | Spectra FS (expects `"spectra"` wrapper) |
 
 ---
 
 ## Error Handling
 
-All loader functions return descriptive errors:
+Loaders return descriptive errors:
 
-- **File read errors**: Wrapped with context about which config file failed
-- **JSON parse errors**: Wrapped with context about parsing failure
-- **Missing files**: Returned as file read errors
+- **File read errors** – Wrapped with which config file failed
+- **JSON parse errors** – Wrapped with parse context
+- **Missing files** – Reported as file read errors
 
-**Example error handling:**
+Example:
+
 ```go
 cfg, err := configs.LoadLogServiceConfig("pkg/configs")
 if err != nil {
-    // Error message will be: "failed to read log service config: ..."
-    // or "failed to parse log service config: ..."
     return fmt.Errorf("configuration error: %w", err)
 }
 ```
 
 ---
 
-## File Locations
+## File Layout
 
-By convention, configuration files are stored in `pkg/configs/`:
+By convention, config files live under `pkg/configs/`:
 
 ```
 pkg/configs/
 ├── config.go           # Loader functions and type definitions
 ├── log_service.json    # Log service UDP configuration
-└── spectra.json        # Spectra simulator configuration
+└── spectra.json        # Spectra simulator (and optional "spectra" block for engine)
 ```
 
-The `configDir` parameter allows loading configs from alternative locations for testing or deployment scenarios.
+`buffers.json` is optional; when absent, `LoadBufferConfig` will fail unless the caller uses a different config dir or provides the file.
 
 ---
 
 ## Integration with Migration Engine
 
-The configs package is used by:
+This package is used by:
 
-1. **Log Service** - Loads `log_service.json` to configure UDP logging
-2. **Filesystem Services** - Loads `spectra.json` to configure Spectra adapters
-3. **Future Buffer Operations** - Will use `buffers.json` for buffered write configurations
+1. **Spectra / migration setup** – `LoadSpectraConfig` for Spectra adapters and root IDs (e.g. in `pkg/migration` config YAML loading)
+2. **Log service** – `LoadLogServiceConfig` for UDP log address and level
+3. **Buffered writes** – `LoadBufferConfig` (when `buffers.json` is present) to configure batch size and flush interval for staging and node buffers in `pkg/db`
 
 ---
 
 ## Summary
 
-The configs package provides:
-- ✅ **Centralized Configuration** - Single location for all JSON config loaders
-- ✅ **Type Safety** - Structured Go types for all configurations
-- ✅ **Error Handling** - Descriptive errors for debugging
-- ✅ **Flexibility** - Configurable directory paths
-- ✅ **Consistency** - Uniform loader function patterns
-
-This package simplifies configuration management across the Migration Engine by providing a consistent interface for loading and parsing JSON configuration files.
-
+- **Centralized config** – Single place for JSON config loaders
+- **Type-safe** – Structured types for each config
+- **Clear errors** – Context on read/parse failures
+- **Configurable paths** – `configDir` for tests and deployment
+- **Consistent API** – Same loader pattern for all configs

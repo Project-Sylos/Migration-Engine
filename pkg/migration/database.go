@@ -16,8 +16,6 @@ type DatabaseConfig struct {
 	Path string
 	// RemoveExisting deletes the database file if it already exists before creating a new database.
 	RemoveExisting bool
-	// ConfigPath is the path to the migration config YAML file. If empty, defaults to {Path}.yaml
-	ConfigPath string
 	// RequireOpen determines whether the DB instance must already be open (true) or can be auto-opened (false).
 	// When true (API mode): DB instance must be provided and already open, error if nil/closed.
 	// When false (standalone mode): Can auto-open DB if instance is nil or not open.

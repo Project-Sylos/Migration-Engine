@@ -138,7 +138,14 @@ func SetupCopyTest(cleanSpectraDB bool, removeMigrationDB bool) (*db.DB, types.F
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	return cfg.DatabaseInstance, cfg.Source.Adapter, cfg.Destination.Adapter, nil
+	database, _, err := migration.SetupDatabase(migration.DatabaseConfig{
+		Path:           cfg.Database.Path,
+		RemoveExisting: false,
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return database, cfg.Source.Adapter, cfg.Destination.Adapter, nil
 }
 
 // SetupCopyTestConfig returns a full migration.Config for the copy test (Spectra roots, DB at copy/shared/main_test.db).
@@ -176,17 +183,7 @@ func SetupCopyTestConfig(cleanSpectraDB bool, removeMigrationDB bool) (migration
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to resolve DB path: %w", err)
 	}
-	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           dbPath,
-		RemoveExisting: removeMigrationDB,
-	})
-	if err != nil {
-		return migration.Config{}, fmt.Errorf("failed to open database: %w", err)
-	}
-
 	cfg := migration.Config{
-		DatabaseInstance: dbInstance,
-		Runtime:          migration.ModeStandalone,
 		Database: migration.DatabaseConfig{
 			Path:           dbPath,
 			RemoveExisting: removeMigrationDB,
@@ -211,7 +208,6 @@ func SetupCopyTestConfig(cleanSpectraDB bool, removeMigrationDB bool) (migration
 	}
 
 	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {
-		_ = dbInstance.Close()
 		return migration.Config{}, err
 	}
 

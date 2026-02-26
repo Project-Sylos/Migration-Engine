@@ -80,7 +80,7 @@ func runTest() error {
 		return fmt.Errorf("traversal setup failed: %w", err)
 	}
 
-	// Run traversal phase (LetsMigrate runs traversal and closes DB in ModeStandalone)
+	// Run traversal phase (LetsMigrate runs traversal using manager-owned DB lifecycle)
 	result, err := migration.LetsMigrate(cfg)
 	if err != nil {
 		return fmt.Errorf("traversal failed: %w", err)
@@ -89,7 +89,7 @@ func runTest() error {
 	fmt.Println()
 
 	// Phase 2: Run copy phase
-	// Reopen database (LetsMigrate closed it in ModeStandalone mode)
+	// Reopen database for explicit copy-phase call.
 	fmt.Println("🚀 Phase 3: Copy Phase")
 	fmt.Println("======================")
 	database, srcAdapter, dstAdapter, err := shared.SetupLocalCopyTest(srcPath, dstPath, false) // Don't remove existing DB
@@ -182,17 +182,7 @@ func setupTraversalConfig(srcPath, dstPath string) (migration.Config, error) {
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to resolve DB path: %w", err)
 	}
-	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           dbPath,
-		RemoveExisting: true, // Clean DB for fresh traversal
-	})
-	if err != nil {
-		return migration.Config{}, fmt.Errorf("failed to open database: %w", err)
-	}
-
 	cfg := migration.Config{
-		DatabaseInstance: dbInstance,
-		Runtime:          migration.ModeStandalone, // Will close DB after traversal
 		Database: migration.DatabaseConfig{
 			Path:           dbPath,
 			RemoveExisting: true,

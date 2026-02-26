@@ -29,11 +29,9 @@ type SweepConfig struct {
 	ProgressTick    time.Duration
 	ShutdownContext context.Context
 	// For retry sweeps only
-	MaxKnownDepth          int                  // Maximum known depth from previous traversal (-1 to auto-detect)
-	SkipAutoETLBeforeRetry bool                 // If true, skip automatic ETL from DuckDB to BoltDB before retry sweep
-	DuckDBPath             string               // Optional: Path to DuckDB file (auto-derived from BoltDB path if empty and ETL is enabled)
-	YAMLConfig             *MigrationConfigYAML // Optional: YAML config for status updates
-	ConfigPath             string               // Optional: Path to YAML config file for status updates
+	MaxKnownDepth          int    // Maximum known depth from previous traversal (-1 to auto-detect)
+	SkipAutoETLBeforeRetry bool   // If true, skip automatic ETL from DuckDB to BoltDB before retry sweep
+	DuckDBPath             string // Optional: Path to DuckDB file (auto-derived from BoltDB path if empty and ETL is enabled)
 }
 
 // RunRetrySweep runs a retry sweep to re-process failed or pending tasks from a previous traversal.
@@ -95,12 +93,6 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 		if maxKnownDepth < 0 {
 			maxKnownDepth = 0 // Default to 0 if no levels found
 		}
-	}
-
-	// DuckDB-only: no ETL before retry; set status to Filters-Set (ready for retry) when YAML is provided.
-	if cfg.YAMLConfig != nil && cfg.ConfigPath != "" {
-		SetStatusFiltersSet(cfg.YAMLConfig, true, maxKnownDepth)
-		_ = SaveMigrationConfig(cfg.ConfigPath, cfg.YAMLConfig)
 	}
 
 	// Create queues in retry mode

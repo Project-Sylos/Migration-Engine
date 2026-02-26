@@ -22,8 +22,8 @@ Each traversal operation is isolated into discrete, non-recursive **tasks** so t
    This keeps each task stateless and lightweight.
 
 3. **Record Results**
-   Children that pass filtering are batched through per-queue buffers and flushed to BoltDB before the next leasing pass.
-   This guarantees deterministic visibility without keeping additional in-memory round queues.
+   Children that pass filtering are written through the database’s buffered staging and node APIs. The queue flushes these buffers before the next task pull so that completed work is visible and not re-leased.
+   Task state lives in the database; the queue pulls by depth and status (keyset queries) and writes via the same database instance.
 
 ---
 
@@ -31,7 +31,7 @@ Each traversal operation is isolated into discrete, non-recursive **tasks** so t
 
 Depth-First Search (DFS) is memory-efficient, but it's less suited to managing two trees in parallel.
 BFS, while it requires storing all nodes at the current level, provides better control, checkpointing, and fault recovery.
-The Migration Engine (ME) serializes traversal data to BoltDB after each round, keeping memory use bounded while preserving full traversal context.
+The Migration Engine serializes traversal data to the database after each round (via buffered staging and node tables), keeping memory use bounded while preserving full traversal context.
 
 ### Two Possible Strategies
 
@@ -53,7 +53,7 @@ The Migration Engine (ME) serializes traversal data to BoltDB after each round, 
 * When the destination processes its corresponding level, it compares existing nodes against the expected list from the source.
 * Extra items in the destination are logged but not traversed further.
 * The destination can run as fast as possible while staying coordinated with the source.
-* Because each round is batched and stored in BoltDB, the system can resume exactly where it left off after a crash.
+* Because each round is batched and stored in the database (node tables, staging, and stats), the system can resume exactly where it left off after a crash.
 * This maximizes both safety and throughput.
 
 ---
@@ -75,13 +75,13 @@ The Migration Engine includes a comprehensive YAML-based configuration system th
 
 ### Automatic State Tracking
 
-Migration state is automatically persisted to a YAML config file (default: `{database_path}.yaml`) at key points:
+Migration state is automatically persisted to a YAML config file. The path defaults to `{database_path}.yaml` (e.g. `migration.duckdb.yaml`) and can be overridden via `DatabaseConfig.ConfigPath`. State is saved at:
 
-- **Root Selection** - When source and destination roots are set
-- **Roots Seeded** - After root tasks are seeded into BoltDB
-- **Traversal Started** - When queues are initialized and ready
-- **Round Advancement** - When source or destination rounds advance during traversal
-- **Traversal Complete** - When migration finishes
+- **Root selection** – When source and destination roots are set
+- **Roots seeded** – After root tasks are seeded into the database
+- **Traversal started** – When queues are initialized and ready
+- **Round advancement** – When source or destination rounds advance during traversal
+- **Traversal complete** – When migration finishes
 
 ### Serialization and Deserialization
 
@@ -120,150 +120,68 @@ See `pkg/migration/README.md` for detailed documentation on the configuration sy
 
 ---
 
-## Storage Architecture: BoltDB
+## Database architecture
 
-The Migration Engine uses **BoltDB** as its operational database for storing traversal state, node metadata, and logs.
+The Migration Engine uses a **single database file** (DuckDB) for all operational state: traversal and copy node data, staging updates, per-depth stats, logs, and queue metrics. The implementation lives in `pkg/db`; the queue and migration packages use the same `*db.DB` instance.
 
-### Why BoltDB?
+### Tables and roles
 
-BoltDB was chosen for its simplicity, reliability, and perfect fit with the BFS traversal model:
+- **Node tables** (`src_nodes`, `dst_nodes`) – One row per node (path, depth, `traversal_status`, `copy_status`, etc.). Workers pull tasks via keyset queries by depth and status; completion writes go through **staging** first, then are merged into these tables at **seal** (end of each round).
+- **Staging tables** (`src_staging`, `dst_staging`) – Pending status updates (traversal and copy). The queue and copy workers call `AddToStaging` / `AddCopyToStaging`; the DB batches these and flushes them via the DuckDB Appender. At round seal, staging is merged into the node tables and staging is cleared.
+- **Stats tables** (`src_stats`, `dst_stats`) – Per-depth counts by status (e.g. traversal/pending, traversal/successful). Recomputed at seal; used for completion detection and progress.
+- **Other** – `stats` (global key/count), `logs` (log buffer from `pkg/logservice`), `queue_stats` (observer metrics), `task_errors`.
 
-1. **Single-Writer Model** - Guarantees consistent reads immediately after writes; eliminates race conditions
-2. **Bucket Hierarchies** - Natural support for organizing data by structure (SRC/DST, levels, status)
-3. **Atomic Consistency** - Single B-tree ensures all-or-nothing transaction semantics
-4. **Simple Transactions** - Clean, predictable transaction model
-5. **Embedded** - No external dependencies or services required
-6. **Crash Resilience** - ACID transactions with automatic recovery
+Traversal and copy status are columns on the node rows (and in staging); there are no separate “status buckets.” SRC/DST correlation is by path (and join by path/parent_path in queries like `ListDstBatchWithSrcChildren`). Node IDs are deterministic (e.g. from `db.DeterministicNodeID`) for stable keys and deduplication.
 
-### Bucket Structure
+### Write path
 
-The database is partitioned into two main areas:
+1. **During a round**: Queue and workers call `database.AddToStaging`, `database.AddCopyToStaging`, `database.AddNode`, `database.AddNodes` (and `AddNodeDeletions` in retry). The DB buffers these and flushes in batches (DuckDB Appender) so that high throughput does not block the hot path.
+2. **Before pulls**: The queue calls `database.FlushTablesForQueue(queueType)` so pending writes are visible and tasks are not re-leased.
+3. **At seal**: The migration layer runs a transaction that merges staging into the live node tables, recomputes stats for the sealed depth, and clears staging. Round then advances; next pull uses the updated tables.
 
-**Traversal-Data** (all traversal-related data, level-sharded):
+All reads and writes use a **single connection** to the database so that appender-written rows are visible to the next query without a separate ETL step.
 
-All node data, children, and join lookups for a given BFS level live under `levels/<level>/`. There are no top-level global `nodes`, `children`, or join buckets.
+See **`pkg/db/README.md`** for schema, buffer behavior, and transaction APIs.
 
-```
-/Traversal-Data
-  /SRC
-    /levels
-      /00000000
-        /nodes              → ULID: NodeState JSON (canonical data)
-        /children           → parentULID: []childULID JSON (tree relationships)
-        /src-to-dst         → srcULID: dstULID (join lookup for this level)
-        /traversal
-          /pending          → ULID: empty (membership set)
-          /successful       → ULID: empty
-          /failed           → ULID: empty
-          /excluded         → ULID: empty
-          /status-lookup    → ULID: status string (reverse index)
-        /copy
-          /folder|file      → /pending, /successful, /skipped, /failed, /status-lookup
-      /00000001/...
-    /exclusion-holding      → path-hash: depth (exclusion hold)
-    /unexclusion-holding    → path-hash: depth (unexclusion hold)
-  /DST
-    /levels
-      /00000000
-        /nodes              → ULID: NodeState JSON
-        /children           → parentULID: []childULID JSON
-        /dst-to-src         → dstULID: srcULID (join lookup for this level)
-        /traversal
-          /pending
-          /successful
-          /failed
-          /not_on_src       → ULID: empty (DST-specific)
-          /excluded
-          /status-lookup
-      /00000001/...
-    /exclusion-holding
-    /unexclusion-holding
-  /STATS
-    (key: bucketPath string) → int64 (bucket count; e.g. "SRC/levels/00000001/nodes")
-    /queue-stats             → queueKey: QueueObserverMetrics JSON (queue metrics)
-```
+---
 
-**LOGS** (separate island, count-sharded):
+## Lifecycle and database ownership
 
-Logs are sharded by entry count (e.g. 1M entries per shard). Each shard holds full log entries and level-index buckets.
+- **Who opens the database**: You can pass an already-open `*db.DB` in `migration.Config.DatabaseInstance`, or leave it nil and set `migration.Config.Database.Path` so the engine calls `db.Open` when it runs.
+- **Who closes it**: If the engine opened the DB (instance was nil), it will close it on exit only when `Config.CloseWhenDone` is true (e.g. standalone/CLI). When you pass `DatabaseInstance` and use the engine as a library, typically `CloseWhenDone` is false so the API keeps the connection after the migration returns. Use `MigrationController.GetDB()` to keep using the same DB after `Wait()`.
+- **Checkpointing**: The engine checkpoints the database at root seeding and when advancing rounds (and on shutdown when using the controller). Checkpoint is serialized inside `pkg/db` so only one connection is used.
+- **Config YAML**: State is saved to a YAML file (default `{Database.Path}.yaml`) at the milestones listed above. Resume by loading that YAML and running again with the same (or a new) database path or instance; the engine inspects the DB and YAML to decide whether to start fresh or resume.
 
-```
-/LOGS
-  /_meta                    → current_shard, current_count (for resume)
-  /000000                   → shard 0
-    /logs                   → uuid: LogEntry JSON (full entries)
-    /trace                  → uuid: empty (membership by level)
-    /debug
-    /info
-    /warning
-    /error
-    /critical
-    /stats                  → count (entries in this shard)
-  /000001/...               → shard 1, ...
-```
+See **`pkg/migration/README.md`** for `LetsMigrate`, `StartMigration`, `SetupDatabase`, and config loading.
 
-This partitioning separates traversal operations (discovery/scanning phase) from future copy operations, allowing the copy phase to have its own data structure under a separate root bucket.
+---
 
-### Key Design Principles
+## Package overview
 
-1. **Separation of Concerns**
-   - All data for a given BFS level lives under **level shards**: `Traversal-Data/{SRC|DST}/levels/<level>/`
-   - Node data lives in `levels/<level>/nodes` (single source of truth per level)
-   - **Traversal status** membership in `levels/<level>/traversal/{status}` (SRC and DST)
-   - **Copy status** membership in `levels/<level>/copy/{type}/{status}` (SRC only)
-   - Status-lookup indexes in `levels/<level>/traversal/status-lookup` and `levels/<level>/copy/status-lookup` provide reverse lookup (ULID → status)
-   - Tree relationships in `levels/<level>/children`; join lookups in `levels/<level>/src-to-dst` (SRC) and `levels/<level>/dst-to-src` (DST)
-   - Join tables enable efficient correlation without embedding references in node data
-
-   **Traversal Status** (SRC and DST):
-   - Answers: "Can I descend?", "Should I enqueue children?", "Did listing fail?", "Was this excluded?"
-   - Used by: traversal engine, retry/exclusion logic, UI tree expansion
-   - Statuses: `pending`, `successful`, `failed`, `excluded` (DST also has `not_on_src`)
-
-   **Copy Status** (SRC only):
-   - Answers: "Will data move?", "Is this already satisfied?", "Did copy fail?", "Was it skipped?"
-   - Used by: copy phase queueing, progress bars, audit & reporting, UI action-plan view
-   - Statuses: `pending`, `successful`, `skipped`, `failed`
-
-2. **Status Transitions are Atomic**
-   Status transitions update multiple buckets atomically:
-   ```go
-   // Traversal status transition (within levels/<level>/):
-   // 1. Update NodeState in nodes bucket
-   // 2. Remove from old traversal status bucket
-   // 3. Add to new traversal status bucket
-   // 4. Update traversal status-lookup index
-   
-   // Copy status transition (SRC only, within levels/<level>/):
-   // 1. Update NodeState in nodes bucket
-   // 2. Remove from old copy status bucket
-   // 3. Add to new copy status bucket
-   // 4. Update copy status-lookup index
-   ```
-
-3. **Status-Lookup Indexes**
-   - Within each level shard, `traversal/status-lookup` and `copy/status-lookup` map `ULID → status string`
-   - Provides O(1) lookup to find which status bucket a node belongs to
-   - Automatically maintained on every insert and status update
-   - Enables efficient queries without scanning all status buckets
-
-4. **ULID-Based Keys and Lookup Tables**
-   - All internal operations use ULID (Universally Unique Lexicographically Sortable Identifier) for keys
-   - ULIDs provide unique, sortable identifiers without path dependencies
-   - **Bidirectional join-lookup tables** (`src-to-dst` and `dst-to-src` under each `levels/<level>/`) map corresponding SRC ↔ DST node ULIDs per level
-     - Join tables are populated when DST children are discovered and matched to SRC children (by Type + Name)
-     - This architecture replaces the legacy `SrcID` field that was previously embedded in DST NodeState
-     - Enables efficient lookups: given a SRC ULID and level, find the corresponding DST ULID (and vice versa)
-   - Matching between SRC and DST nodes is done by Type + Name, not path
-   - Hierarchy is natural and navigable through parent-child ULID relationships
-
-See `pkg/db/README.md` for detailed documentation on the database layer.
+| Package       | Role |
+|---------------|------|
+| **pkg/db**    | Database layer: open/close, schema (node/staging/stats/logs tables), buffered writes (Appender + staging), merge at seal, read queries. Single DuckDB file and connection. |
+| **pkg/queue** | Queue layer: BFS rounds, task pull (keyset by depth/status), completion writes via db buffers, coordinator, observer. Uses `*db.DB` only. |
+| **pkg/migration** | Orchestration: open or accept DB, YAML config, root seeding, run traversal/copy via queue, verification. Owns lifecycle (who opens/closes) when used as entrypoint. |
+| **pkg/configs**   | JSON config loaders: buffer config, log service (UDP), Spectra. |
+| **pkg/logservice** | Dual-channel logging: UDP (level-filtered) and persistence to the main DB’s `logs` table via `db.LogBuffer`. |
 
 ---
 
 ## Documentation
 
-### Testing Guides
+### Package READMEs
+
+- **[docs/ENGINE_ARCHITECTURE_OVERVIEW.md](./docs/ENGINE_ARCHITECTURE_OVERVIEW.md)** - Engine-centric lifecycle architecture and ownership model.
+- **[docs/API_USAGE_GUIDE.md](./docs/API_USAGE_GUIDE.md)** - API integration flow: create migration, add roots, traversal, review, copy, logs.
+- **[docs/ENGINE_API_CUTOVER.md](./docs/ENGINE_API_CUTOVER.md)** - API cutover contract from legacy corebridge paths.
+- **[pkg/db/README.md](./pkg/db/README.md)** – Database layer: schema, buffers, appender, Writer, queries.
+- **[pkg/queue/README.md](./pkg/queue/README.md)** – Queue layer: pull/write flow, modes, coordinator, observer.
+- **[pkg/migration/README.md](./pkg/migration/README.md)** – Migration orchestration, config YAML, lifecycle, verification.
+- **[pkg/configs/README.md](./pkg/configs/README.md)** – JSON config loaders (buffer, log service, Spectra).
+- **[pkg/logservice/README.md](./pkg/logservice/README.md)** – UDP and DB logging.
+
+### Testing guides
 
 - **[Ephemeral Mode Guide](./docs/EPHEMERAL_MODE_GUIDE.md)** - Complete integration guide for using Spectra's ephemeral mode for testing migrations without database persistence. Includes configuration examples, performance expectations, and troubleshooting.
 
@@ -271,7 +189,7 @@ See `pkg/db/README.md` for detailed documentation on the database layer.
 
 ### Testing
 
-The Migration Engine includes comprehensive test suites:
+The Migration Engine includes test suites:
 
 - **Traversal Tests**: `pkg/tests/traversal/`
   - `normal/` - Standard persistent mode tests

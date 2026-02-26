@@ -25,9 +25,9 @@ func DefaultOptions() Options {
 
 // DB is the DuckDB-backed database handle. Single physical connection for all DB operations (schema, appender writes, pulls, merge, checkpoint).
 type DB struct {
-	path        string
-	conn        *sql.DB    // single connection for all operations
-	writeMu     sync.Mutex // one global mutex for all DB writes
+	path         string
+	conn         *sql.DB    // single connection for all operations
+	writeMu      sync.Mutex // one global mutex for all DB writes
 	checkpointMu sync.Mutex // serializes CHECKPOINT; only one connection runs it since it's a global DB op
 
 	// Table-scoped buffers (DB-owned, not queue-owned)
@@ -93,6 +93,7 @@ func schemaDDLs() []string {
 		logsTableDDL(),
 		queueStatsTableDDL(),
 		taskErrorsTableDDL(),
+		migrationsTableDDL(),
 	}
 }
 
