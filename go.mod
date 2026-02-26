@@ -3,8 +3,8 @@ module codeberg.org/Sylos/Migration-Engine
 go 1.25.6
 
 require (
-	codeberg.org/Sylos/Spectra v0.2.56
-	codeberg.org/Sylos/Sylos-FS v0.1.2
+	codeberg.org/Sylos/Spectra v0.2.6
+	codeberg.org/Sylos/Sylos-FS v0.1.4
 	github.com/marcboeker/go-duckdb v1.7.0
 )
 
@@ -25,7 +25,3 @@ require (
 	golang.org/x/tools v0.14.0 // indirect
 	golang.org/x/xerrors v0.0.0-20220907171357-04be3eba64a2 // indirect
 )
-
-replace codeberg.org/Sylos/Spectra => ../Spectra
-
-replace codeberg.org/Sylos/Sylos-FS => ../Sylos-FS
