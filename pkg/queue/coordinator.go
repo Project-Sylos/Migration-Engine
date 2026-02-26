@@ -30,54 +30,54 @@ func NewQueueCoordinator() *QueueCoordinator {
 	}
 }
 
-// UpdateSrcRound updates SRC's current round.
-func (c *QueueCoordinator) UpdateSrcRound(round int) {
+// UpdateRound updates the current round for SRC or DST.
+func (c *QueueCoordinator) UpdateRound(which string, round int) {
 	c.mu.Lock()
-	c.srcRound = round
-	c.mu.Unlock()
-}
-
-// UpdateDstRound updates DST's current round.
-func (c *QueueCoordinator) UpdateDstRound(round int) {
-	c.mu.Lock()
-	c.dstRound = round
-	c.mu.Unlock()
-}
-
-// GetSrcRound returns SRC's current round.
-func (c *QueueCoordinator) GetSrcRound() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.srcRound
-}
-
-// GetDstRound returns DST's current round.
-func (c *QueueCoordinator) GetDstRound() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.dstRound
-}
-
-// MarkSrcCompleted marks SRC as completed.
-func (c *QueueCoordinator) MarkSrcCompleted() {
-	c.mu.Lock()
-	c.srcDone = true
-	c.mu.Unlock()
-	if logservice.LS != nil {
-		_ = logservice.LS.Log("debug",
-			"Coordinator: SRC marked as completed",
-			"coordinator", "mark", "coordinator")
+	defer c.mu.Unlock()
+	switch which {
+	case "src":
+		c.srcRound = round
+	case "dst":
+		c.dstRound = round
 	}
 }
 
-// MarkDstCompleted marks DST as completed.
-func (c *QueueCoordinator) MarkDstCompleted() {
+// GetRound returns the current round for SRC or DST.
+func (c *QueueCoordinator) GetRound(which string) int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	switch which {
+	case "src":
+		return c.srcRound
+	case "dst":
+		return c.dstRound
+	default:
+		return -1
+	}
+}
+
+// MarkCompleted marks SRC or DST as completed based on the argument ("src" or "dst").
+func (c *QueueCoordinator) MarkCompleted(which string) {
 	c.mu.Lock()
-	c.dstDone = true
+	switch which {
+	case "src":
+		c.srcDone = true
+	case "dst":
+		c.dstDone = true
+	}
 	c.mu.Unlock()
 	if logservice.LS != nil {
+		var whichMsg string
+		switch which {
+		case "src":
+			whichMsg = "SRC"
+		case "dst":
+			whichMsg = "DST"
+		default:
+			whichMsg = which
+		}
 		_ = logservice.LS.Log("debug",
-			"Coordinator: DST marked as completed",
+			"Coordinator: "+whichMsg+" marked as completed",
 			"coordinator", "mark", "coordinator")
 	}
 }

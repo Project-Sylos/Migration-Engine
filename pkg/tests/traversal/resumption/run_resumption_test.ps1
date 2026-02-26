@@ -106,21 +106,6 @@ Write-Host "Phase 1 Duration: $($phase1Duration.TotalSeconds) seconds" -Foregrou
 Write-Host ""
 
 # Verify shutdown state was saved
-if (Test-Path "pkg/tests/traversal/shared/main_test.yaml") {
-    Write-Host "YAML config file exists (suspended state saved)" -ForegroundColor Green
-    
-    # Read YAML to check status
-    $yamlContent = Get-Content "pkg/tests/traversal/shared/main_test.yaml" -Raw
-    if ($yamlContent -match 'state:\s*\r?\n\s*status\s*:\s*(suspended|running)') {
-        Write-Host "Migration state indicates suspension or ready to resume" -ForegroundColor Green
-    } else {
-        Write-Host "Warning: YAML status not found or unexpected" -ForegroundColor Yellow
-    }
-} else {
-    Write-Host "YAML config file not found - shutdown may not have saved state!" -ForegroundColor Red
-    exit 1
-}
-
 if (Test-Path "pkg/tests/traversal/shared/main_test.db") {
     Write-Host "Database file exists (checkpoint saved)" -ForegroundColor Green
 } else {
@@ -155,16 +140,6 @@ Write-Host ""
 
 if ($exitCode -eq 0) {
     Write-Host "TEST PASSED - Migration successfully resumed and completed!" -ForegroundColor Green
-    
-    # Verify final state
-    if (Test-Path "pkg/tests/traversal/shared/main_test.yaml") {
-        $finalYaml = Get-Content "pkg/tests/traversal/shared/main_test.yaml" -Raw
-        if ($finalYaml -match 'status:\s*completed') {
-            Write-Host "Final YAML status is 'completed'" -ForegroundColor Green
-        } else {
-            Write-Host "Warning: Final status may not be 'completed'" -ForegroundColor Yellow
-        }
-    }
     
     # Clean up test databases after successful test completion
     Write-Host ""

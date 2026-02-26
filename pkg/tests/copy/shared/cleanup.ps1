@@ -1,4 +1,4 @@
-# Removes main_test artifacts from this shared folder (main_test.db, main_test.db.wal, main_test.yaml).
+# Removes main_test artifacts from this shared folder (main_test.db, main_test.db.wal).
 # Run from repo root: & ".\pkg\tests\copy\shared\cleanup.ps1"
 
 $ErrorActionPreference = "SilentlyContinue"
@@ -8,5 +8,4 @@ if (-not $dir) { $dir = Split-Path -Parent $MyInvocation.MyCommand.Path }
 Write-Host "Cleaning up test databases..." -ForegroundColor Yellow
 Remove-Item -Path "$dir\main_test.db" -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "$dir\main_test.db.wal" -Force -ErrorAction SilentlyContinue
-Remove-Item -Path "$dir\main_test.yaml" -Force -ErrorAction SilentlyContinue
 Write-Host "Cleanup complete" -ForegroundColor Green

@@ -232,8 +232,8 @@ func printTraversalProgress(srcQueue, dstQueue *queue.Queue, lastSrcStats, lastD
 }
 
 func snapshotTraversalQueueStats(database *db.DB, coordinator *queue.QueueCoordinator) (queue.QueueStats, queue.QueueStats) {
-	srcRound := coordinator.GetSrcRound()
-	dstRound := coordinator.GetDstRound()
+	srcRound := coordinator.GetRound("src")
+	dstRound := coordinator.GetRound("dst")
 	srcPending := 0
 	dstPending := 0
 	c, _ := database.GetStatsCountAtDepth("SRC", srcRound, db.StatsKeyTraversalStatus(db.StatusPending))
@@ -303,11 +303,11 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 
 	// Update coordinator state
 	if coordinator != nil {
-		coordinator.UpdateSrcRound(srcRound)
+		coordinator.UpdateRound("src", srcRound)
 		if dstRound >= 0 {
-			coordinator.UpdateDstRound(dstRound)
+			coordinator.UpdateRound("dst", dstRound)
 		} else {
-			coordinator.MarkDstCompleted()
+			coordinator.MarkCompleted("dst")
 		}
 	}
 

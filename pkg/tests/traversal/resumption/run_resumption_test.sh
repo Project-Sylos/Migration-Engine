@@ -64,20 +64,6 @@ echo "Phase 1 Duration: ${phase1Duration} seconds"
 echo ""
 
 # Verify shutdown state was saved
-if [ -f "pkg/tests/traversal/shared/main_test.yaml" ]; then
-    echo "YAML config file exists (suspended state saved)"
-    
-    # Read YAML to check status
-    if grep -qE 'state:\s*\n\s*status\s*:\s*(suspended|running)' "pkg/tests/traversal/shared/main_test.yaml" 2>/dev/null; then
-        echo "Migration state indicates suspension or ready to resume"
-    else
-        echo "Warning: YAML status not found or unexpected"
-    fi
-else
-    echo "YAML config file not found - shutdown may not have saved state!"
-    exit 1
-fi
-
 if [ -f "pkg/tests/traversal/shared/main_test.db" ]; then
     echo "Database file exists (checkpoint saved)"
 else
@@ -112,16 +98,7 @@ echo ""
 
 if [ $exitCode -eq 0 ]; then
     echo "TEST PASSED - Migration successfully resumed and completed!"
-    
-    # Verify final state
-    if [ -f "pkg/tests/traversal/shared/main_test.yaml" ]; then
-        if grep -qE 'status:\s*completed' "pkg/tests/traversal/shared/main_test.yaml" 2>/dev/null; then
-            echo "Final YAML status is 'completed'"
-        else
-            echo "Warning: Final status may not be 'completed'"
-        fi
-    fi
-    
+        
     # Clean up test databases after successful test completion
     echo ""
     bash "$SCRIPT_DIR/../shared/cleanup.sh"

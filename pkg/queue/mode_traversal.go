@@ -69,8 +69,9 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	coordinator := q.getCoordinator()
 
 	// For SRC: Don't pull if we're too far ahead of DST (Phase 6 gating).
-	if q.name == "src" && coordinator != nil {
-		if currentRound > coordinator.GetDstRound()+MaxSrcDstGap {
+	// When DST has already completed, skip this gate so SRC can finish.
+	if q.name == "src" && coordinator != nil && !coordinator.IsCompleted("dst") {
+		if currentRound > coordinator.GetRound("dst")+MaxSrcDstGap {
 			return
 		}
 	}
@@ -515,9 +516,9 @@ func (q *Queue) AdvanceTraversalRound() {
 	if coordinator != nil {
 		switch q.name {
 		case "src":
-			coordinator.UpdateSrcRound(newRound)
+			coordinator.UpdateRound("src", newRound)
 		case "dst":
-			coordinator.UpdateDstRound(newRound)
+			coordinator.UpdateRound("dst", newRound)
 		}
 	}
 

@@ -142,6 +142,7 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 
 	// Wrap result in a pager so we can process children in fixed-size pages.
 	// This mimics real cloud SDK pagination behavior and keeps per-page work bounded.
+	// TODO: This should be done in the Sylos-FS repo, not at this level. Update this at some point. :)
 	const pageSize = 100
 	pager := types.NewListPager(result, pageSize)
 

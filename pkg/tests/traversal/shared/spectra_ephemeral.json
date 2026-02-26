@@ -8,9 +8,10 @@
     "max_files": 50,
     "file_backoff_factor": 0.8,
     "file_depth_decay_factor": 0.80,
-    "seed": 42,
+    "seed": 40,
     "file_binary_seed": 0,
-    "enable_cache": false
+    "enable_cache": false,
+    "diverging_tree_mode": true
   },
   "api": {
     "host": "localhost",

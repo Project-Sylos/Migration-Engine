@@ -574,9 +574,9 @@ func (q *Queue) markComplete(format string, args ...interface{}) bool {
 	if coordinator != nil {
 		switch queueType {
 		case "SRC":
-			coordinator.MarkSrcCompleted()
+			coordinator.MarkCompleted("src")
 		case "DST":
-			coordinator.MarkDstCompleted()
+			coordinator.MarkCompleted("dst")
 		}
 	}
 	return true
