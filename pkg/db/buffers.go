@@ -219,7 +219,7 @@ func (wb *writeBuffer) checkFlushAfterAdd(count int) {
 
 // --- staging add methods ---
 
-func (wb *writeBuffer) addTraversal(nodeID, newTraversal string) {
+func (wb *writeBuffer) addTraversal(nodeID string, depth int, oldTraversal, newTraversal string) {
 	hardCap := wb.batchSize * backPressureHardCapMultiple
 	<-wb.slots
 	wb.mu.Lock()
@@ -229,26 +229,37 @@ func (wb *writeBuffer) addTraversal(nodeID, newTraversal string) {
 	var count int
 	var wasNew bool
 	if wb.table == "SRC" {
-		_, existed := wb.srcRows[nodeID]
 		r := wb.srcRows[nodeID]
+		existed := r.traversal != "" || r.copy != ""
+		effectiveOld := oldTraversal
+		if existed && r.traversal != "" {
+			effectiveOld = r.traversal
+		}
 		r.traversal = newTraversal
 		wb.srcRows[nodeID] = r
 		count = len(wb.srcRows)
 		wasNew = !existed
+		wb.mu.Unlock()
+		wb.db.statsDeltas.addTraversalDelta("SRC", depth, effectiveOld, newTraversal)
 	} else {
-		_, existed := wb.dstRows[nodeID]
+		prev, existed := wb.dstRows[nodeID]
+		effectiveOld := oldTraversal
+		if existed && prev != "" {
+			effectiveOld = prev
+		}
 		wb.dstRows[nodeID] = newTraversal
 		count = len(wb.dstRows)
 		wasNew = !existed
+		wb.mu.Unlock()
+		wb.db.statsDeltas.addTraversalDelta("DST", depth, effectiveOld, newTraversal)
 	}
-	wb.mu.Unlock()
 	if !wasNew {
 		wb.slots <- struct{}{}
 	}
 	wb.checkFlushAfterAdd(count)
 }
 
-func (wb *writeBuffer) addCopy(nodeID, newCopyStatus string) {
+func (wb *writeBuffer) addCopy(nodeID string, depth int, oldCopy, newCopy string) {
 	if wb.table != "SRC" {
 		return
 	}
@@ -258,12 +269,17 @@ func (wb *writeBuffer) addCopy(nodeID, newCopyStatus string) {
 	for len(wb.srcRows) >= hardCap {
 		wb.cond.Wait()
 	}
-	_, existed := wb.srcRows[nodeID]
 	r := wb.srcRows[nodeID]
-	r.copy = newCopyStatus
+	existed := r.traversal != "" || r.copy != ""
+	effectiveOld := oldCopy
+	if existed && r.copy != "" {
+		effectiveOld = r.copy
+	}
+	r.copy = newCopy
 	wb.srcRows[nodeID] = r
 	count := len(wb.srcRows)
 	wb.mu.Unlock()
+	wb.db.statsDeltas.addCopyDelta(depth, effectiveOld, newCopy)
 	if existed {
 		wb.slots <- struct{}{}
 	}

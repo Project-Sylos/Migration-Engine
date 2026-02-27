@@ -3,9 +3,14 @@
 
 package db
 
-// EnsureNodeTableIndexes creates indexes on the given node table (e.g. "src_nodes", "dst_nodes") for path, parent_path, traversal_status, and copy_status.
-// Call only after traversal (and copy) for that queue is complete; each index is O(n) over the table. Idempotent (CREATE INDEX IF NOT EXISTS).
-// Boosts threads to 12 during indexing for faster builds, then restores to 4.
+// EnsureNodeTableIndexes creates stable lookup indexes on the given node table
+// (e.g. "src_nodes", "dst_nodes") for path and parent_path.
+//
+// Mutable status columns are intentionally left unindexed to avoid high write
+// amplification during traversal/copy status updates. Any legacy status indexes
+// are dropped if present.
+//
+// Idempotent for create/drop operations.
 func EnsureNodeTableIndexes(db *DB, table string) error {
 	conn, err := db.GetDB()
 	if err != nil {
@@ -18,8 +23,7 @@ func EnsureNodeTableIndexes(db *DB, table string) error {
 	}{
 		{table + "_path_idx", "path"},
 		{table + "_parent_path_idx", "parent_path"},
-		{table + "_traversal_status_idx", "traversal_status"},
-		{table + "_copy_status_idx", "copy_status"},
+		{table + "_depth_idx", "depth"},
 	}
 	for _, idx := range indexes {
 		_, err := conn.Exec("CREATE INDEX IF NOT EXISTS " + idx.name + " ON " + table + " (" + idx.column + ")")

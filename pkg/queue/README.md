@@ -109,7 +109,6 @@ if err != nil {
 - **Flush before pull**: `database.FlushTablesForQueue(getQueueType(q.name))` so pending staging/node writes are visible.
 - **State checks**: Pull only when queue is running and pending count is at or below the low-water mark (or when forced).
 - **Coordinator (DST)**: Before pulling, DST checks `coordinator.CanDstStartRound(currentRound)`.
-- **SRC gating**: SRC may skip pull if it is more than `MaxSrcDstGap` rounds ahead of DST.
 
 **Traversal**: `db.ListNodesByDepthKeyset(database, queueType, currentRound, cursor, db.StatusPending, batchSize)` (and for DST, `db.ListDstBatchWithSrcChildren` to get DST batch plus SRC children in one query).
 

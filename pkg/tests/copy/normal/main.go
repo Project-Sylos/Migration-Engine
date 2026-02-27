@@ -46,8 +46,8 @@ func runTest() error {
 		MaxRetries:      3,
 		LogAddress:      "127.0.0.1:8081",
 		LogLevel:        "trace",
-		SkipListener:    true,
-		StartupDelay:    1 * time.Second,
+		SkipListener:    false,
+		StartupDelay:    3 * time.Second,
 		ProgressTick:    2 * time.Second,
 		ShutdownContext: nil,
 	})

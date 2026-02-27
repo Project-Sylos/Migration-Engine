@@ -8,9 +8,16 @@ import (
 	"database/sql"
 )
 
-// Writer is the write handle for DuckDB. Used inside RunUpdateWriterTx. Holds only *sql.Tx so all operations are in one transaction.
+// statsKey is (depth, key) for incremental stats updates at seal.
+type statsKey struct {
+	depth int
+	key   string
+}
+
+// Writer is the write handle for DuckDB. Used inside RunUpdateWriterTx. Holds tx and optional db for seal-time stats deltas.
 type Writer struct {
 	tx *sql.Tx
+	db *DB // optional; when set, seal uses pre-accumulated stats deltas instead of computing from staging+live
 }
 
 // AppenderInsert inserts nodes into src_nodes or dst_nodes (batch INSERT). Used when not using DuckDB Appender path; for Appender path use RunAppenderTx.
@@ -98,7 +105,10 @@ func (w *Writer) SetStatsCountForDepth(table string, depth int, key string, coun
 	return err
 }
 
-// RecomputeStatsForDepth deletes stats for the given table and depth, then counts from the live nodes table at that depth (by traversal_status, and for SRC by copy_status) and writes each key/count to the stats table. Call after any direct write that affects node counts at that depth (e.g. SetNodeTraversalStatus, DeleteSubtree).
+// RecomputeStatsForDepth deletes stats for the given table and depth, then writes
+// fresh counts from the live nodes table at that depth (by traversal_status, and
+// for SRC by copy_status). Call after direct writes that affect node counts at
+// that depth (e.g. SetNodeTraversalStatus, DeleteSubtree).
 func (w *Writer) RecomputeStatsForDepth(table string, depth int) error {
 	ctx := context.Background()
 	t := tableName(table)
@@ -110,85 +120,192 @@ func (w *Writer) RecomputeStatsForDepth(table string, depth int) error {
 	if err != nil {
 		return err
 	}
-	rows, err := w.tx.QueryContext(ctx,
-		`SELECT COALESCE(traversal_status, '') AS status, COUNT(*)::BIGINT FROM `+t+` WHERE depth = $1 GROUP BY traversal_status`, depth)
+
+	// Rebuild traversal stats in one set-based statement.
+	_, err = w.tx.ExecContext(ctx,
+		`INSERT INTO `+statsTbl+` (depth, key, count)
+		 SELECT $1 AS depth, 'traversal/' || traversal_status AS key, COUNT(*)::BIGINT AS count
+		 FROM `+t+`
+		 WHERE depth = $1 AND COALESCE(traversal_status, '') <> ''
+		 GROUP BY traversal_status`,
+		depth,
+	)
 	if err != nil {
 		return err
 	}
-	for rows.Next() {
-		var status string
-		var count int64
-		if err := rows.Scan(&status, &count); err != nil {
-			rows.Close()
-			return err
-		}
-		if status == "" {
-			continue
-		}
-		if err := w.SetStatsCountForDepth(table, depth, StatsKeyTraversalStatus(status), count); err != nil {
-			rows.Close()
-			return err
-		}
-	}
-	rows.Close()
-	if err = rows.Err(); err != nil {
-		return err
-	}
+
 	if table == "SRC" {
-		rows, err = w.tx.QueryContext(ctx,
-			`SELECT COALESCE(copy_status, '') AS status, COUNT(*)::BIGINT FROM `+t+` WHERE depth = $1 GROUP BY copy_status`, depth)
+		// Rebuild copy stats in one set-based statement.
+		_, err = w.tx.ExecContext(ctx,
+			`INSERT INTO `+statsTbl+` (depth, key, count)
+			 SELECT $1 AS depth, 'copy/' || copy_status AS key, COUNT(*)::BIGINT AS count
+			 FROM `+t+`
+			 WHERE depth = $1 AND COALESCE(copy_status, '') <> ''
+			 GROUP BY copy_status`,
+			depth,
+		)
 		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			var status string
-			var count int64
-			if err := rows.Scan(&status, &count); err != nil {
-				rows.Close()
-				return err
-			}
-			if status == "" {
-				continue
-			}
-			if err := w.SetStatsCountForDepth("SRC", depth, StatsKeyCopyStatus(status), count); err != nil {
-				rows.Close()
-				return err
-			}
-		}
-		rows.Close()
-		if err = rows.Err(); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// ApplyStatusStagingAndDrop merges src_staging and dst_staging into live nodes, recomputes stats for the given depth, writes completed count for the given table (if table != ""), then clears staging tables. Call at level seal with the depth being sealed; table is "SRC" or "DST", completed is that queue's completed count for this round.
+// computeSrcStatsDeltas returns (depth, key) -> delta for the sealed depth by joining src_staging with src_nodes at that depth. Empty statuses are skipped (no key).
+func (w *Writer) computeSrcStatsDeltas(sealedDepth int) (map[statsKey]int64, error) {
+	ctx := context.Background()
+	rows, err := w.tx.QueryContext(ctx,
+		`SELECT n.depth,
+			COALESCE(n.traversal_status, '') AS old_trav, COALESCE(n.copy_status, '') AS old_copy,
+			COALESCE(s.new_traversal_status, '') AS new_trav, COALESCE(s.new_copy_status, '') AS new_copy
+		 FROM src_nodes n INNER JOIN src_staging s ON n.id = s.node_id WHERE n.depth = $1`,
+		sealedDepth)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	deltas := make(map[statsKey]int64)
+	for rows.Next() {
+		var d int
+		var oldTrav, oldCopy, newTrav, newCopy string
+		if err := rows.Scan(&d, &oldTrav, &oldCopy, &newTrav, &newCopy); err != nil {
+			return nil, err
+		}
+		if oldTrav != "" {
+			deltas[statsKey{d, StatsKeyTraversalStatus(oldTrav)}]--
+		}
+		if newTrav != "" {
+			deltas[statsKey{d, StatsKeyTraversalStatus(newTrav)}]++
+		}
+		if oldCopy != "" {
+			deltas[statsKey{d, StatsKeyCopyStatus(oldCopy)}]--
+		}
+		if newCopy != "" {
+			deltas[statsKey{d, StatsKeyCopyStatus(newCopy)}]++
+		}
+	}
+	return deltas, rows.Err()
+}
+
+// computeDstStatsDeltas returns (depth, key) -> delta for the sealed depth by joining dst_staging with dst_nodes at that depth.
+func (w *Writer) computeDstStatsDeltas(sealedDepth int) (map[statsKey]int64, error) {
+	ctx := context.Background()
+	rows, err := w.tx.QueryContext(ctx,
+		`SELECT n.depth,
+			COALESCE(n.traversal_status, '') AS old_trav,
+			COALESCE(d.new_traversal_status, '') AS new_trav
+		 FROM dst_nodes n INNER JOIN dst_staging d ON n.id = d.node_id WHERE n.depth = $1`,
+		sealedDepth)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	deltas := make(map[statsKey]int64)
+	for rows.Next() {
+		var d int
+		var oldTrav, newTrav string
+		if err := rows.Scan(&d, &oldTrav, &newTrav); err != nil {
+			return nil, err
+		}
+		if oldTrav != "" {
+			deltas[statsKey{d, StatsKeyTraversalStatus(oldTrav)}]--
+		}
+		if newTrav != "" {
+			deltas[statsKey{d, StatsKeyTraversalStatus(newTrav)}]++
+		}
+	}
+	return deltas, rows.Err()
+}
+
+// applyStatsDeltas applies deltas to src_stats or dst_stats (INSERT/ON CONFLICT increment).
+func (w *Writer) applyStatsDeltas(table string, deltas map[statsKey]int64) error {
+	if len(deltas) == 0 {
+		return nil
+	}
+	tbl := tableSrcStats
+	if table == "DST" {
+		tbl = tableDstStats
+	}
+	ctx := context.Background()
+	for k, delta := range deltas {
+		if delta == 0 {
+			continue
+		}
+		_, err := w.tx.ExecContext(ctx,
+			`INSERT INTO `+tbl+` (depth, key, count) VALUES ($1, $2, $3)
+			 ON CONFLICT (depth, key) DO UPDATE SET count = `+tbl+`.count + excluded.count`,
+			k.depth, k.key, delta,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ApplyStatusStagingAndDrop merges src_staging and dst_staging into live nodes,
+// applies pre-accumulated stats deltas for the sealed depth (O(1) per key), writes
+// completed count, then clears staging. When w.db is set, deltas come from the
+// accumulator (filled at staging flush); otherwise we fall back to computing from
+// staging+live JOIN (e.g. MaybeMergeStagingEarly or tests).
 func (w *Writer) ApplyStatusStagingAndDrop(depth int, table string, completed int64) error {
 	ctx := context.Background()
 
-	// 1) Merge staging into live
+	var srcDeltas, dstDeltas map[statsKey]int64
+	if w.db != nil {
+		srcDeltas, dstDeltas = w.db.GetAndClearStatsDeltasForDepth(depth)
+	}
+	if srcDeltas == nil {
+		srcDeltas = make(map[statsKey]int64)
+	}
+	if dstDeltas == nil {
+		dstDeltas = make(map[statsKey]int64)
+	}
+	if w.db == nil {
+		var err error
+		if srcDeltas, err = w.computeSrcStatsDeltas(depth); err != nil {
+			return err
+		}
+		if dstDeltas, err = w.computeDstStatsDeltas(depth); err != nil {
+			return err
+		}
+	}
+
+	// 1) Merge staging into live (depth filter lets planner use depth index)
 	_, err := w.tx.ExecContext(ctx,
 		`UPDATE src_nodes SET
 			traversal_status = COALESCE(s.new_traversal_status, src_nodes.traversal_status),
 			copy_status = COALESCE(s.new_copy_status, src_nodes.copy_status)
-		 FROM src_staging s WHERE src_nodes.id = s.node_id`)
+		 FROM src_staging s WHERE src_nodes.id = s.node_id AND src_nodes.depth = $1`,
+		depth)
 	if err != nil {
 		return err
 	}
 	_, err = w.tx.ExecContext(ctx,
 		`UPDATE dst_nodes SET traversal_status = d.new_traversal_status
-		 FROM dst_staging d WHERE dst_nodes.id = d.node_id`)
+		 FROM dst_staging d WHERE dst_nodes.id = d.node_id AND dst_nodes.depth = $1`,
+		depth)
 	if err != nil {
 		return err
 	}
 
-	// 2) Count from live at this depth and write to stats (replace all stats for this depth)
-	if err := w.RecomputeStatsForDepth("SRC", depth); err != nil {
-		return err
-	}
-	if err := w.RecomputeStatsForDepth("DST", depth); err != nil {
-		return err
+	// 2) Apply stats deltas (pre-accumulated at flush or just computed)
+	switch table {
+	case "SRC":
+		if err := w.applyStatsDeltas("SRC", srcDeltas); err != nil {
+			return err
+		}
+	case "DST":
+		if err := w.applyStatsDeltas("DST", dstDeltas); err != nil {
+			return err
+		}
+	default:
+		if err := w.applyStatsDeltas("SRC", srcDeltas); err != nil {
+			return err
+		}
+		if err := w.applyStatsDeltas("DST", dstDeltas); err != nil {
+			return err
+		}
 	}
 
 	// 3) Write completed count for this depth/table (if provided)
@@ -198,12 +315,20 @@ func (w *Writer) ApplyStatusStagingAndDrop(depth int, table string, completed in
 		}
 	}
 
-	// 4) Clear staging tables for next level (DELETE is quick; tables stay in place)
-	_, err = w.tx.ExecContext(ctx, `DELETE FROM src_staging`)
+	// 4) Drop and recreate staging tables (avoids accumulating deleted rows across rounds)
+	_, err = w.tx.ExecContext(ctx, `DROP TABLE IF EXISTS src_staging`)
 	if err != nil {
 		return err
 	}
-	_, err = w.tx.ExecContext(ctx, `DELETE FROM dst_staging`)
+	_, err = w.tx.ExecContext(ctx, srcStagingDDL())
+	if err != nil {
+		return err
+	}
+	_, err = w.tx.ExecContext(ctx, `DROP TABLE IF EXISTS dst_staging`)
+	if err != nil {
+		return err
+	}
+	_, err = w.tx.ExecContext(ctx, dstStagingDDL())
 	if err != nil {
 		return err
 	}

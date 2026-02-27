@@ -23,6 +23,20 @@ func DefaultOptions() Options {
 	return Options{Path: ":memory:"}
 }
 
+// statsDeltaAccum holds per-(depth, key) deltas to apply to stats at seal. Updated when the queue adds to the buffer.
+type statsDeltaAccum struct {
+	mu   sync.Mutex
+	src  map[statsKey]int64
+	dst  map[statsKey]int64
+}
+
+func newStatsDeltaAccum() *statsDeltaAccum {
+	return &statsDeltaAccum{
+		src: make(map[statsKey]int64),
+		dst: make(map[statsKey]int64),
+	}
+}
+
 // DB is the DuckDB-backed database handle. Single physical connection for all DB operations (schema, appender writes, pulls, merge, checkpoint).
 type DB struct {
 	path         string
@@ -35,6 +49,9 @@ type DB struct {
 	dstStagingBuffer *writeBuffer
 	srcNodesBuffer   *writeBuffer
 	dstNodesBuffer   *writeBuffer
+
+	// Stats deltas accumulated at staging flush; applied at seal (O(1) per key). No recompute from node table at seal.
+	statsDeltas *statsDeltaAccum
 
 	// Flush callbacks per queue for leased-key removal
 	onFlushSRC func(nodeIDs []string)
@@ -53,14 +70,14 @@ func Open(opts Options) (*DB, error) {
 	}
 	conn.SetMaxOpenConns(1)
 	// Limit DuckDB memory and threads to avoid OOM during stress testing
-	if _, err := conn.Exec("PRAGMA memory_limit='4GB'"); err != nil {
+	if _, err := conn.Exec("PRAGMA memory_limit='8GB'"); err != nil {
 		err := conn.Close()
 		if err != nil {
 			return nil, err
 		}
 		return nil, err
 	}
-	if _, err := conn.Exec("PRAGMA threads=12"); err != nil {
+	if _, err := conn.Exec("PRAGMA threads=4"); err != nil {
 		err := conn.Close()
 		if err != nil {
 			return nil, err
@@ -85,8 +102,9 @@ func Open(opts Options) (*DB, error) {
 	}
 
 	d := &DB{
-		path: path,
-		conn: conn,
+		path:        path,
+		conn:        conn,
+		statsDeltas: newStatsDeltaAccum(),
 	}
 	d.srcStagingBuffer = newWriteBuffer(d, "SRC", bufferKindStaging)
 	d.dstStagingBuffer = newWriteBuffer(d, "DST", bufferKindStaging)
@@ -175,20 +193,18 @@ func (db *DB) SetOnFlush(queueType string, fn func(nodeIDs []string)) {
 	}
 }
 
-// AddToStaging buffers a status update for the staging table. table is "SRC" or "DST".
-// For traversal: pass nodeID, newTraversal, "".
-// For copy (SRC only): use AddCopyToStaging.
-func (db *DB) AddToStaging(table, nodeID, newTraversal string) {
+// AddToStaging buffers a traversal status update. depth and oldTraversal/newTraversal are used to update stats counters in memory (no DB read).
+func (db *DB) AddToStaging(table, nodeID string, depth int, oldTraversal, newTraversal string) {
 	if table == "DST" {
-		db.dstStagingBuffer.addTraversal(nodeID, newTraversal)
+		db.dstStagingBuffer.addTraversal(nodeID, depth, oldTraversal, newTraversal)
 	} else {
-		db.srcStagingBuffer.addTraversal(nodeID, newTraversal)
+		db.srcStagingBuffer.addTraversal(nodeID, depth, oldTraversal, newTraversal)
 	}
 }
 
-// AddCopyToStaging buffers a copy status update for src_staging (SRC table only).
-func (db *DB) AddCopyToStaging(nodeID, newCopyStatus string) {
-	db.srcStagingBuffer.addCopy(nodeID, newCopyStatus)
+// AddCopyToStaging buffers a copy status update for src_staging. depth and old/new are used to update stats counters in memory.
+func (db *DB) AddCopyToStaging(nodeID string, depth int, oldCopy, newCopy string) {
+	db.srcStagingBuffer.addCopy(nodeID, depth, oldCopy, newCopy)
 }
 
 // AddNode buffers a node insert for src_nodes or dst_nodes.
@@ -303,6 +319,62 @@ func (db *DB) MaybeMergeStagingEarly(round int, threshold int64) (bool, error) {
 	return true, nil
 }
 
+// addTraversalDelta records one traversal status transition at the given depth (counters updated at add time, no DB read).
+func (a *statsDeltaAccum) addTraversalDelta(table string, depth int, oldStatus, newStatus string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if oldStatus != "" {
+		k := statsKey{depth, StatsKeyTraversalStatus(oldStatus)}
+		if table == "SRC" {
+			a.src[k]--
+		} else {
+			a.dst[k]--
+		}
+	}
+	if newStatus != "" {
+		k := statsKey{depth, StatsKeyTraversalStatus(newStatus)}
+		if table == "SRC" {
+			a.src[k]++
+		} else {
+			a.dst[k]++
+		}
+	}
+}
+
+// addCopyDelta records one copy status transition at the given depth (SRC only).
+func (a *statsDeltaAccum) addCopyDelta(depth int, oldStatus, newStatus string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if oldStatus != "" {
+		a.src[statsKey{depth, StatsKeyCopyStatus(oldStatus)}]--
+	}
+	if newStatus != "" {
+		a.src[statsKey{depth, StatsKeyCopyStatus(newStatus)}]++
+	}
+}
+
+// GetAndClearStatsDeltasForDepth returns and removes accumulated stats deltas for the given depth.
+// Call while holding writeMu (e.g. inside RunUpdateWriterTx before ApplyStatusStagingAndDrop).
+func (db *DB) GetAndClearStatsDeltasForDepth(depth int) (src, dst map[statsKey]int64) {
+	db.statsDeltas.mu.Lock()
+	defer db.statsDeltas.mu.Unlock()
+	src = make(map[statsKey]int64)
+	dst = make(map[statsKey]int64)
+	for k, v := range db.statsDeltas.src {
+		if k.depth == depth && v != 0 {
+			src[k] = v
+			delete(db.statsDeltas.src, k)
+		}
+	}
+	for k, v := range db.statsDeltas.dst {
+		if k.depth == depth && v != 0 {
+			dst[k] = v
+			delete(db.statsDeltas.dst, k)
+		}
+	}
+	return src, dst
+}
+
 // RunUpdateWriterTx runs fn inside a transaction on the main connection.
 func (db *DB) RunUpdateWriterTx(fn func(w *Writer) error) error {
 	db.writeMu.Lock()
@@ -312,7 +384,7 @@ func (db *DB) RunUpdateWriterTx(fn func(w *Writer) error) error {
 	if err != nil {
 		return err
 	}
-	w := &Writer{tx: tx}
+	w := &Writer{tx: tx, db: db}
 	if err := fn(w); err != nil {
 		err := tx.Rollback()
 		if err != nil {
@@ -343,12 +415,12 @@ func (db *DB) RunAppenderWriterTx(queueType string, fn func(w *Writer) error) er
 	return tx.Commit()
 }
 
-// runStagingFlush writes staging rows to the DB. queueType determines which staging appenders to create (SRC vs DST).
+// runStagingFlush writes staging rows to the DB. Stats deltas are already accumulated in memory when the queue adds to the buffer (no read here).
 func (db *DB) runStagingFlush(queueType string, srcRows map[string]srcStagingRow, dstRows map[string]string) error {
 	if len(srcRows) == 0 && len(dstRows) == 0 {
 		return nil
 	}
-	return db.runAppenderTxConn(db.conn, queueType, false, func(aw appenderFlusher) error {
+	return db.runAppenderTxConn(db.conn, queueType, false, nil, func(aw appenderFlusher) error {
 		for nodeID, r := range srcRows {
 			if err := aw.appendSrcStaging(nodeID, r.traversal, r.copy); err != nil {
 				return err
@@ -370,7 +442,7 @@ func (db *DB) runNodesFlush(table string, nodes []*NodeState) error {
 		return nil
 	}
 	rowArgs := make([]driver.Value, 14)
-	return db.runAppenderTxConn(db.conn, table, true, func(aw appenderFlusher) error {
+	return db.runAppenderTxConn(db.conn, table, true, nil, func(aw appenderFlusher) error {
 		for _, n := range nodes {
 			if err := aw.appendNode(table, n, rowArgs); err != nil {
 				return err
@@ -388,8 +460,8 @@ type appenderFlusher interface {
 	appendNode(table string, n *NodeState, rowArgs []driver.Value) error
 }
 
-// runAppenderTxConn runs fn with an appender on the given connection. stagingOnly=true means only staging appenders are created.
-func (db *DB) runAppenderTxConn(conn *sql.DB, queueType string, nodesIncluded bool, fn func(aw appenderFlusher) error) error {
+// runAppenderTxConn runs fn with an appender on the given connection. nodesIncluded=true means node appenders are created. If pre != nil, it runs after DDL inside the same transaction (e.g. to accumulate stats deltas from live before writing staging).
+func (db *DB) runAppenderTxConn(conn *sql.DB, queueType string, nodesIncluded bool, pre func(*sql.Tx) error, fn func(aw appenderFlusher) error) error {
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
 	ctx := context.Background()
@@ -403,18 +475,18 @@ func (db *DB) runAppenderTxConn(conn *sql.DB, queueType string, nodesIncluded bo
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, srcStagingDDL()); err != nil {
-		err := tx.Rollback()
-		if err != nil {
-			return err
-		}
+		_ = tx.Rollback()
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, dstStagingDDL()); err != nil {
-		err := tx.Rollback()
-		if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if pre != nil {
+		if err := pre(tx); err != nil {
+			_ = tx.Rollback()
 			return err
 		}
-		return err
 	}
 	var fnErr error
 	err = c.Raw(func(driverConn any) error {

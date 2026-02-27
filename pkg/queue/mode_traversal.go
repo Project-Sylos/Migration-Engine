@@ -68,14 +68,6 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	currentRound := snapshot.Round
 	coordinator := q.getCoordinator()
 
-	// For SRC: Don't pull if we're too far ahead of DST (Phase 6 gating).
-	// When DST has already completed, skip this gate so SRC can finish.
-	if q.name == "src" && coordinator != nil && !coordinator.IsCompleted("dst") {
-		if currentRound > coordinator.GetRound("dst")+MaxSrcDstGap {
-			return
-		}
-	}
-
 	// For DST: Check coordinator gate before pulling
 	if q.name == "dst" && coordinator != nil {
 		canStartRound := coordinator.CanDstStartRound(currentRound)
@@ -272,7 +264,7 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 			// Update SRC node's CopyStatus if worker determined an update is needed (use meta from pull, no DB lookup)
 			if child.SrcCopyStatus != "" && task.ExpectedSrcNodeMeta != nil {
 				if _, ok := task.ExpectedSrcNodeMeta[child.SrcID]; ok {
-					database.AddCopyToStaging(child.SrcID, child.SrcCopyStatus)
+					database.AddCopyToStaging(child.SrcID, nextRound, db.CopyStatusPending, child.SrcCopyStatus)
 				}
 			}
 		}
@@ -346,7 +338,7 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 				// Update SRC node's CopyStatus if worker determined an update is needed (use meta from pull, no DB lookup)
 				if child.srcCopyStatus != "" && task.ExpectedSrcNodeMeta != nil {
 					if _, ok := task.ExpectedSrcNodeMeta[child.srcID]; ok {
-						database.AddCopyToStaging(child.srcID, child.srcCopyStatus)
+						database.AddCopyToStaging(child.srcID, nextRound, db.CopyStatusPending, child.srcCopyStatus)
 					}
 				}
 			}
@@ -354,8 +346,8 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 	}
 
 	// Write to DB buffers (DB-owned, table-scoped)
-	// Parent status update
-	database.AddToStaging(queueType, nodeID, db.StatusSuccessful)
+	// Parent status update: pending -> successful
+	database.AddToStaging(queueType, nodeID, task.Round, db.StatusPending, db.StatusSuccessful)
 
 	// Child inserts
 	if len(childNodesToInsert) > 0 {
@@ -367,7 +359,7 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 	// For SRC FOLDER tasks in retry mode: Queue DST cleanup only when RetryDstCleanup was populated at pull (no DB reads here).
 	if q.name == "src" && q.GetMode() == QueueModeRetry && task.IsFolder() && task.RetryDstCleanup != nil {
 		c := task.RetryDstCleanup
-		database.AddToStaging("DST", c.DstID, db.StatusPending)
+		database.AddToStaging("DST", c.DstID, task.Round, "", db.StatusPending)
 		deletions := make([]db.NodeDeletion, 0, len(c.Children))
 		for _, ch := range c.Children {
 			deletions = append(deletions, db.NodeDeletion{Table: "DST", NodeID: ch.ID})
@@ -446,7 +438,7 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 	// Update traversal status to failed
 	if nodeID != "" {
 		if database := q.getDatabase(); database != nil {
-			database.AddToStaging(getQueueType(q.name), nodeID, db.StatusFailed)
+			database.AddToStaging(getQueueType(q.name), nodeID, currentRound, db.StatusPending, db.StatusFailed)
 		}
 	}
 

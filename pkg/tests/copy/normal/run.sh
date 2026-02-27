@@ -12,7 +12,10 @@ echo ""
 
 destDB="pkg/tests/copy/shared/main_test.db"
 
-# Generate DuckDB if missing (traversal from Spectra roots; Spectra DBs not modified)
+# Refresh test DB from seeded template when available.
+bash pkg/tests/copy/shared/setup.sh
+
+# Fallback: generate DuckDB if still missing (schema + roots only).
 if [ ! -f "$destDB" ]; then
     echo "Test DB not found. Generating DuckDB (traversal from Spectra roots)..."
     go run ./cmd/gen_copy_test_db

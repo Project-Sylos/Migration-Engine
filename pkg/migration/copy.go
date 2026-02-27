@@ -40,16 +40,20 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		return queue.QueueStats{}, fmt.Errorf("source and destination adapters must be provided")
 	}
 
-	// Initialize log service if address provided
+	// Initialize log service if address provided.
+	// When SkipListener: bind port and discard UDP packets so sender writes don't fail; no display.
 	if cfg.LogAddress != "" {
-		if !cfg.SkipListener {
+		startupDelay := cfg.StartupDelay
+		if startupDelay <= 0 {
+			startupDelay = 500 * time.Millisecond
+		}
+		if cfg.SkipListener {
+			logservice.StartListenerDiscard(cfg.LogAddress)
+			time.Sleep(startupDelay)
+		} else {
 			if err := logservice.StartListener(cfg.LogAddress); err != nil {
 				// Non-fatal: continue without listener
 			} else {
-				startupDelay := cfg.StartupDelay
-				if startupDelay <= 0 {
-					startupDelay = 500 * time.Millisecond
-				}
 				time.Sleep(startupDelay)
 			}
 		}
@@ -183,9 +187,6 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 			}
 		}
 	}()
-
-	// Start queue Run() goroutine
-	go copyQueue.Run()
 
 	// Wait for copy phase completion
 	start := time.Now()

@@ -318,6 +318,7 @@ func (q *Queue) PullCopyTasks(force bool) {
 		}
 		return
 	}
+
 	var matchedBatch []db.FetchResult
 	for _, r := range results {
 		if q.isLeased(r.Key) {
@@ -372,7 +373,6 @@ func (q *Queue) PullCopyTasks(force bool) {
 	// Move tasks to in-progress status and create tasks
 	enqueueSuccessCount := 0
 	for _, item := range matchedBatch {
-		// Already filtered for leased items during scan, so no need to check again
 
 		// Determine task type based on copy pass (not just node type, to ensure consistency)
 		// We're pulling from a bucket filtered by nodeType, so this should match item.State.Type
@@ -441,7 +441,7 @@ func (q *Queue) PullCopyTasks(force bool) {
 
 			// ONLY queue status update if we successfully enqueued the task
 			// This prevents queueing status updates for already-leased or duplicate tasks
-			database.AddCopyToStaging(item.State.ID, db.CopyStatusInProgress)
+			database.AddCopyToStaging(item.State.ID, currentRound, db.CopyStatusPending, db.CopyStatusInProgress)
 		}
 	}
 
@@ -547,7 +547,7 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 	}
 
 	// Update copy status: in-progress -> successful
-	database.AddCopyToStaging(nodeID, db.CopyStatusSuccessful)
+	database.AddCopyToStaging(nodeID, currentRound, db.CopyStatusInProgress, db.CopyStatusSuccessful)
 
 	// Create DST node entry and update join-lookup (deterministic ID from path)
 	dstNodeID := db.DeterministicNodeID("DST", taskType, taskPath)
@@ -651,7 +651,7 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 		q.recordTaskCompletion(currentRound, false)
 
 		// Add to buffer only on final failure
-		database.AddCopyToStaging(nodeID, db.CopyStatusFailed)
+		database.AddCopyToStaging(nodeID, currentRound, db.CopyStatusInProgress, db.CopyStatusFailed)
 
 		q.removeInProgress(nodeID)
 

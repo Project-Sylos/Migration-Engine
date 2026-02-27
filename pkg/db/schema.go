@@ -10,7 +10,8 @@ const (
 	tableDstStats   = "dst_stats"
 	tableSrcStaging = "src_staging"
 	tableDstStaging = "dst_staging"
-	tableMigrations = "migrations"
+	// TableMigrations is the migrations lifecycle table name (used by schema and migration store).
+	TableMigrations = "migrations"
 )
 
 // nodeTableDDL returns CREATE TABLE for src_nodes or dst_nodes.
@@ -99,7 +100,7 @@ func taskErrorsTableDDL() string {
 }
 
 func migrationsTableDDL() string {
-	return `CREATE TABLE IF NOT EXISTS migrations (
+	return `CREATE TABLE IF NOT EXISTS ` + TableMigrations + ` (
 		migration_id VARCHAR PRIMARY KEY,
 		name VARCHAR NOT NULL,
 		phase VARCHAR NOT NULL,

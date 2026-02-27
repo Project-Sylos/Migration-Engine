@@ -176,6 +176,10 @@ func (m *Migration) AddRoots(srcRoot, dstRoot types.Folder) (RootSeedSummary, er
 	if err != nil {
 		return RootSeedSummary{}, fmt.Errorf("seed roots: %w", err)
 	}
+	err = m.manager.store.updateUpdatedAt(m.ID)
+	if err != nil {
+		return RootSeedSummary{}, fmt.Errorf("update updated at: %w", err)
+	}
 	return summary, nil
 }
 
@@ -195,7 +199,13 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 	}
 
 	runCtx := m.beginRun(cfg.ShutdownContext)
-	defer m.endRun()
+	defer func() {
+		m.endRun()
+		err = m.manager.store.updateUpdatedAt(m.ID)
+		if err != nil {
+			fmt.Println("error updating updated at", err)
+		}
+	}()
 	stats, err := RunMigration(MigrationConfig{
 		DB:              m.manager.db,
 		DBPath:          cfg.Database.Path,
@@ -242,7 +252,13 @@ func (m *Migration) StartCopy() (queue.QueueStats, error) {
 	}
 
 	runCtx := m.beginRun(lastCfg.ShutdownContext)
-	defer m.endRun()
+	defer func() {
+		m.endRun()
+		err := m.manager.store.updateUpdatedAt(m.ID)
+		if err != nil {
+			fmt.Println("error updating updated at", err)
+		}
+	}()
 	stats, err := RunCopyPhase(CopyPhaseConfig{
 		DuckDB:          m.manager.db,
 		SrcAdapter:      lastCfg.Source.Adapter,
@@ -280,7 +296,13 @@ func (m *Migration) RunRetrySweep(opts RetrySweepOptions) (RuntimeStats, error) 
 		return RuntimeStats{}, err
 	}
 	runCtx := m.beginRun(lastCfg.ShutdownContext)
-	defer m.endRun()
+	defer func() {
+		m.endRun()
+		err := m.manager.store.updateUpdatedAt(m.ID)
+		if err != nil {
+			fmt.Println("error updating updated at", err)
+		}
+	}()
 
 	workerCount := opts.WorkerCount
 	if workerCount <= 0 {

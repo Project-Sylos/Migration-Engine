@@ -38,7 +38,7 @@ func (s *migrationStore) createMigration(record migrationRecord) error {
 	}
 	_, err = conn.ExecContext(
 		context.Background(),
-		`INSERT INTO migrations (
+		`INSERT INTO `+db.TableMigrations+` (
 			migration_id,
 			name,
 			phase,
@@ -73,7 +73,7 @@ func (s *migrationStore) getMigration(id string) (*migrationRecord, error) {
 	err = conn.QueryRowContext(
 		context.Background(),
 		`SELECT migration_id, name, phase, created_at, updated_at, service_metadata_json, root_config_json
-		 FROM migrations WHERE migration_id = $1`,
+		 FROM `+db.TableMigrations+` WHERE migration_id = $1`,
 		id,
 	).Scan(
 		&record.ID,
@@ -105,7 +105,7 @@ func (s *migrationStore) listMigrations() ([]migrationRecord, error) {
 	rows, err := conn.QueryContext(
 		context.Background(),
 		`SELECT migration_id, name, phase, created_at, updated_at, service_metadata_json, root_config_json
-		 FROM migrations ORDER BY created_at DESC`,
+		 FROM `+db.TableMigrations+` ORDER BY created_at DESC`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list migrations: %w", err)
@@ -146,7 +146,7 @@ func (s *migrationStore) deleteMigration(id string) error {
 	if err != nil {
 		return err
 	}
-	_, err = conn.ExecContext(context.Background(), `DELETE FROM migrations WHERE migration_id = $1`, id)
+	_, err = conn.ExecContext(context.Background(), `DELETE FROM `+db.TableMigrations+` WHERE migration_id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("delete migration %s: %w", id, err)
 	}
@@ -160,13 +160,31 @@ func (s *migrationStore) updatePhase(id string, phase Phase) error {
 	}
 	_, err = conn.ExecContext(
 		context.Background(),
-		`UPDATE migrations SET phase = $1, updated_at = $2 WHERE migration_id = $3`,
+		`UPDATE `+db.TableMigrations+` SET phase = $1, updated_at = $2 WHERE migration_id = $3`,
 		phase.String(),
 		time.Now().UTC(),
 		id,
 	)
 	if err != nil {
 		return fmt.Errorf("update migration %s phase: %w", id, err)
+	}
+	return nil
+}
+
+// updateUpdatedAt sets updated_at to now for the migration (e.g. after roots inserted or run ended).
+func (s *migrationStore) updateUpdatedAt(id string) error {
+	conn, err := s.db.GetDB()
+	if err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(
+		context.Background(),
+		`UPDATE `+db.TableMigrations+` SET updated_at = $1 WHERE migration_id = $2`,
+		time.Now().UTC(),
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("update migration %s updated_at: %w", id, err)
 	}
 	return nil
 }

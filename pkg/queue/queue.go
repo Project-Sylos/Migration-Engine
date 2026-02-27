@@ -59,8 +59,6 @@ const (
 const (
 	defaultLeaseBatchSize = 10_000
 	maxLeaseBatchSize     = 100_000 // Upper bound for pull (lease) batch size
-	// MaxSrcDstGap is the maximum allowed round gap (src - dst). When src exceeds dst + MaxSrcDstGap, src pauses pulling (Phase 6).
-	MaxSrcDstGap = 2
 	// stagingEarlyMergeThreshold: after this many task completions, merge staging into live to reduce memory on pathological wide rounds.
 	stagingEarlyMergeThreshold = 1_000_000
 )
@@ -482,52 +480,12 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			return false
 		}
 
-		// Hard check: verify DuckDB buckets are empty (mode-specific)
+		// Copy mode keeps status updates in src_staging until seal.
+		// A live-table hard check here can see stale "pending" rows and deadlock round advancement.
+		// For copy, rely on the soft check (in-memory + pull exhaustiveness), then seal/merge on round advance.
 		mode := q.GetMode()
-		if mode == QueueModeCopy {
-			database := q.getDatabase()
-			if database != nil {
-				copyPass := q.GetCopyPass()
-				// Determine node type for current pass
-				nodeType := db.NodeTypeFolder
-				if copyPass == 2 {
-					nodeType = db.NodeTypeFile
-				}
-
-				// For copy mode: check if pending OR in-progress buckets have items for this round and node type
-				// Buckets are now split by node type, so no filtering needed!
-				hasPendingForPass := false
-				hasInProgressForPass := false
-
-				// Check pending bucket for this node type
-				c1, err1 := database.GetCopyCountAtDepth(currentRound, nodeType, db.CopyStatusPending)
-				if err1 == nil && c1 > 0 {
-					hasPendingForPass = true
-				}
-
-				// Check in-progress bucket for this node type
-				c2, err2 := database.GetCopyCountAtDepth(currentRound, nodeType, db.CopyStatusInProgress)
-				hasInProgress := err2 == nil && c2 > 0
-				if err2 == nil && hasInProgress {
-					hasInProgressForPass = true
-				}
-
-				if err1 == nil && err2 == nil {
-					if hasPendingForPass || hasInProgressForPass {
-						// Hard check failed: still have pending or in-progress tasks for this pass
-						// Reset lastPullWasPartial to false so normal pull logic can trigger
-						q.setLastPullWasPartial(false)
-						return false
-					}
-				} else {
-					// Error checking buckets - be conservative and don't advance
-					// Errors logged via logservice if available
-					return false
-				}
-			} else {
-				// No DuckDB - can't do hard check
-				return false
-			}
+		if mode != QueueModeCopy {
+			// Non-copy modes can use live status directly for hard validation.
 		}
 
 		// Both soft and hard checks passed - round is complete

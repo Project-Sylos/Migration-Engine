@@ -47,5 +47,15 @@ func SetupDatabase(cfg DatabaseConfig) (*db.DB, bool, error) {
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to open database %s: %w", cfg.Path, err)
 	}
+
+	// Build node indexes up front so traversal/copy queries and joins can use them immediately.
+	if err := db.EnsureNodeTableIndexes(database, "src_nodes"); err != nil {
+		_ = database.Close()
+		return nil, false, fmt.Errorf("failed to ensure src node indexes: %w", err)
+	}
+	if err := db.EnsureNodeTableIndexes(database, "dst_nodes"); err != nil {
+		_ = database.Close()
+		return nil, false, fmt.Errorf("failed to ensure dst node indexes: %w", err)
+	}
 	return database, wasFresh, nil
 }
