@@ -22,8 +22,7 @@ Each traversal operation is isolated into discrete, non-recursive **tasks** so t
    This keeps each task stateless and lightweight.
 
 3. **Record Results**
-   Children that pass filtering are written through the database’s buffered staging and node APIs. The queue flushes these buffers before the next task pull so that completed work is visible and not re-leased.
-   Task state lives in the database; the queue pulls by depth and status (keyset queries) and writes via the same database instance.
+   Children that pass filtering are recorded in per-level in-memory caches (memory-first path) or the database’s buffered APIs. At round advance (seal), the current level is persisted to the database in bulk. The queue pulls by depth and status from cache or keyset queries; the database is the source of truth for sealed state and resume.
 
 ---
 
@@ -31,7 +30,7 @@ Each traversal operation is isolated into discrete, non-recursive **tasks** so t
 
 Depth-First Search (DFS) is memory-efficient, but it's less suited to managing two trees in parallel.
 BFS, while it requires storing all nodes at the current level, provides better control, checkpointing, and fault recovery.
-The Migration Engine serializes traversal data to the database after each round (via buffered staging and node tables), keeping memory use bounded while preserving full traversal context.
+The Migration Engine serializes traversal data to the database at each round boundary (seal: bulk append of the completed level and stats snapshot), keeping memory use bounded while preserving full traversal context.
 
 ### Two Possible Strategies
 
@@ -49,11 +48,11 @@ The Migration Engine serializes traversal data to the database after each round 
 * Source and destination are traversed **in rounds**.
 * **Round 0**: traverse the source root and list its children.
 * **Round 1**: traverse those children; destination traversal remains coordinated behind the source.
-* The destination queue is coordinated to stay at least 3 rounds behind the source via the `QueueCoordinator`.
+* The destination queue is gated by the `QueueCoordinator`; the source may run at most a few rounds ahead of the destination (configurable, default 3).
 * When the destination processes its corresponding level, it compares existing nodes against the expected list from the source.
 * Extra items in the destination are logged but not traversed further.
 * The destination can run as fast as possible while staying coordinated with the source.
-* Because each round is batched and stored in the database (node tables, staging, and stats), the system can resume exactly where it left off after a crash.
+* Because each round is sealed to the database (nodes and per-depth stats), the system can resume exactly where it left off after a crash; on resume, level caches are rehydrated from the DB.
 * This maximizes both safety and throughput.
 
 ---

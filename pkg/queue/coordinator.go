@@ -11,23 +11,36 @@ import (
 )
 
 // QueueCoordinator manages round advancement gates for dual-BFS traversal.
-// It enforces the invariant: "DST cannot advance to round N until SRC has completed rounds N and N+1."
-// This is a simple gate - queues manage themselves, coordinator only controls when DST can advance.
+// It enforces: DST cannot advance to round N until SRC has completed rounds N and N+1;
+// SRC may not run ahead of DST by more than MaxSrcAhead rounds (default 3).
 type QueueCoordinator struct {
-	mu       sync.RWMutex
-	srcRound int  // Current SRC round
-	srcDone  bool // SRC has completed traversal
-	dstRound int  // Current DST round
-	dstDone  bool // DST has completed traversal
+	mu          sync.RWMutex
+	srcRound    int
+	srcDone     bool
+	dstRound    int
+	dstDone     bool
+	maxSrcAhead int // SRC may run when srcRound <= dstRound + maxSrcAhead
 }
+
+const defaultMaxSrcAhead = 3
 
 // NewQueueCoordinator creates a new coordinator.
 func NewQueueCoordinator() *QueueCoordinator {
 	return &QueueCoordinator{
-		srcRound: 0,
-		srcDone:  false,
-		dstRound: 0,
-		dstDone:  false,
+		srcRound:    0,
+		srcDone:     false,
+		dstRound:    0,
+		dstDone:     false,
+		maxSrcAhead: defaultMaxSrcAhead,
+	}
+}
+
+// SetMaxSrcAhead sets the maximum rounds SRC may run ahead of DST (default 3).
+func (c *QueueCoordinator) SetMaxSrcAhead(n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if n >= 0 {
+		c.maxSrcAhead = n
 	}
 }
 
@@ -101,6 +114,21 @@ func (c *QueueCoordinator) IsCompleted(queueType string) bool {
 	default:
 		return false
 	}
+}
+
+// CanSrcStartRound returns true if SRC can run the given round: srcRound <= dstRound + maxSrcAhead (or SRC is done).
+func (c *QueueCoordinator) CanSrcStartRound(srcRound int) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	// If DST has completed traversal, SRC should proceed unconstrained.
+	// This prevents SRC from stalling behind a fixed dstRound after DST exits early.
+	if c.dstDone {
+		return true
+	}
+	if c.srcDone {
+		return true
+	}
+	return srcRound <= c.dstRound+c.maxSrcAhead
 }
 
 // CanDstStartRound returns true if DST can start processing the specified round.

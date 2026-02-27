@@ -8,6 +8,38 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
+// buildExpectedMapsFromChildren builds expected folders, files, srcID map, and srcIDToMeta from a list of SRC child nodes (e.g. from LevelCache.ListChildrenByParentPath).
+func buildExpectedMapsFromChildren(children []*db.NodeState) (
+	folders []types.Folder,
+	files []types.File,
+	idMap map[string]string,
+	srcIDToMeta map[string]SrcNodeMeta,
+) {
+	idMap = make(map[string]string)
+	srcIDToMeta = make(map[string]SrcNodeMeta)
+	for _, n := range children {
+		displayName := n.Name
+		if displayName == "" && n.Path != "" {
+			displayName = n.Path
+		}
+		matchKey := n.Type + ":" + displayName
+		idMap[matchKey] = n.ID
+		srcIDToMeta[n.ID] = SrcNodeMeta{Depth: n.Depth, CopyStatus: n.CopyStatus}
+		if n.Type == types.NodeTypeFolder {
+			folders = append(folders, types.Folder{
+				ServiceID: n.ServiceID, ParentId: n.ParentServiceID, ParentPath: n.ParentPath,
+				DisplayName: displayName, LocationPath: n.Path, LastUpdated: n.MTime, DepthLevel: n.Depth, Type: n.Type,
+			})
+		} else {
+			files = append(files, types.File{
+				ServiceID: n.ServiceID, ParentId: n.ParentServiceID, ParentPath: n.ParentPath,
+				DisplayName: displayName, LocationPath: n.Path, LastUpdated: n.MTime, Size: n.Size, DepthLevel: n.Depth, Type: n.Type,
+			})
+		}
+	}
+	return folders, files, idMap, srcIDToMeta
+}
+
 // BuildExpectedMapsFromDstWithChildren builds expectedFoldersMap, expectedFilesMap, srcIDMap, and srcIDToMeta from a DST batch and its SRC children (e.g. from ListDstBatchWithSrcChildren). Keyed by DST node ID.
 func BuildExpectedMapsFromDstWithChildren(dstBatch []db.FetchResult, childrenByDstID map[string][]*db.NodeState) (
 	expectedFoldersMap map[string][]types.Folder,

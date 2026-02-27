@@ -62,8 +62,14 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		}
 	}
 
+	// In-memory level caches for copy (SRC = source nodes, DST = created nodes)
+	srcCache := queue.NewNodeCache()
+	dstCache := queue.NewNodeCache()
+
 	// Create copy queue (single queue, not dual like traversal)
 	copyQueue := queue.NewQueue("copy", cfg.MaxRetries, cfg.WorkerCount, nil) // No coordinator needed for copy
+	copyQueue.SetNodeCache(srcCache)
+	copyQueue.SetOtherNodeCache(dstCache)
 	copyQueue.SetMode(queue.QueueModeCopy)
 	copyQueue.SetCopyPass(1) // Start with pass 1 (folders)
 

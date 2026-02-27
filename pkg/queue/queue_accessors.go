@@ -484,6 +484,47 @@ func (q *Queue) getCurrentRoundPullCount() int {
 	return info.PullCount
 }
 
+// syncLevelStatsFromDB loads stats for the given depth from the DB into the node cache's LevelStats (used when bootstrapping a level from DB).
+func (q *Queue) syncLevelStatsFromDB(database *db.DB, queueType string, depth int) {
+	nc := q.NodeCache()
+	if nc == nil {
+		return
+	}
+	pending, _ := database.GetStatsCountAtDepth(queueType, depth, db.StatsKeyTraversalStatus(db.StatusPending))
+	successful, _ := database.GetStatsCountAtDepth(queueType, depth, db.StatsKeyTraversalStatus(db.StatusSuccessful))
+	failed, _ := database.GetStatsCountAtDepth(queueType, depth, db.StatsKeyTraversalStatus(db.StatusFailed))
+	completed, _ := database.GetStatsCountAtDepth(queueType, depth, db.StatsKeyCompleted)
+	nc.SetLevelStats(depth, pending, successful, failed, completed)
+}
+
+// RehydrateLevelFromDB loads all nodes at the given depth from the DB into this queue's node cache and syncs level stats.
+// Used on resume so the memory-first path can continue from sealed state without re-pulling from DB on first pull.
+func (q *Queue) RehydrateLevelFromDB(depth int) {
+	database := q.getDatabase()
+	nc := q.NodeCache()
+	if database == nil || nc == nil {
+		return
+	}
+	queueType := getQueueType(q.name)
+	level := nc.EnsureLevel(depth)
+	afterID := ""
+	const batchSize = 5000
+	for {
+		results, err := db.ListNodesByDepthKeyset(database, queueType, depth, afterID, "", batchSize)
+		if err != nil {
+			return
+		}
+		for _, r := range results {
+			level.Put(r.Key, r.State)
+		}
+		if len(results) < batchSize {
+			break
+		}
+		afterID = results[len(results)-1].Key
+	}
+	q.syncLevelStatsFromDB(database, queueType, depth)
+}
+
 // getCurrentRoundPulledAmount returns the number of items actually pulled from the DB (returned by our queries) this round.
 // Used with pull count for completion: if pullCount > 0 && pulledAmount == 0 then we queried but found nothing (round/queue done).
 func (q *Queue) getCurrentRoundPulledAmount() int {

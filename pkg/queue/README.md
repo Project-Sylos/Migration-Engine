@@ -1,26 +1,24 @@
 # Queue Package
 
-The queue layer drives source/destination traversal and copy using the database (`pkg/db`). Two queues (src and dst) perform breadth-first traversal in rounds, with the destination gated by a shared `QueueCoordinator`. Task state lives in the database’s node and stats tables; the queue pulls via keyset queries and writes via the database’s buffered staging and node APIs.
+The queue layer drives source/destination traversal and copy using the database (`pkg/db`). Two queues (src and dst) perform breadth-first traversal in rounds, with the destination gated by a shared `QueueCoordinator`. The **memory-first** flow keeps per-level state in `NodeCache`/`LevelCache`; the DB is only written at **seal** (round advance). The coordinator enforces a configurable SRC-ahead gate (default 3 rounds).
 
 ---
 
 ## High-level flow
 
-1. **Workers** lease tasks from an in-memory buffer that is refilled by **pulling** from the database: keyset queries by depth and status (e.g. `db.ListNodesByDepthKeyset`, `db.ListDstBatchWithSrcChildren`, `db.ListNodesCopyKeyset`).
-2. **Completion** writes go through the database’s buffers: `database.AddToStaging`, `database.AddCopyToStaging`, `database.AddNode`, `database.AddNodes`, and (in retry) `database.AddNodeDeletions`. The DB batches these and flushes via DuckDB Appender; the queue registers an `onFlush` callback so leased keys are removed when a batch is persisted.
-3. **Before each pull** the queue calls `database.FlushTablesForQueue(queueType)` so pending writes are persisted and pulls see up-to-date status.
-4. **Round advancement** happens when the current round is complete (no in-progress, no pending, last pull was partial). At **seal**, the migration layer (or queue) merges staging into the live node tables and recomputes stats (see `pkg/db`).
-5. **Coordinator gating**: DST checks the coordinator before starting a round; SRC may be gated so it does not run more than a few rounds ahead of DST.
+1. **Workers** lease tasks from an in-memory buffer refilled by **pulling**: when `NodeCache` is set, pull from the level cache first (e.g. `LevelCache.ListPending`, `ListPendingCopy`); otherwise from the DB via keyset queries (`db.ListNodesByDepthKeyset`, `db.ListDstBatchWithSrcChildren`, `db.ListNodesCopyKeyset`).
+2. **Completion** updates: when cache is set, the queue updates the level cache (status, children, copy status) and per-level stats; no DB write until seal. When cache is not set, completion goes through the DB’s staging/node buffers as before.
+3. **Round advancement**: when the current round is complete, the queue calls **seal** (in `advanceToNextRound`): snapshot the level from cache, call `database.SealLevel(...)` to bulk-append nodes and write stats for that depth, then drop the level and (for traversal) promote N+1 to N. No staging merge on the memory-first path.
+4. **Coordinator gating**: DST may start a round only when SRC is far enough ahead; SRC may not run more than `MaxSrcAhead` rounds ahead of DST (default 3, configurable via `MigrationConfig.MaxSrcAhead`).
 
 ---
 
 ## Relationship with pkg/db
 
-- **Database**: The queue holds a `*db.DB` reference (`q.database`). It does not open or close the DB. All reads and writes use that single instance (node tables, staging, stats, `queue_stats`).
-- **Pulls**: Use `db.ListNodesByDepthKeyset`, `db.ListDstBatchWithSrcChildren`, and `db.ListNodesCopyKeyset` with depth, status filter, and keyset cursor. Results are converted to `TaskBase` and added to the queue’s `pendingBuff`.
-- **Writes**: Queue calls `database.AddToStaging`, `database.AddCopyToStaging`, `database.AddNode`, `database.AddNodes`, `database.AddNodeDeletions`. The DB owns the buffers and flushes to staging/node tables; the queue’s `SetOnFlush` callback removes leased keys when a batch is flushed.
-- **Completion checks**: Use `database.GetCopyCountAtDepth` (copy mode) and in-memory state (in-progress, pending count, last pull partial). Stats for expected/completed come from `database.GetStatsCountAtDepth` and the stats tables.
-- **Observer**: Reads pending/failed from stats tables (`GetStatsCountAtDepth`); writes metrics to the `queue_stats` table via `database.RunUpdateWriterTx` and `Writer.WriteQueueStats`.
+- **Database**: The queue holds a `*db.DB` reference. When **NodeCache** is set (memory-first), hot-path reads and writes use the cache; the DB is only used at seal (`SealLevel`: bulk append nodes + stats snapshot) and for resume rehydration (`RehydrateLevelFromDB`). When cache is not set, pulls and writes use the DB as before (staging/node buffers, flush before pull).
+- **Pulls**: From cache: `LevelCache.ListPending`, `ListPendingCopy`, `ListChildrenByParentPath`. From DB: `db.ListNodesByDepthKeyset`, `db.ListDstBatchWithSrcChildren`, `db.ListNodesCopyKeyset`. Results become `TaskBase` and are added to `pendingBuff`.
+- **Seal**: `database.SealLevel(table, depth, nodes, pending, successful, failed, completed, copyP, copyS, copyF)` persists one level to the DB and writes per-depth stats. Copy stats (copyP, copyS, copyF) are used for SRC in copy phase; pass -1 for traversal-only.
+- **Completion checks**: When cache is set, completion uses in-memory level stats and cache state; when not, `database.GetCopyCountAtDepth` and stats tables. Observer reads from stats tables and writes `queue_stats`.
 
 ---
 
@@ -28,19 +26,20 @@ The queue layer drives source/destination traversal and copy using the database 
 
 | File                  | Responsibility |
 |-----------------------|----------------|
-| `queue.go`            | Queue struct, Run loop, completion checks, buffer flush before pull, coordinator integration, leasing |
-| `queue_accessors.go`  | Thread-safe getters/setters, keyset cursors, expected-from-stats, round stats |
-| `queue_batch.go`      | BuildExpectedMapsFromDstWithChildren, BatchLoadExpectedChildrenByDSTIDs (expected children for DST tasks) |
-| `mode_traversal.go`   | PullTraversalTasks (keyset pull by depth + pending), traversal completion writes (AddToStaging, AddNode, etc.) |
-| `mode_retry.go`       | PullRetryTasks (pending/failed across levels), same write path as traversal; DST cleanup on SRC folder complete |
-| `mode_copy.go`        | PullCopyTasks (keyset pull by depth + copy_status pending, optional type filter), copy completion (AddCopyToStaging, AddNode for DST) |
+| `queue.go`            | Queue struct, Run loop, seal (advanceToNextRound → SealLevel), coordinator gates, leasing |
+| `level_cache.go`      | LevelCache, NodeCache: per-level nodes and stats; ListPending, ListPendingCopy, DropLevel, PromoteLevel |
+| `queue_accessors.go`  | Thread-safe getters/setters, keyset cursors, syncLevelStatsFromDB, RehydrateLevelFromDB |
+| `queue_batch.go`      | BuildExpectedMapsFromDstWithChildren, batch load expected children for DST tasks |
+| `mode_traversal.go`   | PullTraversalTasks (cache-first or DB keyset), traversal completion (cache or AddToStaging/AddNode) |
+| `mode_retry.go`       | PullRetryTasks; DST cleanup on SRC folder complete |
+| `mode_copy.go`        | PullCopyTasks (cache or DB), copy completion (cache or AddCopyToStaging/AddNode), CheckCopyCompletion |
 | `worker_traversal.go` | TraversalWorker: lease → list children / compare → ReportTaskResult |
 | `worker_copy.go`      | CopyWorker: lease → create folder / copy file → ReportTaskResult |
 | `worker/interface.go` | Worker interface |
 | `task.go`             | TaskBase, ChildResult, task types |
-| `seeding.go`          | SeedRootTask, SeedRootTasks (insert root nodes via db.InsertRootNode, BootstrapRootStats) |
-| `coordinator.go`      | QueueCoordinator: lead window, CanDstStartRound, CanSrcAdvance, completion flags |
-| `observer.go`         | Polls queues, reads stats from DB, writes queue_stats for external metrics |
+| `seeding.go`          | SeedRootTask, SeedRootTasks (insert root nodes, BootstrapRootStats) |
+| `coordinator.go`      | QueueCoordinator: CanDstStartRound, CanSrcStartRound, SetMaxSrcAhead (default 3) |
+| `observer.go`         | Polls queues, reads stats from DB, writes queue_stats |
 
 ---
 
@@ -73,16 +72,11 @@ type TaskBase struct {
 
 ---
 
-## Storage (database tables)
+## Storage
 
-Task state is not stored in the queue; it lives in `pkg/db`:
-
-- **Node tables** (`src_nodes`, `dst_nodes`): One row per node; columns include `id`, `path`, `depth`, `traversal_status`, `copy_status`. Pulls filter by `depth` and status; keyset pagination uses `id > cursor ORDER BY id LIMIT n`.
-- **Staging tables** (`src_staging`, `dst_staging`): Pending status updates (traversal and copy); merged into node tables at **seal** (round advance).
-- **Stats tables** (`src_stats`, `dst_stats`): Per-depth counts by status (e.g. traversal/pending, traversal/successful). Used for completion detection and observer.
-- **queue_stats**: Observer writes per-queue metrics JSON here for external APIs.
-
-There are no level-sharded buckets; the queue uses the same schema as described in `pkg/db`.
+- **Memory-first**: When `NodeCache` is set, active levels (current and next) live in `LevelCache` per queue. Task completion updates the cache and in-memory `LevelStats`. At seal, the level is bulk-appended to the DB and stats are written; the level is then dropped (and N+1 promoted for traversal).
+- **Database** (`pkg/db`): Node tables (`src_nodes`, `dst_nodes`), stats tables (`src_stats`, `dst_stats`), and optional staging tables. Seal writes nodes and stats in one transaction. Resume uses `RehydrateLevelFromDB` to refill the cache from the DB.
+- **queue_stats**: Observer writes per-queue metrics JSON for external APIs.
 
 ---
 
@@ -98,34 +92,32 @@ if err != nil {
 }
 ```
 
-- **Lease**: Task is taken from `pendingBuff` and added to `inProgress`; its key is tracked so it is not pulled again until `onFlush` removes it after the DB flushes that node’s update.
-- **ReportTaskResult**: Queue calls `database.AddToStaging` (and optionally `AddCopyToStaging`, `AddNode`, `AddNodes`, `AddNodeDeletions`). Writes are buffered in the DB; `FlushTablesForQueue` is used before pulls and at completion checks so the DB is up to date.
+- **Lease**: Task is taken from `pendingBuff` and added to `inProgress`; its key is tracked so it is not pulled again (cache path: status updated in cache; DB path: until `onFlush` after buffer flush).
+- **ReportTaskResult**: With cache, the queue updates the level cache and stats; with DB path, it calls `AddToStaging`/`AddCopyToStaging`/`AddNode`/etc. Seal (memory-first) or staging merge (legacy) persists at round advance.
 
 ---
 
 ## Task pulling
 
 - **Pulling flag**: Only one pull runs at a time (`getPulling` / `setPulling`).
-- **Flush before pull**: `database.FlushTablesForQueue(getQueueType(q.name))` so pending staging/node writes are visible.
+- **Cache-first**: When `NodeCache` is set, pull uses `LevelCache.ListPending` / `ListPendingCopy` for the current round; DB is used only when the level is missing (e.g. resume) or for parent/expected lookups. When cache is not set, `FlushTablesForQueue` is called before pull.
 - **State checks**: Pull only when queue is running and pending count is at or below the low-water mark (or when forced).
-- **Coordinator (DST)**: Before pulling, DST checks `coordinator.CanDstStartRound(currentRound)`.
+- **Coordinator**: DST checks `CanDstStartRound(currentRound)`; SRC checks `CanSrcStartRound(currentRound)` (SRC may not run more than `MaxSrcAhead` rounds ahead of DST).
 
-**Traversal**: `db.ListNodesByDepthKeyset(database, queueType, currentRound, cursor, db.StatusPending, batchSize)` (and for DST, `db.ListDstBatchWithSrcChildren` to get DST batch plus SRC children in one query).
+**Traversal**: From cache: `GetLevel(round).ListPending(cursor, batchSize)`; from DB: `db.ListNodesByDepthKeyset` (and for DST, `ListDstBatchWithSrcChildren` or expected from other cache).
 
-**Copy**: `db.ListNodesCopyKeyset(database, depth, nodeType, cursor, limit)` for `copy_status = 'pending'`.
+**Copy**: From cache: `GetLevel(round).ListPendingCopy(cursor, limit, nodeType)`; from DB: `db.ListNodesCopyKeyset`.
 
-**Retry**: Same as traversal but over multiple depths (up to `maxKnownDepth`); pull pending/failed from each level.
+**Retry**: Same as traversal but over multiple depths (up to `maxKnownDepth`).
 
 ---
 
 ## Coordinator
 
-- **QueueCoordinator** keeps SRC and DST round numbers and enforces the lead window.
-- **CanDstStartRound**: DST may start a round only when SRC is far enough ahead (or SRC is complete).
-- **CanSrcAdvance**: SRC may not run arbitrarily far ahead of DST.
-- Completion flags are updated when a queue reaches max depth.
-
-Queues call `WaitForCoordinatorGate` after seeding and when advancing rounds.
+- **QueueCoordinator** keeps SRC and DST round numbers and enforces gating.
+- **CanDstStartRound**: DST may start round N only when SRC has completed rounds N and N+1 (SRC round >= N+2) or SRC is complete.
+- **CanSrcStartRound**: SRC may run round R only when R <= dstRound + MaxSrcAhead (default 3); configurable via `SetMaxSrcAhead` / `MigrationConfig.MaxSrcAhead`.
+- Completion is marked when a queue reaches max depth. Round updates are reported via `UpdateRound` when advancing.
 
 ---
 
@@ -133,30 +125,28 @@ Queues call `WaitForCoordinatorGate` after seeding and when advancing rounds.
 
 ### Traversal (`QueueModeTraversal`)
 
-- Pull: pending nodes at current round (keyset by depth + `traversal_status = 'pending'`).
-- Advance round when round is complete; at seal, staging is merged into live and stats recomputed.
-- DST uses coordinator gate and gets expected children from SRC (e.g. via `ListDstBatchWithSrcChildren`).
+- Pull: from cache (`ListPending`) or DB keyset by depth + `traversal_status = 'pending'`.
+- Completion: update cache (status, children, stats) or staging/node buffers. At seal: `SealLevel` bulk-appends level and writes stats; level dropped, N+1 promoted.
+- DST uses coordinator gate and gets expected children from SRC (cache or `ListDstBatchWithSrcChildren`).
 
 ### Retry (`QueueModeRetry`)
 
-- Pull: pending/failed across known depths (for re-processing marked subtrees).
-- On SRC folder task success: DST cleanup (mark DST parent pending, delete DST children via `AddNodeDeletions`) so DST can re-discover.
-- Same staging/node write path as traversal.
+- Pull: pending/failed across known depths. On SRC folder success: DST cleanup (mark DST parent pending, `AddNodeDeletions` for children). Same cache or staging write path as traversal.
 
 ### Copy (`QueueModeCopy`)
 
-- Pull: `copy_status = 'pending'` at current depth (optional filter by node type for folder vs file pass).
-- Completion: `AddCopyToStaging` for SRC copy status; `AddNode` for DST when creating folders/files.
-- Round advancement uses a hard check: `GetCopyCountAtDepth(round, nodeType, pending)` and `GetCopyCountAtDepth(round, nodeType, in_progress)` must be 0 for the current pass.
+- Pull: from cache (`ListPendingCopy`) or DB by `copy_status = 'pending'` and optional type (folder/file pass).
+- Completion: update SRC copy status and DST node in cache (or `AddCopyToStaging`/`AddNode`). At seal, both SRC and DST levels are sealed with copy stats for SRC.
+- Completion check: no pending/in-progress for current pass (from cache stats or `GetCopyCountAtDepth`).
 
 ---
 
 ## Completion checking
 
 - **Run() loop** polls; completion is not event-driven from task completion.
-- **checkCompletion** (with options): If `FlushBuffer` is true, calls `FlushTablesForQueue` first. Then checks in-memory state (in-progress, pending, last pull partial) and, for copy mode, DB counts for pending/in_progress at the current round and pass.
-- **Round complete**: Advance round (e.g. `advanceToNextRound`); seal is performed by the migration layer (merge staging, recompute stats).
-- **Final completion**: When the first pull of a round returns 0 items and in-progress and pending are 0, the queue is marked completed (mode-specific logic in `CheckTraversalCompletion` / `CheckCopyCompletion`).
+- **checkCompletion**: Checks in-memory state (in-progress, pending, last pull partial) and, for copy mode, cache stats or DB counts for pending/in_progress. When cache is set, `FlushBuffer` is not used.
+- **Round complete**: `advanceToNextRound` runs seal (bulk append + stats snapshot via `SealLevel`, then drop/promote level) or legacy staging merge.
+- **Final completion**: When the first pull of a round returns 0 items and in-progress and pending are 0, the queue is marked completed (mode-specific in `CheckTraversalCompletion` / `CheckCopyCompletion`).
 
 ---
 
@@ -171,7 +161,7 @@ Queues call `WaitForCoordinatorGate` after seeding and when advancing rounds.
 
 - Open the existing database (same file as before).
 - **InspectMigrationStatus** (in `pkg/migration`) reads node counts and stats from the DB to get pending/failed and min pending depth.
-- Set queue round from that state; workers pull from the same keyset queries at the resumed round. No separate resumption format; the node and stats tables are the source of truth.
+- Set queue round from that state. When **NodeCache** is set, `RehydrateLevelFromDB(depth)` is called for each queue so the level cache is refilled from the DB and level stats are synced; workers then pull from cache. Otherwise workers pull from keyset queries at the resumed round. The DB is the source of truth for sealed state.
 
 ---
 
@@ -179,10 +169,14 @@ Queues call `WaitForCoordinatorGate` after seeding and when advancing rounds.
 
 ```
 pkg/queue/
-├── queue.go           # Queue struct, Run, checkCompletion, Lease, ReportTaskResult, InitializeWithContext
-├── queue_accessors.go # Getters/setters, keyset cursors, setExpectedFromStatsBucket
+├── queue.go           # Queue struct, Run, advanceToNextRound (seal), Lease, ReportTaskResult, InitializeWithContext
+├── level_cache.go     # LevelCache, NodeCache (per-level nodes and stats)
+├── level_cache_test.go
+├── coordinator.go     # QueueCoordinator, CanDstStartRound, CanSrcStartRound, SetMaxSrcAhead
+├── coordinator_test.go
+├── queue_accessors.go # Getters/setters, syncLevelStatsFromDB, RehydrateLevelFromDB
 ├── queue_batch.go     # BuildExpectedMapsFromDstWithChildren, BatchLoadExpectedChildrenByDSTIDs
-├── mode_traversal.go  # PullTraversalTasks, traversal completion writes
+├── mode_traversal.go  # PullTraversalTasks, traversal completion (cache or staging)
 ├── mode_retry.go      # PullRetryTasks
 ├── mode_copy.go       # PullCopyTasks, copy completion, CheckCopyCompletion
 ├── worker_traversal.go
@@ -191,7 +185,6 @@ pkg/queue/
 │   └── interface.go
 ├── task.go
 ├── seeding.go
-├── coordinator.go
 ├── observer.go
 └── README.md
 ```
@@ -200,8 +193,8 @@ pkg/queue/
 
 ## Summary
 
-- The queue uses **one database** (`*db.DB`): node tables, staging, and stats (see `pkg/db`). No separate store.
-- **Pull**: Keyset queries by depth and status; results go into `pendingBuff` and are leased to workers.
-- **Writes**: Staging and node inserts via the DB’s buffer API; flush before pulls and at completion checks; staging is merged at seal by the migration layer.
-- **Coordinator** enforces the SRC/DST lead window. **Observer** reads stats from the DB and writes queue metrics to `queue_stats`.
-- **Modes**: Traversal (BFS by round), Retry (re-process pending/failed across depths, with DST cleanup), Copy (by copy_status and optional type).
+- **Memory-first**: When `NodeCache` is set, hot-path reads/writes use per-level caches; the DB is written only at seal (`SealLevel`) and used for resume rehydration. Legacy path uses staging/node buffers and merge at seal.
+- **Pull**: From cache (ListPending / ListPendingCopy) or DB keyset queries; results go into `pendingBuff` and are leased to workers.
+- **Seal**: At round advance, sealed level is bulk-appended to the DB and stats snapshot written; level is dropped (and N+1 promoted for traversal).
+- **Coordinator** enforces DST lead (SRC ahead by N+2) and SRC-ahead cap (default 3). **Observer** reads stats from the DB and writes `queue_stats`.
+- **Modes**: Traversal (BFS by round), Retry (re-process pending/failed, DST cleanup), Copy (by copy_status and type, two passes).

@@ -91,6 +91,47 @@ func (w *Writer) AppendCopyStaging(nodeID, _, newCopyStatus string) error {
 	return err
 }
 
+// WriteLevelStatsSnapshot writes per-depth stats for a sealed level (traversal counts + completed). If copyPending >= 0 and table is SRC, also writes copy/* keys.
+func (w *Writer) WriteLevelStatsSnapshot(table string, depth int, pending, successful, failed, completed int64, copyPending, copySuccessful, copyFailed int64) error {
+	ctx := context.Background()
+	statsTbl := tableSrcStats
+	if table == "DST" {
+		statsTbl = tableDstStats
+	}
+	_, err := w.tx.ExecContext(ctx, `DELETE FROM `+statsTbl+` WHERE depth = $1`, depth)
+	if err != nil {
+		return err
+	}
+	for _, pair := range []struct {
+		key   string
+		count int64
+	}{
+		{StatsKeyTraversalStatus(StatusPending), pending},
+		{StatsKeyTraversalStatus(StatusSuccessful), successful},
+		{StatsKeyTraversalStatus(StatusFailed), failed},
+		{StatsKeyCompleted, completed},
+	} {
+		if err := w.SetStatsCountForDepth(table, depth, pair.key, pair.count); err != nil {
+			return err
+		}
+	}
+	if table == "SRC" && copyPending >= 0 {
+		for _, pair := range []struct {
+			key   string
+			count int64
+		}{
+			{StatsKeyCopyStatus(CopyStatusPending), copyPending},
+			{StatsKeyCopyStatus(CopyStatusSuccessful), copySuccessful},
+			{StatsKeyCopyStatus(CopyStatusFailed), copyFailed},
+		} {
+			if err := w.SetStatsCountForDepth(table, depth, pair.key, pair.count); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // SetStatsCountForDepth sets (depth, key, count) in src_stats or dst_stats. Must be called inside RunUpdateWriterTx. Used at seal after merging staging into live.
 func (w *Writer) SetStatsCountForDepth(table string, depth int, key string, count int64) error {
 	tbl := tableSrcStats

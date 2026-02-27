@@ -1,5 +1,5 @@
 {
-  "mode": "persistent",
+  "mode": "ephemeral",
   "seed": {
     "max_depth": 5,
     "max_folders": 50,

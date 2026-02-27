@@ -266,6 +266,19 @@ type NodeDeletion struct {
 	NodeID string
 }
 
+// SealLevel persists a sealed level from memory cache to the DB (bulk append + stats snapshot). copyP/copyS/copyF are used for SRC copy stats when >= 0.
+func (db *DB) SealLevel(table string, depth int, nodes []*NodeState, pending, successful, failed, completed int64, copyP, copyS, copyF int64) error {
+	if table != "SRC" && table != "DST" {
+		return nil
+	}
+	return db.RunUpdateWriterTx(func(w *Writer) error {
+		if err := w.AppenderInsert(table, nodes); err != nil {
+			return err
+		}
+		return w.WriteLevelStatsSnapshot(table, depth, pending, successful, failed, completed, copyP, copyS, copyF)
+	})
+}
+
 // FlushTablesForQueue flushes the buffers for the tables that queue writes to.
 // Uses ForceFlush to persist partial batches before pull/round advance.
 // SRC: src_staging + src_nodes. DST: dst_staging + dst_nodes + src_staging.

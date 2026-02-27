@@ -27,6 +27,7 @@ type MigrationConfig struct {
 	WorkerCount     int
 	MaxRetries      int
 	CoordinatorLead int
+	MaxSrcAhead     int           // Max rounds SRC may run ahead of DST (default 3); 0 uses default
 	LogAddress      string
 	LogLevel        string
 	SkipListener    bool
@@ -77,16 +78,26 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		}
 	}
 
-	// Create coordinator for round advancement gates
 	coordinator := queue.NewQueueCoordinator()
+	if cfg.MaxSrcAhead > 0 {
+		coordinator.SetMaxSrcAhead(cfg.MaxSrcAhead)
+	}
+
+	// In-memory level caches (memory-first hot path; DB only at seal)
+	srcCache := queue.NewNodeCache()
+	dstCache := queue.NewNodeCache()
 
 	// Create queues
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
+	srcQueue.SetNodeCache(srcCache)
+	srcQueue.SetOtherNodeCache(dstCache)
 	srcQueue.InitializeWithContext(database, cfg.SrcAdapter, cfg.ShutdownContext)
 	// Note: Queues clean themselves up when they complete (Run() exits when state=QueueStateCompleted)
 	// We only need to explicitly close for forced shutdowns, which is handled via Pause() + shutdown context
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
+	dstQueue.SetNodeCache(dstCache)
+	dstQueue.SetOtherNodeCache(srcCache)
 	dstQueue.InitializeWithContext(database, cfg.DstAdapter, cfg.ShutdownContext)
 	// Note: Queues clean themselves up when they complete (Run() exits when state=QueueStateCompleted)
 	// We only need to explicitly close for forced shutdowns, which is handled via Pause() + shutdown context
@@ -305,7 +316,6 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 	srcQueue.EnsureRoundExpectedFromStats()
 	dstQueue.EnsureRoundExpectedFromStats()
 
-	// Update coordinator state
 	if coordinator != nil {
 		coordinator.UpdateRound("src", srcRound)
 		if dstRound >= 0 {
@@ -313,6 +323,14 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 		} else {
 			coordinator.MarkCompleted("dst")
 		}
+	}
+
+	// Rehydrate level caches from DB on resume so memory-first path can continue without re-pull
+	if srcQueue.NodeCache() != nil && srcRound > 0 {
+		srcQueue.RehydrateLevelFromDB(srcRound)
+	}
+	if dstQueue.NodeCache() != nil && dstRound > 0 {
+		dstQueue.RehydrateLevelFromDB(dstRound)
 	}
 
 	// Don't pull tasks here - let Run() handle the initial pull

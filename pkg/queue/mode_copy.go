@@ -33,17 +33,21 @@ func (q *Queue) CheckCopyCompletion(currentRound int, wasFirstPull bool) bool {
 		return false // Let advanceToNextRound handle progression
 	}
 
-	// We've reached or passed maxKnownDepth for current pass
-	// Now check if there are any pending or in-progress tasks for the current pass at any level
-	levels, err := db.GetAllLevels(database, "SRC")
-	if err != nil {
-		return false
-	}
-
-	// Determine node type for current pass
 	nodeType := db.NodeTypeFolder
 	if copyPass == 2 {
 		nodeType = db.NodeTypeFile
+	}
+
+	var levels []int
+	nc := q.NodeCache()
+	if nc != nil {
+		levels = nc.LevelDepths()
+	} else {
+		var err error
+		levels, err = db.GetAllLevels(database, "SRC")
+		if err != nil {
+			return false
+		}
 	}
 
 	hasAnyPendingForPass := false
@@ -51,31 +55,33 @@ func (q *Queue) CheckCopyCompletion(currentRound int, wasFirstPull bool) bool {
 	inProgressLevels := []int{}
 	for _, level := range levels {
 		if level == 0 {
-			continue // Skip round 0
+			continue
 		}
-		c, err := database.GetCopyCountAtDepth(level, nodeType, db.CopyStatusPending)
-		if err == nil && c > 0 {
-			hasAnyPendingForPass = true
-		}
-		c2, err := database.GetCopyCountAtDepth(level, nodeType, db.CopyStatusInProgress)
-		hasInProgress := err == nil && c2 > 0
-		if err == nil && hasInProgress {
-			hasAnyInProgressForPass = true
-			inProgressLevels = append(inProgressLevels, level)
-		}
-		if hasAnyPendingForPass && hasAnyInProgressForPass {
-			break // Found both, no need to continue
-		}
-	}
-
-	// Log in-progress tasks if found
-	if hasAnyInProgressForPass {
-		if logservice.LS != nil {
-			err := logservice.LS.Log("warn", fmt.Sprintf("Found in-progress tasks for pass %d (nodeType=%s) at levels: %v", copyPass, nodeType, inProgressLevels), "queue", q.name, q.name)
-			if err != nil {
-				fmt.Println("error logging", err)
+		if nc != nil {
+			ls := nc.GetLevelStats(level)
+			if ls != nil && ls.CopyPending > 0 {
+				hasAnyPendingForPass = true
+			}
+		} else {
+			c, err := database.GetCopyCountAtDepth(level, nodeType, db.CopyStatusPending)
+			if err == nil && c > 0 {
+				hasAnyPendingForPass = true
+			}
+			c2, err := database.GetCopyCountAtDepth(level, nodeType, db.CopyStatusInProgress)
+			if err == nil && c2 > 0 {
+				hasAnyInProgressForPass = true
+				inProgressLevels = append(inProgressLevels, level)
 			}
 		}
+		if hasAnyPendingForPass && (hasAnyInProgressForPass || (nc != nil && q.InProgressCount() > 0)) {
+			break
+		}
+	}
+	if nc != nil {
+		hasAnyInProgressForPass = q.InProgressCount() > 0
+	}
+	if hasAnyInProgressForPass && logservice.LS != nil {
+		_ = logservice.LS.Log("warn", fmt.Sprintf("Found in-progress tasks for pass %d (nodeType=%s) at levels: %v", copyPass, nodeType, inProgressLevels), "queue", q.name, q.name)
 	}
 
 	// If no pending tasks in DuckDB, no in-progress tasks in DuckDB, no pending in memory,
@@ -84,21 +90,29 @@ func (q *Queue) CheckCopyCompletion(currentRound int, wasFirstPull bool) bool {
 	// Tasks retrying are in-progress in DuckDB but pending in memory
 	if !hasAnyPendingForPass && !hasAnyInProgressForPass && q.GetPendingCount() == 0 && q.InProgressCount() == 0 && wasFirstPull {
 		if copyPass == 1 {
-			// Pass 1 (folders) complete - switch to pass 2 (files)
 			q.SetCopyPass(2)
 
-			// Find minimum level with pending file tasks for pass 2
 			minLevel := -1
 			for _, level := range levels {
 				if level == 0 {
-					continue // Skip round 0
+					continue
 				}
-				c, err := database.GetCopyCountAtDepth(level, db.NodeTypeFile, db.CopyStatusPending)
-				if err == nil && c > 0 {
-					if minLevel == -1 || level < minLevel {
-						minLevel = level
+				if nc != nil {
+					lvl := nc.GetLevel(level)
+					if lvl != nil && len(lvl.ListPendingCopy("", 1, db.NodeTypeFile)) > 0 {
+						if minLevel == -1 || level < minLevel {
+							minLevel = level
+						}
+						break
 					}
-					break
+				} else {
+					c, err := database.GetCopyCountAtDepth(level, db.NodeTypeFile, db.CopyStatusPending)
+					if err == nil && c > 0 {
+						if minLevel == -1 || level < minLevel {
+							minLevel = level
+						}
+						break
+					}
 				}
 			}
 
@@ -135,56 +149,69 @@ func (q *Queue) AdvanceCopyRound() {
 		return
 	}
 
-	// Flush buffer before advancing to ensure all pending writes (like DST node creation)
-	// are persisted before the next round's tasks try to read them
-	database.FlushTablesForQueue(getQueueType(q.name))
+	if q.NodeCache() == nil {
+		database.FlushTablesForQueue(getQueueType(q.name))
+	}
 
 	currentRound := q.GetRound()
 	copyPass := q.GetCopyPass()
 
-	// Get all levels to check
-	levels, err := db.GetAllLevels(database, "SRC")
-	if err != nil {
-		if logservice.LS != nil {
-			err := logservice.LS.Log("error", fmt.Sprintf("Error getting levels: %v", err), "queue", q.name, q.name)
-			if err != nil {
-				fmt.Println("error logging", err)
-			}
-		}
-		return
-	}
-
-	// Determine node type for current pass
 	nodeType := db.NodeTypeFolder
 	if copyPass == 2 {
 		nodeType = db.NodeTypeFile
 	}
 
-	// Check if current round still has pending tasks matching the current pass
+	nc := q.NodeCache()
+	var levels []int
+	if nc != nil {
+		levels = nc.LevelDepths()
+	} else {
+		var err error
+		levels, err = db.GetAllLevels(database, "SRC")
+		if err != nil {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("error", fmt.Sprintf("Error getting levels: %v", err), "queue", q.name, q.name)
+			}
+			return
+		}
+	}
+
 	currentRoundHasPending := false
 	if currentRound > 0 {
-		c, err := database.GetCopyCountAtDepth(currentRound, nodeType, db.CopyStatusPending)
-		if err == nil && c > 0 {
-			currentRoundHasPending = true
+		if nc != nil {
+			lvl := nc.GetLevel(currentRound)
+			if lvl != nil && len(lvl.ListPendingCopy("", 1, nodeType)) > 0 {
+				currentRoundHasPending = true
+			}
+		} else {
+			c, err := database.GetCopyCountAtDepth(currentRound, nodeType, db.CopyStatusPending)
+			if err == nil && c > 0 {
+				currentRoundHasPending = true
+			}
 		}
 	}
 
 	var newRound int
-
-	// If current round still has pending tasks, stay on it
 	if currentRoundHasPending {
 		newRound = currentRound
 	} else {
-		// Find the next round (after currentRound) that has pending tasks matching the current pass
 		newRound = -1
 		for _, level := range levels {
 			if level <= currentRound || level == 0 {
-				continue // Skip current round, previous rounds, and round 0
+				continue
 			}
-			c, err := database.GetCopyCountAtDepth(level, nodeType, db.CopyStatusPending)
-			if err == nil && c > 0 {
-				newRound = level
-				break
+			if nc != nil {
+				lvl := nc.GetLevel(level)
+				if lvl != nil && len(lvl.ListPendingCopy("", 1, nodeType)) > 0 {
+					newRound = level
+					break
+				}
+			} else {
+				c, err := database.GetCopyCountAtDepth(level, nodeType, db.CopyStatusPending)
+				if err == nil && c > 0 {
+					newRound = level
+					break
+				}
 			}
 		}
 	}
@@ -271,68 +298,80 @@ func (q *Queue) PullCopyTasks(force bool) {
 		q.setPulling(false)
 	}()
 
-	// Force-flush buffer before pulling tasks to ensure we don't pull tasks
-	// that are waiting in the buffer to be written
-	database.FlushTablesForQueue(getQueueType(q.name))
+	// When using staging, flush before pull so we don't pull tasks still in buffer
+	if q.NodeCache() == nil {
+		database.FlushTablesForQueue(getQueueType(q.name))
+	}
 
-	// Get state snapshot
 	snapshot := q.getStateSnapshot()
-
-	// Even when forcing, don't pull if paused
 	if snapshot.State == QueueStatePaused {
 		return
 	}
-
-	if !force {
-		// Only pull if queue is running and buffer is low
-		if snapshot.PendingCount > snapshot.PullLowWM {
-			return
-		}
+	if !force && snapshot.PendingCount > snapshot.PullLowWM {
+		return
 	}
 
 	currentRound := snapshot.Round
-
-	// Skip round 0 (root already exists)
 	if currentRound == 0 {
 		return
 	}
 
-	// Get current copy pass (1 for folders, 2 for files)
 	copyPass := q.GetCopyPass()
-
-	// Determine node type for current pass
 	nodeType := db.NodeTypeFolder
 	if copyPass == 2 {
 		nodeType = db.NodeTypeFile
 	}
 
-	// Fetch pending copy tasks via keyset (copy_status = 'pending' in query; cursor is round-scoped).
 	batchSize := effectiveLeaseBatchSize()
-	results, err := db.ListNodesCopyKeyset(database, currentRound, nodeType, q.getCopyKeysetCursor(), batchSize)
-	if err != nil {
-		if logservice.LS != nil {
-			err := logservice.LS.Log("error", fmt.Sprintf("Failed to fetch copy tasks: round=%d, error=%v", currentRound, err), "queue", q.name, q.name)
-			if err != nil {
-				fmt.Println("error logging", err)
+	var matchedBatch []db.FetchResult
+	var hitEndOfBucket bool
+
+	nc := q.NodeCache()
+	var level *LevelCache
+	if nc != nil {
+		level = nc.GetLevel(currentRound)
+	}
+	if nc != nil && level != nil {
+		pendingNodes := level.ListPendingCopy(q.getCopyKeysetCursor(), batchSize, nodeType)
+		for _, n := range pendingNodes {
+			if n == nil || q.isLeased(n.ID) {
+				continue
+			}
+			matchedBatch = append(matchedBatch, db.FetchResult{Key: n.ID, State: n})
+			if len(matchedBatch) >= batchSize {
+				break
 			}
 		}
-		return
-	}
-
-	var matchedBatch []db.FetchResult
-	for _, r := range results {
-		if q.isLeased(r.Key) {
-			continue
+		if len(matchedBatch) > 0 {
+			q.setCopyKeysetCursor(matchedBatch[len(matchedBatch)-1].Key)
+			for _, r := range matchedBatch {
+				level.UpdateStatus(r.State.ID, "", db.CopyStatusInProgress)
+				nc.RecordCopyTransition(currentRound, db.CopyStatusPending, db.CopyStatusInProgress)
+			}
 		}
-		matchedBatch = append(matchedBatch, r)
-		if len(matchedBatch) >= batchSize {
-			break
+		hitEndOfBucket = len(pendingNodes) < batchSize
+	} else {
+		results, err := db.ListNodesCopyKeyset(database, currentRound, nodeType, q.getCopyKeysetCursor(), batchSize)
+		if err != nil {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("error", fmt.Sprintf("Failed to fetch copy tasks: round=%d, error=%v", currentRound, err), "queue", q.name, q.name)
+			}
+			return
 		}
+		for _, r := range results {
+			if q.isLeased(r.Key) {
+				continue
+			}
+			matchedBatch = append(matchedBatch, r)
+			if len(matchedBatch) >= batchSize {
+				break
+			}
+		}
+		if len(matchedBatch) > 0 {
+			q.setCopyKeysetCursor(matchedBatch[len(matchedBatch)-1].Key)
+		}
+		hitEndOfBucket = len(results) < batchSize
 	}
-	if len(matchedBatch) > 0 {
-		q.setCopyKeysetCursor(matchedBatch[len(matchedBatch)-1].Key)
-	}
-	hitEndOfBucket := len(results) < batchSize
 
 	// Batch resolve parent SRC ID -> DST ID -> DST node (ServiceID). No per-item DB reads.
 	parentIDSet := make(map[string]struct{})
@@ -434,21 +473,16 @@ func (q *Queue) PullCopyTasks(force bool) {
 		}
 		task.DstParentID = dstParentNode.ServiceID
 
-		// Enqueue task first - only proceed if enqueue succeeds
 		if q.Add(task) {
 			q.addLeasedKey(item.Key)
 			enqueueSuccessCount++
-
-			// ONLY queue status update if we successfully enqueued the task
-			// This prevents queueing status updates for already-leased or duplicate tasks
-			database.AddCopyToStaging(item.State.ID, currentRound, db.CopyStatusPending, db.CopyStatusInProgress)
+			if nc == nil {
+				database.AddCopyToStaging(item.State.ID, currentRound, db.CopyStatusPending, db.CopyStatusInProgress)
+			}
 		}
 	}
 
-	// This ensures the status updates are written to DuckDB before any hard checks run
-	// Without this flush, hard checks will still see tasks in the pending bucket
-	// Only flush if we actually enqueued tasks (enqueueSuccessCount > 0)
-	if enqueueSuccessCount > 0 {
+	if enqueueSuccessCount > 0 && nc == nil {
 		database.FlushTablesForQueue(getQueueType(q.name))
 	}
 
@@ -513,7 +547,6 @@ func nodeStateToCopyTask(state *db.NodeState, taskType string, copyPass int) *Ta
 // CompleteCopyTask handles successful completion of copy tasks.
 // Updates copy status, creates DST node entry, and updates join-lookup mapping.
 func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
-	// Record execution time delta
 	q.recordExecutionTime(executionDelta)
 
 	currentRound := task.Round
@@ -527,14 +560,10 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 	task.Locked = false
 	task.Status = "successful"
 
-	// Increment completed count
 	q.incrementRoundStatsCompleted(currentRound)
 	q.incrementTasksCompletedTotal()
-
-	// Record task completion in RoundInfo
 	q.recordTaskCompletion(currentRound, true)
 
-	// Use only task fields (no DB read). Derive type/path/name/size/mtime from task.
 	taskType := types.NodeTypeFile
 	taskPath := task.LocationPath()
 	taskName := task.File.DisplayName
@@ -546,35 +575,59 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 		taskMTime = task.Folder.LastUpdated
 	}
 
-	// Update copy status: in-progress -> successful
-	database.AddCopyToStaging(nodeID, currentRound, db.CopyStatusInProgress, db.CopyStatusSuccessful)
-
-	// Create DST node entry and update join-lookup (deterministic ID from path)
-	dstNodeID := db.DeterministicNodeID("DST", taskType, taskPath)
-	var dstServiceID string
-	if task.IsFolder() {
-		dstServiceID = task.Folder.ServiceID
+	nc := q.NodeCache()
+	if nc != nil {
+		nc.EnsureLevel(currentRound).UpdateStatus(nodeID, "", db.CopyStatusSuccessful)
+		nc.RecordCopyTransition(currentRound, db.CopyStatusInProgress, db.CopyStatusSuccessful)
+		dstNodeID := db.DeterministicNodeID("DST", taskType, taskPath)
+		var dstServiceID string
+		if task.IsFolder() {
+			dstServiceID = task.Folder.ServiceID
+		} else {
+			dstServiceID = task.File.ServiceID
+		}
+		dstNode := &db.NodeState{
+			ID:              dstNodeID,
+			ServiceID:       dstServiceID,
+			ParentID:        "",
+			ParentServiceID: task.DstParentID,
+			Name:            taskName,
+			Path:            taskPath,
+			Type:            taskType,
+			Size:            taskSize,
+			MTime:           taskMTime,
+			Depth:           currentRound,
+			TraversalStatus: db.StatusSuccessful,
+			Status:          db.StatusSuccessful,
+		}
+		other := q.OtherNodeCache()
+		if other != nil {
+			other.EnsureLevel(currentRound).Put(dstNodeID, dstNode)
+		}
 	} else {
-		dstServiceID = task.File.ServiceID
-	}
-	dstNode := &db.NodeState{
-		ID:              dstNodeID,
-		ServiceID:       dstServiceID,
-		ParentID:        "",
-		ParentServiceID: "",
-		Name:            taskName,
-		Path:            taskPath,
-		Type:            taskType,
-		Size:            taskSize,
-		MTime:           taskMTime,
-		Depth:           currentRound,
+		database.AddCopyToStaging(nodeID, currentRound, db.CopyStatusInProgress, db.CopyStatusSuccessful)
+		dstNodeID := db.DeterministicNodeID("DST", taskType, taskPath)
+		var dstServiceID string
+		if task.IsFolder() {
+			dstServiceID = task.Folder.ServiceID
+		} else {
+			dstServiceID = task.File.ServiceID
+		}
+		dstNode := &db.NodeState{
+			ID:              dstNodeID,
+			ServiceID:       dstServiceID,
+			ParentID:        "",
+			ParentServiceID: "",
+			Name:            taskName,
+			Path:            taskPath,
+			Type:            taskType,
+			Size:            taskSize,
+			MTime:           taskMTime,
+			Depth:           currentRound,
+		}
+		database.AddNode("DST", dstNode, db.StatusSuccessful)
 	}
 
-	// Queue the creation of the DST node (DB-owned buffer)
-	// DST nodes use traversal status (not copy status) - mark as "successful" since it was just created
-	database.AddNode("DST", dstNode, db.StatusSuccessful)
-
-	// Track metrics based on task type
 	q.mu.Lock()
 	if task.IsFolder() {
 		q.foldersCreatedTotal++
@@ -584,7 +637,6 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 	}
 	q.mu.Unlock()
 
-	// Remove from in-progress
 	q.removeInProgress(nodeID)
 }
 
@@ -640,18 +692,19 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 			}
 		}
 	} else {
-		// Max retries exceeded: mark as failed
-		// Only NOW do we add to buffer - this is the final failure
 		task.Locked = false
 		task.Status = "failed"
 
-		// Increment failed count and completed total
 		q.incrementRoundStatsFailed(currentRound)
 		q.incrementTasksCompletedTotal()
 		q.recordTaskCompletion(currentRound, false)
 
-		// Add to buffer only on final failure
-		database.AddCopyToStaging(nodeID, currentRound, db.CopyStatusInProgress, db.CopyStatusFailed)
+		if nc := q.NodeCache(); nc != nil {
+			nc.EnsureLevel(currentRound).UpdateStatus(nodeID, "", db.CopyStatusFailed)
+			nc.RecordCopyTransition(currentRound, db.CopyStatusInProgress, db.CopyStatusFailed)
+		} else {
+			database.AddCopyToStaging(nodeID, currentRound, db.CopyStatusInProgress, db.CopyStatusFailed)
+		}
 
 		q.removeInProgress(nodeID)
 

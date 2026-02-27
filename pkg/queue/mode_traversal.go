@@ -40,10 +40,6 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		q.setPulling(false)
 	}()
 
-	// Force-flush buffer before pulling tasks to ensure we don't pull tasks
-	// that are waiting in the buffer to be written
-	database.FlushTablesForQueue(getQueueType(q.name))
-
 	queueType := getQueueType(q.name)
 	taskType := TaskTypeSrcTraversal
 	if q.name == "dst" {
@@ -72,17 +68,94 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	if q.name == "dst" && coordinator != nil {
 		canStartRound := coordinator.CanDstStartRound(currentRound)
 		if !canStartRound {
-			// Can't start this round yet - wait for coordinator gate
 			return
 		}
 	}
 
 	batchSize := effectiveLeaseBatchSize()
+	nc := q.NodeCache()
+
+	// Memory-first: try pull from cache
+	if nc != nil {
+		level := nc.GetLevel(currentRound)
+		if level != nil {
+			cursor := q.getSrcKeysetCursor()
+			if q.name == "dst" {
+				cursor = q.getDstKeysetCursor()
+			}
+			list := level.ListPending(cursor, batchSize)
+			if len(list) > 0 {
+				lastKey := list[len(list)-1].ID
+				if q.name == "dst" {
+					q.setDstKeysetCursor(lastKey)
+				} else {
+					q.setSrcKeysetCursor(lastKey)
+				}
+				expectedFoldersMap := make(map[string][]types.Folder)
+				expectedFilesMap := make(map[string][]types.File)
+				srcIDMap := make(map[string]map[string]string)
+				srcIDToMeta := make(map[string]SrcNodeMeta)
+				if q.name == "dst" {
+					other := q.OtherNodeCache()
+					nextLevel := other.GetLevel(currentRound + 1)
+					for _, state := range list {
+						if state.Type != types.NodeTypeFolder {
+							continue
+						}
+						dstID := state.ID
+						var children []*db.NodeState
+						if nextLevel != nil {
+							children = nextLevel.ListChildrenByParentPath(state.Path)
+						}
+						folders, files, idMap, meta := buildExpectedMapsFromChildren(children)
+						expectedFoldersMap[dstID], expectedFilesMap[dstID], srcIDMap[dstID] = folders, files, idMap
+						for k, v := range meta {
+							srcIDToMeta[k] = v
+						}
+					}
+				}
+				for _, state := range list {
+					if q.isLeased(state.ID) {
+						continue
+					}
+					task := nodeStateToTask(state, taskType)
+					if task != nil && task.ID == "" {
+						task.ID = state.ID
+					}
+					if q.name == "dst" && task != nil && task.IsFolder() {
+						task.ExpectedFolders = expectedFoldersMap[state.ID]
+						task.ExpectedFiles = expectedFilesMap[state.ID]
+						task.ExpectedSrcIDMap = srcIDMap[state.ID]
+						if task.ExpectedSrcIDMap != nil {
+							task.ExpectedSrcNodeMeta = make(map[string]SrcNodeMeta)
+							for _, srcID := range task.ExpectedSrcIDMap {
+								if meta, ok := srcIDToMeta[srcID]; ok {
+									task.ExpectedSrcNodeMeta[srcID] = meta
+								}
+							}
+						}
+					}
+					if task != nil && q.Add(task) {
+						q.addLeasedKey(state.ID)
+					}
+				}
+				q.setLastPullWasPartial(len(list) < batchSize)
+				q.recordPull(currentRound, len(list), len(list) < batchSize)
+				return
+			}
+		}
+	}
+
+	// Fallback: flush buffer (legacy) and pull from DB
+	if nc == nil {
+		database.FlushTablesForQueue(getQueueType(q.name))
+	}
+
 	var batch []db.FetchResult
 	var expectedFoldersMap map[string][]types.Folder
 	var expectedFilesMap map[string][]types.File
-	var srcIDMap map[string]map[string]string // DST ULID -> (Type+Name -> SRC node ID)
-	var srcIDToMeta map[string]SrcNodeMeta    // SRC ID -> Depth/CopyStatus (for copy-status updates at completion)
+	var srcIDMap map[string]map[string]string
+	var srcIDToMeta map[string]SrcNodeMeta
 	var err error
 
 	if q.name == "dst" {
@@ -91,6 +164,12 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		if err == nil && len(batch) > 0 {
 			q.setDstKeysetCursor(batch[len(batch)-1].Key)
 			expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta = BuildExpectedMapsFromDstWithChildren(batch, childrenByDstID)
+			if nc != nil {
+				for _, item := range batch {
+					nc.EnsureLevel(currentRound).Put(item.Key, item.State)
+				}
+				q.syncLevelStatsFromDB(database, queueType, currentRound)
+			}
 		}
 		if err != nil {
 			batch = nil
@@ -99,14 +178,17 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		batch, err = db.ListNodesByDepthKeyset(database, queueType, currentRound, q.getSrcKeysetCursor(), db.StatusPending, batchSize)
 		if err == nil && len(batch) > 0 {
 			q.setSrcKeysetCursor(batch[len(batch)-1].Key)
+			if nc != nil {
+				for _, item := range batch {
+					nc.EnsureLevel(currentRound).Put(item.Key, item.State)
+				}
+				q.syncLevelStatsFromDB(database, queueType, currentRound)
+			}
 		}
 	}
 	if err != nil {
 		if logservice.LS != nil {
-			err := logservice.LS.Log("debug", fmt.Sprintf("Failed to fetch batch from DuckDB: %v", err), "queue", q.name, q.name)
-			if err != nil {
-				fmt.Println("error logging", err)
-			}
+			_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to fetch batch from DuckDB: %v", err), "queue", q.name, q.name)
 		}
 		return
 	}
@@ -345,13 +427,40 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 		}
 	}
 
-	// Write to DB buffers (DB-owned, table-scoped)
-	// Parent status update: pending -> successful
-	database.AddToStaging(queueType, nodeID, task.Round, db.StatusPending, db.StatusSuccessful)
-
-	// Child inserts
-	if len(childNodesToInsert) > 0 {
-		database.AddNodes(childNodesToInsert)
+	nc := q.NodeCache()
+	if nc != nil {
+		// Memory-first: update cache only
+		level := nc.EnsureLevel(currentRound)
+		level.UpdateStatus(nodeID, db.StatusSuccessful, "")
+		nc.RecordTraversalTransition(currentRound, db.StatusPending, db.StatusSuccessful)
+		nc.IncrementCompleted(currentRound)
+		nextLevel := nc.EnsureLevel(nextRound)
+		for _, op := range childNodesToInsert {
+			if op.State != nil {
+				nextLevel.Put(op.State.ID, op.State)
+				nc.IncrementPending(nextRound)
+			}
+		}
+		// DST: update SRC copy status in other cache for children that have SrcID
+		if queueType == "DST" {
+			other := q.OtherNodeCache()
+			if other != nil {
+				otherNext := other.EnsureLevel(nextRound)
+				for _, child := range task.DiscoveredChildren {
+					if child.SrcID != "" && child.SrcCopyStatus != "" && task.ExpectedSrcNodeMeta != nil {
+						if _, ok := task.ExpectedSrcNodeMeta[child.SrcID]; ok {
+							otherNext.UpdateStatus(child.SrcID, "", child.SrcCopyStatus)
+						}
+					}
+				}
+			}
+		}
+	} else {
+		// Legacy: write to DB buffers
+		database.AddToStaging(queueType, nodeID, task.Round, db.StatusPending, db.StatusSuccessful)
+		if len(childNodesToInsert) > 0 {
+			database.AddNodes(childNodesToInsert)
+		}
 	}
 
 	// fmt.Printf("Added %d child nodes to DB buffers\n", len(childNodesToInsert))
@@ -359,13 +468,18 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 	// For SRC FOLDER tasks in retry mode: Queue DST cleanup only when RetryDstCleanup was populated at pull (no DB reads here).
 	if q.name == "src" && q.GetMode() == QueueModeRetry && task.IsFolder() && task.RetryDstCleanup != nil {
 		c := task.RetryDstCleanup
-		database.AddToStaging("DST", c.DstID, task.Round, "", db.StatusPending)
+		dstCache := q.OtherNodeCache()
+		if dstCache != nil {
+			dstCache.EnsureLevel(task.Round).Put(c.DstID, &db.NodeState{ID: c.DstID, Depth: task.Round, TraversalStatus: db.StatusPending})
+			dstCache.IncrementPending(task.Round)
+		} else {
+			database.AddToStaging("DST", c.DstID, task.Round, "", db.StatusPending)
+		}
 		deletions := make([]db.NodeDeletion, 0, len(c.Children))
 		for _, ch := range c.Children {
 			deletions = append(deletions, db.NodeDeletion{Table: "DST", NodeID: ch.ID})
 		}
-		err := database.AddNodeDeletions(deletions)
-		if err != nil {
+		if err := database.AddNodeDeletions(deletions); err != nil {
 			fmt.Println("error adding node deletions", err)
 		}
 	}
@@ -437,7 +551,15 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 
 	// Update traversal status to failed
 	if nodeID != "" {
-		if database := q.getDatabase(); database != nil {
+		nc := q.NodeCache()
+		if nc != nil {
+			level := nc.GetLevel(currentRound)
+			if level != nil {
+				level.UpdateStatus(nodeID, db.StatusFailed, "")
+			}
+			nc.RecordTraversalTransition(currentRound, db.StatusPending, db.StatusFailed)
+			nc.IncrementCompleted(currentRound)
+		} else if database := q.getDatabase(); database != nil {
 			database.AddToStaging(getQueueType(q.name), nodeID, currentRound, db.StatusPending, db.StatusFailed)
 		}
 	}
@@ -459,13 +581,20 @@ func (q *Queue) CheckTraversalCompletion(currentRound int, wasFirstPull bool) bo
 
 	switch mode {
 	case QueueModeTraversal:
-		// Traversal: first pull with 0 entries → complete (exhausted all depths)
-		// Check if any pending tasks exist at current round
-		c, err := database.GetStatsCountAtDepth(queueType, currentRound, db.StatsKeyTraversalStatus(db.StatusPending))
-		if err != nil {
-			return false
+		// Traversal: first pull with 0 entries -> complete (exhausted all depths).
+		// With memory-first cache, DB may lag until seal, so check cache first.
+		hasPending := false
+		if nc := q.NodeCache(); nc != nil {
+			if level := nc.GetLevel(currentRound); level != nil {
+				hasPending = len(level.ListPending("", 1)) > 0
+			}
+		} else {
+			c, err := database.GetStatsCountAtDepth(queueType, currentRound, db.StatsKeyTraversalStatus(db.StatusPending))
+			if err != nil {
+				return false
+			}
+			hasPending = c > 0
 		}
-		hasPending := c > 0
 
 		// Only end if we don't have any pending items and this was our first pull of the round
 		if !hasPending {

@@ -211,6 +211,9 @@ type Queue struct {
 	srcKeysetCursor  string // SRC traversal/retry pull
 	dstKeysetCursor  string // DST traversal/retry pull
 	copyKeysetCursor string // Copy phase pull
+	// In-memory level caches (memory-first hot path; DB only at seal)
+	nodeCache     *NodeCache // This queue's table (read-write)
+	otherNodeCache *NodeCache // Other table for cross-check (read-only; do not mutate)
 }
 
 // NewQueue creates a new Queue instance.
@@ -235,6 +238,34 @@ func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCo
 		lastAvgTime:         time.Now(),
 		maxKnownDepth:       -1, // -1 means not set yet
 	}
+}
+
+// SetNodeCache sets this queue's node cache (read-write). Call before Run() when using memory-first flow.
+func (q *Queue) SetNodeCache(c *NodeCache) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.nodeCache = c
+}
+
+// SetOtherNodeCache sets the other queue's node cache (read-only for cross-check). Call before Run() when using memory-first flow.
+func (q *Queue) SetOtherNodeCache(c *NodeCache) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.otherNodeCache = c
+}
+
+// NodeCache returns this queue's node cache (may be nil if not set).
+func (q *Queue) NodeCache() *NodeCache {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.nodeCache
+}
+
+// OtherNodeCache returns the other queue's node cache for read-only cross-check (may be nil).
+func (q *Queue) OtherNodeCache() *NodeCache {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.otherNodeCache
 }
 
 // InitializeWithContext sets up the queue with DuckDB, context, and filesystem adapter references.
@@ -1041,23 +1072,32 @@ func (q *Queue) Run() {
 		currentRound := q.GetRound()
 		coordinator := q.getCoordinator()
 
-		// GATE CHECK: Can we start processing this round? (DST only)
-		// This check happens IMMEDIATELY at the start of each iteration, before any task processing.
-		if q.name == "dst" && coordinator != nil {
-			canStartRound := coordinator.CanDstStartRound(currentRound)
-
-			if !canStartRound {
-				// Still waiting - set state and sleep
-				if state != QueueStateWaiting {
-					q.SetState(QueueStateWaiting)
+		// GATE CHECK: DST may only start round when SRC is far enough ahead; SRC may not run more than maxAhead rounds ahead of DST.
+		if coordinator != nil {
+			if q.name == "dst" {
+				canStartRound := coordinator.CanDstStartRound(currentRound)
+				if !canStartRound {
+					if state != QueueStateWaiting {
+						q.SetState(QueueStateWaiting)
+					}
+					time.Sleep(50 * time.Millisecond)
+					continue
 				}
-				time.Sleep(50 * time.Millisecond)
-				continue // Loop back and check again
-			}
-
-			// Green light - can start this round, ensure state is running
-			if state == QueueStateWaiting {
-				q.SetState(QueueStateRunning)
+				if state == QueueStateWaiting {
+					q.SetState(QueueStateRunning)
+				}
+			} else if q.name == "src" && (mode == QueueModeTraversal || mode == QueueModeRetry) {
+				canRun := coordinator.CanSrcStartRound(currentRound)
+				if !canRun {
+					if state != QueueStateWaiting {
+						q.SetState(QueueStateWaiting)
+					}
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+				if state == QueueStateWaiting {
+					q.SetState(QueueStateRunning)
+				}
 			}
 		}
 
@@ -1143,6 +1183,19 @@ func (q *Queue) Run() {
 	}
 }
 
+// snapshotLevel returns a slice of nodes from the level cache for seal (nil if level is nil).
+func snapshotLevel(level *LevelCache) []*db.NodeState {
+	if level == nil {
+		return nil
+	}
+	m := level.Snapshot()
+	out := make([]*db.NodeState, 0, len(m))
+	for _, n := range m {
+		out = append(out, n)
+	}
+	return out
+}
+
 // advanceToNextRound advances the queue to the next round and cleans up old round queues.
 // Note: Round advancement is now free - gating only happens when STARTING a round (checked in Run()).
 // For copy mode, advances to the next round that has pending tasks for the current pass.
@@ -1151,26 +1204,131 @@ func (q *Queue) advanceToNextRound() {
 	// Gating only happens when STARTING a round (checked in Run() outer loop)
 
 	database := q.getDatabase()
-	if database != nil {
-		// Flush buffer before seal so all status updates are in staging
-		database.FlushTablesForQueue(getQueueType(q.name))
-	}
+	round := q.GetRound()
+	nc := q.NodeCache()
 
-	// Phase 5: onLevelSeal - merge staging to live, update stats, write completed count, drop staging, create new staging.
-	if database != nil {
-		round := q.GetRound()
+	if nc != nil && database != nil {
+		mode := q.GetMode()
+		if mode == QueueModeCopy {
+			// Copy phase: seal both SRC and DST levels
+			other := q.OtherNodeCache()
+			if other != nil {
+				srcLevel := nc.GetLevel(round)
+				dstLevel := other.GetLevel(round)
+				srcSlice := snapshotLevel(srcLevel)
+				dstSlice := snapshotLevel(dstLevel)
+				ls := nc.GetLevelStats(round)
+				p, s, f, c := int64(0), int64(0), int64(0), int64(0)
+				cp, cs, cf := int64(-1), int64(-1), int64(-1)
+				if ls != nil {
+					p, s, f, c = int64(ls.Pending), int64(ls.Successful), int64(ls.Failed), int64(ls.Completed)
+					cp, cs, cf = ls.CopyPending, ls.CopySuccessful, ls.CopyFailed
+				}
+				if err := database.SealLevel("SRC", round, srcSlice, p, s, f, c, cp, cs, cf); err != nil {
+					fmt.Println("error sealing SRC level", err)
+				}
+				dstLs := other.GetLevelStats(round)
+				dp, ds, df, dc := int64(0), int64(0), int64(0), int64(0)
+				if dstLs != nil {
+					dp, ds, df, dc = int64(dstLs.Pending), int64(dstLs.Successful), int64(dstLs.Failed), int64(dstLs.Completed)
+				}
+				if err := database.SealLevel("DST", round, dstSlice, dp, ds, df, dc, -1, -1, -1); err != nil {
+					fmt.Println("error sealing DST level", err)
+				}
+				nc.DropLevel(round)
+				other.DropLevel(round)
+			}
+		} else {
+			// Traversal/retry with memory cache:
+			// - SRC keeps levels in cache until DST completes that level (DST needs SRC cache to build expected maps).
+			// - DST seals both DST and matching SRC level, then drops both.
+			// - If DST is fully completed early, SRC falls back to sealing its own levels.
+			wroteSeal := false
+			switch q.name {
+			case "dst":
+				// Seal DST level.
+				level := nc.GetLevel(round)
+				if level != nil {
+					nodeSlice := snapshotLevel(level)
+					ls := nc.GetLevelStats(round)
+					pending, successful, failed, completed := int64(0), int64(0), int64(0), int64(0)
+					if ls != nil {
+						pending, successful, failed, completed = int64(ls.Pending), int64(ls.Successful), int64(ls.Failed), int64(ls.Completed)
+					}
+					if err := database.SealLevel("DST", round, nodeSlice, pending, successful, failed, completed, -1, -1, -1); err != nil {
+						fmt.Println("error sealing DST level", err)
+					} else {
+						wroteSeal = true
+						nc.DropLevel(round)
+					}
+				}
+				// Seal matching SRC level when DST completes this depth.
+				other := q.OtherNodeCache()
+				if other != nil {
+					srcLevel := other.GetLevel(round)
+					if srcLevel != nil {
+						srcSlice := snapshotLevel(srcLevel)
+						srcLs := other.GetLevelStats(round)
+						sp, ss, sf, sc := int64(0), int64(0), int64(0), int64(0)
+						if srcLs != nil {
+							sp, ss, sf, sc = int64(srcLs.Pending), int64(srcLs.Successful), int64(srcLs.Failed), int64(srcLs.Completed)
+						}
+						if err := database.SealLevel("SRC", round, srcSlice, sp, ss, sf, sc, -1, -1, -1); err != nil {
+							fmt.Println("error sealing SRC level", err)
+						} else {
+							wroteSeal = true
+							other.DropLevel(round)
+						}
+					}
+				}
+			case "src":
+				coordinator := q.getCoordinator()
+				if coordinator == nil || coordinator.IsCompleted("dst") {
+					// Drain any accumulated unsealed SRC levels up to this completed round.
+					// While DST is active, SRC may advance without sealing to preserve expected-child lookups.
+					// Once DST is done, seal backlog in order.
+					for _, depth := range nc.LevelDepths() {
+						if depth > round {
+							continue
+						}
+						level := nc.GetLevel(depth)
+						if level == nil {
+							continue
+						}
+						nodeSlice := snapshotLevel(level)
+						ls := nc.GetLevelStats(depth)
+						pending, successful, failed, completed := int64(0), int64(0), int64(0), int64(0)
+						if ls != nil {
+							pending, successful, failed, completed = int64(ls.Pending), int64(ls.Successful), int64(ls.Failed), int64(ls.Completed)
+						}
+						if err := database.SealLevel("SRC", depth, nodeSlice, pending, successful, failed, completed, -1, -1, -1); err != nil {
+							fmt.Println("error sealing SRC level", err)
+						} else {
+							wroteSeal = true
+							nc.DropLevel(depth)
+						}
+					}
+				}
+			}
+			if wroteSeal {
+				if err := database.Checkpoint(); err != nil {
+					fmt.Println("error checkpointing", err)
+				}
+			}
+		}
+	} else if database != nil {
+		// Legacy: flush staging and merge into live
+		database.FlushTablesForQueue(getQueueType(q.name))
 		completed := int64(0)
 		if stats := q.GetRoundStats(round); stats != nil {
 			completed = int64(stats.Completed)
 		}
-		err := database.RunUpdateWriterTx(func(w *db.Writer) error {
+		if err := database.RunUpdateWriterTx(func(w *db.Writer) error {
 			return w.ApplyStatusStagingAndDrop(round, getQueueType(q.name), completed)
-		})
-		if err != nil {
+		}); err != nil {
 			fmt.Println("error running update writer tx", err)
 		}
-		err = database.Checkpoint()
-		if err != nil {
+		if err := database.Checkpoint(); err != nil {
 			fmt.Println("error checkpointing", err)
 		}
 	}

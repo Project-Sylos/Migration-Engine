@@ -87,6 +87,9 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	// Create coordinator for round advancement gates (retry uses traversal-like coordination)
 	coordinator := queue.NewQueueCoordinator()
 
+	srcCache := queue.NewNodeCache()
+	dstCache := queue.NewNodeCache()
+
 	// Get max known depth from config or detect from stats table
 	maxKnownDepth := cfg.MaxKnownDepth
 	if maxKnownDepth < 0 {
@@ -101,11 +104,15 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 
 	// Create queues in retry mode
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
+	srcQueue.SetNodeCache(srcCache)
+	srcQueue.SetOtherNodeCache(dstCache)
 	srcQueue.SetMode(queue.QueueModeRetry)
 	srcQueue.SetMaxKnownDepth(maxKnownDepth)
 	srcQueue.InitializeWithContext(duckDB, cfg.SrcAdapter, cfg.ShutdownContext)
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
+	dstQueue.SetNodeCache(dstCache)
+	dstQueue.SetOtherNodeCache(srcCache)
 	dstQueue.SetMode(queue.QueueModeRetry)
 	if cfg.MaxKnownDepth >= 0 {
 		dstQueue.SetMaxKnownDepth(cfg.MaxKnownDepth)

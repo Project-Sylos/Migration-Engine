@@ -1,23 +1,21 @@
 # db Package
 
-The **db** package is the persistence layer for the Migration Engine. It owns the database file, schema, buffered writes (staging and node inserts via DuckDB Appender), transactional updates (merge, stats, deletes, logs), and all read queries used by the queue and migration layers.
+The **db** package is the persistence layer for the Migration Engine. It owns the database file, schema, and all read/write operations. The queue uses a **memory-first** flow: hot-path updates go to in-memory level caches; the DB is written only at **seal** (round advance) via bulk append and stats snapshot. A legacy staging path remains for compatibility when caches are not used.
 
 ---
 
 ## Overview
 
-- **DB** (`db.go`): Opens DuckDB (file or `:memory:`), creates schema, holds one `*sql.DB` and four **write buffers** (src/dst staging, src/dst nodes). Exposes `AddToStaging`, `AddCopyToStaging`, `AddNode`/`AddNodes`, `FlushTablesForQueue`, `MaybeMergeStagingEarly`, `Checkpoint`, and transaction runners.
-- **Buffers** (`buffers.go`): Table-scoped buffers batch staging rows (coalesced by node_id) and node rows, then flush via **Appender** in `appender.go`. Batch size and flush interval are fixed (overridable via config in the future). Back-pressure at 2× batch size; optional `onFlush` callback for leased-key removal in the queue.
-- **Appender** (`appender.go`): `queueAppenderWriter` creates DuckDB Appenders for `src_staging`, `dst_staging`, `src_nodes`, `dst_nodes` per queue (DST also writes copy updates to `src_staging`). Used by buffer flush paths only.
-- **Writer** (`writer.go`): Used inside `RunUpdateWriterTx` / `RunAppenderWriterTx`. Applies staging → live (`ApplyStatusStagingAndDrop`), recomputes stats, deletes nodes/subtrees, writes logs and task_errors, queue_stats. All in one transaction.
-- **Schema** (`schema.go`): DDL for live tables (`src_nodes`, `dst_nodes`, `src_stats`, `dst_stats`, `stats`, `logs`, `queue_stats`, `task_errors`) and staging tables (`src_staging`, `dst_staging`).
-- **Queries** (`queries.go`): Read-only helpers: node by id/path, root, children, keyset lists by depth (traversal and copy), subtree counts, stats, batch lookups, `ListDstBatchWithSrcChildren` (DST batch + SRC children in one query). All use the main DB connection.
+- **DB** (`db.go`): Opens DuckDB (file or `:memory:`), creates schema, holds one `*sql.DB`, buffers (when using staging path), and transaction runners. Exposes **seal** API `SealLevel(table, depth, nodes, pending, successful, failed, completed, copyP, copyS, copyF)` for memory-first persistence; also `AddToStaging`, `AddCopyToStaging`, `AddNode`/`AddNodes`, `FlushTablesForQueue`, `Checkpoint` for the legacy staging path.
+- **Writer** (`writer.go`): Used inside `RunUpdateWriterTx`. `AppenderInsert` bulk-inserts nodes into live tables; `WriteLevelStatsSnapshot` writes per-depth stats (traversal and, for SRC, copy). For staging path: `ApplyStatusStagingAndDrop` merges staging into live.
+- **Schema** (`schema.go`): DDL for live tables (`src_nodes`, `dst_nodes`, `src_stats`, `dst_stats`, `stats`, `logs`, `queue_stats`, `task_errors`) and optional staging tables (`src_staging`, `dst_staging`).
+- **Queries** (`queries.go`): Read-only helpers: node by id/path, root, children, keyset lists by depth (traversal and copy), subtree counts, stats, batch lookups, `ListDstBatchWithSrcChildren`. All use the main DB connection.
 - **Constants** (`constants.go`): Traversal and copy status values, node types.
-- **Types** (`nodestate.go`): `NodeState`, `NodeMeta`, `InsertOperation`, `FetchResult`, `DeterministicNodeID`; legacy `WriteOperation` implementations for staging and batch insert.
+- **Types** (`nodestate.go`): `NodeState`, `NodeMeta`, `InsertOperation`, `FetchResult`, `DeterministicNodeID`.
 - **Logs** (`logs.go`): `LogBuffer` batches log entries and flushes to the `logs` table via `Writer`.
 - **Seeding** (`seeding.go`): `InsertRootNode`, `BootstrapRootStats`, `BatchInsertNodes` for initial setup.
 - **Stats** (`stats.go`): Stats key helpers, `GetStatsCount`, `GetStatsCountAtDepth`, `GetCopyCountAtDepth`, `GetMaxDepth`, `GetPendingTraversalCountAtDepthFromLive`, `GetStatsBreakdown`, queue stats getters.
-- **Indexes** (`indexes.go`): `EnsureNodeTableIndexes` for path, parent_path, traversal_status, copy_status on node tables (call after traversal/copy for that table is complete).
+- **Indexes** (`indexes.go`): `EnsureNodeTableIndexes` for path, parent_path, traversal_status, copy_status on node tables.
 
 ---
 
@@ -25,12 +23,12 @@ The **db** package is the persistence layer for the Migration Engine. It owns th
 
 | Table          | Purpose |
 |----------------|---------|
-| `src_nodes`    | Live source tree (path, depth, traversal_status, copy_status). Written via appender + staging merge. |
-| `dst_nodes`    | Live destination tree. Written via appender + staging merge. |
-| `src_staging`  | Pending traversal/copy status updates for SRC; merged into `src_nodes` at seal. |
-| `dst_staging`  | Pending traversal status updates for DST; merged into `dst_nodes` at seal. |
-| `src_stats`    | Per-depth counts (traversal and copy status). Recomputed at seal. |
-| `dst_stats`    | Per-depth traversal status counts. Recomputed at seal. |
+| `src_nodes`    | Live source tree (path, depth, traversal_status, copy_status). Written at seal via bulk append (memory-first) or via appender + staging merge (legacy). |
+| `dst_nodes`    | Live destination tree. Same write paths as SRC. |
+| `src_staging`  | (Legacy) Pending traversal/copy status updates; merged into `src_nodes` at seal when not using memory-first. |
+| `dst_staging`  | (Legacy) Pending traversal status updates for DST. |
+| `src_stats`    | Per-depth counts (traversal and copy). Written at seal from in-memory snapshot or recomputed from staging. |
+| `dst_stats`    | Per-depth traversal status counts. |
 | `stats`        | Global key/count (e.g. completed counts). |
 | `logs`         | Log entries (from `LogBuffer`). |
 | `queue_stats`  | Queue metrics JSON per queue key. |
@@ -40,14 +38,14 @@ The **db** package is the persistence layer for the Migration Engine. It owns th
 
 ## Write Paths
 
-1. **Staging (traversal/copy status)**  
-   Queue calls `AddToStaging(table, nodeID, newTraversal)` or `AddCopyToStaging(nodeID, newCopyStatus)`. Buffers coalesce by node_id; when batch is full or `FlushTablesForQueue` runs, rows are written via **Appender** to `src_staging` / `dst_staging`. At **seal**, `ApplyStatusStagingAndDrop` merges staging into live nodes and clears staging.
+1. **Memory-first (primary)**  
+   Queue holds per-level caches (`NodeCache` / `LevelCache`). Task completion updates cache only. At **seal** (round advance), the queue calls `SealLevel(table, depth, nodes, ...)`: one transaction bulk-appends the sealed level’s nodes into `src_nodes`/`dst_nodes` and writes `WriteLevelStatsSnapshot` for that depth. No staging tables on the hot path.
 
-2. **Node inserts**  
-   Queue calls `AddNode` / `AddNodes`. Buffers accumulate nodes; flush uses **Appender** to write into `src_nodes` / `dst_nodes`. Same connection is used for subsequent pulls so new rows are visible without ETL.
+2. **Staging (legacy)**  
+   When caches are not set, queue calls `AddToStaging`, `AddCopyToStaging`, `AddNode`/`AddNodes`. Buffers flush to staging/node tables; at seal, `ApplyStatusStagingAndDrop` merges staging into live and recomputes stats.
 
 3. **Transactional updates**  
-   `RunUpdateWriterTx(fn)` runs `fn(Writer)` in a single transaction: merge staging, recompute stats, delete nodes/subtrees, insert logs, record task errors, write queue stats. Serialized with other writes via `writeMu`.
+   `RunUpdateWriterTx(fn)` runs `fn(Writer)` in a single transaction. Serialized with other writes via `writeMu`.
 
 ---
 
