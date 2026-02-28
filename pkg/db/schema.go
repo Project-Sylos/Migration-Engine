@@ -8,8 +8,6 @@ const (
 	tableDstNodes   = "dst_nodes"
 	tableSrcStats   = "src_stats"
 	tableDstStats   = "dst_stats"
-	tableSrcStaging = "src_staging"
-	tableDstStaging = "dst_staging"
 	// TableMigrations is the migrations lifecycle table name (used by schema and migration store).
 	TableMigrations = "migrations"
 )
@@ -111,19 +109,3 @@ func migrationsTableDDL() string {
 	)`
 }
 
-// srcStagingDDL returns CREATE TABLE for src_staging (one row per node; new_traversal_status and new_copy_status for merge at seal).
-func srcStagingDDL() string {
-	return `CREATE TABLE IF NOT EXISTS src_staging (
-		node_id VARCHAR PRIMARY KEY,
-		new_traversal_status VARCHAR,
-		new_copy_status VARCHAR
-	)`
-}
-
-// dstStagingDDL returns CREATE TABLE for dst_staging (one row per node; new_traversal_status for merge at seal).
-func dstStagingDDL() string {
-	return `CREATE TABLE IF NOT EXISTS dst_staging (
-		node_id VARCHAR PRIMARY KEY,
-		new_traversal_status VARCHAR
-	)`
-}

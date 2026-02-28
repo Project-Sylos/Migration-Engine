@@ -43,6 +43,7 @@ func SetupDatabase(cfg DatabaseConfig) (*db.DB, bool, error) {
 
 	opts := db.DefaultOptions()
 	opts.Path = cfg.Path
+	opts.SealBuffer = &db.SealBufferOptions{} // async seal with default interval/threshold
 	database, err := db.Open(opts)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to open database %s: %w", cfg.Path, err)

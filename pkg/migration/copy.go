@@ -62,14 +62,13 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		}
 	}
 
-	// In-memory level caches for copy (SRC = source nodes, DST = created nodes)
-	srcCache := queue.NewNodeCache()
-	dstCache := queue.NewNodeCache()
+	// In-memory level caches: Src = SRC table (copy phase), Dst = cross-check when needed
+	caches := queue.NewEngineCaches()
 
 	// Create copy queue (single queue, not dual like traversal)
 	copyQueue := queue.NewQueue("copy", cfg.MaxRetries, cfg.WorkerCount, nil) // No coordinator needed for copy
-	copyQueue.SetNodeCache(srcCache)
-	copyQueue.SetOtherNodeCache(dstCache)
+	copyQueue.SetNodeCache(caches.Src)
+	copyQueue.SetOtherNodeCache(caches.Dst)
 	copyQueue.SetMode(queue.QueueModeCopy)
 	copyQueue.SetCopyPass(1) // Start with pass 1 (folders)
 
@@ -101,6 +100,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	}
 	copyQueue.SetRound(minLevel) // Set initial round
 	copyQueue.EnsureRoundExpectedFromStats()
+	copyQueue.RehydrateLevelFromDB(minLevel)
 
 	// Set max known depth from DB so copy completion and round advancement know the full depth range.
 	// Must be set before any tasks are pulled or completion checks run.

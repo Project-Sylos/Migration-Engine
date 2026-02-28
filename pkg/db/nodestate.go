@@ -68,14 +68,8 @@ type StatusUpdateOperation struct {
 }
 
 func (o *StatusUpdateOperation) flush(w *Writer) error {
-	if o.NodeID == "" {
-		return nil
-	}
-	table := o.QueueType
-	if table != "SRC" && table != "DST" {
-		table = "SRC"
-	}
-	return w.AppendStatusStaging(table, o.NodeID, o.OldStatus, o.NewStatus)
+	// Status updates are applied via cache + SealLevel; no staging write.
+	return nil
 }
 
 // BatchInsertOperation is a batch of node inserts.

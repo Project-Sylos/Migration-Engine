@@ -121,26 +121,25 @@ See `pkg/migration/README.md` for detailed documentation on the configuration sy
 
 ## Database architecture
 
-The Migration Engine uses a **single database file** (DuckDB) for all operational state: traversal and copy node data, staging updates, per-depth stats, logs, and queue metrics. The implementation lives in `pkg/db`; the queue and migration packages use the same `*db.DB` instance.
+The Migration Engine uses a **single database file** (DuckDB) for all operational state: traversal and copy node data, per-depth stats, logs, and queue metrics. The implementation lives in `pkg/db`; the queue and migration packages use the same `*db.DB` instance.
 
 ### Tables and roles
 
-- **Node tables** (`src_nodes`, `dst_nodes`) – One row per node (path, depth, `traversal_status`, `copy_status`, etc.). Workers pull tasks via keyset queries by depth and status; completion writes go through **staging** first, then are merged into these tables at **seal** (end of each round).
-- **Staging tables** (`src_staging`, `dst_staging`) – Pending status updates (traversal and copy). The queue and copy workers call `AddToStaging` / `AddCopyToStaging`; the DB batches these and flushes them via the DuckDB Appender. At round seal, staging is merged into the node tables and staging is cleared.
-- **Stats tables** (`src_stats`, `dst_stats`) – Per-depth counts by status (e.g. traversal/pending, traversal/successful). Recomputed at seal; used for completion detection and progress.
+- **Node tables** (`src_nodes`, `dst_nodes`) – One row per node (path, depth, `traversal_status`, `copy_status`, etc.). **NodeCache is required.** Workers pull tasks from the level cache; at **seal** (end of each round) the queue bulk-appends the completed level to these tables.
+- **Stats tables** (`src_stats`, `dst_stats`) – Per-depth counts by status (e.g. traversal/pending, traversal/successful). Written at seal from in-memory snapshot; used for completion detection and progress.
 - **Other** – `stats` (global key/count), `logs` (log buffer from `pkg/logservice`), `queue_stats` (observer metrics), `task_errors`.
 
-Traversal and copy status are columns on the node rows (and in staging); there are no separate “status buckets.” SRC/DST correlation is by path (and join by path/parent_path in queries like `ListDstBatchWithSrcChildren`). Node IDs are deterministic (e.g. from `db.DeterministicNodeID`) for stable keys and deduplication.
+Traversal and copy status are columns on the node rows; there are no separate “status buckets.” SRC/DST correlation is by path (and join by path/parent_path in queries like `ListDstBatchWithSrcChildren`). Node IDs are deterministic (e.g. from `db.DeterministicNodeID`) for stable keys and deduplication.
 
 ### Write path
 
-1. **During a round**: Queue and workers call `database.AddToStaging`, `database.AddCopyToStaging`, `database.AddNode`, `database.AddNodes` (and `AddNodeDeletions` in retry). The DB buffers these and flushes in batches (DuckDB Appender) so that high throughput does not block the hot path.
-2. **Before pulls**: The queue calls `database.FlushTablesForQueue(queueType)` so pending writes are visible and tasks are not re-leased.
-3. **At seal**: The migration layer runs a transaction that merges staging into the live node tables, recomputes stats for the sealed depth, and clears staging. Round then advances; next pull uses the updated tables.
+1. **During a round**: Task completion updates the level cache and in-memory stats only; no DB write until seal.
+2. **At seal**: The queue calls `database.SealLevel(table, depth, nodes, ...)` to bulk-append the level's nodes and write per-depth stats in one transaction. Round then advances; next pull uses the cache (rehydrated from DB on resume).
+3. **Retry**: `AddNodeDeletions` for DST cleanup when SRC folder completes in retry mode.
 
-All reads and writes use a **single connection** to the database so that appender-written rows are visible to the next query without a separate ETL step.
+All reads and writes use a **single connection** to the database.
 
-See **`pkg/db/README.md`** for schema, buffer behavior, and transaction APIs.
+See **`pkg/db/README.md`** for schema and transaction APIs.
 
 ---
 
@@ -159,8 +158,8 @@ See **`pkg/migration/README.md`** for `LetsMigrate`, `StartMigration`, `SetupDat
 
 | Package       | Role |
 |---------------|------|
-| **pkg/db**    | Database layer: open/close, schema (node/staging/stats/logs tables), buffered writes (Appender + staging), merge at seal, read queries. Single DuckDB file and connection. |
-| **pkg/queue** | Queue layer: BFS rounds, task pull (keyset by depth/status), completion writes via db buffers, coordinator, observer. Uses `*db.DB` only. |
+| **pkg/db**    | Database layer: open/close, schema (node/stats/logs tables), seal (bulk append + stats), read queries. Single DuckDB file and connection. |
+| **pkg/queue** | Queue layer: BFS rounds, task pull from cache, completion updates to cache, seal via `SealLevel`, coordinator, observer. NodeCache required; uses `*db.DB` for seal and resume. |
 | **pkg/migration** | Orchestration: open or accept DB, YAML config, root seeding, run traversal/copy via queue, verification. Owns lifecycle (who opens/closes) when used as entrypoint. |
 | **pkg/configs**   | JSON config loaders: buffer config, log service (UDP), Spectra. |
 | **pkg/logservice** | Dual-channel logging: UDP (level-filtered) and persistence to the main DB’s `logs` table via `db.LogBuffer`. |

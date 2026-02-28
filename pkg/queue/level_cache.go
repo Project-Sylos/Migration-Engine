@@ -12,16 +12,70 @@ import (
 
 // LevelCache holds exactly one BFS level in memory (nodes keyed by id).
 // Only two active levels exist at a time: N and N+1; sealed levels are flushed to DB and dropped.
+// ByPath and ByParentPath are O(1) indexes into the same nodes (no duplicate node data).
+// ByTraversalStatus and ByCopyStatus are status-keyed ID sets for O(pending) ListPending/ListPendingCopy (no full-level scan).
 type LevelCache struct {
-	mu    sync.RWMutex
-	Nodes map[string]*db.NodeState // id -> node state
+	mu                sync.RWMutex
+	Nodes             map[string]*db.NodeState            // id -> node state
+	ByPath            map[string]*db.NodeState            // path -> node (same ptrs as Nodes)
+	ByParentPath      map[string]map[string]*db.NodeState // parentPath -> id -> node (same ptrs)
+	ByTraversalStatus map[string]map[string]struct{}      // traversal status -> id set (pending, in_progress, successful, failed)
+	ByCopyStatus      map[string]map[string]struct{}      // copy status -> id set (pending, in_progress, successful, failed)
 }
 
 // NewLevelCache creates an empty level cache.
 func NewLevelCache() *LevelCache {
 	return &LevelCache{
-		Nodes: make(map[string]*db.NodeState),
+		Nodes:             make(map[string]*db.NodeState),
+		ByPath:            make(map[string]*db.NodeState),
+		ByParentPath:      make(map[string]map[string]*db.NodeState),
+		ByTraversalStatus: make(map[string]map[string]struct{}),
+		ByCopyStatus:      make(map[string]map[string]struct{}),
 	}
+}
+
+func normTrav(s string) string {
+	if s == "" {
+		return db.StatusPending
+	}
+	return s
+}
+
+func normCopy(s string) string {
+	if s == "" {
+		return db.CopyStatusPending
+	}
+	return s
+}
+
+// removeFromStatusMaps removes id from the given traversal and copy buckets (caller holds lc.mu).
+func (lc *LevelCache) removeFromStatusMaps(id string, travStatus, copyStatus string) {
+	if m := lc.ByTraversalStatus[normTrav(travStatus)]; m != nil {
+		delete(m, id)
+		if len(m) == 0 {
+			delete(lc.ByTraversalStatus, normTrav(travStatus))
+		}
+	}
+	if m := lc.ByCopyStatus[normCopy(copyStatus)]; m != nil {
+		delete(m, id)
+		if len(m) == 0 {
+			delete(lc.ByCopyStatus, normCopy(copyStatus))
+		}
+	}
+}
+
+// addToStatusMaps adds id to the given traversal and copy buckets (caller holds lc.mu).
+func (lc *LevelCache) addToStatusMaps(id string, travStatus, copyStatus string) {
+	t := normTrav(travStatus)
+	if lc.ByTraversalStatus[t] == nil {
+		lc.ByTraversalStatus[t] = make(map[string]struct{})
+	}
+	lc.ByTraversalStatus[t][id] = struct{}{}
+	c := normCopy(copyStatus)
+	if lc.ByCopyStatus[c] == nil {
+		lc.ByCopyStatus[c] = make(map[string]struct{})
+	}
+	lc.ByCopyStatus[c][id] = struct{}{}
 }
 
 // Get returns a copy of the node state for id, or nil if not present.
@@ -43,13 +97,60 @@ func (lc *LevelCache) GetRef(id string) *db.NodeState {
 }
 
 // Put inserts or overwrites the node for id. Caller may pass the same pointer that will be stored.
+// Indexes ByPath, ByParentPath, and status maps are kept in sync.
 func (lc *LevelCache) Put(id string, n *db.NodeState) {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
 	if lc.Nodes == nil {
 		lc.Nodes = make(map[string]*db.NodeState)
 	}
+	if lc.ByPath == nil {
+		lc.ByPath = make(map[string]*db.NodeState)
+	}
+	if lc.ByParentPath == nil {
+		lc.ByParentPath = make(map[string]map[string]*db.NodeState)
+	}
+	if lc.ByTraversalStatus == nil {
+		lc.ByTraversalStatus = make(map[string]map[string]struct{})
+	}
+	if lc.ByCopyStatus == nil {
+		lc.ByCopyStatus = make(map[string]map[string]struct{})
+	}
+	if old := lc.Nodes[id]; old != nil {
+		if old.Path != "" {
+			delete(lc.ByPath, old.Path)
+		}
+		if old.ParentPath != "" {
+			if pm := lc.ByParentPath[old.ParentPath]; pm != nil {
+				delete(pm, id)
+				if len(pm) == 0 {
+					delete(lc.ByParentPath, old.ParentPath)
+				}
+			}
+		}
+		oldTrav := old.TraversalStatus
+		if oldTrav == "" {
+			oldTrav = old.Status
+		}
+		lc.removeFromStatusMaps(id, oldTrav, old.CopyStatus)
+	}
 	lc.Nodes[id] = n
+	if n != nil {
+		if n.Path != "" {
+			lc.ByPath[n.Path] = n
+		}
+		if n.ParentPath != "" {
+			if lc.ByParentPath[n.ParentPath] == nil {
+				lc.ByParentPath[n.ParentPath] = make(map[string]*db.NodeState)
+			}
+			lc.ByParentPath[n.ParentPath][id] = n
+		}
+		trav := n.TraversalStatus
+		if trav == "" {
+			trav = n.Status
+		}
+		lc.addToStatusMaps(id, trav, n.CopyStatus)
+	}
 }
 
 // PutIfAbsent inserts n only if id is not already present. Returns true if inserted.
@@ -59,14 +160,43 @@ func (lc *LevelCache) PutIfAbsent(id string, n *db.NodeState) bool {
 	if lc.Nodes == nil {
 		lc.Nodes = make(map[string]*db.NodeState)
 	}
+	if lc.ByPath == nil {
+		lc.ByPath = make(map[string]*db.NodeState)
+	}
+	if lc.ByParentPath == nil {
+		lc.ByParentPath = make(map[string]map[string]*db.NodeState)
+	}
+	if lc.ByTraversalStatus == nil {
+		lc.ByTraversalStatus = make(map[string]map[string]struct{})
+	}
+	if lc.ByCopyStatus == nil {
+		lc.ByCopyStatus = make(map[string]map[string]struct{})
+	}
 	if _, ok := lc.Nodes[id]; ok {
 		return false
 	}
 	lc.Nodes[id] = n
+	if n != nil {
+		if n.Path != "" {
+			lc.ByPath[n.Path] = n
+		}
+		if n.ParentPath != "" {
+			if lc.ByParentPath[n.ParentPath] == nil {
+				lc.ByParentPath[n.ParentPath] = make(map[string]*db.NodeState)
+			}
+			lc.ByParentPath[n.ParentPath][id] = n
+		}
+		trav := n.TraversalStatus
+		if trav == "" {
+			trav = n.Status
+		}
+		lc.addToStatusMaps(id, trav, n.CopyStatus)
+	}
 	return true
 }
 
 // UpdateStatus updates traversal_status and optionally copy_status for the node at id. No-op if not present.
+// Status-keyed ID sets are updated so ListPending/ListPendingCopy stay O(pending).
 func (lc *LevelCache) UpdateStatus(id string, traversalStatus, copyStatus string) {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
@@ -74,6 +204,11 @@ func (lc *LevelCache) UpdateStatus(id string, traversalStatus, copyStatus string
 	if n == nil {
 		return
 	}
+	oldTrav := n.TraversalStatus
+	if oldTrav == "" {
+		oldTrav = n.Status
+	}
+	oldCopy := n.CopyStatus
 	if traversalStatus != "" {
 		n.TraversalStatus = traversalStatus
 		n.Status = traversalStatus
@@ -81,6 +216,12 @@ func (lc *LevelCache) UpdateStatus(id string, traversalStatus, copyStatus string
 	if copyStatus != "" {
 		n.CopyStatus = copyStatus
 	}
+	lc.removeFromStatusMaps(id, oldTrav, oldCopy)
+	trav := n.TraversalStatus
+	if trav == "" {
+		trav = n.Status
+	}
+	lc.addToStatusMaps(id, trav, n.CopyStatus)
 }
 
 // Count returns the number of nodes in this level.
@@ -106,31 +247,29 @@ func (lc *LevelCache) Clear() {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
 	lc.Nodes = make(map[string]*db.NodeState)
+	lc.ByPath = make(map[string]*db.NodeState)
+	lc.ByParentPath = make(map[string]map[string]*db.NodeState)
+	lc.ByTraversalStatus = make(map[string]map[string]struct{})
+	lc.ByCopyStatus = make(map[string]map[string]struct{})
 }
 
 // ListPending returns up to limit nodes with traversal_status == pending and id > afterID, in id order.
-// Used to fill the pull buffer from cache (keyset pagination).
+// Uses status-keyed ID set for O(pending) instead of O(n) scan.
 func (lc *LevelCache) ListPending(afterID string, limit int) []*db.NodeState {
 	lc.mu.RLock()
 	defer lc.mu.RUnlock()
+	ids := lc.ByTraversalStatus[db.StatusPending]
+	if len(ids) == 0 {
+		return nil
+	}
 	var out []*db.NodeState
-	for _, n := range lc.Nodes {
-		if n == nil {
-			continue
-		}
-		s := n.TraversalStatus
-		if s == "" {
-			s = n.Status
-		}
-		if s != "" && s != "pending" {
-			continue
-		}
-		if n.ID <= afterID {
+	for id := range ids {
+		n := lc.Nodes[id]
+		if n == nil || n.ID <= afterID {
 			continue
 		}
 		out = append(out, copyNodeState(n))
 	}
-	// Sort by id (simple slice sort)
 	sortSliceByID(out)
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
@@ -138,28 +277,24 @@ func (lc *LevelCache) ListPending(afterID string, limit int) []*db.NodeState {
 	return out
 }
 
-// ListPendingCopy returns up to limit nodes with copy_status == pending and id > afterID, in id order. If nodeType != "" filter by type (e.g. "folder" or "file" for copy pass).
+// ListPendingCopy returns up to limit nodes with copy_status == pending and id > afterID, in id order. If nodeType != "" filter by type.
+// Uses status-keyed ID set for O(pending) instead of O(n) scan.
 func (lc *LevelCache) ListPendingCopy(afterID string, limit int, nodeType string) []*db.NodeState {
 	lc.mu.RLock()
 	defer lc.mu.RUnlock()
+	ids := lc.ByCopyStatus[db.CopyStatusPending]
+	if len(ids) == 0 {
+		return nil
+	}
 	var out []*db.NodeState
-	for _, n := range lc.Nodes {
-		if n == nil {
-			continue
-		}
-		c := n.CopyStatus
-		if c == "" {
-			c = "pending"
-		}
-		if c != "pending" {
+	for id := range ids {
+		n := lc.Nodes[id]
+		if n == nil || n.ID <= afterID {
 			continue
 		}
 		if nodeType != "" && n.Type != nodeType {
 			continue
 		}
-		if n.ID <= afterID {
-			continue
-		}
 		out = append(out, copyNodeState(n))
 	}
 	sortSliceByID(out)
@@ -169,17 +304,32 @@ func (lc *LevelCache) ListPendingCopy(afterID string, limit int, nodeType string
 	return out
 }
 
-// ListChildrenByParentPath returns nodes at this level whose parent_path equals parentPath (for building expected SRC children when DST pulls from cache).
+// ListChildrenByParentPath returns nodes at this level whose parent_path equals parentPath (O(1) index lookup + O(children) copy).
 func (lc *LevelCache) ListChildrenByParentPath(parentPath string) []*db.NodeState {
 	lc.mu.RLock()
 	defer lc.mu.RUnlock()
-	var out []*db.NodeState
-	for _, n := range lc.Nodes {
-		if n != nil && n.ParentPath == parentPath {
+	pm := lc.ByParentPath[parentPath]
+	if len(pm) == 0 {
+		return nil
+	}
+	out := make([]*db.NodeState, 0, len(pm))
+	for _, n := range pm {
+		if n != nil {
 			out = append(out, copyNodeState(n))
 		}
 	}
 	return out
+}
+
+// GetByPath returns a copy of the node with the given path, or nil if not present (O(1)).
+func (lc *LevelCache) GetByPath(path string) *db.NodeState {
+	lc.mu.RLock()
+	defer lc.mu.RUnlock()
+	n := lc.ByPath[path]
+	if n == nil {
+		return nil
+	}
+	return copyNodeState(n)
 }
 
 func sortSliceByID(nodes []*db.NodeState) {
@@ -228,6 +378,22 @@ func NewNodeCache() *NodeCache {
 	return &NodeCache{
 		Levels: make(map[int]*LevelCache),
 		Stats:  make(map[int]*LevelStats),
+	}
+}
+
+// EngineCaches holds separate node caches for SRC and DST. Each queue mutates its own cache;
+// DST cross-queries SRC (read-only) for expected children via OtherNodeCache(). Copy phase
+// uses Src for the SRC table and Dst for cross-check when needed.
+type EngineCaches struct {
+	Src *NodeCache // SRC traversal (and copy phase: SRC table)
+	Dst *NodeCache // DST traversal
+}
+
+// NewEngineCaches creates a new SRC and DST node cache pair for memory-first flow.
+func NewEngineCaches() *EngineCaches {
+	return &EngineCaches{
+		Src: NewNodeCache(),
+		Dst: NewNodeCache(),
 	}
 }
 
