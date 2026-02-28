@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 )
 
@@ -129,6 +130,17 @@ func (c *QueueCoordinator) CanSrcStartRound(srcRound int) bool {
 		return true
 	}
 	return srcRound <= c.dstRound+c.maxSrcAhead
+}
+
+// WaitSealBackpressure blocks until the seal buffer has flushed through (round-2) when round >= 2.
+// Flushes pending seal jobs first so we don't block on the buffer's interval timer. Call before advancing to the next round.
+// Pulling/processing from cache is not blocked; only round advancement waits. Pass database from the queue.
+func (c *QueueCoordinator) WaitSealBackpressure(round int, database *db.DB) {
+	if database == nil || round < 2 {
+		return
+	}
+	_ = database.FlushSealBuffer()
+	database.WaitUntilSealFlushedThrough(round - 2)
 }
 
 // CanDstStartRound returns true if DST can start processing the specified round.

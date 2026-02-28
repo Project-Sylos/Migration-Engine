@@ -7,8 +7,7 @@ package db
 // (e.g. "src_nodes", "dst_nodes") for path and parent_path.
 //
 // Mutable status columns are intentionally left unindexed to avoid high write
-// amplification during traversal/copy status updates. Any legacy status indexes
-// are dropped if present.
+// amplification during traversal/copy status updates.
 //
 // Idempotent for create/drop operations.
 func EnsureNodeTableIndexes(db *DB, table string) error {

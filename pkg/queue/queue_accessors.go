@@ -67,34 +67,6 @@ func (q *Queue) incrementTasksCompletedTotal() {
 	q.tasksCompletedTotal++
 }
 
-// maybeMergeStagingEarlyOnTaskComplete is called after each SRC traversal/retry task completion.
-// When completedSinceLastEarlyMerge reaches the threshold, merges staging into live to reduce memory on pathological wide rounds.
-func (q *Queue) maybeMergeStagingEarlyOnTaskComplete() {
-	if q.name != "src" {
-		return
-	}
-	if mode := q.GetMode(); mode != QueueModeTraversal && mode != QueueModeRetry {
-		return
-	}
-	database := q.getDatabase()
-	if database == nil {
-		return
-	}
-	q.mu.Lock()
-	q.completedSinceLastEarlyMerge++
-	if q.completedSinceLastEarlyMerge < stagingEarlyMergeThreshold {
-		q.mu.Unlock()
-		return
-	}
-	q.completedSinceLastEarlyMerge = 0
-	round := q.round
-	q.mu.Unlock()
-	_, err := database.MaybeMergeStagingEarly(round, stagingEarlyMergeThreshold)
-	if err != nil {
-		fmt.Println("error merging staging early", err)
-	}
-}
-
 // SetCopyPass sets the current copy pass.
 func (q *Queue) SetCopyPass(pass int) {
 	q.mu.Lock()
@@ -171,7 +143,7 @@ func (q *Queue) getPullLowWM() int {
 }
 
 // Keyset cursors are strictly round-scoped per queue. Each queue (src, dst, copy) has its own cursor and runtime;
-// we only reset the cursor for the queue that advanced or changed mode. Resets: round advance (setRound), mode switch (setMode), and immediately after that queue's seal (ApplyStatusStagingAndDrop).
+// we only reset the cursor for the queue that advanced or changed mode. Resets: round advance (setRound), mode switch (setMode), and after that queue's seal.
 
 func (q *Queue) getSrcKeysetCursor() string {
 	q.mu.RLock()
@@ -523,6 +495,22 @@ func (q *Queue) RehydrateLevelFromDB(depth int) {
 		afterID = results[len(results)-1].Key
 	}
 	q.syncLevelStatsFromDB(database, queueType, depth)
+	q.SetTraversalCacheLoaded(true)
+}
+
+// SetTraversalCacheLoaded sets whether the level cache has been loaded from DB (e.g. after RehydrateLevelFromDB).
+// Until true, CheckTraversalCompletion returns false so the queue does not complete before round 0 is populated.
+// Call after loading cache at startup; retry/sweeps should set true when their cache is ready.
+func (q *Queue) SetTraversalCacheLoaded(loaded bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.traversalCacheLoaded = loaded
+}
+
+func (q *Queue) getTraversalCacheLoaded() bool {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.traversalCacheLoaded
 }
 
 // getCurrentRoundPulledAmount returns the number of items actually pulled from the DB (returned by our queries) this round.

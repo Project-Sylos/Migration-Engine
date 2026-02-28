@@ -105,3 +105,104 @@ func TestNodeCache_LevelDepths(t *testing.T) {
 		t.Errorf("LevelDepths = %v", deps)
 	}
 }
+
+func TestLevelCache_ListChildrenByParentPath_GetByPath(t *testing.T) {
+	lc := NewLevelCache()
+	// Root-level nodes (parentPath ""); not indexed in ByParentPath per plan
+	lc.Put("id1", &db.NodeState{ID: "id1", Path: "/a", ParentPath: "", Type: "folder"})
+	lc.Put("id2", &db.NodeState{ID: "id2", Path: "/b", ParentPath: "", Type: "folder"})
+	// Children of /a
+	lc.Put("id3", &db.NodeState{ID: "id3", Path: "/a/x", ParentPath: "/a", Type: "file"})
+	lc.Put("id4", &db.NodeState{ID: "id4", Path: "/a/y", ParentPath: "/a", Type: "file"})
+	// Children of /b
+	lc.Put("id5", &db.NodeState{ID: "id5", Path: "/b/z", ParentPath: "/b", Type: "file"})
+
+	childrenRoot := lc.ListChildrenByParentPath("")
+	if childrenRoot != nil {
+		t.Errorf("ListChildrenByParentPath(\"\") = %v, want nil (root not indexed)", childrenRoot)
+	}
+	childrenA := lc.ListChildrenByParentPath("/a")
+	if len(childrenA) != 2 {
+		t.Errorf("ListChildrenByParentPath(\"/a\") len = %d, want 2", len(childrenA))
+	}
+	childrenB := lc.ListChildrenByParentPath("/b")
+	if len(childrenB) != 1 {
+		t.Errorf("ListChildrenByParentPath(\"/b\") len = %d, want 1", len(childrenB))
+	}
+	childrenMissing := lc.ListChildrenByParentPath("/none")
+	if childrenMissing != nil {
+		t.Errorf("ListChildrenByParentPath(\"/none\") = %v, want nil", childrenMissing)
+	}
+
+	if got := lc.GetByPath("/a"); got == nil || got.ID != "id1" {
+		t.Errorf("GetByPath(\"/a\") = %v, want node id1", got)
+	}
+	if got := lc.GetByPath("/a/x"); got == nil || got.ID != "id3" {
+		t.Errorf("GetByPath(\"/a/x\") = %v, want node id3", got)
+	}
+	if lc.GetByPath("/missing") != nil {
+		t.Error("GetByPath(\"/missing\") should be nil")
+	}
+
+	// Overwrite node: indexes must stay consistent (same path/parentPath)
+	lc.Put("id3", &db.NodeState{ID: "id3", Path: "/a/x", ParentPath: "/a", Type: "file", CopyStatus: "done"})
+	childrenA2 := lc.ListChildrenByParentPath("/a")
+	if len(childrenA2) != 2 {
+		t.Errorf("after overwrite ListChildrenByParentPath(\"/a\") len = %d, want 2", len(childrenA2))
+	}
+	if got := lc.GetByPath("/a/x"); got == nil || got.CopyStatus != "done" {
+		t.Errorf("GetByPath(\"/a/x\") after overwrite = %v", got)
+	}
+
+	lc.Clear()
+	if lc.ListChildrenByParentPath("/a") != nil {
+		t.Error("ListChildrenByParentPath after Clear should return nil")
+	}
+	if lc.GetByPath("/a") != nil {
+		t.Error("GetByPath after Clear should return nil")
+	}
+}
+
+func TestLevelCache_ListPending_statusSets(t *testing.T) {
+	lc := NewLevelCache()
+	lc.Put("a", &db.NodeState{ID: "a", Path: "/a", TraversalStatus: db.StatusPending})
+	lc.Put("b", &db.NodeState{ID: "b", Path: "/b", TraversalStatus: db.StatusPending})
+	lc.Put("c", &db.NodeState{ID: "c", Path: "/c", TraversalStatus: db.StatusPending})
+
+	pending := lc.ListPending("", 10)
+	if len(pending) != 3 {
+		t.Errorf("ListPending len = %d, want 3", len(pending))
+	}
+	lc.UpdateStatus("b", db.StatusSuccessful, "")
+	pending2 := lc.ListPending("", 10)
+	if len(pending2) != 2 {
+		t.Errorf("after UpdateStatus ListPending len = %d, want 2", len(pending2))
+	}
+	for _, n := range pending2 {
+		if n.ID == "b" {
+			t.Error("ListPending should not return b after successful")
+		}
+	}
+	// Keyset: afterID "b" should return only c
+	pending3 := lc.ListPending("b", 10)
+	if len(pending3) != 1 || pending3[0].ID != "c" {
+		t.Errorf("ListPending(afterID b) = %v, want [c]", pending3)
+	}
+}
+
+func TestLevelCache_ListPendingCopy_statusSets(t *testing.T) {
+	lc := NewLevelCache()
+	lc.Put("f1", &db.NodeState{ID: "f1", Path: "/f1", Type: db.NodeTypeFolder, CopyStatus: db.CopyStatusPending})
+	lc.Put("f2", &db.NodeState{ID: "f2", Path: "/f2", Type: db.NodeTypeFolder, CopyStatus: db.CopyStatusPending})
+	lc.Put("x1", &db.NodeState{ID: "x1", Path: "/x1", Type: db.NodeTypeFile, CopyStatus: db.CopyStatusPending})
+
+	folderPending := lc.ListPendingCopy("", 10, db.NodeTypeFolder)
+	if len(folderPending) != 2 {
+		t.Errorf("ListPendingCopy(folder) len = %d, want 2", len(folderPending))
+	}
+	lc.UpdateStatus("f1", "", db.CopyStatusSuccessful)
+	folderPending2 := lc.ListPendingCopy("", 10, db.NodeTypeFolder)
+	if len(folderPending2) != 1 || folderPending2[0].ID != "f2" {
+		t.Errorf("after copy success ListPendingCopy(folder) = %v, want [f2]", folderPending2)
+	}
+}

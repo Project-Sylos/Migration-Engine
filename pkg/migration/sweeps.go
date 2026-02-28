@@ -87,8 +87,7 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	// Create coordinator for round advancement gates (retry uses traversal-like coordination)
 	coordinator := queue.NewQueueCoordinator()
 
-	srcCache := queue.NewNodeCache()
-	dstCache := queue.NewNodeCache()
+	caches := queue.NewEngineCaches()
 
 	// Get max known depth from config or detect from stats table
 	maxKnownDepth := cfg.MaxKnownDepth
@@ -104,15 +103,15 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 
 	// Create queues in retry mode
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
-	srcQueue.SetNodeCache(srcCache)
-	srcQueue.SetOtherNodeCache(dstCache)
+	srcQueue.SetNodeCache(caches.Src)
+	srcQueue.SetOtherNodeCache(caches.Dst)
 	srcQueue.SetMode(queue.QueueModeRetry)
 	srcQueue.SetMaxKnownDepth(maxKnownDepth)
 	srcQueue.InitializeWithContext(duckDB, cfg.SrcAdapter, cfg.ShutdownContext)
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
-	dstQueue.SetNodeCache(dstCache)
-	dstQueue.SetOtherNodeCache(srcCache)
+	dstQueue.SetNodeCache(caches.Dst)
+	dstQueue.SetOtherNodeCache(caches.Src)
 	dstQueue.SetMode(queue.QueueModeRetry)
 	if cfg.MaxKnownDepth >= 0 {
 		dstQueue.SetMaxKnownDepth(cfg.MaxKnownDepth)
@@ -124,9 +123,11 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	dstQueue.SetRound(0)
 	srcQueue.EnsureRoundExpectedFromStats()
 	dstQueue.EnsureRoundExpectedFromStats()
+	srcQueue.SetTraversalCacheLoaded(true)
+	dstQueue.SetTraversalCacheLoaded(true)
 
 	// Give queues a moment to start
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 
 	// Trigger initial pull from database (force=true to bypass low-water checks)
 	// This is critical for event-driven Run() loop - without initial tasks, workers never trigger pulls
@@ -134,7 +135,7 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	dstQueue.PullTasksIfNeeded(true)
 
 	// Create observer for stats publishing
-	observer := queue.NewQueueObserver(duckDB, 200*time.Millisecond)
+	observer := queue.NewQueueObserver(duckDB, 500*time.Millisecond)
 	observer.Start()
 	defer observer.Stop()
 

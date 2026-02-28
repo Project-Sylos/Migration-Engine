@@ -59,8 +59,6 @@ const (
 const (
 	defaultLeaseBatchSize = 10_000
 	maxLeaseBatchSize     = 100_000 // Upper bound for pull (lease) batch size
-	// stagingEarlyMergeThreshold: after this many task completions, merge staging into live to reduce memory on pathological wide rounds.
-	stagingEarlyMergeThreshold = 1_000_000
 )
 
 // effectiveLeaseBatchSize returns the lease batch size capped by maxLeaseBatchSize.
@@ -205,8 +203,6 @@ type Queue struct {
 	filesCreatedTotal     int64 // Total files created (monotonic counter)
 	// Tasks completed total: incremented on every success or final failure, pushed to stats on flush
 	tasksCompletedTotal int64
-	// completedSinceLastEarlyMerge: SRC traversal/retry only; when >= threshold, merge staging and reset
-	completedSinceLastEarlyMerge int64
 	// Keyset cursors for pagination (id > cursor ORDER BY id LIMIT n). Strictly round-scoped per queue; see resetThisQueueKeysetCursor.
 	srcKeysetCursor  string // SRC traversal/retry pull
 	dstKeysetCursor  string // DST traversal/retry pull
@@ -214,6 +210,8 @@ type Queue struct {
 	// In-memory level caches (memory-first hot path; DB only at seal)
 	nodeCache     *NodeCache // This queue's table (read-write)
 	otherNodeCache *NodeCache // Other table for cross-check (read-only; do not mutate)
+	// traversalCacheLoaded: set when level cache has been loaded from DB (e.g. RehydrateLevelFromDB). Until true, completion checks are ignored so we don't complete before cache is populated.
+	traversalCacheLoaded bool
 }
 
 // NewQueue creates a new Queue instance.
@@ -282,13 +280,6 @@ func (q *Queue) InitializeWithContext(database *db.DB, adapter types.FSAdapter, 
 	workerCount := cap(q.workers) // Get the worker count we preallocated for
 	q.mu.RUnlock()
 
-	// Register flush callback for leased-key removal (DB owns buffers)
-	database.SetOnFlush(getQueueType(q.name), func(nodeIDs []string) {
-		for _, nodeID := range nodeIDs {
-			q.removeLeasedKey(nodeID)
-		}
-	})
-
 	// Create and start workers - they manage themselves
 	for i := 0; i < workerCount; i++ {
 		w := NewTraversalWorker(
@@ -326,13 +317,6 @@ func (q *Queue) InitializeCopyWithContext(database *db.DB, srcAdapter, dstAdapte
 	q.mu.RLock()
 	workerCount := cap(q.workers)
 	q.mu.RUnlock()
-
-	// Register flush callback for leased-key removal (DB owns buffers)
-	database.SetOnFlush(getQueueType(q.name), func(nodeIDs []string) {
-		for _, nodeID := range nodeIDs {
-			q.removeLeasedKey(nodeID)
-		}
-	})
 
 	// Create and start copy workers
 	for i := 0; i < workerCount; i++ {
@@ -436,61 +420,33 @@ func (q *Queue) Lease() *TaskBase {
 // CompletionCheckOptions configures what actions to take during completion checks.
 type CompletionCheckOptions struct {
 	CheckRoundComplete     bool // Check if current round is complete
-	CheckFinalCompletion   bool // Check if traversal is complete (first pull with 0 items)
+	CheckFinalCompletion   bool // Check if traversal/copy is complete (mode-specific logic in CheckTraversalCompletion / CheckCopyCompletion)
 	AdvanceRoundIfComplete bool // Advance to next round if current round is complete
-	WasFirstPull           bool // Whether this is the first pull of the round (passed from caller)
-	FlushBuffer            bool // Flush buffer before checking DB
+	WasFirstPull           bool // For copy mode only: first pull of the round (CheckTraversalCompletion derives this itself)
 }
 
 // checkCompletion performs completion checks based on the provided options.
 // Returns true if queue was marked as completed, false otherwise.
 func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) bool {
-	// Flush buffer first (if requested) to ensure all writes are persisted before checking
-	if opts.FlushBuffer {
-		if database := q.getDatabase(); database != nil {
-			database.FlushTablesForQueue(getQueueType(q.name))
-		}
-	}
-
 	// For traversal/sweep completion check (handles all modes)
 	// Called when first pull returns 0 entries - decides if we're completely done
 	if opts.CheckFinalCompletion {
 		// Skip check if queue is in waiting state (DST gating)
-		queueState := q.State()
-		if queueState == QueueStateWaiting {
+		if q.State() == QueueStateWaiting {
 			return false
 		}
-
-		// Check state and conditions after flush
-		inProgressCount := q.InProgressCount()
-		pendingBuffCount := q.GetPendingCount()
-		wasFirstPull := opts.WasFirstPull
-		database := q.getDatabase()
-
-		// If we have tasks in progress or in buffer, we're definitely not done
-		if inProgressCount > 0 || pendingBuffCount > 0 {
-			return false
-		}
-
-		// Only check completion on first pull (prevents premature completion mid-round)
-
-		if database == nil {
+		// Soft queue checks: if we have tasks in progress or in buffer, we're not done
+		if q.InProgressCount() > 0 || q.GetPendingCount() > 0 {
 			return false
 		}
 
 		mode := q.GetMode()
-
-		// Mode-specific completion conditions
 		switch mode {
 		case QueueModeTraversal, QueueModeRetry:
-			// Delegate to traversal/retry-specific completion check in mode_traversal.go
-			return q.CheckTraversalCompletion(currentRound, wasFirstPull)
-
+			return q.CheckTraversalCompletion(currentRound)
 		case QueueModeCopy:
-			// Delegate to copy-specific completion check in mode_copy.go
-			return q.CheckCopyCompletion(currentRound, wasFirstPull)
+			return q.CheckCopyCompletion(currentRound, opts.WasFirstPull)
 		}
-
 		return false
 	}
 
@@ -509,14 +465,6 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 		// Round is complete if: no in-progress, no pending, and last pull was partial
 		if inProgressCount > 0 || pendingBuffCount > 0 || !lastPullWasPartial {
 			return false
-		}
-
-		// Copy mode keeps status updates in src_staging until seal.
-		// A live-table hard check here can see stale "pending" rows and deadlock round advancement.
-		// For copy, rely on the soft check (in-memory + pull exhaustiveness), then seal/merge on round advance.
-		mode := q.GetMode()
-		if mode != QueueModeCopy {
-			// Non-copy modes can use live status directly for hard validation.
 		}
 
 		// Both soft and hard checks passed - round is complete
@@ -1101,7 +1049,7 @@ func (q *Queue) Run() {
 			}
 		}
 
-		// Polling loop: Single source of truth for round advancement and completion
+		// Polling loop: Single source of truth for round advancement and completion.
 		// Poll conditions directly - no soft flags needed
 		for {
 			// Check for shutdown
@@ -1134,21 +1082,11 @@ func (q *Queue) Run() {
 			pulledAmount := q.getCurrentRoundPulledAmount() // items actually returned from our DB queries this round
 			roundToCheck := q.GetRound()
 
-			// 1. Check queue completion (mode-specific)
-			// Done when we've queried at least once (pullCount > 0) and pulled amount is 0 (queries returned nothing).
+			// 1. Check queue completion (mode-specific). Traversal logic lives in CheckTraversalCompletion.
 			mode := q.GetMode()
 			if mode != QueueModeCopy {
-				// Traversal/retry: mark complete only when we queried and got 0 items, and first pull of round (prevents premature completion mid-round).
-				if pullCount > 0 && pulledAmount == 0 && inProgressCount == 0 && pendingCount == 0 {
-					wasFirstPull := (pullCount == 1) // first pull of this round returned 0 items
-					completed := q.checkCompletion(roundToCheck, CompletionCheckOptions{
-						CheckFinalCompletion: true,
-						WasFirstPull:         wasFirstPull,
-						FlushBuffer:          true,
-					})
-					if completed {
-						// Don't call Stop() here - let the outer loop handle cleanup
-						// The outer loop will detect QueueStateCompleted and stop the buffer
+				if inProgressCount == 0 && pendingCount == 0 {
+					if q.checkCompletion(roundToCheck, CompletionCheckOptions{CheckFinalCompletion: true}) {
 						return
 					}
 				}
@@ -1159,6 +1097,11 @@ func (q *Queue) Run() {
 			// Round complete when: no in-progress, no pending, last pull was partial
 			roundCompleteSoft := inProgressCount == 0 && pendingCount == 0 && lastPullWasPartial
 
+			// Traversal/retry: only advance if we've actually pulled this round. If we never tried to pull, don't advance.
+			// First pull with 0 items is queue complete (handled above in CheckTraversalCompletion), not advance.
+			if mode != QueueModeCopy && (pullCount == 0 || (pullCount == 1 && pulledAmount == 0)) {
+				roundCompleteSoft = false
+			}
 			// For copy mode, also consider round complete if we queried and pulled amount is 0 (no tasks for this pass at this round)
 			if mode == QueueModeCopy && pullCount > 0 && pulledAmount == 0 && inProgressCount == 0 && pendingCount == 0 {
 				roundCompleteSoft = true
@@ -1169,7 +1112,6 @@ func (q *Queue) Run() {
 				q.checkCompletion(roundToCheck, CompletionCheckOptions{
 					CheckRoundComplete:     true,
 					AdvanceRoundIfComplete: true,
-					FlushBuffer:            true,
 				})
 			}
 
@@ -1200,12 +1142,13 @@ func snapshotLevel(level *LevelCache) []*db.NodeState {
 // Note: Round advancement is now free - gating only happens when STARTING a round (checked in Run()).
 // For copy mode, advances to the next round that has pending tasks for the current pass.
 func (q *Queue) advanceToNextRound() {
-	// No gating here - rounds advance freely
-	// Gating only happens when STARTING a round (checked in Run() outer loop)
-
 	database := q.getDatabase()
 	round := q.GetRound()
 	nc := q.NodeCache()
+
+	if coord := q.getCoordinator(); coord != nil {
+		coord.WaitSealBackpressure(round, database)
+	}
 
 	if nc != nil && database != nil {
 		mode := q.GetMode()
@@ -1218,6 +1161,8 @@ func (q *Queue) advanceToNextRound() {
 				srcSlice := snapshotLevel(srcLevel)
 				dstSlice := snapshotLevel(dstLevel)
 				ls := nc.GetLevelStats(round)
+
+				// What the fuck is this alphabet soup of variables...?!
 				p, s, f, c := int64(0), int64(0), int64(0), int64(0)
 				cp, cs, cf := int64(-1), int64(-1), int64(-1)
 				if ls != nil {
@@ -1246,7 +1191,6 @@ func (q *Queue) advanceToNextRound() {
 			wroteSeal := false
 			switch q.name {
 			case "dst":
-				// Seal DST level.
 				level := nc.GetLevel(round)
 				if level != nil {
 					nodeSlice := snapshotLevel(level)
@@ -1255,7 +1199,13 @@ func (q *Queue) advanceToNextRound() {
 					if ls != nil {
 						pending, successful, failed, completed = int64(ls.Pending), int64(ls.Successful), int64(ls.Failed), int64(ls.Completed)
 					}
-					if err := database.SealLevel("DST", round, nodeSlice, pending, successful, failed, completed, -1, -1, -1); err != nil {
+					var err error
+					if round == 0 {
+						err = database.SealLevelDepth0("DST", nodeSlice, pending, successful, failed, completed, -1, -1, -1)
+					} else {
+						err = database.SealLevel("DST", round, nodeSlice, pending, successful, failed, completed, -1, -1, -1)
+					}
+					if err != nil {
 						fmt.Println("error sealing DST level", err)
 					} else {
 						wroteSeal = true
@@ -1273,7 +1223,13 @@ func (q *Queue) advanceToNextRound() {
 						if srcLs != nil {
 							sp, ss, sf, sc = int64(srcLs.Pending), int64(srcLs.Successful), int64(srcLs.Failed), int64(srcLs.Completed)
 						}
-						if err := database.SealLevel("SRC", round, srcSlice, sp, ss, sf, sc, -1, -1, -1); err != nil {
+						var err error
+						if round == 0 {
+							err = database.SealLevelDepth0("SRC", srcSlice, sp, ss, sf, sc, -1, -1, -1)
+						} else {
+							err = database.SealLevel("SRC", round, srcSlice, sp, ss, sf, sc, -1, -1, -1)
+						}
+						if err != nil {
 							fmt.Println("error sealing SRC level", err)
 						} else {
 							wroteSeal = true
@@ -1285,8 +1241,7 @@ func (q *Queue) advanceToNextRound() {
 				coordinator := q.getCoordinator()
 				if coordinator == nil || coordinator.IsCompleted("dst") {
 					// Drain any accumulated unsealed SRC levels up to this completed round.
-					// While DST is active, SRC may advance without sealing to preserve expected-child lookups.
-					// Once DST is done, seal backlog in order.
+					// Depth 0 is sealed via update path (root exists from seed), others via normal seal.
 					for _, depth := range nc.LevelDepths() {
 						if depth > round {
 							continue
@@ -1301,7 +1256,13 @@ func (q *Queue) advanceToNextRound() {
 						if ls != nil {
 							pending, successful, failed, completed = int64(ls.Pending), int64(ls.Successful), int64(ls.Failed), int64(ls.Completed)
 						}
-						if err := database.SealLevel("SRC", depth, nodeSlice, pending, successful, failed, completed, -1, -1, -1); err != nil {
+						var err error
+						if depth == 0 {
+							err = database.SealLevelDepth0("SRC", nodeSlice, pending, successful, failed, completed, -1, -1, -1)
+						} else {
+							err = database.SealLevel("SRC", depth, nodeSlice, pending, successful, failed, completed, -1, -1, -1)
+						}
+						if err != nil {
 							fmt.Println("error sealing SRC level", err)
 						} else {
 							wroteSeal = true
@@ -1316,20 +1277,9 @@ func (q *Queue) advanceToNextRound() {
 				}
 			}
 		}
-	} else if database != nil {
-		// Legacy: flush staging and merge into live
-		database.FlushTablesForQueue(getQueueType(q.name))
-		completed := int64(0)
-		if stats := q.GetRoundStats(round); stats != nil {
-			completed = int64(stats.Completed)
-		}
-		if err := database.RunUpdateWriterTx(func(w *db.Writer) error {
-			return w.ApplyStatusStagingAndDrop(round, getQueueType(q.name), completed)
-		}); err != nil {
-			fmt.Println("error running update writer tx", err)
-		}
-		if err := database.Checkpoint(); err != nil {
-			fmt.Println("error checkpointing", err)
+		// Seal => persist now; flush so we don't block on the buffer's interval in the next WaitSealBackpressure.
+		if err := database.FlushSealBuffer(); err != nil {
+			fmt.Println("error flushing seal buffer", err)
 		}
 	}
 	// This queue's cursor must not survive its seal. Reset only this queue's cursor; other queues are independent.

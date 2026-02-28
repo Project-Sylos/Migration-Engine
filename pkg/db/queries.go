@@ -193,14 +193,12 @@ func ListNodesByDepthKeyset(d *DB, table string, depth int, afterID, statusFilte
 	var rows *sql.Rows
 	if statusFilter != "" {
 		if afterID == "" {
-			// fmt.Printf("[ListNodesByDepthKeyset] table=%s depth=%d afterID=%q statusFilter=%q limit=%d\n  SQL: SELECT ... FROM %s WHERE depth = $1 AND traversal_status = $2 ORDER BY id LIMIT $3  ($1=%d $2=%q $3=%d)\n", t, depth, afterID, statusFilter, limit, t, depth, statusFilter, limit)
 			rows, err = conn.QueryContext(ctx,
 				`SELECT id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth, traversal_status, copy_status, excluded, errors
 				 FROM `+t+` WHERE depth = $1 AND traversal_status = $2 ORDER BY id LIMIT $3`,
 				depth, statusFilter, limit,
 			)
 		} else {
-			// fmt.Printf("[ListNodesByDepthKeyset] table=%s depth=%d afterID=%q statusFilter=%q limit=%d\n  SQL: SELECT ... FROM %s WHERE depth = $1 AND traversal_status = $2 AND id > $3 ORDER BY id LIMIT $4  ($1=%d $2=%q $3=%q $4=%d)\n", t, depth, afterID, statusFilter, limit, t, depth, statusFilter, afterID, limit)
 			rows, err = conn.QueryContext(ctx,
 				`SELECT id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth, traversal_status, copy_status, excluded, errors
 				 FROM `+t+` WHERE depth = $1 AND traversal_status = $2 AND id > $3 ORDER BY id LIMIT $4`,
@@ -209,14 +207,12 @@ func ListNodesByDepthKeyset(d *DB, table string, depth int, afterID, statusFilte
 		}
 	} else {
 		if afterID == "" {
-			// fmt.Printf("[ListNodesByDepthKeyset] table=%s depth=%d afterID=%q statusFilter=(none) limit=%d\n  SQL: SELECT ... FROM %s WHERE depth = $1 ORDER BY id LIMIT $2  ($1=%d $2=%d)\n", t, depth, afterID, limit, t, depth, limit)
 			rows, err = conn.QueryContext(ctx,
 				`SELECT id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth, traversal_status, copy_status, excluded, errors
 				 FROM `+t+` WHERE depth = $1 ORDER BY id LIMIT $2`,
 				depth, limit,
 			)
 		} else {
-			// fmt.Printf("[ListNodesByDepthKeyset] table=%s depth=%d afterID=%q statusFilter=(none) limit=%d\n  SQL: SELECT ... FROM %s WHERE depth = $1 AND id > $2 ORDER BY id LIMIT $3  ($1=%d $2=%q $3=%d)\n", t, depth, afterID, limit, t, depth, afterID, limit)
 			rows, err = conn.QueryContext(ctx,
 				`SELECT id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth, traversal_status, copy_status, excluded, errors
 				 FROM `+t+` WHERE depth = $1 AND id > $2 ORDER BY id LIMIT $3`,
