@@ -17,9 +17,9 @@ import (
 )
 
 func (s *migrationStore) queryNodes(filter NodeQueryFilter) ([]db.NodeState, error) {
-	table := "src_nodes"
+	table := "SRC"
 	if strings.ToUpper(filter.Queue) == "DST" {
-		table = "dst_nodes"
+		table = "DST"
 	}
 	limit := filter.Limit
 	if limit <= 0 {
@@ -32,87 +32,7 @@ func (s *migrationStore) queryNodes(filter NodeQueryFilter) ([]db.NodeState, err
 	if offset < 0 {
 		offset = 0
 	}
-
-	where := make([]string, 0, 4)
-	args := make([]any, 0, 5)
-	argPos := 1
-	if filter.Depth != nil {
-		where = append(where, fmt.Sprintf("depth = $%d", argPos))
-		args = append(args, *filter.Depth)
-		argPos++
-	}
-	if filter.Status != "" {
-		where = append(where, fmt.Sprintf("traversal_status = $%d", argPos))
-		args = append(args, filter.Status)
-		argPos++
-	}
-	if filter.Excluded != nil {
-		where = append(where, fmt.Sprintf("excluded = $%d", argPos))
-		args = append(args, *filter.Excluded)
-		argPos++
-	}
-	if filter.PathLike != "" {
-		where = append(where, fmt.Sprintf("path LIKE $%d", argPos))
-		args = append(args, "%"+filter.PathLike+"%")
-		argPos++
-	}
-
-	query := `SELECT id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth, traversal_status, copy_status, excluded, errors FROM ` + table
-	if len(where) > 0 {
-		query += ` WHERE ` + strings.Join(where, " AND ")
-	}
-	if filter.OrderByPath {
-		query += ` ORDER BY path`
-	} else {
-		query += ` ORDER BY id`
-	}
-	query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argPos, argPos+1)
-	args = append(args, limit, offset)
-
-	conn, err := s.db.GetDB()
-	if err != nil {
-		return nil, err
-	}
-	rows, err := conn.QueryContext(context.Background(), query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("query nodes: %w", err)
-	}
-	defer rows.Close()
-
-	results := make([]db.NodeState, 0, limit)
-	for rows.Next() {
-		var (
-			node db.NodeState
-			size sql.NullInt64
-		)
-		if err := rows.Scan(
-			&node.ID,
-			&node.ServiceID,
-			&node.ParentID,
-			&node.ParentServiceID,
-			&node.Path,
-			&node.ParentPath,
-			&node.Type,
-			&size,
-			&node.MTime,
-			&node.Depth,
-			&node.TraversalStatus,
-			&node.CopyStatus,
-			&node.Excluded,
-			&node.Errors,
-		); err != nil {
-			return nil, fmt.Errorf("query nodes scan: %w", err)
-		}
-		if size.Valid {
-			node.Size = size.Int64
-		}
-		node.Status = node.TraversalStatus
-		results = append(results, node)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("query nodes rows: %w", err)
-	}
-	return results, nil
+	return db.QueryNodesForReview(s.db, table, filter.Depth, filter.Status, filter.Excluded, filter.PathLike, filter.OrderByPath, limit, offset)
 }
 
 func (s *migrationStore) setNodeExcluded(queueType, nodeID string, excluded bool) error {
@@ -120,8 +40,10 @@ func (s *migrationStore) setNodeExcluded(queueType, nodeID string, excluded bool
 	if q != "DST" {
 		q = "SRC"
 	}
-	return s.db.RunUpdateWriterTx(func(w *db.Writer) error {
-		return w.SetNodeExcluded(q, nodeID, excluded)
+	return s.db.RunWrite(context.Background(), func(s *db.WriteSession) error {
+		return s.WithTx(func(w *db.Writer) error {
+			return w.SetNodeExcluded(q, nodeID, excluded)
+		})
 	})
 }
 
@@ -166,8 +88,10 @@ func (s *migrationStore) listRecentLogs(limit int) ([]LogEntry, error) {
 
 func (s *migrationStore) setNodeTraversalStatus(nodeID, status string) error {
 	// Try SRC first, then DST. This avoids a read-before-write table resolution hop.
-	err := s.db.RunUpdateWriterTx(func(w *db.Writer) error {
-		return w.SetNodeTraversalStatus("SRC", nodeID, status)
+	err := s.db.RunWrite(context.Background(), func(s *db.WriteSession) error {
+		return s.WithTx(func(w *db.Writer) error {
+			return w.SetNodeTraversalStatus("SRC", nodeID, status)
+		})
 	})
 	if err == nil {
 		return nil
@@ -175,8 +99,10 @@ func (s *migrationStore) setNodeTraversalStatus(nodeID, status string) error {
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	err = s.db.RunUpdateWriterTx(func(w *db.Writer) error {
-		return w.SetNodeTraversalStatus("DST", nodeID, status)
+	err = s.db.RunWrite(context.Background(), func(s *db.WriteSession) error {
+		return s.WithTx(func(w *db.Writer) error {
+			return w.SetNodeTraversalStatus("DST", nodeID, status)
+		})
 	})
 	if err == nil {
 		return nil
@@ -188,8 +114,10 @@ func (s *migrationStore) setNodeTraversalStatus(nodeID, status string) error {
 }
 
 func (s *migrationStore) setNodeCopyStatus(nodeID, status string) error {
-	return s.db.RunUpdateWriterTx(func(w *db.Writer) error {
-		return w.SetNodeCopyStatus("SRC", nodeID, status)
+	return s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+		return sess.WithTx(func(w *db.Writer) error {
+			return w.SetNodeCopyStatus("SRC", nodeID, status)
+		})
 	})
 }
 
@@ -205,22 +133,14 @@ func (s *migrationStore) setNodeExcludedWithPropagation(queueType, nodeID string
 	if node == nil {
 		return fmt.Errorf("node %s not found in %s", nodeID, q)
 	}
-	table := "src_nodes"
-	if q == "DST" {
-		table = "dst_nodes"
+	if !excluded {
+		return fmt.Errorf("setNodeExcludedWithPropagation: unexclude with propagation not implemented")
 	}
-	conn, err := s.db.GetDB()
-	if err != nil {
-		return err
-	}
-	prefix := node.Path + "/%"
-	_, err = conn.ExecContext(
-		context.Background(),
-		`UPDATE `+table+` SET excluded = $1 WHERE path = $2 OR path LIKE $3`,
-		excluded,
-		node.Path,
-		prefix,
-	)
+	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+		return sess.WithTx(func(w *db.Writer) error {
+			return w.InsertExclusionEventsForSubtree(q, node.Path)
+		})
+	})
 	if err != nil {
 		return fmt.Errorf("set exclusion with propagation: %w", err)
 	}
@@ -276,29 +196,7 @@ func (s *migrationStore) listChildrenDiffs(req ListChildrenDiffsRequest) (ListCh
 		args = append(args, req.Status)
 	}
 
-	base := `WITH merged AS (
-SELECT
-	COALESCE(s.path, d.path) AS path,
-	COALESCE(s.parent_path, d.parent_path) AS parent_path,
-	COALESCE(s.depth, d.depth, 0) AS depth,
-	COALESCE(s.type, d.type, '') AS type,
-	COALESCE(s.id, '') AS src_node_id,
-	COALESCE(d.id, '') AS dst_node_id,
-	COALESCE(s.traversal_status, '') AS src_traversal_status,
-	COALESCE(d.traversal_status, '') AS dst_traversal_status,
-	COALESCE(s.copy_status, '') AS copy_status,
-	COALESCE(s.excluded, d.excluded, false) AS excluded,
-	COALESCE(s.size, d.size, 0) AS size,
-	COALESCE(s.parent_path, '') AS src_parent_path,
-	COALESCE(d.parent_path, '') AS dst_parent_path,
-	CASE
-		WHEN COALESCE(s.path, d.path) = '' THEN ''
-		WHEN strpos(reverse(COALESCE(s.path, d.path)), '/') = 0 THEN COALESCE(s.path, d.path)
-		ELSE right(COALESCE(s.path, d.path), strpos(reverse(COALESCE(s.path, d.path)), '/') - 1)
-	END AS name
-FROM src_nodes s
-FULL OUTER JOIN dst_nodes d ON s.path = d.path
-)`
+	base := db.MergedReviewQueryBase()
 
 	countQuery := base + ` SELECT COUNT(*) FROM merged` + where
 	var total int

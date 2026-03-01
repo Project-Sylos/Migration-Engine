@@ -81,21 +81,18 @@ func (db *DB) GetStatsCountAtDepth(table string, depth int, key string) (int64, 
 	return 0, nil
 }
 
-// GetCopyCountAtDepth returns the count of nodes in src_nodes at the given depth and copy_status; if nodeType != "", filters by type (e.g. "folder" or "file").
+// GetCopyCountAtDepth returns the count of nodes in src_nodes at the given depth with current copy_status (event-derived). Optional nodeType filter.
 func (db *DB) GetCopyCountAtDepth(depth int, nodeType string, copyStatus string) (int64, error) {
 	conn, err := db.GetDB()
 	if err != nil {
 		return 0, err
 	}
 	ctx := context.Background()
-	var q string
-	var args []interface{}
-	if nodeType == "" {
-		q = `SELECT COUNT(*)::BIGINT FROM src_nodes WHERE depth = $1 AND copy_status = $2`
-		args = []interface{}{depth, copyStatus}
-	} else {
-		q = `SELECT COUNT(*)::BIGINT FROM src_nodes WHERE depth = $1 AND type = $2 AND copy_status = $3`
-		args = []interface{}{depth, nodeType, copyStatus}
+	q := `SELECT COUNT(*)::BIGINT FROM src_nodes n LEFT JOIN ` + cteSrcCurrentStatus + ` e ON n.id = e.id WHERE n.depth = $1 AND COALESCE(e.copy_status,'') = $2`
+	args := []interface{}{depth, copyStatus}
+	if nodeType != "" {
+		q += ` AND n.type = $3`
+		args = append(args, nodeType)
 	}
 	var n sql.NullInt64
 	err = conn.QueryRowContext(ctx, q, args...).Scan(&n)
@@ -127,22 +124,22 @@ func (db *DB) GetMaxDepth(table string) (int, error) {
 	return int(d.Int64), nil
 }
 
-// GetPendingTraversalCountAtDepthFromLive returns the count of nodes at the given depth with traversal_status = 'pending' from the live nodes table. Use when advancing to a new round (stats for that depth may not exist yet).
+// GetPendingTraversalCountAtDepthFromLive returns the count of nodes at the given depth with current traversal_status = 'pending' (event-derived).
 func (db *DB) GetPendingTraversalCountAtDepthFromLive(table string, depth int) (int64, error) {
 	t := tableSrcNodes
+	cte := cteSrcCurrentStatus
 	if table == "DST" {
 		t = tableDstNodes
+		cte = cteDstCurrentStatus
 	}
 	conn, err := db.GetDB()
 	if err != nil {
 		return 0, err
 	}
 	ctx := context.Background()
+	q := `SELECT COUNT(*)::BIGINT FROM ` + t + ` n LEFT JOIN ` + cte + ` e ON n.id = e.id WHERE n.depth = $1 AND COALESCE(e.traversal_status,'') = 'pending'`
 	var n sql.NullInt64
-	err = conn.QueryRowContext(ctx,
-		`SELECT COUNT(*)::BIGINT FROM `+t+` WHERE depth = $1 AND COALESCE(traversal_status, '') = 'pending'`,
-		depth,
-	).Scan(&n)
+	err = conn.QueryRowContext(ctx, q, depth).Scan(&n)
 	if err != nil {
 		return 0, err
 	}

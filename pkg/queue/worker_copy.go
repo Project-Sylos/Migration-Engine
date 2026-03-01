@@ -115,11 +115,13 @@ func (w *CopyWorker) Run() {
 		if err != nil {
 			// Record task error in main DB for cross-lookup (copy phase, SRC only)
 			if w.database != nil {
-				err := w.database.RunUpdateWriterTx(func(tx *db.Writer) error {
-					return tx.RecordTaskError("SRC", "copy", task.ID, err.Error(), task.Attempts, task.LocationPath())
+				err := w.database.RunWrite(context.Background(), func(s *db.WriteSession) error {
+					return s.WithTx(func(tx *db.Writer) error {
+						return tx.RecordTaskError("SRC", "copy", task.ID, err.Error(), task.Attempts, task.LocationPath())
+					})
 				})
 				if err != nil {
-					fmt.Println("error running update writer tx", err)
+					fmt.Println("error running write", err)
 				}
 			}
 			if logservice.LS != nil {

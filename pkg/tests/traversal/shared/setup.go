@@ -211,10 +211,10 @@ func SetupEphemeralTest(removeMigrationDB bool) (migration.Config, error) {
 		WorkerCount:     10,
 		MaxRetries:      3,
 		CoordinatorLead: 4,
-		SkipListener:    false,
+		SkipListener:    true,
 		LogAddress:      "127.0.0.1:8081",
 		LogLevel:        "trace",
-		StartupDelay:    3 * time.Second, // you should set this to 3 if you set skip listener to false to account for terminal opening delay
+		StartupDelay:    1 * time.Second, // you should set this to 3 if you set skip listener to false to account for terminal opening delay
 		Verification: migration.VerifyOptions{
 			AllowNotOnSrc: true, // Ephemeral mode allows divergent trees (nodes on dst but not src)
 		},
@@ -345,7 +345,7 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 		CoordinatorLead: 4,
 		LogAddress:      "127.0.0.1:8081",
 		LogLevel:        "trace",
-		SkipListener:    true,
+		SkipListener:    false,
 		StartupDelay:    3 * time.Second,
 		Verification:    migration.VerifyOptions{AllowNotOnSrc: true},
 	}

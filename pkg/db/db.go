@@ -41,7 +41,8 @@ func Open(opts Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	conn.SetMaxOpenConns(1)
+	// Two conns so the phase can hold one (persistent appenders) while SealLevelDepth0 or other RunWrite callers can use the other.
+	conn.SetMaxOpenConns(2)
 	// Limit DuckDB memory and threads to avoid OOM during stress testing
 	if _, err := conn.Exec("PRAGMA memory_limit='8GB'"); err != nil {
 		err := conn.Close()
@@ -87,6 +88,8 @@ func schemaDDLs() []string {
 	return []string{
 		nodeTableDDL(tableSrcNodes),
 		nodeTableDDL(tableDstNodes),
+		srcStatusEventsTableDDL(),
+		dstStatusEventsTableDDL(),
 		statsTableDDL(),
 		srcStatsTableDDL(),
 		dstStatsTableDDL(),
@@ -111,7 +114,8 @@ func (db *DB) Close() error {
 	if db.sealBuffer != nil {
 		db.sealBuffer.Stop()
 	}
-	return db.conn.Close()
+	err := db.conn.Close()
+	return err
 }
 
 // Path returns the database file path (or ":memory:").
@@ -143,8 +147,8 @@ func (db *DB) GetDBForPulls(queueType string) (*sql.DB, error) {
 
 // AddNodeDeletion deletes a node immediately (retry DST cleanup).
 func (db *DB) AddNodeDeletion(table, nodeID string) error {
-	return db.RunUpdateWriterTx(func(w *Writer) error {
-		return w.DeleteNode(table, nodeID)
+	return db.RunWrite(context.Background(), func(s *WriteSession) error {
+		return s.WithTx(func(w *Writer) error { return w.DeleteNode(table, nodeID) })
 	})
 }
 
@@ -153,13 +157,15 @@ func (db *DB) AddNodeDeletions(deletions []NodeDeletion) error {
 	if len(deletions) == 0 {
 		return nil
 	}
-	return db.RunUpdateWriterTx(func(w *Writer) error {
-		for _, d := range deletions {
-			if err := w.DeleteNode(d.Table, d.NodeID); err != nil {
-				return err
+	return db.RunWrite(context.Background(), func(s *WriteSession) error {
+		return s.WithTx(func(w *Writer) error {
+			for _, d := range deletions {
+				if err := w.DeleteNode(d.Table, d.NodeID); err != nil {
+					return err
+				}
 			}
-		}
-		return nil
+			return nil
+		})
 	})
 }
 
@@ -185,8 +191,10 @@ func (db *DB) SealLevelDepth0(table string, nodes []*NodeState, pending, success
 	if table != "SRC" && table != "DST" {
 		return nil
 	}
-	return db.RunUpdateWriterTx(func(w *Writer) error {
-		return w.SealDepth0(table, nodes, pending, successful, failed, completed, copyP, copyS, copyF)
+	return db.RunWrite(context.Background(), func(s *WriteSession) error {
+		return s.WithTx(func(w *Writer) error {
+			return w.SealDepth0(table, nodes, pending, successful, failed, completed, copyP, copyS, copyF)
+		})
 	})
 }
 
@@ -200,8 +208,33 @@ func (db *DB) WaitUntilSealFlushedThrough(depth int) {
 	db.sealBuffer.WaitUntilFlushedThrough(depth)
 }
 
-// RunWithConn runs fn with the single DB connection while holding writeMu. Used by the seal buffer for appender + stats. Caller must not retain conn after fn returns.
-func (db *DB) RunWithConn(ctx context.Context, fn func(conn *sql.Conn) error) error {
+// WriteSession is the handle passed to RunWrite. Caller must not retain conn after the callback returns.
+type WriteSession struct {
+	conn *sql.Conn
+}
+
+// Conn returns the single DB connection for raw use (e.g. DuckDB appender). Valid only during the RunWrite callback.
+func (s *WriteSession) Conn() *sql.Conn {
+	return s.conn
+}
+
+// WithTx runs fn inside a transaction on this session's connection.
+func (s *WriteSession) WithTx(fn func(w *Writer) error) error {
+	ctx := context.Background()
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	w := &Writer{tx: tx}
+	if err := fn(w); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// RunWrite holds writeMu and runs fn with a WriteSession (single connection). Use Conn() for raw conn (e.g. appender) or WithTx for transactional writes. Caller must not retain the session or conn after fn returns.
+func (db *DB) RunWrite(ctx context.Context, fn func(s *WriteSession) error) error {
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
 	conn, err := db.conn.Conn(ctx)
@@ -209,45 +242,60 @@ func (db *DB) RunWithConn(ctx context.Context, fn func(conn *sql.Conn) error) er
 		return err
 	}
 	defer conn.Close()
-	return fn(conn)
+	return fn(&WriteSession{conn: conn})
 }
 
-// RunUpdateWriterTx runs fn inside a transaction on the main connection.
-func (db *DB) RunUpdateWriterTx(fn func(w *Writer) error) error {
+// BeginTraversalPhase starts the traversal phase: drops secondary indexes, acquires a persistent connection and creates 4 appenders for the seal buffer. Flush will use one tx per flush until EndTraversalPhase.
+func (db *DB) BeginTraversalPhase(ctx context.Context) error {
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
-	ctx := context.Background()
-	tx, err := db.conn.BeginTx(ctx, nil)
+	if err := DropNodeTableIndexes(db, tableSrcNodes); err != nil {
+		return err
+	}
+	if err := DropNodeTableIndexes(db, tableDstNodes); err != nil {
+		return err
+	}
+	if err := DropStatusEventTableIndexes(db, tableSrcStatusEvents); err != nil {
+		return err
+	}
+	if err := DropStatusEventTableIndexes(db, tableDstStatusEvents); err != nil {
+		return err
+	}
+	conn, err := db.conn.Conn(ctx)
 	if err != nil {
 		return err
 	}
-	w := &Writer{tx: tx}
-	if err := fn(w); err != nil {
-		err := tx.Rollback()
-		if err != nil {
-			return err
-		}
+	if err := db.sealBuffer.StartPhase(conn); err != nil {
+		conn.Close()
 		return err
 	}
-	return tx.Commit()
+	return nil
 }
 
-// RunAppenderWriterTx runs fn inside a transaction on the main connection.
-func (db *DB) RunAppenderWriterTx(queueType string, fn func(w *Writer) error) error {
-	db.writeMu.Lock()
-	defer db.writeMu.Unlock()
-	ctx := context.Background()
-	tx, err := db.conn.BeginTx(ctx, nil)
-	if err != nil {
+// EndTraversalPhase flushes remaining seal jobs, closes phase appenders and connection, rebuilds indexes, and checkpoints once.
+func (db *DB) EndTraversalPhase() error {
+	if err := db.sealBuffer.StopPhase(); err != nil {
 		return err
 	}
-	w := &Writer{tx: tx}
-	if err := fn(w); err != nil {
-		err := tx.Rollback()
-		if err != nil {
+	for _, table := range []string{tableSrcNodes, tableDstNodes} {
+		if err := EnsureNodeTableIndexes(db, table); err != nil {
 			return err
 		}
-		return err
 	}
-	return tx.Commit()
+	for _, table := range []string{tableSrcStatusEvents, tableDstStatusEvents} {
+		if err := EnsureStatusEventTableIndexes(db, table); err != nil {
+			return err
+		}
+	}
+	return db.Checkpoint()
+}
+
+// BeginCopyPhase starts the copy phase (same as traversal: drop indexes, persistent appenders).
+func (db *DB) BeginCopyPhase(ctx context.Context) error {
+	return db.BeginTraversalPhase(ctx)
+}
+
+// EndCopyPhase ends the copy phase (flush, close appenders, rebuild indexes, checkpoint).
+func (db *DB) EndCopyPhase() error {
+	return db.EndTraversalPhase()
 }

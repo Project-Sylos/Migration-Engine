@@ -14,6 +14,8 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
+const listChildrenTimeout = 60 * time.Second
+
 // TraversalWorker executes traversal tasks by listing children and recording them to DuckDB.
 // Each worker runs independently in its own goroutine, continuously polling the queue for work.
 type TraversalWorker struct {
@@ -109,11 +111,13 @@ func (w *TraversalWorker) Run() {
 			// Record task error in main DB for cross-lookup (traversal phase)
 			if w.database != nil {
 				queueType := strings.ToUpper(w.queueName)
-				err := w.database.RunUpdateWriterTx(func(tx *db.Writer) error {
-					return tx.RecordTaskError(queueType, "traversal", task.ID, err.Error(), task.Attempts, task.LocationPath())
+				err := w.database.RunWrite(context.Background(), func(s *db.WriteSession) error {
+					return s.WithTx(func(tx *db.Writer) error {
+						return tx.RecordTaskError(queueType, "traversal", task.ID, err.Error(), task.Attempts, task.LocationPath())
+					})
 				})
 				if err != nil {
-					fmt.Println("error running update writer tx", err)
+					fmt.Println("error running write", err)
 				}
 			}
 			w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
@@ -141,7 +145,28 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 	// Pass the folder's depth level and path - required for SpectraFS in ephemeral mode,
 	// optional for persistent mode and other adapters (they'll ignore it).
 	depth := folder.DepthLevel
-	result, err := w.fsAdapter.ListChildren(folder.ServiceID, &depth, folder.LocationPath)
+	type listChildrenResult struct {
+		result types.ListResult
+		err    error
+	}
+	listDone := make(chan listChildrenResult, 1)
+	go func(serviceID string, listDepth int, path string) {
+		r, err := w.fsAdapter.ListChildren(serviceID, &listDepth, path)
+		listDone <- listChildrenResult{result: r, err: err}
+	}(folder.ServiceID, depth, folder.LocationPath)
+	var (
+		result types.ListResult
+		err    error
+	)
+	select {
+	case out := <-listDone:
+		result = out.result
+		err = out.err
+	case <-time.After(listChildrenTimeout):
+		err = fmt.Errorf("list children timeout after %s", listChildrenTimeout)
+	case <-w.shutdownCtx.Done():
+		err = fmt.Errorf("list children cancelled by shutdown")
+	}
 	if err != nil {
 		if logservice.LS != nil {
 			err := logservice.LS.Log("error",
@@ -209,12 +234,12 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 
 	// log discovered children count
 	// leave this in for debugging if you need to see if workers are firing off
-	if logservice.LS != nil {
-		err := logservice.LS.Log("info", fmt.Sprintf("Discovered %d children for task %s", len(task.DiscoveredChildren), task.ID), "worker", w.id, w.queueName)
-		if err != nil {
-			fmt.Println("error logging", err)
-		}
-	}
+	// if logservice.LS != nil {
+	// 	err := logservice.LS.Log("info", fmt.Sprintf("Discovered %d children for task %s", len(task.DiscoveredChildren), task.ID), "worker", w.id, w.queueName)
+	// 	if err != nil {
+	// 		fmt.Println("error logging", err)
+	// 	}
+	// }
 
 	return nil
 }

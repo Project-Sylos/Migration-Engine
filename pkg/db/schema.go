@@ -4,15 +4,17 @@
 package db
 
 const (
-	tableSrcNodes   = "src_nodes"
-	tableDstNodes   = "dst_nodes"
-	tableSrcStats   = "src_stats"
-	tableDstStats   = "dst_stats"
+	tableSrcNodes         = "src_nodes"
+	tableDstNodes         = "dst_nodes"
+	tableSrcStatusEvents  = "src_status_events"
+	tableDstStatusEvents  = "dst_status_events"
+	tableSrcStats         = "src_stats"
+	tableDstStats         = "dst_stats"
 	// TableMigrations is the migrations lifecycle table name (used by schema and migration store).
 	TableMigrations = "migrations"
 )
 
-// nodeTableDDL returns CREATE TABLE for src_nodes or dst_nodes.
+// nodeTableDDL returns CREATE TABLE for src_nodes or dst_nodes (metadata only; no status columns).
 func nodeTableDDL(table string) string {
 	return `CREATE TABLE IF NOT EXISTS ` + table + ` (
 		id VARCHAR PRIMARY KEY,
@@ -24,11 +26,28 @@ func nodeTableDDL(table string) string {
 		type VARCHAR,
 		size BIGINT,
 		mtime VARCHAR,
-		depth INTEGER NOT NULL,
+		depth INTEGER NOT NULL
+	)`
+}
+
+// srcStatusEventsTableDDL returns CREATE TABLE for append-only source status events.
+func srcStatusEventsTableDDL() string {
+	return `CREATE TABLE IF NOT EXISTS ` + tableSrcStatusEvents + ` (
+		id VARCHAR NOT NULL,
 		traversal_status VARCHAR,
 		copy_status VARCHAR,
-		excluded BOOLEAN DEFAULT FALSE,
-		errors VARCHAR
+		event_time BIGINT NOT NULL,
+		depth INTEGER NOT NULL
+	)`
+}
+
+// dstStatusEventsTableDDL returns CREATE TABLE for append-only destination status events.
+func dstStatusEventsTableDDL() string {
+	return `CREATE TABLE IF NOT EXISTS ` + tableDstStatusEvents + ` (
+		id VARCHAR NOT NULL,
+		traversal_status VARCHAR,
+		event_time BIGINT NOT NULL,
+		depth INTEGER NOT NULL
 	)`
 }
 

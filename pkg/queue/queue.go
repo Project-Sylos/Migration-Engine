@@ -190,6 +190,11 @@ type Queue struct {
 	avgExecutionTime    time.Duration   // Average execution time (calculated periodically)
 	lastAvgTime         time.Time       // Last time average was calculated
 	avgInterval         time.Duration   // Interval for calculating averages
+	roundDebugLastLogAt time.Time       // Throttle timestamp for round-completion debug prints
+	dequeueDebugLastLogAt time.Time     // Throttle timestamp for dequeue skip debug prints
+	dequeueSkipOldRound   int64         // Aggregated dequeue skips: task.Round < currentRound
+	dequeueSkipEmptyID    int64         // Aggregated dequeue skips: empty task.ID
+	dequeueSkipInProgress int64         // Aggregated dequeue skips: already in progress
 	// Retry sweep specific fields
 	maxKnownDepth int // Maximum known depth from previous traversal (for retry sweep)
 	// Copy phase specific fields
@@ -427,14 +432,11 @@ type CompletionCheckOptions struct {
 
 // checkCompletion performs completion checks based on the provided options.
 // Returns true if queue was marked as completed, false otherwise.
+// please see the docs/algorithms.md file for more information on the completion checking logic.
 func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) bool {
 	// For traversal/sweep completion check (handles all modes)
 	// Called when first pull returns 0 entries - decides if we're completely done
 	if opts.CheckFinalCompletion {
-		// Skip check if queue is in waiting state (DST gating)
-		if q.State() == QueueStateWaiting {
-			return false
-		}
 		// Soft queue checks: if we have tasks in progress or in buffer, we're not done
 		if q.InProgressCount() > 0 || q.GetPendingCount() > 0 {
 			return false
@@ -461,6 +463,41 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 		inProgressCount := q.InProgressCount()
 		pendingBuffCount := q.GetPendingCount()
 		lastPullWasPartial := q.getLastPullWasPartial()
+		mode := q.GetMode()
+		if inProgressCount == 0 && pendingBuffCount == 0 && !lastPullWasPartial {
+			// We may be at round-end but never observed a terminal pull yet.
+			// Force one pull attempt so partial/empty state is recorded and completion can progress.
+			q.PullTasksIfNeeded(true)
+			inProgressCount = q.InProgressCount()
+			pendingBuffCount = q.GetPendingCount()
+			lastPullWasPartial = q.getLastPullWasPartial()
+		}
+
+		// Traversal/retry use cache truth for "round drained":
+		// no queued/in-progress work and no pending nodes at this depth.
+		if mode == QueueModeTraversal || mode == QueueModeRetry {
+			if inProgressCount > 0 || pendingBuffCount > 0 {
+				return false
+			}
+			nc := q.NodeCache()
+			if nc == nil {
+				return false
+			}
+			level := nc.GetLevel(currentRound)
+			hasPendingAtDepth := level != nil && level.HasPendingTraversal()
+			if hasPendingAtDepth {
+				return false
+			}
+			// Require at least one pull attempt for this round to avoid premature advancement.
+			info := q.getRoundInfoReadOnly(currentRound)
+			if info == nil || info.PullCount == 0 {
+				return false
+			}
+			if opts.AdvanceRoundIfComplete {
+				q.advanceToNextRound()
+			}
+			return true
+		}
 
 		// Round is complete if: no in-progress, no pending, and last pull was partial
 		if inProgressCount > 0 || pendingBuffCount > 0 || !lastPullWasPartial {
@@ -519,6 +556,7 @@ func (q *Queue) markComplete(format string, args ...interface{}) bool {
 		q.name, totalTasksProcessed, totalChildrenDiscovered)
 
 	q.SetState(QueueStateCompleted)
+	// Flush and checkpoint are done at phase end (EndTraversalPhase/EndCopyPhase), not per-queue.
 
 	// Notify coordinator
 	coordinator := q.getCoordinator()
@@ -1075,45 +1113,18 @@ func (q *Queue) Run() {
 			}
 
 			// Get current state snapshot
-			inProgressCount := q.InProgressCount()
-			pendingCount := q.GetPendingCount()
-			lastPullWasPartial := q.getLastPullWasPartial()
-			pullCount := q.getCurrentRoundPullCount()
-			pulledAmount := q.getCurrentRoundPulledAmount() // items actually returned from our DB queries this round
 			roundToCheck := q.GetRound()
 
-			// 1. Check queue completion (mode-specific). Traversal logic lives in CheckTraversalCompletion.
-			mode := q.GetMode()
-			if mode != QueueModeCopy {
-				if inProgressCount == 0 && pendingCount == 0 {
-					if q.checkCompletion(roundToCheck, CompletionCheckOptions{CheckFinalCompletion: true}) {
-						return
-					}
-				}
+			// 1. Check queue completion
+			if q.checkCompletion(roundToCheck, CompletionCheckOptions{CheckFinalCompletion: true}) {
+				return
 			}
 
-			// 2. Check round completion (universal)
-			// Soft check: in-memory state only (fast, no DB access)
-			// Round complete when: no in-progress, no pending, last pull was partial
-			roundCompleteSoft := inProgressCount == 0 && pendingCount == 0 && lastPullWasPartial
-
-			// Traversal/retry: only advance if we've actually pulled this round. If we never tried to pull, don't advance.
-			// First pull with 0 items is queue complete (handled above in CheckTraversalCompletion), not advance.
-			if mode != QueueModeCopy && (pullCount == 0 || (pullCount == 1 && pulledAmount == 0)) {
-				roundCompleteSoft = false
-			}
-			// For copy mode, also consider round complete if we queried and pulled amount is 0 (no tasks for this pass at this round)
-			if mode == QueueModeCopy && pullCount > 0 && pulledAmount == 0 && inProgressCount == 0 && pendingCount == 0 {
-				roundCompleteSoft = true
-			}
-
-			// If soft check passes, do hard check (DB verification) in checkCompletion
-			if roundCompleteSoft {
-				q.checkCompletion(roundToCheck, CompletionCheckOptions{
-					CheckRoundComplete:     true,
-					AdvanceRoundIfComplete: true,
-				})
-			}
+			// Check if the round is complete
+			q.checkCompletion(roundToCheck, CompletionCheckOptions{
+				CheckRoundComplete:     true,
+				AdvanceRoundIfComplete: true,
+			})
 
 			// Check if round advanced
 			if q.GetRound() != currentRound {
@@ -1145,10 +1156,7 @@ func (q *Queue) advanceToNextRound() {
 	database := q.getDatabase()
 	round := q.GetRound()
 	nc := q.NodeCache()
-
-	if coord := q.getCoordinator(); coord != nil {
-		coord.WaitSealBackpressure(round, database)
-	}
+	coord := q.getCoordinator()
 
 	if nc != nil && database != nil {
 		mode := q.GetMode()
@@ -1180,6 +1188,9 @@ func (q *Queue) advanceToNextRound() {
 				if err := database.SealLevel("DST", round, dstSlice, dp, ds, df, dc, -1, -1, -1); err != nil {
 					fmt.Println("error sealing DST level", err)
 				}
+				if coord != nil {
+					coord.WaitSealBackpressure(q.name, round, database)
+				}
 				nc.DropLevel(round)
 				other.DropLevel(round)
 			}
@@ -1188,7 +1199,6 @@ func (q *Queue) advanceToNextRound() {
 			// - SRC keeps levels in cache until DST completes that level (DST needs SRC cache to build expected maps).
 			// - DST seals both DST and matching SRC level, then drops both.
 			// - If DST is fully completed early, SRC falls back to sealing its own levels.
-			wroteSeal := false
 			switch q.name {
 			case "dst":
 				level := nc.GetLevel(round)
@@ -1207,9 +1217,6 @@ func (q *Queue) advanceToNextRound() {
 					}
 					if err != nil {
 						fmt.Println("error sealing DST level", err)
-					} else {
-						wroteSeal = true
-						nc.DropLevel(round)
 					}
 				}
 				// Seal matching SRC level when DST completes this depth.
@@ -1231,17 +1238,25 @@ func (q *Queue) advanceToNextRound() {
 						}
 						if err != nil {
 							fmt.Println("error sealing SRC level", err)
-						} else {
-							wroteSeal = true
-							other.DropLevel(round)
 						}
 					}
 				}
+				if coord != nil {
+					coord.WaitSealBackpressure("dst", round, database)
+				}
+				if level := nc.GetLevel(round); level != nil {
+					nc.DropLevel(round)
+				}
+				if other != nil {
+					if srcLevel := other.GetLevel(round); srcLevel != nil {
+						other.DropLevel(round)
+					}
+				}
 			case "src":
-				coordinator := q.getCoordinator()
-				if coordinator == nil || coordinator.IsCompleted("dst") {
+				if coord != nil && coord.IsCompleted("dst") {
 					// Drain any accumulated unsealed SRC levels up to this completed round.
-					// Depth 0 is sealed via update path (root exists from seed), others via normal seal.
+					// Seal all first, then wait for flush through round, then drop.
+					var sealed []int
 					for _, depth := range nc.LevelDepths() {
 						if depth > round {
 							continue
@@ -1265,21 +1280,17 @@ func (q *Queue) advanceToNextRound() {
 						if err != nil {
 							fmt.Println("error sealing SRC level", err)
 						} else {
-							wroteSeal = true
+							sealed = append(sealed, depth)
+						}
+					}
+					if len(sealed) > 0 {
+						coord.WaitSealBackpressure("src", round, database)
+						for _, depth := range sealed {
 							nc.DropLevel(depth)
 						}
 					}
 				}
 			}
-			if wroteSeal {
-				if err := database.Checkpoint(); err != nil {
-					fmt.Println("error checkpointing", err)
-				}
-			}
-		}
-		// Seal => persist now; flush so we don't block on the buffer's interval in the next WaitSealBackpressure.
-		if err := database.FlushSealBuffer(); err != nil {
-			fmt.Println("error flushing seal buffer", err)
 		}
 	}
 	// This queue's cursor must not survive its seal. Reset only this queue's cursor; other queues are independent.

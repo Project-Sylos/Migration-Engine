@@ -153,7 +153,7 @@ if err != nil {
 ## Observer
 
 - Polls queues periodically and reads stats from the database (`GetStatsCountAtDepth`, etc.) to compute pending/failed totals.
-- Writes aggregated metrics to the `queue_stats` table via `database.RunUpdateWriterTx` and `Writer.WriteQueueStats` (keyed e.g. by `src-traversal`, `dst-traversal`, `copy`).
+- Writes aggregated metrics to the `queue_stats` table via `database.RunWrite` and `Writer.WriteQueueStats` (keyed e.g. by `src-traversal`, `dst-traversal`, `copy`).
 
 ---
 

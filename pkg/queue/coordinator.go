@@ -132,15 +132,20 @@ func (c *QueueCoordinator) CanSrcStartRound(srcRound int) bool {
 	return srcRound <= c.dstRound+c.maxSrcAhead
 }
 
-// WaitSealBackpressure blocks until the seal buffer has flushed through (round-2) when round >= 2.
-// Flushes pending seal jobs first so we don't block on the buffer's interval timer. Call before advancing to the next round.
-// Pulling/processing from cache is not blocked; only round advancement waits. Pass database from the queue.
-func (c *QueueCoordinator) WaitSealBackpressure(round int, database *db.DB) {
-	if database == nil || round < 2 {
+// WaitSealBackpressure ensures the seal buffer has flushed through the given round before the caller drops that level from node cache.
+// Call after enqueueing the round's seal data and before dropping the level. Prevents the DB flush buffer from growing unbounded.
+func (c *QueueCoordinator) WaitSealBackpressure(queueName string, round int, database *db.DB) {
+	if database == nil || round < 0 {
 		return
 	}
-	_ = database.FlushSealBuffer()
-	database.WaitUntilSealFlushedThrough(round - 2)
+	if queueName == "dst" && c.IsCompleted("src") {
+		return
+	}
+	if err := database.FlushSealBuffer(); err != nil {
+		fmt.Println("error flushing seal buffer", err)
+		return
+	}
+	database.WaitUntilSealFlushedThrough(round)
 }
 
 // CanDstStartRound returns true if DST can start processing the specified round.

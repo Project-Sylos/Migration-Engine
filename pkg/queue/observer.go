@@ -21,6 +21,7 @@
 package queue
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -689,29 +690,31 @@ func (o *QueueObserver) publishMetricsToDuckDB(metricsMap map[string]ExternalQue
 		return
 	}
 
-	err := o.database.RunUpdateWriterTx(func(w *db.Writer) error {
-		for queueName, metrics := range metricsMap {
-			key := queueName
-			if queueName != "copy" {
-				key = queueName + "-traversal"
-			}
-			metricsJSON, err := json.Marshal(metrics)
-			if err != nil {
-				if logservice.LS != nil {
-					err := logservice.LS.Log("error",
-						fmt.Sprintf("Failed to marshal metrics for queue %s: %v", queueName, err),
-						"observer", "publish", "")
-					if err != nil {
-						fmt.Println("error logging", err)
-					}
+	err := o.database.RunWrite(context.Background(), func(s *db.WriteSession) error {
+		return s.WithTx(func(w *db.Writer) error {
+			for queueName, metrics := range metricsMap {
+				key := queueName
+				if queueName != "copy" {
+					key = queueName + "-traversal"
 				}
-				continue
+				metricsJSON, err := json.Marshal(metrics)
+				if err != nil {
+					if logservice.LS != nil {
+						err := logservice.LS.Log("error",
+							fmt.Sprintf("Failed to marshal metrics for queue %s: %v", queueName, err),
+							"observer", "publish", "")
+						if err != nil {
+							fmt.Println("error logging", err)
+						}
+					}
+					continue
+				}
+				if err := w.WriteQueueStats(key, string(metricsJSON)); err != nil {
+					return fmt.Errorf("failed to write metrics for %s: %w", key, err)
+				}
 			}
-			if err := w.WriteQueueStats(key, string(metricsJSON)); err != nil {
-				return fmt.Errorf("failed to write metrics for %s: %w", key, err)
-			}
-		}
-		return nil
+			return nil
+		})
 	})
 
 	if err != nil {

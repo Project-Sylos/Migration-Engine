@@ -4,6 +4,7 @@
 package db
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -116,18 +117,20 @@ func (lb *LogBuffer) Flush() {
 	if len(batch) == 0 {
 		return
 	}
-	defer lb.setFlushingDone()
 	n := len(batch)
-	err := lb.db.RunUpdateWriterTx(func(w *Writer) error {
-		for _, e := range batch {
-			if err := w.InsertLog(e.ID, e.Level, e.Message, e.Entity, e.Entity, e.EntityID, e.Queue); err != nil {
-				return err
+	defer lb.setFlushingDone()
+	err := lb.db.RunWrite(context.Background(), func(s *WriteSession) error {
+		return s.WithTx(func(w *Writer) error {
+			for _, e := range batch {
+				if err := w.InsertLog(e.ID, e.Level, e.Message, e.Entity, e.Entity, e.EntityID, e.Queue); err != nil {
+					return err
+				}
 			}
-		}
-		return nil
+			return nil
+		})
 	})
 	if err != nil {
-		fmt.Println("error running update writer tx", err)
+		fmt.Println("error running write", err)
 		return
 	}
 	for i := 0; i < n; i++ {

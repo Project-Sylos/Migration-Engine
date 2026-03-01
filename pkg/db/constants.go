@@ -3,13 +3,14 @@
 
 package db
 
-// Traversal status values (live table and staging). Stats keys use: pending, successful, failed, not_on_src (DST only).
+// Traversal status values (event-derived). Stats keys use: pending, successful, failed, not_on_src (DST only).
 const (
-	StatusPending    = "pending"
-	StatusSuccessful = "successful"
-	StatusFailed     = "failed"
-	StatusNotOnSrc   = "not_on_src" // DST only
-	StatusExcluded   = "excluded"
+	StatusPending           = "pending"
+	StatusSuccessful        = "successful"
+	StatusFailed            = "failed"
+	StatusNotOnSrc          = "not_on_src"          // DST only
+	StatusExcluded          = "excluded"
+	StatusExclusionInherited = "exclusion_inherited" // bulk subtree exclusion
 )
 
 // Copy status values (src_nodes only). Stats keys use: pending, successful, failed (no in_progress in stats).

@@ -6,6 +6,7 @@ package db
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"time"
 )
 
 // NodeState is the in-memory representation of a row in src_nodes or dst_nodes.
@@ -58,6 +59,15 @@ type WriteOperation interface {
 	flush(w *Writer) error
 }
 
+// StatusEvent is one append-only row for src_status_events or dst_status_events.
+type StatusEvent struct {
+	ID               string
+	TraversalStatus  string // nullable in DB
+	CopyStatus       string // src only; empty for dst
+	EventTime        int64
+	Depth            int
+}
+
 // StatusUpdateOperation represents a traversal status transition (e.g. pending → successful).
 type StatusUpdateOperation struct {
 	QueueType string
@@ -83,6 +93,7 @@ func (o *BatchInsertOperation) flush(w *Writer) error {
 	}
 	srcNodes := make([]*NodeState, 0)
 	dstNodes := make([]*NodeState, 0)
+	eventTime := time.Now().UnixNano()
 	for _, op := range o.Operations {
 		if op.State == nil {
 			continue
@@ -105,10 +116,22 @@ func (o *BatchInsertOperation) flush(w *Writer) error {
 		if err := w.AppenderInsert(tableSrcNodes, srcNodes); err != nil {
 			return err
 		}
+		for _, s := range srcNodes {
+			ev := &StatusEvent{ID: s.ID, TraversalStatus: s.TraversalStatus, CopyStatus: s.CopyStatus, EventTime: eventTime, Depth: s.Depth}
+			if err := w.InsertStatusEvent("SRC", ev); err != nil {
+				return err
+			}
+		}
 	}
 	if len(dstNodes) > 0 {
 		if err := w.AppenderInsert(tableDstNodes, dstNodes); err != nil {
 			return err
+		}
+		for _, s := range dstNodes {
+			ev := &StatusEvent{ID: s.ID, TraversalStatus: s.TraversalStatus, EventTime: eventTime, Depth: s.Depth}
+			if err := w.InsertStatusEvent("DST", ev); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

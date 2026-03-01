@@ -188,17 +188,20 @@ func (s *Sender) ClearConsole() error {
 }
 
 // Close terminates the UDP connection and stops the log buffer. Does not close the main DB.
+// Sets conn to nil under mu so any Log() after Close() no-ops instead of writing to a closed connection.
 func (s *Sender) Close() error {
 	if s.logBuffer != nil {
 		s.logBuffer.Stop()
 		s.logBuffer = nil
 	}
-	if s.conn != nil {
-		err := s.conn.Close()
-		if err != nil {
+	s.mu.Lock()
+	conn := s.conn
+	s.conn = nil
+	s.mu.Unlock()
+	if conn != nil {
+		if err := conn.Close(); err != nil {
 			return fmt.Errorf("failed to close UDP connection: %w", err)
 		}
-		s.conn = nil
 	}
 	s.logDB = nil
 	return nil

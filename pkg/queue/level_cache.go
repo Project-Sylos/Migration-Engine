@@ -21,6 +21,8 @@ type LevelCache struct {
 	ByParentPath      map[string]map[string]*db.NodeState // parentPath -> id -> node (same ptrs)
 	ByTraversalStatus map[string]map[string]struct{}      // traversal status -> id set (pending, in_progress, successful, failed)
 	ByCopyStatus      map[string]map[string]struct{}      // copy status -> id set (pending, in_progress, successful, failed)
+	pendingQueue      []string                            // traversal pending IDs in insertion order for O(1) leasing
+	pendingHead       int                                 // head index into pendingQueue
 }
 
 // NewLevelCache creates an empty level cache.
@@ -31,6 +33,7 @@ func NewLevelCache() *LevelCache {
 		ByParentPath:      make(map[string]map[string]*db.NodeState),
 		ByTraversalStatus: make(map[string]map[string]struct{}),
 		ByCopyStatus:      make(map[string]map[string]struct{}),
+		pendingQueue:      make([]string, 0, 1024),
 	}
 }
 
@@ -71,11 +74,25 @@ func (lc *LevelCache) addToStatusMaps(id string, travStatus, copyStatus string) 
 		lc.ByTraversalStatus[t] = make(map[string]struct{})
 	}
 	lc.ByTraversalStatus[t][id] = struct{}{}
+	if t == db.StatusPending {
+		lc.pendingQueue = append(lc.pendingQueue, id)
+	}
 	c := normCopy(copyStatus)
 	if lc.ByCopyStatus[c] == nil {
 		lc.ByCopyStatus[c] = make(map[string]struct{})
 	}
 	lc.ByCopyStatus[c][id] = struct{}{}
+}
+
+func (lc *LevelCache) compactPendingQueue() {
+	if lc.pendingHead == 0 {
+		return
+	}
+	if lc.pendingHead < 1024 && lc.pendingHead*2 < len(lc.pendingQueue) {
+		return
+	}
+	lc.pendingQueue = append([]string(nil), lc.pendingQueue[lc.pendingHead:]...)
+	lc.pendingHead = 0
 }
 
 // Get returns a copy of the node state for id, or nil if not present.
@@ -251,6 +268,8 @@ func (lc *LevelCache) Clear() {
 	lc.ByParentPath = make(map[string]map[string]*db.NodeState)
 	lc.ByTraversalStatus = make(map[string]map[string]struct{})
 	lc.ByCopyStatus = make(map[string]map[string]struct{})
+	lc.pendingQueue = lc.pendingQueue[:0]
+	lc.pendingHead = 0
 }
 
 // ListPending returns up to limit nodes with traversal_status == pending and id > afterID, in id order.
@@ -275,6 +294,49 @@ func (lc *LevelCache) ListPending(afterID string, limit int) []*db.NodeState {
 		out = out[:limit]
 	}
 	return out
+}
+
+// LeasePending pops up to limit traversal-pending nodes, marks them in_progress, and returns copies.
+// This avoids full pending-bucket scans/sorts on every pull.
+func (lc *LevelCache) LeasePending(limit int) []*db.NodeState {
+	if limit <= 0 {
+		return nil
+	}
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	if len(lc.ByTraversalStatus[db.StatusPending]) == 0 {
+		return nil
+	}
+	out := make([]*db.NodeState, 0, limit)
+	for len(out) < limit && lc.pendingHead < len(lc.pendingQueue) {
+		id := lc.pendingQueue[lc.pendingHead]
+		lc.pendingHead++
+		n := lc.Nodes[id]
+		if n == nil {
+			continue
+		}
+		trav := n.TraversalStatus
+		if trav == "" {
+			trav = n.Status
+		}
+		if trav != db.StatusPending {
+			continue
+		}
+		lc.removeFromStatusMaps(id, trav, n.CopyStatus)
+		n.TraversalStatus = "in_progress"
+		n.Status = "in_progress"
+		lc.addToStatusMaps(id, n.TraversalStatus, n.CopyStatus)
+		out = append(out, copyNodeState(n))
+	}
+	lc.compactPendingQueue()
+	return out
+}
+
+// HasPendingTraversal returns true if this level has traversal-pending nodes.
+func (lc *LevelCache) HasPendingTraversal() bool {
+	lc.mu.RLock()
+	defer lc.mu.RUnlock()
+	return len(lc.ByTraversalStatus[db.StatusPending]) > 0
 }
 
 // ListPendingCopy returns up to limit nodes with copy_status == pending and id > afterID, in id order. If nodeType != "" filter by type.
@@ -474,6 +536,8 @@ func (nc *NodeCache) RecordTraversalTransition(depth int, oldStatus, newStatus s
 		s.Pending--
 	}
 	switch newStatus {
+	case "pending":
+		s.Pending++
 	case "successful":
 		s.Successful++
 	case "failed":

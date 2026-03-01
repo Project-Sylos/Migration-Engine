@@ -109,6 +109,20 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	// Give queues a moment to start their Run() goroutines
 	time.Sleep(100 * time.Millisecond)
 
+	// Start traversal phase: drop indexes, persistent appenders. Flush/checkpoint at phase end only.
+	phaseCtx := context.Background()
+	if cfg.ShutdownContext != nil {
+		phaseCtx = cfg.ShutdownContext
+	}
+	if err := database.BeginTraversalPhase(phaseCtx); err != nil {
+		return RuntimeStats{}, fmt.Errorf("begin traversal phase: %w", err)
+	}
+	defer func() {
+		if err := database.EndTraversalPhase(); err != nil {
+			fmt.Println("error ending traversal phase", err)
+		}
+	}()
+
 	// Create observer for database stats publishing (200ms update interval)
 	observer := queue.NewQueueObserver(database, 200*time.Millisecond)
 	observer.Start()      // Start observer loop immediately
@@ -201,6 +215,8 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		bothCompleted := coordinator.IsCompleted("both")
 
 		if bothCompleted {
+			observer.Stop()
+			time.Sleep(250 * time.Millisecond) // let observer loop exit before we close the logger
 			return completeTraversalRun(database, coordinator, progressTicker, start), nil
 		}
 
@@ -208,6 +224,8 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		case <-progressTicker.C:
 			// Re-check exhaustion from coordinator (queues might have completed during tick)
 			if coordinator.IsCompleted("both") {
+				observer.Stop()
+				time.Sleep(250 * time.Millisecond)
 				return completeTraversalRun(database, coordinator, progressTicker, start), nil
 			}
 

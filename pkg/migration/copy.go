@@ -144,6 +144,16 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	}
 	copyQueue.InitializeCopyWithContext(duckDB, cfg.SrcAdapter, cfg.DstAdapter, shutdownCtx)
 
+	// Start copy phase: drop indexes, persistent appenders. Flush/checkpoint at phase end only.
+	if err := duckDB.BeginCopyPhase(shutdownCtx); err != nil {
+		return queue.QueueStats{}, fmt.Errorf("begin copy phase: %w", err)
+	}
+	defer func() {
+		if err := duckDB.EndCopyPhase(); err != nil {
+			fmt.Println("error ending copy phase", err)
+		}
+	}()
+
 	// Create observer for stats publishing
 	observer := queue.NewQueueObserver(duckDB, 200*time.Millisecond)
 	observer.Start()

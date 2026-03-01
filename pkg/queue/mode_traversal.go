@@ -30,6 +30,12 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	if q.State() == QueueStateCompleted {
 		return
 	}
+	// Traversal pulls are cache-driven. Until hydration marks cache ready, do not
+	// record pull attempts or mutate pull state; otherwise we can advance/complete
+	// based on an empty pre-hydration view.
+	if !q.getTraversalCacheLoaded() {
+		return
+	}
 
 	// Set pulling flag early and defer clearing it
 	// This ensures only one thread can execute the pull logic at a time
@@ -75,83 +81,79 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	nc := q.NodeCache()
 
 	// Memory-first: try pull from cache. Always record the pull when we attempt (check), even if we get 0 items.
-	if nc != nil {
-		level := nc.GetLevel(currentRound)
-		if level != nil {
-			cursor := q.getSrcKeysetCursor()
+	if nc == nil {
+		// No cache available still counts as a pull attempt for this round.
+		q.setLastPullWasPartial(true)
+		q.recordPull(currentRound, 0, true)
+		q.setFirstPullForRound(false)
+		return
+	}
+	level := nc.GetLevel(currentRound)
+	if level != nil {
+		list := level.LeasePending(batchSize)
+		if len(list) > 0 {
+			expectedFoldersMap := make(map[string][]types.Folder)
+			expectedFilesMap := make(map[string][]types.File)
+			srcIDMap := make(map[string]map[string]string)
+			srcIDToMeta := make(map[string]SrcNodeMeta)
 			if q.name == "dst" {
-				cursor = q.getDstKeysetCursor()
-			}
-			list := level.ListPending(cursor, batchSize)
-			if len(list) > 0 {
-				lastKey := list[len(list)-1].ID
-				if q.name == "dst" {
-					q.setDstKeysetCursor(lastKey)
-				} else {
-					q.setSrcKeysetCursor(lastKey)
-				}
-				expectedFoldersMap := make(map[string][]types.Folder)
-				expectedFilesMap := make(map[string][]types.File)
-				srcIDMap := make(map[string]map[string]string)
-				srcIDToMeta := make(map[string]SrcNodeMeta)
-				if q.name == "dst" {
-					other := q.OtherNodeCache()
-					nextLevel := other.GetLevel(currentRound + 1)
-					for _, state := range list {
-						if state.Type != types.NodeTypeFolder {
-							continue
-						}
-						dstID := state.ID
-						var children []*db.NodeState
-						if nextLevel != nil {
-							children = nextLevel.ListChildrenByParentPath(state.Path)
-						}
-						folders, files, idMap, meta := buildExpectedMapsFromChildren(children)
-						expectedFoldersMap[dstID], expectedFilesMap[dstID], srcIDMap[dstID] = folders, files, idMap
-						for k, v := range meta {
-							srcIDToMeta[k] = v
-						}
-					}
-				}
+				other := q.OtherNodeCache()
+				nextLevel := other.GetLevel(currentRound + 1)
 				for _, state := range list {
-					if q.isLeased(state.ID) {
+					if state.Type != types.NodeTypeFolder {
 						continue
 					}
-					task := nodeStateToTask(state, taskType)
-					if task != nil && task.ID == "" {
-						task.ID = state.ID
+					dstID := state.ID
+					var children []*db.NodeState
+					if nextLevel != nil {
+						children = nextLevel.ListChildrenByParentPath(state.Path)
 					}
-					if q.name == "dst" && task != nil && task.IsFolder() {
-						task.ExpectedFolders = expectedFoldersMap[state.ID]
-						task.ExpectedFiles = expectedFilesMap[state.ID]
-						task.ExpectedSrcIDMap = srcIDMap[state.ID]
-						if task.ExpectedSrcIDMap != nil {
-							task.ExpectedSrcNodeMeta = make(map[string]SrcNodeMeta)
-							for _, srcID := range task.ExpectedSrcIDMap {
-								if meta, ok := srcIDToMeta[srcID]; ok {
-									task.ExpectedSrcNodeMeta[srcID] = meta
-								}
+					folders, files, idMap, meta := buildExpectedMapsFromChildren(children)
+					expectedFoldersMap[dstID], expectedFilesMap[dstID], srcIDMap[dstID] = folders, files, idMap
+					for k, v := range meta {
+						srcIDToMeta[k] = v
+					}
+				}
+			}
+			for _, state := range list {
+				task := nodeStateToTask(state, taskType)
+				if task != nil && task.ID == "" {
+					task.ID = state.ID
+				}
+				if q.name == "dst" && task != nil && task.IsFolder() {
+					task.ExpectedFolders = expectedFoldersMap[state.ID]
+					task.ExpectedFiles = expectedFilesMap[state.ID]
+					task.ExpectedSrcIDMap = srcIDMap[state.ID]
+					if task.ExpectedSrcIDMap != nil {
+						task.ExpectedSrcNodeMeta = make(map[string]SrcNodeMeta)
+						for _, srcID := range task.ExpectedSrcIDMap {
+							if meta, ok := srcIDToMeta[srcID]; ok {
+								task.ExpectedSrcNodeMeta[srcID] = meta
 							}
 						}
 					}
-					if task != nil && q.Add(task) {
-						q.addLeasedKey(state.ID)
-					}
+				}
+				if task != nil {
+					_ = q.Add(task)
 				}
 			}
-			// Record pull whether we got items or not; we checked and that counts as an attempt.
-			wasPartial := len(list) < batchSize
-			q.setLastPullWasPartial(wasPartial)
-			q.recordPull(currentRound, len(list), wasPartial)
-			q.setFirstPullForRound(false)
-			return
+			// Pull now performs lease transition in cache: pending -> in_progress.
+			// Keep per-level counters in sync for stats/seal snapshots.
+			for range list {
+				nc.RecordTraversalTransition(currentRound, db.StatusPending, "in_progress")
+			}
 		}
-		// Level is nil for this round (e.g. cache not populated yet, or no nodes at this depth). We attempted but didn't read from cache.
-		// Set lastPullWasPartial=false so we retry pull once cache is populated; otherwise we'd never pull again this round.
-		q.setLastPullWasPartial(false)
-		q.recordPull(currentRound, 0, true)
+		// Record pull whether we got items or not; we checked and that counts as an attempt.
+		wasPartial := len(list) < batchSize
+		q.setLastPullWasPartial(wasPartial)
+		q.recordPull(currentRound, len(list), wasPartial)
 		q.setFirstPullForRound(false)
+		return
 	}
+	// Level is nil for this round (e.g. cache not populated yet, or no nodes at this depth). This still counts as a pull attempt.
+	q.setLastPullWasPartial(true)
+	q.recordPull(currentRound, 0, true)
+	q.setFirstPullForRound(false)
 }
 
 // CompleteTraversalTask handles successful completion of traversal/retry tasks.
@@ -324,8 +326,8 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 			}
 		}
 		level.UpdateStatus(nodeID, db.StatusSuccessful, "")
-		if prevStatus == db.StatusPending {
-			nc.RecordTraversalTransition(currentRound, db.StatusPending, db.StatusSuccessful)
+		if prevStatus == db.StatusPending || prevStatus == "in_progress" {
+			nc.RecordTraversalTransition(currentRound, prevStatus, db.StatusSuccessful)
 		}
 		nc.IncrementCompleted(currentRound)
 		nextLevel := nc.EnsureLevel(nextRound)
@@ -398,6 +400,12 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 	// Check if we should retry
 	if task.Attempts < maxRetries {
 		task.Locked = false
+		if nc := q.NodeCache(); nc != nil {
+			if level := nc.GetLevel(currentRound); level != nil {
+				level.UpdateStatus(nodeID, db.StatusPending, "")
+				nc.RecordTraversalTransition(currentRound, "in_progress", db.StatusPending)
+			}
+		}
 		// Remove from in-progress BEFORE re-enqueuing to pending
 		q.removeInProgress(nodeID)
 		q.Add(task) // Re-adds to tracked automatically
@@ -449,8 +457,8 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 				}
 				level.UpdateStatus(nodeID, db.StatusFailed, "")
 			}
-			if prevStatus == db.StatusPending {
-				nc.RecordTraversalTransition(currentRound, db.StatusPending, db.StatusFailed)
+			if prevStatus == db.StatusPending || prevStatus == "in_progress" {
+				nc.RecordTraversalTransition(currentRound, prevStatus, db.StatusFailed)
 			}
 			nc.IncrementCompleted(currentRound)
 		}
@@ -464,6 +472,23 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 // All traversal-specific completion logic lives here: cache loaded, attempted pull, first pull returned 0, no pending in cache.
 // Returns true if the queue should mark as complete, false otherwise.
 func (q *Queue) CheckTraversalCompletion(currentRound int) bool {
+	// Completion checks do not apply while we're waiting on round-gate coordination.
+	if q.State() == QueueStateWaiting {
+		return false
+	}
+	if coordinator := q.getCoordinator(); coordinator != nil {
+		switch q.name {
+		case "dst":
+			if !coordinator.CanDstStartRound(currentRound) {
+				return false
+			}
+		case "src":
+			if !coordinator.CanSrcStartRound(currentRound) {
+				return false
+			}
+		}
+	}
+
 	nc := q.NodeCache()
 	if nc == nil {
 		return false
@@ -472,19 +497,38 @@ func (q *Queue) CheckTraversalCompletion(currentRound int) bool {
 		return false
 	}
 
-	pullCount := q.getCurrentRoundPullCount()
-	pulledAmount := q.getCurrentRoundPulledAmount()
+	info := q.getRoundInfoReadOnly(currentRound)
+	pullCount := 0
+	pulledAmount := 0
+	if info != nil {
+		pullCount = info.PullCount
+		pulledAmount = info.ItemsYielded
+	}
 	attemptedPull := pullCount > 0
 	wasFirstPull := pullCount == 1
 	if !attemptedPull {
-		return false
+		// Completion requires at least one pull attempt for this round.
+		// If none is recorded, force a pull check now so we don't idle forever.
+		q.PullTasksIfNeeded(true)
+		info = q.getRoundInfoReadOnly(currentRound)
+		pullCount = 0
+		pulledAmount = 0
+		if info != nil {
+			pullCount = info.PullCount
+			pulledAmount = info.ItemsYielded
+		}
+		attemptedPull = pullCount > 0
+		wasFirstPull = pullCount == 1
+		if !attemptedPull {
+			return false
+		}
 	}
 
 	mode := q.GetMode()
 	hasPending := false
 	level := nc.GetLevel(currentRound)
 	if level != nil {
-		hasPending = len(level.ListPending("", 1)) > 0
+		hasPending = level.HasPendingTraversal()
 	}
 	if hasPending {
 		return false

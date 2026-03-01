@@ -4,6 +4,7 @@
 package shared
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"time"
@@ -18,8 +19,10 @@ func CountSubtree(database *db.DB, queueType string, rootPath string) (db.Subtre
 
 // DeleteSubtree deletes all nodes in the subtree at rootPath and recomputes stats for affected depths. Uses Writer.DeleteSubtree.
 func DeleteSubtree(database *db.DB, queueType string, rootPath string) error {
-	return database.RunUpdateWriterTx(func(w *db.Writer) error {
-		return w.DeleteSubtree(queueType, rootPath)
+	return database.RunWrite(context.Background(), func(s *db.WriteSession) error {
+		return s.WithTx(func(w *db.Writer) error {
+			return w.DeleteSubtree(queueType, rootPath)
+		})
 	})
 }
 
@@ -32,8 +35,10 @@ func MarkNodeAsPending(database *db.DB, queueType string, nodePath string) error
 	if nodeState == nil {
 		return fmt.Errorf("node not found: %s", nodePath)
 	}
-	return database.RunUpdateWriterTx(func(w *db.Writer) error {
-		return w.SetNodeTraversalStatus(queueType, nodeState.ID, db.StatusPending)
+	return database.RunWrite(context.Background(), func(s *db.WriteSession) error {
+		return s.WithTx(func(w *db.Writer) error {
+			return w.SetNodeTraversalStatus(queueType, nodeState.ID, db.StatusPending)
+		})
 	})
 }
 
@@ -46,8 +51,10 @@ func MarkNodeAsFailed(database *db.DB, queueType string, nodePath string) error 
 	if nodeState == nil {
 		return fmt.Errorf("node not found: %s", nodePath)
 	}
-	return database.RunUpdateWriterTx(func(w *db.Writer) error {
-		return w.SetNodeTraversalStatus(queueType, nodeState.ID, db.StatusFailed)
+	return database.RunWrite(context.Background(), func(s *db.WriteSession) error {
+		return s.WithTx(func(w *db.Writer) error {
+			return w.SetNodeTraversalStatus(queueType, nodeState.ID, db.StatusFailed)
+		})
 	})
 }
 
@@ -60,8 +67,10 @@ func MarkNodeAsExcluded(database *db.DB, queueType string, nodePath string) erro
 	if nodeState == nil {
 		return fmt.Errorf("node not found: %s", nodePath)
 	}
-	return database.RunUpdateWriterTx(func(w *db.Writer) error {
-		return w.SetNodeExcluded(queueType, nodeState.ID, true)
+	return database.RunWrite(context.Background(), func(s *db.WriteSession) error {
+		return s.WithTx(func(w *db.Writer) error {
+			return w.SetNodeExcluded(queueType, nodeState.ID, true)
+		})
 	})
 }
 
@@ -74,8 +83,10 @@ func MarkNodeAsUnexcluded(database *db.DB, queueType string, nodePath string) er
 	if nodeState == nil {
 		return fmt.Errorf("node not found: %s", nodePath)
 	}
-	return database.RunUpdateWriterTx(func(w *db.Writer) error {
-		return w.SetNodeExcluded(queueType, nodeState.ID, false)
+	return database.RunWrite(context.Background(), func(s *db.WriteSession) error {
+		return s.WithTx(func(w *db.Writer) error {
+			return w.SetNodeExcluded(queueType, nodeState.ID, false)
+		})
 	})
 }
 

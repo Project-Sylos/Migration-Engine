@@ -8,7 +8,7 @@ The **db** package is the persistence layer for the Migration Engine. It owns th
 
 - **DB** (`db.go`): Opens DuckDB (file or `:memory:`), creates schema, holds one `*sql.DB` and transaction runners. Exposes **seal** API `SealLevel(...)` for persistence; `AddNodeDeletions` for retry DST cleanup; `Checkpoint` for durability. When `Options.SealBuffer` is non-nil, seal writes go through **SealBuffer** (async); otherwise seal is synchronous.
 - **SealBuffer** (`seal_buffer.go`): Buffers seal jobs (table, depth, nodes, stats); flushes to `src_nodes`/`dst_nodes` and stats tables on interval, row/batch threshold, and `Stop`/`Flush`. Used for write-ahead-log behavior at round seal without blocking the queue.
-- **Writer** (`writer.go`): Used inside `RunUpdateWriterTx`. `AppenderInsert` bulk-inserts nodes into live tables; `WriteLevelStatsSnapshot` writes per-depth stats (traversal and, for SRC, copy).
+- **Writer** (`writer.go`): Used inside `RunWrite` via `WriteSession.WithTx`. `AppenderInsert` bulk-inserts nodes into live tables; `WriteLevelStatsSnapshot` writes per-depth stats (traversal and, for SRC, copy).
 - **Schema** (`schema.go`): DDL for live tables (`src_nodes`, `dst_nodes`, `src_stats`, `dst_stats`, `stats`, `logs`, `queue_stats`, `task_errors`).
 - **Queries** (`queries.go`): Read-only helpers: node by id/path, root, children, keyset lists by depth (traversal and copy), subtree counts, stats, batch lookups, `ListDstBatchWithSrcChildren`. All use the main DB connection.
 - **Constants** (`constants.go`): Traversal and copy status values, node types.
@@ -40,7 +40,7 @@ The **db** package is the persistence layer for the Migration Engine. It owns th
 1. **Cache + seal (only path)**  
    **NodeCache is required.** Queue holds per-level caches (`NodeCache` / `LevelCache`). Task completion updates cache only. At **seal** (round advance), the queue calls `SealLevel(...)`. When a **SealBuffer** is configured (`Options.SealBuffer != nil`), the payload is enqueued and written asynchronously (flush on interval, row/job threshold, or `DB.Close`); otherwise the write is synchronous in one transaction.
 2. **Transactional updates**  
-   `RunUpdateWriterTx(fn)` runs `fn(Writer)` in a single transaction. Serialized with other writes via `writeMu`. Used for seal, deletes (`AddNodeDeletions`), logs, queue_stats, and test setup.
+   `RunWrite(ctx, fn)` runs `fn(WriteSession)` while holding `writeMu`. Use `s.Conn()` for raw connection (e.g. DuckDB appender in seal buffer) or `s.WithTx(fn(Writer))` for a transaction. Used for seal flush, deletes (`AddNodeDeletions`), logs, queue_stats, and test setup.
 
 ---
 
@@ -55,7 +55,7 @@ The **db** package is the persistence layer for the Migration Engine. It owns th
 ## Concurrency and Checkpoint
 
 - **Single connection**: `conn.SetMaxOpenConns(1)` so all operations share one connection; no cross-connection CHECKPOINT issues.
-- **Writes**: Guarded by `writeMu`; `RunUpdateWriterTx` and `RunAppenderWriterTx` are serialized. Seal buffer flushes and log buffer flushes use the same mutex. `Checkpoint` is separately guarded by `checkpointMu` (call at root seeding and round advancement only).
+- **Writes**: Guarded by `writeMu`; `RunWrite` serializes all writes (conn and WithTx). Seal buffer flushes and log buffer flushes use the same mutex. `Checkpoint` is separately guarded by `checkpointMu` (call at root seeding and round advancement only).
 
 ---
 
@@ -63,7 +63,7 @@ The **db** package is the persistence layer for the Migration Engine. It owns th
 
 ```
 pkg/db/
-├── db.go        # DB open/close, schema init, SealLevel, AddNodeDeletions, checkpoint, transaction runners, optional SealBuffer
+├── db.go        # DB open/close, schema init, SealLevel, AddNodeDeletions, checkpoint, RunWrite (WriteSession), optional SealBuffer
 ├── seal_buffer.go # SealBuffer: async seal jobs, flush on interval/row/job threshold and Stop
 ├── writer.go    # Writer: AppenderInsert, WriteLevelStatsSnapshot, stats, deletes, logs, task_errors, queue_stats
 ├── schema.go    # DDL for node, stats, logs, queue_stats, task_errors, migrations
@@ -89,4 +89,4 @@ pkg/db/
 
 - **Single connection**: One `*sql.DB`; all reads and writes go through it.
 - **Cache + seal only**: Writes to the DB are bulk append and stats at seal (`SealLevel`), plus `AddNodeDeletions` for retry and transactional updates for logs, queue_stats, and setup. The former **buffers.go** (removed) was for the old staging/node merge path; **SealBuffer** and **LogBuffer** provide the appender-buffer behavior for seal and logs only (no staging): time-based, count-based, and manual flush.
-- **Transactional updates**: Seal (sync or via buffer flush), stats, deletes, and logging go through `RunUpdateWriterTx(Writer)`.
+- **Transactional updates**: Seal (sync or via buffer flush), stats, deletes, and logging go through `RunWrite` (with `WriteSession.WithTx(Writer)` or `Conn()` for appender).

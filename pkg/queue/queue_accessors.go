@@ -446,16 +446,6 @@ func (q *Queue) recordTaskCompletion(round int, success bool) {
 	}
 }
 
-// Convenience getters for current round
-func (q *Queue) getCurrentRoundPullCount() int {
-	currentRound := q.GetRound()
-	info := q.getRoundInfoReadOnly(currentRound)
-	if info == nil {
-		return 0
-	}
-	return info.PullCount
-}
-
 // syncLevelStatsFromDB loads stats for the given depth from the DB into the node cache's LevelStats (used when bootstrapping a level from DB).
 func (q *Queue) syncLevelStatsFromDB(database *db.DB, queueType string, depth int) {
 	nc := q.NodeCache()
@@ -511,17 +501,6 @@ func (q *Queue) getTraversalCacheLoaded() bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.traversalCacheLoaded
-}
-
-// getCurrentRoundPulledAmount returns the number of items actually pulled from the DB (returned by our queries) this round.
-// Used with pull count for completion: if pullCount > 0 && pulledAmount == 0 then we queried but found nothing (round/queue done).
-func (q *Queue) getCurrentRoundPulledAmount() int {
-	currentRound := q.GetRound()
-	info := q.getRoundInfoReadOnly(currentRound)
-	if info == nil {
-		return 0
-	}
-	return info.ItemsYielded
 }
 
 func (q *Queue) setLastPullWasPartial(value bool) {
@@ -664,12 +643,14 @@ func (q *Queue) setExpectedFromStatsBucket(round int) {
 			return
 		}
 		if expected > 0 {
-			err = database.RunUpdateWriterTx(func(w *db.Writer) error {
-				if err != nil {
-					fmt.Println("error running update writer tx", err)
-					return err
-				}
-				return w.SetStatsCountForDepth(queueType, round, db.StatsKeyExpected, expected)
+			err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
+				return s.WithTx(func(w *db.Writer) error {
+					if err != nil {
+						fmt.Println("error before set stats count", err)
+						return err
+					}
+					return w.SetStatsCountForDepth(queueType, round, db.StatsKeyExpected, expected)
+				})
 			})
 			if err != nil {
 				fmt.Println("error setting stats count for depth", err)
@@ -737,6 +718,42 @@ func (q *Queue) getStateSnapshot() QueueStateSnapshot {
 	}
 }
 
+func (q *Queue) recordDequeueSkip(reason string, currentRound int) {
+	q.mu.Lock()
+	switch reason {
+	case "old_round":
+		q.dequeueSkipOldRound++
+	case "empty_id":
+		q.dequeueSkipEmptyID++
+	case "already_in_progress":
+		q.dequeueSkipInProgress++
+	}
+	shouldLog := false
+	queueRound := q.round
+	state := q.state
+	workers := len(q.workers)
+	pendingBuf := len(q.pendingBuff)
+	inProgress := len(q.inProgress)
+	oldRoundSkips := q.dequeueSkipOldRound
+	emptyIDSkips := q.dequeueSkipEmptyID
+	inProgressSkips := q.dequeueSkipInProgress
+	if q.name == "dst" && q.coordinator != nil && q.coordinator.IsCompleted("src") {
+		now := time.Now()
+		if q.dequeueDebugLastLogAt.IsZero() || now.Sub(q.dequeueDebugLastLogAt) >= 2*time.Second {
+			q.dequeueDebugLastLogAt = now
+			shouldLog = true
+			q.dequeueSkipOldRound = 0
+			q.dequeueSkipEmptyID = 0
+			q.dequeueSkipInProgress = 0
+		}
+	}
+	q.mu.Unlock()
+	if shouldLog {
+		fmt.Printf("[dequeue-skip] queue=%s currentRound=%d queueRound=%d state=%s workers=%d pendingBuf=%d inProgress=%d oldRound=%d emptyID=%d alreadyInProgress=%d\n",
+			q.name, currentRound, queueRound, state, workers, pendingBuf, inProgress, oldRoundSkips, emptyIDSkips, inProgressSkips)
+	}
+}
+
 // Add enqueues a task into the pending buffer. Returns false if task is nil, has empty ID, or is already in progress/pending.
 func (q *Queue) Add(task *TaskBase) bool {
 	if task == nil {
@@ -798,6 +815,7 @@ func (q *Queue) dequeuePending() *TaskBase {
 				}
 			}
 			q.mu.Unlock()
+			q.recordDequeueSkip("empty_id", 0)
 			continue
 		}
 
@@ -811,10 +829,12 @@ func (q *Queue) dequeuePending() *TaskBase {
 		q.mu.Unlock()
 
 		if task.Round < currentRound {
+			q.recordDequeueSkip("old_round", currentRound)
 			continue // Skip old round tasks
 		}
 
 		if inProgress {
+			q.recordDequeueSkip("already_in_progress", currentRound)
 			continue
 		}
 

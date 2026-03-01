@@ -49,7 +49,7 @@ func SetupDatabase(cfg DatabaseConfig) (*db.DB, bool, error) {
 		return nil, false, fmt.Errorf("failed to open database %s: %w", cfg.Path, err)
 	}
 
-	// Build node indexes up front so traversal/copy queries and joins can use them immediately.
+	// Build node and status event indexes up front so traversal/copy queries and joins can use them immediately.
 	if err := db.EnsureNodeTableIndexes(database, "src_nodes"); err != nil {
 		_ = database.Close()
 		return nil, false, fmt.Errorf("failed to ensure src node indexes: %w", err)
@@ -57,6 +57,14 @@ func SetupDatabase(cfg DatabaseConfig) (*db.DB, bool, error) {
 	if err := db.EnsureNodeTableIndexes(database, "dst_nodes"); err != nil {
 		_ = database.Close()
 		return nil, false, fmt.Errorf("failed to ensure dst node indexes: %w", err)
+	}
+	if err := db.EnsureStatusEventTableIndexes(database, "src_status_events"); err != nil {
+		_ = database.Close()
+		return nil, false, fmt.Errorf("failed to ensure src status event indexes: %w", err)
+	}
+	if err := db.EnsureStatusEventTableIndexes(database, "dst_status_events"); err != nil {
+		_ = database.Close()
+		return nil, false, fmt.Errorf("failed to ensure dst status event indexes: %w", err)
 	}
 	return database, wasFresh, nil
 }
