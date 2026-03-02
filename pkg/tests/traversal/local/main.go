@@ -34,11 +34,11 @@ func runTest() error {
 	fmt.Printf("Home directory: %s\n", homeDir)
 
 	// Set up paths
-	srcPath := homeDir
-	dstPath := homeDir
+	// srcPath := homeDir
+	// dstPath := homeDir
 
-	// srcPath := "/"
-	// dstPath := "/"
+	srcPath := "/"
+	dstPath := "/"
 
 	// Normalize paths to absolute
 	srcPath, err = filepath.Abs(srcPath)

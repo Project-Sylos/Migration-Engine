@@ -84,7 +84,7 @@ func dstStatsTableDDL() string {
 // logsTableDDL returns CREATE TABLE for logs.
 func logsTableDDL() string {
 	return `CREATE TABLE IF NOT EXISTS logs (
-		id INTEGER PRIMARY KEY,
+		id VARCHAR PRIMARY KEY,
 		level VARCHAR,
 		message VARCHAR,
 		component VARCHAR,

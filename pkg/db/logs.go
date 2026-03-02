@@ -9,11 +9,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // LogEntry is a single log line for persistence.
 type LogEntry struct {
-	ID        int64
+	ID        string
 	Timestamp string
 	Level     string
 	Entity    string
@@ -22,14 +24,14 @@ type LogEntry struct {
 	Queue     string
 }
 
-// GenerateLogID returns a unique log id (monotonic in practice).
-func GenerateLogID() int64 {
-	return time.Now().UnixNano()
+// GenerateLogID returns a unique log id (UUID).
+func GenerateLogID() string {
+	return uuid.New().String()
 }
 
 // LogBuffer buffers log entries and flushes them to the DB logs table.
-// Back-pressure: at 2x batch size, Add blocks until a flush completes.
-// Flushing guard: only one in-flight flush; getAndClearIfReady returns nil if already flushing.
+// Flush triggers: row threshold (batchSize), time-based (interval), and on backpressure (drain all).
+// Backpressure: when buffer reaches 2*batchSize, Add blocks and drains the entire buffer before accepting more.
 type LogBuffer struct {
 	db        *DB
 	entries   []LogEntry
@@ -62,17 +64,23 @@ func NewLogBuffer(db *DB, batchSize int, interval time.Duration) *LogBuffer {
 	return lb
 }
 
-func (lb *LogBuffer) getAndClearIfReady() []LogEntry {
+func (lb *LogBuffer) takeBatch() (batch []LogEntry, hadWork bool) {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
-	if lb.flushing || len(lb.entries) < lb.batchSize {
-		return nil
+	if lb.flushing || len(lb.entries) == 0 {
+		return nil, false
 	}
-	batch := lb.entries
-	lb.entries = make([]LogEntry, 0, cap(lb.entries))
+	// Take up to batchSize, or all if we're at/over threshold so we drain faster
+	n := len(lb.entries)
+	if n > lb.batchSize {
+		n = lb.batchSize
+	}
+	batch = make([]LogEntry, n)
+	copy(batch, lb.entries[:n])
+	lb.entries = append(lb.entries[:0], lb.entries[n:]...)
 	lb.flushing = true
 	lb.cond.Broadcast()
-	return batch
+	return batch, true
 }
 
 func (lb *LogBuffer) setFlushingDone() {
@@ -82,13 +90,46 @@ func (lb *LogBuffer) setFlushingDone() {
 	lb.cond.Broadcast()
 }
 
-// Add adds an entry to the buffer.
+func (lb *LogBuffer) writeBatch(batch []LogEntry) error {
+	return lb.db.RunWrite(context.Background(), func(s *WriteSession) error {
+		return s.WithTx(func(w *Writer) error {
+			for _, e := range batch {
+				if err := w.InsertLog(e.ID, e.Level, e.Message, e.Entity, e.Entity, e.EntityID, e.Queue); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	})
+}
+
+// drainAll writes the entire buffer in batches until empty. Call when at backpressure.
+func (lb *LogBuffer) drainAll() {
+	for {
+		batch, hadWork := lb.takeBatch()
+		if !hadWork || len(batch) == 0 {
+			return
+		}
+		n := len(batch)
+		if err := lb.writeBatch(batch); err != nil {
+			fmt.Println("error running write", err)
+		}
+		for i := 0; i < n; i++ {
+			lb.slots <- struct{}{}
+		}
+		lb.setFlushingDone()
+	}
+}
+
+// Add adds an entry to the buffer. At 2*batchSize (backpressure threshold), blocks and drains the entire buffer before adding.
 func (lb *LogBuffer) Add(e LogEntry) {
 	hardCap := lb.batchSize * 2
 	<-lb.slots
 	lb.mu.Lock()
 	for len(lb.entries) >= hardCap {
-		lb.cond.Wait()
+		lb.mu.Unlock()
+		lb.drainAll()
+		lb.mu.Lock()
 	}
 	lb.entries = append(lb.entries, e)
 	count := len(lb.entries)
@@ -111,25 +152,15 @@ func (lb *LogBuffer) flushLoop() {
 	}
 }
 
-// Flush writes buffered entries to the logs table.
+// Flush writes one batch if the buffer has at least batchSize entries. Does not block on backpressure.
 func (lb *LogBuffer) Flush() {
-	batch := lb.getAndClearIfReady()
-	if len(batch) == 0 {
+	batch, hadWork := lb.takeBatch()
+	if !hadWork || len(batch) == 0 {
 		return
 	}
 	n := len(batch)
 	defer lb.setFlushingDone()
-	err := lb.db.RunWrite(context.Background(), func(s *WriteSession) error {
-		return s.WithTx(func(w *Writer) error {
-			for _, e := range batch {
-				if err := w.InsertLog(e.ID, e.Level, e.Message, e.Entity, e.Entity, e.EntityID, e.Queue); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-	})
-	if err != nil {
+	if err := lb.writeBatch(batch); err != nil {
 		fmt.Println("error running write", err)
 		return
 	}
@@ -138,10 +169,10 @@ func (lb *LogBuffer) Flush() {
 	}
 }
 
-// Stop stops the flush loop. Does not close the DB.
+// Stop stops the flush loop and drains the entire buffer. Does not close the DB.
 func (lb *LogBuffer) Stop() {
 	if atomic.CompareAndSwapInt32(&lb.stopped, 0, 1) {
 		close(lb.stopCh)
 	}
-	lb.Flush()
+	lb.drainAll()
 }

@@ -14,7 +14,7 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
-const defaultBatchSize = 20_000
+const defaultBatchSize = 10_000
 
 // LS is the global log service sender instance.
 // It must be initialized via InitGlobalLogger before use.

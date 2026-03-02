@@ -519,7 +519,7 @@ func (w *Writer) DeleteSubtree(table, rootPath string) error {
 }
 
 // InsertLog inserts a row into logs. id must be unique (e.g. from GenerateLogID).
-func (w *Writer) InsertLog(id int64, level, message, component, entity, entityID, queue string) error {
+func (w *Writer) InsertLog(id string, level, message, component, entity, entityID, queue string) error {
 	_, err := w.tx.ExecContext(context.Background(),
 		`INSERT INTO logs (id, level, message, component, entity, entity_id, queue) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		id, level, message, component, entity, entityID, queue,
