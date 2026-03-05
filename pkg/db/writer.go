@@ -357,9 +357,26 @@ func (w *Writer) DeleteNode(table, nodeID string) error {
 	return err
 }
 
-// SealDepth0 writes the depth-0 stats snapshot. Root metadata and initial status events are written at seed time; no node row updates.
+// SealDepth0 writes the depth-0 stats snapshot and emits status events for each depth-0 node so the events table reflects current state (e.g. root marked successful after round 0 completes).
 func (w *Writer) SealDepth0(table string, nodes []*NodeState, pending, successful, failed, completed int64, copyPending, copySuccessful, copyFailed int64) error {
-	return w.WriteLevelStatsSnapshot(table, 0, pending, successful, failed, completed, copyPending, copySuccessful, copyFailed)
+	if err := w.WriteLevelStatsSnapshot(table, 0, pending, successful, failed, completed, copyPending, copySuccessful, copyFailed); err != nil {
+		return err
+	}
+	eventTime := time.Now().UnixNano()
+	for _, nd := range nodes {
+		trav := nd.TraversalStatus
+		if trav == "" {
+			trav = nd.Status
+		}
+		ev := &StatusEvent{ID: nd.ID, TraversalStatus: trav, EventTime: eventTime, Depth: 0}
+		if table == "SRC" {
+			ev.CopyStatus = nd.CopyStatus
+		}
+		if err := w.InsertStatusEvent(table, ev); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // SetNodeTraversalStatus emits a traversal_status event and applies stat deltas (decrement old, increment new). Single-node path: no full recompute.

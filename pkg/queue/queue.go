@@ -57,8 +57,8 @@ const (
 )
 
 const (
-	defaultLeaseBatchSize = 10_000
-	maxLeaseBatchSize     = 100_000 // Upper bound for pull (lease) batch size
+	defaultLeaseBatchSize = 1000
+	maxLeaseBatchSize     = 40_000 // Upper bound for pull (lease) batch size
 )
 
 // effectiveLeaseBatchSize returns the lease batch size capped by maxLeaseBatchSize.
@@ -1188,8 +1188,8 @@ func (q *Queue) advanceToNextRound() {
 				if err := database.SealLevel("DST", round, dstSlice, dp, ds, df, dc, -1, -1, -1); err != nil {
 					fmt.Println("error sealing DST level", err)
 				}
-				if coord != nil {
-					coord.WaitSealBackpressure(q.name, round, database)
+				if coord != nil && !coord.WaitSealBackpressure(q.name, round, database) {
+					return
 				}
 				nc.DropLevel(round)
 				other.DropLevel(round)
@@ -1241,8 +1241,8 @@ func (q *Queue) advanceToNextRound() {
 						}
 					}
 				}
-				if coord != nil {
-					coord.WaitSealBackpressure("dst", round, database)
+				if coord != nil && !coord.WaitSealBackpressure("dst", round, database) {
+					return
 				}
 				if level := nc.GetLevel(round); level != nil {
 					nc.DropLevel(round)
@@ -1284,7 +1284,9 @@ func (q *Queue) advanceToNextRound() {
 						}
 					}
 					if len(sealed) > 0 {
-						coord.WaitSealBackpressure("src", round, database)
+						if !coord.WaitSealBackpressure("src", round, database) {
+							return
+						}
 						for _, depth := range sealed {
 							nc.DropLevel(depth)
 						}

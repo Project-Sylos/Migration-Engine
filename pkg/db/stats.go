@@ -25,6 +25,55 @@ const StatsKeyExpected = "expected"
 // StatsKeyCompleted is the stats key for completed count at a depth (written at seal).
 const StatsKeyCompleted = "completed"
 
+// TraversalStatusCounts holds traversal status counts derived from the status_events table (one row per node, latest event).
+type TraversalStatusCounts struct {
+	Pending    int64
+	Successful int64
+	Failed     int64
+	NotOnSrc   int64 // DST only; 0 for SRC
+}
+
+// GetTraversalStatusCountsFromEvents returns counts of nodes by current traversal_status, derived from the status_events table (arg_max per id) joined to the node table. Use for verification instead of stats-table counters.
+func (db *DB) GetTraversalStatusCountsFromEvents(table string) (TraversalStatusCounts, error) {
+	var out TraversalStatusCounts
+	nodeTable := tableSrcNodes
+	eventTable := tableSrcStatusEvents
+	if table == "DST" {
+		nodeTable = tableDstNodes
+		eventTable = tableDstStatusEvents
+	}
+	conn, err := db.GetDB()
+	if err != nil {
+		return out, err
+	}
+	ctx := context.Background()
+	q := `WITH latest AS (SELECT id, arg_max(traversal_status, event_time) AS traversal_status FROM ` + eventTable + ` GROUP BY id)
+SELECT COALESCE(e.traversal_status,'') AS status, count(*)::BIGINT FROM ` + nodeTable + ` n LEFT JOIN latest e ON n.id = e.id GROUP BY 1`
+	rows, err := conn.QueryContext(ctx, q)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var n int64
+		if err := rows.Scan(&status, &n); err != nil {
+			return out, err
+		}
+		switch status {
+		case StatusPending, "":
+			out.Pending += n
+		case StatusSuccessful:
+			out.Successful = n
+		case StatusFailed:
+			out.Failed = n
+		case StatusNotOnSrc:
+			out.NotOnSrc = n
+		}
+	}
+	return out, rows.Err()
+}
+
 // GetStatsCount returns the total count for the given key across all depths from src_stats or dst_stats (table = "SRC" or "DST"). E.g. "all pending items total in src_nodes" = GetStatsCount("SRC", StatsKeyTraversalStatus("pending")).
 func (db *DB) GetStatsCount(table, key string) (int64, error) {
 	if key == "" {

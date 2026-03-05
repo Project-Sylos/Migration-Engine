@@ -98,7 +98,7 @@ logservice.LS.Log("debug", "Processing task", "worker", "worker-1", "src")
 ## Buffering and persistence
 
 - **Batch size**: 20,000 entries (`defaultBatchSize` in `sender.go`).
-- **Flush interval**: 10 seconds (`db.NewLogBuffer(…, 10*time.Second)`).
+- **Flush interval**: 10 seconds (`db.NewLogBuffer(…, 3 * time.Second)`).
 - **Shutdown**: `Close()` calls `logBuffer.Stop()` (stops flush loop and flushes) and closes the UDP connection.
 
 Persistence is to the main database’s `logs` table; schema and `Writer.InsertLog` are in `pkg/db`. Query logs with SQL against that table.

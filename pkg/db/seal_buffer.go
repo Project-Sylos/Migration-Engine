@@ -16,9 +16,9 @@ import (
 )
 
 const (
-	defaultSealFlushInterval     = 60 * time.Second
-	defaultSealFlushRowThreshold = 100_000
-	defaultSealBufferHardCap     = 100_000
+	defaultSealFlushInterval     = 30 * time.Second
+	defaultSealFlushRowThreshold = 40_000
+	defaultSealBufferHardCap     = 40_000
 )
 
 type sealStatsSnapshot struct {
@@ -146,15 +146,11 @@ func (sb *SealBuffer) Add(table string, depth int, nodes []*NodeState, pending, 
 		CopyF:      copyF,
 	})
 	sb.rowsSinceFlush += n
-	overThreshold := sb.rowsSinceFlush >= sb.rowThreshold
 	sb.cond.Broadcast()
 	sb.mu.Unlock()
-	if overThreshold {
-		err := sb.Flush()
-		if err != nil {
-			fmt.Println("Error flushing jobs:", err)
-			return
-		}
+	// Flush immediately after each seal so the queue holds at most one round (max 1 job).
+	if err := sb.Flush(); err != nil {
+		fmt.Println("Error flushing jobs:", err)
 	}
 }
 
@@ -440,6 +436,7 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob) error {
 }
 
 // Flush drains queued jobs and writes them to the DB. When a phase is active, uses persistent appenders and one tx per flush (append + stats). Otherwise uses legacy per-flush appenders.
+// On write failure, jobs are re-queued so waiters in WaitUntilFlushedThrough do not block forever.
 func (sb *SealBuffer) Flush() error {
 	jobs := sb.drain()
 	if len(jobs) == 0 {
@@ -455,9 +452,23 @@ func (sb *SealBuffer) Flush() error {
 		err = sb.legacyFlush(jobs)
 	}
 	if err != nil {
+		sb.requeue(jobs)
 		return err
 	}
 	return nil
+}
+
+// requeue puts jobs back on the queue and restores rowsSinceFlush. Call when a flush fails so data is not lost.
+func (sb *SealBuffer) requeue(jobs []SealJob) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	rows := int64(0)
+	for _, j := range jobs {
+		rows += int64(len(j.Nodes))
+	}
+	sb.queue = append(sb.queue, jobs...)
+	sb.rowsSinceFlush += int(rows)
+	sb.cond.Broadcast()
 }
 
 // LastFlushedDepth returns the maximum depth that has been written to the DB by a completed Flush. -1 until first flush.

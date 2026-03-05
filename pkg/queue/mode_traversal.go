@@ -374,6 +374,7 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 
 	// Remove from in-progress LAST
 	q.removeInProgress(nodeID)
+	q.removeLeasedKey(nodeID)
 }
 
 // FailTraversalTask handles failure of traversal/retry tasks.
@@ -466,6 +467,7 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 
 	// Remove from in-progress LAST
 	q.removeInProgress(nodeID)
+	q.removeLeasedKey(nodeID)
 }
 
 // CheckTraversalCompletion checks if traversal/retry phase should complete.

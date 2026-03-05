@@ -556,6 +556,7 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 	q.mu.Unlock()
 
 	q.removeInProgress(nodeID)
+	q.removeLeasedKey(nodeID)
 }
 
 // FailCopyTask handles failure of copy tasks.
@@ -623,6 +624,7 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 		}
 
 		q.removeInProgress(nodeID)
+		q.removeLeasedKey(nodeID)
 
 		if logservice.LS != nil {
 			err := logservice.LS.Log("error",
