@@ -57,11 +57,13 @@ type ListChildrenDiffsResult struct {
 
 type SearchRequest struct {
 	Query         string
-	Path          string
+	Path          string // empty = global search over all review paths
 	Limit         int
 	Offset        int
 	SortBy        string
 	SortDirection string
+	FoldersOnly   bool
+	Status        string
 }
 
 type SearchResult struct {

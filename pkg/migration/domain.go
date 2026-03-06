@@ -436,7 +436,7 @@ func (m *Migration) MarkNodeForRetryDiscovery(nodeID string) error {
 	if m.Phase() != PhaseReview {
 		return fmt.Errorf("retry discovery mutation requires review phase")
 	}
-	if err := m.manager.store.setNodeTraversalStatus(nodeID, db.StatusPending); err != nil {
+	if err := m.manager.store.markNodeForRetryDiscovery(nodeID); err != nil {
 		return err
 	}
 	m.refreshRuntimeState()
@@ -447,7 +447,7 @@ func (m *Migration) UnmarkNodeForRetryDiscovery(nodeID string) error {
 	if m.Phase() != PhaseReview {
 		return fmt.Errorf("retry discovery mutation requires review phase")
 	}
-	if err := m.manager.store.setNodeTraversalStatus(nodeID, db.StatusSuccessful); err != nil {
+	if err := m.manager.store.unmarkNodeForRetryDiscovery(nodeID); err != nil {
 		return err
 	}
 	m.refreshRuntimeState()
@@ -469,7 +469,7 @@ func (m *Migration) UnmarkNodeForRetryCopy(nodeID string) error {
 	if m.Phase() != PhaseReview && m.Phase() != PhaseCopying {
 		return fmt.Errorf("retry copy mutation requires review or copying phase")
 	}
-	if err := m.manager.store.setNodeCopyStatus(nodeID, db.CopyStatusSuccessful); err != nil {
+	if err := m.manager.store.setNodeCopyStatus(nodeID, db.CopyStatusFailed); err != nil {
 		return err
 	}
 	m.refreshRuntimeState()
@@ -548,6 +548,14 @@ func (m *Migration) GetChildrenDiffsStats(path string, foldersOnly bool) (DiffsS
 		return DiffsStats{}, fmt.Errorf("diff stats requires review or later phase")
 	}
 	return m.manager.store.getChildrenDiffsStats(path, foldersOnly)
+}
+
+// GetSearchStats returns aggregate counts for the same filter as SearchPathReviewItems (query, path, status, foldersOnly).
+func (m *Migration) GetSearchStats(req SearchRequest) (DiffsStats, error) {
+	if m.Phase() != PhaseReview && m.Phase() != PhaseCopying && m.Phase() != PhaseCompleted {
+		return DiffsStats{}, fmt.Errorf("search stats requires review or later phase")
+	}
+	return m.manager.store.getSearchStats(req)
 }
 
 func (m *Migration) GetQueueMetrics() (QueueMetricsSnapshot, error) {

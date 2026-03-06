@@ -16,6 +16,28 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
+func mergedRowToDiffItem(r db.MergedReviewRow) DiffItem {
+	item := DiffItem{
+		Path:               r.Path,
+		Name:               r.Name,
+		Depth:              r.Depth,
+		Type:               r.Type,
+		SrcNodeID:          r.SrcNodeID,
+		DstNodeID:          r.DstNodeID,
+		SrcTraversalStatus: r.SrcTraversalStatus,
+		DstTraversalStatus: r.DstTraversalStatus,
+		CopyStatus:         r.CopyStatus,
+		Excluded:           r.Excluded,
+		Size:               r.Size,
+		MissingOnSource:    r.SrcNodeID == "",
+		MissingOnDest:      r.DstNodeID == "",
+	}
+	if item.Name == "" {
+		item.Name = path.Base(item.Path)
+	}
+	return item
+}
+
 func (s *migrationStore) queryNodes(filter NodeQueryFilter) ([]db.NodeState, error) {
 	table := "SRC"
 	if strings.ToUpper(filter.Queue) == "DST" {
@@ -121,6 +143,76 @@ func (s *migrationStore) setNodeCopyStatus(nodeID, status string) error {
 	})
 }
 
+// markNodeForRetryDiscovery looks up the node by ID in SRC then DST (nodeID is either a SRC or DST node ID).
+// For a SRC node, the DST counterpart is resolved by path (path_hash), not by ID; then DST children of that path are marked pending.
+func (s *migrationStore) markNodeForRetryDiscovery(nodeID string) error {
+	srcNode, err := db.GetNodeByID(s.db, "SRC", nodeID)
+	if err != nil {
+		return err
+	}
+	if srcNode != nil {
+		return s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+			return sess.WithTx(func(w *db.Writer) error {
+				if err := w.SetNodeTraversalStatus("SRC", nodeID, db.StatusPending); err != nil {
+					return err
+				}
+				// DST counterpart is same path (join by path_hash), not same ID
+				dstAtPath, _ := db.GetNodeByPath(s.db, "DST", srcNode.Path)
+				if dstAtPath != nil {
+					return w.InsertDstChildrenTraversalStatusEvents(srcNode.Path, db.StatusPending)
+				}
+				return nil
+			})
+		})
+	}
+	dstNode, err := db.GetNodeByID(s.db, "DST", nodeID)
+	if err != nil || dstNode == nil {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("node %s not found", nodeID)
+	}
+	return s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+		return sess.WithTx(func(w *db.Writer) error {
+			return w.SetNodeTraversalStatus("DST", nodeID, db.StatusPending)
+		})
+	})
+}
+
+// unmarkNodeForRetryDiscovery looks up the node by ID in SRC then DST. For a SRC node, the DST counterpart is by path (path_hash); then DST children of that path are set back to not_on_src.
+func (s *migrationStore) unmarkNodeForRetryDiscovery(nodeID string) error {
+	srcNode, err := db.GetNodeByID(s.db, "SRC", nodeID)
+	if err != nil {
+		return err
+	}
+	if srcNode != nil {
+		return s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+			return sess.WithTx(func(w *db.Writer) error {
+				if err := w.SetNodeTraversalStatus("SRC", nodeID, db.StatusFailed); err != nil {
+					return err
+				}
+				dstAtPath, _ := db.GetNodeByPath(s.db, "DST", srcNode.Path)
+				if dstAtPath != nil {
+					return w.InsertDstChildrenTraversalStatusEvents(srcNode.Path, db.StatusNotOnSrc)
+				}
+				return nil
+			})
+		})
+	}
+	dstNode, err := db.GetNodeByID(s.db, "DST", nodeID)
+	if err != nil || dstNode == nil {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("node %s not found", nodeID)
+	}
+	return s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+		return sess.WithTx(func(w *db.Writer) error {
+			return w.SetNodeTraversalStatus("DST", nodeID, db.StatusFailed)
+		})
+	})
+}
+
 func (s *migrationStore) setNodeExcludedWithPropagation(queueType, nodeID string, excluded bool) error {
 	q := strings.ToUpper(queueType)
 	if q != "DST" {
@@ -133,12 +225,12 @@ func (s *migrationStore) setNodeExcludedWithPropagation(queueType, nodeID string
 	if node == nil {
 		return fmt.Errorf("node %s not found in %s", nodeID, q)
 	}
-	if !excluded {
-		return fmt.Errorf("setNodeExcludedWithPropagation: unexclude with propagation not implemented")
-	}
 	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
 		return sess.WithTx(func(w *db.Writer) error {
-			return w.InsertExclusionEventsForSubtree(q, node.Path)
+			if excluded {
+				return w.InsertExclusionEventsForSubtree(q, node.Path)
+			}
+			return w.InsertUnexcludeEventsForSubtree(q, node.Path)
 		})
 	})
 	if err != nil {
@@ -180,68 +272,19 @@ func (s *migrationStore) listChildrenDiffs(req ListChildrenDiffsRequest) (ListCh
 		offset = 0
 	}
 	orderBy := sanitizeSort(req.SortBy, req.SortDirection)
-
-	conn, err := s.db.GetDB()
+	f := db.ReviewFilter{
+		ParentPath:  req.Path,
+		Status:      req.Status,
+		FoldersOnly: req.FoldersOnly,
+	}
+	rows, total, err := db.ListMergedReviewDiffs(s.db, f, orderBy, limit, offset)
 	if err != nil {
 		return ListChildrenDiffsResult{}, err
 	}
-
-	where := ` WHERE (src_parent_path = $1 OR dst_parent_path = $1) `
-	args := []any{req.Path}
-	if req.FoldersOnly {
-		where += ` AND type = 'folder'`
+	items := make([]DiffItem, 0, len(rows))
+	for i := range rows {
+		items = append(items, mergedRowToDiffItem(rows[i]))
 	}
-	if req.Status != "" {
-		where += ` AND (src_traversal_status = $2 OR dst_traversal_status = $2 OR copy_status = $2)`
-		args = append(args, req.Status)
-	}
-
-	base := db.MergedReviewQueryBase()
-
-	countQuery := base + ` SELECT COUNT(*) FROM merged` + where
-	var total int
-	if err := conn.QueryRowContext(context.Background(), countQuery, args...).Scan(&total); err != nil {
-		return ListChildrenDiffsResult{}, err
-	}
-
-	listQuery := base + ` SELECT path, name, depth, type, src_node_id, dst_node_id, src_traversal_status, dst_traversal_status, copy_status, excluded, size FROM merged` +
-		where + ` ORDER BY ` + orderBy + ` LIMIT $` + fmt.Sprintf("%d", len(args)+1) + ` OFFSET $` + fmt.Sprintf("%d", len(args)+2)
-	queryArgs := append(args, limit, offset)
-	rows, err := conn.QueryContext(context.Background(), listQuery, queryArgs...)
-	if err != nil {
-		return ListChildrenDiffsResult{}, err
-	}
-	defer rows.Close()
-
-	items := make([]DiffItem, 0, limit)
-	for rows.Next() {
-		var item DiffItem
-		if err := rows.Scan(
-			&item.Path,
-			&item.Name,
-			&item.Depth,
-			&item.Type,
-			&item.SrcNodeID,
-			&item.DstNodeID,
-			&item.SrcTraversalStatus,
-			&item.DstTraversalStatus,
-			&item.CopyStatus,
-			&item.Excluded,
-			&item.Size,
-		); err != nil {
-			return ListChildrenDiffsResult{}, err
-		}
-		item.MissingOnSource = item.SrcNodeID == ""
-		item.MissingOnDest = item.DstNodeID == ""
-		if item.Name == "" {
-			item.Name = path.Base(item.Path)
-		}
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
-		return ListChildrenDiffsResult{}, err
-	}
-
 	return ListChildrenDiffsResult{
 		Items:  items,
 		Total:  total,
@@ -251,71 +294,74 @@ func (s *migrationStore) listChildrenDiffs(req ListChildrenDiffsRequest) (ListCh
 }
 
 func (s *migrationStore) searchPathReviewItems(req SearchRequest) (SearchResult, error) {
-	listReq := ListChildrenDiffsRequest{
-		Path:          req.Path,
-		Limit:         req.Limit,
-		Offset:        req.Offset,
-		SortBy:        req.SortBy,
-		SortDirection: req.SortDirection,
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 100
 	}
-	res, err := s.listChildrenDiffs(listReq)
+	offset := req.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	orderBy := sanitizeSort(req.SortBy, req.SortDirection)
+	f := db.ReviewFilter{
+		ParentPath:  req.Path,
+		Query:       strings.TrimSpace(req.Query),
+		Status:      req.Status,
+		FoldersOnly: req.FoldersOnly,
+		ExcludeRoot: req.Path == "", // global search: exclude root from results
+	}
+	rows, total, err := db.ListMergedReviewDiffs(s.db, f, orderBy, limit, offset)
 	if err != nil {
 		return SearchResult{}, err
 	}
-	if strings.TrimSpace(req.Query) == "" {
-		return SearchResult{
-			Items:  res.Items,
-			Total:  res.Total,
-			Limit:  res.Limit,
-			Offset: res.Offset,
-		}, nil
-	}
-	query := strings.ToLower(strings.TrimSpace(req.Query))
-	filtered := make([]DiffItem, 0, len(res.Items))
-	for i := range res.Items {
-		item := res.Items[i]
-		if strings.Contains(strings.ToLower(item.Path), query) || strings.Contains(strings.ToLower(item.Name), query) {
-			filtered = append(filtered, item)
-		}
+	items := make([]DiffItem, 0, len(rows))
+	for i := range rows {
+		items = append(items, mergedRowToDiffItem(rows[i]))
 	}
 	return SearchResult{
-		Items:  filtered,
-		Total:  len(filtered),
-		Limit:  res.Limit,
-		Offset: res.Offset,
+		Items:  items,
+		Total:  total,
+		Limit:  limit,
+		Offset: offset,
 	}, nil
 }
 
 func (s *migrationStore) getChildrenDiffsStats(path string, foldersOnly bool) (DiffsStats, error) {
-	res, err := s.listChildrenDiffs(ListChildrenDiffsRequest{
-		Path:        path,
-		Limit:       10000,
-		Offset:      0,
-		FoldersOnly: foldersOnly,
-	})
+	f := db.ReviewFilter{ParentPath: path, FoldersOnly: foldersOnly}
+	stats, err := db.GetMergedReviewStats(s.db, f)
 	if err != nil {
 		return DiffsStats{}, err
 	}
-	stats := DiffsStats{Total: res.Total}
-	for i := range res.Items {
-		item := res.Items[i]
-		if item.Type == "folder" {
-			stats.Folders++
-		}
-		if item.Type == "file" {
-			stats.Files++
-		}
-		if item.MissingOnSource {
-			stats.MissingOnSource++
-		}
-		if item.MissingOnDest {
-			stats.MissingOnDest++
-		}
-		if item.Excluded {
-			stats.Excluded++
-		}
+	return DiffsStats{
+		Total:           stats.Total,
+		Folders:         stats.Folders,
+		Files:           stats.Files,
+		MissingOnSource: stats.MissingOnSource,
+		MissingOnDest:   stats.MissingOnDest,
+		Excluded:        stats.Excluded,
+	}, nil
+}
+
+func (s *migrationStore) getSearchStats(req SearchRequest) (DiffsStats, error) {
+	f := db.ReviewFilter{
+		ParentPath:  req.Path,
+		Query:       strings.TrimSpace(req.Query),
+		Status:      req.Status,
+		FoldersOnly: req.FoldersOnly,
+		ExcludeRoot: req.Path == "",
 	}
-	return stats, nil
+	stats, err := db.GetMergedReviewStats(s.db, f)
+	if err != nil {
+		return DiffsStats{}, err
+	}
+	return DiffsStats{
+		Total:           stats.Total,
+		Folders:         stats.Folders,
+		Files:           stats.Files,
+		MissingOnSource: stats.MissingOnSource,
+		MissingOnDest:   stats.MissingOnDest,
+		Excluded:        stats.Excluded,
+	}, nil
 }
 
 func (s *migrationStore) getQueueMetrics() (QueueMetricsSnapshot, error) {

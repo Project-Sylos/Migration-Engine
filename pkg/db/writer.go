@@ -312,26 +312,144 @@ func (w *Writer) RecomputeStatsForDepth(table string, depth int) error {
 	return nil
 }
 
-// InsertExclusionEventsForSubtree appends one status event per node in the subtree (path = rootPath OR path LIKE rootPath/'%') with traversal_status = 'exclusion_inherited'. Table is "SRC" or "DST". Call inside RunWrite.
+// InsertExclusionEventsForSubtree appends one status event per node in the subtree. Root gets 'excluded', descendants get 'exclusion_inherited'. Then recomputes stats for affected depths. Call inside RunWrite.
 func (w *Writer) InsertExclusionEventsForSubtree(table, rootPath string) error {
 	ctx := context.Background()
 	eventTime := time.Now().UnixNano()
 	if table == "DST" {
 		if rootPath == "/" {
-			_, err := w.tx.ExecContext(ctx, `INSERT INTO dst_status_events (id, traversal_status, event_time, depth) SELECT id, 'exclusion_inherited', $1, depth FROM dst_nodes WHERE path LIKE '/%'`, eventTime)
-			return err
+			_, err := w.tx.ExecContext(ctx, `INSERT INTO dst_status_events (id, traversal_status, event_time, depth) SELECT id, CASE WHEN path = '/' THEN 'excluded' ELSE 'exclusion_inherited' END, $1, depth FROM dst_nodes WHERE path LIKE '/%'`, eventTime)
+			if err != nil {
+				return err
+			}
+			return w.recomputeStatsForSubtreeDepths(ctx, tableDstNodes, "/")
 		}
 		prefix := rootPath + "/%"
-		_, err := w.tx.ExecContext(ctx, `INSERT INTO dst_status_events (id, traversal_status, event_time, depth) SELECT id, 'exclusion_inherited', $1, depth FROM dst_nodes WHERE path = $2 OR path LIKE $3`, eventTime, rootPath, prefix)
-		return err
+		_, err := w.tx.ExecContext(ctx, `INSERT INTO dst_status_events (id, traversal_status, event_time, depth) SELECT id, CASE WHEN path = $2 THEN 'excluded' ELSE 'exclusion_inherited' END, $1, depth FROM dst_nodes WHERE path = $2 OR path LIKE $3`, eventTime, rootPath, prefix)
+		if err != nil {
+			return err
+		}
+		return w.recomputeStatsForSubtreeDepths(ctx, tableDstNodes, rootPath)
 	}
 	if rootPath == "/" {
-		_, err := w.tx.ExecContext(ctx, `INSERT INTO src_status_events (id, traversal_status, copy_status, event_time, depth) SELECT n.id, 'exclusion_inherited', COALESCE((SELECT arg_max(e.copy_status, e.event_time) FROM src_status_events e WHERE e.id = n.id), ''), $1, n.depth FROM src_nodes n WHERE n.path LIKE '/%'`, eventTime)
-		return err
+		_, err := w.tx.ExecContext(ctx, `INSERT INTO src_status_events (id, traversal_status, copy_status, event_time, depth) SELECT n.id, CASE WHEN n.path = '/' THEN 'excluded' ELSE 'exclusion_inherited' END, COALESCE((SELECT arg_max(e.copy_status, e.event_time) FROM src_status_events e WHERE e.id = n.id), ''), $1, n.depth FROM src_nodes n WHERE n.path LIKE '/%'`, eventTime)
+		if err != nil {
+			return err
+		}
+		return w.recomputeStatsForSubtreeDepths(ctx, tableSrcNodes, "/")
 	}
 	prefix := rootPath + "/%"
-	_, err := w.tx.ExecContext(ctx, `INSERT INTO src_status_events (id, traversal_status, copy_status, event_time, depth) SELECT n.id, 'exclusion_inherited', COALESCE((SELECT arg_max(e.copy_status, e.event_time) FROM src_status_events e WHERE e.id = n.id), ''), $1, n.depth FROM src_nodes n WHERE n.path = $2 OR n.path LIKE $3`, eventTime, rootPath, prefix)
-	return err
+	_, err := w.tx.ExecContext(ctx, `INSERT INTO src_status_events (id, traversal_status, copy_status, event_time, depth) SELECT n.id, CASE WHEN n.path = $2 THEN 'excluded' ELSE 'exclusion_inherited' END, COALESCE((SELECT arg_max(e.copy_status, e.event_time) FROM src_status_events e WHERE e.id = n.id), ''), $1, n.depth FROM src_nodes n WHERE n.path = $2 OR n.path LIKE $3`, eventTime, rootPath, prefix)
+	if err != nil {
+		return err
+	}
+	return w.recomputeStatsForSubtreeDepths(ctx, tableSrcNodes, rootPath)
+}
+
+// recomputeStatsForSubtreeDepths runs RecomputeStatsForDepth for each depth present in the subtree at rootPath.
+func (w *Writer) recomputeStatsForSubtreeDepths(ctx context.Context, table, rootPath string) error {
+	var rows *sql.Rows
+	var err error
+	if rootPath == "/" {
+		rows, err = w.tx.QueryContext(ctx, `SELECT DISTINCT depth FROM `+table+` WHERE path LIKE '/%'`)
+	} else {
+		prefix := rootPath + "/%"
+		rows, err = w.tx.QueryContext(ctx, `SELECT DISTINCT depth FROM `+table+` WHERE path = $1 OR path LIKE $2`, rootPath, prefix)
+	}
+	if err != nil {
+		return err
+	}
+	var depths []int
+	for rows.Next() {
+		var d int
+		if err := rows.Scan(&d); err != nil {
+			rows.Close()
+			return err
+		}
+		depths = append(depths, d)
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	t := "SRC"
+	if table == tableDstNodes {
+		t = "DST"
+	}
+	for _, depth := range depths {
+		if err := w.RecomputeStatsForDepth(t, depth); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// InsertUnexcludeEventsForSubtree appends one status event per node in the subtree with traversal_status = 'successful' and copy_status = 'pending' (SRC). Then recomputes stats for affected depths. Call inside RunWrite.
+func (w *Writer) InsertUnexcludeEventsForSubtree(table, rootPath string) error {
+	ctx := context.Background()
+	eventTime := time.Now().UnixNano()
+	if table == "DST" {
+		if rootPath == "/" {
+			_, err := w.tx.ExecContext(ctx, `INSERT INTO dst_status_events (id, traversal_status, event_time, depth) SELECT id, 'successful', $1, depth FROM dst_nodes WHERE path LIKE '/%'`, eventTime)
+			if err != nil {
+				return err
+			}
+			return w.recomputeStatsForSubtreeDepths(ctx, tableDstNodes, "/")
+		}
+		prefix := rootPath + "/%"
+		_, err := w.tx.ExecContext(ctx, `INSERT INTO dst_status_events (id, traversal_status, event_time, depth) SELECT id, 'successful', $1, depth FROM dst_nodes WHERE path = $2 OR path LIKE $3`, eventTime, rootPath, prefix)
+		if err != nil {
+			return err
+		}
+		return w.recomputeStatsForSubtreeDepths(ctx, tableDstNodes, rootPath)
+	}
+	if rootPath == "/" {
+		_, err := w.tx.ExecContext(ctx, `INSERT INTO src_status_events (id, traversal_status, copy_status, event_time, depth) SELECT n.id, 'successful', 'pending', $1, n.depth FROM src_nodes n WHERE n.path LIKE '/%'`, eventTime)
+		if err != nil {
+			return err
+		}
+		return w.recomputeStatsForSubtreeDepths(ctx, tableSrcNodes, "/")
+	}
+	prefix := rootPath + "/%"
+	_, err := w.tx.ExecContext(ctx, `INSERT INTO src_status_events (id, traversal_status, copy_status, event_time, depth) SELECT n.id, 'successful', 'pending', $1, n.depth FROM src_nodes n WHERE n.path = $2 OR n.path LIKE $3`, eventTime, rootPath, prefix)
+	if err != nil {
+		return err
+	}
+	return w.recomputeStatsForSubtreeDepths(ctx, tableSrcNodes, rootPath)
+}
+
+// InsertDstChildrenTraversalStatusEvents appends one traversal_status event for each DST node whose parent_path equals parentPath. Used when marking/unmarking SRC node for retry (DST-only children get pending or not_on_src). Call inside RunWrite.
+func (w *Writer) InsertDstChildrenTraversalStatusEvents(parentPath, status string) error {
+	ctx := context.Background()
+	eventTime := time.Now().UnixNano()
+	parentHash := PathHash(parentPath)
+	_, err := w.tx.ExecContext(ctx, `INSERT INTO dst_status_events (id, traversal_status, event_time, depth) SELECT n.id, $1, $2, n.depth FROM dst_nodes n WHERE n.parent_path_hash = $3`, status, eventTime, parentHash)
+	if err != nil {
+		return err
+	}
+	var depths []int
+	rows, err := w.tx.QueryContext(ctx, `SELECT DISTINCT depth FROM dst_nodes WHERE parent_path_hash = $1`, parentHash)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var d int
+		if err := rows.Scan(&d); err != nil {
+			rows.Close()
+			return err
+		}
+		depths = append(depths, d)
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	for _, depth := range depths {
+		if err := w.RecomputeStatsForDepth("DST", depth); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // InsertStatusEvent appends one row to src_status_events or dst_status_events. Table is "SRC" or "DST".
@@ -450,7 +568,7 @@ func (w *Writer) SetNodeCopyStatus(table, nodeID, status string) error {
 	return nil
 }
 
-// SetNodeExcluded emits a traversal_status event and applies stat deltas (decrement old, increment new). Single-node path: no full recompute.
+// SetNodeExcluded emits a traversal_status event and applies stat deltas. When excluding, sets StatusExcluded. When unexcluding, restores to StatusSuccessful and CopyStatusPending (SRC) so the node is no longer excluded and is ready for copy.
 func (w *Writer) SetNodeExcluded(table, nodeID string, excluded bool) error {
 	ctx := context.Background()
 	t := tableName(table)
@@ -465,15 +583,24 @@ func (w *Writer) SetNodeExcluded(table, nodeID string, excluded bool) error {
 	} else {
 		_ = w.tx.QueryRowContext(ctx, `SELECT COALESCE(arg_max(traversal_status, event_time), '') FROM dst_status_events WHERE id = $1`, nodeID).Scan(&oldStatus)
 	}
-	status := StatusPending
+	var status string
+	var evCopyStatus string
+	var oldCopyStatus string
+	if table == "SRC" {
+		_ = w.tx.QueryRowContext(ctx, `SELECT COALESCE(arg_max(copy_status, event_time), '') FROM src_status_events WHERE id = $1`, nodeID).Scan(&evCopyStatus)
+		oldCopyStatus = evCopyStatus
+	}
 	if excluded {
 		status = StatusExcluded
+	} else {
+		status = StatusSuccessful
+		if table == "SRC" {
+			evCopyStatus = CopyStatusPending
+		}
 	}
 	ev := &StatusEvent{ID: nodeID, TraversalStatus: status, EventTime: time.Now().UnixNano(), Depth: depth}
 	if table == "SRC" {
-		var copyStatus string
-		_ = w.tx.QueryRowContext(ctx, `SELECT COALESCE(arg_max(copy_status, event_time), '') FROM src_status_events WHERE id = $1`, nodeID).Scan(&copyStatus)
-		ev.CopyStatus = copyStatus
+		ev.CopyStatus = evCopyStatus
 	}
 	if err := w.InsertStatusEvent(table, ev); err != nil {
 		return err
@@ -485,6 +612,16 @@ func (w *Writer) SetNodeExcluded(table, nodeID string, excluded bool) error {
 	}
 	if status != "" {
 		if err := w.UpdateStatsCountByDelta(table, depth, StatsKeyTraversalStatus(status), 1); err != nil {
+			return err
+		}
+	}
+	if table == "SRC" && !excluded {
+		if oldCopyStatus != "" && oldCopyStatus != CopyStatusInProgress {
+			if err := w.UpdateStatsCountByDelta("SRC", depth, StatsKeyCopyStatus(oldCopyStatus), -1); err != nil {
+				return err
+			}
+		}
+		if err := w.UpdateStatsCountByDelta("SRC", depth, StatsKeyCopyStatus(CopyStatusPending), 1); err != nil {
 			return err
 		}
 	}

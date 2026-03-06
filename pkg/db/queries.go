@@ -100,12 +100,14 @@ func QueryNodesForReview(d *DB, table string, depth *int, status string, exclude
 }
 
 // MergedReviewQueryBase returns the WITH clause for the merged src+dst review view (status from events). Use with " SELECT ... FROM merged" + where.
+// merged includes parent_path_hash for indexed child lookups.
 func MergedReviewQueryBase() string {
 	return `WITH src_cur AS ` + cteSrcCurrentStatus + `, dst_cur AS ` + cteDstCurrentStatus + `,
 merged AS (
 SELECT
 	COALESCE(s.path, d.path) AS path,
 	COALESCE(s.parent_path, d.parent_path) AS parent_path,
+	COALESCE(s.parent_path_hash, d.parent_path_hash) AS parent_path_hash,
 	COALESCE(s.depth, d.depth, 0) AS depth,
 	COALESCE(s.type, d.type, '') AS type,
 	COALESCE(s.id, '') AS src_node_id,
@@ -127,6 +129,148 @@ LEFT JOIN src_cur se ON s.id = se.id
 FULL OUTER JOIN dst_nodes d ON s.path_hash = d.path_hash
 LEFT JOIN dst_cur de ON d.id = de.id
 )`
+}
+
+// MergedReviewRow is one row from the merged review view (SRC+DST joined by path_hash, status from events).
+type MergedReviewRow struct {
+	Path               string
+	Name               string
+	Depth              int
+	Type               string
+	SrcNodeID          string
+	DstNodeID          string
+	SrcTraversalStatus string
+	DstTraversalStatus string
+	CopyStatus         string
+	Excluded           bool
+	Size               int64
+}
+
+// ReviewFilter narrows merged review rows for listing, search, and counts.
+// ParentPath: if non-empty, only direct children of this path (uses parent_path_hash).
+// Query: if non-empty, path or name contains this string (case-insensitive).
+// Status: if non-empty, row must match this in src_traversal_status, dst_traversal_status, or copy_status.
+// FoldersOnly: if true, type = 'folder'.
+// ExcludeRoot: if true, exclude path = '/' from results (for global search).
+type ReviewFilter struct {
+	ParentPath   string
+	Query        string
+	Status       string
+	FoldersOnly  bool
+	ExcludeRoot  bool
+}
+
+// buildMergedReviewWhere returns a WHERE clause and args for the merged CTE. Param placeholders are $1, $2, ...
+func buildMergedReviewWhere(f ReviewFilter) (clause string, args []interface{}) {
+	var parts []string
+	param := 1
+	if f.ParentPath != "" {
+		parts = append(parts, `parent_path_hash = $`+strconv.Itoa(param))
+		args = append(args, PathHash(f.ParentPath))
+		param++
+	}
+	if f.Query != "" {
+		q := "%" + strings.ToLower(strings.TrimSpace(f.Query)) + "%"
+		parts = append(parts, `(LOWER(path) LIKE $`+strconv.Itoa(param)+` OR LOWER(name) LIKE $`+strconv.Itoa(param)+`)`)
+		args = append(args, q)
+		param++
+	}
+	if f.Status != "" {
+		parts = append(parts, `(src_traversal_status = $`+strconv.Itoa(param)+` OR dst_traversal_status = $`+strconv.Itoa(param)+` OR copy_status = $`+strconv.Itoa(param)+`)`)
+		args = append(args, f.Status)
+		param++
+	}
+	if f.FoldersOnly {
+		parts = append(parts, `type = 'folder'`)
+	}
+	if f.ExcludeRoot {
+		parts = append(parts, `path <> '/'`)
+	}
+	if len(parts) == 0 {
+		return "", nil
+	}
+	return " WHERE " + strings.Join(parts, " AND "), args
+}
+
+// ListMergedReviewDiffs returns merged review rows and total count matching the filter, ordered and paginated.
+func ListMergedReviewDiffs(d *DB, f ReviewFilter, orderBy string, limit, offset int) ([]MergedReviewRow, int, error) {
+	conn, err := d.GetDB()
+	if err != nil {
+		return nil, 0, err
+	}
+	ctx := context.Background()
+	where, args := buildMergedReviewWhere(f)
+	if orderBy == "" {
+		orderBy = "path ASC"
+	}
+	base := MergedReviewQueryBase()
+	countQ := base + ` SELECT COUNT(*)::INT FROM merged` + where
+	var total int
+	if err := conn.QueryRowContext(ctx, countQ, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	sel := base + ` SELECT path, name, depth, type, src_node_id, dst_node_id, src_traversal_status, dst_traversal_status, copy_status, excluded, size FROM merged` + where +
+		` ORDER BY ` + orderBy + ` LIMIT $` + strconv.Itoa(len(args)+1) + ` OFFSET $` + strconv.Itoa(len(args)+2)
+	listArgs := append(append([]interface{}{}, args...), limit, offset)
+	rows, err := conn.QueryContext(ctx, sel, listArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []MergedReviewRow
+	for rows.Next() {
+		var r MergedReviewRow
+		if err := rows.Scan(&r.Path, &r.Name, &r.Depth, &r.Type, &r.SrcNodeID, &r.DstNodeID, &r.SrcTraversalStatus, &r.DstTraversalStatus, &r.CopyStatus, &r.Excluded, &r.Size); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, r)
+	}
+	return out, total, rows.Err()
+}
+
+// CountMergedReviewRows returns the number of merged rows matching the filter.
+func CountMergedReviewRows(d *DB, f ReviewFilter) (int, error) {
+	conn, err := d.GetDB()
+	if err != nil {
+		return 0, err
+	}
+	where, args := buildMergedReviewWhere(f)
+	q := MergedReviewQueryBase() + ` SELECT COUNT(*)::INT FROM merged` + where
+	var n int
+	err = conn.QueryRowContext(context.Background(), q, args...).Scan(&n)
+	return n, err
+}
+
+// MergedReviewStats holds aggregate counts over merged review rows (same filter semantics as list/count).
+type MergedReviewStats struct {
+	Total           int
+	Folders         int
+	Files           int
+	MissingOnSource int
+	MissingOnDest   int
+	Excluded        int
+}
+
+// GetMergedReviewStats returns aggregate counts for rows matching the filter (single query with FILTER).
+func GetMergedReviewStats(d *DB, f ReviewFilter) (MergedReviewStats, error) {
+	conn, err := d.GetDB()
+	if err != nil {
+		return MergedReviewStats{}, err
+	}
+	where, args := buildMergedReviewWhere(f)
+	q := MergedReviewQueryBase() + ` SELECT
+		COUNT(*)::INT,
+		COUNT(*) FILTER (WHERE type = 'folder')::INT,
+		COUNT(*) FILTER (WHERE type = 'file')::INT,
+		COUNT(*) FILTER (WHERE src_node_id = '' OR src_node_id IS NULL)::INT,
+		COUNT(*) FILTER (WHERE dst_node_id = '' OR dst_node_id IS NULL)::INT,
+		COUNT(*) FILTER (WHERE excluded)::INT
+	FROM merged` + where
+	var s MergedReviewStats
+	err = conn.QueryRowContext(context.Background(), q, args...).Scan(
+		&s.Total, &s.Folders, &s.Files, &s.MissingOnSource, &s.MissingOnDest, &s.Excluded,
+	)
+	return s, err
 }
 
 // GetNodeByID returns the node by id from the given table. Status is derived from latest status event.
