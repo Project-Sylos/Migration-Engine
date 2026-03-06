@@ -1,11 +1,11 @@
 {
   "mode": "ephemeral",
   "seed": {
-    "max_depth": 6,
-    "max_folders": 30,
+    "max_depth": 4,
+    "max_folders": 20,
     "folder_backoff_factor": 0.9,
     "folder_depth_decay_factor": 0.9,
-    "max_files": 200,
+    "max_files": 20,
     "file_backoff_factor": 0.9,
     "file_depth_decay_factor": 0.9,
     "seed": 40,
