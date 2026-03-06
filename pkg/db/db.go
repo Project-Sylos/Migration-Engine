@@ -6,10 +6,14 @@ package db
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"runtime"
 	"sync"
 
 	_ "github.com/marcboeker/go-duckdb"
 )
+
+const pathHashMigrationBatchSize = 5000
 
 // Options configures DB open behavior.
 type Options struct {
@@ -24,11 +28,11 @@ func DefaultOptions() Options {
 
 // DB is the DuckDB-backed database handle. Single physical connection for all DB operations (schema, bulk append at seal, pulls, checkpoint).
 type DB struct {
-	path         string
-	conn         *sql.DB     // single connection for all operations
-	writeMu      sync.Mutex  // one global mutex for all DB writes
-	checkpointMu sync.Mutex  // serializes CHECKPOINT; only one connection runs it since it's a global DB op
-	sealBuffer   *SealBuffer // always set; flushes sealed levels and checkpoints WAL
+	path       string
+	conn       *sql.DB    // single connection for all operations
+	writeMu    sync.Mutex // one global mutex for all DB writes
+	checkpointMu sync.Mutex // serializes CHECKPOINT; only one connection runs it since it's a global DB op
+	sealBuffer *SealBuffer // always set; seal jobs + discovery (nodes/events), flushes async and on demand
 }
 
 // Open opens a DuckDB database at the given path and creates schema if missing.
@@ -44,7 +48,7 @@ func Open(opts Options) (*DB, error) {
 	// Two conns so the phase can hold one (persistent appenders) while SealLevelDepth0 or other RunWrite callers can use the other.
 	conn.SetMaxOpenConns(2)
 	// Limit DuckDB memory and threads to avoid OOM during stress testing
-	if _, err := conn.Exec("PRAGMA memory_limit='8GB'"); err != nil {
+	if _, err := conn.Exec("PRAGMA memory_limit='4GB'"); err != nil {
 		err := conn.Close()
 		if err != nil {
 			return nil, err
@@ -65,17 +69,17 @@ func Open(opts Options) (*DB, error) {
 		}
 		return nil, err
 	}
+	db := &DB{path: path, conn: conn}
+	if err := migratePathHashColumns(conn); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	if path != ":memory:" {
 		if _, err := conn.Exec("CHECKPOINT"); err != nil {
-			err := conn.Close()
-			if err != nil {
-				return nil, err
-			}
+			_ = conn.Close()
 			return nil, err
 		}
 	}
-
-	db := &DB{path: path, conn: conn}
 	sbOpts := SealBufferOptions{}
 	if opts.SealBuffer != nil {
 		sbOpts = *opts.SealBuffer
@@ -109,7 +113,94 @@ func initSchemaConn(conn *sql.DB) error {
 	return nil
 }
 
-// Close closes the database connection. Stops the seal buffer first (flushing any pending jobs).
+// migratePathHashColumns adds path_hash and parent_path_hash to existing node tables, backfills them, and swaps indexes.
+func migratePathHashColumns(conn *sql.DB) error {
+	ctx := context.Background()
+	var exists int64
+	err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'src_nodes' AND column_name = 'path_hash'").Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("path_hash migration check: %w", err)
+	}
+	if exists > 0 {
+		return nil
+	}
+	for _, table := range []string{tableSrcNodes, tableDstNodes} {
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN path_hash VARCHAR"); err != nil {
+			return fmt.Errorf("path_hash migration add path_hash %s: %w", table, err)
+		}
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN parent_path_hash VARCHAR"); err != nil {
+			return fmt.Errorf("path_hash migration add parent_path_hash %s: %w", table, err)
+		}
+	}
+	for _, table := range []string{tableSrcNodes, tableDstNodes} {
+		if err := backfillPathHash(conn, table); err != nil {
+			return err
+		}
+	}
+	for _, name := range []string{
+		tableSrcNodes + "_path_idx", tableSrcNodes + "_parent_path_idx",
+		tableDstNodes + "_path_idx", tableDstNodes + "_parent_path_idx",
+	} {
+		_, _ = conn.ExecContext(ctx, "DROP INDEX IF EXISTS "+name)
+	}
+	for _, table := range []string{tableSrcNodes, tableDstNodes} {
+		for _, idx := range []struct{ name, col string }{
+			{table + "_path_hash_idx", "path_hash"},
+			{table + "_parent_path_hash_idx", "parent_path_hash"},
+		} {
+			q := "CREATE INDEX IF NOT EXISTS " + idx.name + " ON " + table + " (" + idx.col + ")"
+			if _, err := conn.ExecContext(ctx, q); err != nil {
+				return fmt.Errorf("path_hash migration create index %s: %w", idx.name, err)
+			}
+		}
+	}
+	return nil
+}
+
+func backfillPathHash(conn *sql.DB, table string) error {
+	ctx := context.Background()
+	rows, err := conn.QueryContext(ctx, "SELECT id, path, parent_path FROM "+table)
+	if err != nil {
+		return fmt.Errorf("path_hash backfill select %s: %w", table, err)
+	}
+	defer rows.Close()
+	var id, path, parentPath string
+	var batch []struct{ id, pathHash, parentPathHash string }
+	for rows.Next() {
+		if err := rows.Scan(&id, &path, &parentPath); err != nil {
+			return fmt.Errorf("path_hash backfill scan %s: %w", table, err)
+		}
+		batch = append(batch, struct{ id, pathHash, parentPathHash string }{id, PathHash(path), PathHash(parentPath)})
+		if len(batch) >= pathHashMigrationBatchSize {
+			if err := execPathHashBatch(conn, table, batch); err != nil {
+				return err
+			}
+			batch = batch[:0]
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("path_hash backfill rows %s: %w", table, err)
+	}
+	if len(batch) > 0 {
+		if err := execPathHashBatch(conn, table, batch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func execPathHashBatch(conn *sql.DB, table string, batch []struct{ id, pathHash, parentPathHash string }) error {
+	ctx := context.Background()
+	for _, r := range batch {
+		_, err := conn.ExecContext(ctx, "UPDATE "+table+" SET path_hash = $1, parent_path_hash = $2 WHERE id = $3", r.pathHash, r.parentPathHash, r.id)
+		if err != nil {
+			return fmt.Errorf("path_hash backfill update %s: %w", table, err)
+		}
+	}
+	return nil
+}
+
+// Close closes the database connection. Stops the seal buffer first (flushing any pending seal and discovery jobs).
 func (db *DB) Close() error {
 	if db.sealBuffer != nil {
 		db.sealBuffer.Stop()
@@ -181,8 +272,16 @@ func (db *DB) SealLevel(table string, depth int, nodes []*NodeState, pending, su
 	if table != "SRC" && table != "DST" {
 		return nil
 	}
-	db.sealBuffer.Add(table, depth, nodes, pending, successful, failed, completed, copyP, copyS, copyF)
-	return nil
+	return db.sealBuffer.Add(table, depth, nodes, pending, successful, failed, completed, copyP, copyS, copyF)
+}
+
+// AddSealNodes writes a subset of nodes and their status events to the seal buffer (no level stats).
+// Use when removing nodes from cache after DST task completion or SRC early completion; only remove from cache if this returns nil.
+func (db *DB) AddSealNodes(table string, depth int, nodes []*NodeState) error {
+	if table != "SRC" && table != "DST" || len(nodes) == 0 {
+		return nil
+	}
+	return db.sealBuffer.Add(table, depth, nodes, 0, 0, 0, 0, 0, 0, 0)
 }
 
 // SealLevelDepth0 updates existing root row(s) at depth 0 and writes stats.
@@ -206,6 +305,28 @@ func (db *DB) FlushSealBuffer() error {
 // WaitUntilSealFlushedThrough blocks until the seal buffer has written at least the given depth (for backpressure: don't run more than one round ahead of flushed state).
 func (db *DB) WaitUntilSealFlushedThrough(depth int) {
 	db.sealBuffer.WaitUntilFlushedThrough(depth)
+}
+
+// AppendDiscoveredNodes adds discovered nodes (and their initial status events) to the seal buffer discovery queue. Call from traversal completion; flush is async until FlushAppenderBuffer.
+func (db *DB) AppendDiscoveredNodes(ops []InsertOperation) {
+	if db.sealBuffer != nil && len(ops) > 0 {
+		db.sealBuffer.AddDiscoveryNodes(ops)
+	}
+}
+
+// AppendStatusEvent adds a status event (e.g. completed/failed) to the seal buffer discovery queue. Call from CompleteTraversalTask / FailTraversalTask.
+func (db *DB) AppendStatusEvent(table string, e StatusEvent) {
+	if db.sealBuffer != nil {
+		db.sealBuffer.AddDiscoveryStatusEvent(table, e)
+	}
+}
+
+// FlushAppenderBuffer flushes the seal buffer (including discovery queue) and returns when all pending nodes and status events are persisted. Call before round advance.
+func (db *DB) FlushAppenderBuffer() error {
+	if db.sealBuffer == nil {
+		return nil
+	}
+	return db.sealBuffer.Flush()
 }
 
 // WriteSession is the handle passed to RunWrite. Caller must not retain conn after the callback returns.
@@ -272,11 +393,27 @@ func (db *DB) BeginTraversalPhase(ctx context.Context) error {
 	return nil
 }
 
-// EndTraversalPhase flushes remaining seal jobs, closes phase appenders and connection, rebuilds indexes, and checkpoints once.
+// EndTraversalPhase flushes remaining seal jobs, closes phase appenders, checkpoints to flush WAL and free memory, then rebuilds indexes.
 func (db *DB) EndTraversalPhase() error {
 	if err := db.sealBuffer.StopPhase(); err != nil {
 		return err
 	}
+	if err := db.Checkpoint(); err != nil {
+		return err
+	}
+	runtime.GC()
+	if _, err := db.conn.Exec("PRAGMA threads=1"); err != nil {
+		return err
+	}
+	if _, err := db.conn.Exec("PRAGMA memory_limit='2GB'"); err != nil {
+		return err
+	}
+	// reset defaults after indexes are created. :)
+	// Duck DB index creation on large tables is super memory hungry so we are essentially trying to limit this to prevent OOM crashes.
+	defer func() {
+		_, _ = db.conn.Exec("PRAGMA threads=4")
+		_, _ = db.conn.Exec("PRAGMA memory_limit='4GB'")
+	}()
 	for _, table := range []string{tableSrcNodes, tableDstNodes} {
 		if err := EnsureNodeTableIndexes(db, table); err != nil {
 			return err

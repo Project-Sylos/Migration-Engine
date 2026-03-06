@@ -83,20 +83,14 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		coordinator.SetMaxSrcAhead(cfg.MaxSrcAhead)
 	}
 
-	// In-memory level caches: separate SRC/DST with bridge for DST cross-querying SRC (read-only)
-	caches := queue.NewEngineCaches()
-
+	// DB-backed frontier: no LevelCache for traversal. Queues pull from DuckDB in batches.
 	// Create queues
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
-	srcQueue.SetNodeCache(caches.Src)
-	srcQueue.SetOtherNodeCache(caches.Dst)
 	srcQueue.InitializeWithContext(database, cfg.SrcAdapter, cfg.ShutdownContext)
 	// Note: Queues clean themselves up when they complete (Run() exits when state=QueueStateCompleted)
 	// We only need to explicitly close for forced shutdowns, which is handled via Pause() + shutdown context
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
-	dstQueue.SetNodeCache(caches.Dst)
-	dstQueue.SetOtherNodeCache(caches.Src)
 	dstQueue.InitializeWithContext(database, cfg.DstAdapter, cfg.ShutdownContext)
 	// Note: Queues clean themselves up when they complete (Run() exits when state=QueueStateCompleted)
 	// We only need to explicitly close for forced shutdowns, which is handled via Pause() + shutdown context
@@ -342,13 +336,6 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 		}
 	}
 
-	// Load current round from DB into node cache so workers pull from cache (startup and resume, including round 0)
-	if srcQueue.NodeCache() != nil {
-		srcQueue.RehydrateLevelFromDB(srcRound)
-	}
-	if dstQueue.NodeCache() != nil {
-		dstQueue.RehydrateLevelFromDB(dstRound)
-	}
 
 	// Don't pull tasks here - let Run() handle the initial pull
 	// DST will check coordinator when it needs to advance

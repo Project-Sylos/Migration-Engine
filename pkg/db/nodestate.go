@@ -137,6 +137,13 @@ func (o *BatchInsertOperation) flush(w *Writer) error {
 	return nil
 }
 
+// PathHash returns a deterministic 32-char hex hash of path for use as an index key.
+// Uses SHA256(path), first 16 bytes hex-encoded; matches node table path_hash column.
+func PathHash(path string) string {
+	sum := sha256.Sum256([]byte(path))
+	return hex.EncodeToString(sum[:16])
+}
+
 // DeterministicNodeID returns a stable id from (queueType, nodeType, path) for race-safe deduplication.
 func DeterministicNodeID(queueType, nodeType, path string) string {
 	h := sha256.New()

@@ -12,147 +12,106 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
-// PullTraversalTasks pulls traversal tasks from DuckDB for the current round.
-// Uses getter/setter methods - no direct mutex access.
+// PullTraversalTasks refills the queue from DuckDB for the current round (ID-offset pagination, ~10K batch).
+// SRC: ListNodesByDepthKeyset; DST: ListDstBatchWithSrcChildren (join for expected children). Pushed directly to queue.
 func (q *Queue) PullTraversalTasks(force bool) {
 	database := q.getDatabase()
 	if database == nil {
 		return
 	}
-
-	// Check pulling flag FIRST before any other logic
-	// This prevents multiple threads from executing pull logic concurrently
 	if q.getPulling() {
 		return
 	}
-
-	// Don't pull if queue is completed (prevents deadlock on coordinator gate)
 	if q.State() == QueueStateCompleted {
 		return
 	}
-	// Traversal pulls are cache-driven. Until hydration marks cache ready, do not
-	// record pull attempts or mutate pull state; otherwise we can advance/complete
-	// based on an empty pre-hydration view.
+	// Allow first refill attempt without prior cache hydration (DB-backed frontier).
 	if !q.getTraversalCacheLoaded() {
-		return
+		q.SetTraversalCacheLoaded(true)
 	}
-
-	// Set pulling flag early and defer clearing it
-	// This ensures only one thread can execute the pull logic at a time
 	q.setPulling(true)
-
-	// Always clear pulling flag when done
-	defer func() {
-		q.setPulling(false)
-	}()
+	defer q.setPulling(false)
 
 	taskType := TaskTypeSrcTraversal
 	if q.name == "dst" {
 		taskType = TaskTypeDstTraversal
 	}
-
-	// Get state snapshot
 	snapshot := q.getStateSnapshot()
-
 	if !force {
-		// Only pull if queue is running (not paused or completed)
 		if snapshot.State != QueueStateRunning || snapshot.PendingCount > snapshot.PullLowWM {
 			return
 		}
 	} else {
-		// Even when forcing, don't pull if paused
 		if snapshot.State == QueueStatePaused {
 			return
 		}
 	}
-
 	currentRound := snapshot.Round
 	coordinator := q.getCoordinator()
-
-	// For DST: Check coordinator gate before pulling
 	if q.name == "dst" && coordinator != nil {
-		canStartRound := coordinator.CanDstStartRound(currentRound)
-		if !canStartRound {
+		if !coordinator.CanDstStartRound(currentRound) {
 			return
 		}
 	}
 
-	batchSize := effectiveLeaseBatchSize()
-	nc := q.NodeCache()
-
-	// Memory-first: try pull from cache. Always record the pull when we attempt (check), even if we get 0 items.
-	if nc == nil {
-		// No cache available still counts as a pull attempt for this round.
-		q.setLastPullWasPartial(true)
-		q.recordPull(currentRound, 0, true)
-		q.setFirstPullForRound(false)
-		return
-	}
-	level := nc.GetLevel(currentRound)
-	if level != nil {
-		list := level.LeasePending(batchSize)
-		if len(list) > 0 {
-			expectedFoldersMap := make(map[string][]types.Folder)
-			expectedFilesMap := make(map[string][]types.File)
-			srcIDMap := make(map[string]map[string]string)
-			srcIDToMeta := make(map[string]SrcNodeMeta)
-			if q.name == "dst" {
-				other := q.OtherNodeCache()
-				nextLevel := other.GetLevel(currentRound + 1)
-				for _, state := range list {
-					if state.Type != types.NodeTypeFolder {
-						continue
-					}
-					dstID := state.ID
-					var children []*db.NodeState
-					if nextLevel != nil {
-						children = nextLevel.ListChildrenByParentPath(state.Path)
-					}
-					folders, files, idMap, meta := buildExpectedMapsFromChildren(children)
-					expectedFoldersMap[dstID], expectedFilesMap[dstID], srcIDMap[dstID] = folders, files, idMap
-					for k, v := range meta {
-						srcIDToMeta[k] = v
-					}
+	batchSize := refillFromDBBatchSize
+	var count int
+	if q.name == "dst" {
+		afterID := q.getDstKeysetCursor()
+		dstBatch, childrenByDstID, err := db.ListDstBatchWithSrcChildren(database, currentRound, afterID, batchSize, db.StatusPending)
+		if err != nil {
+			q.setLastPullWasPartial(true)
+			q.recordPull(currentRound, 0, true)
+			q.setFirstPullForRound(false)
+			return
+		}
+		expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta := BuildExpectedMapsFromDstWithChildren(dstBatch, childrenByDstID)
+		for _, fr := range dstBatch {
+			task := nodeStateToTask(fr.State, taskType)
+			if task != nil {
+				if task.ID == "" {
+					task.ID = fr.Key
 				}
-			}
-			for _, state := range list {
-				task := nodeStateToTask(state, taskType)
-				if task != nil && task.ID == "" {
-					task.ID = state.ID
+				if task.IsFolder() {
+					task.ExpectedFolders = expectedFoldersMap[fr.Key]
+					task.ExpectedFiles = expectedFilesMap[fr.Key]
+					task.ExpectedSrcIDMap = srcIDMap[fr.Key]
+					task.ExpectedSrcNodeMeta = srcIDToMeta
 				}
-				if q.name == "dst" && task != nil && task.IsFolder() {
-					task.ExpectedFolders = expectedFoldersMap[state.ID]
-					task.ExpectedFiles = expectedFilesMap[state.ID]
-					task.ExpectedSrcIDMap = srcIDMap[state.ID]
-					if task.ExpectedSrcIDMap != nil {
-						task.ExpectedSrcNodeMeta = make(map[string]SrcNodeMeta)
-						for _, srcID := range task.ExpectedSrcIDMap {
-							if meta, ok := srcIDToMeta[srcID]; ok {
-								task.ExpectedSrcNodeMeta[srcID] = meta
-							}
-						}
-					}
-				}
-				if task != nil {
-					_ = q.Add(task)
-				}
-			}
-			// Pull now performs lease transition in cache: pending -> in_progress.
-			// Keep per-level counters in sync for stats/seal snapshots.
-			for range list {
-				nc.RecordTraversalTransition(currentRound, db.StatusPending, "in_progress")
+				_ = q.Add(task)
+				count++
 			}
 		}
-		// Record pull whether we got items or not; we checked and that counts as an attempt.
-		wasPartial := len(list) < batchSize
-		q.setLastPullWasPartial(wasPartial)
-		q.recordPull(currentRound, len(list), wasPartial)
-		q.setFirstPullForRound(false)
-		return
+		if len(dstBatch) > 0 {
+			q.setDstKeysetCursor(dstBatch[len(dstBatch)-1].Key)
+		}
+	} else {
+		afterID := q.getSrcKeysetCursor()
+		queueType := getQueueType(q.name)
+		results, err := db.ListNodesByDepthKeyset(database, queueType, currentRound, afterID, db.StatusPending, batchSize)
+		if err != nil {
+			q.setLastPullWasPartial(true)
+			q.recordPull(currentRound, 0, true)
+			q.setFirstPullForRound(false)
+			return
+		}
+		for _, fr := range results {
+			task := nodeStateToTask(fr.State, taskType)
+			if task != nil {
+				if task.ID == "" {
+					task.ID = fr.Key
+				}
+				_ = q.Add(task)
+				count++
+			}
+		}
+		if len(results) > 0 {
+			q.setSrcKeysetCursor(results[len(results)-1].Key)
+		}
 	}
-	// Level is nil for this round (e.g. cache not populated yet, or no nodes at this depth). This still counts as a pull attempt.
-	q.setLastPullWasPartial(true)
-	q.recordPull(currentRound, 0, true)
+	wasPartial := count < batchSize
+	q.setLastPullWasPartial(wasPartial)
+	q.recordPull(currentRound, count, wasPartial)
 	q.setFirstPullForRound(false)
 }
 
@@ -304,65 +263,37 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 				taskState.SrcID = child.srcID
 			}
 
-			childNodesToInsert = append(childNodesToInsert, db.InsertOperation{
-				QueueType: queueType,
-				Level:     nextRound,
-				Status:    child.status,
-				State:     taskState,
-			})
+		childNodesToInsert = append(childNodesToInsert, db.InsertOperation{
+			QueueType: queueType,
+			Level:     nextRound,
+			Status:    child.status,
+			State:     taskState,
+		})
 
-		}
 	}
+}
 
-	nc := q.NodeCache()
-	if nc != nil {
-		// Memory-first: update cache only
-		level := nc.EnsureLevel(currentRound)
-		prevStatus := ""
-		if prev := level.Get(nodeID); prev != nil {
-			prevStatus = prev.TraversalStatus
-			if prevStatus == "" {
-				prevStatus = prev.Status
-			}
-		}
-		level.UpdateStatus(nodeID, db.StatusSuccessful, "")
-		if prevStatus == db.StatusPending || prevStatus == "in_progress" {
-			nc.RecordTraversalTransition(currentRound, prevStatus, db.StatusSuccessful)
-		}
-		nc.IncrementCompleted(currentRound)
-		nextLevel := nc.EnsureLevel(nextRound)
-		for _, op := range childNodesToInsert {
-			if op.State != nil {
-				nextLevel.Put(op.State.ID, op.State)
-				if op.State.TraversalStatus == db.StatusPending {
-					nc.IncrementPending(nextRound)
-				}
-			}
-		}
-		// DST: update SRC copy status in other cache for children that have SrcID
-		if queueType == "DST" {
-			other := q.OtherNodeCache()
-			if other != nil {
-				otherNext := other.EnsureLevel(nextRound)
-				for _, child := range task.DiscoveredChildren {
-					if child.SrcID != "" && child.SrcCopyStatus != "" && task.ExpectedSrcNodeMeta != nil {
-						if _, ok := task.ExpectedSrcNodeMeta[child.SrcID]; ok {
-							otherNext.UpdateStatus(child.SrcID, "", child.SrcCopyStatus)
-						}
-					}
-				}
-			}
-		}
+	// Push discovered children and completed-node status to appender buffer (async flush until round advance).
+	if len(childNodesToInsert) > 0 {
+		database.AppendDiscoveredNodes(childNodesToInsert)
 	}
+	database.AppendStatusEvent(queueType, db.StatusEvent{
+		ID:               nodeID,
+		TraversalStatus:  db.StatusSuccessful,
+		CopyStatus:       state.CopyStatus,
+		EventTime:        time.Now().UnixNano(),
+		Depth:            currentRound,
+	})
 
-	// For SRC FOLDER tasks in retry mode: Queue DST cleanup only when RetryDstCleanup was populated at pull (no DB reads here).
+	// For SRC FOLDER tasks in retry mode: Re-queue DST task via status event and schedule DST child deletions.
 	if q.name == "src" && q.GetMode() == QueueModeRetry && task.IsFolder() && task.RetryDstCleanup != nil {
 		c := task.RetryDstCleanup
-		dstCache := q.OtherNodeCache()
-		if dstCache != nil {
-			dstCache.EnsureLevel(task.Round).Put(c.DstID, &db.NodeState{ID: c.DstID, Depth: task.Round, TraversalStatus: db.StatusPending})
-			dstCache.IncrementPending(task.Round)
-		}
+		database.AppendStatusEvent("DST", db.StatusEvent{
+			ID:              c.DstID,
+			TraversalStatus: db.StatusPending,
+			EventTime:       time.Now().UnixNano(),
+			Depth:           task.Round,
+		})
 		deletions := make([]db.NodeDeletion, 0, len(c.Children))
 		for _, ch := range c.Children {
 			deletions = append(deletions, db.NodeDeletion{Table: "DST", NodeID: ch.ID})
@@ -401,15 +332,8 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 	// Check if we should retry
 	if task.Attempts < maxRetries {
 		task.Locked = false
-		if nc := q.NodeCache(); nc != nil {
-			if level := nc.GetLevel(currentRound); level != nil {
-				level.UpdateStatus(nodeID, db.StatusPending, "")
-				nc.RecordTraversalTransition(currentRound, "in_progress", db.StatusPending)
-			}
-		}
-		// Remove from in-progress BEFORE re-enqueuing to pending
 		q.removeInProgress(nodeID)
-		q.Add(task) // Re-adds to tracked automatically
+		q.Add(task)
 		if logservice.LS != nil {
 			err := logservice.LS.Log("debug",
 				fmt.Sprintf("Retrying task: id=%s path=%s round=%d attempt=%d/%d",
@@ -443,57 +367,31 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 	// Record task completion in RoundInfo (failed)
 	q.recordTaskCompletion(currentRound, false)
 
-	// Update traversal status to failed
-	if nodeID != "" {
-		nc := q.NodeCache()
-		if nc != nil {
-			level := nc.GetLevel(currentRound)
-			prevStatus := ""
-			if level != nil {
-				if prev := level.Get(nodeID); prev != nil {
-					prevStatus = prev.TraversalStatus
-					if prevStatus == "" {
-						prevStatus = prev.Status
-					}
-				}
-				level.UpdateStatus(nodeID, db.StatusFailed, "")
-			}
-			if prevStatus == db.StatusPending || prevStatus == "in_progress" {
-				nc.RecordTraversalTransition(currentRound, prevStatus, db.StatusFailed)
-			}
-			nc.IncrementCompleted(currentRound)
-		}
+	// Persist failed status to appender buffer
+	database := q.getDatabase()
+	if database != nil && nodeID != "" {
+		database.AppendStatusEvent(getQueueType(q.name), db.StatusEvent{
+			ID:              nodeID,
+			TraversalStatus: db.StatusFailed,
+			EventTime:       time.Now().UnixNano(),
+			Depth:           currentRound,
+		})
 	}
-
 	// Remove from in-progress LAST
 	q.removeInProgress(nodeID)
 	q.removeLeasedKey(nodeID)
 }
 
 // CheckTraversalCompletion checks if traversal/retry phase should complete.
-// All traversal-specific completion logic lives here: cache loaded, attempted pull, first pull returned 0, no pending in cache.
-// Returns true if the queue should mark as complete, false otherwise.
+// DB-backed: no pending at depth (from GetPendingTraversalCountAtDepthFromLive), attempted pull, first pull returned 0.
 func (q *Queue) CheckTraversalCompletion(currentRound int) bool {
-	// Completion checks do not apply while we're waiting on round-gate coordination.
 	if q.State() == QueueStateWaiting {
 		return false
 	}
 	if coordinator := q.getCoordinator(); coordinator != nil {
-		switch q.name {
-		case "dst":
-			if !coordinator.CanDstStartRound(currentRound) {
-				return false
-			}
-		case "src":
-			if !coordinator.CanSrcStartRound(currentRound) {
-				return false
-			}
+		if !coordinator.CanDstStartRound(currentRound) && q.name == "dst" {
+			return false
 		}
-	}
-
-	nc := q.NodeCache()
-	if nc == nil {
-		return false
 	}
 	if !q.getTraversalCacheLoaded() {
 		return false
@@ -509,8 +407,6 @@ func (q *Queue) CheckTraversalCompletion(currentRound int) bool {
 	attemptedPull := pullCount > 0
 	wasFirstPull := pullCount == 1
 	if !attemptedPull {
-		// Completion requires at least one pull attempt for this round.
-		// If none is recorded, force a pull check now so we don't idle forever.
 		q.PullTasksIfNeeded(true)
 		info = q.getRoundInfoReadOnly(currentRound)
 		pullCount = 0
@@ -527,14 +423,6 @@ func (q *Queue) CheckTraversalCompletion(currentRound int) bool {
 	}
 
 	mode := q.GetMode()
-	hasPending := false
-	level := nc.GetLevel(currentRound)
-	if level != nil {
-		hasPending = level.HasPendingTraversal()
-	}
-	if hasPending {
-		return false
-	}
 
 	switch mode {
 	case QueueModeTraversal:

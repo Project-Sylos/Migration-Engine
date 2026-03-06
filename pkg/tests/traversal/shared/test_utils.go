@@ -147,7 +147,7 @@ func GetTopLevelChildren(database *db.DB, queueType string, rootPath string) ([]
 	if rootNode == nil {
 		return nil, fmt.Errorf("node not found: %s", rootPath)
 	}
-	return db.GetChildrenByParentPath(database, queueType, rootPath, 40_000)
+	return db.GetChildrenByParentPath(database, queueType, rootPath, 10_000)
 }
 
 // PickRandomTopLevelChild picks a random top-level child from the root. Only selects folders (not files).

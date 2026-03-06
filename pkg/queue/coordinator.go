@@ -117,21 +117,6 @@ func (c *QueueCoordinator) IsCompleted(queueType string) bool {
 	}
 }
 
-// CanSrcStartRound returns true if SRC can run the given round: srcRound <= dstRound + maxSrcAhead (or SRC is done).
-func (c *QueueCoordinator) CanSrcStartRound(srcRound int) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	// If DST has completed traversal, SRC should proceed unconstrained.
-	// This prevents SRC from stalling behind a fixed dstRound after DST exits early.
-	if c.dstDone {
-		return true
-	}
-	if c.srcDone {
-		return true
-	}
-	return srcRound <= c.dstRound+c.maxSrcAhead
-}
-
 // WaitSealBackpressure ensures the seal buffer has flushed through the given round before the caller drops that level from node cache.
 // Call after enqueueing the round's seal data and before dropping the level. Prevents the DB flush buffer from growing unbounded.
 // Returns false if flushing fails; callers should fail closed (do not drop level or advance round).

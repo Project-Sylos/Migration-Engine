@@ -23,6 +23,8 @@ func nodeTableDDL(table string) string {
 		parent_service_id VARCHAR,
 		path VARCHAR,
 		parent_path VARCHAR,
+		path_hash VARCHAR,
+		parent_path_hash VARCHAR,
 		type VARCHAR,
 		size BIGINT,
 		mtime VARCHAR,

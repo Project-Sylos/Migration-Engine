@@ -21,6 +21,7 @@ type Writer struct {
 func NodeStateAppendRowArgs(n *NodeState) []any {
 	return []any{
 		n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath,
+		PathHash(n.Path), PathHash(n.ParentPath),
 		n.Type, n.Size, n.MTime, int32(n.Depth),
 	}
 }
@@ -33,9 +34,9 @@ func (w *Writer) AppenderInsert(table string, nodes []*NodeState) error {
 	ctx := context.Background()
 	for _, n := range nodes {
 		_, err := w.tx.ExecContext(ctx,
-			`INSERT INTO `+table+` (id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath, n.Type, n.Size, n.MTime, n.Depth,
+			`INSERT INTO `+table+` (id, service_id, parent_id, parent_service_id, path, parent_path, path_hash, parent_path_hash, type, size, mtime, depth)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath, PathHash(n.Path), PathHash(n.ParentPath), n.Type, n.Size, n.MTime, n.Depth,
 		)
 		if err != nil {
 			return err

@@ -446,51 +446,8 @@ func (q *Queue) recordTaskCompletion(round int, success bool) {
 	}
 }
 
-// syncLevelStatsFromDB loads stats for the given depth from the DB into the node cache's LevelStats (used when bootstrapping a level from DB).
-func (q *Queue) syncLevelStatsFromDB(database *db.DB, queueType string, depth int) {
-	nc := q.NodeCache()
-	if nc == nil {
-		return
-	}
-	pending, _ := database.GetStatsCountAtDepth(queueType, depth, db.StatsKeyTraversalStatus(db.StatusPending))
-	successful, _ := database.GetStatsCountAtDepth(queueType, depth, db.StatsKeyTraversalStatus(db.StatusSuccessful))
-	failed, _ := database.GetStatsCountAtDepth(queueType, depth, db.StatsKeyTraversalStatus(db.StatusFailed))
-	completed, _ := database.GetStatsCountAtDepth(queueType, depth, db.StatsKeyCompleted)
-	nc.SetLevelStats(depth, pending, successful, failed, completed)
-}
-
-// RehydrateLevelFromDB loads all nodes at the given depth from the DB into this queue's node cache and syncs level stats.
-// Used on resume so the memory-first path can continue from sealed state without re-pulling from DB on first pull.
-func (q *Queue) RehydrateLevelFromDB(depth int) {
-	database := q.getDatabase()
-	nc := q.NodeCache()
-	if database == nil || nc == nil {
-		return
-	}
-	queueType := getQueueType(q.name)
-	level := nc.EnsureLevel(depth)
-	afterID := ""
-	const batchSize = 5000
-	for {
-		results, err := db.ListNodesByDepthKeyset(database, queueType, depth, afterID, "", batchSize)
-		if err != nil {
-			return
-		}
-		for _, r := range results {
-			level.Put(r.Key, r.State)
-		}
-		if len(results) < batchSize {
-			break
-		}
-		afterID = results[len(results)-1].Key
-	}
-	q.syncLevelStatsFromDB(database, queueType, depth)
-	q.SetTraversalCacheLoaded(true)
-}
-
-// SetTraversalCacheLoaded sets whether the level cache has been loaded from DB (e.g. after RehydrateLevelFromDB).
-// Until true, CheckTraversalCompletion returns false so the queue does not complete before round 0 is populated.
-// Call after loading cache at startup; retry/sweeps should set true when their cache is ready.
+// SetTraversalCacheLoaded sets whether we have completed the first pull for the current round.
+// Until true, CheckTraversalCompletion returns false so the queue does not complete before the first pull.
 func (q *Queue) SetTraversalCacheLoaded(loaded bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -592,9 +549,9 @@ func (q *Queue) getOrCreateRoundStatsUnlocked(round int) *RoundStats {
 	return q.roundStats[round]
 }
 
-// setExpectedFromStatsBucket sets roundStats[round].Expected from the stats table (key 'expected').
-// First tries GetExpectedAtDepth; if missing or 0, computes from pending count and writes to stats.
-// Used at the start of each round so Expected reflects actual DB state and survives restarts.
+// setExpectedFromStatsBucket sets roundStats[round].Expected from the live DB count (or stats for init/resume).
+// For traversal/retry: always compute from live pending count when advancing, to avoid stale stats from prior runs.
+// For copy: compute from live. For init (EnsureRoundExpectedFromStats): try stats first for resume, else compute.
 func (q *Queue) setExpectedFromStatsBucket(round int) {
 	database := q.getDatabase()
 	if database == nil {
@@ -603,60 +560,48 @@ func (q *Queue) setExpectedFromStatsBucket(round int) {
 	queueType := getQueueType(q.name)
 	mode := q.GetMode()
 	var expected int64
-	// Try fast read from stats first
-	expected, err := database.GetStatsCountAtDepth(queueType, round, db.StatsKeyExpected)
-	if err != nil {
-		fmt.Println("error getting stats count at depth", err)
-		return
-	}
-	if expected == 0 {
-		// Compute from live table (stats for this depth may not exist yet when advancing to a new round) and write back
-		switch mode {
-		case QueueModeTraversal:
-			if round == 0 {
-				expected = 1
-			} else {
-				expected, err = database.GetPendingTraversalCountAtDepthFromLive(queueType, round)
-				if err != nil {
-					fmt.Println("error getting pending traversal count at depth from live", err)
-					return
-				}
-			}
-		case QueueModeRetry:
+	var err error
+
+	// For traversal/retry, always compute from live count when advancing (no stale stats from prior runs).
+	// EnsureRoundExpectedFromStats (init/resume) still goes through this; we compute for traversal there too.
+	switch mode {
+	case QueueModeTraversal:
+		if round == 0 {
+			expected = 1
+		} else {
 			expected, err = database.GetPendingTraversalCountAtDepthFromLive(queueType, round)
 			if err != nil {
 				fmt.Println("error getting pending traversal count at depth from live", err)
 				return
 			}
-		case QueueModeCopy:
-			copyPass := q.GetCopyPass()
-			nodeType := db.NodeTypeFolder
-			if copyPass == 2 {
-				nodeType = db.NodeTypeFile
-			}
-			expected, err = database.GetCopyCountAtDepth(round, nodeType, db.CopyStatusPending)
-			if err != nil {
-				fmt.Println("error getting copy count at depth", err)
-				return
-			}
-		default:
+		}
+	case QueueModeRetry:
+		expected, err = database.GetPendingTraversalCountAtDepthFromLive(queueType, round)
+		if err != nil {
+			fmt.Println("error getting pending traversal count at depth from live", err)
 			return
 		}
-		if expected > 0 {
-			err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-				return s.WithTx(func(w *db.Writer) error {
-					if err != nil {
-						fmt.Println("error before set stats count", err)
-						return err
-					}
-					return w.SetStatsCountForDepth(queueType, round, db.StatsKeyExpected, expected)
-				})
-			})
-			if err != nil {
-				fmt.Println("error setting stats count for depth", err)
-				return
-			}
+	case QueueModeCopy:
+		copyPass := q.GetCopyPass()
+		nodeType := db.NodeTypeFolder
+		if copyPass == 2 {
+			nodeType = db.NodeTypeFile
 		}
+		expected, err = database.GetCopyCountAtDepth(round, nodeType, db.CopyStatusPending)
+		if err != nil {
+			fmt.Println("error getting copy count at depth", err)
+			return
+		}
+	default:
+		return
+	}
+	// Persist to stats for resume
+	if expected > 0 {
+		_ = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
+			return s.WithTx(func(w *db.Writer) error {
+				return w.SetStatsCountForDepth(queueType, round, db.StatsKeyExpected, expected)
+			})
+		})
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
