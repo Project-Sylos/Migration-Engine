@@ -479,7 +479,7 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 		CopyStatus: db.CopyStatusSuccessful,
 		EventTime:  time.Now().UnixNano(),
 		Depth:      currentRound,
-	})
+	}, false)
 	dstNodeID := db.DeterministicNodeID("DST", taskType, taskPath)
 	var dstServiceID string
 	if task.IsFolder() {
@@ -582,7 +582,7 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 			CopyStatus: db.CopyStatusFailed,
 			EventTime:  time.Now().UnixNano(),
 			Depth:      currentRound,
-		})
+		}, false)
 
 		q.removeInProgress(nodeID)
 		q.removeLeasedKey(nodeID)

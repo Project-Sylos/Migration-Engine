@@ -277,23 +277,24 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 	if len(childNodesToInsert) > 0 {
 		database.AppendDiscoveredNodes(childNodesToInsert)
 	}
+	fromRetry := q.GetMode() == QueueModeRetry
 	database.AppendStatusEvent(queueType, db.StatusEvent{
 		ID:               nodeID,
 		TraversalStatus:  db.StatusSuccessful,
 		CopyStatus:       state.CopyStatus,
 		EventTime:        time.Now().UnixNano(),
 		Depth:            currentRound,
-	})
+	}, fromRetry)
 
 	// For SRC FOLDER tasks in retry mode: Re-queue DST task via status event and schedule DST child deletions.
-	if q.name == "src" && q.GetMode() == QueueModeRetry && task.IsFolder() && task.RetryDstCleanup != nil {
+	if q.name == "src" && fromRetry && task.IsFolder() && task.RetryDstCleanup != nil {
 		c := task.RetryDstCleanup
 		database.AppendStatusEvent("DST", db.StatusEvent{
 			ID:              c.DstID,
 			TraversalStatus: db.StatusPending,
 			EventTime:       time.Now().UnixNano(),
 			Depth:           task.Round,
-		})
+		}, false)
 		deletions := make([]db.NodeDeletion, 0, len(c.Children))
 		for _, ch := range c.Children {
 			deletions = append(deletions, db.NodeDeletion{Table: "DST", NodeID: ch.ID})
@@ -375,7 +376,7 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 			TraversalStatus: db.StatusFailed,
 			EventTime:       time.Now().UnixNano(),
 			Depth:           currentRound,
-		})
+		}, q.GetMode() == QueueModeRetry)
 	}
 	// Remove from in-progress LAST
 	q.removeInProgress(nodeID)

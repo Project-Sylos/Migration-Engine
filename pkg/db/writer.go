@@ -7,7 +7,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -40,6 +39,37 @@ func (w *Writer) AppenderInsert(table string, nodes []*NodeState) error {
 		)
 		if err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// UpsertNodes inserts or updates node metadata in src_nodes or dst_nodes.
+func (w *Writer) UpsertNodes(table string, nodes []*NodeState) error {
+	if len(nodes) == 0 {
+		return nil
+	}
+	ctx := context.Background()
+	for _, n := range nodes {
+		_, err := w.tx.ExecContext(ctx,
+			`INSERT INTO `+table+` (id, service_id, parent_id, parent_service_id, path, parent_path, path_hash, parent_path_hash, type, size, mtime, depth)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			 ON CONFLICT (id) DO UPDATE SET
+			 	service_id = excluded.service_id,
+			 	parent_id = excluded.parent_id,
+			 	parent_service_id = excluded.parent_service_id,
+			 	path = excluded.path,
+			 	parent_path = excluded.parent_path,
+			 	path_hash = excluded.path_hash,
+			 	parent_path_hash = excluded.parent_path_hash,
+			 	type = excluded.type,
+			 	size = excluded.size,
+			 	mtime = excluded.mtime,
+			 	depth = excluded.depth`,
+			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath, PathHash(n.Path), PathHash(n.ParentPath), n.Type, n.Size, n.MTime, n.Depth,
+		)
+		if err != nil {
+			return fmt.Errorf("upsert node %s into %s: %w", n.ID, table, err)
 		}
 	}
 	return nil
@@ -96,150 +126,17 @@ func (w *Writer) WriteLevelStatsSnapshot(table string, depth int, pending, succe
 	return nil
 }
 
-// WriteLevelStatsSnapshotsBatch writes stats for multiple (table, depth) snapshots in two batched DELETEs and two batched INSERTs. Call from seal flush to reduce round-trips.
-func (w *Writer) WriteLevelStatsSnapshotsBatch(rows []sealStatsSnapshot) error {
-	if len(rows) == 0 {
-		return nil
-	}
-	ctx := context.Background()
-	srcDepths := make([]int, 0, len(rows))
-	dstDepths := make([]int, 0, len(rows))
-	var srcTuples []struct {
-		depth int
-		key   string
-		count int64
-	}
-	var dstTuples []struct {
-		depth int
-		key   string
-		count int64
-	}
-	for _, r := range rows {
-		depth := r.depth
-		if r.table == "SRC" {
-			srcDepths = append(srcDepths, depth)
-			srcTuples = append(srcTuples,
-				struct {
-					depth int
-					key   string
-					count int64
-				}{depth, StatsKeyTraversalStatus(StatusPending), r.pending},
-				struct {
-					depth int
-					key   string
-					count int64
-				}{depth, StatsKeyTraversalStatus(StatusSuccessful), r.success},
-				struct {
-					depth int
-					key   string
-					count int64
-				}{depth, StatsKeyTraversalStatus(StatusFailed), r.failed},
-				struct {
-					depth int
-					key   string
-					count int64
-				}{depth, StatsKeyCompleted, r.completed},
-			)
-			if r.copyP >= 0 {
-				srcTuples = append(srcTuples,
-					struct {
-						depth int
-						key   string
-						count int64
-					}{depth, StatsKeyCopyStatus(CopyStatusPending), r.copyP},
-					struct {
-						depth int
-						key   string
-						count int64
-					}{depth, StatsKeyCopyStatus(CopyStatusSuccessful), r.copyS},
-					struct {
-						depth int
-						key   string
-						count int64
-					}{depth, StatsKeyCopyStatus(CopyStatusFailed), r.copyF},
-				)
-			}
-		} else {
-			dstDepths = append(dstDepths, depth)
-			dstTuples = append(dstTuples,
-				struct {
-					depth int
-					key   string
-					count int64
-				}{depth, StatsKeyTraversalStatus(StatusPending), r.pending},
-				struct {
-					depth int
-					key   string
-					count int64
-				}{depth, StatsKeyTraversalStatus(StatusSuccessful), r.success},
-				struct {
-					depth int
-					key   string
-					count int64
-				}{depth, StatsKeyTraversalStatus(StatusFailed), r.failed},
-				struct {
-					depth int
-					key   string
-					count int64
-				}{depth, StatsKeyCompleted, r.completed},
-			)
-		}
-	}
-	if len(srcDepths) > 0 {
-		if _, err := w.tx.ExecContext(ctx, buildDeleteIn(tableSrcStats, srcDepths)); err != nil {
-			return err
-		}
-		if len(srcTuples) > 0 {
-			if err := w.bulkInsertStats(ctx, tableSrcStats, srcTuples); err != nil {
-				return err
-			}
-		}
-	}
-	if len(dstDepths) > 0 {
-		if _, err := w.tx.ExecContext(ctx, buildDeleteIn(tableDstStats, dstDepths)); err != nil {
-			return err
-		}
-		if len(dstTuples) > 0 {
-			if err := w.bulkInsertStats(ctx, tableDstStats, dstTuples); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func buildDeleteIn(table string, depths []int) string {
-	if len(depths) == 0 {
-		return "SELECT 1"
-	}
-	b := "DELETE FROM " + table + " WHERE depth IN ("
-	for i := range depths {
-		if i > 0 {
-			b += ","
-		}
-		b += strconv.Itoa(depths[i])
-	}
-	return b + ")"
-}
-
-func (w *Writer) bulkInsertStats(ctx context.Context, table string, tuples []struct {
+func (w *Writer) UpsertStatsCounts(table string, tuples []struct {
 	depth int
 	key   string
 	count int64
 }) error {
-	if len(tuples) == 0 {
-		return nil
+	for _, t := range tuples {
+		if err := w.SetStatsCountForDepth(table, t.depth, t.key, t.count); err != nil {
+			return err
+		}
 	}
-	args := make([]interface{}, 0, len(tuples)*3)
-	placeholders := make([]string, 0, len(tuples))
-	for i, t := range tuples {
-		args = append(args, t.depth, t.key, t.count)
-		n := i*3 + 1
-		placeholders = append(placeholders, fmt.Sprintf("($%d,$%d,$%d)", n, n+1, n+2))
-	}
-	q := "INSERT INTO " + table + " (depth, key, count) VALUES " + strings.Join(placeholders, ",") + " ON CONFLICT (depth, key) DO UPDATE SET count = excluded.count"
-	_, err := w.tx.ExecContext(ctx, q, args...)
-	return err
+	return nil
 }
 
 // SetStatsCountForDepth sets (depth, key, count) in src_stats or dst_stats. Must be called inside RunWrite (WithTx).
@@ -270,6 +167,27 @@ func (w *Writer) UpdateStatsCountByDelta(table string, depth int, key string, de
 	return err
 }
 
+// StatsDelta is one (table, depth, key) delta for batch application.
+type StatsDelta struct {
+	Table string
+	Depth int
+	Key   string
+	Delta int64
+}
+
+// ApplyStatsDeltas applies multiple stats deltas in one transaction. Used by seal buffer after discovery/copy flushes.
+func (w *Writer) ApplyStatsDeltas(deltas []StatsDelta) error {
+	for _, d := range deltas {
+		if d.Delta == 0 {
+			continue
+		}
+		if err := w.UpdateStatsCountByDelta(d.Table, d.Depth, d.Key, d.Delta); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // RecomputeStatsForDepth deletes stats for the given table and depth, then writes fresh counts from nodes joined with current status (event-derived).
 // For bulk operations only (DeleteSubtree, exclusion propagation, diffs/search). Single-node updates use UpdateStatsCountByDelta instead.
 func (w *Writer) RecomputeStatsForDepth(table string, depth int) error {
@@ -285,27 +203,53 @@ func (w *Writer) RecomputeStatsForDepth(table string, depth int) error {
 	if err != nil {
 		return err
 	}
-	_, err = w.tx.ExecContext(ctx,
-		`INSERT INTO `+statsTbl+` (depth, key, count)
-		 SELECT $1 AS depth, 'traversal/' || COALESCE(e.traversal_status,'') AS key, COUNT(*)::BIGINT AS count
+	rows, err := w.tx.QueryContext(ctx,
+		`SELECT COALESCE(e.traversal_status,'') AS status, COUNT(*)::BIGINT AS count
 		 FROM `+t+` n LEFT JOIN `+cte+` e ON n.id = e.id
 		 WHERE n.depth = $1 AND COALESCE(e.traversal_status,'') <> ''
-		 GROUP BY e.traversal_status`,
+		 GROUP BY 1`,
 		depth,
 	)
 	if err != nil {
 		return err
 	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var count int64
+		if err := rows.Scan(&status, &count); err != nil {
+			return err
+		}
+		if err := w.SetStatsCountForDepth(table, depth, StatsKeyTraversalStatus(status), count); err != nil {
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	if table == "SRC" {
-		_, err = w.tx.ExecContext(ctx,
-			`INSERT INTO `+statsTbl+` (depth, key, count)
-			 SELECT $1 AS depth, 'copy/' || COALESCE(e.copy_status,'') AS key, COUNT(*)::BIGINT AS count
+		rows, err = w.tx.QueryContext(ctx,
+			`SELECT COALESCE(e.copy_status,'') AS status, COUNT(*)::BIGINT AS count
 			 FROM `+t+` n LEFT JOIN `+cte+` e ON n.id = e.id
 			 WHERE n.depth = $1 AND COALESCE(e.copy_status,'') <> ''
-			 GROUP BY e.copy_status`,
+			 GROUP BY 1`,
 			depth,
 		)
 		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var status string
+			var count int64
+			if err := rows.Scan(&status, &count); err != nil {
+				return err
+			}
+			if err := w.SetStatsCountForDepth(table, depth, StatsKeyCopyStatus(status), count); err != nil {
+				return err
+			}
+		}
+		if err := rows.Err(); err != nil {
 			return err
 		}
 	}
@@ -476,6 +420,62 @@ func (w *Writer) DeleteNode(table, nodeID string) error {
 	return err
 }
 
+// CountExcludedInSubtree returns (excluded, notExcluded) counts for nodes in the subtree (path = rootPath OR path LIKE rootPath||'/%'). Uses current status from events. Call inside a transaction.
+func (w *Writer) CountExcludedInSubtree(table, rootPath string) (excluded, notExcluded int64, err error) {
+	ctx := context.Background()
+	nodeTbl := tableSrcNodes
+	evTbl := tableSrcStatusEvents
+	if table == "DST" {
+		nodeTbl = tableDstNodes
+		evTbl = tableDstStatusEvents
+	}
+	q := `WITH latest AS (SELECT id, arg_max(traversal_status, event_time) AS traversal_status FROM ` + evTbl + ` GROUP BY id)
+SELECT COUNT(*) FILTER (WHERE COALESCE(e.traversal_status,'') IN ('excluded','exclusion_inherited'))::BIGINT,
+       COUNT(*) FILTER (WHERE COALESCE(e.traversal_status,'') NOT IN ('excluded','exclusion_inherited'))::BIGINT
+FROM ` + nodeTbl + ` n LEFT JOIN latest e ON n.id = e.id WHERE n.path = $1 OR n.path LIKE $2`
+	if rootPath == "/" {
+		err = w.tx.QueryRowContext(ctx, `WITH latest AS (SELECT id, arg_max(traversal_status, event_time) AS traversal_status FROM `+evTbl+` GROUP BY id)
+SELECT COUNT(*) FILTER (WHERE COALESCE(e.traversal_status,'') IN ('excluded','exclusion_inherited'))::BIGINT,
+       COUNT(*) FILTER (WHERE COALESCE(e.traversal_status,'') NOT IN ('excluded','exclusion_inherited'))::BIGINT
+FROM `+nodeTbl+` n LEFT JOIN latest e ON n.id = e.id WHERE n.path LIKE '/%'`).Scan(&excluded, &notExcluded)
+	} else {
+		err = w.tx.QueryRowContext(ctx, q, rootPath, rootPath+"/%").Scan(&excluded, &notExcluded)
+	}
+	return excluded, notExcluded, err
+}
+
+// CountDstNodesUnderPath returns the number of DST nodes whose parent_path equals parentPath (direct children only). Call inside a transaction.
+func (w *Writer) CountDstNodesUnderPath(parentPath string) (int64, error) {
+	ctx := context.Background()
+	parentHash := PathHash(parentPath)
+	var n int64
+	err := w.tx.QueryRowContext(ctx, `SELECT COUNT(*)::BIGINT FROM dst_nodes WHERE parent_path_hash = $1`, parentHash).Scan(&n)
+	return n, err
+}
+
+// CountDstNodesUnderPathWithTraversalStatus returns the number of DST nodes under parentPath (parent_path = parentPath) whose current traversal_status equals status. Call inside a transaction.
+func (w *Writer) CountDstNodesUnderPathWithTraversalStatus(parentPath, status string) (int64, error) {
+	ctx := context.Background()
+	parentHash := PathHash(parentPath)
+	q := `WITH latest AS (SELECT id, arg_max(traversal_status, event_time) AS traversal_status FROM dst_status_events GROUP BY id)
+SELECT COUNT(*)::BIGINT FROM dst_nodes n JOIN latest e ON n.id = e.id WHERE n.parent_path_hash = $1 AND COALESCE(e.traversal_status,'') = $2`
+	var n int64
+	err := w.tx.QueryRowContext(ctx, q, parentHash, status).Scan(&n)
+	return n, err
+}
+
+// NodeTraversalStatus returns the current traversal_status for the node from the events table. Call inside a transaction.
+func (w *Writer) NodeTraversalStatus(table, nodeID string) (string, error) {
+	ctx := context.Background()
+	evTbl := tableSrcStatusEvents
+	if table == "DST" {
+		evTbl = tableDstStatusEvents
+	}
+	var s string
+	err := w.tx.QueryRowContext(ctx, `SELECT COALESCE(arg_max(traversal_status, event_time), '') FROM `+evTbl+` WHERE id = $1`, nodeID).Scan(&s)
+	return s, err
+}
+
 // SealDepth0 writes the depth-0 stats snapshot and emits status events for each depth-0 node so the events table reflects current state (e.g. root marked successful after round 0 completes).
 func (w *Writer) SealDepth0(table string, nodes []*NodeState, pending, successful, failed, completed int64, copyPending, copySuccessful, copyFailed int64) error {
 	if err := w.WriteLevelStatsSnapshot(table, 0, pending, successful, failed, completed, copyPending, copySuccessful, copyFailed); err != nil {
@@ -628,6 +628,124 @@ func (w *Writer) SetNodeExcluded(table, nodeID string, excluded bool) error {
 	return nil
 }
 
+// DstDescendantsReviewStats holds aggregate counts for DST nodes under a path (descendants only, not the node at the path). Used to apply review-stats deltas when deleting those nodes.
+type DstDescendantsReviewStats struct {
+	Folders          int64
+	Files            int64
+	Excluded         int64
+	SizeDst          int64
+	TraversalPending int64
+	TraversalFailed  int64
+}
+
+// CountDstDescendantsReviewStats returns aggregate counts for DST nodes that are strict descendants of rootPath (path LIKE rootPath||'/%'; for rootPath "/" uses path != '/' AND path LIKE '/%'). Call inside a transaction.
+func (w *Writer) CountDstDescendantsReviewStats(rootPath string) (DstDescendantsReviewStats, error) {
+	ctx := context.Background()
+	var out DstDescendantsReviewStats
+	q := `WITH latest AS (SELECT id, arg_max(traversal_status, event_time) AS traversal_status FROM dst_status_events GROUP BY id)
+SELECT
+  COUNT(*) FILTER (WHERE n.type = 'folder')::BIGINT,
+  COUNT(*) FILTER (WHERE n.type = 'file')::BIGINT,
+  COUNT(*) FILTER (WHERE COALESCE(e.traversal_status,'') IN ('excluded','exclusion_inherited'))::BIGINT,
+  COALESCE(SUM(n.size), 0)::BIGINT,
+  COUNT(*) FILTER (WHERE COALESCE(e.traversal_status,'') = 'pending')::BIGINT,
+  COUNT(*) FILTER (WHERE COALESCE(e.traversal_status,'') = 'failed')::BIGINT
+FROM dst_nodes n LEFT JOIN latest e ON n.id = e.id WHERE `
+	if rootPath == "/" {
+		q += `n.path != '/' AND n.path LIKE '/%'`
+		err := w.tx.QueryRowContext(ctx, q).Scan(&out.Folders, &out.Files, &out.Excluded, &out.SizeDst, &out.TraversalPending, &out.TraversalFailed)
+		return out, err
+	}
+	q += `n.path LIKE $1`
+	err := w.tx.QueryRowContext(ctx, q, rootPath+"/%").Scan(&out.Folders, &out.Files, &out.Excluded, &out.SizeDst, &out.TraversalPending, &out.TraversalFailed)
+	return out, err
+}
+
+// DeleteDescendantsUnderPath deletes only nodes that are strict descendants of rootPath (path LIKE rootPath||'/%'; for rootPath "/" deletes path != '/' AND path LIKE '/%'). The node at rootPath itself is not deleted. For DST, also deletes matching rows from dst_status_events. Recomputes stats for affected depths. Table is "SRC" or "DST".
+func (w *Writer) DeleteDescendantsUnderPath(table, rootPath string) error {
+	ctx := context.Background()
+	t := tableName(table)
+	var pathCond string
+	var args []interface{}
+	if rootPath == "/" {
+		pathCond = `path != '/' AND path LIKE '/%'`
+	} else {
+		pathCond = `path LIKE $1`
+		args = append(args, rootPath+"/%")
+	}
+	// Get affected depths before delete
+	depthsQ := `SELECT DISTINCT depth FROM ` + t + ` WHERE ` + pathCond
+	rows, err := w.tx.QueryContext(ctx, depthsQ, args...)
+	if err != nil {
+		return err
+	}
+	var depths []int
+	for rows.Next() {
+		var d int
+		if err := rows.Scan(&d); err != nil {
+			rows.Close()
+			return err
+		}
+		depths = append(depths, d)
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	if table == "DST" {
+		idsRows, err := w.tx.QueryContext(ctx, `SELECT id FROM dst_nodes WHERE `+pathCond, args...)
+		if err != nil {
+			return err
+		}
+		var ids []string
+		for idsRows.Next() {
+			var id string
+			if err := idsRows.Scan(&id); err != nil {
+				idsRows.Close()
+				return err
+			}
+			ids = append(ids, id)
+		}
+		idsRows.Close()
+		if err = idsRows.Err(); err != nil {
+			return err
+		}
+		if len(ids) > 0 {
+			placeholders := make([]string, len(ids))
+			for i := range ids {
+				placeholders[i] = fmt.Sprintf("$%d", i+1)
+			}
+			argList := make([]interface{}, len(ids))
+			for i, id := range ids {
+				argList[i] = id
+			}
+			_, err = w.tx.ExecContext(ctx, `DELETE FROM dst_status_events WHERE id IN (`+strings.Join(placeholders, ",")+`)`, argList...)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	delQ := `DELETE FROM ` + t + ` WHERE ` + pathCond
+	if len(args) == 0 {
+		_, err = w.tx.ExecContext(ctx, delQ)
+	} else {
+		_, err = w.tx.ExecContext(ctx, delQ, args...)
+	}
+	if err != nil {
+		return err
+	}
+	tbl := "SRC"
+	if table == "DST" {
+		tbl = "DST"
+	}
+	for _, depth := range depths {
+		if err := w.RecomputeStatsForDepth(tbl, depth); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // DeleteSubtree deletes all nodes in the subtree at rootPath (path = rootPath OR path LIKE rootPath || '/%'; for rootPath "/" uses path LIKE '/%'), then recomputes stats for each affected depth. Table is "SRC" or "DST".
 func (w *Writer) DeleteSubtree(table, rootPath string) error {
 	ctx := context.Background()
@@ -699,4 +817,93 @@ func (w *Writer) WriteQueueStats(queueKey, metricsJSON string) error {
 		queueKey, metricsJSON,
 	)
 	return err
+}
+
+// WriteReviewStatsSnapshot writes the full canonical review stats snapshot to the universal stats table (replaces counts for review keys).
+func (w *Writer) WriteReviewStatsSnapshot(s ReviewStatsSnapshot) error {
+	ctx := context.Background()
+	pairs := []struct {
+		key   string
+		count int64
+	}{
+		{ReviewKeyTraversalPending, s.TraversalPending},
+		{ReviewKeyTraversalPendingRetry, s.TraversalPendingRetry},
+		{ReviewKeyTraversalFailed, s.TraversalFailed},
+		{ReviewKeyCopyPending, s.CopyPending},
+		{ReviewKeyCopyFailed, s.CopyFailed},
+		{ReviewKeyExcluded, s.Excluded},
+		{ReviewKeyFolders, s.Folders},
+		{ReviewKeyFiles, s.Files},
+		{ReviewKeySizeSrc, s.SizeSrc},
+		{ReviewKeySizeDst, s.SizeDst},
+	}
+	for _, p := range pairs {
+		_, err := w.tx.ExecContext(ctx,
+			`INSERT INTO `+tableStats+` (key, count) VALUES ($1, $2)
+			 ON CONFLICT (key) DO UPDATE SET count = excluded.count`,
+			p.key, p.count,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// NodePath returns the path and table ("SRC" or "DST") for a node by ID, or error if not found.
+func (w *Writer) NodePath(nodeID string) (path string, tbl string, err error) {
+	ctx := context.Background()
+	err = w.tx.QueryRowContext(ctx, `SELECT path FROM `+tableSrcNodes+` WHERE id = $1`, nodeID).Scan(&path)
+	if err == nil {
+		return path, "SRC", nil
+	}
+	if err != sql.ErrNoRows {
+		return "", "", err
+	}
+	err = w.tx.QueryRowContext(ctx, `SELECT path FROM `+tableDstNodes+` WHERE id = $1`, nodeID).Scan(&path)
+	if err == nil {
+		return path, "DST", nil
+	}
+	return "", "", err
+}
+
+// CountPendingTraversalAtPath returns how many nodes (SRC + DST) at the given path have current traversal_status = 'pending'.
+// Call inside the same transaction after status events have been written so the count reflects the new state.
+func (w *Writer) CountPendingTraversalAtPath(path string) (int, error) {
+	ctx := context.Background()
+	q := `WITH src_latest AS (SELECT id, arg_max(traversal_status, event_time) AS s FROM ` + tableSrcStatusEvents + ` GROUP BY id),
+dst_latest AS (SELECT id, arg_max(traversal_status, event_time) AS d FROM ` + tableDstStatusEvents + ` GROUP BY id)
+SELECT
+  (SELECT COUNT(*)::BIGINT FROM ` + tableSrcNodes + ` n LEFT JOIN src_latest e ON n.id = e.id WHERE n.path = $1 AND COALESCE(e.s,'') = 'pending')
+  + (SELECT COUNT(*)::BIGINT FROM ` + tableDstNodes + ` n LEFT JOIN dst_latest e ON n.id = e.id WHERE n.path = $1 AND COALESCE(e.d,'') = 'pending')`
+	var n int64
+	if err := w.tx.QueryRowContext(ctx, q, path).Scan(&n); err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+// ReviewStatsDelta is one (key, delta) for the universal stats table.
+type ReviewStatsDelta struct {
+	Key   string
+	Delta int64
+}
+
+// ApplyReviewStatsDeltas applies deltas to the universal stats table (count += delta per key). Used for incremental review stats updates.
+func (w *Writer) ApplyReviewStatsDeltas(deltas []ReviewStatsDelta) error {
+	ctx := context.Background()
+	for _, d := range deltas {
+		if d.Delta == 0 {
+			continue
+		}
+		_, err := w.tx.ExecContext(ctx,
+			`INSERT INTO `+tableStats+` (key, count) VALUES ($1, $2)
+			 ON CONFLICT (key) DO UPDATE SET count = count + excluded.count`,
+			d.Key, d.Delta,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

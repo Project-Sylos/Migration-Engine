@@ -87,12 +87,32 @@ type TraversalSummary struct {
 	DstFailed   int
 	SrcExcluded int
 	DstExcluded int
+	// CopyStatusCounts are SRC-only counts by copy_status (pending, successful, failed, skipped) from status_events.
+	CopyStatusCounts CopyStatusCounts
+	// Merged review totals (one row per path in merged view; use for API foldersCount, filesCount, excludedCount).
+	FoldersCount   int
+	FilesCount     int
+	ExcludedCount  int
+	TotalFileSizeSrc  int64
+	TotalFileSizeDst  int64
+	FoldersRatio   float64 // FoldersCount / total, rounded to 2 decimals
+	FilesRatio     float64 // FilesCount / total, rounded to 2 decimals
+}
+
+// CopyStatusCounts holds copy status counts for the API (e.g. copyStatusCounts response).
+type CopyStatusCounts struct {
+	Pending    int
+	Successful int
+	Failed     int
+	Skipped    int
 }
 
 // Migration is the first-class domain object for a single migration lifecycle.
 type Migration struct {
 	ID      string
 	Name    string
+	DB      *db.DB // this migration's DB (per-migration or shared in legacy mode)
+	store   *migrationStore // store bound to this migration's DB
 	manager *MigrationManager
 
 	mu            sync.RWMutex
@@ -104,15 +124,30 @@ type Migration struct {
 	running       bool
 }
 
-func newMigration(manager *MigrationManager, record migrationRecord) *Migration {
+func newMigration(manager *MigrationManager, record migrationRecord, database *db.DB) *Migration {
 	m := &Migration{
 		ID:      record.ID,
 		Name:    record.Name,
+		DB:      database,
+		store:   newMigrationStore(database),
 		manager: manager,
 		phase:   record.Phase,
 		logRing: newLogRing(256),
 	}
 	return m
+}
+
+func (m *Migration) syncRecord(record migrationRecord) {
+	m.mu.Lock()
+	m.Name = record.Name
+	m.phase = record.Phase
+	m.mu.Unlock()
+}
+
+// bindDB attaches the database to a migration that was created without one (pending). Called by the manager when the API passes the migration folder path.
+func (m *Migration) bindDB(database *db.DB) {
+	m.DB = database
+	m.store = newMigrationStore(database)
 }
 
 func (m *Migration) Phase() Phase {
@@ -127,7 +162,7 @@ func (m *Migration) transitionTo(next Phase) error {
 	if !canTransition(m.phase, next) {
 		return fmt.Errorf("invalid migration phase transition %s -> %s", m.phase.String(), next.String())
 	}
-	if err := m.manager.store.updatePhase(m.ID, next); err != nil {
+	if err := m.store.updatePhase(m.ID, next); err != nil {
 		return err
 	}
 	m.phase = next
@@ -172,11 +207,11 @@ func (m *Migration) AddRoots(srcRoot, dstRoot types.Folder) (RootSeedSummary, er
 	if err != nil {
 		return RootSeedSummary{}, fmt.Errorf("destination root: %w", err)
 	}
-	summary, err := SeedRootTasks(normalizedSrc, normalizedDst, m.manager.db)
+	summary, err := SeedRootTasks(normalizedSrc, normalizedDst, m.DB)
 	if err != nil {
 		return RootSeedSummary{}, fmt.Errorf("seed roots: %w", err)
 	}
-	err = m.manager.store.updateUpdatedAt(m.ID)
+	err = m.store.updateUpdatedAt(m.ID)
 	if err != nil {
 		return RootSeedSummary{}, fmt.Errorf("update updated at: %w", err)
 	}
@@ -201,13 +236,13 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 	runCtx := m.beginRun(cfg.ShutdownContext)
 	defer func() {
 		m.endRun()
-		err = m.manager.store.updateUpdatedAt(m.ID)
+		err = m.store.updateUpdatedAt(m.ID)
 		if err != nil {
 			fmt.Println("error updating updated at", err)
 		}
 	}()
 	stats, err := RunMigration(MigrationConfig{
-		DB:              m.manager.db,
+		DB:              m.DB,
 		DBPath:          cfg.Database.Path,
 		SrcAdapter:      cfg.Source.Adapter,
 		DstAdapter:      cfg.Destination.Adapter,
@@ -254,13 +289,13 @@ func (m *Migration) StartCopy() (queue.QueueStats, error) {
 	runCtx := m.beginRun(lastCfg.ShutdownContext)
 	defer func() {
 		m.endRun()
-		err := m.manager.store.updateUpdatedAt(m.ID)
+		err := m.store.updateUpdatedAt(m.ID)
 		if err != nil {
 			fmt.Println("error updating updated at", err)
 		}
 	}()
 	stats, err := RunCopyPhase(CopyPhaseConfig{
-		DuckDB:          m.manager.db,
+		DuckDB:          m.DB,
 		SrcAdapter:      lastCfg.Source.Adapter,
 		DstAdapter:      lastCfg.Destination.Adapter,
 		WorkerCount:     lastCfg.WorkerCount,
@@ -298,7 +333,7 @@ func (m *Migration) RunRetrySweep(opts RetrySweepOptions) (RuntimeStats, error) 
 	runCtx := m.beginRun(lastCfg.ShutdownContext)
 	defer func() {
 		m.endRun()
-		err := m.manager.store.updateUpdatedAt(m.ID)
+		err := m.store.updateUpdatedAt(m.ID)
 		if err != nil {
 			fmt.Println("error updating updated at", err)
 		}
@@ -322,7 +357,7 @@ func (m *Migration) RunRetrySweep(opts RetrySweepOptions) (RuntimeStats, error) 
 	}
 
 	stats, err := RunRetrySweep(SweepConfig{
-		DuckDB:       m.manager.db,
+		DuckDB:       m.DB,
 		SrcAdapter:   lastCfg.Source.Adapter,
 		DstAdapter:   lastCfg.Destination.Adapter,
 		WorkerCount:  workerCount,
@@ -371,183 +406,259 @@ func (m *Migration) QueryNodes(filter NodeQueryFilter) ([]db.NodeState, error) {
 	if m.Phase() != PhaseReview && m.Phase() != PhaseCopying && m.Phase() != PhaseCompleted {
 		return nil, fmt.Errorf("query nodes is only available after traversal reaches review phase")
 	}
-	return m.manager.store.queryNodes(filter)
+	return m.store.queryNodes(filter)
+}
+
+func pathReviewResult(affected int64, deltas map[string]int64) PathReviewActionResult {
+	if deltas == nil {
+		deltas = make(map[string]int64)
+	}
+	return PathReviewActionResult{AffectedCount: affected, Deltas: deltas}
 }
 
 // SetNodeExcluded mutates review exclusions in engine-owned store.
-func (m *Migration) SetNodeExcluded(queueType, nodeID string, excluded bool) error {
+func (m *Migration) SetNodeExcluded(queueType, nodeID string, excluded bool) (PathReviewActionResult, error) {
 	if m.Phase() != PhaseReview {
-		return fmt.Errorf("set node excluded requires review phase")
+		return PathReviewActionResult{}, fmt.Errorf("set node excluded requires review phase")
 	}
-	err := m.manager.store.setNodeExcluded(queueType, nodeID, excluded)
+	n, deltas, err := m.store.setNodeExcluded(queueType, nodeID, excluded)
 	if err != nil {
-		return fmt.Errorf("set node excluded: %w", err)
+		return PathReviewActionResult{}, fmt.Errorf("set node excluded: %w", err)
 	}
 	m.refreshRuntimeState()
-	return nil
+	return pathReviewResult(n, deltas), nil
 }
 
 // BulkExclude applies exclusion over a query slice.
-func (m *Migration) BulkExclude(filter NodeQueryFilter, excluded bool) (int, error) {
+func (m *Migration) BulkExclude(filter NodeQueryFilter, excluded bool) (PathReviewActionResult, error) {
 	nodes, err := m.QueryNodes(filter)
 	if err != nil {
-		return 0, err
+		return PathReviewActionResult{}, err
 	}
-	updated := 0
+	var total int64
+	merged := make(map[string]int64)
 	for i := range nodes {
 		if nodes[i].Excluded == excluded {
 			continue
 		}
-		if err := m.manager.store.setNodeExcluded(filter.Queue, nodes[i].ID, excluded); err != nil {
-			return updated, fmt.Errorf("bulk exclude %s: %w", nodes[i].ID, err)
+		n, deltas, err := m.store.setNodeExcluded(filter.Queue, nodes[i].ID, excluded)
+		if err != nil {
+			return pathReviewResult(total, merged), fmt.Errorf("bulk exclude %s: %w", nodes[i].ID, err)
 		}
-		updated++
+		total += n
+		for k, d := range deltas {
+			merged[k] += d
+		}
 	}
 	m.refreshRuntimeState()
-	return updated, nil
+	return pathReviewResult(total, merged), nil
+}
+
+// GetPathReviewStats returns phase-aware review stats for API passthrough. Always computed from the DB (nodes + status events); no in-memory cache.
+func (m *Migration) GetPathReviewStats() PathReviewStats {
+	if m.DB == nil {
+		return PathReviewStats{}
+	}
+	snap, err := m.DB.GetPathReviewStatsFromDB()
+	if err != nil {
+		return PathReviewStats{}
+	}
+	raw := ReviewStatsRawFromSnapshot(snap)
+	return raw.ToPathReviewStats(m.Phase())
 }
 
 func (m *Migration) GetTraversalSummary() (TraversalSummary, error) {
-	status, err := InspectMigrationStatus(m.manager.db)
+	status, err := InspectMigrationStatus(m.DB)
 	if err != nil {
 		return TraversalSummary{}, err
 	}
-	srcExcluded, err := db.CountExcluded(m.manager.db, "SRC")
+	srcExcluded, err := db.CountExcluded(m.DB, "SRC")
 	if err != nil {
 		return TraversalSummary{}, err
 	}
-	dstExcluded, err := db.CountExcluded(m.manager.db, "DST")
+	dstExcluded, err := db.CountExcluded(m.DB, "DST")
 	if err != nil {
 		return TraversalSummary{}, err
+	}
+	copyCounts, err := m.DB.GetCopyStatusCountsFromEvents()
+	if err != nil {
+		return TraversalSummary{}, err
+	}
+	merged, err := db.GetMergedReviewStats(m.DB, db.ReviewFilter{})
+	if err != nil {
+		return TraversalSummary{}, err
+	}
+	total := merged.Folders + merged.Files
+	var foldersRatio, filesRatio float64
+	if total > 0 {
+		foldersRatio = roundRatio(float64(merged.Folders)/float64(total), 2)
+		filesRatio = roundRatio(float64(merged.Files)/float64(total), 2)
 	}
 	return TraversalSummary{
-		SrcTotal:    status.SrcTotal,
-		DstTotal:    status.DstTotal,
-		SrcPending:  status.SrcPending,
-		DstPending:  status.DstPending,
-		SrcFailed:   status.SrcFailed,
-		DstFailed:   status.DstFailed,
-		SrcExcluded: srcExcluded,
-		DstExcluded: dstExcluded,
+		SrcTotal:         status.SrcTotal,
+		DstTotal:         status.DstTotal,
+		SrcPending:       status.SrcPending,
+		DstPending:       status.DstPending,
+		SrcFailed:        status.SrcFailed,
+		DstFailed:        status.DstFailed,
+		SrcExcluded:      srcExcluded,
+		DstExcluded:      dstExcluded,
+		CopyStatusCounts: CopyStatusCounts{
+			Pending:    int(copyCounts.Pending),
+			Successful: int(copyCounts.Successful),
+			Failed:     int(copyCounts.Failed),
+			Skipped:    int(copyCounts.Skipped),
+		},
+		FoldersCount:      merged.Folders,
+		FilesCount:        merged.Files,
+		ExcludedCount:     merged.Excluded,
+		TotalFileSizeSrc:  merged.SizeSrc,
+		TotalFileSizeDst:  merged.SizeDst,
+		FoldersRatio:      foldersRatio,
+		FilesRatio:        filesRatio,
 	}, nil
 }
 
-func (m *Migration) MarkNodeForRetryDiscovery(nodeID string) error {
+// roundRatio rounds v to n decimal places (e.g. 2 for 0.00).
+func roundRatio(v float64, n int) float64 {
+	if n <= 0 {
+		return v
+	}
+	pow := 1.0
+	for i := 0; i < n; i++ {
+		pow *= 10
+	}
+	return float64(int64(v*pow+0.5)) / pow
+}
+
+func (m *Migration) MarkNodeForRetryDiscovery(nodeID string) (PathReviewActionResult, error) {
 	if m.Phase() != PhaseReview {
-		return fmt.Errorf("retry discovery mutation requires review phase")
+		return PathReviewActionResult{}, fmt.Errorf("retry discovery mutation requires review phase")
 	}
-	if err := m.manager.store.markNodeForRetryDiscovery(nodeID); err != nil {
-		return err
-	}
-	m.refreshRuntimeState()
-	return nil
-}
-
-func (m *Migration) UnmarkNodeForRetryDiscovery(nodeID string) error {
-	if m.Phase() != PhaseReview {
-		return fmt.Errorf("retry discovery mutation requires review phase")
-	}
-	if err := m.manager.store.unmarkNodeForRetryDiscovery(nodeID); err != nil {
-		return err
-	}
-	m.refreshRuntimeState()
-	return nil
-}
-
-func (m *Migration) MarkNodeForRetryCopy(nodeID string) error {
-	if m.Phase() != PhaseReview && m.Phase() != PhaseCopying {
-		return fmt.Errorf("retry copy mutation requires review or copying phase")
-	}
-	if err := m.manager.store.setNodeCopyStatus(nodeID, db.CopyStatusPending); err != nil {
-		return err
-	}
-	m.refreshRuntimeState()
-	return nil
-}
-
-func (m *Migration) UnmarkNodeForRetryCopy(nodeID string) error {
-	if m.Phase() != PhaseReview && m.Phase() != PhaseCopying {
-		return fmt.Errorf("retry copy mutation requires review or copying phase")
-	}
-	if err := m.manager.store.setNodeCopyStatus(nodeID, db.CopyStatusFailed); err != nil {
-		return err
-	}
-	m.refreshRuntimeState()
-	return nil
-}
-
-func (m *Migration) RetryAllFailed() error {
-	if m.Phase() != PhaseReview {
-		return fmt.Errorf("retry all failed requires review phase")
-	}
-	srcFailed, err := m.manager.store.queryNodes(NodeQueryFilter{Queue: "SRC", Status: db.StatusFailed, Limit: 100000})
+	n, deltas, err := m.store.markNodeForRetryDiscovery(nodeID)
 	if err != nil {
-		return err
+		return PathReviewActionResult{}, err
+	}
+	m.refreshRuntimeState()
+	return pathReviewResult(n, deltas), nil
+}
+
+func (m *Migration) UnmarkNodeForRetryDiscovery(nodeID string) (PathReviewActionResult, error) {
+	if m.Phase() != PhaseReview {
+		return PathReviewActionResult{}, fmt.Errorf("retry discovery mutation requires review phase")
+	}
+	n, deltas, err := m.store.unmarkNodeForRetryDiscovery(nodeID)
+	if err != nil {
+		return PathReviewActionResult{}, err
+	}
+	m.refreshRuntimeState()
+	return pathReviewResult(n, deltas), nil
+}
+
+func (m *Migration) MarkNodeForRetryCopy(nodeID string) (PathReviewActionResult, error) {
+	if m.Phase() != PhaseReview && m.Phase() != PhaseCopying {
+		return PathReviewActionResult{}, fmt.Errorf("retry copy mutation requires review or copying phase")
+	}
+	n, deltas, err := m.store.setNodeCopyStatus(nodeID, db.CopyStatusPending)
+	if err != nil {
+		return PathReviewActionResult{}, err
+	}
+	m.refreshRuntimeState()
+	return pathReviewResult(n, deltas), nil
+}
+
+func (m *Migration) UnmarkNodeForRetryCopy(nodeID string) (PathReviewActionResult, error) {
+	if m.Phase() != PhaseReview && m.Phase() != PhaseCopying {
+		return PathReviewActionResult{}, fmt.Errorf("retry copy mutation requires review or copying phase")
+	}
+	n, deltas, err := m.store.setNodeCopyStatus(nodeID, db.CopyStatusFailed)
+	if err != nil {
+		return PathReviewActionResult{}, err
+	}
+	m.refreshRuntimeState()
+	return pathReviewResult(n, deltas), nil
+}
+
+func (m *Migration) RetryAllFailed() (PathReviewActionResult, error) {
+	if m.Phase() != PhaseReview {
+		return PathReviewActionResult{}, fmt.Errorf("retry all failed requires review phase")
+	}
+	srcFailed, err := m.store.queryNodes(NodeQueryFilter{Queue: "SRC", Status: db.StatusFailed, Limit: 100000})
+	if err != nil {
+		return PathReviewActionResult{}, err
 	}
 	for i := range srcFailed {
-		if err := m.manager.store.setNodeTraversalStatus(srcFailed[i].ID, db.StatusPending); err != nil {
-			return err
+		if err := m.store.setNodeTraversalStatus(srcFailed[i].ID, db.StatusPending); err != nil {
+			return pathReviewResult(int64(i), nil), err
 		}
 	}
-	dstFailed, err := m.manager.store.queryNodes(NodeQueryFilter{Queue: "DST", Status: db.StatusFailed, Limit: 100000})
+	dstFailed, err := m.store.queryNodes(NodeQueryFilter{Queue: "DST", Status: db.StatusFailed, Limit: 100000})
 	if err != nil {
-		return err
+		return PathReviewActionResult{}, err
 	}
 	for i := range dstFailed {
-		if err := m.manager.store.setNodeTraversalStatus(dstFailed[i].ID, db.StatusPending); err != nil {
-			return err
+		if err := m.store.setNodeTraversalStatus(dstFailed[i].ID, db.StatusPending); err != nil {
+			return pathReviewResult(int64(len(srcFailed)+i), nil), err
 		}
 	}
+	total := int64(len(srcFailed) + len(dstFailed))
+	deltas := map[string]int64{"failed": -total, "pending": total}
 	m.refreshRuntimeState()
-	return nil
+	return pathReviewResult(total, deltas), nil
 }
 
-func (m *Migration) SetNodeExcludedWithPropagation(queueType, nodeID string, excluded bool) error {
+func (m *Migration) SetNodeExcludedWithPropagation(queueType, nodeID string, excluded bool) (PathReviewActionResult, error) {
 	if m.Phase() != PhaseReview {
-		return fmt.Errorf("exclusion propagation requires review phase")
+		return PathReviewActionResult{}, fmt.Errorf("exclusion propagation requires review phase")
 	}
-	if err := m.manager.store.setNodeExcludedWithPropagation(queueType, nodeID, excluded); err != nil {
-		return err
+	n, deltas, err := m.store.setNodeExcludedWithPropagation(queueType, nodeID, excluded)
+	if err != nil {
+		return PathReviewActionResult{}, err
 	}
 	m.refreshRuntimeState()
-	return nil
+	return pathReviewResult(n, deltas), nil
 }
 
-func (m *Migration) BulkExcludeWithPropagation(filter NodeQueryFilter, excluded bool) (int, error) {
+func (m *Migration) BulkExcludeWithPropagation(filter NodeQueryFilter, excluded bool) (PathReviewActionResult, error) {
 	nodes, err := m.QueryNodes(filter)
 	if err != nil {
-		return 0, err
+		return PathReviewActionResult{}, err
 	}
-	updated := 0
+	var total int64
+	merged := make(map[string]int64)
 	for i := range nodes {
-		if err := m.manager.store.setNodeExcludedWithPropagation(filter.Queue, nodes[i].ID, excluded); err != nil {
-			return updated, err
+		n, deltas, err := m.store.setNodeExcludedWithPropagation(filter.Queue, nodes[i].ID, excluded)
+		if err != nil {
+			return pathReviewResult(total, merged), err
 		}
-		updated++
+		total += n
+		for k, d := range deltas {
+			merged[k] += d
+		}
 	}
 	m.refreshRuntimeState()
-	return updated, nil
+	return pathReviewResult(total, merged), nil
 }
 
 func (m *Migration) ListChildrenDiffs(req ListChildrenDiffsRequest) (ListChildrenDiffsResult, error) {
 	if m.Phase() != PhaseReview && m.Phase() != PhaseCopying && m.Phase() != PhaseCompleted {
 		return ListChildrenDiffsResult{}, fmt.Errorf("diff listing requires review or later phase")
 	}
-	return m.manager.store.listChildrenDiffs(req)
+	return m.store.listChildrenDiffs(req)
 }
 
 func (m *Migration) SearchPathReviewItems(req SearchRequest) (SearchResult, error) {
 	if m.Phase() != PhaseReview && m.Phase() != PhaseCopying && m.Phase() != PhaseCompleted {
 		return SearchResult{}, fmt.Errorf("search requires review or later phase")
 	}
-	return m.manager.store.searchPathReviewItems(req)
+	return m.store.searchPathReviewItems(req)
 }
 
 func (m *Migration) GetChildrenDiffsStats(path string, foldersOnly bool) (DiffsStats, error) {
 	if m.Phase() != PhaseReview && m.Phase() != PhaseCopying && m.Phase() != PhaseCompleted {
 		return DiffsStats{}, fmt.Errorf("diff stats requires review or later phase")
 	}
-	return m.manager.store.getChildrenDiffsStats(path, foldersOnly)
+	return m.store.getChildrenDiffsStats(path, foldersOnly)
 }
 
 // GetSearchStats returns aggregate counts for the same filter as SearchPathReviewItems (query, path, status, foldersOnly).
@@ -555,11 +666,11 @@ func (m *Migration) GetSearchStats(req SearchRequest) (DiffsStats, error) {
 	if m.Phase() != PhaseReview && m.Phase() != PhaseCopying && m.Phase() != PhaseCompleted {
 		return DiffsStats{}, fmt.Errorf("search stats requires review or later phase")
 	}
-	return m.manager.store.getSearchStats(req)
+	return m.store.getSearchStats(req)
 }
 
 func (m *Migration) GetQueueMetrics() (QueueMetricsSnapshot, error) {
-	return m.manager.store.getQueueMetrics()
+	return m.store.getQueueMetrics()
 }
 
 func (m *Migration) GetLogs(limit int, groupByLevel bool) (LogsProjection, error) {
@@ -579,7 +690,7 @@ func (m *Migration) GetLogs(limit int, groupByLevel bool) (LogsProjection, error
 }
 
 func (m *Migration) refreshRuntimeState() {
-	status, err := InspectMigrationStatus(m.manager.db)
+	status, err := InspectMigrationStatus(m.DB)
 	if err != nil {
 		return
 	}
@@ -602,7 +713,7 @@ func (m *Migration) GetRecentLogs(limit int) ([]LogEntry, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	out, err := m.manager.store.listRecentLogs(limit)
+	out, err := m.store.listRecentLogs(limit)
 	if err != nil {
 		return nil, err
 	}

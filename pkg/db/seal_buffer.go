@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,31 +23,20 @@ const (
 	checkpointRowThreshold       = 50_000 // run CHECKPOINT only after this many appender rows since last checkpoint
 )
 
-type sealStatsSnapshot struct {
-	table     string
-	depth     int
-	pending   int64
-	success   int64
-	failed    int64
-	completed int64
-	copyP     int64
-	copyS     int64
-	copyF     int64
-}
-
 // SealJob is one sealed level's payload: table, depth, node metadata, status events, and stats.
 type SealJob struct {
-	Table      string
-	Depth      int
-	Nodes      []*NodeState
-	Events     []StatusEvent
-	Pending    int64
-	Successful int64
-	Failed     int64
-	Completed  int64
-	CopyP      int64
-	CopyS      int64
-	CopyF      int64
+	Table       string
+	Depth       int
+	Nodes       []*NodeState
+	Events      []StatusEvent
+	Pending     int64
+	Successful  int64
+	Failed      int64
+	Completed   int64
+	CopyP       int64
+	CopyS       int64
+	CopyF       int64
+	FromRetry   bool // event-only: this completion is from retry mode; subtract from PendingRetry when path zeros
 }
 
 // phaseAppenders holds persistent appenders for the duration of a phase (traversal or copy).
@@ -61,6 +51,131 @@ type phaseAppenders struct {
 
 // discoveryJobStatsSentinel marks a SealJob as discovery-only (nodes + events, no stats write). Used for traversal discovery and status events.
 const discoveryJobStatsSentinel int64 = -1
+
+// levelStatsKey identifies one (table, depth, key) for level stats.
+type levelStatsKey struct {
+	table string
+	depth int
+	key   string
+}
+
+// buildMergedLevelStats processes jobs in order: seal jobs set counts for that (table, depth); discovery jobs with nodes add +1 per event.
+// Returns one tuple list per table for a single batch upsert (no duplicate keys). Event-only jobs are handled by RecomputeStatsForDepth.
+func buildMergedLevelStats(jobs []SealJob) (srcTuples, dstTuples []struct {
+	depth int
+	key   string
+	count int64
+}) {
+	counts := make(map[levelStatsKey]int64)
+	for _, j := range jobs {
+		if j.Pending >= 0 {
+			// Seal: set totals for this (table, depth).
+			t := j.Table
+			d := j.Depth
+			counts[levelStatsKey{t, d, StatsKeyTraversalStatus(StatusPending)}] = j.Pending
+			counts[levelStatsKey{t, d, StatsKeyTraversalStatus(StatusSuccessful)}] = j.Successful
+			counts[levelStatsKey{t, d, StatsKeyTraversalStatus(StatusFailed)}] = j.Failed
+			counts[levelStatsKey{t, d, StatsKeyCompleted}] = j.Completed
+			if t == "SRC" && j.CopyP >= 0 {
+				counts[levelStatsKey{t, d, StatsKeyCopyStatus(CopyStatusPending)}] = j.CopyP
+				counts[levelStatsKey{t, d, StatsKeyCopyStatus(CopyStatusSuccessful)}] = j.CopyS
+				counts[levelStatsKey{t, d, StatsKeyCopyStatus(CopyStatusFailed)}] = j.CopyF
+			}
+			continue
+		}
+		if j.Pending != discoveryJobStatsSentinel || len(j.Nodes) == 0 {
+			continue
+		}
+		// Discovery with nodes: add +1 per event.
+		for _, e := range j.Events {
+			trav := e.TraversalStatus
+			if trav == "" {
+				trav = StatusPending
+			}
+			k := levelStatsKey{j.Table, j.Depth, StatsKeyTraversalStatus(trav)}
+			counts[k]++
+			if j.Table == "SRC" {
+				copySt := e.CopyStatus
+				if copySt == "" {
+					copySt = CopyStatusPending
+				}
+				if copySt != CopyStatusInProgress {
+					counts[levelStatsKey{"SRC", j.Depth, StatsKeyCopyStatus(copySt)}]++
+				}
+			}
+		}
+	}
+	for k, count := range counts {
+		tup := struct {
+			depth int
+			key   string
+			count int64
+		}{k.depth, k.key, count}
+		if k.table == "SRC" {
+			srcTuples = append(srcTuples, tup)
+		} else {
+			dstTuples = append(dstTuples, tup)
+		}
+	}
+	return srcTuples, dstTuples
+}
+
+func hasDiscoveryJobs(jobs []SealJob) bool {
+	for _, j := range jobs {
+		if j.Pending == discoveryJobStatsSentinel {
+			return true
+		}
+	}
+	return false
+}
+
+// dedupeJobsByID returns nodes and events from jobs deduped by (table, id); last occurrence wins. Prevents duplicate key on append.
+func dedupeJobsByID(jobs []SealJob) (srcNodes, dstNodes []*NodeState, srcEvents, dstEvents []StatusEvent) {
+	type key struct{ table, id string }
+	nodesByKey := make(map[key]*NodeState)
+	eventsByKey := make(map[key]StatusEvent)
+	for _, j := range jobs {
+		for _, n := range j.Nodes {
+			nodesByKey[key{j.Table, n.ID}] = n
+		}
+		for _, e := range j.Events {
+			eventsByKey[key{j.Table, e.ID}] = e
+		}
+	}
+	for k, n := range nodesByKey {
+		if k.table == "SRC" {
+			srcNodes = append(srcNodes, n)
+		} else {
+			dstNodes = append(dstNodes, n)
+		}
+	}
+	for k, e := range eventsByKey {
+		if k.table == "SRC" {
+			srcEvents = append(srcEvents, e)
+		} else {
+			dstEvents = append(dstEvents, e)
+		}
+	}
+	return srcNodes, dstNodes, srcEvents, dstEvents
+}
+
+// discoveryRecomputeDepths returns (table, depth) pairs for discovery jobs that are event-only (status updates); stats for those depths must be recomputed.
+func discoveryRecomputeDepths(jobs []SealJob) []struct{ Table string; Depth int } {
+	seen := make(map[string]bool)
+	var out []struct{ Table string; Depth int }
+	for _, j := range jobs {
+		if j.Pending != discoveryJobStatsSentinel || len(j.Nodes) > 0 || len(j.Events) == 0 {
+			continue
+		}
+		k := j.Table + "\x00" + strconv.Itoa(j.Depth)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, struct{ Table string; Depth int }{j.Table, j.Depth})
+	}
+	return out
+}
 
 // SealBuffer buffers seal jobs and discovery jobs (nodes + events only), flushes them to the DB asynchronously.
 // Flush triggers: interval timer, row count threshold, and Stop/ForceFlush.
@@ -217,8 +332,8 @@ func (sb *SealBuffer) AddDiscoveryNodes(ops []InsertOperation) {
 	}
 }
 
-// AddDiscoveryStatusEvent enqueues one status event (e.g. completed/failed) for async flush. No stats written.
-func (sb *SealBuffer) AddDiscoveryStatusEvent(table string, e StatusEvent) {
+// AddDiscoveryStatusEvent enqueues one status event (e.g. completed/failed) for async flush. No stats written. fromRetry should be true when the completion is from retry mode so we subtract from PendingRetry when the path zeros.
+func (sb *SealBuffer) AddDiscoveryStatusEvent(table string, e StatusEvent, fromRetry bool) {
 	if table != "SRC" && table != "DST" {
 		return
 	}
@@ -227,6 +342,7 @@ func (sb *SealBuffer) AddDiscoveryStatusEvent(table string, e StatusEvent) {
 		Table: table, Depth: e.Depth, Nodes: nil, Events: []StatusEvent{e},
 		Pending: discoveryJobStatsSentinel, Successful: discoveryJobStatsSentinel, Failed: discoveryJobStatsSentinel,
 		Completed: discoveryJobStatsSentinel, CopyP: discoveryJobStatsSentinel, CopyS: discoveryJobStatsSentinel, CopyF: discoveryJobStatsSentinel,
+		FromRetry: fromRetry,
 	})
 	sb.rowsSinceFlush++
 	sb.cond.Broadcast()
@@ -332,59 +448,41 @@ func (sb *SealBuffer) phaseFlush(jobs []SealJob) error {
 		return err
 	}
 	maxDepth := -1
-	statsRows := make([]sealStatsSnapshot, 0, len(jobs))
-	nodeDvals := make([]driver.Value, 0, 10)
-	evDvals := make([]driver.Value, 0, 5)
 	for _, j := range jobs {
 		if j.Depth > maxDepth {
 			maxDepth = j.Depth
 		}
-		if j.Pending >= 0 {
-			statsRows = append(statsRows, sealStatsSnapshot{
-				table:     j.Table,
-				depth:     j.Depth,
-				pending:   j.Pending,
-				success:   j.Successful,
-				failed:    j.Failed,
-				completed: j.Completed,
-				copyP:     j.CopyP,
-				copyS:     j.CopyS,
-				copyF:     j.CopyF,
-			})
+	}
+	srcNodes, dstNodes, srcEvents, dstEvents := dedupeJobsByID(jobs)
+	evDvals := make([]driver.Value, 0, 5)
+	w := &Writer{tx: tx}
+	if err := w.UpsertNodes(tableSrcNodes, srcNodes); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := w.UpsertNodes(tableDstNodes, dstNodes); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	for _, e := range srcEvents {
+		for _, v := range SrcStatusEventAppendRowArgs(&e) {
+			evDvals = append(evDvals, v)
 		}
-		nodeApp := pa.appSrc
-		evApp := pa.appSrcEv
-		if j.Table == "DST" {
-			nodeApp = pa.appDst
-			evApp = pa.appDstEv
+		if err := pa.appSrcEv.AppendRow(evDvals...); err != nil {
+			_ = tx.Rollback()
+			return err
 		}
-		for _, n := range j.Nodes {
-			args := NodeStateAppendRowArgs(n)
-			nodeDvals = nodeDvals[:0]
-			for _, v := range args {
-				nodeDvals = append(nodeDvals, v)
-			}
-			if err := nodeApp.AppendRow(nodeDvals...); err != nil {
-				_ = tx.Rollback()
-				return err
-			}
+		evDvals = evDvals[:0]
+	}
+	for _, e := range dstEvents {
+		for _, v := range DstStatusEventAppendRowArgs(&e) {
+			evDvals = append(evDvals, v)
 		}
-		for _, e := range j.Events {
-			var args []interface{}
-			if j.Table == "SRC" {
-				args = SrcStatusEventAppendRowArgs(&e)
-			} else {
-				args = DstStatusEventAppendRowArgs(&e)
-			}
-			evDvals = evDvals[:0]
-			for _, v := range args {
-				evDvals = append(evDvals, v)
-			}
-			if err := evApp.AppendRow(evDvals...); err != nil {
-				_ = tx.Rollback()
-				return err
-			}
+		if err := pa.appDstEv.AppendRow(evDvals...); err != nil {
+			_ = tx.Rollback()
+			return err
 		}
+		evDvals = evDvals[:0]
 	}
 	for _, app := range []*duckdb.Appender{pa.appSrc, pa.appDst, pa.appSrcEv, pa.appDstEv} {
 		if err := app.Flush(); err != nil {
@@ -392,9 +490,21 @@ func (sb *SealBuffer) phaseFlush(jobs []SealJob) error {
 			return err
 		}
 	}
-	if len(statsRows) > 0 {
-		w := &Writer{tx: tx}
-		if err := w.WriteLevelStatsSnapshotsBatch(statsRows); err != nil {
+	srcTuples, dstTuples := buildMergedLevelStats(jobs)
+	if len(srcTuples) > 0 {
+		if err := w.UpsertStatsCounts("SRC", srcTuples); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	if len(dstTuples) > 0 {
+		if err := w.UpsertStatsCounts("DST", dstTuples); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	for _, d := range discoveryRecomputeDepths(jobs) {
+		if err := w.RecomputeStatsForDepth(d.Table, d.Depth); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -402,10 +512,7 @@ func (sb *SealBuffer) phaseFlush(jobs []SealJob) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	var totalRows int64
-	for _, j := range jobs {
-		totalRows += int64(len(j.Nodes) + len(j.Events))
-	}
+	totalRows := int64(len(srcNodes) + len(dstNodes) + len(srcEvents) + len(dstEvents))
 	sb.mu.Lock()
 	if maxDepth > sb.lastFlushedDepth {
 		sb.lastFlushedDepth = maxDepth
@@ -430,15 +537,18 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob) error {
 	if len(jobs) == 0 {
 		return nil
 	}
-	var totalRows int64
-	for _, j := range jobs {
-		totalRows += int64(len(j.Nodes) + len(j.Events))
-	}
 	maxDepth := -1
+	for _, j := range jobs {
+		if j.Depth > maxDepth {
+			maxDepth = j.Depth
+		}
+	}
+	srcNodes, dstNodes, srcEvents, dstEvents := dedupeJobsByID(jobs)
+	totalRows := int64(len(srcNodes) + len(dstNodes) + len(srcEvents) + len(dstEvents))
+	srcTuples, dstTuples := buildMergedLevelStats(jobs)
 	ctx := context.Background()
 	if err := sb.db.RunWrite(ctx, func(s *WriteSession) error {
 		conn := s.Conn()
-		statsRows := make([]sealStatsSnapshot, 0, len(jobs))
 		if err := conn.Raw(func(driverConn any) error {
 			dc, ok := driverConn.(driver.Conn)
 			if !ok {
@@ -464,55 +574,23 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob) error {
 				return err
 			}
 			defer appDstEv.Close()
-			nodeDvals := make([]driver.Value, 0, 10)
 			evDvals := make([]driver.Value, 0, 5)
-			for _, j := range jobs {
-				if j.Depth > maxDepth {
-					maxDepth = j.Depth
+			for _, e := range srcEvents {
+				evDvals = evDvals[:0]
+				for _, v := range SrcStatusEventAppendRowArgs(&e) {
+					evDvals = append(evDvals, v)
 				}
-				if j.Pending >= 0 {
-					statsRows = append(statsRows, sealStatsSnapshot{
-						table:     j.Table,
-						depth:     j.Depth,
-						pending:   j.Pending,
-						success:   j.Successful,
-						failed:    j.Failed,
-						completed: j.Completed,
-						copyP:     j.CopyP,
-						copyS:     j.CopyS,
-						copyF:     j.CopyF,
-					})
+				if err := appSrcEv.AppendRow(evDvals...); err != nil {
+					return err
 				}
-				nodeApp := appSrc
-				evApp := appSrcEv
-				if j.Table == "DST" {
-					nodeApp = appDst
-					evApp = appDstEv
+			}
+			for _, e := range dstEvents {
+				evDvals = evDvals[:0]
+				for _, v := range DstStatusEventAppendRowArgs(&e) {
+					evDvals = append(evDvals, v)
 				}
-				for _, n := range j.Nodes {
-					args := NodeStateAppendRowArgs(n)
-					nodeDvals = nodeDvals[:0]
-					for _, v := range args {
-						nodeDvals = append(nodeDvals, v)
-					}
-					if err := nodeApp.AppendRow(nodeDvals...); err != nil {
-						return err
-					}
-				}
-				for _, e := range j.Events {
-					var args []interface{}
-					if j.Table == "SRC" {
-						args = SrcStatusEventAppendRowArgs(&e)
-					} else {
-						args = DstStatusEventAppendRowArgs(&e)
-					}
-					evDvals = evDvals[:0]
-					for _, v := range args {
-						evDvals = append(evDvals, v)
-					}
-					if err := evApp.AppendRow(evDvals...); err != nil {
-						return err
-					}
+				if err := appDstEv.AppendRow(evDvals...); err != nil {
+					return err
 				}
 			}
 			for _, app := range []*duckdb.Appender{appSrc, appDst, appSrcEv, appDstEv} {
@@ -535,9 +613,32 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob) error {
 		}
 		sb.cond.Broadcast()
 		sb.mu.Unlock()
-		if len(statsRows) > 0 {
+		recomputeDepths := discoveryRecomputeDepths(jobs)
+		needTx := len(srcTuples) > 0 || len(dstTuples) > 0 || len(recomputeDepths) > 0 || hasDiscoveryJobs(jobs)
+		if needTx {
 			return s.WithTx(func(w *Writer) error {
-				return w.WriteLevelStatsSnapshotsBatch(statsRows)
+				if err := w.UpsertNodes(tableSrcNodes, srcNodes); err != nil {
+					return err
+				}
+				if err := w.UpsertNodes(tableDstNodes, dstNodes); err != nil {
+					return err
+				}
+				if len(srcTuples) > 0 {
+					if err := w.UpsertStatsCounts("SRC", srcTuples); err != nil {
+						return err
+					}
+				}
+				if len(dstTuples) > 0 {
+					if err := w.UpsertStatsCounts("DST", dstTuples); err != nil {
+						return err
+					}
+				}
+				for _, d := range recomputeDepths {
+					if err := w.RecomputeStatsForDepth(d.Table, d.Depth); err != nil {
+						return err
+					}
+				}
+				return nil
 			})
 		}
 		return nil

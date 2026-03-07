@@ -191,7 +191,7 @@ func LetsMigrate(cfg Config) (Result, error) {
 	}
 
 	if cfg.SeedRoots {
-		summary, err := SeedRootTasks(srcRoot, dstRoot, manager.db)
+		summary, err := SeedRootTasks(srcRoot, dstRoot, migrationInstance.DB)
 		if err != nil {
 			return Result{}, fmt.Errorf("seed roots: %w", err)
 		}
@@ -238,7 +238,7 @@ func LetsMigrate(cfg Config) (Result, error) {
 		err    error
 	}, 1)
 	go func() {
-		report, err := VerifyMigration(manager.db, cfg.Verification)
+		report, err := VerifyMigration(migrationInstance.DB, cfg.Verification)
 		verifyDone <- struct {
 			report VerificationReport
 			err    error

@@ -57,16 +57,45 @@ func (s *migrationStore) queryNodes(filter NodeQueryFilter) ([]db.NodeState, err
 	return db.QueryNodesForReview(s.db, table, filter.Depth, filter.Status, filter.Excluded, filter.PathLike, filter.OrderByPath, limit, offset)
 }
 
-func (s *migrationStore) setNodeExcluded(queueType, nodeID string, excluded bool) error {
+func (s *migrationStore) setNodeExcluded(queueType, nodeID string, excluded bool) (int64, map[string]int64, error) {
 	q := strings.ToUpper(queueType)
 	if q != "DST" {
 		q = "SRC"
 	}
-	return s.db.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
+	node, err := db.GetNodeByID(s.db, q, nodeID)
+	if err != nil {
+		return 0, nil, err
+	}
+	if node == nil {
+		return 0, nil, fmt.Errorf("node %s not found", nodeID)
+	}
+	if node.Excluded == excluded {
+		return 0, nil, nil
+	}
+	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+		return sess.WithTx(func(w *db.Writer) error {
 			return w.SetNodeExcluded(q, nodeID, excluded)
 		})
 	})
+	if err != nil {
+		return 0, nil, err
+	}
+	deltas := make(map[string]int64)
+	if excluded {
+		deltas["excluded"] = 1
+		switch node.TraversalStatus {
+		case db.StatusPending:
+			deltas["pending"] = -1
+		case db.StatusFailed:
+			deltas["failed"] = -1
+		default:
+			deltas["pending"] = -1
+		}
+	} else {
+		deltas["excluded"] = -1
+		deltas["pending"] = 1
+	}
+	return 1, deltas, nil
 }
 
 func (s *migrationStore) listRecentLogs(limit int) ([]LogEntry, error) {
@@ -135,108 +164,204 @@ func (s *migrationStore) setNodeTraversalStatus(nodeID, status string) error {
 	return err
 }
 
-func (s *migrationStore) setNodeCopyStatus(nodeID, status string) error {
-	return s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+func (s *migrationStore) setNodeCopyStatus(nodeID, status string) (int64, map[string]int64, error) {
+	err := s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
 		return sess.WithTx(func(w *db.Writer) error {
 			return w.SetNodeCopyStatus("SRC", nodeID, status)
 		})
 	})
+	if err != nil {
+		return 0, nil, err
+	}
+	deltas := make(map[string]int64)
+	if status == db.CopyStatusPending {
+		deltas["failed"] = -1
+		deltas["pending"] = 1
+	} else {
+		deltas["pending"] = -1
+		deltas["failed"] = 1
+	}
+	return 1, deltas, nil
 }
 
 // markNodeForRetryDiscovery looks up the node by ID in SRC then DST (nodeID is either a SRC or DST node ID).
-// For a SRC node, the DST counterpart is resolved by path (path_hash), not by ID; then DST children of that path are marked pending.
-func (s *migrationStore) markNodeForRetryDiscovery(nodeID string) error {
+// For a SRC node at path P: deletes all DST descendants under P (not the DST node at P), marks SRC and DST node at P as pending. Non-recursive; DST children are removed so they can be re-derived on next traversal.
+func (s *migrationStore) markNodeForRetryDiscovery(nodeID string) (int64, map[string]int64, error) {
 	srcNode, err := db.GetNodeByID(s.db, "SRC", nodeID)
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 	if srcNode != nil {
-		return s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+		path := srcNode.Path
+		dstAtPath, _ := db.GetNodeByPath(s.db, "DST", path)
+		var desc db.DstDescendantsReviewStats
+		err := s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
 			return sess.WithTx(func(w *db.Writer) error {
+				var err error
+				desc, err = w.CountDstDescendantsReviewStats(path)
+				if err != nil {
+					return err
+				}
+				if err := w.DeleteDescendantsUnderPath("DST", path); err != nil {
+					return err
+				}
 				if err := w.SetNodeTraversalStatus("SRC", nodeID, db.StatusPending); err != nil {
 					return err
 				}
-				// DST counterpart is same path (join by path_hash), not same ID
-				dstAtPath, _ := db.GetNodeByPath(s.db, "DST", srcNode.Path)
 				if dstAtPath != nil {
-					return w.InsertDstChildrenTraversalStatusEvents(srcNode.Path, db.StatusPending)
+					if err := w.SetNodeTraversalStatus("DST", dstAtPath.ID, db.StatusPending); err != nil {
+						return err
+					}
 				}
 				return nil
 			})
 		})
+		if err != nil {
+			return 0, nil, err
+		}
+		deltas := make(map[string]int64)
+		deltas["failed"] = -1
+		deltas["pendingRetries"] = 1
+		deltas["pending"] = 2 - desc.TraversalPending
+		deltas["failed"] += -desc.TraversalFailed
+		if desc.Folders != 0 {
+			deltas["folders"] = -desc.Folders
+		}
+		if desc.Files != 0 {
+			deltas["files"] = -desc.Files
+		}
+		if desc.Excluded != 0 {
+			deltas["excluded"] = -desc.Excluded
+		}
+		if desc.SizeDst != 0 {
+			deltas["sizeDst"] = -desc.SizeDst
+		}
+		return 1, deltas, nil
 	}
 	dstNode, err := db.GetNodeByID(s.db, "DST", nodeID)
 	if err != nil || dstNode == nil {
 		if err != nil {
-			return err
+			return 0, nil, err
 		}
-		return fmt.Errorf("node %s not found", nodeID)
+		return 0, nil, fmt.Errorf("node %s not found", nodeID)
 	}
-	return s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
 		return sess.WithTx(func(w *db.Writer) error {
 			return w.SetNodeTraversalStatus("DST", nodeID, db.StatusPending)
 		})
 	})
+	if err != nil {
+		return 0, nil, err
+	}
+	deltas := make(map[string]int64)
+	deltas["failed"] = -1
+	deltas["pendingRetries"] = 1
+	deltas["pending"] = 1
+	return 1, deltas, nil
 }
 
-// unmarkNodeForRetryDiscovery looks up the node by ID in SRC then DST. For a SRC node, the DST counterpart is by path (path_hash); then DST children of that path are set back to not_on_src.
-func (s *migrationStore) unmarkNodeForRetryDiscovery(nodeID string) error {
+// unmarkNodeForRetryDiscovery sets SRC node back to failed and DST node at same path (if any) to not_on_src. Does not recreate DST children that were deleted on mark-for-retry.
+func (s *migrationStore) unmarkNodeForRetryDiscovery(nodeID string) (int64, map[string]int64, error) {
 	srcNode, err := db.GetNodeByID(s.db, "SRC", nodeID)
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 	if srcNode != nil {
-		return s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+		path := srcNode.Path
+		dstAtPath, _ := db.GetNodeByPath(s.db, "DST", path)
+		err := s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
 			return sess.WithTx(func(w *db.Writer) error {
 				if err := w.SetNodeTraversalStatus("SRC", nodeID, db.StatusFailed); err != nil {
 					return err
 				}
-				dstAtPath, _ := db.GetNodeByPath(s.db, "DST", srcNode.Path)
 				if dstAtPath != nil {
-					return w.InsertDstChildrenTraversalStatusEvents(srcNode.Path, db.StatusNotOnSrc)
+					if err := w.SetNodeTraversalStatus("DST", dstAtPath.ID, db.StatusNotOnSrc); err != nil {
+						return err
+					}
 				}
 				return nil
 			})
 		})
+		if err != nil {
+			return 0, nil, err
+		}
+		deltas := make(map[string]int64)
+		deltas["pendingRetries"] = -1
+		deltas["failed"] = 1
+		deltas["pending"] = -2
+		return 1, deltas, nil
 	}
 	dstNode, err := db.GetNodeByID(s.db, "DST", nodeID)
 	if err != nil || dstNode == nil {
 		if err != nil {
-			return err
+			return 0, nil, err
 		}
-		return fmt.Errorf("node %s not found", nodeID)
+		return 0, nil, fmt.Errorf("node %s not found", nodeID)
 	}
-	return s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
 		return sess.WithTx(func(w *db.Writer) error {
 			return w.SetNodeTraversalStatus("DST", nodeID, db.StatusFailed)
 		})
 	})
+	if err != nil {
+		return 0, nil, err
+	}
+	deltas := make(map[string]int64)
+	deltas["pendingRetries"] = -1
+	deltas["failed"] = 1
+	deltas["pending"] = -1
+	return 1, deltas, nil
 }
 
-func (s *migrationStore) setNodeExcludedWithPropagation(queueType, nodeID string, excluded bool) error {
+func (s *migrationStore) setNodeExcludedWithPropagation(queueType, nodeID string, excluded bool) (int64, map[string]int64, error) {
 	q := strings.ToUpper(queueType)
 	if q != "DST" {
 		q = "SRC"
 	}
 	node, err := db.GetNodeByID(s.db, q, nodeID)
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 	if node == nil {
-		return fmt.Errorf("node %s not found in %s", nodeID, q)
+		return 0, nil, fmt.Errorf("node %s not found in %s", nodeID, q)
 	}
+	rootPath := node.Path
+	var affected int64
 	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
 		return sess.WithTx(func(w *db.Writer) error {
-			if excluded {
-				return w.InsertExclusionEventsForSubtree(q, node.Path)
+			excl, notExcl, err := w.CountExcludedInSubtree(q, rootPath)
+			if err != nil {
+				return err
 			}
-			return w.InsertUnexcludeEventsForSubtree(q, node.Path)
+			if excluded {
+				affected = notExcl
+			} else {
+				affected = excl
+			}
+			if excluded {
+				if err := w.InsertExclusionEventsForSubtree(q, rootPath); err != nil {
+					return err
+				}
+			} else {
+				if err := w.InsertUnexcludeEventsForSubtree(q, rootPath); err != nil {
+					return err
+				}
+			}
+			return nil
 		})
 	})
 	if err != nil {
-		return fmt.Errorf("set exclusion with propagation: %w", err)
+		return 0, nil, fmt.Errorf("set exclusion with propagation: %w", err)
 	}
-	return nil
+	deltas := make(map[string]int64)
+	if affected != 0 {
+		if excluded {
+			deltas["excluded"] = affected
+		} else {
+			deltas["excluded"] = -affected
+		}
+	}
+	return affected, deltas, nil
 }
 
 func sanitizeSort(sortBy, sortDirection string) string {

@@ -40,14 +40,21 @@ func InsertRootNode(d *DB, table string, state *NodeState) error {
 			if trav == "" {
 				trav = state.Status
 			}
+			copyStatus := state.CopyStatus
+			if table == "SRC" && copyStatus == "" {
+				copyStatus = CopyStatusPending
+			}
 			ev := &StatusEvent{
 				ID:              state.ID,
 				TraversalStatus: trav,
-				CopyStatus:      state.CopyStatus,
+				CopyStatus:      copyStatus,
 				EventTime:       time.Now().UnixNano(),
 				Depth:           0,
 			}
-			return w.InsertStatusEvent(table, ev)
+			if err := w.InsertStatusEvent(table, ev); err != nil {
+				return err
+			}
+			return nil
 		})
 	})
 }

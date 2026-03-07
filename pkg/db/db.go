@@ -314,10 +314,10 @@ func (db *DB) AppendDiscoveredNodes(ops []InsertOperation) {
 	}
 }
 
-// AppendStatusEvent adds a status event (e.g. completed/failed) to the seal buffer discovery queue. Call from CompleteTraversalTask / FailTraversalTask.
-func (db *DB) AppendStatusEvent(table string, e StatusEvent) {
+// AppendStatusEvent adds a status event (e.g. completed/failed) to the seal buffer discovery queue. Call from CompleteTraversalTask / FailTraversalTask. fromRetry should be true when the completion is from retry mode so we decrement PendingRetry (not Pending) when the path zeros.
+func (db *DB) AppendStatusEvent(table string, e StatusEvent, fromRetry bool) {
 	if db.sealBuffer != nil {
-		db.sealBuffer.AddDiscoveryStatusEvent(table, e)
+		db.sealBuffer.AddDiscoveryStatusEvent(table, e, fromRetry)
 	}
 }
 

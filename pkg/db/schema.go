@@ -10,6 +10,7 @@ const (
 	tableDstStatusEvents  = "dst_status_events"
 	tableSrcStats         = "src_stats"
 	tableDstStats         = "dst_stats"
+	tableStats            = "stats" // universal key/count table for canonical review stats
 	// TableMigrations is the migrations lifecycle table name (used by schema and migration store).
 	TableMigrations = "migrations"
 )
@@ -53,9 +54,9 @@ func dstStatusEventsTableDDL() string {
 	)`
 }
 
-// statsTableDDL returns CREATE TABLE for stats (completed counts, etc.).
+// statsTableDDL returns CREATE TABLE for the universal stats table (key/count for review and other global counters).
 func statsTableDDL() string {
-	return `CREATE TABLE IF NOT EXISTS stats (
+	return `CREATE TABLE IF NOT EXISTS ` + tableStats + ` (
 		key VARCHAR PRIMARY KEY,
 		count BIGINT NOT NULL DEFAULT 0
 	)`

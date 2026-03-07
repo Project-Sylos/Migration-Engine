@@ -117,6 +117,8 @@ SELECT
 	COALESCE(se.copy_status, '') AS copy_status,
 	(COALESCE(se.traversal_status,'') IN ('excluded','exclusion_inherited') OR COALESCE(de.traversal_status,'') IN ('excluded','exclusion_inherited')) AS excluded,
 	COALESCE(s.size, d.size, 0) AS size,
+	COALESCE(s.size, 0) AS src_size,
+	COALESCE(d.size, 0) AS dst_size,
 	COALESCE(s.parent_path, '') AS src_parent_path,
 	COALESCE(d.parent_path, '') AS dst_parent_path,
 	CASE
@@ -241,7 +243,7 @@ func CountMergedReviewRows(d *DB, f ReviewFilter) (int, error) {
 	return n, err
 }
 
-// MergedReviewStats holds aggregate counts over merged review rows (same filter semantics as list/count).
+// MergedReviewStats holds aggregate counts over merged review rows (one row per path; same filter semantics as list/count).
 type MergedReviewStats struct {
 	Total           int
 	Folders         int
@@ -249,9 +251,11 @@ type MergedReviewStats struct {
 	MissingOnSource int
 	MissingOnDest   int
 	Excluded        int
+	SizeSrc         int64 // sum of file sizes on SRC (unique by path)
+	SizeDst         int64 // sum of file sizes on DST (unique by path)
 }
 
-// GetMergedReviewStats returns aggregate counts for rows matching the filter (single query with FILTER).
+// GetMergedReviewStats returns aggregate counts for rows matching the filter (single query with FILTER). Counts are unique by path (merged view = one row per path).
 func GetMergedReviewStats(d *DB, f ReviewFilter) (MergedReviewStats, error) {
 	conn, err := d.GetDB()
 	if err != nil {
@@ -264,13 +268,31 @@ func GetMergedReviewStats(d *DB, f ReviewFilter) (MergedReviewStats, error) {
 		COUNT(*) FILTER (WHERE type = 'file')::INT,
 		COUNT(*) FILTER (WHERE src_node_id = '' OR src_node_id IS NULL)::INT,
 		COUNT(*) FILTER (WHERE dst_node_id = '' OR dst_node_id IS NULL)::INT,
-		COUNT(*) FILTER (WHERE excluded)::INT
+		COUNT(*) FILTER (WHERE excluded)::INT,
+		COALESCE(SUM(src_size) FILTER (WHERE type = 'file'), 0)::BIGINT,
+		COALESCE(SUM(dst_size) FILTER (WHERE type = 'file'), 0)::BIGINT
 	FROM merged` + where
 	var s MergedReviewStats
 	err = conn.QueryRowContext(context.Background(), q, args...).Scan(
-		&s.Total, &s.Folders, &s.Files, &s.MissingOnSource, &s.MissingOnDest, &s.Excluded,
+		&s.Total, &s.Folders, &s.Files, &s.MissingOnSource, &s.MissingOnDest, &s.Excluded, &s.SizeSrc, &s.SizeDst,
 	)
 	return s, err
+}
+
+// GetTotalFileSizes returns the sum of size across src_nodes and dst_nodes (for API totalFileSize).
+func GetTotalFileSizes(d *DB) (srcTotal, dstTotal int64, err error) {
+	conn, err := d.GetDB()
+	if err != nil {
+		return 0, 0, err
+	}
+	ctx := context.Background()
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(size), 0) FROM `+tableSrcNodes).Scan(&srcTotal); err != nil {
+		return 0, 0, err
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(size), 0) FROM `+tableDstNodes).Scan(&dstTotal); err != nil {
+		return 0, 0, err
+	}
+	return srcTotal, dstTotal, nil
 }
 
 // GetNodeByID returns the node by id from the given table. Status is derived from latest status event.

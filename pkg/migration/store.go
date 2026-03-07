@@ -24,6 +24,7 @@ type migrationRecord struct {
 }
 
 type migrationStore struct {
+	// db is used only in legacy single-DB mode. When nil, callers pass per-migration db to each method.
 	db *db.DB
 }
 
@@ -31,8 +32,11 @@ func newMigrationStore(database *db.DB) *migrationStore {
 	return &migrationStore{db: database}
 }
 
-func (s *migrationStore) createMigration(record migrationRecord) error {
-	conn, err := s.db.GetDB()
+func (s *migrationStore) createMigration(database *db.DB, record migrationRecord) error {
+	if database == nil {
+		database = s.db
+	}
+	conn, err := database.GetDB()
 	if err != nil {
 		return err
 	}
@@ -46,7 +50,8 @@ func (s *migrationStore) createMigration(record migrationRecord) error {
 			updated_at,
 			service_metadata_json,
 			root_config_json
-		) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (migration_id) DO NOTHING`,
 		record.ID,
 		record.Name,
 		record.Phase.String(),
@@ -61,8 +66,11 @@ func (s *migrationStore) createMigration(record migrationRecord) error {
 	return nil
 }
 
-func (s *migrationStore) getMigration(id string) (*migrationRecord, error) {
-	conn, err := s.db.GetDB()
+func (s *migrationStore) getMigration(database *db.DB, id string) (*migrationRecord, error) {
+	if database == nil {
+		database = s.db
+	}
+	conn, err := database.GetDB()
 	if err != nil {
 		return nil, err
 	}
@@ -97,8 +105,11 @@ func (s *migrationStore) getMigration(id string) (*migrationRecord, error) {
 	return &record, nil
 }
 
-func (s *migrationStore) listMigrations() ([]migrationRecord, error) {
-	conn, err := s.db.GetDB()
+func (s *migrationStore) listMigrationsFromDB(database *db.DB) ([]migrationRecord, error) {
+	if database == nil {
+		database = s.db
+	}
+	conn, err := database.GetDB()
 	if err != nil {
 		return nil, err
 	}
@@ -141,8 +152,18 @@ func (s *migrationStore) listMigrations() ([]migrationRecord, error) {
 	return records, nil
 }
 
-func (s *migrationStore) deleteMigration(id string) error {
-	conn, err := s.db.GetDB()
+func (s *migrationStore) listMigrations(database *db.DB) ([]migrationRecord, error) {
+	if database == nil {
+		database = s.db
+	}
+	return s.listMigrationsFromDB(database)
+}
+
+func (s *migrationStore) deleteMigration(database *db.DB, id string) error {
+	if database == nil {
+		database = s.db
+	}
+	conn, err := database.GetDB()
 	if err != nil {
 		return err
 	}
@@ -154,6 +175,9 @@ func (s *migrationStore) deleteMigration(id string) error {
 }
 
 func (s *migrationStore) updatePhase(id string, phase Phase) error {
+	if s.db == nil {
+		return fmt.Errorf("updatePhase requires store db")
+	}
 	conn, err := s.db.GetDB()
 	if err != nil {
 		return err
@@ -173,6 +197,9 @@ func (s *migrationStore) updatePhase(id string, phase Phase) error {
 
 // updateUpdatedAt sets updated_at to now for the migration (e.g. after roots inserted or run ended).
 func (s *migrationStore) updateUpdatedAt(id string) error {
+	if s.db == nil {
+		return fmt.Errorf("updateUpdatedAt requires store db")
+	}
 	conn, err := s.db.GetDB()
 	if err != nil {
 		return err

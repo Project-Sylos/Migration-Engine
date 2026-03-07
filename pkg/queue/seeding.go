@@ -50,6 +50,9 @@ func SeedRootTask(queueType string, rootFolder types.Folder, rootNodeID string, 
 
 	// Populate traversal status in the NodeState metadata
 	state.TraversalStatus = db.StatusPending
+	if queueType == "SRC" {
+		state.CopyStatus = db.CopyStatusPending
+	}
 
 	if err := db.InsertRootNode(database, queueType, state); err != nil {
 		return fmt.Errorf("failed to seed root task for %s: %w", queueType, err)

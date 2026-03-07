@@ -187,7 +187,15 @@ See **`pkg/migration/README.md`** for `LetsMigrate`, `StartMigration`, `SetupDat
 
 ### Testing
 
-The Migration Engine includes test suites:
+**Lightweight unit tests** (safe for CI and quick feedback):
+
+```bash
+go test ./pkg/db ./pkg/migration ./pkg/queue
+```
+
+These cover stats, review models, and queue logic with small in-process DBs. Use them for targeted checks during development.
+
+**Heavy E2E / integration tests** (run only when doing full validation; they are resource-heavy and can stress the system):
 
 - **Traversal Tests**: `pkg/tests/traversal/`
   - `normal/` - Standard persistent mode tests
@@ -197,11 +205,4 @@ The Migration Engine includes test suites:
 
 - **Copy Tests**: `pkg/tests/copy/` - File content migration tests
 
-Run tests using the provided shell scripts:
-```bash
-# Linux/Mac
-./run.sh
-
-# Windows
-.\run.ps1
-```
+Run these manually using the provided scripts (e.g. `pkg/tests/traversal/local/run.sh` or the repo `run.sh` / `run.ps1`). Do **not** run them via `go test ./...`; reserve them for deliberate end-to-end runs.

@@ -6,13 +6,14 @@ package migration
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
 // DatabaseConfig defines how the migration engine should prepare its backing store.
 type DatabaseConfig struct {
-	// Path is the DuckDB file path to create/open (e.g. migration.duckdb).
+	// Path is the DuckDB file path for legacy single-DB mode (all migrations in one file). When empty, the manager uses per-migration DBs; the API passes each migration's folder path to CreateMigration (MigrationDir) and GetMigration (migrationDir).
 	Path string
 	// RemoveExisting deletes the database file if it already exists before creating a new database.
 	RemoveExisting bool
@@ -20,6 +21,12 @@ type DatabaseConfig struct {
 	// When true (API mode): DB instance must be provided and already open, error if nil/closed.
 	// When false (standalone mode): Can auto-open DB if instance is nil or not open.
 	RequireOpen bool
+}
+
+// MigrationDBPath returns the per-migration DB path when the API passes the folder for that migration.
+// migrationDir is the absolute path to the migration's folder (e.g. data/migration-123); the DB file is migrationDir/{migrationID}.db.
+func MigrationDBPath(migrationDir, migrationID string) string {
+	return filepath.Join(migrationDir, migrationID+".db")
 }
 
 // SetupDatabase opens a DuckDB database at cfg.Path. Returns the DB and whether it was fresh (true if new or removed).
