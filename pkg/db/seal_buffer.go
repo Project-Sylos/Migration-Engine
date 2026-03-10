@@ -8,7 +8,6 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,33 +17,33 @@ import (
 
 const (
 	defaultSealFlushInterval     = 10 * time.Second
-	defaultSealFlushRowThreshold = 10_000
-	defaultSealBufferHardCap     = 20_000
-	checkpointRowThreshold       = 50_000 // run CHECKPOINT only after this many appender rows since last checkpoint
+	defaultSealFlushRowThreshold = 20_000
+	defaultSealBufferHardCap     = 40_000
+	checkpointRowThreshold       = 200_000 // run CHECKPOINT only after this many appender rows since last checkpoint
 )
 
 // SealJob is one sealed level's payload: table, depth, node metadata, status events, and stats.
 type SealJob struct {
-	Table       string
-	Depth       int
-	Nodes       []*NodeState
-	Events      []StatusEvent
-	Pending     int64
-	Successful  int64
-	Failed      int64
-	Completed   int64
-	CopyP       int64
-	CopyS       int64
-	CopyF       int64
-	FromRetry   bool // event-only: this completion is from retry mode; subtract from PendingRetry when path zeros
+	Table      string
+	Depth      int
+	Nodes      []*NodeState
+	Events     []StatusEvent
+	Pending    int64
+	Successful int64
+	Failed     int64
+	Completed  int64
+	CopyP      int64
+	CopyS      int64
+	CopyF      int64
+	FromRetry  bool // event-only: this completion is from retry mode; subtract from PendingRetry when path zeros
 }
 
 // phaseAppenders holds persistent appenders for the duration of a phase (traversal or copy).
 // Created once at phase start, closed at phase end. Used by Flush() for one tx per flush.
 type phaseAppenders struct {
-	conn    *sql.Conn
-	appSrc  *duckdb.Appender
-	appDst  *duckdb.Appender
+	conn     *sql.Conn
+	appSrc   *duckdb.Appender
+	appDst   *duckdb.Appender
 	appSrcEv *duckdb.Appender
 	appDstEv *duckdb.Appender
 }
@@ -120,13 +119,13 @@ func buildMergedLevelStats(jobs []SealJob) (srcTuples, dstTuples []struct {
 	return srcTuples, dstTuples
 }
 
-func hasDiscoveryJobs(jobs []SealJob) bool {
-	for _, j := range jobs {
-		if j.Pending == discoveryJobStatsSentinel {
-			return true
-		}
+// anyToDriverValues converts []any to []driver.Value for DuckDB appender AppendRow.
+func anyToDriverValues(a []any) []driver.Value {
+	out := make([]driver.Value, len(a))
+	for i, v := range a {
+		out[i] = driver.Value(v)
 	}
-	return false
+	return out
 }
 
 // dedupeJobsByID returns nodes and events from jobs deduped by (table, id); last occurrence wins. Prevents duplicate key on append.
@@ -159,22 +158,62 @@ func dedupeJobsByID(jobs []SealJob) (srcNodes, dstNodes []*NodeState, srcEvents,
 	return srcNodes, dstNodes, srcEvents, dstEvents
 }
 
-// discoveryRecomputeDepths returns (table, depth) pairs for discovery jobs that are event-only (status updates); stats for those depths must be recomputed.
-func discoveryRecomputeDepths(jobs []SealJob) []struct{ Table string; Depth int } {
-	seen := make(map[string]bool)
-	var out []struct{ Table string; Depth int }
+// buildEventOnlyStatusDeltas computes per-depth key deltas for event-only jobs.
+// PrevTraversalStatus/PrevCopyStatus are set at enqueue time from the task's loaded state,
+// so no DB query is needed here.
+func buildEventOnlyStatusDeltas(jobs []SealJob) (srcDeltas, dstDeltas []struct {
+	depth int
+	key   string
+	delta int64
+}) {
+	type deltaKey struct {
+		table string
+		depth int
+		key   string
+	}
+	deltas := make(map[deltaKey]int64)
 	for _, j := range jobs {
 		if j.Pending != discoveryJobStatsSentinel || len(j.Nodes) > 0 || len(j.Events) == 0 {
 			continue
 		}
-		k := j.Table + "\x00" + strconv.Itoa(j.Depth)
-		if seen[k] {
+		for _, e := range j.Events {
+			if e.ID == "" {
+				continue
+			}
+			if e.PrevTraversalStatus != e.TraversalStatus {
+				if e.PrevTraversalStatus != "" {
+					deltas[deltaKey{j.Table, e.Depth, StatsKeyTraversalStatus(e.PrevTraversalStatus)}]--
+				}
+				if e.TraversalStatus != "" {
+					deltas[deltaKey{j.Table, e.Depth, StatsKeyTraversalStatus(e.TraversalStatus)}]++
+				}
+			}
+			if j.Table == "SRC" && e.CopyStatus != "" && e.PrevCopyStatus != e.CopyStatus {
+				if e.PrevCopyStatus != "" && e.PrevCopyStatus != CopyStatusInProgress {
+					deltas[deltaKey{"SRC", e.Depth, StatsKeyCopyStatus(e.PrevCopyStatus)}]--
+				}
+				if e.CopyStatus != "" && e.CopyStatus != CopyStatusInProgress {
+					deltas[deltaKey{"SRC", e.Depth, StatsKeyCopyStatus(e.CopyStatus)}]++
+				}
+			}
+		}
+	}
+	for k, d := range deltas {
+		if d == 0 {
 			continue
 		}
-		seen[k] = true
-		out = append(out, struct{ Table string; Depth int }{j.Table, j.Depth})
+		t := struct {
+			depth int
+			key   string
+			delta int64
+		}{k.depth, k.key, d}
+		if k.table == "SRC" {
+			srcDeltas = append(srcDeltas, t)
+		} else {
+			dstDeltas = append(dstDeltas, t)
+		}
 	}
-	return out
+	return srcDeltas, dstDeltas
 }
 
 // SealBuffer buffers seal jobs and discovery jobs (nodes + events only), flushes them to the DB asynchronously.
@@ -182,21 +221,22 @@ func discoveryRecomputeDepths(jobs []SealJob) []struct{ Table string; Depth int 
 // When a phase is active (StartPhase called), Flush uses persistent appenders and one tx per flush.
 // Discovery jobs use Pending == discoveryJobStatsSentinel so stats are not written.
 type SealBuffer struct {
-	db                *DB
-	interval          time.Duration
-	rowThreshold      int
-	hardCap           int
-	mu                sync.Mutex
-	cond              *sync.Cond
-	queue             []SealJob
-	discoveryQueue    []SealJob // nodes + events only (no stats); flushed with queue, stats skipped when Pending < 0
-	rowsSinceFlush    int
-	lastFlushedDepth   int   // max depth written by completed Flush(); -1 until first flush
-	rowsSinceCheckpoint  int64 // appender rows written since last CHECKPOINT
+	db                  *DB
+	interval            time.Duration
+	rowThreshold        int
+	hardCap             int
+	mu                  sync.Mutex
+	cond                *sync.Cond
+	queue               []SealJob
+	discoveryQueue      []SealJob       // nodes + events only (no stats); flushed with queue, stats skipped when Pending < 0
+	taskErrorsQueue     []TaskErrorRecord // buffered task errors; flushed with jobs
+	rowsSinceFlush      int
+	lastFlushedDepth    int   // max depth written by completed Flush(); -1 until first flush
+	rowsSinceCheckpoint int64 // appender rows written since last CHECKPOINT
 	pendingCheckpoint   bool  // set when threshold hit from legacyFlush; run Checkpoint after RunWrite returns
 	stopCh              chan struct{}
 	stopped             int32
-	phase              *phaseAppenders // non-nil when phase is active (persistent appenders)
+	phase               *phaseAppenders // non-nil when phase is active (persistent appenders)
 }
 
 // SealBufferOptions configures the seal buffer. Zero value uses defaults.
@@ -221,13 +261,14 @@ func NewSealBuffer(db *DB, opts SealBufferOptions) *SealBuffer {
 		hardCap = defaultSealBufferHardCap
 	}
 	sb := &SealBuffer{
-		db:             db,
-		interval:       interval,
-		rowThreshold:   rowThreshold,
-		hardCap:        hardCap,
-		queue:          make([]SealJob, 0, 64),
-		discoveryQueue: make([]SealJob, 0, 64),
-		stopCh:         make(chan struct{}),
+		db:              db,
+		interval:        interval,
+		rowThreshold:    rowThreshold,
+		hardCap:         hardCap,
+		queue:           make([]SealJob, 0, 64),
+		discoveryQueue:  make([]SealJob, 0, 64),
+		taskErrorsQueue: make([]TaskErrorRecord, 0, 64),
+		stopCh:          make(chan struct{}),
 	}
 	sb.cond = sync.NewCond(&sb.mu)
 	go sb.flushLoop()
@@ -289,7 +330,10 @@ func (sb *SealBuffer) AddDiscoveryNodes(ops []InsertOperation) {
 	}
 	eventTime := time.Now().UnixNano()
 	// Group by (table, depth) so we emit one SealJob per group.
-	type key struct{ table string; depth int }
+	type key struct {
+		table string
+		depth int
+	}
 	groups := make(map[key][]*NodeState)
 	for _, op := range ops {
 		if op.State == nil {
@@ -349,18 +393,29 @@ func (sb *SealBuffer) AddDiscoveryStatusEvent(table string, e StatusEvent, fromR
 	sb.mu.Unlock()
 }
 
-func (sb *SealBuffer) drain() []SealJob {
+// AddTaskError enqueues one task error for async flush via the seal buffer.
+func (sb *SealBuffer) AddTaskError(rec TaskErrorRecord) {
+	sb.mu.Lock()
+	sb.taskErrorsQueue = append(sb.taskErrorsQueue, rec)
+	sb.rowsSinceFlush++
+	sb.cond.Broadcast()
+	sb.mu.Unlock()
+}
+
+func (sb *SealBuffer) drain() ([]SealJob, []TaskErrorRecord) {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
-	if len(sb.queue) == 0 && len(sb.discoveryQueue) == 0 {
-		return nil
+	if len(sb.queue) == 0 && len(sb.discoveryQueue) == 0 && len(sb.taskErrorsQueue) == 0 {
+		return nil, nil
 	}
 	out := append(sb.queue, sb.discoveryQueue...)
+	taskErrors := append([]TaskErrorRecord(nil), sb.taskErrorsQueue...)
 	sb.queue = make([]SealJob, 0, cap(sb.queue))
 	sb.discoveryQueue = make([]SealJob, 0, cap(sb.discoveryQueue))
+	sb.taskErrorsQueue = make([]TaskErrorRecord, 0, cap(sb.taskErrorsQueue))
 	sb.rowsSinceFlush = 0
 	sb.cond.Broadcast()
-	return out
+	return out, taskErrors
 }
 
 // StartPhase starts a phase (traversal or copy): conn is held for the phase; 4 appenders are created and reused until StopPhase.
@@ -431,9 +486,9 @@ func (sb *SealBuffer) StopPhase() error {
 	return pa.conn.Close()
 }
 
-// phaseFlush runs one transaction per flush when phase is active: drain, BEGIN, append via persistent appenders, app.Flush(), stats in same tx, COMMIT.
-func (sb *SealBuffer) phaseFlush(jobs []SealJob) error {
-	if len(jobs) == 0 {
+// phaseFlush runs one transaction per flush when phase is active: drain, BEGIN, upsert nodes, insert events (in tx), task errors, stats, COMMIT. Events and task errors are written inside the tx so requeue on failure does not produce duplicates.
+func (sb *SealBuffer) phaseFlush(jobs []SealJob, taskErrors []TaskErrorRecord) error {
+	if len(jobs) == 0 && len(taskErrors) == 0 {
 		return nil
 	}
 	sb.db.writeMu.Lock()
@@ -454,7 +509,6 @@ func (sb *SealBuffer) phaseFlush(jobs []SealJob) error {
 		}
 	}
 	srcNodes, dstNodes, srcEvents, dstEvents := dedupeJobsByID(jobs)
-	evDvals := make([]driver.Value, 0, 5)
 	w := &Writer{tx: tx}
 	if err := w.UpsertNodes(tableSrcNodes, srcNodes); err != nil {
 		_ = tx.Rollback()
@@ -464,30 +518,29 @@ func (sb *SealBuffer) phaseFlush(jobs []SealJob) error {
 		_ = tx.Rollback()
 		return err
 	}
+	// Batch events via appenders (fast); same conn as tx so appender flush is part of this transaction.
 	for _, e := range srcEvents {
-		for _, v := range SrcStatusEventAppendRowArgs(&e) {
-			evDvals = append(evDvals, v)
-		}
-		if err := pa.appSrcEv.AppendRow(evDvals...); err != nil {
+		if err := pa.appSrcEv.AppendRow(anyToDriverValues(SrcStatusEventAppendRowArgs(&e))...); err != nil {
 			_ = tx.Rollback()
-			return err
+			return fmt.Errorf("append src_status_event: %w", err)
 		}
-		evDvals = evDvals[:0]
 	}
 	for _, e := range dstEvents {
-		for _, v := range DstStatusEventAppendRowArgs(&e) {
-			evDvals = append(evDvals, v)
-		}
-		if err := pa.appDstEv.AppendRow(evDvals...); err != nil {
+		if err := pa.appDstEv.AppendRow(anyToDriverValues(DstStatusEventAppendRowArgs(&e))...); err != nil {
 			_ = tx.Rollback()
-			return err
+			return fmt.Errorf("append dst_status_event: %w", err)
 		}
-		evDvals = evDvals[:0]
 	}
 	for _, app := range []*duckdb.Appender{pa.appSrc, pa.appDst, pa.appSrcEv, pa.appDstEv} {
 		if err := app.Flush(); err != nil {
 			_ = tx.Rollback()
 			return err
+		}
+	}
+	for _, te := range taskErrors {
+		if err := w.RecordTaskError(te.QueueType, te.Phase, te.NodeID, te.Message, te.Attempts, te.Path); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("record task error: %w", err)
 		}
 	}
 	srcTuples, dstTuples := buildMergedLevelStats(jobs)
@@ -503,8 +556,15 @@ func (sb *SealBuffer) phaseFlush(jobs []SealJob) error {
 			return err
 		}
 	}
-	for _, d := range discoveryRecomputeDepths(jobs) {
-		if err := w.RecomputeStatsForDepth(d.Table, d.Depth); err != nil {
+	srcEvDeltas, dstEvDeltas := buildEventOnlyStatusDeltas(jobs)
+	for _, d := range srcEvDeltas {
+		if err := w.UpdateStatsCountByDelta("SRC", d.depth, d.key, d.delta); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	for _, d := range dstEvDeltas {
+		if err := w.UpdateStatsCountByDelta("DST", d.depth, d.key, d.delta); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -532,9 +592,9 @@ func (sb *SealBuffer) phaseFlush(jobs []SealJob) error {
 	return nil
 }
 
-// legacyFlush is used when no phase is active: RunWrite with per-flush appenders and two tx (append block + stats).
-func (sb *SealBuffer) legacyFlush(jobs []SealJob) error {
-	if len(jobs) == 0 {
+// legacyFlush is used when no phase is active: batch events via appenders, then one tx for nodes, task errors, and stats.
+func (sb *SealBuffer) legacyFlush(jobs []SealJob, taskErrors []TaskErrorRecord) error {
+	if len(jobs) == 0 && len(taskErrors) == 0 {
 		return nil
 	}
 	maxDepth := -1
@@ -554,16 +614,6 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob) error {
 			if !ok {
 				return fmt.Errorf("seal flush: conn is not driver.Conn")
 			}
-			appSrc, err := duckdb.NewAppenderFromConn(dc, "", tableSrcNodes)
-			if err != nil {
-				return err
-			}
-			defer appSrc.Close()
-			appDst, err := duckdb.NewAppenderFromConn(dc, "", tableDstNodes)
-			if err != nil {
-				return err
-			}
-			defer appDst.Close()
 			appSrcEv, err := duckdb.NewAppenderFromConn(dc, "", tableSrcStatusEvents)
 			if err != nil {
 				return err
@@ -574,47 +624,28 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob) error {
 				return err
 			}
 			defer appDstEv.Close()
-			evDvals := make([]driver.Value, 0, 5)
 			for _, e := range srcEvents {
-				evDvals = evDvals[:0]
-				for _, v := range SrcStatusEventAppendRowArgs(&e) {
-					evDvals = append(evDvals, v)
-				}
-				if err := appSrcEv.AppendRow(evDvals...); err != nil {
+				if err := appSrcEv.AppendRow(anyToDriverValues(SrcStatusEventAppendRowArgs(&e))...); err != nil {
 					return err
 				}
 			}
 			for _, e := range dstEvents {
-				evDvals = evDvals[:0]
-				for _, v := range DstStatusEventAppendRowArgs(&e) {
-					evDvals = append(evDvals, v)
-				}
-				if err := appDstEv.AppendRow(evDvals...); err != nil {
+				if err := appDstEv.AppendRow(anyToDriverValues(DstStatusEventAppendRowArgs(&e))...); err != nil {
 					return err
 				}
 			}
-			for _, app := range []*duckdb.Appender{appSrc, appDst, appSrcEv, appDstEv} {
-				if err := app.Flush(); err != nil {
-					return err
-				}
+			if err := appSrcEv.Flush(); err != nil {
+				return err
+			}
+			if err := appDstEv.Flush(); err != nil {
+				return err
 			}
 			return nil
 		}); err != nil {
 			return err
 		}
-		sb.mu.Lock()
-		if maxDepth > sb.lastFlushedDepth {
-			sb.lastFlushedDepth = maxDepth
-		}
-		sb.rowsSinceCheckpoint += totalRows
-		if sb.rowsSinceCheckpoint >= checkpointRowThreshold {
-			sb.rowsSinceCheckpoint = 0
-			sb.pendingCheckpoint = true
-		}
-		sb.cond.Broadcast()
-		sb.mu.Unlock()
-		recomputeDepths := discoveryRecomputeDepths(jobs)
-		needTx := len(srcTuples) > 0 || len(dstTuples) > 0 || len(recomputeDepths) > 0 || hasDiscoveryJobs(jobs)
+		srcEvDeltas, dstEvDeltas := buildEventOnlyStatusDeltas(jobs)
+		needTx := len(srcNodes) > 0 || len(dstNodes) > 0 || len(srcTuples) > 0 || len(dstTuples) > 0 || len(srcEvDeltas) > 0 || len(dstEvDeltas) > 0 || len(taskErrors) > 0
 		if needTx {
 			return s.WithTx(func(w *Writer) error {
 				if err := w.UpsertNodes(tableSrcNodes, srcNodes); err != nil {
@@ -622,6 +653,11 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob) error {
 				}
 				if err := w.UpsertNodes(tableDstNodes, dstNodes); err != nil {
 					return err
+				}
+				for _, te := range taskErrors {
+					if err := w.RecordTaskError(te.QueueType, te.Phase, te.NodeID, te.Message, te.Attempts, te.Path); err != nil {
+						return err
+					}
 				}
 				if len(srcTuples) > 0 {
 					if err := w.UpsertStatsCounts("SRC", srcTuples); err != nil {
@@ -633,8 +669,13 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob) error {
 						return err
 					}
 				}
-				for _, d := range recomputeDepths {
-					if err := w.RecomputeStatsForDepth(d.Table, d.Depth); err != nil {
+				for _, d := range srcEvDeltas {
+					if err := w.UpdateStatsCountByDelta("SRC", d.depth, d.key, d.delta); err != nil {
+						return err
+					}
+				}
+				for _, d := range dstEvDeltas {
+					if err := w.UpdateStatsCountByDelta("DST", d.depth, d.key, d.delta); err != nil {
 						return err
 					}
 				}
@@ -645,6 +686,17 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob) error {
 	}); err != nil {
 		return err
 	}
+	sb.mu.Lock()
+	if maxDepth > sb.lastFlushedDepth {
+		sb.lastFlushedDepth = maxDepth
+	}
+	sb.rowsSinceCheckpoint += totalRows
+	if sb.rowsSinceCheckpoint >= checkpointRowThreshold {
+		sb.rowsSinceCheckpoint = 0
+		sb.pendingCheckpoint = true
+	}
+	sb.cond.Broadcast()
+	sb.mu.Unlock()
 	sb.mu.Lock()
 	p := sb.pendingCheckpoint
 	sb.pendingCheckpoint = false
@@ -657,11 +709,11 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob) error {
 	return nil
 }
 
-// Flush drains queued jobs and writes them to the DB. When a phase is active, uses persistent appenders and one tx per flush (append + stats). Otherwise uses legacy per-flush appenders.
-// On write failure, jobs are re-queued so waiters in WaitUntilFlushedThrough do not block forever.
+// Flush drains queued jobs and task errors and writes them to the DB. When a phase is active, uses persistent appenders and one tx per flush (append + stats). Otherwise uses legacy per-flush appenders.
+// On write failure, jobs and task errors are re-queued so waiters in WaitUntilFlushedThrough do not block forever.
 func (sb *SealBuffer) Flush() error {
-	jobs := sb.drain()
-	if len(jobs) == 0 {
+	jobs, taskErrors := sb.drain()
+	if len(jobs) == 0 && len(taskErrors) == 0 {
 		return nil
 	}
 	sb.mu.Lock()
@@ -669,19 +721,19 @@ func (sb *SealBuffer) Flush() error {
 	sb.mu.Unlock()
 	var err error
 	if pa != nil {
-		err = sb.phaseFlush(jobs)
+		err = sb.phaseFlush(jobs, taskErrors)
 	} else {
-		err = sb.legacyFlush(jobs)
+		err = sb.legacyFlush(jobs, taskErrors)
 	}
 	if err != nil {
-		sb.requeue(jobs)
+		sb.requeue(jobs, taskErrors)
 		return err
 	}
 	return nil
 }
 
-// requeue puts jobs back on the queue and restores rowsSinceFlush. Call when a flush fails so data is not lost.
-func (sb *SealBuffer) requeue(jobs []SealJob) {
+// requeue puts jobs and task errors back on the queue and restores rowsSinceFlush. Call when a flush fails so data is not lost.
+func (sb *SealBuffer) requeue(jobs []SealJob, taskErrors []TaskErrorRecord) {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
 	rows := int64(0)
@@ -689,7 +741,8 @@ func (sb *SealBuffer) requeue(jobs []SealJob) {
 		rows += int64(len(j.Nodes))
 	}
 	sb.queue = append(sb.queue, jobs...)
-	sb.rowsSinceFlush += int(rows)
+	sb.taskErrorsQueue = append(sb.taskErrorsQueue, taskErrors...)
+	sb.rowsSinceFlush += int(rows) + len(taskErrors)
 	sb.cond.Broadcast()
 }
 

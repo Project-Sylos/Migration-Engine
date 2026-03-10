@@ -18,19 +18,22 @@ import (
 
 func mergedRowToDiffItem(r db.MergedReviewRow) DiffItem {
 	item := DiffItem{
-		Path:               r.Path,
-		Name:               r.Name,
-		Depth:              r.Depth,
-		Type:               r.Type,
-		SrcNodeID:          r.SrcNodeID,
-		DstNodeID:          r.DstNodeID,
-		SrcTraversalStatus: r.SrcTraversalStatus,
-		DstTraversalStatus: r.DstTraversalStatus,
-		CopyStatus:         r.CopyStatus,
-		Excluded:           r.Excluded,
+			Path:               r.Path,
+			Name:               r.Name,
+			Depth:              r.Depth,
+			Type:               r.Type,
+			SrcNodeID:          r.SrcNodeID,
+			DstNodeID:          r.DstNodeID,
+			SrcTraversalStatus: r.SrcTraversalStatus,
+			DstTraversalStatus: r.DstTraversalStatus,
+			CopyStatus:         db.CopyStatusForDisplay(r.CopyStatus),
+			Excluded:           r.Excluded,
 		Size:               r.Size,
 		MissingOnSource:    r.SrcNodeID == "",
 		MissingOnDest:      r.DstNodeID == "",
+	}
+	if item.MissingOnSource {
+		item.CopyStatus = ""
 	}
 	if item.Name == "" {
 		item.Name = path.Base(item.Path)
@@ -57,18 +60,16 @@ func (s *migrationStore) queryNodes(filter NodeQueryFilter) ([]db.NodeState, err
 	return db.QueryNodesForReview(s.db, table, filter.Depth, filter.Status, filter.Excluded, filter.PathLike, filter.OrderByPath, limit, offset)
 }
 
-func (s *migrationStore) setNodeExcluded(queueType, nodeID string, excluded bool) (int64, map[string]int64, error) {
-	q := strings.ToUpper(queueType)
-	if q != "DST" {
-		q = "SRC"
-	}
-	node, err := db.GetNodeByID(s.db, q, nodeID)
+func (s *migrationStore) setNodeExcluded(nodeID string, excluded bool) (int64, map[string]int64, error) {
+	// Exclude/unexclude is SRC-only: only source nodes can be excluded from copy; no DST lookup.
+	node, err := db.GetNodeByID(s.db, "SRC", nodeID)
 	if err != nil {
 		return 0, nil, err
 	}
 	if node == nil {
-		return 0, nil, fmt.Errorf("node %s not found", nodeID)
+		return 0, nil, fmt.Errorf("node %s not found in SRC", nodeID)
 	}
+	q := "SRC"
 	if node.Excluded == excluded {
 		return 0, nil, nil
 	}
@@ -82,18 +83,18 @@ func (s *migrationStore) setNodeExcluded(queueType, nodeID string, excluded bool
 	}
 	deltas := make(map[string]int64)
 	if excluded {
-		deltas["excluded"] = 1
+		addReviewDelta(deltas, DeltaExcluded, 1)
 		switch node.TraversalStatus {
 		case db.StatusPending:
-			deltas["pending"] = -1
+			addReviewDelta(deltas, DeltaTraversalPending, -1)
 		case db.StatusFailed:
-			deltas["failed"] = -1
+			addReviewDelta(deltas, DeltaTraversalFailed, -1)
 		default:
-			deltas["pending"] = -1
+			addReviewDelta(deltas, DeltaTraversalPending, -1)
 		}
 	} else {
-		deltas["excluded"] = -1
-		deltas["pending"] = 1
+		addReviewDelta(deltas, DeltaExcluded, -1)
+		addReviewDelta(deltas, DeltaTraversalPending, 1)
 	}
 	return 1, deltas, nil
 }
@@ -175,11 +176,11 @@ func (s *migrationStore) setNodeCopyStatus(nodeID, status string) (int64, map[st
 	}
 	deltas := make(map[string]int64)
 	if status == db.CopyStatusPending {
-		deltas["failed"] = -1
-		deltas["pending"] = 1
+		addReviewDelta(deltas, DeltaCopyFailed, -1)
+		addReviewDelta(deltas, DeltaCopyPending, 1)
 	} else {
-		deltas["pending"] = -1
-		deltas["failed"] = 1
+		addReviewDelta(deltas, DeltaCopyPending, -1)
+		addReviewDelta(deltas, DeltaCopyFailed, 1)
 	}
 	return 1, deltas, nil
 }
@@ -202,14 +203,14 @@ func (s *migrationStore) markNodeForRetryDiscovery(nodeID string) (int64, map[st
 				if err != nil {
 					return err
 				}
-				if err := w.DeleteDescendantsUnderPath("DST", path); err != nil {
-					return err
-				}
 				if err := w.SetNodeTraversalStatus("SRC", nodeID, db.StatusPending); err != nil {
 					return err
 				}
 				if dstAtPath != nil {
 					if err := w.SetNodeTraversalStatus("DST", dstAtPath.ID, db.StatusPending); err != nil {
+						return err
+					}
+					if err := w.DeleteDescendantsUnderPath("DST", path); err != nil {
 						return err
 					}
 				}
@@ -220,22 +221,12 @@ func (s *migrationStore) markNodeForRetryDiscovery(nodeID string) (int64, map[st
 			return 0, nil, err
 		}
 		deltas := make(map[string]int64)
-		deltas["failed"] = -1
-		deltas["pendingRetries"] = 1
-		deltas["pending"] = 2 - desc.TraversalPending
-		deltas["failed"] += -desc.TraversalFailed
-		if desc.Folders != 0 {
-			deltas["folders"] = -desc.Folders
-		}
-		if desc.Files != 0 {
-			deltas["files"] = -desc.Files
-		}
-		if desc.Excluded != 0 {
-			deltas["excluded"] = -desc.Excluded
-		}
-		if desc.SizeDst != 0 {
-			deltas["sizeDst"] = -desc.SizeDst
-		}
+		addReviewDelta(deltas, DeltaTraversalFailed, -1+-desc.TraversalFailed)
+		addReviewDelta(deltas, DeltaTraversalPendingRetry, 1)
+		addReviewDelta(deltas, DeltaFolders, -desc.Folders)
+		addReviewDelta(deltas, DeltaFiles, -desc.Files)
+		addReviewDelta(deltas, DeltaExcluded, -desc.Excluded)
+		addReviewDelta(deltas, DeltaSizeDst, -desc.SizeDst)
 		return 1, deltas, nil
 	}
 	dstNode, err := db.GetNodeByID(s.db, "DST", nodeID)
@@ -254,9 +245,8 @@ func (s *migrationStore) markNodeForRetryDiscovery(nodeID string) (int64, map[st
 		return 0, nil, err
 	}
 	deltas := make(map[string]int64)
-	deltas["failed"] = -1
-	deltas["pendingRetries"] = 1
-	deltas["pending"] = 1
+	addReviewDelta(deltas, DeltaTraversalFailed, -1)
+	addReviewDelta(deltas, DeltaTraversalPendingRetry, 1)
 	return 1, deltas, nil
 }
 
@@ -286,9 +276,8 @@ func (s *migrationStore) unmarkNodeForRetryDiscovery(nodeID string) (int64, map[
 			return 0, nil, err
 		}
 		deltas := make(map[string]int64)
-		deltas["pendingRetries"] = -1
-		deltas["failed"] = 1
-		deltas["pending"] = -2
+		addReviewDelta(deltas, DeltaTraversalPendingRetry, -1)
+		addReviewDelta(deltas, DeltaTraversalFailed, 1)
 		return 1, deltas, nil
 	}
 	dstNode, err := db.GetNodeByID(s.db, "DST", nodeID)
@@ -307,24 +296,21 @@ func (s *migrationStore) unmarkNodeForRetryDiscovery(nodeID string) (int64, map[
 		return 0, nil, err
 	}
 	deltas := make(map[string]int64)
-	deltas["pendingRetries"] = -1
-	deltas["failed"] = 1
-	deltas["pending"] = -1
+	addReviewDelta(deltas, DeltaTraversalPendingRetry, -1)
+	addReviewDelta(deltas, DeltaTraversalFailed, 1)
 	return 1, deltas, nil
 }
 
-func (s *migrationStore) setNodeExcludedWithPropagation(queueType, nodeID string, excluded bool) (int64, map[string]int64, error) {
-	q := strings.ToUpper(queueType)
-	if q != "DST" {
-		q = "SRC"
-	}
-	node, err := db.GetNodeByID(s.db, q, nodeID)
+func (s *migrationStore) setNodeExcludedWithPropagation(nodeID string, excluded bool) (int64, map[string]int64, error) {
+	// Exclude/unexclude is SRC-only: only source nodes can be excluded from copy; no DST lookup.
+	node, err := db.GetNodeByID(s.db, "SRC", nodeID)
 	if err != nil {
 		return 0, nil, err
 	}
 	if node == nil {
-		return 0, nil, fmt.Errorf("node %s not found in %s", nodeID, q)
+		return 0, nil, fmt.Errorf("node %s not found in SRC", nodeID)
 	}
+	q := "SRC"
 	rootPath := node.Path
 	var affected int64
 	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
@@ -354,12 +340,10 @@ func (s *migrationStore) setNodeExcludedWithPropagation(queueType, nodeID string
 		return 0, nil, fmt.Errorf("set exclusion with propagation: %w", err)
 	}
 	deltas := make(map[string]int64)
-	if affected != 0 {
-		if excluded {
-			deltas["excluded"] = affected
-		} else {
-			deltas["excluded"] = -affected
-		}
+	if excluded {
+		addReviewDelta(deltas, DeltaExcluded, affected)
+	} else {
+		addReviewDelta(deltas, DeltaExcluded, -affected)
 	}
 	return affected, deltas, nil
 }

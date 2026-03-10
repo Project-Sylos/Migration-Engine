@@ -19,7 +19,9 @@ rm -rf "$BaseDir"
 mkdir -p "$TreeA/subfolder_a"
 echo "test file 1" > "$TreeA/file1.txt"
 echo "test file 2" > "$TreeA/subfolder_a/file2.txt"
-# Only A/items has file1.txt and subfolder_a with a file
+echo "A extra 1" > "$TreeA/extra1.txt"
+echo "A extra 2" > "$TreeA/extra2.txt"
+# Only A/items has file1.txt, subfolder_a with a file, and two extra files (extra1.txt, extra2.txt)
 
 # Create B/items (DST) with a superset structure
 mkdir -p "$TreeB/subfolder_a"

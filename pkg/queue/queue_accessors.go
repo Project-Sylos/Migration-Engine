@@ -4,8 +4,8 @@
 package queue
 
 import (
-	"fmt"
 	"context"
+	"fmt"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
@@ -92,7 +92,6 @@ func (q *Queue) getDatabase() *db.DB {
 	defer q.mu.RUnlock()
 	return q.database
 }
-
 
 func (q *Queue) getShutdownCtx() context.Context {
 	q.mu.RLock()
@@ -245,13 +244,6 @@ func (q *Queue) GetTotalFailed() int {
 		}
 	}
 	return total
-}
-
-func (q *Queue) isLeased(nodeID string) bool {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	_, exists := q.leasedKeys[nodeID]
-	return exists
 }
 
 func (q *Queue) isInPendingSet(nodeID string) bool {
@@ -503,18 +495,6 @@ func (q *Queue) setLastAvgTime(t time.Time) {
 	q.lastAvgTime = t
 }
 
-func (q *Queue) addLeasedKey(nodeID string) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.leasedKeys[nodeID] = struct{}{}
-}
-
-func (q *Queue) removeLeasedKey(nodeID string) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	delete(q.leasedKeys, nodeID)
-}
-
 func (q *Queue) addInProgress(nodeID string, task *TaskBase) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -532,6 +512,18 @@ func (q *Queue) incrementRoundStatsCompleted(round int) {
 	defer q.mu.Unlock()
 	stats := q.getOrCreateRoundStatsUnlocked(round)
 	stats.Completed++
+}
+
+// resetRoundStatsCompleted zeros Completed for all rounds. Call when switching copy pass
+// so pass 2 stats (files) don't include pass 1 completions (folders).
+func (q *Queue) resetRoundStatsCompleted() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, stats := range q.roundStats {
+		if stats != nil {
+			stats.Completed = 0
+		}
+	}
 }
 
 func (q *Queue) incrementRoundStatsFailed(round int) {
@@ -587,7 +579,18 @@ func (q *Queue) setExpectedFromStatsBucket(round int) {
 		if copyPass == 2 {
 			nodeType = db.NodeTypeFile
 		}
-		expected, err = database.GetCopyCountAtDepth(round, nodeType, db.CopyStatusPending)
+		expected, err = database.GetCopyCountAtDepth(round, nodeType, db.CopyStatusPending, false)
+		if err != nil {
+			fmt.Println("error getting copy count at depth", err)
+			return
+		}
+	case QueueModeCopyRetry:
+		copyPass := q.GetCopyPass()
+		nodeType := db.NodeTypeFolder
+		if copyPass == 2 {
+			nodeType = db.NodeTypeFile
+		}
+		expected, err = database.GetCopyCountAtDepth(round, nodeType, db.CopyStatusFailed, false)
 		if err != nil {
 			fmt.Println("error getting copy count at depth", err)
 			return

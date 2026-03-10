@@ -107,8 +107,8 @@ func runTest() error {
 		MaxRetries:      3,
 		LogAddress:      "127.0.0.1:8081",
 		LogLevel:        "trace",
-		SkipListener:    true,
-		StartupDelay:    1 * time.Second,
+		SkipListener:    false,
+		StartupDelay:    3 * time.Second,
 		ProgressTick:    2 * time.Second,
 		ShutdownContext: nil,
 	})
@@ -131,18 +131,6 @@ func runTest() error {
 // setupTraversalConfig creates a migration config for running traversal phase.
 // Uses the same database path as copy tests so copy phase can use the populated DB.
 func setupTraversalConfig(srcPath, dstPath string) (migration.Config, error) {
-	// Import traversal shared to use SetupLocalTest
-	// But we need to use copy/shared database path
-	// So we'll create the config manually similar to SetupLocalTest
-
-	// We'll use a helper that creates the config but uses copy/shared DB path
-	// Actually, let's just use the traversal shared SetupLocalTest but with a custom DB path
-	// Or better: create a minimal config here
-
-	// For now, let's use traversal shared but we need to adjust the DB path
-	// Actually, the simplest is to temporarily use traversal/shared DB, then copy it
-	// Or just use copy/shared DB path directly
-
 	// Create LocalFS adapters
 	srcAdapter, err := fs.NewLocalFS(srcPath)
 	if err != nil {
@@ -202,7 +190,7 @@ func setupTraversalConfig(srcPath, dstPath string) (migration.Config, error) {
 		LogAddress:      "127.0.0.1:8081",
 		LogLevel:        "trace",
 		SkipListener:    true,
-		StartupDelay:    1 * time.Second,
+		StartupDelay:    2 * time.Second,
 		Verification:    migration.VerifyOptions{},
 	}
 

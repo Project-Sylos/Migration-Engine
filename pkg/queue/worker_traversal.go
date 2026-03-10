@@ -108,17 +108,9 @@ func (w *TraversalWorker) Run() {
 		// Execute the task (check for shutdown during execution if needed)
 		err := w.execute(task)
 		if err != nil {
-			// Record task error in main DB for cross-lookup (traversal phase)
 			if w.database != nil {
 				queueType := strings.ToUpper(w.queueName)
-				err := w.database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-					return s.WithTx(func(tx *db.Writer) error {
-						return tx.RecordTaskError(queueType, "traversal", task.ID, err.Error(), task.Attempts, task.LocationPath())
-					})
-				})
-				if err != nil {
-					fmt.Println("error running write", err)
-				}
+				w.database.AppendTaskError(queueType, "traversal", task.ID, err.Error(), task.Attempts, task.LocationPath())
 			}
 			w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
 			nodeID := task.ID
@@ -378,7 +370,7 @@ func compareTimestamps(srcMTime, dstMTime string) string {
 	}
 
 	// If dst is newer, no copy needed - mark as successful
-	if dstTime.After(srcTime) {
+	if dstTime.After(srcTime)  || dstTime.Equal(srcTime) {
 		return "Successful"
 	}
 

@@ -6,8 +6,24 @@ package db
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"strings"
 	"time"
 )
+
+// NormalizeRootRelativePath returns a root-relative path with no "//" so SRC/DST path_hash joins match.
+// Root is "/"; children are "/name", "/name/child". Collapses any "//" to "/".
+func NormalizeRootRelativePath(path string) string {
+	if path == "" {
+		return "/"
+	}
+	for strings.Contains(path, "//") {
+		path = strings.ReplaceAll(path, "//", "/")
+	}
+	if path != "/" && !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return path
+}
 
 // NodeState is the in-memory representation of a row in src_nodes or dst_nodes.
 // Path and parent_path are the join keys between SRC and DST.
@@ -66,6 +82,21 @@ type StatusEvent struct {
 	CopyStatus       string // src only; empty for dst
 	EventTime        int64
 	Depth            int
+	// PrevTraversalStatus and PrevCopyStatus carry the status that was current before this event.
+	// Set at enqueue time (task already has the loaded state); used by the seal buffer to compute
+	// per-depth level-stat deltas without re-querying the events table.
+	PrevTraversalStatus string
+	PrevCopyStatus      string
+}
+
+// TaskErrorRecord is one buffered row for task_errors (queue_type, phase, node_id, message, attempts, path).
+type TaskErrorRecord struct {
+	QueueType string
+	Phase     string
+	NodeID    string
+	Message   string
+	Attempts  int
+	Path      string
 }
 
 // StatusUpdateOperation represents a traversal status transition (e.g. pending → successful).
@@ -138,7 +169,6 @@ func (o *BatchInsertOperation) flush(w *Writer) error {
 }
 
 // PathHash returns a deterministic 32-char hex hash of path for use as an index key.
-// Uses SHA256(path), first 16 bytes hex-encoded; matches node table path_hash column.
 func PathHash(path string) string {
 	sum := sha256.Sum256([]byte(path))
 	return hex.EncodeToString(sum[:16])

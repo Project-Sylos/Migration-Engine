@@ -321,6 +321,20 @@ func (db *DB) AppendStatusEvent(table string, e StatusEvent, fromRetry bool) {
 	}
 }
 
+// AppendTaskError adds a task error to the seal buffer for async flush. Call from workers on failure (replaces immediate RecordTaskError).
+func (db *DB) AppendTaskError(queueType, phase, nodeID, message string, attempts int, path string) {
+	if db.sealBuffer != nil {
+		db.sealBuffer.AddTaskError(TaskErrorRecord{
+			QueueType: queueType,
+			Phase:     phase,
+			NodeID:    nodeID,
+			Message:   message,
+			Attempts:  attempts,
+			Path:      path,
+		})
+	}
+}
+
 // FlushAppenderBuffer flushes the seal buffer (including discovery queue) and returns when all pending nodes and status events are persisted. Call before round advance.
 func (db *DB) FlushAppenderBuffer() error {
 	if db.sealBuffer == nil {

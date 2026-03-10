@@ -51,9 +51,10 @@ const (
 type QueueMode string
 
 const (
-	QueueModeTraversal QueueMode = "traversal" // Normal BFS traversal
-	QueueModeRetry     QueueMode = "retry"     // Retry failed tasks sweep
-	QueueModeCopy      QueueMode = "copy"      // Copy phase (folders then files)
+	QueueModeTraversal  QueueMode = "traversal"  // Normal BFS traversal
+	QueueModeRetry      QueueMode = "retry"      // Retry failed tasks sweep
+	QueueModeCopy       QueueMode = "copy"       // Copy phase (folders then files)
+	QueueModeCopyRetry  QueueMode = "copy-retry" // Copy retry: only copy_status = failed, max-depth guarded completion
 )
 
 const (
@@ -97,6 +98,7 @@ func taskToNodeState(task *TaskBase) *db.NodeState {
 		Depth:           task.Round,
 		TraversalStatus: db.StatusSuccessful,
 		Status:          db.StatusSuccessful,
+		CopyStatus:      task.CopyStatus,
 		Name:            "",
 	}
 	if task.IsFolder() {
@@ -131,6 +133,7 @@ func nodeStateToTask(state *db.NodeState, taskType string) *TaskBase {
 		Status:    "",
 		Locked:    false,
 		LeaseTime: time.Now(),
+		CopyStatus: state.CopyStatus,
 	}
 	if state.Type == types.NodeTypeFolder {
 		task.Folder = types.Folder{
@@ -170,7 +173,6 @@ type Queue struct {
 	inProgress         map[string]*TaskBase // Tasks currently being executed (keyed by ULID)
 	pendingBuff        []*TaskBase          // Local task buffer fetched from DuckDB
 	pendingSet         map[string]struct{}  // Fast lookup for pending buffer dedupe (keyed by ULID)
-	leasedKeys         map[string]struct{}  // ULIDs already pulled/leased - prevents duplicate pulls from stale views
 	pulling            bool                 // Indicates a pull operation is active
 	lastPullWasPartial bool                 // True if last pull returned fewer tasks than requested (partial batch)
 	firstPullForRound  bool                 // True if we haven't done the first pull for the current round
@@ -226,7 +228,6 @@ func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCo
 		inProgress:          make(map[string]*TaskBase),
 		pendingBuff:         make([]*TaskBase, 0, effectiveLeaseBatchSize()),
 		pendingSet:          make(map[string]struct{}),
-		leasedKeys:          make(map[string]struct{}),
 		maxRetries:          maxRetries,
 		round:               0,
 		workers:             make([]Worker, 0, workerCount),
@@ -397,7 +398,6 @@ type CompletionCheckOptions struct {
 	CheckRoundComplete     bool // Check if current round is complete
 	CheckFinalCompletion   bool // Check if traversal/copy is complete (mode-specific logic in CheckTraversalCompletion / CheckCopyCompletion)
 	AdvanceRoundIfComplete bool // Advance to next round if current round is complete
-	WasFirstPull           bool // For copy mode only: first pull of the round (CheckTraversalCompletion derives this itself)
 }
 
 // checkCompletion performs completion checks based on the provided options.
@@ -416,8 +416,8 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 		switch mode {
 		case QueueModeTraversal, QueueModeRetry:
 			return q.CheckTraversalCompletion(currentRound)
-		case QueueModeCopy:
-			return q.CheckCopyCompletion(currentRound, opts.WasFirstPull)
+		case QueueModeCopy, QueueModeCopyRetry:
+			return q.CheckCopyCompletion(currentRound)
 		}
 		return false
 	}
@@ -443,8 +443,9 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			lastPullWasPartial = q.getLastPullWasPartial()
 		}
 
-		// Traversal/retry: round is complete when queue is empty, in-progress is 0, and last pull was partial (we got fewer than batch size, so no more at this depth).
-		// We use lastPullWasPartial instead of a DB pending count so we don't depend on status events being flushed yet.
+		// Round completion: memory state only. DB is a stale snapshot during the round.
+		// Complete when: pending empty, in-progress 0, and last pull was partial (keyspace exhausted).
+		// We use lastPullWasPartial instead of a DB pending count so we don't depend on status events being flushed.
 		if mode == QueueModeTraversal || mode == QueueModeRetry {
 			if inProgressCount > 0 || pendingBuffCount > 0 {
 				return false
@@ -452,6 +453,26 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			if !lastPullWasPartial {
 				return false
 			}
+			info := q.getRoundInfoReadOnly(currentRound)
+			if info == nil || info.PullCount == 0 {
+				return false
+			}
+			if opts.AdvanceRoundIfComplete {
+				q.advanceToNextRound()
+			}
+			return true
+		}
+
+		// Copy / copy-retry: same as traversal/retry - require at least one pull for this round before we can advance
+		if mode == QueueModeCopy || mode == QueueModeCopyRetry {
+			if inProgressCount > 0 || pendingBuffCount > 0 {
+				return false
+			}
+			fmt.Println("last pull was partial check", q.name, currentRound, lastPullWasPartial)
+			if !lastPullWasPartial {
+				return false
+			}
+			fmt.Println("last pull was partial", q.name, currentRound, lastPullWasPartial)
 			info := q.getRoundInfoReadOnly(currentRound)
 			if info == nil || info.PullCount == 0 {
 				return false
@@ -519,7 +540,6 @@ func (q *Queue) markComplete(format string, args ...interface{}) bool {
 		q.name, totalTasksProcessed, totalChildrenDiscovered)
 
 	q.SetState(QueueStateCompleted)
-	// Flush and checkpoint are done at phase end (EndTraversalPhase/EndCopyPhase), not per-queue.
 
 	// Notify coordinator
 	coordinator := q.getCoordinator()
@@ -592,7 +612,7 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 	mode := q.GetMode()
 
 	// Delegate to mode-specific implementation
-	if mode == QueueModeCopy {
+	if mode == QueueModeCopy || mode == QueueModeCopyRetry {
 		q.CompleteCopyTask(task, executionDelta)
 		return
 	}
@@ -710,7 +730,7 @@ func (q *Queue) PullTasksIfNeeded(force bool) {
 		switch mode {
 		case QueueModeRetry:
 			q.PullRetryTasks(true)
-		case QueueModeCopy:
+		case QueueModeCopy, QueueModeCopyRetry:
 			q.PullCopyTasks(true)
 		default: // QueueModeTraversal
 			q.PullTraversalTasks(true)
@@ -730,7 +750,7 @@ func (q *Queue) PullTasksIfNeeded(force bool) {
 		switch mode {
 		case QueueModeRetry:
 			q.PullRetryTasks(false)
-		case QueueModeCopy:
+		case QueueModeCopy, QueueModeCopyRetry:
 			q.PullCopyTasks(false)
 		default: // QueueModeTraversal
 			q.PullTraversalTasks(false)
@@ -743,7 +763,7 @@ func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
 	mode := q.GetMode()
 
 	// Delegate to mode-specific implementation
-	if mode == QueueModeCopy {
+	if mode == QueueModeCopy || mode == QueueModeCopyRetry {
 		q.FailCopyTask(task, executionDelta)
 		return
 	}
@@ -1070,7 +1090,7 @@ func (q *Queue) Run() {
 			// Get current state snapshot
 			roundToCheck := q.GetRound()
 
-			// 1. Check queue completion
+			// 1. Check phase completion (pass switch or copy/traversal done)
 			if q.checkCompletion(roundToCheck, CompletionCheckOptions{CheckFinalCompletion: true}) {
 				return
 			}
@@ -1091,25 +1111,38 @@ func (q *Queue) Run() {
 	}
 }
 
+const flushRetryAttempts = 5
+const flushRetryBackoff = 100 * time.Millisecond
+
 // advanceToNextRound advances the queue to the next round.
 // For traversal/retry: force-flush appender buffer then reset cursor and advance (frontier is in DB).
 // For copy mode: flush appender buffer then reset cursor and advance.
+// If flush fails after retries, round is not advanced so the observer can retry.
 func (q *Queue) advanceToNextRound() {
 	database := q.getDatabase()
 	mode := q.GetMode()
 
-	if mode == QueueModeTraversal || mode == QueueModeRetry {
-		// DB-backed frontier: ensure all discovery writes are persisted before next round refill.
-		if database != nil {
-			if err := database.FlushAppenderBuffer(); err != nil {
+	if database != nil {
+		var err error
+		for attempt := 0; attempt < flushRetryAttempts; attempt++ {
+			if attempt > 0 {
+				time.Sleep(flushRetryBackoff)
+			}
+			err = database.FlushAppenderBuffer()
+			if err == nil {
+				break
+			}
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("warning", fmt.Sprintf("flush before round advance failed (attempt %d/%d): %v", attempt+1, flushRetryAttempts, err), "queue", q.name, q.name)
+			} else {
 				fmt.Println("error flushing appender buffer before round advance:", err)
 			}
 		}
-		// No seal/drop/promote; frontier lives in DuckDB.
-	} else if mode == QueueModeCopy && database != nil {
-		// Copy phase: DB-backed. Flush appender buffer before round advance.
-		if err := database.FlushAppenderBuffer(); err != nil {
-			fmt.Println("error flushing appender buffer before copy round advance:", err)
+		if err != nil {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("error", "aborting round advance: flush did not succeed after retries", "queue", q.name, q.name)
+			}
+			return // do not advance; observer will retry
 		}
 	}
 	q.resetThisQueueKeysetCursor()
@@ -1121,7 +1154,7 @@ func (q *Queue) advanceToNextRound() {
 	}
 
 	// Delegate to mode-specific round advancement
-	if mode == QueueModeCopy {
+	if mode == QueueModeCopy || mode == QueueModeCopyRetry {
 		q.AdvanceCopyRound()
 		return
 	}

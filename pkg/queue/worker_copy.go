@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path/filepath"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
@@ -113,21 +114,15 @@ func (w *CopyWorker) Run() {
 		// Execute the task (check for shutdown during execution if needed)
 		err := w.execute(task)
 		if err != nil {
-			// Record task error in main DB for cross-lookup (copy phase, SRC only)
 			if w.database != nil {
-				err := w.database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-					return s.WithTx(func(tx *db.Writer) error {
-						return tx.RecordTaskError("SRC", "copy", task.ID, err.Error(), task.Attempts, task.LocationPath())
-					})
-				})
-				if err != nil {
-					fmt.Println("error running write", err)
-				}
+				w.database.AppendTaskError("SRC", "copy", task.ID, err.Error(), task.Attempts, task.LocationPath())
 			}
 			if logservice.LS != nil {
+				logMsg := fmt.Sprintf("Copy worker task execution failed: path=%s round=%d pass=%d error=%v",
+					task.LocationPath(), task.Round, task.CopyPass, err)
+				// fmt.Println(logMsg)
 				err := logservice.LS.Log("error",
-					fmt.Sprintf("Copy worker task execution failed: path=%s round=%d pass=%d error=%v",
-						task.LocationPath(), task.Round, task.CopyPass, err),
+					logMsg,
 					"worker", w.id, w.queueName)
 				if err != nil {
 					fmt.Println("error logging", err)
@@ -179,10 +174,13 @@ func (w *CopyWorker) createFolder(task *TaskBase) error {
 		return fmt.Errorf("task missing DstParentID (ServiceID) for %s", folder.LocationPath)
 	}
 
-	// Create folder on destination using ServiceID
-	// CreateFolder(parentIdentifier string, folderName string) (types.Folder, error)
-	// For LocalFS: parentIdentifier is a path, for SpectraFS: parentIdentifier is a ServiceID
-	createdFolder, err := w.dstAdapter.CreateFolder(dstParentServiceID, folder.DisplayName)
+	// Create folder on destination using ServiceID.
+	// Adapter expects a single path component (base name), not a path.
+	folderName := filepath.Base(folder.LocationPath)
+	if folderName == "" || folderName == "." {
+		folderName = folder.DisplayName
+	}
+	createdFolder, err := w.dstAdapter.CreateFolder(dstParentServiceID, folderName)
 	if err != nil {
 		return fmt.Errorf("failed to create folder %s in parent %s: %w", folder.DisplayName, dstParentServiceID, err)
 	}
@@ -220,11 +218,15 @@ func (w *CopyWorker) copyFile(task *TaskBase) error {
 	}
 	defer srcReader.Close()
 
-	// Step 2: Create destination file with metadata
-	// CreateFile creates the file metadata and returns a types.File with ServiceID populated
-	createdFile, err := w.dstAdapter.CreateFile(ctx, dstParentServiceID, file.DisplayName, file.Size, nil)
+	// Step 2: Create destination file with metadata.
+	// Adapter expects a single path component (base name), not a path (e.g. Resumes/file.pdf).
+	fileName := filepath.Base(file.LocationPath)
+	if fileName == "" || fileName == "." {
+		fileName = file.DisplayName
+	}
+	createdFile, err := w.dstAdapter.CreateFile(ctx, dstParentServiceID, fileName, file.Size, nil)
 	if err != nil {
-		return fmt.Errorf("failed to create destination file %s in parent %s: %w", file.DisplayName, dstParentServiceID, err)
+		return fmt.Errorf("failed to create destination file %s in parent %s: %w", fileName, dstParentServiceID, err)
 	}
 
 	// Step 3: Open destination file for writing

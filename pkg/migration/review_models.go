@@ -84,10 +84,31 @@ type DiffsStats struct {
 	Excluded        int
 }
 
-// PathReviewActionResult is the result of a path review mutation. Deltas holds per-status/category changes (e.g. "pending": -1, "excluded": 1) so the UI can update each counter. AffectedCount is the total rows touched.
+// Canonical delta keys for PathReviewActionResult.Deltas. Only keys that changed (non-zero) are included.
+const (
+	DeltaTraversalPending     = "traversalPending"
+	DeltaTraversalPendingRetry = "traversalPendingRetry"
+	DeltaTraversalFailed      = "traversalFailed"
+	DeltaCopyPending          = "copyPending"
+	DeltaCopyFailed           = "copyFailed"
+	DeltaExcluded             = "excluded"
+	DeltaFolders              = "folders"
+	DeltaFiles                = "files"
+	DeltaSizeSrc              = "sizeSrc"
+	DeltaSizeDst              = "sizeDst"
+)
+
+// addReviewDelta sets deltas[key] = delta only when delta != 0, so the API omits unchanged counters.
+func addReviewDelta(deltas map[string]int64, key string, delta int64) {
+	if delta != 0 {
+		deltas[key] = delta
+	}
+}
+
+// PathReviewActionResult is the result of a path review mutation. Deltas holds per-status/category changes (only non-zero keys). UI applies them to the matching counter; phase determines which counters are shown.
 type PathReviewActionResult struct {
 	AffectedCount int64
-	Deltas        map[string]int64 // keys: "pending", "failed", "excluded", "pendingRetries", "folders", "files", "sizeSrc", "sizeDst"
+	Deltas        map[string]int64
 }
 
 // PathReviewStats is the UI/API-facing review stats shape. pendingCount, failedCount, and pendingRetriesCount are phase-aware.

@@ -60,6 +60,9 @@ type MigrationManager struct {
 	ownsDB         bool
 	openDBs        map[string]*db.DB   // cache: key = absolute DB file path
 	openDBsMu      sync.Mutex
+	// pendingLocks serializes "pending → persist" per migration id so only one goroutine runs openDB + createMigration + bindDB for a given id.
+	pendingMu   sync.Mutex
+	pendingLocks map[string]*sync.Mutex
 }
 
 var migrationIDCounter int64
@@ -94,8 +97,18 @@ func newMigrationManager(database *db.DB, ownsDB bool) *MigrationManager {
 		m.db = database
 	} else {
 		m.pendingRecords = make(map[string]migrationRecord)
+		m.pendingLocks = make(map[string]*sync.Mutex)
 	}
 	return m
+}
+
+func (m *MigrationManager) getPendingLock(id string) *sync.Mutex {
+	m.pendingMu.Lock()
+	defer m.pendingMu.Unlock()
+	if m.pendingLocks[id] == nil {
+		m.pendingLocks[id] = &sync.Mutex{}
+	}
+	return m.pendingLocks[id]
 }
 
 // Close releases manager-owned resources (single DB in legacy mode, or all open per-migration DBs).
@@ -190,6 +203,23 @@ func (m *MigrationManager) CreateMigration(cfg CreateMigrationConfig) (*Migratio
 		return instance, nil
 	}
 
+	// Single-DB mode (e.g. local test): use the manager's DB so the migration has a DB immediately.
+	if m.db != nil {
+		if err := m.store.createMigration(m.db, record); err != nil {
+			return nil, err
+		}
+		persisted, err := m.store.getMigration(m.db, id)
+		if err != nil {
+			return nil, err
+		}
+		if persisted != nil {
+			record = *persisted
+		}
+		instance := newMigration(m, record, m.db)
+		m.migrations[id] = instance
+		return instance, nil
+	}
+
 	// No path yet: return migration with generated ID; DB will be created when API calls GetMigration(id, migrationDir).
 	if m.pendingRecords == nil {
 		m.pendingRecords = make(map[string]migrationRecord)
@@ -200,12 +230,17 @@ func (m *MigrationManager) CreateMigration(cfg CreateMigrationConfig) (*Migratio
 	return instance, nil
 }
 
+// isDuplicateKey treats any error that looks like a duplicate/unique/primary-key violation as "already inserted", so callers can return the existing migration. Covers DuckDB and other drivers (e.g. "TransactionContext Error: ...").
 func isDuplicateKey(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "Duplicate key") || strings.Contains(msg, "primary key constraint")
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "duplicate key") ||
+		strings.Contains(msg, "primary key") ||
+		strings.Contains(msg, "unique constraint") ||
+		strings.Contains(msg, "constraint violated") ||
+		strings.Contains(msg, "constraint violation")
 }
 
 // GetMigration loads or returns a cached migration. When using per-migration DBs, pass the absolute path to that migration's folder (e.g. data/{id}); the engine creates or opens the DB at migrationDir/id.db. When migrationDir is empty, uses the legacy single DB (Path must have been set when creating the manager).
@@ -224,7 +259,7 @@ func (m *MigrationManager) GetMigration(id string, migrationDir string) (*Migrat
 			}
 			return existing, nil
 		}
-		// Pending migration (no DB yet): need migrationDir to create the DB
+		// Pending migration (no DB yet): need migrationDir to create the DB. Serialize per id so only one goroutine runs openDB + createMigration + bindDB.
 		if migrationDir == "" {
 			m.mu.Unlock()
 			return nil, fmt.Errorf("migration %q has no database yet: pass the migration folder path (e.g. data/%s) so the engine can create the DB", id, id)
@@ -235,15 +270,36 @@ func (m *MigrationManager) GetMigration(id string, migrationDir string) (*Migrat
 			return existing, nil
 		}
 		m.mu.Unlock()
+		lock := m.getPendingLock(id)
+		lock.Lock()
+		defer lock.Unlock()
+		m.mu.Lock()
+		existing = m.migrations[id]
+		if existing != nil && existing.DB != nil {
+			m.mu.Unlock()
+			if persisted, _ := m.store.getMigration(existing.DB, id); persisted != nil {
+				existing.syncRecord(*persisted)
+			}
+			return existing, nil
+		}
+		if existing == nil {
+			m.mu.Unlock()
+			return nil, nil
+		}
+		record, _ = m.pendingRecords[id]
+		m.mu.Unlock()
 		database, err := m.openDB(migrationDir, id)
 		if err != nil {
 			return nil, err
 		}
 		if err := m.store.createMigration(database, record); err != nil {
 			if isDuplicateKey(err) {
-				// Another goroutine already inserted and bound; return the cached migration.
 				m.mu.Lock()
 				out := m.migrations[id]
+				if out != nil {
+					delete(m.pendingRecords, id)
+					out.bindDB(database)
+				}
 				m.mu.Unlock()
 				if out != nil {
 					if persisted, _ := m.store.getMigration(database, id); persisted != nil {

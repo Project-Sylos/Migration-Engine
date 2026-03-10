@@ -55,18 +55,24 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	}
 
 	batchSize := refillFromDBBatchSize
+	requestLimit := batchSize + 1
 	var count int
 	if q.name == "dst" {
 		afterID := q.getDstKeysetCursor()
-		dstBatch, childrenByDstID, err := db.ListDstBatchWithSrcChildren(database, currentRound, afterID, batchSize, db.StatusPending)
+		dstBatch, childrenByDstID, err := db.ListDstBatchWithSrcChildren(database, currentRound, afterID, requestLimit, db.StatusPending)
 		if err != nil {
 			q.setLastPullWasPartial(true)
 			q.recordPull(currentRound, 0, true)
 			q.setFirstPullForRound(false)
 			return
 		}
-		expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta := BuildExpectedMapsFromDstWithChildren(dstBatch, childrenByDstID)
-		for _, fr := range dstBatch {
+		processLimit := batchSize
+		if len(dstBatch) <= batchSize {
+			processLimit = len(dstBatch)
+		}
+		expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta := BuildExpectedMapsFromDstWithChildren(dstBatch[:processLimit], childrenByDstID)
+		for i := 0; i < processLimit; i++ {
+			fr := dstBatch[i]
 			task := nodeStateToTask(fr.State, taskType)
 			if task != nil {
 				if task.ID == "" {
@@ -83,19 +89,29 @@ func (q *Queue) PullTraversalTasks(force bool) {
 			}
 		}
 		if len(dstBatch) > 0 {
-			q.setDstKeysetCursor(dstBatch[len(dstBatch)-1].Key)
+			cursorIdx := processLimit - 1
+			if cursorIdx < 0 {
+				cursorIdx = 0
+			}
+			q.setDstKeysetCursor(dstBatch[cursorIdx].Key)
 		}
+		q.setLastPullWasPartial(len(dstBatch) <= batchSize)
 	} else {
 		afterID := q.getSrcKeysetCursor()
 		queueType := getQueueType(q.name)
-		results, err := db.ListNodesByDepthKeyset(database, queueType, currentRound, afterID, db.StatusPending, batchSize)
+		results, err := db.ListNodesByDepthKeyset(database, queueType, currentRound, afterID, db.StatusPending, requestLimit)
 		if err != nil {
 			q.setLastPullWasPartial(true)
 			q.recordPull(currentRound, 0, true)
 			q.setFirstPullForRound(false)
 			return
 		}
-		for _, fr := range results {
+		processLimit := batchSize
+		if len(results) <= batchSize {
+			processLimit = len(results)
+		}
+		for i := 0; i < processLimit; i++ {
+			fr := results[i]
 			task := nodeStateToTask(fr.State, taskType)
 			if task != nil {
 				if task.ID == "" {
@@ -106,12 +122,15 @@ func (q *Queue) PullTraversalTasks(force bool) {
 			}
 		}
 		if len(results) > 0 {
-			q.setSrcKeysetCursor(results[len(results)-1].Key)
+			cursorIdx := processLimit - 1
+			if cursorIdx < 0 {
+				cursorIdx = 0
+			}
+			q.setSrcKeysetCursor(results[cursorIdx].Key)
 		}
+		q.setLastPullWasPartial(len(results) <= batchSize)
 	}
-	wasPartial := count < batchSize
-	q.setLastPullWasPartial(wasPartial)
-	q.recordPull(currentRound, count, wasPartial)
+	q.recordPull(currentRound, count, q.getLastPullWasPartial())
 	q.setFirstPullForRound(false)
 }
 
@@ -278,22 +297,57 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 		database.AppendDiscoveredNodes(childNodesToInsert)
 	}
 	fromRetry := q.GetMode() == QueueModeRetry
+	completionCopyStatus := state.CopyStatus
+	if q.name == "src" {
+		// Traversal completion should not overwrite copy_status; DST comparison/copy flows own that field.
+		completionCopyStatus = ""
+	}
 	database.AppendStatusEvent(queueType, db.StatusEvent{
-		ID:               nodeID,
-		TraversalStatus:  db.StatusSuccessful,
-		CopyStatus:       state.CopyStatus,
-		EventTime:        time.Now().UnixNano(),
-		Depth:            currentRound,
+		ID:                  nodeID,
+		TraversalStatus:     db.StatusSuccessful,
+		CopyStatus:          completionCopyStatus,
+		EventTime:           time.Now().UnixNano(),
+		Depth:               currentRound,
+		PrevTraversalStatus: state.TraversalStatus,
+		PrevCopyStatus:      state.CopyStatus,
 	}, fromRetry)
+
+	// DST comparison: persist SRC copy status for each matched child so path review shows correct copy_status.
+	if q.name == "dst" {
+		eventTime := time.Now().UnixNano()
+		for _, child := range task.DiscoveredChildren {
+			if child.SrcID == "" || child.SrcCopyStatus == "" {
+				continue
+			}
+			meta := task.ExpectedSrcNodeMeta[child.SrcID]
+			if child.SrcCopyStatus == meta.CopyStatus {
+				continue // No SRC copy-status change, so no event is needed.
+			}
+			prevTrav := meta.TraversalStatus
+			if prevTrav == "" {
+				prevTrav = db.StatusSuccessful
+			}
+			database.AppendStatusEvent("SRC", db.StatusEvent{
+				ID:                  child.SrcID,
+				TraversalStatus:     prevTrav,
+				CopyStatus:          child.SrcCopyStatus,
+				EventTime:           eventTime,
+				Depth:               nextRound,
+				PrevTraversalStatus: prevTrav,
+				PrevCopyStatus:      meta.CopyStatus, // old copy status before this comparison update
+			}, false)
+		}
+	}
 
 	// For SRC FOLDER tasks in retry mode: Re-queue DST task via status event and schedule DST child deletions.
 	if q.name == "src" && fromRetry && task.IsFolder() && task.RetryDstCleanup != nil {
 		c := task.RetryDstCleanup
 		database.AppendStatusEvent("DST", db.StatusEvent{
-			ID:              c.DstID,
-			TraversalStatus: db.StatusPending,
-			EventTime:       time.Now().UnixNano(),
-			Depth:           task.Round,
+			ID:                  c.DstID,
+			TraversalStatus:     db.StatusPending,
+			EventTime:           time.Now().UnixNano(),
+			Depth:               task.Round,
+			PrevTraversalStatus: c.DstOldStatus,
 		}, false)
 		deletions := make([]db.NodeDeletion, 0, len(c.Children))
 		for _, ch := range c.Children {
@@ -306,7 +360,6 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 
 	// Remove from in-progress LAST
 	q.removeInProgress(nodeID)
-	q.removeLeasedKey(nodeID)
 }
 
 // FailTraversalTask handles failure of traversal/retry tasks.
@@ -372,15 +425,15 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 	database := q.getDatabase()
 	if database != nil && nodeID != "" {
 		database.AppendStatusEvent(getQueueType(q.name), db.StatusEvent{
-			ID:              nodeID,
-			TraversalStatus: db.StatusFailed,
-			EventTime:       time.Now().UnixNano(),
-			Depth:           currentRound,
+			ID:                  nodeID,
+			TraversalStatus:     db.StatusFailed,
+			EventTime:           time.Now().UnixNano(),
+			Depth:               currentRound,
+			PrevTraversalStatus: db.StatusPending,
 		}, q.GetMode() == QueueModeRetry)
 	}
 	// Remove from in-progress LAST
 	q.removeInProgress(nodeID)
-	q.removeLeasedKey(nodeID)
 }
 
 // CheckTraversalCompletion checks if traversal/retry phase should complete.
@@ -433,10 +486,19 @@ func (q *Queue) CheckTraversalCompletion(currentRound int) bool {
 		}
 		return q.markComplete("No pending tasks found for round %d - traversal complete (first pull)", currentRound)
 	case QueueModeRetry:
+		// Per algorithms.md: only apply "pull -> see nothing -> end" when currentRound >= maxKnownDepth.
+		// Otherwise a round may have 0 retry items while deeper levels still do; return false so we advance the round.
+		if !wasFirstPull || pulledAmount != 0 {
+			return false
+		}
 		maxKnownDepth := q.getMaxKnownDepth()
+		if maxKnownDepth >= 0 && currentRound < maxKnownDepth {
+			return false
+		}
 		if maxKnownDepth >= 0 && currentRound > maxKnownDepth {
 			return q.markComplete("Retry sweep complete - past maxKnownDepth (%d), no pending at round %d", maxKnownDepth, currentRound)
 		}
+		return q.markComplete("Retry sweep complete - no pending at round %d", currentRound)
 	}
 	return false
 }

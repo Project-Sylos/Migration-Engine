@@ -274,7 +274,7 @@ func snapshotTraversalQueueStats(database *db.DB, coordinator *queue.QueueCoordi
 
 func completeTraversalRun(database *db.DB, coordinator *queue.QueueCoordinator, progressTicker *time.Ticker, start time.Time) RuntimeStats {
 	srcStats, dstStats := snapshotTraversalQueueStats(database, coordinator)
-	fmt.Println("\nMigration complete!")
+	fmt.Println("\nTraversal complete!")
 	progressTicker.Stop()
 	closeGlobalLoggerWithTimeout(1 * time.Second)
 	return RuntimeStats{

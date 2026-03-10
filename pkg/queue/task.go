@@ -22,6 +22,7 @@ const (
 // SrcNodeMeta holds Depth and CopyStatus for an SRC node; used by DST tasks at completion to avoid per-child DB lookups.
 type SrcNodeMeta struct {
 	Depth      int
+	TraversalStatus string
 	CopyStatus string
 }
 
@@ -59,10 +60,12 @@ type TaskBase struct {
 	DiscoveredChildren  []ChildResult      // Children discovered during execution
 	Round              int               // The round this task belongs to (for buffer coordination)
 	LeaseTime          time.Time         // Time when task was leased (for execution time tracking)
+	CopyStatus         string            // Current SRC copy status from DB (used to preserve copy_status on traversal completion events)
 	// Copy phase specific fields
-	CopyPass         int    // Copy pass number (1 for folders, 2 for files)
-	BytesTransferred int64  // Bytes transferred for file copy tasks
-	DstParentID      string // Destination parent folder ID for creation
+	CopyPass           int    // Copy pass number (1 for folders, 2 for files)
+	SrcTraversalStatus string // SRC node traversal_status at pull time (preserved when writing copy_status events)
+	BytesTransferred   int64  // Bytes transferred for file copy tasks
+	DstParentID        string // Destination parent folder ID for creation
 }
 
 // ChildResult represents a discovered child node with its traversal status.

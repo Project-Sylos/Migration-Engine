@@ -13,185 +13,78 @@ import (
 )
 
 // CheckCopyCompletion checks if the copy phase should switch passes or complete.
-// Returns true if the queue should mark as complete, false otherwise.
-// This is called when advanceToNextRound can't find a next round for the current pass.
-func (q *Queue) CheckCopyCompletion(currentRound int, wasFirstPull bool) bool {
+// Only called when we're past maxKnownDepth - the pass has exhausted itself round-by-round.
+// Trust the per-round logic; no re-checking of pending/inProgress/wasFirstPull.
+func (q *Queue) CheckCopyCompletion(currentRound int) bool {
 	database := q.getDatabase()
 	if database == nil {
 		return false
 	}
 
-	// Copy: must progress through all rounds up to maxKnownDepth in each pass
-	// Only switch from pass 1 to pass 2 after reaching maxKnownDepth
-	// This is similar to retry mode's pattern
 	copyPass := q.GetCopyPass()
 	maxKnownDepth := q.getMaxKnownDepth()
 
-	// If we haven't reached maxKnownDepth yet, don't switch passes
-	// Even if current round has no folders/files, we need to progress through all rounds
+	// Only consider pass switch/phase complete when we've exhausted all rounds for this pass
 	if maxKnownDepth >= 0 && currentRound < maxKnownDepth {
-		return false // Let advanceToNextRound handle progression
-	}
-
-	nodeType := db.NodeTypeFolder
-	if copyPass == 2 {
-		nodeType = db.NodeTypeFile
-	}
-
-	levels, err := db.GetAllLevels(database, "SRC")
-	if err != nil {
 		return false
 	}
 
-	hasAnyPendingForPass := false
-	hasAnyInProgressForPass := false
-	inProgressLevels := []int{}
-	for _, level := range levels {
-		if level == 0 {
-			continue
-		}
-		c, err := database.GetCopyCountAtDepth(level, nodeType, db.CopyStatusPending)
-		if err == nil && c > 0 {
-			hasAnyPendingForPass = true
-		}
-		c2, err := database.GetCopyCountAtDepth(level, nodeType, db.CopyStatusInProgress)
-		if err == nil && c2 > 0 {
-			hasAnyInProgressForPass = true
-			inProgressLevels = append(inProgressLevels, level)
-		}
-		if hasAnyPendingForPass && (hasAnyInProgressForPass || q.InProgressCount() > 0) {
-			break
-		}
-	}
-	hasAnyInProgressForPass = hasAnyInProgressForPass || q.InProgressCount() > 0
-
-	if hasAnyInProgressForPass && logservice.LS != nil {
-		_ = logservice.LS.Log("warn", fmt.Sprintf("Found in-progress tasks for pass %d (nodeType=%s) at levels: %v", copyPass, nodeType, inProgressLevels), "queue", q.name, q.name)
+	// if any in progress or pending in the current queue
+	// just to be safe.
+	if q.InProgressCount() > 0 || q.GetPendingCount() > 0 {
+		return false
 	}
 
-	// If no pending tasks in DuckDB, no in-progress tasks in DuckDB, no pending in memory,
-	// no in-progress in memory, and this was first pull, switch passes or complete
-	// CRITICAL: Must check both DuckDB AND memory state to avoid premature completion
-	// Tasks retrying are in-progress in DuckDB but pending in memory
-	if !hasAnyPendingForPass && !hasAnyInProgressForPass && q.GetPendingCount() == 0 && q.InProgressCount() == 0 && wasFirstPull {
-		if copyPass == 1 {
-			q.SetCopyPass(2)
+	if copyPass == 1 {
+		// Pass 1 (folders) done - switch to pass 2 (files); find starting round
+		q.SetCopyPass(2)
+		q.resetRoundStatsCompleted()
 
-			minLevel := -1
-			for _, level := range levels {
-				if level == 0 {
-					continue
-				}
-				c, err := database.GetCopyCountAtDepth(level, db.NodeTypeFile, db.CopyStatusPending)
-				if err == nil && c > 0 {
-					if minLevel == -1 || level < minLevel {
-						minLevel = level
-					}
-					break
-				}
-			}
+		q.SetRound(1)
+		q.setExpectedFromStatsBucket(1)
+		q.setLastPullWasPartial(false)
 
-			if minLevel == -1 {
-				// No file tasks found - pass 2 is also complete
-				return q.markComplete("Copy phase complete - both passes finished (no files to copy)")
-			}
-
-			q.SetRound(minLevel) // Set to minimum pending level for pass 2
-			q.setExpectedFromStatsBucket(minLevel)
-
-			if logservice.LS != nil {
-				err := logservice.LS.Log("info", fmt.Sprintf("Copy pass 1 (folders) complete, switching to pass 2 (files) at round %d", minLevel), "queue", q.name, q.name)
-				if err != nil {
-					fmt.Println("error logging", err)
-				}
-			}
-			return false // Not complete yet, just switching passes
-		} else if copyPass == 2 {
-			// Pass 2 (files) complete - copy phase is done
-			return q.markComplete("Copy phase complete - both passes finished")
-		}
+		return false
 	}
 
-	// Still have tasks for current pass - rounds will advance naturally
-	return false
+	// Pass 2 (files) complete
+	return q.markComplete("Copy phase complete - both passes finished")
 }
 
 // AdvanceCopyRound handles copy-specific round advancement logic.
-// Checks for pending tasks matching the current pass and advances to the next applicable round.
+// Round completion is determined by lastPullWasPartial (memory/keyset only); we never query the DB for in-round advancement.
+// When called, the current round has just completed - we always advance to currentRound+1.
 func (q *Queue) AdvanceCopyRound() {
-	database := q.getDatabase()
-	if database == nil {
-		return
-	}
-
 	currentRound := q.GetRound()
 	copyPass := q.GetCopyPass()
+	maxKnownDepth := q.getMaxKnownDepth()
 
-	nodeType := db.NodeTypeFolder
-	if copyPass == 2 {
-		nodeType = db.NodeTypeFile
-	}
+	// We just completed currentRound (lastPullWasPartial, pending empty, inProgress empty).
+	// Advance sequentially - no DB queries for "does this round have pending?" (DB is stale during round).
+	newRound := currentRound + 1
 
-	levels, err := db.GetAllLevels(database, "SRC")
-	if err != nil {
+	if maxKnownDepth >= 0 && newRound > maxKnownDepth {
+		// Past maxKnownDepth - check for pass switch or phase complete.
+		// DB can be used here: we're at phase boundary, flush has run, deciding phase-level completion.
+		if logservice.LS != nil {
+			err := logservice.LS.Log("info", fmt.Sprintf("Pass %d exhausted rounds (past maxKnownDepth %d), checking for completion", copyPass, maxKnownDepth), "queue", q.name, q.name)
+			if err != nil {
+				fmt.Println("error logging", err)
+			}
+		}
+		completed := q.checkCompletion(currentRound, CompletionCheckOptions{
+			CheckFinalCompletion: true,
+		})
+		if completed {
+			return
+		}
+		q.PullTasksIfNeeded(true)
 		return
 	}
 
-	c, err := database.GetCopyCountAtDepth(currentRound, nodeType, db.CopyStatusPending)
-	currentRoundHasPending := (err == nil && c > 0)
-
-	var newRound int
-	if currentRoundHasPending {
-		newRound = currentRound
-	} else {
-		newRound = -1
-		for _, level := range levels {
-			if level <= currentRound || level == 0 {
-				continue
-			}
-			c, err := database.GetCopyCountAtDepth(level, nodeType, db.CopyStatusPending)
-			if err == nil && c > 0 {
-				newRound = level
-				break
-			}
-		}
-	}
-
-	// If no next round found with tasks, check if we should advance sequentially or switch passes
-	if newRound == -1 {
-		maxKnownDepth := q.getMaxKnownDepth()
-
-		// If we're below maxKnownDepth, advance sequentially even if no tasks exist
-		// This maintains BFS progression through all levels
-		if maxKnownDepth >= 0 && currentRound < maxKnownDepth {
-			newRound = currentRound + 1
-		} else {
-			// At or past maxKnownDepth - check if we should switch passes or complete
-			if logservice.LS != nil {
-				err := logservice.LS.Log("info", fmt.Sprintf("No more rounds with pending tasks for pass %d, checking for completion", copyPass), "queue", q.name, q.name)
-				if err != nil {
-					fmt.Println("error logging", err)
-				}
-			}
-			// Check for final completion (will switch passes or mark complete)
-			completed := q.checkCompletion(currentRound, CompletionCheckOptions{
-				CheckFinalCompletion: true,
-				WasFirstPull:         true,
-			})
-			if completed {
-				// Queue is complete - state is set to QueueStateCompleted
-				return
-			}
-			// If not completed, we switched passes - round was reset to minimum for new pass
-			// Pull tasks for the new pass
-			q.PullTasksIfNeeded(true)
-			return
-		}
-	}
-
-	// Get stats for logging
 	q.SetRound(newRound)
 	q.setExpectedFromStatsBucket(newRound)
+	q.setLastPullWasPartial(false)
 
 	passName := "folders"
 	if copyPass == 2 {
@@ -258,25 +151,41 @@ func (q *Queue) PullCopyTasks(force bool) {
 	}
 
 	batchSize := effectiveLeaseBatchSize()
-	// DB-backed: pull directly from DuckDB via ListNodesCopyKeyset
-	results, err := db.ListNodesCopyKeyset(database, currentRound, nodeType, q.getCopyKeysetCursor(), batchSize)
+	copyStatusFilter := db.CopyStatusPending
+	if q.GetMode() == QueueModeCopyRetry {
+		copyStatusFilter = db.CopyStatusFailed
+	}
+	// Request limit+1 to detect keyspace exhaustion: if we get <= limit, we're done; else more exists.
+	requestLimit := batchSize + 1
+	results, err := db.ListNodesCopyKeyset(database, currentRound, nodeType, q.getCopyKeysetCursor(), requestLimit, copyStatusFilter)
 	if err != nil {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("error", fmt.Sprintf("ListNodesCopyKeyset failed: %v", err), "queue", q.name, q.name)
 		}
 		return
 	}
+	// Process at most batchSize items this pull; the extra (+1) is only for exhaustion detection
+	processLimit := batchSize
+	if len(results) <= processLimit {
+		processLimit = len(results)
+	}
 	var matchedBatch []db.FetchResult
-	for _, r := range results {
-		if r.State == nil || q.isLeased(r.Key) {
+	for i := 0; i < processLimit; i++ {
+		r := results[i]
+		if r.State == nil {
 			continue
 		}
 		matchedBatch = append(matchedBatch, r)
 	}
-	if len(matchedBatch) > 0 {
-		q.setCopyKeysetCursor(matchedBatch[len(matchedBatch)-1].Key)
+	// Cursor = last item we consumed. lastPullWasPartial = keyspace exhausted (got <= batchSize from DB).
+	if len(results) > 0 {
+		cursorIdx := processLimit - 1
+		if cursorIdx < 0 {
+			cursorIdx = 0
+		}
+		q.setCopyKeysetCursor(results[cursorIdx].Key)
 	}
-	hitEndOfBucket := len(results) < batchSize
+	q.setLastPullWasPartial(len(results) <= batchSize)
 
 	// Batch resolve parent SRC ID -> DST ID -> DST node (ServiceID). No per-item DB reads.
 	parentIDSet := make(map[string]struct{})
@@ -359,7 +268,7 @@ func (q *Queue) PullCopyTasks(force bool) {
 		dstParentULID := dstIDBySrcID[item.State.ParentID]
 		if dstParentULID == "" {
 			if logservice.LS != nil {
-				err := logservice.LS.Log("warn", fmt.Sprintf("No join-lookup for parent %s of %s", item.State.ParentID, item.State.Path), "queue", q.name, q.name)
+				err := logservice.LS.Log("warning", fmt.Sprintf("No join-lookup for parent %s of %s", item.State.ParentID, item.State.Path), "queue", q.name, q.name)
 				if err != nil {
 					fmt.Println("error logging", err)
 				}
@@ -379,19 +288,12 @@ func (q *Queue) PullCopyTasks(force bool) {
 		task.DstParentID = dstParentNode.ServiceID
 
 		if q.Add(task) {
-			q.addLeasedKey(item.Key)
 			enqueueSuccessCount++
 		}
 	}
 
-	// Track if this pull was partial
-	// wasPartial = true when we hit the end of the bucket (couldn't collect enough matching items)
-	// This accurately signals when we've exhausted the current round for this pass
-	wasPartial := hitEndOfBucket
-	q.setLastPullWasPartial(wasPartial)
-
-	// Record pull in RoundInfo; after first pull we're no longer "first pull for round"
-	q.recordPull(currentRound, len(matchedBatch), wasPartial)
+	// Record pull in RoundInfo; lastPullWasPartial already set from raw DB result count
+	q.recordPull(currentRound, enqueueSuccessCount, q.getLastPullWasPartial())
 	q.setFirstPullForRound(false)
 }
 
@@ -402,15 +304,17 @@ func nodeStateToCopyTask(state *db.NodeState, taskType string, copyPass int) *Ta
 	}
 
 	task := &TaskBase{
-		ID:          state.ID,
-		Type:        taskType,
-		Round:       state.Depth,
-		CopyPass:    copyPass,
-		Attempts:    0,
-		Status:      "",
-		Locked:      false,
-		LeaseTime:   time.Now(),
-		DstParentID: "",
+		ID:                 state.ID,
+		Type:               taskType,
+		Round:              state.Depth,
+		CopyPass:           copyPass,
+		Attempts:           0,
+		Status:             "",
+		Locked:             false,
+		LeaseTime:          time.Now(),
+		DstParentID:        "",
+		CopyStatus:         state.CopyStatus,
+		SrcTraversalStatus: state.TraversalStatus,
 	}
 
 	// Populate folder or file based on node type
@@ -463,7 +367,7 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 	q.recordTaskCompletion(currentRound, true)
 
 	taskType := types.NodeTypeFile
-	taskPath := task.LocationPath()
+	taskPath := db.NormalizeRootRelativePath(task.LocationPath())
 	taskName := task.File.DisplayName
 	taskSize := task.File.Size
 	taskMTime := task.File.LastUpdated
@@ -473,12 +377,20 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 		taskMTime = task.Folder.LastUpdated
 	}
 
+	parentPath := task.File.ParentPath
+	if task.IsFolder() {
+		parentPath = task.Folder.ParentPath
+	}
+	parentPath = db.NormalizeRootRelativePath(parentPath)
+
 	// DB-backed: append SRC copy status event and DST node to seal buffer
 	database.AppendStatusEvent("SRC", db.StatusEvent{
-		ID:         nodeID,
-		CopyStatus: db.CopyStatusSuccessful,
-		EventTime:  time.Now().UnixNano(),
-		Depth:      currentRound,
+		ID:              nodeID,
+		TraversalStatus: task.SrcTraversalStatus,
+		CopyStatus:      db.CopyStatusSuccessful,
+		PrevCopyStatus:  task.CopyStatus,
+		EventTime:       time.Now().UnixNano(),
+		Depth:           currentRound,
 	}, false)
 	dstNodeID := db.DeterministicNodeID("DST", taskType, taskPath)
 	var dstServiceID string
@@ -487,11 +399,16 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 	} else {
 		dstServiceID = task.File.ServiceID
 	}
+	dstParentID := ""
+	if parentPath != "" && parentPath != "/" {
+		dstParentID = db.DeterministicNodeID("DST", db.NodeTypeFolder, parentPath)
+	}
 	dstNode := &db.NodeState{
 		ID:              dstNodeID,
 		ServiceID:       dstServiceID,
-		ParentID:        "",
+		ParentID:        dstParentID,
 		ParentServiceID: task.DstParentID,
+		ParentPath:      parentPath,
 		Name:            taskName,
 		Path:            taskPath,
 		Type:            taskType,
@@ -515,7 +432,6 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 	q.mu.Unlock()
 
 	q.removeInProgress(nodeID)
-	q.removeLeasedKey(nodeID)
 }
 
 // FailCopyTask handles failure of copy tasks.
@@ -553,9 +469,6 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 		task.Locked = false
 		q.removeInProgress(nodeID)
 
-		// Remove from leased set so it can be pulled again
-		q.removeLeasedKey(nodeID)
-
 		// Re-enqueue to memory pending buffer (append, not insert at 0)
 		// The task stays as in-progress in DuckDB to avoid unnecessary writes
 		// It will be pulled from memory on the next worker cycle
@@ -573,19 +486,21 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 		task.Locked = false
 		task.Status = "failed"
 
+		q.incrementRoundStatsCompleted(currentRound)
 		q.incrementRoundStatsFailed(currentRound)
 		q.incrementTasksCompletedTotal()
 		q.recordTaskCompletion(currentRound, false)
 
 		database.AppendStatusEvent("SRC", db.StatusEvent{
-			ID:         nodeID,
-			CopyStatus: db.CopyStatusFailed,
-			EventTime:  time.Now().UnixNano(),
-			Depth:      currentRound,
+			ID:              nodeID,
+			TraversalStatus: task.SrcTraversalStatus,
+			CopyStatus:      db.CopyStatusFailed,
+			PrevCopyStatus:  task.CopyStatus,
+			EventTime:       time.Now().UnixNano(),
+			Depth:           currentRound,
 		}, false)
 
 		q.removeInProgress(nodeID)
-		q.removeLeasedKey(nodeID)
 
 		if logservice.LS != nil {
 			err := logservice.LS.Log("error",

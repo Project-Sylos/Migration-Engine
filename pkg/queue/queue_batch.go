@@ -35,7 +35,7 @@ func BuildExpectedMapsFromDstWithChildren(dstBatch []db.FetchResult, childrenByD
 			}
 			matchKey := n.Type + ":" + displayName
 			idMap[matchKey] = n.ID
-			srcIDToMeta[n.ID] = SrcNodeMeta{Depth: n.Depth, CopyStatus: n.CopyStatus}
+			srcIDToMeta[n.ID] = SrcNodeMeta{Depth: n.Depth, TraversalStatus: n.TraversalStatus, CopyStatus: n.CopyStatus}
 			if n.Type == types.NodeTypeFolder {
 				folders = append(folders, types.Folder{
 					ServiceID:    n.ServiceID,
@@ -117,7 +117,7 @@ func BatchLoadExpectedChildrenByDSTIDs(database *db.DB, dstParentIDs []string, d
 			}
 			matchKey := n.Type + ":" + displayName
 			idMap[matchKey] = n.ID
-			srcIDToMeta[n.ID] = SrcNodeMeta{Depth: n.Depth, CopyStatus: n.CopyStatus}
+			srcIDToMeta[n.ID] = SrcNodeMeta{Depth: n.Depth, TraversalStatus: n.TraversalStatus, CopyStatus: n.CopyStatus}
 			if n.Type == types.NodeTypeFolder {
 				folders = append(folders, types.Folder{
 					ServiceID:    n.ServiceID,

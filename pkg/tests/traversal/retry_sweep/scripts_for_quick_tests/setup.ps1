@@ -27,6 +27,8 @@ New-Item -ItemType Directory -Path $TreeA | Out-Null
 New-Item -ItemType Directory -Path "$TreeA\subfolder_a" | Out-Null
 "test file 1" | Out-File "$TreeA\file1.txt"
 "test file 2" | Out-File "$TreeA\subfolder_a\file2.txt"
+"A extra 1" | Out-File "$TreeA\extra1.txt"
+"A extra 2" | Out-File "$TreeA\extra2.txt"
 # Only A/items has file1.txt and subfolder_a with a file
 
 # Create B/items (DST) with a superset structure

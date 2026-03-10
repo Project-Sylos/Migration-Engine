@@ -19,7 +19,21 @@ func tableName(table string) string {
 
 // Current status from events (join with nodes to get traversal_status, copy_status, excluded).
 const (
-	cteSrcCurrentStatus = `(SELECT id, arg_max(traversal_status, event_time) AS traversal_status, arg_max(copy_status, event_time) AS copy_status FROM src_status_events GROUP BY id)`
+	cteSrcCurrentStatus = `(WITH src_traversal AS (
+		SELECT id, arg_max(traversal_status, event_time) AS traversal_status
+		FROM src_status_events
+		GROUP BY id
+	), src_copy AS (
+		SELECT id, arg_max(copy_status, event_time) AS copy_status
+		FROM src_status_events
+		WHERE COALESCE(copy_status, '') <> ''
+		GROUP BY id
+	)
+	SELECT COALESCE(t.id, c.id) AS id,
+		COALESCE(t.traversal_status, '') AS traversal_status,
+		COALESCE(c.copy_status, '') AS copy_status
+	FROM src_traversal t
+	FULL OUTER JOIN src_copy c ON t.id = c.id)`
 	cteDstCurrentStatus = `(SELECT id, arg_max(traversal_status, event_time) AS traversal_status FROM dst_status_events GROUP BY id)`
 )
 
@@ -35,9 +49,9 @@ func selectNodeColsWithStatus(table string) string {
 	t := tableName(table)
 	n, e, cte := statusJoinExpr(table)
 	if table == "DST" {
-		return `SELECT ` + n + `.id, ` + n + `.service_id, ` + n + `.parent_id, ` + n + `.parent_service_id, ` + n + `.path, ` + n + `.parent_path, ` + n + `.type, ` + n + `.size, ` + n + `.mtime, ` + n + `.depth, COALESCE(` + e + `.traversal_status,'') AS traversal_status, '' AS copy_status, (COALESCE(` + e + `.traversal_status,'') IN ('excluded','exclusion_inherited')) AS excluded, '' AS errors FROM ` + t + ` ` + n + ` LEFT JOIN ` + cte + ` ` + e + ` ON ` + n + `.id = ` + e + `.id`
+		return `SELECT ` + n + `.id, ` + n + `.service_id, ` + n + `.parent_id, ` + n + `.parent_service_id, ` + n + `.path, ` + n + `.parent_path, ` + n + `.type, ` + n + `.size, ` + n + `.mtime, ` + n + `.depth, COALESCE(` + e + `.traversal_status,'') AS traversal_status, '' AS copy_status, 0 AS excluded, '' AS errors FROM ` + t + ` ` + n + ` LEFT JOIN ` + cte + ` ` + e + ` ON ` + n + `.id = ` + e + `.id`
 	}
-	return `SELECT ` + n + `.id, ` + n + `.service_id, ` + n + `.parent_id, ` + n + `.parent_service_id, ` + n + `.path, ` + n + `.parent_path, ` + n + `.type, ` + n + `.size, ` + n + `.mtime, ` + n + `.depth, COALESCE(` + e + `.traversal_status,'') AS traversal_status, COALESCE(` + e + `.copy_status,'') AS copy_status, (COALESCE(` + e + `.traversal_status,'') IN ('excluded','exclusion_inherited')) AS excluded, '' AS errors FROM ` + t + ` ` + n + ` LEFT JOIN ` + cte + ` ` + e + ` ON ` + n + `.id = ` + e + `.id`
+	return `SELECT ` + n + `.id, ` + n + `.service_id, ` + n + `.parent_id, ` + n + `.parent_service_id, ` + n + `.path, ` + n + `.parent_path, ` + n + `.type, ` + n + `.size, ` + n + `.mtime, ` + n + `.depth, COALESCE(` + e + `.traversal_status,'') AS traversal_status, COALESCE(` + e + `.copy_status,'') AS copy_status, (COALESCE(` + e + `.copy_status,'') IN ('excluded_explicit','excluded_inherited')) AS excluded, '' AS errors FROM ` + t + ` ` + n + ` LEFT JOIN ` + cte + ` ` + e + ` ON ` + n + `.id = ` + e + `.id`
 }
 
 // QueryNodesForReview returns nodes from the given table (SRC or DST) with optional depth, status, excluded, pathLike filters. Status from events. Used by review API.
@@ -61,10 +75,16 @@ func QueryNodesForReview(d *DB, table string, depth *int, status string, exclude
 		args = append(args, status)
 		param++
 	}
-	if excluded != nil && *excluded {
-		base += ` AND (` + e + `.traversal_status = 'excluded' OR ` + e + `.traversal_status = 'exclusion_inherited')`
-	} else if excluded != nil && !*excluded {
-		base += ` AND (` + e + `.traversal_status IS NULL OR (` + e + `.traversal_status <> 'excluded' AND ` + e + `.traversal_status <> 'exclusion_inherited'))`
+	// Exclusion is SRC-only (copy_status). DST has no excluded state.
+	if excluded != nil && table == "SRC" {
+		if *excluded {
+			base += ` AND (` + e + `.copy_status = 'excluded_explicit' OR ` + e + `.copy_status = 'excluded_inherited')`
+		} else {
+			base += ` AND (COALESCE(` + e + `.copy_status,'') NOT IN ('excluded_explicit','excluded_inherited'))`
+		}
+	}
+	if excluded != nil && table == "DST" && *excluded {
+		base += ` AND 0=1`
 	}
 	if pathLike != "" {
 		base += ` AND ` + nodeAlias + `.path LIKE $` + strconv.Itoa(param)
@@ -115,7 +135,7 @@ SELECT
 	COALESCE(se.traversal_status, '') AS src_traversal_status,
 	COALESCE(de.traversal_status, '') AS dst_traversal_status,
 	COALESCE(se.copy_status, '') AS copy_status,
-	(COALESCE(se.traversal_status,'') IN ('excluded','exclusion_inherited') OR COALESCE(de.traversal_status,'') IN ('excluded','exclusion_inherited')) AS excluded,
+	(COALESCE(se.copy_status,'') IN ('excluded_explicit','excluded_inherited')) AS excluded,
 	COALESCE(s.size, d.size, 0) AS size,
 	COALESCE(s.size, 0) AS src_size,
 	COALESCE(d.size, 0) AS dst_size,
@@ -487,17 +507,17 @@ func ListNodesByDepthKeyset(d *DB, table string, depth int, afterID, statusFilte
 	return out, rows.Err()
 }
 
-// ListNodesCopyKeyset returns src_nodes at depth for copy phase with current copy_status = 'pending' (event-derived), ordered by id.
-func ListNodesCopyKeyset(d *DB, depth int, nodeType, afterID string, limit int) ([]FetchResult, error) {
+// ListNodesCopyKeyset returns src_nodes at depth with current copy_status = statusFilter (event-derived), ordered by id. Pass CopyStatusPending for copy phase, CopyStatusFailed for copy-retry.
+func ListNodesCopyKeyset(d *DB, depth int, nodeType, afterID string, limit int, statusFilter string) ([]FetchResult, error) {
 	conn, err := d.GetDBForPulls("SRC")
 	if err != nil {
 		return nil, err
 	}
 	ctx := context.Background()
 	_, e, _ := statusJoinExpr("SRC")
-	base := selectNodeColsWithStatus("SRC") + ` WHERE n.depth = $1 AND ` + e + `.copy_status = 'pending'`
-	args := []interface{}{depth}
-	param := 2
+	base := selectNodeColsWithStatus("SRC") + ` WHERE n.depth = $1 AND ` + e + `.copy_status = $2`
+	args := []interface{}{depth, statusFilter}
+	param := 3
 	if nodeType != "" {
 		base += ` AND n.type = $` + strconv.Itoa(param)
 		args = append(args, nodeType)
@@ -571,16 +591,18 @@ func CountSubtree(d *DB, table, rootPath string) (SubtreeStats, error) {
 	return stats, nil
 }
 
-// CountExcludedInSubtree returns the number of nodes in the subtree whose current traversal_status is excluded or exclusion_inherited.
+// CountExcludedInSubtree returns the number of SRC nodes in the subtree with copy_status in (excluded_explicit, excluded_inherited). Exclusion is SRC-only; returns 0 for DST.
 func CountExcludedInSubtree(d *DB, table, rootPath string) (int, error) {
+	if table == "DST" {
+		return 0, nil
+	}
 	conn, err := d.GetDB()
 	if err != nil {
 		return 0, err
 	}
-	t := tableName(table)
-	nodeAlias, e, cte := statusJoinExpr(table)
+	nodeAlias, e, cte := statusJoinExpr("SRC")
 	ctx := context.Background()
-	base := `SELECT COUNT(*)::INT FROM ` + t + ` ` + nodeAlias + ` LEFT JOIN ` + cte + ` ` + e + ` ON ` + nodeAlias + `.id = ` + e + `.id WHERE (` + e + `.traversal_status = 'excluded' OR ` + e + `.traversal_status = 'exclusion_inherited')`
+	base := `SELECT COUNT(*)::INT FROM ` + tableSrcNodes + ` ` + nodeAlias + ` LEFT JOIN ` + cte + ` ` + e + ` ON ` + nodeAlias + `.id = ` + e + `.id WHERE (COALESCE(` + e + `.copy_status,'') IN ('excluded_explicit','excluded_inherited'))`
 	var nCount int
 	if rootPath == "/" {
 		err = conn.QueryRowContext(ctx, base+` AND `+nodeAlias+`.path LIKE '/%'`).Scan(&nCount)
@@ -594,16 +616,18 @@ func CountExcludedInSubtree(d *DB, table, rootPath string) (int, error) {
 	return nCount, nil
 }
 
-// CountExcluded returns the number of nodes whose current traversal_status is excluded or exclusion_inherited.
+// CountExcluded returns the number of SRC nodes with copy_status in (excluded_explicit, excluded_inherited). Exclusion is SRC-only; returns 0 for DST.
 func CountExcluded(d *DB, table string) (int, error) {
+	if table == "DST" {
+		return 0, nil
+	}
 	conn, err := d.GetDB()
 	if err != nil {
 		return 0, err
 	}
-	t := tableName(table)
-	nodeAlias, e, cte := statusJoinExpr(table)
+	nodeAlias, e, cte := statusJoinExpr("SRC")
 	ctx := context.Background()
-	q := `SELECT COUNT(*)::INT FROM ` + t + ` ` + nodeAlias + ` LEFT JOIN ` + cte + ` ` + e + ` ON ` + nodeAlias + `.id = ` + e + `.id WHERE (` + e + `.traversal_status = 'excluded' OR ` + e + `.traversal_status = 'exclusion_inherited')`
+	q := `SELECT COUNT(*)::INT FROM ` + tableSrcNodes + ` ` + nodeAlias + ` LEFT JOIN ` + cte + ` ` + e + ` ON ` + nodeAlias + `.id = ` + e + `.id WHERE (COALESCE(` + e + `.copy_status,'') IN ('excluded_explicit','excluded_inherited'))`
 	var nCount int
 	err = conn.QueryRowContext(ctx, q).Scan(&nCount)
 	if err != nil {
@@ -718,13 +742,13 @@ func ListDstBatchWithSrcChildren(d *DB, depth int, afterID string, limit int, tr
 dst_batch AS (
   SELECT dn.id, dn.service_id, dn.parent_id, dn.parent_service_id, dn.path, dn.parent_path, dn.path_hash, dn.type, dn.size, dn.mtime, dn.depth,
     COALESCE(de.traversal_status,'') AS traversal_status, '' AS copy_status,
-    (COALESCE(de.traversal_status,'') IN ('excluded','exclusion_inherited')) AS excluded, '' AS errors
+    0 AS excluded, '' AS errors
   FROM ` + tableDstNodes + ` dn LEFT JOIN dst_current de ON dn.id = de.id WHERE ` + cteWhere + ` ORDER BY dn.id LIMIT ` + limitParam + `
 ),
 src_current AS ` + cteSrcCurrentStatus + `
 SELECT
   d.id AS d_id, d.service_id AS d_service_id, d.parent_id AS d_parent_id, d.parent_service_id AS d_parent_service_id, d.path AS d_path, d.parent_path AS d_parent_path, d.type AS d_type, d.size AS d_size, d.mtime AS d_mtime, d.depth AS d_depth, d.traversal_status AS d_traversal_status, d.copy_status AS d_copy_status, d.excluded AS d_excluded, d.errors AS d_errors,
-  COALESCE(sn.id, '') AS s_id, COALESCE(sn.service_id, '') AS s_service_id, COALESCE(sn.parent_id, '') AS s_parent_id, COALESCE(sn.parent_service_id, '') AS s_parent_service_id, COALESCE(sn.path, '') AS s_path, COALESCE(sn.parent_path, '') AS s_parent_path, COALESCE(sn.type, '') AS s_type, sn.size AS s_size, COALESCE(sn.mtime, '') AS s_mtime, COALESCE(sn.depth, 0) AS s_depth, COALESCE(se.traversal_status, '') AS s_traversal_status, COALESCE(se.copy_status, '') AS s_copy_status, (COALESCE(se.traversal_status,'') IN ('excluded','exclusion_inherited')) AS s_excluded, '' AS s_errors
+  COALESCE(sn.id, '') AS s_id, COALESCE(sn.service_id, '') AS s_service_id, COALESCE(sn.parent_id, '') AS s_parent_id, COALESCE(sn.parent_service_id, '') AS s_parent_service_id, COALESCE(sn.path, '') AS s_path, COALESCE(sn.parent_path, '') AS s_parent_path, COALESCE(sn.type, '') AS s_type, sn.size AS s_size, COALESCE(sn.mtime, '') AS s_mtime, COALESCE(sn.depth, 0) AS s_depth, COALESCE(se.traversal_status, '') AS s_traversal_status, COALESCE(se.copy_status, '') AS s_copy_status, (COALESCE(se.copy_status,'') IN ('excluded_explicit','excluded_inherited')) AS s_excluded, '' AS s_errors
 FROM dst_batch d
 LEFT JOIN ` + tableSrcNodes + ` sn ON sn.parent_path_hash = d.path_hash
 LEFT JOIN src_current se ON sn.id = se.id
@@ -824,7 +848,7 @@ func GetSrcChildrenGroupedByParentPath(d *DB, parentPaths []string) (map[string]
 		parentPathHashes[i] = PathHash(p)
 	}
 	nodeAlias, e, cte := statusJoinExpr("SRC")
-	sel := `SELECT ` + nodeAlias + `.parent_path, ` + nodeAlias + `.id, ` + nodeAlias + `.service_id, ` + nodeAlias + `.parent_id, ` + nodeAlias + `.parent_service_id, ` + nodeAlias + `.path, ` + nodeAlias + `.type, ` + nodeAlias + `.size, ` + nodeAlias + `.mtime, ` + nodeAlias + `.depth, COALESCE(` + e + `.traversal_status,'') AS traversal_status, COALESCE(` + e + `.copy_status,'') AS copy_status, (COALESCE(` + e + `.traversal_status,'') IN ('excluded','exclusion_inherited')) AS excluded, '' AS errors FROM ` + tableSrcNodes + ` ` + nodeAlias + ` LEFT JOIN ` + cte + ` ` + e + ` ON ` + nodeAlias + `.id = ` + e + `.id WHERE ` + nodeAlias + `.parent_path_hash IN (`
+	sel := `SELECT ` + nodeAlias + `.parent_path, ` + nodeAlias + `.id, ` + nodeAlias + `.service_id, ` + nodeAlias + `.parent_id, ` + nodeAlias + `.parent_service_id, ` + nodeAlias + `.path, ` + nodeAlias + `.type, ` + nodeAlias + `.size, ` + nodeAlias + `.mtime, ` + nodeAlias + `.depth, COALESCE(` + e + `.traversal_status,'') AS traversal_status, COALESCE(` + e + `.copy_status,'') AS copy_status, (COALESCE(` + e + `.copy_status,'') IN ('excluded_explicit','excluded_inherited')) AS excluded, '' AS errors FROM ` + tableSrcNodes + ` ` + nodeAlias + ` LEFT JOIN ` + cte + ` ` + e + ` ON ` + nodeAlias + `.id = ` + e + `.id WHERE ` + nodeAlias + `.parent_path_hash IN (`
 	for i := 0; i < len(parentPathHashes); i += chunk {
 		end := i + chunk
 		if end > len(parentPathHashes) {

@@ -205,6 +205,7 @@ type CopyStatusCounts struct {
 	Successful int64
 	Failed     int64
 	Skipped    int64
+	Excluded   int64 // excluded_explicit + excluded_inherited
 }
 
 // GetCopyStatusCountsFromEvents returns counts of SRC nodes by current copy_status from src_status_events (arg_max per id). Use for review/API counts.
@@ -215,7 +216,12 @@ func (db *DB) GetCopyStatusCountsFromEvents() (CopyStatusCounts, error) {
 		return out, err
 	}
 	ctx := context.Background()
-	q := `WITH latest AS (SELECT id, arg_max(copy_status, event_time) AS copy_status FROM ` + tableSrcStatusEvents + ` GROUP BY id)
+	q := `WITH latest AS (
+SELECT id, arg_max(copy_status, event_time) AS copy_status
+FROM ` + tableSrcStatusEvents + `
+WHERE COALESCE(copy_status, '') <> ''
+GROUP BY id
+)
 SELECT COALESCE(e.copy_status,'') AS status, count(*)::BIGINT FROM ` + tableSrcNodes + ` n LEFT JOIN latest e ON n.id = e.id GROUP BY 1`
 	rows, err := conn.QueryContext(ctx, q)
 	if err != nil {
@@ -237,6 +243,8 @@ SELECT COALESCE(e.copy_status,'') AS status, count(*)::BIGINT FROM ` + tableSrcN
 			out.Failed += n
 		case CopyStatusSkipped:
 			out.Skipped += n
+		case CopyStatusExcludedExplicit, CopyStatusExcludedInherited:
+			out.Excluded += n
 		default:
 			out.Pending += n
 		}
@@ -300,28 +308,51 @@ func (db *DB) GetStatsCountAtDepth(table string, depth int, key string) (int64, 
 	return 0, nil
 }
 
-// GetCopyCountAtDepth returns the count of nodes in src_nodes at the given depth with current copy_status (event-derived). Optional nodeType filter.
-func (db *DB) GetCopyCountAtDepth(depth int, nodeType string, copyStatus string) (int64, error) {
+// GetCopyCountAtDepth returns the count of nodes in src_nodes at the given depth with current copy_status (event-derived).
+// Optional nodeType filter. If breakAtFirst is true, returns 1 if any matching node exists or 0 otherwise.
+func (db *DB) GetCopyCountAtDepth(depth int, nodeType string, copyStatus string, breakAtFirst bool) (int64, error) {
 	conn, err := db.GetDB()
 	if err != nil {
 		return 0, err
 	}
 	ctx := context.Background()
-	q := `SELECT COUNT(*)::BIGINT FROM src_nodes n LEFT JOIN ` + cteSrcCurrentStatus + ` e ON n.id = e.id WHERE n.depth = $1 AND COALESCE(e.copy_status,'') = $2`
+
+	var q string
 	args := []interface{}{depth, copyStatus}
-	if nodeType != "" {
-		q += ` AND n.type = $3`
-		args = append(args, nodeType)
+
+	if breakAtFirst {
+		// Break at the first occurrence: just check for existence.
+		q = `SELECT 1 FROM src_nodes n LEFT JOIN ` + cteSrcCurrentStatus + ` e ON n.id = e.id WHERE n.depth = $1 AND COALESCE(e.copy_status,'') = $2`
+		if nodeType != "" {
+			q += ` AND n.type = $3`
+			args = append(args, nodeType)
+		}
+		q += ` LIMIT 1`
+		var dummy int
+		err = conn.QueryRowContext(ctx, q, args...).Scan(&dummy)
+		if err == sql.ErrNoRows {
+			return 0, nil
+		}
+		if err != nil {
+			return 0, err
+		}
+		return 1, nil
+	} else {
+		q = `SELECT COUNT(*)::BIGINT FROM src_nodes n LEFT JOIN ` + cteSrcCurrentStatus + ` e ON n.id = e.id WHERE n.depth = $1 AND COALESCE(e.copy_status,'') = $2`
+		if nodeType != "" {
+			q += ` AND n.type = $3`
+			args = append(args, nodeType)
+		}
+		var n sql.NullInt64
+		err = conn.QueryRowContext(ctx, q, args...).Scan(&n)
+		if err != nil {
+			return 0, err
+		}
+		if n.Valid {
+			return n.Int64, nil
+		}
+		return 0, nil
 	}
-	var n sql.NullInt64
-	err = conn.QueryRowContext(ctx, q, args...).Scan(&n)
-	if err != nil {
-		return 0, err
-	}
-	if n.Valid {
-		return n.Int64, nil
-	}
-	return 0, nil
 }
 
 // GetMaxDepth returns the maximum depth present in the stats table for the given table ("SRC" or "DST"). Used as stop condition for retry sweep.

@@ -79,6 +79,7 @@ func (q *Queue) PullRetryTasks(force bool) {
 	if maxKnownDepth >= 0 && currentRound <= maxKnownDepth {
 		queueType := getQueueType(q.name)
 		batchSize := effectiveLeaseBatchSize()
+		requestLimit := batchSize + 1
 		var batch []db.FetchResult
 		var expectedFoldersMap map[string][]types.Folder
 		var expectedFilesMap map[string][]types.File
@@ -86,20 +87,33 @@ func (q *Queue) PullRetryTasks(force bool) {
 		var srcIDToMeta map[string]SrcNodeMeta
 		var err error
 
+		rawResultCount := 0
 		if q.name == "dst" {
 			var childrenByDstID map[string][]*db.NodeState
-			batch, childrenByDstID, err = db.ListDstBatchWithSrcChildren(database, currentRound, q.getDstKeysetCursor(), batchSize, db.StatusPending)
+			batch, childrenByDstID, err = db.ListDstBatchWithSrcChildren(database, currentRound, q.getDstKeysetCursor(), requestLimit, db.StatusPending)
 			if err == nil && len(batch) > 0 {
-				q.setDstKeysetCursor(batch[len(batch)-1].Key)
-				expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta = BuildExpectedMapsFromDstWithChildren(batch, childrenByDstID)
+				rawResultCount = len(batch)
+				processLimit := batchSize
+				if len(batch) <= batchSize {
+					processLimit = len(batch)
+				}
+				q.setDstKeysetCursor(batch[processLimit-1].Key)
+				expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta = BuildExpectedMapsFromDstWithChildren(batch[:processLimit], childrenByDstID)
+				batch = batch[:processLimit]
 			}
 			if err != nil {
 				batch = nil
 			}
 		} else {
-			batch, err = db.ListNodesByDepthKeyset(database, queueType, currentRound, q.getSrcKeysetCursor(), db.StatusPending, batchSize)
+			batch, err = db.ListNodesByDepthKeyset(database, queueType, currentRound, q.getSrcKeysetCursor(), db.StatusPending, requestLimit)
 			if err == nil && len(batch) > 0 {
-				q.setSrcKeysetCursor(batch[len(batch)-1].Key)
+				rawResultCount = len(batch)
+				processLimit := batchSize
+				if len(batch) <= batchSize {
+					processLimit = len(batch)
+				}
+				q.setSrcKeysetCursor(batch[processLimit-1].Key)
+				batch = batch[:processLimit]
 			}
 		}
 		if err != nil {
@@ -128,9 +142,6 @@ func (q *Queue) PullRetryTasks(force bool) {
 		if q.name == "src" {
 			var srcFolderIDs []string
 			for _, item := range batch {
-				if q.isLeased(item.Key) {
-					continue
-				}
 				task := nodeStateToTask(item.State, taskType)
 				if task != nil && task.IsFolder() {
 					srcFolderIDs = append(srcFolderIDs, item.State.ID)
@@ -155,11 +166,6 @@ func (q *Queue) PullRetryTasks(force bool) {
 
 		enqueuedCount := 0
 		for _, item := range batch {
-			// Skip ULIDs we've already leased
-			if q.isLeased(item.Key) {
-				continue
-			}
-
 			task := nodeStateToTask(item.State, taskType)
 			// Ensure task has the ULID from the database
 			if task != nil && task.ID == "" {
@@ -191,21 +197,16 @@ func (q *Queue) PullRetryTasks(force bool) {
 				}
 			}
 
-			// Enqueue task - only mark as leased if enqueue succeeds
 			if q.Add(task) {
-				q.addLeasedKey(item.Key)
 				enqueuedCount++
 			}
 		}
 
-		// Track if pull was partial based on actual enqueued count
-		// Even if we enqueued 0 (all were leased), we still record the pull
-		// so the queue can properly advance rounds and check completion
-		wasPartial := len(batch) < batchSize
-		q.setLastPullWasPartial(wasPartial)
+		// lastPullWasPartial = keyspace exhausted (got <= batchSize from DB)
+		q.setLastPullWasPartial(rawResultCount <= batchSize)
 
 		// Record pull in RoundInfo
-		q.recordPull(currentRound, len(batch), wasPartial)
+		q.recordPull(currentRound, enqueuedCount, q.getLastPullWasPartial())
 		q.setFirstPullForRound(false)
 
 		return

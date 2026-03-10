@@ -421,7 +421,7 @@ func (m *Migration) SetNodeExcluded(queueType, nodeID string, excluded bool) (Pa
 	if m.Phase() != PhaseReview {
 		return PathReviewActionResult{}, fmt.Errorf("set node excluded requires review phase")
 	}
-	n, deltas, err := m.store.setNodeExcluded(queueType, nodeID, excluded)
+	n, deltas, err := m.store.setNodeExcluded(nodeID, excluded)
 	if err != nil {
 		return PathReviewActionResult{}, fmt.Errorf("set node excluded: %w", err)
 	}
@@ -441,7 +441,7 @@ func (m *Migration) BulkExclude(filter NodeQueryFilter, excluded bool) (PathRevi
 		if nodes[i].Excluded == excluded {
 			continue
 		}
-		n, deltas, err := m.store.setNodeExcluded(filter.Queue, nodes[i].ID, excluded)
+		n, deltas, err := m.store.setNodeExcluded(nodes[i].ID, excluded)
 		if err != nil {
 			return pathReviewResult(total, merged), fmt.Errorf("bulk exclude %s: %w", nodes[i].ID, err)
 		}
@@ -602,7 +602,9 @@ func (m *Migration) RetryAllFailed() (PathReviewActionResult, error) {
 		}
 	}
 	total := int64(len(srcFailed) + len(dstFailed))
-	deltas := map[string]int64{"failed": -total, "pending": total}
+	deltas := make(map[string]int64)
+	addReviewDelta(deltas, DeltaTraversalFailed, -total)
+	addReviewDelta(deltas, DeltaTraversalPending, total)
 	m.refreshRuntimeState()
 	return pathReviewResult(total, deltas), nil
 }
@@ -611,7 +613,7 @@ func (m *Migration) SetNodeExcludedWithPropagation(queueType, nodeID string, exc
 	if m.Phase() != PhaseReview {
 		return PathReviewActionResult{}, fmt.Errorf("exclusion propagation requires review phase")
 	}
-	n, deltas, err := m.store.setNodeExcludedWithPropagation(queueType, nodeID, excluded)
+	n, deltas, err := m.store.setNodeExcludedWithPropagation(nodeID, excluded)
 	if err != nil {
 		return PathReviewActionResult{}, err
 	}
@@ -627,7 +629,7 @@ func (m *Migration) BulkExcludeWithPropagation(filter NodeQueryFilter, excluded 
 	var total int64
 	merged := make(map[string]int64)
 	for i := range nodes {
-		n, deltas, err := m.store.setNodeExcludedWithPropagation(filter.Queue, nodes[i].ID, excluded)
+		n, deltas, err := m.store.setNodeExcludedWithPropagation(nodes[i].ID, excluded)
 		if err != nil {
 			return pathReviewResult(total, merged), err
 		}

@@ -8,14 +8,10 @@ clear
 echo "=== Local Copy Phase Test Runner ==="
 echo ""
 
-# Get user's Documents folder (Linux equivalent)
-documentsPath="${HOME}/Documents"
-if [ ! -d "$documentsPath" ]; then
-    # Fallback to HOME if Documents doesn't exist
-    documentsPath="${HOME}"
-fi
+# Use home directory as source
+homePath="${HOME}"
 
-echo "Source (Documents): $documentsPath"
+echo "Source (Home): $homePath"
 echo ""
 
 # Create temporary destination folder
@@ -41,7 +37,7 @@ bash "$SCRIPT_DIR/../shared/cleanup.sh"
 echo ""
 
 # Set environment variables for source and destination paths
-export SYLOS_COPY_TEST_SRC="$documentsPath"
+export SYLOS_COPY_TEST_SRC="$homePath"
 export SYLOS_COPY_TEST_DST="$tempDestPath"
 
 # Run the test

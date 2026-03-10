@@ -591,11 +591,11 @@ func (o *QueueObserver) getTotalPendingCount(queueName string) int {
 
 		totalPending := 0
 		for _, level := range levels {
-			count, err := o.database.GetCopyCountAtDepth(level, db.NodeTypeFolder, db.CopyStatusPending)
+			count, err := o.database.GetCopyCountAtDepth(level, db.NodeTypeFolder, db.CopyStatusPending, false)
 			if err == nil {
 				totalPending += int(count)
 			}
-			count, err = o.database.GetCopyCountAtDepth(level, db.NodeTypeFile, db.CopyStatusPending)
+			count, err = o.database.GetCopyCountAtDepth(level, db.NodeTypeFile, db.CopyStatusPending, false)
 			if err == nil {
 				totalPending += int(count)
 			}
@@ -645,11 +645,11 @@ func (o *QueueObserver) getTotalFailedCount(queueName string) int {
 
 		totalFailed := 0
 		for _, level := range levels {
-			count, err := o.database.GetCopyCountAtDepth(level, db.NodeTypeFolder, db.CopyStatusFailed)
+			count, err := o.database.GetCopyCountAtDepth(level, db.NodeTypeFolder, db.CopyStatusFailed, false)
 			if err == nil {
 				totalFailed += int(count)
 			}
-			count, err = o.database.GetCopyCountAtDepth(level, db.NodeTypeFile, db.CopyStatusFailed)
+			count, err = o.database.GetCopyCountAtDepth(level, db.NodeTypeFile, db.CopyStatusFailed, false)
 			if err == nil {
 				totalFailed += int(count)
 			}
