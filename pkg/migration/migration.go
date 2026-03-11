@@ -63,8 +63,6 @@ type MigrationController struct {
 	done           chan struct{}
 	result         *Result
 	err            error
-	manager        *MigrationManager
-	migration      *Migration
 }
 
 // Shutdown triggers a force shutdown of the migration.

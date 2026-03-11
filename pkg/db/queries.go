@@ -200,7 +200,6 @@ func buildMergedReviewWhere(f ReviewFilter) (clause string, args []any) {
 	if f.Status != "" {
 		parts = append(parts, `(src_traversal_status = $`+strconv.Itoa(param)+` OR dst_traversal_status = $`+strconv.Itoa(param)+` OR copy_status = $`+strconv.Itoa(param)+`)`)
 		args = append(args, f.Status)
-		param++
 	}
 	if f.FoldersOnly {
 		parts = append(parts, `type = 'folder'`)

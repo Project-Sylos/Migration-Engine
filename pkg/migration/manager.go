@@ -245,62 +245,49 @@ func isDuplicateKey(err error) bool {
 
 // GetMigration loads or returns a cached migration. When using per-migration DBs, pass the absolute path to that migration's folder (e.g. data/{id}); the engine creates or opens the DB at migrationDir/id.db. When migrationDir is empty, uses the legacy single DB (Path must have been set when creating the manager).
 func (m *MigrationManager) GetMigration(id string, migrationDir string) (*Migration, error) {
-	m.mu.Lock()
-	existing := m.migrations[id]
-	if existing != nil {
-		if existing.DB != nil {
-			record, err := m.store.getMigration(existing.DB, id)
-			m.mu.Unlock()
+	snap := m.snapshotMigrationEntry(id)
+	if snap.Migration != nil {
+		if snap.HasDB {
+			record, err := m.store.getMigration(snap.Migration.DB, id)
 			if err != nil {
 				return nil, err
 			}
 			if record != nil {
-				existing.syncRecord(*record)
+				snap.Migration.syncRecord(*record)
 			}
-			return existing, nil
+			return snap.Migration, nil
 		}
 		// Pending migration (no DB yet): need migrationDir to create the DB. Serialize per id so only one goroutine runs openDB + createMigration + bindDB.
 		if migrationDir == "" {
-			m.mu.Unlock()
 			return nil, fmt.Errorf("migration %q has no database yet: pass the migration folder path (e.g. data/%s) so the engine can create the DB", id, id)
 		}
-		record, ok := m.pendingRecords[id]
-		if !ok {
-			m.mu.Unlock()
-			return existing, nil
+		if !snap.HasPending {
+			return snap.Migration, nil
 		}
-		m.mu.Unlock()
+		record := snap.Pending
 		lock := m.getPendingLock(id)
 		lock.Lock()
 		defer lock.Unlock()
-		m.mu.Lock()
-		existing = m.migrations[id]
-		if existing != nil && existing.DB != nil {
-			m.mu.Unlock()
-			if persisted, _ := m.store.getMigration(existing.DB, id); persisted != nil {
-				existing.syncRecord(*persisted)
+
+		after := m.snapshotMigrationEntry(id)
+		if after.Migration != nil && after.HasDB {
+			if persisted, _ := m.store.getMigration(after.Migration.DB, id); persisted != nil {
+				after.Migration.syncRecord(*persisted)
 			}
-			return existing, nil
+			return after.Migration, nil
 		}
-		if existing == nil {
-			m.mu.Unlock()
+		if after.Migration == nil {
 			return nil, nil
 		}
-		record, _ = m.pendingRecords[id]
-		m.mu.Unlock()
+		existing := after.Migration
+
 		database, err := m.openDB(migrationDir, id)
 		if err != nil {
 			return nil, err
 		}
 		if err := m.store.createMigration(database, record); err != nil {
 			if isDuplicateKey(err) {
-				m.mu.Lock()
-				out := m.migrations[id]
-				if out != nil {
-					delete(m.pendingRecords, id)
-					out.bindDB(database)
-				}
-				m.mu.Unlock()
+				out := m.tryBindDuplicateMigration(id, database)
 				if out != nil {
 					if persisted, _ := m.store.getMigration(database, id); persisted != nil {
 						out.syncRecord(*persisted)
@@ -314,30 +301,25 @@ func (m *MigrationManager) GetMigration(id string, migrationDir string) (*Migrat
 		if err != nil {
 			return nil, err
 		}
-		m.mu.Lock()
-		delete(m.pendingRecords, id)
-		existing.bindDB(database)
-		m.mu.Unlock()
+		m.bindPendingMigrationDB(id, existing, database)
 		if persisted != nil {
 			existing.syncRecord(*persisted)
 		}
 		return existing, nil
 	}
-	m.mu.Unlock()
 
 	if migrationDir == "" {
 		// Legacy single DB
-		if m.db == nil {
+		legacyDB := m.getLegacyDB()
+		if legacyDB == nil {
 			return nil, nil
 		}
 		record, err := m.store.getMigration(nil, id)
 		if err != nil || record == nil {
 			return nil, err
 		}
-		instance := newMigration(m, *record, m.db)
-		m.mu.Lock()
-		m.migrations[id] = instance
-		m.mu.Unlock()
+		instance := newMigration(m, *record, legacyDB)
+		m.putMigration(id, instance)
 		return instance, nil
 	}
 
@@ -361,9 +343,7 @@ func (m *MigrationManager) GetMigration(id string, migrationDir string) (*Migrat
 		return nil, nil
 	}
 	instance := newMigration(m, *record, database)
-	m.mu.Lock()
-	m.migrations[id] = instance
-	m.mu.Unlock()
+	m.putMigration(id, instance)
 	return instance, nil
 }
 

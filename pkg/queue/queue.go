@@ -192,7 +192,6 @@ type Queue struct {
 	avgExecutionTime      time.Duration   // Average execution time (calculated periodically)
 	lastAvgTime           time.Time       // Last time average was calculated
 	avgInterval           time.Duration   // Interval for calculating averages
-	roundDebugLastLogAt   time.Time       // Throttle timestamp for round-completion debug prints
 	dequeueDebugLastLogAt time.Time       // Throttle timestamp for dequeue skip debug prints
 	dequeueSkipOldRound   int64           // Aggregated dequeue skips: task.Round < currentRound
 	dequeueSkipEmptyID    int64           // Aggregated dequeue skips: empty task.ID

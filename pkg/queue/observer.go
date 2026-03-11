@@ -556,13 +556,6 @@ func (o *QueueObserver) updateInternalMetrics(queueName string, queue *Queue, cu
 		// (these states are terminal)
 	}
 
-	// Track tasks completed while active
-	if currentState == QueueStateRunning && inProgressCount > 0 {
-		// We're actively processing - track completed tasks
-		// Note: This is tracked per-poll, actual completion tracking happens in completeTask
-		// For now, we'll track this separately if needed
-	}
-
 	// Update state tracking
 	if internal.LastState != currentState {
 		// State changed - reset last state change time
