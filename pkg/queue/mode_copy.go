@@ -165,13 +165,9 @@ func (q *Queue) PullCopyTasks(force bool) {
 		return
 	}
 	// Process at most batchSize items this pull; the extra (+1) is only for exhaustion detection
-	processLimit := batchSize
-	if len(results) <= processLimit {
-		processLimit = len(results)
-	}
+	processLimit := min(batchSize, len(results))
 	var matchedBatch []db.FetchResult
-	for i := 0; i < processLimit; i++ {
-		r := results[i]
+	for _, r := range results[:processLimit] {
 		if r.State == nil {
 			continue
 		}
@@ -179,49 +175,10 @@ func (q *Queue) PullCopyTasks(force bool) {
 	}
 	// Cursor = last item we consumed. lastPullWasPartial = keyspace exhausted (got <= batchSize from DB).
 	if len(results) > 0 {
-		cursorIdx := processLimit - 1
-		if cursorIdx < 0 {
-			cursorIdx = 0
-		}
+		cursorIdx := max(0, processLimit-1)
 		q.setCopyKeysetCursor(results[cursorIdx].Key)
 	}
 	q.setLastPullWasPartial(len(results) <= batchSize)
-
-	// Batch resolve parent SRC ID -> DST ID -> DST node (ServiceID). No per-item DB reads.
-	parentIDSet := make(map[string]struct{})
-	for _, item := range matchedBatch {
-		if item.State.ParentID != "" {
-			parentIDSet[item.State.ParentID] = struct{}{}
-		}
-	}
-	parentIDs := make([]string, 0, len(parentIDSet))
-	for pid := range parentIDSet {
-		parentIDs = append(parentIDs, pid)
-	}
-	dstIDBySrcID, err := db.BatchGetDstIDsFromSrcIDs(database, parentIDs)
-	if err != nil {
-		if logservice.LS != nil {
-			err := logservice.LS.Log("error", fmt.Sprintf("Batch parent lookup failed: %v", err), "queue", q.name, q.name)
-			if err != nil {
-				fmt.Println("error logging", err)
-			}
-		}
-		return
-	}
-	dstParentIDs := make([]string, 0, len(dstIDBySrcID))
-	for _, dstID := range dstIDBySrcID {
-		dstParentIDs = append(dstParentIDs, dstID)
-	}
-	dstNodesByID, err := db.BatchGetNodesByID(database, "DST", dstParentIDs)
-	if err != nil {
-		if logservice.LS != nil {
-			err := logservice.LS.Log("error", fmt.Sprintf("Batch DST node lookup failed: %v", err), "queue", q.name, q.name)
-			if err != nil {
-				fmt.Println("error logging", err)
-			}
-		}
-		return
-	}
 
 	// Move tasks to in-progress status and create tasks
 	enqueueSuccessCount := 0
@@ -255,7 +212,7 @@ func (q *Queue) PullCopyTasks(force bool) {
 			task.ID = item.State.ID
 		}
 
-		// Resolve destination parent ServiceID from batch lookups
+		// DstParentServiceID from path_hash join in ListNodesCopyKeyset
 		if item.State.ParentID == "" {
 			if logservice.LS != nil {
 				err := logservice.LS.Log("error", fmt.Sprintf("Item at round %d has empty ParentID (path=%s) - this should not happen", item.State.Depth, item.State.Path), "queue", q.name, q.name)
@@ -265,27 +222,16 @@ func (q *Queue) PullCopyTasks(force bool) {
 			}
 			continue
 		}
-		dstParentULID := dstIDBySrcID[item.State.ParentID]
-		if dstParentULID == "" {
+		if item.DstParentServiceID == "" {
 			if logservice.LS != nil {
-				err := logservice.LS.Log("warning", fmt.Sprintf("No join-lookup for parent %s of %s", item.State.ParentID, item.State.Path), "queue", q.name, q.name)
+				err := logservice.LS.Log("warning", fmt.Sprintf("No DST parent for %s (parent %s) - DST may not exist yet", item.State.Path, item.State.ParentID), "queue", q.name, q.name)
 				if err != nil {
 					fmt.Println("error logging", err)
 				}
 			}
 			continue
 		}
-		dstParentNode := dstNodesByID[dstParentULID]
-		if dstParentNode == nil {
-			if logservice.LS != nil {
-				err := logservice.LS.Log("error", fmt.Sprintf("DST node not found for ULID %s (parent of %s)", dstParentULID, item.State.Path), "queue", q.name, q.name)
-				if err != nil {
-					fmt.Println("error logging", err)
-				}
-			}
-			continue
-		}
-		task.DstParentID = dstParentNode.ServiceID
+		task.DstParentID = item.DstParentServiceID
 
 		if q.Add(task) {
 			enqueueSuccessCount++
@@ -293,7 +239,7 @@ func (q *Queue) PullCopyTasks(force bool) {
 	}
 
 	// Record pull in RoundInfo; lastPullWasPartial already set from raw DB result count
-	q.recordPull(currentRound, enqueueSuccessCount, q.getLastPullWasPartial())
+	q.recordPull(currentRound, enqueueSuccessCount, q.GetLastPullWasPartial())
 	q.setFirstPullForRound(false)
 }
 
@@ -356,6 +302,7 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 
 	database := q.getDatabase()
 	if database == nil {
+		q.removeInProgress(nodeID)
 		return
 	}
 
@@ -383,7 +330,6 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 	}
 	parentPath = db.NormalizeRootRelativePath(parentPath)
 
-	// DB-backed: append SRC copy status event and DST node to seal buffer
 	database.AppendStatusEvent("SRC", db.StatusEvent{
 		ID:              nodeID,
 		TraversalStatus: task.SrcTraversalStatus,
@@ -437,11 +383,6 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 // FailCopyTask handles failure of copy tasks.
 // Updates copy status to failed if max retries exceeded, or back to pending if retrying.
 func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
-	database := q.getDatabase()
-	if database == nil {
-		return
-	}
-
 	// Record execution time delta (even for failures)
 	q.recordExecutionTime(executionDelta)
 
@@ -461,18 +402,18 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 
 	task.Attempts++
 
-	// Use only task fields for status update (no DB read)
 	// Check if we should retry
 	if task.Attempts < maxRetries {
 		// Retry: re-enqueue to memory, DON'T write to DuckDB (stays as in-progress)
-		// This avoids unnecessary DuckDB writes and keeps the queue fast
 		task.Locked = false
 		q.removeInProgress(nodeID)
-
-		// Re-enqueue to memory pending buffer (append, not insert at 0)
-		// The task stays as in-progress in DuckDB to avoid unnecessary writes
-		// It will be pulled from memory on the next worker cycle
-		q.Add(task)
+		if !q.Add(task) {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("error",
+					fmt.Sprintf("retry re-enqueue rejected for %s (id=%s) - task lost", task.LocationPath(), nodeID),
+					"queue", q.name, q.name)
+			}
+		}
 
 		if logservice.LS != nil {
 			err := logservice.LS.Log("debug",
@@ -482,33 +423,46 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 				fmt.Println("error logging", err)
 			}
 		}
-	} else {
-		task.Locked = false
-		task.Status = "failed"
+		return
+	}
 
-		q.incrementRoundStatsCompleted(currentRound)
-		q.incrementRoundStatsFailed(currentRound)
-		q.incrementTasksCompletedTotal()
-		q.recordTaskCompletion(currentRound, false)
+	// Max retries exceeded - permanent failure
+	task.Locked = false
+	task.Status = "failed"
 
-		database.AppendStatusEvent("SRC", db.StatusEvent{
-			ID:              nodeID,
-			TraversalStatus: task.SrcTraversalStatus,
-			CopyStatus:      db.CopyStatusFailed,
-			PrevCopyStatus:  task.CopyStatus,
-			EventTime:       time.Now().UnixNano(),
-			Depth:           currentRound,
-		}, false)
+	q.incrementRoundStatsCompleted(currentRound)
+	q.incrementRoundStatsFailed(currentRound)
+	q.incrementTasksCompletedTotal()
+	q.recordTaskCompletion(currentRound, false)
 
-		q.removeInProgress(nodeID)
-
-		if logservice.LS != nil {
-			err := logservice.LS.Log("error",
-				fmt.Sprintf("Copy task failed (max retries): path=%s", task.LocationPath()),
-				"queue", q.name, q.name)
-			if err != nil {
-				fmt.Println("error logging", err)
-			}
+	if logservice.LS != nil {
+		err := logservice.LS.Log("error",
+			fmt.Sprintf("Copy task failed (max retries): path=%s", task.LocationPath()),
+			"queue", q.name, q.name)
+		if err != nil {
+			fmt.Println("error logging", err)
 		}
 	}
+
+	database := q.getDatabase()
+	if database == nil {
+		q.removeInProgress(nodeID)
+		return
+	}
+
+	// Record task error if present
+	if task.LastError != "" {
+		database.AppendTaskError("SRC", "copy", nodeID, task.LastError, task.Attempts, task.LocationPath())
+	}
+
+	database.AppendStatusEvent("SRC", db.StatusEvent{
+		ID:              nodeID,
+		TraversalStatus: task.SrcTraversalStatus,
+		CopyStatus:      db.CopyStatusFailed,
+		PrevCopyStatus:  task.CopyStatus,
+		EventTime:       time.Now().UnixNano(),
+		Depth:           currentRound,
+	}, false)
+
+	q.removeInProgress(nodeID)
 }

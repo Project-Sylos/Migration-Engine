@@ -15,7 +15,7 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Migration-Engine/pkg/tests/traversal/shared"
 	"codeberg.org/Sylos/Spectra/sdk"
-	"codeberg.org/Sylos/Sylos-FS/pkg/fs"
+	"codeberg.org/Sylos/Sylos-FS/pkg/fs/spectra"
 )
 
 // isEphemeralMode checks if the Spectra config file specifies ephemeral mode.
@@ -83,12 +83,12 @@ func runTest() error {
 		return fmt.Errorf("failed to check mode: %w", err)
 	}
 
-	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary", isEphemeral)
+	srcAdapter, err := spectra.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary", isEphemeral)
 	if err != nil {
 		return fmt.Errorf("failed to create src adapter: %w", err)
 	}
 
-	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1", isEphemeral)
+	dstAdapter, err := spectra.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1", isEphemeral)
 	if err != nil {
 		return fmt.Errorf("failed to create dst adapter: %w", err)
 	}

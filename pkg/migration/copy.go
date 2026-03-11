@@ -127,7 +127,12 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 						expected = roundStats.Expected
 						completed = roundStats.Completed
 					}
-					fmt.Printf("\r  Copy retry: Pass %d (%s) Round %d (Expected:%d Completed:%d)   ", copyPass, passName, lastStats.Round, expected, completed)
+					pending := copyQueue.GetPendingCount()
+					inProgress := copyQueue.InProgressCount()
+					lastPartial := copyQueue.GetLastPullWasPartial()
+					workers := copyQueue.GetWorkerCount()
+					fmt.Printf("\r  Copy retry: Pass %d (%s) Round %d | Exp:%d Comp:%d | Pend:%d InProg:%d | Partial:%v Workers:%d   ",
+						copyPass, passName, lastStats.Round, expected, completed, pending, inProgress, lastPartial, workers)
 				}
 			}
 		}
@@ -328,8 +333,12 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 						expected = roundStats.Expected
 						completed = roundStats.Completed
 					}
-					fmt.Printf("\r  Copy: Pass %d (%s) Round %d (Expected:%d Completed:%d)   ",
-						copyPass, passName, lastStats.Round, expected, completed)
+					pending := copyQueue.GetPendingCount()
+					inProgress := copyQueue.InProgressCount()
+					lastPartial := copyQueue.GetLastPullWasPartial()
+					workers := copyQueue.GetWorkerCount()
+					fmt.Printf("\r  Copy: Pass %d (%s) Round %d | Exp:%d Comp:%d | Pend:%d InProg:%d | Partial:%v Workers:%d   ",
+						copyPass, passName, lastStats.Round, expected, completed, pending, inProgress, lastPartial, workers)
 				}
 			}
 		}

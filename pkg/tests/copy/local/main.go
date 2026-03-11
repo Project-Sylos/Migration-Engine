@@ -11,7 +11,7 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Migration-Engine/pkg/tests/copy/shared"
-	"codeberg.org/Sylos/Sylos-FS/pkg/fs"
+	"codeberg.org/Sylos/Sylos-FS/pkg/fs/local"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -132,12 +132,12 @@ func runTest() error {
 // Uses the same database path as copy tests so copy phase can use the populated DB.
 func setupTraversalConfig(srcPath, dstPath string) (migration.Config, error) {
 	// Create LocalFS adapters
-	srcAdapter, err := fs.NewLocalFS(srcPath)
+	srcAdapter, err := local.NewLocalFS(srcPath)
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create src adapter: %w", err)
 	}
 
-	dstAdapter, err := fs.NewLocalFS(dstPath)
+	dstAdapter, err := local.NewLocalFS(dstPath)
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
 	}

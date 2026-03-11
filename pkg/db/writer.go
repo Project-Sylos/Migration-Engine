@@ -633,7 +633,7 @@ func (w *Writer) DeleteDescendantsUnderPath(table, rootPath string) error {
 	ctx := context.Background()
 	t := tableName(table)
 	var pathCond string
-	var args []interface{}
+	var args []any
 	if rootPath == "/" {
 		pathCond = `path != '/' AND path LIKE '/%'`
 	} else {
@@ -682,7 +682,7 @@ func (w *Writer) DeleteDescendantsUnderPath(table, rootPath string) error {
 			for i := range ids {
 				placeholders[i] = fmt.Sprintf("$%d", i+1)
 			}
-			argList := make([]interface{}, len(ids))
+			argList := make([]any, len(ids))
 			for i, id := range ids {
 				argList[i] = id
 			}

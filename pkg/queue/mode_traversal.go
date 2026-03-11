@@ -130,7 +130,7 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		}
 		q.setLastPullWasPartial(len(results) <= batchSize)
 	}
-	q.recordPull(currentRound, count, q.getLastPullWasPartial())
+	q.recordPull(currentRound, count, q.GetLastPullWasPartial())
 	q.setFirstPullForRound(false)
 }
 
@@ -140,9 +140,36 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 	// Record execution time delta
 	q.recordExecutionTime(executionDelta)
 	currentRound := task.Round
+	nodeID := task.ID
+
+	task.Locked = false
+	task.Status = "successful"
+
+	q.incrementRoundStatsCompleted(currentRound)
+	q.incrementTasksCompletedTotal()
+	q.recordTaskCompletion(currentRound, true)
+
+	// Update discovery counters (thread-safe)
+	totalChildren := len(task.DiscoveredChildren)
+	foldersCount := 0
+	filesCount := 0
+	if totalChildren > 0 {
+		for _, child := range task.DiscoveredChildren {
+			if child.IsFile {
+				filesCount++
+			} else {
+				foldersCount++
+			}
+		}
+		q.mu.Lock()
+		q.filesDiscoveredTotal += int64(filesCount)
+		q.foldersDiscoveredTotal += int64(foldersCount)
+		q.mu.Unlock()
+	}
 
 	database := q.getDatabase()
 	if database == nil {
+		q.removeInProgress(nodeID)
 		return
 	}
 
@@ -159,44 +186,15 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 				fmt.Println("error logging", err)
 			}
 		}
+		q.removeInProgress(nodeID)
 		return
 	}
 
-	nodeID := state.ID
 	nextRound := currentRound + 1
-
-	task.Locked = false
-	task.Status = "successful"
-
-	// Increment completed count (even if failed, this is a "processed" counter)
-	q.incrementRoundStatsCompleted(currentRound)
-	q.incrementTasksCompletedTotal()
-
-	// Record task completion in RoundInfo
-	q.recordTaskCompletion(currentRound, true)
 
 	// Prepare child nodes for insertion
 	parentPath := types.NormalizeLocationPath(task.LocationPath())
 	var childNodesToInsert []db.InsertOperation
-
-	// Log folder discovery with details and update discovery counters
-	totalChildren := len(task.DiscoveredChildren)
-	foldersCount := 0
-	filesCount := 0
-	if totalChildren > 0 {
-		for _, child := range task.DiscoveredChildren {
-			if child.IsFile {
-				filesCount++
-			} else {
-				foldersCount++
-			}
-		}
-		// Increment discovery counters (thread-safe)
-		q.mu.Lock()
-		q.filesDiscoveredTotal += int64(filesCount)
-		q.foldersDiscoveredTotal += int64(foldersCount)
-		q.mu.Unlock()
-	}
 
 	// Collect discovered children for insertion
 	// Deterministic IDs based on (queueType, nodeType, path) ensure no duplicates -
@@ -282,15 +280,15 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 				taskState.SrcID = child.srcID
 			}
 
-		childNodesToInsert = append(childNodesToInsert, db.InsertOperation{
-			QueueType: queueType,
-			Level:     nextRound,
-			Status:    child.status,
-			State:     taskState,
-		})
+			childNodesToInsert = append(childNodesToInsert, db.InsertOperation{
+				QueueType: queueType,
+				Level:     nextRound,
+				Status:    child.status,
+				State:     taskState,
+			})
 
+		}
 	}
-}
 
 	// Push discovered children and completed-node status to appender buffer (async flush until round advance).
 	if len(childNodesToInsert) > 0 {
@@ -358,7 +356,6 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 		}
 	}
 
-	// Remove from in-progress LAST
 	q.removeInProgress(nodeID)
 }
 
@@ -387,7 +384,13 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 	if task.Attempts < maxRetries {
 		task.Locked = false
 		q.removeInProgress(nodeID)
-		q.Add(task)
+		if !q.Add(task) {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("error",
+					fmt.Sprintf("retry re-enqueue rejected for %s (id=%s) - task lost", task.LocationPath(), nodeID),
+					"queue", q.name, q.name)
+			}
+		}
 		if logservice.LS != nil {
 			err := logservice.LS.Log("debug",
 				fmt.Sprintf("Retrying task: id=%s path=%s round=%d attempt=%d/%d",
@@ -401,6 +404,13 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 	}
 
 	// Max retries reached - task is truly done
+	task.Locked = false
+	task.Status = "failed"
+
+	q.incrementRoundStatsCompleted(currentRound)
+	q.incrementTasksCompletedTotal()
+	q.recordTaskCompletion(currentRound, false)
+
 	if logservice.LS != nil {
 		err := logservice.LS.Log("error",
 			fmt.Sprintf("Failed to traverse folder %s (id=%s) after %d attempts (max retries exceeded) round=%d",
@@ -411,20 +421,21 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 		}
 	}
 
-	task.Locked = false
-	task.Status = "failed"
-
-	// Increment completed count
-	q.incrementRoundStatsCompleted(currentRound)
-	q.incrementTasksCompletedTotal()
-
-	// Record task completion in RoundInfo (failed)
-	q.recordTaskCompletion(currentRound, false)
-
-	// Persist failed status to appender buffer
 	database := q.getDatabase()
-	if database != nil && nodeID != "" {
-		database.AppendStatusEvent(getQueueType(q.name), db.StatusEvent{
+	if database == nil {
+		q.removeInProgress(nodeID)
+		return
+	}
+
+	queueType := getQueueType(q.name)
+
+	// Record task error if present
+	if task.LastError != "" {
+		database.AppendTaskError(queueType, "traversal", nodeID, task.LastError, task.Attempts, task.LocationPath())
+	}
+
+	if nodeID != "" {
+		database.AppendStatusEvent(queueType, db.StatusEvent{
 			ID:                  nodeID,
 			TraversalStatus:     db.StatusFailed,
 			EventTime:           time.Now().UnixNano(),
@@ -432,7 +443,7 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 			PrevTraversalStatus: db.StatusPending,
 		}, q.GetMode() == QueueModeRetry)
 	}
-	// Remove from in-progress LAST
+
 	q.removeInProgress(nodeID)
 }
 

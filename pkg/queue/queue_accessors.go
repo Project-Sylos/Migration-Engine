@@ -113,10 +113,17 @@ func (q *Queue) GetPendingCount() int {
 	return len(q.pendingBuff)
 }
 
-func (q *Queue) getLastPullWasPartial() bool {
+func (q *Queue) GetLastPullWasPartial() bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.lastPullWasPartial
+}
+
+// GetWorkerCount returns the number of workers registered with this queue.
+func (q *Queue) GetWorkerCount() int {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return len(q.workers)
 }
 
 func (q *Queue) setFirstPullForRound(value bool) {
@@ -246,13 +253,6 @@ func (q *Queue) GetTotalFailed() int {
 	return total
 }
 
-func (q *Queue) isInPendingSet(nodeID string) bool {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	_, exists := q.pendingSet[nodeID]
-	return exists
-}
-
 // GetRoundStats returns the statistics for a specific round. Returns nil if the round has no stats yet.
 func (q *Queue) GetRoundStats(round int) *RoundStats {
 	q.mu.RLock()
@@ -305,8 +305,14 @@ func (q *Queue) getAvgInterval() time.Duration {
 // SetState sets the queue lifecycle state.
 func (q *Queue) SetState(state QueueState) {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	q.state = state
+	watchdog := q.watchdog
+	q.mu.Unlock()
+
+	// Stop watchdog when queue completes or stops
+	if (state == QueueStateCompleted || state == QueueStateStopped) && watchdog != nil {
+		watchdog.Stop()
+	}
 }
 
 // SetRound sets the queue's current round. Used for resume operations.
@@ -702,7 +708,7 @@ func (q *Queue) recordDequeueSkip(reason string, currentRound int) {
 	}
 }
 
-// Add enqueues a task into the pending buffer. Returns false if task is nil, has empty ID, or is already in progress/pending.
+// Add enqueues a task into the pending buffer. Returns false if task is nil, has empty ID, or is already in progress.
 func (q *Queue) Add(task *TaskBase) bool {
 	if task == nil {
 		return false
@@ -726,17 +732,11 @@ func (q *Queue) Add(task *TaskBase) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	// Check if already in progress or pending
 	if _, exists := q.inProgress[nodeID]; exists {
 		return false
 	}
-	if _, exists := q.pendingSet[nodeID]; exists {
-		return false
-	}
 
-	// Add to pending buffer and set
 	q.pendingBuff = append(q.pendingBuff, task)
-	q.pendingSet[nodeID] = struct{}{}
 	return true
 }
 
@@ -766,9 +766,6 @@ func (q *Queue) dequeuePending() *TaskBase {
 			q.recordDequeueSkip("empty_id", 0)
 			continue
 		}
-
-		// Remove from pending set
-		delete(q.pendingSet, nodeID)
 
 		// Check if task is for current or future round
 		currentRound := q.round

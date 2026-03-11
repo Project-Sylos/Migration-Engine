@@ -5,12 +5,12 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
 	"time"
 
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
@@ -25,7 +25,6 @@ const (
 type CopyWorker struct {
 	id          string
 	queue       *Queue
-	database    *db.DB
 	srcAdapter  types.FSAdapter // Source adapter for reading files
 	dstAdapter  types.FSAdapter // Destination adapter for writing files/folders
 	queueName   string          // "copy" for logging
@@ -38,7 +37,6 @@ type CopyWorker struct {
 func NewCopyWorker(
 	id string,
 	queue *Queue,
-	database *db.DB,
 	srcAdapter types.FSAdapter,
 	dstAdapter types.FSAdapter,
 	shutdownCtx context.Context,
@@ -46,7 +44,6 @@ func NewCopyWorker(
 	return &CopyWorker{
 		id:          id,
 		queue:       queue,
-		database:    database,
 		srcAdapter:  srcAdapter,
 		dstAdapter:  dstAdapter,
 		queueName:   "copy",
@@ -114,13 +111,12 @@ func (w *CopyWorker) Run() {
 		// Execute the task (check for shutdown during execution if needed)
 		err := w.execute(task)
 		if err != nil {
-			if w.database != nil {
-				w.database.AppendTaskError("SRC", "copy", task.ID, err.Error(), task.Attempts, task.LocationPath())
-			}
+			// Mark worker result BEFORE calling ReportTaskResult (for stall diagnostics)
+			task.WorkerResult = "error"
+			task.LastError = err.Error()
 			if logservice.LS != nil {
 				logMsg := fmt.Sprintf("Copy worker task execution failed: path=%s round=%d pass=%d error=%v",
 					task.LocationPath(), task.Round, task.CopyPass, err)
-				// fmt.Println(logMsg)
 				err := logservice.LS.Log("error",
 					logMsg,
 					"worker", w.id, w.queueName)
@@ -129,12 +125,11 @@ func (w *CopyWorker) Run() {
 				}
 			}
 			w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
-			// Check if task was retried for logging
-			nodeID := task.ID
-			willRetry := w.queue.isInPendingSet(nodeID)
+			willRetry := task.Attempts < w.queue.getMaxRetries()
 			w.logError(task, err, willRetry)
 		} else {
-			// Task succeeded
+			// Mark worker result BEFORE calling ReportTaskResult (for stall diagnostics)
+			task.WorkerResult = "success"
 			w.queue.ReportTaskResult(task, TaskExecutionResultSuccessful)
 		}
 	}
@@ -144,124 +139,149 @@ func (w *CopyWorker) Run() {
 // For folders: creates the folder on the destination.
 // For files: streams the file from source to destination.
 func (w *CopyWorker) execute(task *TaskBase) error {
+	parent := w.shutdownCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	wd, ctx := NewProgressWatchdog(parent, copyStallTimeout)
+	defer wd.Stop()
+
+	// This whole block of code looks like an x-wing fighter from star wars lol...
 	switch task.CopyPass {
 	case 1:
-		// Pass 1: Create folders
 		if !task.IsFolder() {
 			return fmt.Errorf("copy worker received non-folder task in pass 1")
 		}
-		return w.createFolder(task)
+		return w.createFolder(task, ctx, wd)
 	case 2:
-		// Pass 2: Copy files
 		if !task.IsFile() {
 			return fmt.Errorf("copy worker received non-file task in pass 2")
 		}
-		return w.copyFile(task)
+		return w.copyFile(task, ctx, wd)
 	}
 
 	return fmt.Errorf("invalid copy pass: %d", task.CopyPass)
 }
 
 // createFolder creates a folder on the destination filesystem.
-func (w *CopyWorker) createFolder(task *TaskBase) error {
+// CreateFolder does not take context; we run it in a goroutine and select on ctx.Done() for stall detection.
+func (w *CopyWorker) createFolder(task *TaskBase, ctx context.Context, wd *ProgressWatchdog) error {
 	folder := task.Folder
 
-	// Processing folder task
-
-	// Get destination parent folder ServiceID (should already be populated by queue)
 	dstParentServiceID := task.DstParentID
 	if dstParentServiceID == "" {
 		return fmt.Errorf("task missing DstParentID (ServiceID) for %s", folder.LocationPath)
 	}
 
-	// Create folder on destination using ServiceID.
-	// Adapter expects a single path component (base name), not a path.
 	folderName := filepath.Base(folder.LocationPath)
 	if folderName == "" || folderName == "." {
 		folderName = folder.DisplayName
 	}
-	createdFolder, err := w.dstAdapter.CreateFolder(dstParentServiceID, folderName)
-	if err != nil {
-		return fmt.Errorf("failed to create folder %s in parent %s: %w", folder.DisplayName, dstParentServiceID, err)
+
+	wd.Beat()
+	done := make(chan error, 1)
+	go func() {
+		created, err := w.dstAdapter.CreateFolder(dstParentServiceID, folderName)
+		if err != nil {
+			done <- fmt.Errorf("failed to create folder %s in parent %s: %w", folder.DisplayName, dstParentServiceID, err)
+			return
+		}
+		task.Folder = created
+		done <- nil
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return err
+		}
+		wd.Beat()
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("create folder cancelled by watchdog for %s: %w", folder.LocationPath, ctx.Err())
 	}
-
-	// Store created folder info in task for queue to process on completion
-	// The queue will create DST node entry and update join-lookup after task succeeds
-	task.Folder = createdFolder
-
-	return nil
 }
 
 // copyFile streams a file from source to destination.
-func (w *CopyWorker) copyFile(task *TaskBase) error {
+// Uses a read/write loop with Beat() so the progress watchdog resets while data is flowing.
+func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressWatchdog) error {
 	file := task.File
 
-	// Processing file task
-
-	// Get destination parent folder ServiceID (should already be populated by queue)
 	dstParentServiceID := task.DstParentID
 	if dstParentServiceID == "" {
 		return fmt.Errorf("task missing DstParentID (ServiceID) for file %s", file.LocationPath)
 	}
 
-	// Get context for FS operations (use shutdownCtx if available, otherwise background)
-	ctx := w.shutdownCtx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	// Step 1: Open source file for reading
-	// OpenRead returns an io.ReadCloser for streaming reads
 	srcReader, err := w.srcAdapter.OpenRead(ctx, file.ServiceID)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("open source cancelled by watchdog for %s: %w", file.LocationPath, err)
+		}
 		return fmt.Errorf("failed to open source file %s for reading: %w", file.LocationPath, err)
 	}
 	defer srcReader.Close()
+	wd.Beat()
 
-	// Step 2: Create destination file with metadata.
-	// Adapter expects a single path component (base name), not a path (e.g. Resumes/file.pdf).
 	fileName := filepath.Base(file.LocationPath)
 	if fileName == "" || fileName == "." {
 		fileName = file.DisplayName
 	}
 	createdFile, err := w.dstAdapter.CreateFile(ctx, dstParentServiceID, fileName, file.Size, nil)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("create file cancelled by watchdog for %s: %w", file.LocationPath, err)
+		}
 		return fmt.Errorf("failed to create destination file %s in parent %s: %w", fileName, dstParentServiceID, err)
 	}
+	// All of these beats are making me wanna jam. 
+	wd.Beat()
 
-	// Step 3: Open destination file for writing
-	// OpenWrite returns an io.WriteCloser for streaming writes
 	dstWriter, err := w.dstAdapter.OpenWrite(ctx, createdFile.ServiceID)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("open write cancelled by watchdog for %s: %w", file.LocationPath, err)
+		}
 		return fmt.Errorf("failed to open destination file %s for writing: %w", createdFile.ServiceID, err)
 	}
+	wd.Beat()
 
-	// Step 4: Worker owns the copy loop - stream data directly from source to destination
-	// io.CopyBuffer handles the streaming efficiently with our buffer
-	bytesTransferred, err := io.CopyBuffer(dstWriter, srcReader, w.copyBuffer)
-	if err != nil {
-		// Close writer on copy error (may fail, but we already have the copy error)
-		err := dstWriter.Close()
-		if err != nil {
-			fmt.Println("error closing destination writer", err)
+	var bytesTransferred int64
+	buf := w.copyBuffer
+	for {
+		n, readErr := srcReader.Read(buf)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			_ = dstWriter.Close()
+			if errors.Is(readErr, context.Canceled) || errors.Is(readErr, context.DeadlineExceeded) {
+				return fmt.Errorf("copy cancelled by watchdog for %s: %w", file.LocationPath, readErr)
+			}
+			return fmt.Errorf("failed to copy file data for %s: %w", file.LocationPath, readErr)
 		}
-		return fmt.Errorf("failed to copy file data for %s: %w", file.LocationPath, err)
+		if n > 0 {
+			_, writeErr := dstWriter.Write(buf[:n])
+			if writeErr != nil {
+				_ = dstWriter.Close()
+				if errors.Is(writeErr, context.Canceled) || errors.Is(writeErr, context.DeadlineExceeded) {
+					return fmt.Errorf("copy cancelled by watchdog for %s: %w", file.LocationPath, writeErr)
+				}
+				return fmt.Errorf("failed to copy file data for %s: %w", file.LocationPath, writeErr)
+			}
+			bytesTransferred += int64(n)
+			wd.Beat()
+		}
+		if readErr == io.EOF {
+			break
+		}
 	}
 
-	// Step 5: Close writer to commit the upload
-	// Close() finalizes the upload - if it fails, the upload failed
-	// This is NOT deferred because we need to check the error to know if upload succeeded
 	if err := dstWriter.Close(); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("commit cancelled by watchdog for %s: %w", file.LocationPath, err)
+		}
 		return fmt.Errorf("failed to commit upload for file %s: %w", file.DisplayName, err)
 	}
 
-	// Track bytes transferred
 	task.BytesTransferred = bytesTransferred
-
-	// Store created file info in task for queue to process on completion
-	// The queue will create DST node entry and update join-lookup after task succeeds
 	task.File = createdFile
-
 	return nil
 }
 

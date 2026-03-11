@@ -27,30 +27,30 @@ const StatsKeyCompleted = "completed"
 
 // Universal stats table keys for canonical review stats (tableStats).
 const (
-	ReviewKeyTraversalPending     = "review/traversal/pending"
+	ReviewKeyTraversalPending      = "review/traversal/pending"
 	ReviewKeyTraversalPendingRetry = "review/traversal/pending_retry"
-	ReviewKeyTraversalFailed      = "review/traversal/failed"
-	ReviewKeyCopyPending          = "review/copy/pending"
-	ReviewKeyCopyFailed       = "review/copy/failed"
-	ReviewKeyExcluded         = "review/excluded"
-	ReviewKeyFolders          = "review/folders"
-	ReviewKeyFiles            = "review/files"
-	ReviewKeySizeSrc          = "review/size/src"
-	ReviewKeySizeDst          = "review/size/dst"
+	ReviewKeyTraversalFailed       = "review/traversal/failed"
+	ReviewKeyCopyPending           = "review/copy/pending"
+	ReviewKeyCopyFailed            = "review/copy/failed"
+	ReviewKeyExcluded              = "review/excluded"
+	ReviewKeyFolders               = "review/folders"
+	ReviewKeyFiles                 = "review/files"
+	ReviewKeySizeSrc               = "review/size/src"
+	ReviewKeySizeDst               = "review/size/dst"
 )
 
 // ReviewStatsSnapshot is the canonical persisted review stats in the universal stats table.
 type ReviewStatsSnapshot struct {
-	TraversalPending     int64
+	TraversalPending      int64
 	TraversalPendingRetry int64
-	TraversalFailed      int64
-	CopyPending      int64
-	CopyFailed       int64
-	Excluded         int64
-	Folders          int64
-	Files            int64
-	SizeSrc          int64
-	SizeDst          int64
+	TraversalFailed       int64
+	CopyPending           int64
+	CopyFailed            int64
+	Excluded              int64
+	Folders               int64
+	Files                 int64
+	SizeSrc               int64
+	SizeDst               int64
 }
 
 // GetReviewStatsSnapshot reads the full canonical review stats from the universal stats table.
@@ -318,7 +318,7 @@ func (db *DB) GetCopyCountAtDepth(depth int, nodeType string, copyStatus string,
 	ctx := context.Background()
 
 	var q string
-	args := []interface{}{depth, copyStatus}
+	args := []any{depth, copyStatus}
 
 	if breakAtFirst {
 		// Break at the first occurrence: just check for existence.

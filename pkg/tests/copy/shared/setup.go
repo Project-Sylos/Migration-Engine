@@ -13,7 +13,8 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Spectra/sdk"
-	"codeberg.org/Sylos/Sylos-FS/pkg/fs"
+	"codeberg.org/Sylos/Sylos-FS/pkg/fs/local"
+	"codeberg.org/Sylos/Sylos-FS/pkg/fs/spectra"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -172,12 +173,12 @@ func SetupCopyTestConfig(cleanSpectraDB bool, removeMigrationDB bool) (migration
 		return migration.Config{}, fmt.Errorf("failed to check mode: %w", err)
 	}
 
-	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary", isEphemeral)
+	srcAdapter, err := spectra.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary", isEphemeral)
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create src adapter: %w", err)
 	}
 
-	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1", isEphemeral)
+	dstAdapter, err := spectra.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1", isEphemeral)
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
 	}
@@ -227,12 +228,12 @@ func SetupLocalCopyTest(srcPath, dstPath string, removeMigrationDB bool) (*db.DB
 	fmt.Printf("  Destination: %s\n", dstPath)
 
 	// Create LocalFS adapters
-	srcAdapter, err := fs.NewLocalFS(srcPath)
+	srcAdapter, err := local.NewLocalFS(srcPath)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to create src adapter: %w", err)
 	}
 
-	dstAdapter, err := fs.NewLocalFS(dstPath)
+	dstAdapter, err := local.NewLocalFS(dstPath)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to create dst adapter: %w", err)
 	}

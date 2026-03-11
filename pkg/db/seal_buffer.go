@@ -19,7 +19,8 @@ const (
 	defaultSealFlushInterval     = 10 * time.Second
 	defaultSealFlushRowThreshold = 20_000
 	defaultSealBufferHardCap     = 40_000
-	checkpointRowThreshold       = 200_000 // run CHECKPOINT only after this many appender rows since last checkpoint
+	defaultFlushTimeout          = 60 * time.Second // max time for a single flush operation
+	checkpointRowThreshold       = 200_000          // run CHECKPOINT only after this many appender rows since last checkpoint
 )
 
 // SealJob is one sealed level's payload: table, depth, node metadata, status events, and stats.
@@ -225,10 +226,11 @@ type SealBuffer struct {
 	interval            time.Duration
 	rowThreshold        int
 	hardCap             int
+	flushTimeout        time.Duration
 	mu                  sync.Mutex
 	cond                *sync.Cond
 	queue               []SealJob
-	discoveryQueue      []SealJob       // nodes + events only (no stats); flushed with queue, stats skipped when Pending < 0
+	discoveryQueue      []SealJob         // nodes + events only (no stats); flushed with queue, stats skipped when Pending < 0
 	taskErrorsQueue     []TaskErrorRecord // buffered task errors; flushed with jobs
 	rowsSinceFlush      int
 	lastFlushedDepth    int   // max depth written by completed Flush(); -1 until first flush
@@ -244,6 +246,7 @@ type SealBufferOptions struct {
 	FlushInterval time.Duration
 	RowThreshold  int
 	HardCap       int
+	FlushTimeout  time.Duration // max time for a single flush operation (default 60s)
 }
 
 // NewSealBuffer creates a seal buffer and starts its flush loop.
@@ -260,11 +263,16 @@ func NewSealBuffer(db *DB, opts SealBufferOptions) *SealBuffer {
 	if hardCap <= 0 {
 		hardCap = defaultSealBufferHardCap
 	}
+	flushTimeout := opts.FlushTimeout
+	if flushTimeout <= 0 {
+		flushTimeout = defaultFlushTimeout
+	}
 	sb := &SealBuffer{
 		db:              db,
 		interval:        interval,
 		rowThreshold:    rowThreshold,
 		hardCap:         hardCap,
+		flushTimeout:    flushTimeout,
 		queue:           make([]SealJob, 0, 64),
 		discoveryQueue:  make([]SealJob, 0, 64),
 		taskErrorsQueue: make([]TaskErrorRecord, 0, 64),
@@ -298,6 +306,10 @@ func (sb *SealBuffer) Add(table string, depth int, nodes []*NodeState, pending, 
 		events = append(events, e)
 	}
 	sb.mu.Lock()
+	// Backpressure: wait if buffer is at hard cap
+	for sb.rowsSinceFlush >= sb.hardCap {
+		sb.cond.Wait()
+	}
 	sb.queue = append(sb.queue, SealJob{
 		Table:      table,
 		Depth:      depth,
@@ -350,6 +362,10 @@ func (sb *SealBuffer) AddDiscoveryNodes(ops []InsertOperation) {
 		groups[k] = append(groups[k], s)
 	}
 	sb.mu.Lock()
+	// Backpressure: wait if buffer is at hard cap (drain() broadcasts on cond after clearing)
+	for sb.rowsSinceFlush >= sb.hardCap {
+		sb.cond.Wait()
+	}
 	for k, nodes := range groups {
 		events := make([]StatusEvent, 0, len(nodes))
 		for _, n := range nodes {
@@ -382,6 +398,10 @@ func (sb *SealBuffer) AddDiscoveryStatusEvent(table string, e StatusEvent, fromR
 		return
 	}
 	sb.mu.Lock()
+	// Backpressure: wait if buffer is at hard cap
+	for sb.rowsSinceFlush >= sb.hardCap {
+		sb.cond.Wait()
+	}
 	sb.discoveryQueue = append(sb.discoveryQueue, SealJob{
 		Table: table, Depth: e.Depth, Nodes: nil, Events: []StatusEvent{e},
 		Pending: discoveryJobStatsSentinel, Successful: discoveryJobStatsSentinel, Failed: discoveryJobStatsSentinel,
@@ -396,6 +416,10 @@ func (sb *SealBuffer) AddDiscoveryStatusEvent(table string, e StatusEvent, fromR
 // AddTaskError enqueues one task error for async flush via the seal buffer.
 func (sb *SealBuffer) AddTaskError(rec TaskErrorRecord) {
 	sb.mu.Lock()
+	// Backpressure: wait if buffer is at hard cap
+	for sb.rowsSinceFlush >= sb.hardCap {
+		sb.cond.Wait()
+	}
 	sb.taskErrorsQueue = append(sb.taskErrorsQueue, rec)
 	sb.rowsSinceFlush++
 	sb.cond.Broadcast()
@@ -497,10 +521,11 @@ func (sb *SealBuffer) phaseFlush(jobs []SealJob, taskErrors []TaskErrorRecord) e
 	if pa == nil {
 		return nil
 	}
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), sb.flushTimeout)
+	defer cancel()
 	tx, err := pa.conn.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("phaseFlush begin tx: %w", err)
 	}
 	maxDepth := -1
 	for _, j := range jobs {
@@ -606,7 +631,8 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob, taskErrors []TaskErrorRecord) 
 	srcNodes, dstNodes, srcEvents, dstEvents := dedupeJobsByID(jobs)
 	totalRows := int64(len(srcNodes) + len(dstNodes) + len(srcEvents) + len(dstEvents))
 	srcTuples, dstTuples := buildMergedLevelStats(jobs)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), sb.flushTimeout)
+	defer cancel()
 	if err := sb.db.RunWrite(ctx, func(s *WriteSession) error {
 		conn := s.Conn()
 		if err := conn.Raw(func(driverConn any) error {
@@ -769,6 +795,8 @@ func (sb *SealBuffer) WaitUntilFlushedThrough(depth int) {
 func (sb *SealBuffer) flushLoop() {
 	ticker := time.NewTicker(sb.interval)
 	defer ticker.Stop()
+	consecutiveErrors := 0
+	const maxConsecutiveErrors = 5
 	for {
 		select {
 		case <-sb.stopCh:
@@ -780,8 +808,20 @@ func (sb *SealBuffer) flushLoop() {
 			if hasWork {
 				err := sb.Flush()
 				if err != nil {
-					fmt.Println("Error flushing jobs:", err)
-					return
+					consecutiveErrors++
+					fmt.Printf("Error flushing jobs (attempt %d/%d): %v\n", consecutiveErrors, maxConsecutiveErrors, err)
+					if consecutiveErrors >= maxConsecutiveErrors {
+						fmt.Println("seal buffer: too many consecutive flush errors, stopping flush loop")
+						return
+					}
+					// Backoff before next attempt (exponential: 1s, 2s, 4s, 8s, 16s)
+					backoff := time.Duration(1<<(consecutiveErrors-1)) * time.Second
+					if backoff > 16*time.Second {
+						backoff = 16 * time.Second
+					}
+					time.Sleep(backoff)
+				} else {
+					consecutiveErrors = 0 // Reset on success
 				}
 			}
 		}

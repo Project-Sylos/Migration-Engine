@@ -51,16 +51,16 @@ const (
 type QueueMode string
 
 const (
-	QueueModeTraversal  QueueMode = "traversal"  // Normal BFS traversal
-	QueueModeRetry      QueueMode = "retry"      // Retry failed tasks sweep
-	QueueModeCopy       QueueMode = "copy"       // Copy phase (folders then files)
-	QueueModeCopyRetry  QueueMode = "copy-retry" // Copy retry: only copy_status = failed, max-depth guarded completion
+	QueueModeTraversal QueueMode = "traversal"  // Normal BFS traversal
+	QueueModeRetry     QueueMode = "retry"      // Retry failed tasks sweep
+	QueueModeCopy      QueueMode = "copy"       // Copy phase (folders then files)
+	QueueModeCopyRetry QueueMode = "copy-retry" // Copy retry: only copy_status = failed, max-depth guarded completion
 )
 
 const (
-	defaultLeaseBatchSize   = 1000
-	maxLeaseBatchSize       = 10_000 // Upper bound for pull (lease) batch size
-	refillFromDBBatchSize   = 10_000 // Batch size when refilling queue from DuckDB (ID-offset pagination)
+	defaultLeaseBatchSize = 1000
+	maxLeaseBatchSize     = 10_000 // Upper bound for pull (lease) batch size
+	refillFromDBBatchSize = 10_000 // Batch size when refilling queue from DuckDB (ID-offset pagination)
 )
 
 // effectiveLeaseBatchSize returns the lease batch size capped by maxLeaseBatchSize.
@@ -126,13 +126,13 @@ func nodeStateToTask(state *db.NodeState, taskType string) *TaskBase {
 		return nil
 	}
 	task := &TaskBase{
-		ID:        state.ID,
-		Type:      taskType,
-		Round:     state.Depth,
-		Attempts:  0,
-		Status:    "",
-		Locked:    false,
-		LeaseTime: time.Now(),
+		ID:         state.ID,
+		Type:       taskType,
+		Round:      state.Depth,
+		Attempts:   0,
+		Status:     "",
+		Locked:     false,
+		LeaseTime:  time.Now(),
 		CopyStatus: state.CopyStatus,
 	}
 	if state.Type == types.NodeTypeFolder {
@@ -172,7 +172,6 @@ type Queue struct {
 	state              QueueState           // Lifecycle state (running/paused/stopped/completed/waiting)
 	inProgress         map[string]*TaskBase // Tasks currently being executed (keyed by ULID)
 	pendingBuff        []*TaskBase          // Local task buffer fetched from DuckDB
-	pendingSet         map[string]struct{}  // Fast lookup for pending buffer dedupe (keyed by ULID)
 	pulling            bool                 // Indicates a pull operation is active
 	lastPullWasPartial bool                 // True if last pull returned fewer tasks than requested (partial batch)
 	firstPullForRound  bool                 // True if we haven't done the first pull for the current round
@@ -189,15 +188,15 @@ type Queue struct {
 	statsChan chan QueueStats // Channel for publishing stats (optional, set via SetStatsChannel)
 	statsTick *time.Ticker    // Ticker for periodic stats publishing (optional)
 	// Task execution time tracking
-	executionTimeDeltas []time.Duration // Buffer of task execution times (lease to complete/fail)
-	avgExecutionTime    time.Duration   // Average execution time (calculated periodically)
-	lastAvgTime         time.Time       // Last time average was calculated
-	avgInterval         time.Duration   // Interval for calculating averages
-	roundDebugLastLogAt time.Time       // Throttle timestamp for round-completion debug prints
-	dequeueDebugLastLogAt time.Time     // Throttle timestamp for dequeue skip debug prints
-	dequeueSkipOldRound   int64         // Aggregated dequeue skips: task.Round < currentRound
-	dequeueSkipEmptyID    int64         // Aggregated dequeue skips: empty task.ID
-	dequeueSkipInProgress int64         // Aggregated dequeue skips: already in progress
+	executionTimeDeltas   []time.Duration // Buffer of task execution times (lease to complete/fail)
+	avgExecutionTime      time.Duration   // Average execution time (calculated periodically)
+	lastAvgTime           time.Time       // Last time average was calculated
+	avgInterval           time.Duration   // Interval for calculating averages
+	roundDebugLastLogAt   time.Time       // Throttle timestamp for round-completion debug prints
+	dequeueDebugLastLogAt time.Time       // Throttle timestamp for dequeue skip debug prints
+	dequeueSkipOldRound   int64           // Aggregated dequeue skips: task.Round < currentRound
+	dequeueSkipEmptyID    int64           // Aggregated dequeue skips: empty task.ID
+	dequeueSkipInProgress int64           // Aggregated dequeue skips: already in progress
 	// Retry sweep specific fields
 	maxKnownDepth int // Maximum known depth from previous traversal (for retry sweep)
 	// Copy phase specific fields
@@ -217,6 +216,8 @@ type Queue struct {
 	copyKeysetCursor string // Copy phase pull
 	// traversalCacheLoaded: set on first pull; until true, completion checks are ignored so we don't complete before first pull.
 	traversalCacheLoaded bool
+	// Watchdog for detecting stalled queues
+	watchdog *QueueWatchdog
 }
 
 // NewQueue creates a new Queue instance.
@@ -227,7 +228,6 @@ func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCo
 		state:               QueueStateRunning,
 		inProgress:          make(map[string]*TaskBase),
 		pendingBuff:         make([]*TaskBase, 0, effectiveLeaseBatchSize()),
-		pendingSet:          make(map[string]struct{}),
 		maxRetries:          maxRetries,
 		round:               0,
 		workers:             make([]Worker, 0, workerCount),
@@ -261,7 +261,6 @@ func (q *Queue) InitializeWithContext(database *db.DB, adapter types.FSAdapter, 
 		w := NewTraversalWorker(
 			fmt.Sprintf("%s-worker-%d", q.name, i),
 			q,
-			database,
 			adapter,
 			q.name,
 			shutdownCtx,
@@ -272,6 +271,10 @@ func (q *Queue) InitializeWithContext(database *db.DB, adapter types.FSAdapter, 
 
 	// Start the queue's Run() method to coordinate pulling tasks and advancing rounds
 	go q.Run()
+
+	// Start queue watchdog to detect stalls
+	q.watchdog = NewQueueWatchdog(q, defaultQueueStallTimeout)
+	q.watchdog.Start()
 
 	// Queues are initialized - tasks will be seeded externally or propagated through Complete()
 	if logservice.LS != nil {
@@ -299,7 +302,6 @@ func (q *Queue) InitializeCopyWithContext(database *db.DB, srcAdapter, dstAdapte
 		w := NewCopyWorker(
 			fmt.Sprintf("%s-worker-%d", q.name, i),
 			q,
-			database,
 			srcAdapter,
 			dstAdapter,
 			shutdownCtx,
@@ -310,6 +312,10 @@ func (q *Queue) InitializeCopyWithContext(database *db.DB, srcAdapter, dstAdapte
 
 	// Start the queue's Run() method to coordinate pulling tasks and advancing rounds
 	go q.Run()
+
+	// Start queue watchdog to detect stalls
+	q.watchdog = NewQueueWatchdog(q, defaultQueueStallTimeout)
+	q.watchdog.Start()
 
 	// Queues are initialized - tasks will be pulled from copy status buckets
 	if logservice.LS != nil {
@@ -432,7 +438,7 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 		// Soft check: verify in-memory state (after flush)
 		inProgressCount := q.InProgressCount()
 		pendingBuffCount := q.GetPendingCount()
-		lastPullWasPartial := q.getLastPullWasPartial()
+		lastPullWasPartial := q.GetLastPullWasPartial()
 		mode := q.GetMode()
 		if inProgressCount == 0 && pendingBuffCount == 0 && !lastPullWasPartial {
 			// We may be at round-end but never observed a terminal pull yet.
@@ -440,7 +446,7 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			q.PullTasksIfNeeded(true)
 			inProgressCount = q.InProgressCount()
 			pendingBuffCount = q.GetPendingCount()
-			lastPullWasPartial = q.getLastPullWasPartial()
+			lastPullWasPartial = q.GetLastPullWasPartial()
 		}
 
 		// Round completion: memory state only. DB is a stale snapshot during the round.
@@ -468,11 +474,9 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			if inProgressCount > 0 || pendingBuffCount > 0 {
 				return false
 			}
-			fmt.Println("last pull was partial check", q.name, currentRound, lastPullWasPartial)
 			if !lastPullWasPartial {
 				return false
 			}
-			fmt.Println("last pull was partial", q.name, currentRound, lastPullWasPartial)
 			info := q.getRoundInfoReadOnly(currentRound)
 			if info == nil || info.PullCount == 0 {
 				return false
@@ -502,7 +506,7 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 
 // markComplete marks the queue as completed and notifies the coordinator.
 // Returns true if successfully marked complete.
-func (q *Queue) markComplete(format string, args ...interface{}) bool {
+func (q *Queue) markComplete(format string, args ...any) bool {
 	state := q.State()
 	if state != QueueStateRunning && state != QueueStateWaiting {
 		return false
@@ -590,9 +594,14 @@ func (q *Queue) ReportTaskResult(task *TaskBase, result TaskExecutionResult) {
 		return
 	}
 
+	// Signal progress to watchdog (task completed)
+	if q.watchdog != nil {
+		q.watchdog.Beat()
+	}
+
 	// Event-driven post-processing: check if we need to pull more tasks
 	pendingCount := q.GetPendingCount()
-	lastPullWasPartial := q.getLastPullWasPartial()
+	lastPullWasPartial := q.GetLastPullWasPartial()
 	state := q.State()
 
 	// Only process if queue is running
@@ -740,7 +749,7 @@ func (q *Queue) PullTasksIfNeeded(force bool) {
 
 	// Only pull if: queue is running, buffer is low, not already pulling, and last pull wasn't partial
 	// If last pull was partial, we might have exhausted this round - don't pull again until round advances
-	lastPullWasPartial := q.getLastPullWasPartial()
+	lastPullWasPartial := q.GetLastPullWasPartial()
 	pendingCount := q.GetPendingCount()
 	pullLowWM := q.getPullLowWM()
 	pulling := q.getPulling()
@@ -786,7 +795,6 @@ func (q *Queue) Clear() {
 	// Clear in-progress tracking
 	q.inProgress = make(map[string]*TaskBase)
 	q.pendingBuff = make([]*TaskBase, 0, effectiveLeaseBatchSize())
-	q.pendingSet = make(map[string]struct{})
 	q.pulling = false
 
 	// DuckDB clearing would require deleting all buckets - typically not needed

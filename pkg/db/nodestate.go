@@ -65,9 +65,11 @@ type InsertOperation struct {
 }
 
 // FetchResult is one row from a keyset list (id + full state).
+// DstParentServiceID is populated by ListNodesCopyKeyset when joining dst_nodes on parent path_hash.
 type FetchResult struct {
-	Key   string
-	State *NodeState
+	Key                string
+	State              *NodeState
+	DstParentServiceID string // DST parent's ServiceID from path_hash join (copy pull only)
 }
 
 // WriteOperation is an operation that can be buffered and flushed via the writer.

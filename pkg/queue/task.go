@@ -45,22 +45,24 @@ type RetryDstCleanup struct {
 // Workers lease tasks, mark them Locked, and attempt execution.
 // Tasks are identified by ULID (ID) for internal tracking.
 type TaskBase struct {
-	ID                 string            // ULID for internal tracking (database keys)
-	Type               string            // Task type: "src-traversal", "dst-traversal", "upload", etc.
-	Folder             types.Folder      // Folder to process (if applicable)
-	File               types.File        // File to process (if applicable)
-	Locked             bool              // Whether this task is currently leased by a worker
-	Attempts           int               // Number of execution attempts
-	Status             string            // Execution result: "successful", "failed"
-	ExpectedFolders    []types.Folder    // Expected folders (dst tasks only)
-	ExpectedFiles      []types.File      // Expected files (dst tasks only)
-	ExpectedSrcIDMap    map[string]string   // Map of Type+Name -> SRC node ID for matching (dst tasks only)
+	ID                  string             // ULID for internal tracking (database keys)
+	Type                string             // Task type: "src-traversal", "dst-traversal", "upload", etc.
+	Folder              types.Folder       // Folder to process (if applicable)
+	File                types.File         // File to process (if applicable)
+	Locked              bool               // Whether this task is currently leased by a worker
+	Attempts            int                // Number of execution attempts
+	Status              string             // Execution result: "successful", "failed" (set by queue)
+	WorkerResult        string             // Worker execution result: "success", "error" (set by worker before ReportTaskResult)
+	LastError           string             // Error message from last execution attempt (set by worker, written by queue)
+	ExpectedFolders     []types.Folder     // Expected folders (dst tasks only)
+	ExpectedFiles       []types.File       // Expected files (dst tasks only)
+	ExpectedSrcIDMap    map[string]string  // Map of Type+Name -> SRC node ID for matching (dst tasks only)
 	ExpectedSrcNodeMeta map[string]SrcNodeMeta // SRC node Depth/CopyStatus keyed by SRC ID (dst tasks only, populated at pull)
 	RetryDstCleanup     *RetryDstCleanup   // DST counterpart + children meta for SRC folder in retry mode (populated at pull)
 	DiscoveredChildren  []ChildResult      // Children discovered during execution
-	Round              int               // The round this task belongs to (for buffer coordination)
-	LeaseTime          time.Time         // Time when task was leased (for execution time tracking)
-	CopyStatus         string            // Current SRC copy status from DB (used to preserve copy_status on traversal completion events)
+	Round               int                // The round this task belongs to (for buffer coordination)
+	LeaseTime           time.Time          // Time when task was leased (for execution time tracking)
+	CopyStatus          string             // Current SRC copy status from DB (used to preserve copy_status on traversal completion events)
 	// Copy phase specific fields
 	CopyPass           int    // Copy pass number (1 for folders, 2 for files)
 	SrcTraversalStatus string // SRC node traversal_status at pull time (preserved when writing copy_status events)
@@ -118,12 +120,4 @@ type CopyTask struct {
 	SrcId  string
 	DstId  string
 	DstCtx types.ServiceContext
-}
-
-// TaskResult represents the outcome of a task execution.
-type TaskResult struct {
-	Task    *TaskBase
-	Success bool
-	Error   error
-	Data    any // Optional result data (e.g., ListResult)
 }

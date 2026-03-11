@@ -44,7 +44,7 @@ func statusJoinExpr(table string) (nodesAlias, cteAlias, cte string) {
 	return "n", "e", cteSrcCurrentStatus
 }
 
-// Node columns from joined form: n.* plus e.traversal_status, e.copy_status (SRC only), excluded derived, errors as ''.
+// Node columns from joined form: n.* plus e.traversal_status, e.copy_status (SRC only), excluded derived, errors as ”.
 func selectNodeColsWithStatus(table string) string {
 	t := tableName(table)
 	n, e, cte := statusJoinExpr(table)
@@ -63,7 +63,7 @@ func QueryNodesForReview(d *DB, table string, depth *int, status string, exclude
 	nodeAlias, e, _ := statusJoinExpr(table)
 	ctx := context.Background()
 	base := selectNodeColsWithStatus(table) + ` WHERE 1=1`
-	args := []interface{}{}
+	args := []any{}
 	param := 1
 	if depth != nil {
 		base += ` AND ` + nodeAlias + `.depth = $` + strconv.Itoa(param)
@@ -175,15 +175,15 @@ type MergedReviewRow struct {
 // FoldersOnly: if true, type = 'folder'.
 // ExcludeRoot: if true, exclude path = '/' from results (for global search).
 type ReviewFilter struct {
-	ParentPath   string
-	Query        string
-	Status       string
-	FoldersOnly  bool
-	ExcludeRoot  bool
+	ParentPath  string
+	Query       string
+	Status      string
+	FoldersOnly bool
+	ExcludeRoot bool
 }
 
 // buildMergedReviewWhere returns a WHERE clause and args for the merged CTE. Param placeholders are $1, $2, ...
-func buildMergedReviewWhere(f ReviewFilter) (clause string, args []interface{}) {
+func buildMergedReviewWhere(f ReviewFilter) (clause string, args []any) {
 	var parts []string
 	param := 1
 	if f.ParentPath != "" {
@@ -233,7 +233,7 @@ func ListMergedReviewDiffs(d *DB, f ReviewFilter, orderBy string, limit, offset 
 	}
 	sel := base + ` SELECT path, name, depth, type, src_node_id, dst_node_id, src_traversal_status, dst_traversal_status, copy_status, excluded, size FROM merged` + where +
 		` ORDER BY ` + orderBy + ` LIMIT $` + strconv.Itoa(len(args)+1) + ` OFFSET $` + strconv.Itoa(len(args)+2)
-	listArgs := append(append([]interface{}{}, args...), limit, offset)
+	listArgs := append(append([]any{}, args...), limit, offset)
 	rows, err := conn.QueryContext(ctx, sel, listArgs...)
 	if err != nil {
 		return nil, 0, err
@@ -471,7 +471,7 @@ func ListNodesByDepthKeyset(d *DB, table string, depth int, afterID, statusFilte
 	ctx := context.Background()
 	_, e, _ := statusJoinExpr(table)
 	base := selectNodeColsWithStatus(table) + ` WHERE n.depth = $1`
-	args := []interface{}{depth}
+	args := []any{depth}
 	param := 2
 	if statusFilter != "" {
 		base += ` AND ` + e + `.traversal_status = $` + strconv.Itoa(param)
@@ -514,9 +514,9 @@ func ListNodesCopyKeyset(d *DB, depth int, nodeType, afterID string, limit int, 
 		return nil, err
 	}
 	ctx := context.Background()
-	_, e, _ := statusJoinExpr("SRC")
-	base := selectNodeColsWithStatus("SRC") + ` WHERE n.depth = $1 AND ` + e + `.copy_status = $2`
-	args := []interface{}{depth, statusFilter}
+	_, e, cte := statusJoinExpr("SRC")
+	base := `SELECT n.id, n.service_id, n.parent_id, n.parent_service_id, n.path, n.parent_path, n.type, n.size, n.mtime, n.depth, COALESCE(` + e + `.traversal_status,'') AS traversal_status, COALESCE(` + e + `.copy_status,'') AS copy_status, (COALESCE(` + e + `.copy_status,'') IN ('excluded_explicit','excluded_inherited')) AS excluded, '' AS errors, COALESCE(dst_parent.service_id,'') AS dst_parent_service_id FROM ` + tableSrcNodes + ` n LEFT JOIN ` + cte + ` ` + e + ` ON n.id = ` + e + `.id LEFT JOIN ` + tableSrcNodes + ` parent ON parent.id = n.parent_id LEFT JOIN ` + tableDstNodes + ` dst_parent ON dst_parent.path_hash = parent.path_hash WHERE n.depth = $1 AND ` + e + `.copy_status = $2`
+	args := []any{depth, statusFilter}
 	param := 3
 	if nodeType != "" {
 		base += ` AND n.type = $` + strconv.Itoa(param)
@@ -539,7 +539,8 @@ func ListNodesCopyKeyset(d *DB, depth int, nodeType, afterID string, limit int, 
 	for rows.Next() {
 		var node NodeState
 		var size sql.NullInt64
-		if err := rows.Scan(&node.ID, &node.ServiceID, &node.ParentID, &node.ParentServiceID, &node.Path, &node.ParentPath, &node.Type, &size, &node.MTime, &node.Depth, &node.TraversalStatus, &node.CopyStatus, &node.Excluded, &node.Errors); err != nil {
+		var dstParentServiceID string
+		if err := rows.Scan(&node.ID, &node.ServiceID, &node.ParentID, &node.ParentServiceID, &node.Path, &node.ParentPath, &node.Type, &size, &node.MTime, &node.Depth, &node.TraversalStatus, &node.CopyStatus, &node.Excluded, &node.Errors, &dstParentServiceID); err != nil {
 			return nil, err
 		}
 		if size.Valid {
@@ -547,7 +548,7 @@ func ListNodesCopyKeyset(d *DB, depth int, nodeType, afterID string, limit int, 
 		}
 		node.Status = node.TraversalStatus
 		node.Name = node.Path
-		out = append(out, FetchResult{Key: node.ID, State: &node})
+		out = append(out, FetchResult{Key: node.ID, State: &node, DstParentServiceID: dstParentServiceID})
 	}
 	return out, rows.Err()
 }
@@ -693,7 +694,7 @@ func BatchGetNodeMeta(d *DB, table string, ids []string) (map[string]NodeMeta, e
 	nodeAlias, e, cte := statusJoinExpr(table)
 	ctx := context.Background()
 	placeholders := make([]string, len(ids))
-	args := make([]interface{}, len(ids))
+	args := make([]any, len(ids))
 	for i := range ids {
 		placeholders[i] = "$" + strconv.Itoa(i+1)
 		args[i] = ids[i]
@@ -723,7 +724,7 @@ func ListDstBatchWithSrcChildren(d *DB, depth int, afterID string, limit int, tr
 	}
 	ctx := context.Background()
 	cteWhere := "dn.depth = $1"
-	args := []interface{}{depth}
+	args := []any{depth}
 	argNum := 2
 	if afterID != "" {
 		cteWhere += " AND dn.id > $" + strconv.Itoa(argNum)
@@ -863,7 +864,7 @@ func GetSrcChildrenGroupedByParentPath(d *DB, parentPaths []string) (map[string]
 			q += "$" + strconv.Itoa(j+1)
 		}
 		q += ") ORDER BY " + nodeAlias + ".parent_path, " + nodeAlias + ".id"
-		args := make([]interface{}, len(chunkHashes))
+		args := make([]any, len(chunkHashes))
 		for j, h := range chunkHashes {
 			args[j] = h
 		}
@@ -949,7 +950,7 @@ func BatchGetDstIDsFromSrcIDs(d *DB, srcIDs []string) (map[string]string, error)
 	ctx := context.Background()
 	// 1) SRC: id -> path_hash
 	placeholders := make([]string, len(srcIDs))
-	args := make([]interface{}, len(srcIDs))
+	args := make([]any, len(srcIDs))
 	for i := range srcIDs {
 		placeholders[i] = "$" + strconv.Itoa(i+1)
 		args[i] = srcIDs[i]
@@ -991,7 +992,7 @@ func BatchGetDstIDsFromSrcIDs(d *DB, srcIDs []string) (map[string]string, error)
 		return out, nil
 	}
 	placeholders = make([]string, len(hashes))
-	args = make([]interface{}, len(hashes))
+	args = make([]any, len(hashes))
 	for i := range hashes {
 		placeholders[i] = "$" + strconv.Itoa(i+1)
 		args[i] = hashes[i]
@@ -1034,7 +1035,7 @@ func BatchGetNodesByID(d *DB, table string, ids []string) (map[string]*NodeState
 	}
 	ctx := context.Background()
 	placeholders := make([]string, len(ids))
-	args := make([]interface{}, len(ids))
+	args := make([]any, len(ids))
 	for i := range ids {
 		placeholders[i] = "$" + strconv.Itoa(i+1)
 		args[i] = ids[i]
@@ -1083,7 +1084,7 @@ func BatchGetChildrenIDsByParentIDs(d *DB, table string, parentIDs []string) (ma
 		q += "$" + strconv.Itoa(i+1)
 	}
 	q += ")"
-	args := make([]interface{}, len(parentIDs))
+	args := make([]any, len(parentIDs))
 	for i, id := range parentIDs {
 		args[i] = id
 	}

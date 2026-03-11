@@ -206,7 +206,7 @@ func (q *Queue) PullRetryTasks(force bool) {
 		q.setLastPullWasPartial(rawResultCount <= batchSize)
 
 		// Record pull in RoundInfo
-		q.recordPull(currentRound, enqueuedCount, q.getLastPullWasPartial())
+		q.recordPull(currentRound, enqueuedCount, q.GetLastPullWasPartial())
 		q.setFirstPullForRound(false)
 
 		return
