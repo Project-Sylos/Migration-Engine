@@ -39,3 +39,9 @@ __pycache__/
 # ignore logs and misc files
 *logs.txt
 *.log
+
+# ignore test DB files
+*_test.db
+*_test.db.wal
+*_test.db-journal
+*_test.duckdb
