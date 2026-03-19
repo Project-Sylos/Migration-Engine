@@ -176,6 +176,12 @@ func PathHash(path string) string {
 	return hex.EncodeToString(sum[:16])
 }
 
+// PathHashForJoin returns PathHash(NormalizeRootRelativePath(path)). Use when storing or querying path_hash
+// so that "" and "/" hash to the same value and SRC/DST root joins match.
+func PathHashForJoin(path string) string {
+	return PathHash(NormalizeRootRelativePath(path))
+}
+
 // DeterministicNodeID returns a stable id from (queueType, nodeType, path) for race-safe deduplication.
 func DeterministicNodeID(queueType, nodeType, path string) string {
 	h := sha256.New()

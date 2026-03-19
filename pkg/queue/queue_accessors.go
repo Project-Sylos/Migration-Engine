@@ -604,14 +604,6 @@ func (q *Queue) setExpectedFromStatsBucket(round int) {
 	default:
 		return
 	}
-	// Persist to stats for resume
-	if expected > 0 {
-		_ = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-			return s.WithTx(func(w *db.Writer) error {
-				return w.SetStatsCountForDepth(queueType, round, db.StatsKeyExpected, expected)
-			})
-		})
-	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	stats := q.getOrCreateRoundStatsUnlocked(round)

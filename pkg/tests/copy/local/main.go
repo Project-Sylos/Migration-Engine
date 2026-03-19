@@ -73,47 +73,58 @@ func runTest() error {
 	// Phase 1: Run traversal to populate the database
 	fmt.Println("🚀 Phase 2: Traversal")
 	fmt.Println("=====================")
-	// Setup for traversal (using traversal shared setup)
-	// We'll use LetsMigrate which runs traversal
 	cfg, err := setupTraversalConfig(srcPath, dstPath)
 	if err != nil {
 		return fmt.Errorf("traversal setup failed: %w", err)
 	}
 
-	// Run traversal phase (LetsMigrate runs traversal using manager-owned DB lifecycle)
-	result, err := migration.LetsMigrate(cfg)
+	manager, err := migration.NewMigrationManager(cfg.Database)
+	if err != nil {
+		return fmt.Errorf("failed to create migration manager: %w", err)
+	}
+	defer manager.Close()
+
+	migrationInstance, err := manager.CreateMigration(migration.CreateMigrationConfig{
+		Name: filepath.Base(cfg.Database.Path),
+		ServiceMetadata: map[string]string{
+			"source_name":      cfg.Source.Name,
+			"destination_name": cfg.Destination.Name,
+		},
+		RootConfig: map[string]string{
+			"source_root_id":      cfg.Source.Root.ServiceID,
+			"destination_root_id": cfg.Destination.Root.ServiceID,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create migration: %w", err)
+	}
+
+	if _, err := migrationInstance.AddRoots(cfg.Source.Root, cfg.Destination.Root); err != nil {
+		return fmt.Errorf("failed to add roots: %w", err)
+	}
+	if err := assertMigrationPhase(manager, migrationInstance.ID, migration.PhaseFiltersSet); err != nil {
+		return err
+	}
+
+	runtime, err := migrationInstance.StartTraversal(cfg)
 	if err != nil {
 		return fmt.Errorf("traversal failed: %w", err)
 	}
-	fmt.Printf("Traversal completed. Processed %d SRC nodes, %d DST nodes\n", result.Verification.SrcTotal, result.Verification.DstTotal)
+	if err := assertMigrationPhase(manager, migrationInstance.ID, migration.PhaseTraversalReview); err != nil {
+		return err
+	}
+	fmt.Printf("Traversal completed. SRC tracked %d, DST tracked %d\n", runtime.Src.TotalTracked, runtime.Dst.TotalTracked)
 	fmt.Println()
 
-	// Phase 2: Run copy phase
-	// Reopen database for explicit copy-phase call.
+	// Phase 2: Run copy phase via the migration lifecycle so DB phase updates match the API flow.
 	fmt.Println("🚀 Phase 3: Copy Phase")
 	fmt.Println("======================")
-	database, srcAdapter, dstAdapter, err := shared.SetupLocalCopyTest(srcPath, dstPath, false) // Don't remove existing DB
-	if err != nil {
-		return fmt.Errorf("copy setup failed: %w", err)
-	}
-	defer database.Close()
-
-	// Run copy phase
-	stats, err := migration.RunCopyPhase(migration.CopyPhaseConfig{
-		DuckDB:          database,
-		SrcAdapter:      srcAdapter,
-		DstAdapter:      dstAdapter,
-		WorkerCount:     10,
-		MaxRetries:      3,
-		LogAddress:      "127.0.0.1:8081",
-		LogLevel:        "trace",
-		SkipListener:    false,
-		StartupDelay:    3 * time.Second,
-		ProgressTick:    2 * time.Second,
-		ShutdownContext: nil,
-	})
+	stats, err := migrationInstance.StartCopy()
 	if err != nil {
 		return fmt.Errorf("copy phase failed: %w", err)
+	}
+	if err := assertMigrationPhase(manager, migrationInstance.ID, migration.PhaseCopyReview); err != nil {
+		return err
 	}
 	fmt.Println()
 
@@ -121,7 +132,7 @@ func runTest() error {
 	fmt.Println("✓ Phase 4: Verification")
 	fmt.Println("========================")
 	shared.PrintCopyVerification(stats)
-	if err := shared.VerifyCopyCompletion(database); err != nil {
+	if err := shared.VerifyCopyCompletion(migrationInstance.DB); err != nil {
 		return fmt.Errorf("verification failed: %w", err)
 	}
 
@@ -199,4 +210,18 @@ func setupTraversalConfig(srcPath, dstPath string) (migration.Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func assertMigrationPhase(manager *migration.MigrationManager, migrationID, expected string) error {
+	details, err := manager.GetMigrationDetails(migrationID, "")
+	if err != nil {
+		return fmt.Errorf("failed to load migration details for %s: %w", migrationID, err)
+	}
+	if details == nil {
+		return fmt.Errorf("migration details missing for %s", migrationID)
+	}
+	if details.Phase != expected {
+		return fmt.Errorf("unexpected migration phase: got %q want %q", details.Phase, expected)
+	}
+	return nil
 }

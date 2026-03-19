@@ -70,6 +70,10 @@ func Open(opts Options) (*DB, error) {
 		return nil, err
 	}
 	db := &DB{path: path, conn: conn}
+	if err := migrateMigrationsRuntimeState(conn); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	if err := migratePathHashColumns(conn); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -109,6 +113,27 @@ func initSchemaConn(conn *sql.DB) error {
 		if _, err := conn.Exec(ddl); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// migrateMigrationsRuntimeState adds runtime_state_json to migrations table if missing (for resumability: last round, copy pass).
+func migrateMigrationsRuntimeState(conn *sql.DB) error {
+	ctx := context.Background()
+	var exists int64
+	err := conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.columns WHERE table_name = $1 AND column_name = 'runtime_state_json'",
+		TableMigrations,
+	).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("runtime_state_json migration check: %w", err)
+	}
+	if exists > 0 {
+		return nil
+	}
+	_, err = conn.ExecContext(ctx, "ALTER TABLE "+TableMigrations+" ADD COLUMN runtime_state_json VARCHAR")
+	if err != nil {
+		return fmt.Errorf("runtime_state_json migration add column: %w", err)
 	}
 	return nil
 }
@@ -170,7 +195,7 @@ func backfillPathHash(conn *sql.DB, table string) error {
 		if err := rows.Scan(&id, &path, &parentPath); err != nil {
 			return fmt.Errorf("path_hash backfill scan %s: %w", table, err)
 		}
-		batch = append(batch, struct{ id, pathHash, parentPathHash string }{id, PathHash(path), PathHash(parentPath)})
+		batch = append(batch, struct{ id, pathHash, parentPathHash string }{id, PathHashForJoin(path), PathHashForJoin(parentPath)})
 		if len(batch) >= pathHashMigrationBatchSize {
 			if err := execPathHashBatch(conn, table, batch); err != nil {
 				return err
@@ -332,6 +357,14 @@ func (db *DB) AppendTaskError(queueType, phase, nodeID, message string, attempts
 			Attempts:  attempts,
 			Path:      path,
 		})
+	}
+}
+
+// AppendFailedSubtree enqueues an SRC folder path for subtree failure propagation.
+// At the next flush, all pending descendants will be marked as copy_status='failed'.
+func (db *DB) AppendFailedSubtree(parentPath string) {
+	if db.sealBuffer != nil {
+		db.sealBuffer.AddFailedSubtreePath(parentPath)
 	}
 }
 

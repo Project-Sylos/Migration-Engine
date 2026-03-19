@@ -3,7 +3,7 @@
 #   A/items  -> access denied (SRC-like, minimal structure)
 #   B/items  -> accessible (DST-like, superset structure with extra files/folders)
 
-$BaseDir = "$env:USERPROFILE\sylos_retry_test"
+$BaseDir = "$env:USERPROFILE\..sylos_retry_test"
 $TreeA   = "$BaseDir\A\items"
 $TreeB   = "$BaseDir\B\items"
 

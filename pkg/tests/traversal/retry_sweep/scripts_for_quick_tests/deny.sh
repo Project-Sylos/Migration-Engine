@@ -4,7 +4,7 @@
 # Note: On Linux, we use chmod to make the directory read-only or remove execute permissions
 # This simulates access denial similar to Windows icacls deny
 
-BaseDir="${HOME}/sylos_retry_test"
+BaseDir="${HOME}/..sylos_retry_test"
 TreeA="${BaseDir}/A/items"
 
 echo "Denying access to A/items..." 

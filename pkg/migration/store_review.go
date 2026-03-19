@@ -16,6 +16,55 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
+// deltaKeyToReviewKey maps a migration-layer delta key to the universal stats table key.
+func deltaKeyToReviewKey(k string) string {
+	switch k {
+	case DeltaTraversalPending:
+		return db.ReviewKeyTraversalPending
+	case DeltaTraversalPendingRetry:
+		return db.ReviewKeyTraversalPendingRetry
+	case DeltaTraversalFailed:
+		return db.ReviewKeyTraversalFailed
+	case DeltaCopyPending:
+		return db.ReviewKeyCopyPending
+	case DeltaCopyFailed:
+		return db.ReviewKeyCopyFailed
+	case DeltaExcluded:
+		return db.ReviewKeyExcluded
+	case DeltaFolders:
+		return db.ReviewKeyFolders
+	case DeltaFiles:
+		return db.ReviewKeyFiles
+	case DeltaSizeSrc:
+		return db.ReviewKeySizeSrc
+	case DeltaSizeDst:
+		return db.ReviewKeySizeDst
+	default:
+		return ""
+	}
+}
+
+// persistReviewDeltas applies migration-layer deltas to the universal stats table.
+func (s *migrationStore) persistReviewDeltas(deltas map[string]int64) error {
+	if len(deltas) == 0 {
+		return nil
+	}
+	dbDeltas := make([]db.ReviewStatsDelta, 0, len(deltas))
+	for k, v := range deltas {
+		if rk := deltaKeyToReviewKey(k); rk != "" {
+			dbDeltas = append(dbDeltas, db.ReviewStatsDelta{Key: rk, Delta: v})
+		}
+	}
+	if len(dbDeltas) == 0 {
+		return nil
+	}
+	return s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+		return sess.WithTx(func(w *db.Writer) error {
+			return w.ApplyReviewStatsDeltas(dbDeltas)
+		})
+	})
+}
+
 func mergedRowToDiffItem(r db.MergedReviewRow) DiffItem {
 	item := DiffItem{
 			Path:               r.Path,
@@ -95,6 +144,9 @@ func (s *migrationStore) setNodeExcluded(nodeID string, excluded bool) (int64, m
 	} else {
 		addReviewDelta(deltas, DeltaExcluded, -1)
 		addReviewDelta(deltas, DeltaTraversalPending, 1)
+	}
+	if err := s.persistReviewDeltas(deltas); err != nil {
+		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
 	}
 	return 1, deltas, nil
 }
@@ -182,6 +234,9 @@ func (s *migrationStore) setNodeCopyStatus(nodeID, status string) (int64, map[st
 		addReviewDelta(deltas, DeltaCopyPending, -1)
 		addReviewDelta(deltas, DeltaCopyFailed, 1)
 	}
+	if err := s.persistReviewDeltas(deltas); err != nil {
+		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+	}
 	return 1, deltas, nil
 }
 
@@ -227,6 +282,9 @@ func (s *migrationStore) markNodeForRetryDiscovery(nodeID string) (int64, map[st
 		addReviewDelta(deltas, DeltaFiles, -desc.Files)
 		addReviewDelta(deltas, DeltaExcluded, -desc.Excluded)
 		addReviewDelta(deltas, DeltaSizeDst, -desc.SizeDst)
+		if err := s.persistReviewDeltas(deltas); err != nil {
+			return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+		}
 		return 1, deltas, nil
 	}
 	dstNode, err := db.GetNodeByID(s.db, "DST", nodeID)
@@ -247,6 +305,9 @@ func (s *migrationStore) markNodeForRetryDiscovery(nodeID string) (int64, map[st
 	deltas := make(map[string]int64)
 	addReviewDelta(deltas, DeltaTraversalFailed, -1)
 	addReviewDelta(deltas, DeltaTraversalPendingRetry, 1)
+	if err := s.persistReviewDeltas(deltas); err != nil {
+		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+	}
 	return 1, deltas, nil
 }
 
@@ -278,6 +339,9 @@ func (s *migrationStore) unmarkNodeForRetryDiscovery(nodeID string) (int64, map[
 		deltas := make(map[string]int64)
 		addReviewDelta(deltas, DeltaTraversalPendingRetry, -1)
 		addReviewDelta(deltas, DeltaTraversalFailed, 1)
+		if err := s.persistReviewDeltas(deltas); err != nil {
+			return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+		}
 		return 1, deltas, nil
 	}
 	dstNode, err := db.GetNodeByID(s.db, "DST", nodeID)
@@ -298,6 +362,9 @@ func (s *migrationStore) unmarkNodeForRetryDiscovery(nodeID string) (int64, map[
 	deltas := make(map[string]int64)
 	addReviewDelta(deltas, DeltaTraversalPendingRetry, -1)
 	addReviewDelta(deltas, DeltaTraversalFailed, 1)
+	if err := s.persistReviewDeltas(deltas); err != nil {
+		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+	}
 	return 1, deltas, nil
 }
 
@@ -344,6 +411,9 @@ func (s *migrationStore) setNodeExcludedWithPropagation(nodeID string, excluded 
 		addReviewDelta(deltas, DeltaExcluded, affected)
 	} else {
 		addReviewDelta(deltas, DeltaExcluded, -affected)
+	}
+	if err := s.persistReviewDeltas(deltas); err != nil {
+		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
 	}
 	return affected, deltas, nil
 }

@@ -16,11 +16,12 @@ import (
 type migrationRecord struct {
 	ID                  string
 	Name                string
-	Phase               Phase
+	Phase               string
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
 	ServiceMetadataJSON string
 	RootConfigJSON      string
+	RuntimeStateJSON    string
 }
 
 type migrationStore struct {
@@ -49,16 +50,18 @@ func (s *migrationStore) createMigration(database *db.DB, record migrationRecord
 			created_at,
 			updated_at,
 			service_metadata_json,
-			root_config_json
-		) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			root_config_json,
+			runtime_state_json
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (migration_id) DO NOTHING`,
 		record.ID,
 		record.Name,
-		record.Phase.String(),
+		record.Phase,
 		record.CreatedAt,
 		record.UpdatedAt,
 		record.ServiceMetadataJSON,
 		record.RootConfigJSON,
+		record.RuntimeStateJSON,
 	)
 	if err != nil {
 		return fmt.Errorf("create migration %s: %w", record.ID, err)
@@ -80,7 +83,7 @@ func (s *migrationStore) getMigration(database *db.DB, id string) (*migrationRec
 	)
 	err = conn.QueryRowContext(
 		context.Background(),
-		`SELECT migration_id, name, phase, created_at, updated_at, service_metadata_json, root_config_json
+		`SELECT migration_id, name, phase, created_at, updated_at, service_metadata_json, root_config_json, COALESCE(runtime_state_json,'')
 		 FROM `+db.TableMigrations+` WHERE migration_id = $1`,
 		id,
 	).Scan(
@@ -91,6 +94,7 @@ func (s *migrationStore) getMigration(database *db.DB, id string) (*migrationRec
 		&record.UpdatedAt,
 		&record.ServiceMetadataJSON,
 		&record.RootConfigJSON,
+		&record.RuntimeStateJSON,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -115,7 +119,7 @@ func (s *migrationStore) listMigrationsFromDB(database *db.DB) ([]migrationRecor
 	}
 	rows, err := conn.QueryContext(
 		context.Background(),
-		`SELECT migration_id, name, phase, created_at, updated_at, service_metadata_json, root_config_json
+		`SELECT migration_id, name, phase, created_at, updated_at, service_metadata_json, root_config_json, COALESCE(runtime_state_json,'')
 		 FROM `+db.TableMigrations+` ORDER BY created_at DESC`,
 	)
 	if err != nil {
@@ -137,6 +141,7 @@ func (s *migrationStore) listMigrationsFromDB(database *db.DB) ([]migrationRecor
 			&record.UpdatedAt,
 			&record.ServiceMetadataJSON,
 			&record.RootConfigJSON,
+			&record.RuntimeStateJSON,
 		); err != nil {
 			return nil, fmt.Errorf("list migrations scan: %w", err)
 		}
@@ -174,7 +179,7 @@ func (s *migrationStore) deleteMigration(database *db.DB, id string) error {
 	return nil
 }
 
-func (s *migrationStore) updatePhase(id string, phase Phase) error {
+func (s *migrationStore) updatePhase(id string, phase string) error {
 	if s.db == nil {
 		return fmt.Errorf("updatePhase requires store db")
 	}
@@ -185,7 +190,7 @@ func (s *migrationStore) updatePhase(id string, phase Phase) error {
 	_, err = conn.ExecContext(
 		context.Background(),
 		`UPDATE `+db.TableMigrations+` SET phase = $1, updated_at = $2 WHERE migration_id = $3`,
-		phase.String(),
+		phase,
 		time.Now().UTC(),
 		id,
 	)
@@ -212,6 +217,46 @@ func (s *migrationStore) updateUpdatedAt(id string) error {
 	)
 	if err != nil {
 		return fmt.Errorf("update migration %s updated_at: %w", id, err)
+	}
+	return nil
+}
+
+// updateRuntimeState merges stateJSON into existing runtime_state_json (e.g. last_round_src, last_round_dst, last_copy_round). Pass partial JSON to update only some keys.
+func (s *migrationStore) updateRuntimeState(id string, stateJSON string) error {
+	if s.db == nil || stateJSON == "" {
+		return nil
+	}
+	conn, err := s.db.GetDB()
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	var existing string
+	err = conn.QueryRowContext(ctx, `SELECT COALESCE(runtime_state_json,'{}') FROM `+db.TableMigrations+` WHERE migration_id = $1`, id).Scan(&existing)
+	if err != nil {
+		return fmt.Errorf("read runtime_state %s: %w", id, err)
+	}
+	merged := make(map[string]any)
+	if existing != "" && existing != "{}" {
+		if err := json.Unmarshal([]byte(existing), &merged); err != nil {
+			merged = make(map[string]any)
+		}
+	}
+	var incoming map[string]any
+	if err := json.Unmarshal([]byte(stateJSON), &incoming); err != nil {
+		return fmt.Errorf("runtime_state JSON: %w", err)
+	}
+	for k, v := range incoming {
+		merged[k] = v
+	}
+	out, err := json.Marshal(merged)
+	if err != nil {
+		return fmt.Errorf("runtime_state marshal: %w", err)
+	}
+	now := time.Now().UTC()
+	_, err = conn.ExecContext(ctx, `UPDATE `+db.TableMigrations+` SET runtime_state_json = $1, updated_at = $2 WHERE migration_id = $3`, string(out), now, id)
+	if err != nil {
+		return fmt.Errorf("update migration %s runtime_state: %w", id, err)
 	}
 	return nil
 }

@@ -20,7 +20,7 @@ type Writer struct {
 func NodeStateAppendRowArgs(n *NodeState) []any {
 	return []any{
 		n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath,
-		PathHash(n.Path), PathHash(n.ParentPath),
+		PathHashForJoin(n.Path), PathHashForJoin(n.ParentPath),
 		n.Type, n.Size, n.MTime, int32(n.Depth),
 	}
 }
@@ -35,7 +35,7 @@ func (w *Writer) AppenderInsert(table string, nodes []*NodeState) error {
 		_, err := w.tx.ExecContext(ctx,
 			`INSERT INTO `+table+` (id, service_id, parent_id, parent_service_id, path, parent_path, path_hash, parent_path_hash, type, size, mtime, depth)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath, PathHash(n.Path), PathHash(n.ParentPath), n.Type, n.Size, n.MTime, n.Depth,
+			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath, PathHashForJoin(n.Path), PathHashForJoin(n.ParentPath), n.Type, n.Size, n.MTime, n.Depth,
 		)
 		if err != nil {
 			return err
@@ -56,7 +56,7 @@ func (w *Writer) UpsertNodes(table string, nodes []*NodeState) error {
 			`INSERT INTO `+table+` (id, service_id, parent_id, parent_service_id, path, parent_path, path_hash, parent_path_hash, type, size, mtime, depth)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			 ON CONFLICT (id) DO NOTHING`,
-			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath, PathHash(n.Path), PathHash(n.ParentPath), n.Type, n.Size, n.MTime, n.Depth,
+			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath, PathHashForJoin(n.Path), PathHashForJoin(n.ParentPath), n.Type, n.Size, n.MTime, n.Depth,
 		)
 		if err != nil {
 			return fmt.Errorf("insert node %s into %s: %w", n.ID, table, err)
@@ -111,44 +111,8 @@ func (w *Writer) BatchInsertDstStatusEvents(events []StatusEvent) error {
 	return nil
 }
 
-// WriteLevelStatsSnapshot writes per-depth stats for a sealed level (traversal counts + completed). If copyPending >= 0 and table is SRC, also writes copy/* keys.
+// WriteLevelStatsSnapshot is a no-op; per-depth stats are no longer persisted (callers use live nodes+events).
 func (w *Writer) WriteLevelStatsSnapshot(table string, depth int, pending, successful, failed, completed int64, copyPending, copySuccessful, copyFailed int64) error {
-	ctx := context.Background()
-	statsTbl := tableSrcStats
-	if table == "DST" {
-		statsTbl = tableDstStats
-	}
-	_, err := w.tx.ExecContext(ctx, `DELETE FROM `+statsTbl+` WHERE depth = $1`, depth)
-	if err != nil {
-		return err
-	}
-	for _, pair := range []struct {
-		key   string
-		count int64
-	}{
-		{StatsKeyTraversalStatus(StatusPending), pending},
-		{StatsKeyTraversalStatus(StatusSuccessful), successful},
-		{StatsKeyTraversalStatus(StatusFailed), failed},
-		{StatsKeyCompleted, completed},
-	} {
-		if err := w.SetStatsCountForDepth(table, depth, pair.key, pair.count); err != nil {
-			return err
-		}
-	}
-	if table == "SRC" && copyPending >= 0 {
-		for _, pair := range []struct {
-			key   string
-			count int64
-		}{
-			{StatsKeyCopyStatus(CopyStatusPending), copyPending},
-			{StatsKeyCopyStatus(CopyStatusSuccessful), copySuccessful},
-			{StatsKeyCopyStatus(CopyStatusFailed), copyFailed},
-		} {
-			if err := w.SetStatsCountForDepth(table, depth, pair.key, pair.count); err != nil {
-				return err
-			}
-		}
-	}
 	return nil
 }
 
@@ -165,32 +129,14 @@ func (w *Writer) UpsertStatsCounts(table string, tuples []struct {
 	return nil
 }
 
-// SetStatsCountForDepth sets (depth, key, count) in src_stats or dst_stats. Must be called inside RunWrite (WithTx).
+// SetStatsCountForDepth is a no-op; per-depth stats are no longer persisted (callers use live nodes+events).
 func (w *Writer) SetStatsCountForDepth(table string, depth int, key string, count int64) error {
-	tbl := tableSrcStats
-	if table == "DST" {
-		tbl = tableDstStats
-	}
-	_, err := w.tx.ExecContext(context.Background(),
-		`INSERT INTO `+tbl+` (depth, key, count) VALUES ($1, $2, $3)
-		 ON CONFLICT (depth, key) DO UPDATE SET count = excluded.count`,
-		depth, key, count,
-	)
-	return err
+	return nil
 }
 
-// UpdateStatsCountByDelta applies a delta to the (depth, key) count. Used for single-node status changes (traversal/copy hot path); avoids full recompute.
+// UpdateStatsCountByDelta is a no-op; per-depth stats are no longer persisted.
 func (w *Writer) UpdateStatsCountByDelta(table string, depth int, key string, delta int64) error {
-	tbl := tableSrcStats
-	if table == "DST" {
-		tbl = tableDstStats
-	}
-	_, err := w.tx.ExecContext(context.Background(),
-		`INSERT INTO `+tbl+` (depth, key, count) VALUES ($1, $2, $3)
-		 ON CONFLICT (depth, key) DO UPDATE SET count = count + excluded.count`,
-		depth, key, delta,
-	)
-	return err
+	return nil
 }
 
 // StatsDelta is one (table, depth, key) delta for batch application.
@@ -362,11 +308,43 @@ SELECT n.id, COALESCE((SELECT arg_max(e.traversal_status, e.event_time) FROM src
 	return w.recomputeStatsForSubtreeDepths(ctx, tableSrcNodes, rootPath)
 }
 
+// PropagateSubtreeFailure inserts copy_status='failed' events for all SRC descendants of parentPath
+// whose current copy_status is 'pending'. Returns the number of affected nodes. Call inside a transaction.
+func (w *Writer) PropagateSubtreeFailure(parentPath string) (int64, error) {
+	ctx := context.Background()
+	eventTime := time.Now().UnixNano()
+	prefix := parentPath + "/%"
+	res, err := w.tx.ExecContext(ctx, `INSERT INTO `+tableSrcStatusEvents+` (id, traversal_status, copy_status, event_time, depth)
+SELECT n.id,
+       COALESCE((SELECT arg_max(e.traversal_status, e.event_time) FROM `+tableSrcStatusEvents+` e WHERE e.id = n.id), ''),
+       'failed',
+       $1,
+       n.depth
+FROM `+tableSrcNodes+` n
+LEFT JOIN `+cteSrcCurrentStatus+` cur ON n.id = cur.id
+WHERE n.path LIKE $2
+  AND COALESCE(cur.copy_status, '') = 'pending'`, eventTime, prefix)
+	if err != nil {
+		return 0, fmt.Errorf("propagate subtree failure for %s: %w", parentPath, err)
+	}
+	affected, _ := res.RowsAffected()
+	if affected > 0 {
+		deltas := []ReviewStatsDelta{
+			{Key: ReviewKeyCopyPending, Delta: -affected},
+			{Key: ReviewKeyCopyFailed, Delta: affected},
+		}
+		if err := w.ApplyReviewStatsDeltas(deltas); err != nil {
+			return affected, err
+		}
+	}
+	return affected, nil
+}
+
 // InsertDstChildrenTraversalStatusEvents appends one traversal_status event for each DST node whose parent_path equals parentPath. Used when marking/unmarking SRC node for retry (DST-only children get pending or not_on_src). Call inside RunWrite.
 func (w *Writer) InsertDstChildrenTraversalStatusEvents(parentPath, status string) error {
 	ctx := context.Background()
 	eventTime := time.Now().UnixNano()
-	parentHash := PathHash(parentPath)
+	parentHash := PathHashForJoin(parentPath)
 	_, err := w.tx.ExecContext(ctx, `INSERT INTO dst_status_events (id, traversal_status, event_time, depth) SELECT n.id, $1, $2, n.depth FROM dst_nodes n WHERE n.parent_path_hash = $3`, status, eventTime, parentHash)
 	if err != nil {
 		return err
@@ -441,7 +419,7 @@ FROM `+tableSrcNodes+` n LEFT JOIN latest e ON n.id = e.id WHERE n.path LIKE '/%
 // CountDstNodesUnderPath returns the number of DST nodes whose parent_path equals parentPath (direct children only). Call inside a transaction.
 func (w *Writer) CountDstNodesUnderPath(parentPath string) (int64, error) {
 	ctx := context.Background()
-	parentHash := PathHash(parentPath)
+	parentHash := PathHashForJoin(parentPath)
 	var n int64
 	err := w.tx.QueryRowContext(ctx, `SELECT COUNT(*)::BIGINT FROM dst_nodes WHERE parent_path_hash = $1`, parentHash).Scan(&n)
 	return n, err
@@ -450,7 +428,7 @@ func (w *Writer) CountDstNodesUnderPath(parentPath string) (int64, error) {
 // CountDstNodesUnderPathWithTraversalStatus returns the number of DST nodes under parentPath (parent_path = parentPath) whose current traversal_status equals status. Call inside a transaction.
 func (w *Writer) CountDstNodesUnderPathWithTraversalStatus(parentPath, status string) (int64, error) {
 	ctx := context.Background()
-	parentHash := PathHash(parentPath)
+	parentHash := PathHashForJoin(parentPath)
 	q := `WITH latest AS (SELECT id, arg_max(traversal_status, event_time) AS traversal_status FROM dst_status_events GROUP BY id)
 SELECT COUNT(*)::BIGINT FROM dst_nodes n JOIN latest e ON n.id = e.id WHERE n.parent_path_hash = $1 AND COALESCE(e.traversal_status,'') = $2`
 	var n int64
@@ -789,14 +767,21 @@ func (w *Writer) WriteQueueStats(queueKey, metricsJSON string) error {
 // WriteReviewStatsSnapshot writes the full canonical review stats snapshot to the universal stats table (replaces counts for review keys).
 func (w *Writer) WriteReviewStatsSnapshot(s ReviewStatsSnapshot) error {
 	ctx := context.Background()
+	for _, key := range legacyReviewKeys {
+		if _, err := w.tx.ExecContext(ctx, `DELETE FROM `+tableStats+` WHERE key = $1`, key); err != nil {
+			return err
+		}
+	}
 	pairs := []struct {
 		key   string
 		count int64
 	}{
 		{ReviewKeyTraversalPending, s.TraversalPending},
 		{ReviewKeyTraversalPendingRetry, s.TraversalPendingRetry},
+		{ReviewKeyTraversalSuccessful, s.TraversalSuccessful},
 		{ReviewKeyTraversalFailed, s.TraversalFailed},
 		{ReviewKeyCopyPending, s.CopyPending},
+		{ReviewKeyCopySuccessful, s.CopySuccessful},
 		{ReviewKeyCopyFailed, s.CopyFailed},
 		{ReviewKeyExcluded, s.Excluded},
 		{ReviewKeyFolders, s.Folders},

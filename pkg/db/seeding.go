@@ -8,18 +8,6 @@ import (
 	"time"
 )
 
-// BootstrapRootStats writes (depth=0, key=traversal/pending, count=1) for SRC and DST so the queue sees pending work at round 0 after roots are seeded. Call once after inserting root nodes.
-func BootstrapRootStats(d *DB) error {
-	return d.RunWrite(context.Background(), func(s *WriteSession) error {
-		return s.WithTx(func(w *Writer) error {
-			if err := w.SetStatsCountForDepth("SRC", 0, StatsKeyTraversalStatus(StatusPending), 1); err != nil {
-				return err
-			}
-			return w.SetStatsCountForDepth("DST", 0, StatsKeyTraversalStatus(StatusPending), 1)
-		})
-	})
-}
-
 // InsertRootNode inserts the root node (path "/", depth 0) as metadata only, then emits initial status event(s).
 func InsertRootNode(d *DB, table string, state *NodeState) error {
 	if state == nil {
@@ -31,7 +19,7 @@ func InsertRootNode(d *DB, table string, state *NodeState) error {
 			_, err := w.tx.ExecContext(context.Background(),
 				`INSERT INTO `+t+` (id, service_id, parent_id, parent_service_id, path, parent_path, path_hash, parent_path_hash, type, size, mtime, depth)
 				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-				state.ID, state.ServiceID, state.ParentID, state.ParentServiceID, state.Path, state.ParentPath, PathHash(state.Path), PathHash(state.ParentPath), state.Type, state.Size, state.MTime, state.Depth,
+				state.ID, state.ServiceID, state.ParentID, state.ParentServiceID, state.Path, state.ParentPath, PathHashForJoin(state.Path), PathHashForJoin(state.ParentPath), state.Type, state.Size, state.MTime, state.Depth,
 			)
 			if err != nil {
 				return err
@@ -42,7 +30,7 @@ func InsertRootNode(d *DB, table string, state *NodeState) error {
 			}
 			copyStatus := state.CopyStatus
 			if table == "SRC" && copyStatus == "" {
-				copyStatus = CopyStatusPending
+				copyStatus = CopyStatusSuccessful
 			}
 			ev := &StatusEvent{
 				ID:              state.ID,
@@ -52,6 +40,17 @@ func InsertRootNode(d *DB, table string, state *NodeState) error {
 				Depth:           0,
 			}
 			if err := w.InsertStatusEvent(table, ev); err != nil {
+				return err
+			}
+			deltas := []ReviewStatsDelta{
+				{Key: reviewKeyForTraversalStatus(trav), Delta: 1},
+			}
+			if table == "SRC" {
+				if key := reviewKeyForCopyStatus(copyStatus); key != "" {
+					deltas = append(deltas, ReviewStatsDelta{Key: key, Delta: 1})
+				}
+			}
+			if err := w.ApplyReviewStatsDeltas(deltas); err != nil {
 				return err
 			}
 			return nil

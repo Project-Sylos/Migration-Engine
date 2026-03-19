@@ -127,7 +127,8 @@ func migrationsTableDDL() string {
 		created_at TIMESTAMP NOT NULL,
 		updated_at TIMESTAMP NOT NULL,
 		service_metadata_json VARCHAR,
-		root_config_json VARCHAR
+		root_config_json VARCHAR,
+		runtime_state_json VARCHAR
 	)`
 }
 

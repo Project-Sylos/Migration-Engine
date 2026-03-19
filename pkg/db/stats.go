@@ -25,26 +25,86 @@ const StatsKeyExpected = "expected"
 // StatsKeyCompleted is the stats key for completed count at a depth (written at seal).
 const StatsKeyCompleted = "completed"
 
-// Universal stats table keys for canonical review stats (tableStats).
+// Universal stats table keys for canonical review stats (tableStats). Namespaced as traversal/*, copy/*, and flat aggregates.
 const (
-	ReviewKeyTraversalPending      = "review/traversal/pending"
-	ReviewKeyTraversalPendingRetry = "review/traversal/pending_retry"
-	ReviewKeyTraversalFailed       = "review/traversal/failed"
-	ReviewKeyCopyPending           = "review/copy/pending"
-	ReviewKeyCopyFailed            = "review/copy/failed"
-	ReviewKeyExcluded              = "review/excluded"
-	ReviewKeyFolders               = "review/folders"
-	ReviewKeyFiles                 = "review/files"
-	ReviewKeySizeSrc               = "review/size/src"
-	ReviewKeySizeDst               = "review/size/dst"
+	ReviewKeyTraversalPending      = "traversal/pending"
+	ReviewKeyTraversalPendingRetry = "traversal/pending_retry"
+	ReviewKeyTraversalSuccessful   = "traversal/successful"
+	ReviewKeyTraversalFailed       = "traversal/failed"
+	ReviewKeyCopyPending           = "copy/pending"
+	ReviewKeyCopySuccessful        = "copy/successful"
+	ReviewKeyCopyFailed            = "copy/failed"
+	ReviewKeyExcluded              = "excluded"
+	ReviewKeyFolders               = "folders"
+	ReviewKeyFiles                 = "files"
+	ReviewKeySizeSrc               = "size_src"
+	ReviewKeySizeDst               = "size_dst"
 )
+
+var canonicalReviewKeys = []string{
+	ReviewKeyTraversalPending,
+	ReviewKeyTraversalPendingRetry,
+	ReviewKeyTraversalSuccessful,
+	ReviewKeyTraversalFailed,
+	ReviewKeyCopyPending,
+	ReviewKeyCopySuccessful,
+	ReviewKeyCopyFailed,
+	ReviewKeyExcluded,
+	ReviewKeyFolders,
+	ReviewKeyFiles,
+	ReviewKeySizeSrc,
+	ReviewKeySizeDst,
+}
+
+var legacyReviewKeys = []string{
+	"review/traversal/pending",
+	"review/traversal/pending_retry",
+	"review/traversal/successful",
+	"review/traversal/failed",
+	"review/copy/pending",
+	"review/copy/successful",
+	"review/copy/failed",
+	"review/excluded",
+	"review/folders",
+	"review/files",
+	"review/size/src",
+	"review/size/dst",
+}
+
+func reviewKeyForTraversalStatus(status string) string {
+	switch status {
+	case StatusPending:
+		return ReviewKeyTraversalPending
+	case StatusSuccessful:
+		return ReviewKeyTraversalSuccessful
+	case StatusFailed:
+		return ReviewKeyTraversalFailed
+	default:
+		return ""
+	}
+}
+
+func reviewKeyForCopyStatus(status string) string {
+	switch status {
+	case CopyStatusPending:
+		return ReviewKeyCopyPending
+	case CopyStatusSuccessful:
+		return ReviewKeyCopySuccessful
+	case CopyStatusFailed:
+		return ReviewKeyCopyFailed
+	default:
+		return ""
+	}
+}
 
 // ReviewStatsSnapshot is the canonical persisted review stats in the universal stats table.
 type ReviewStatsSnapshot struct {
 	TraversalPending      int64
 	TraversalPendingRetry int64
+	TraversalSuccessful   int64
 	TraversalFailed       int64
 	CopyPending           int64
+	CopySuccessful        int64
 	CopyFailed            int64
 	Excluded              int64
 	Folders               int64
@@ -61,11 +121,7 @@ func (db *DB) GetReviewStatsSnapshot() (ReviewStatsSnapshot, error) {
 		return out, err
 	}
 	ctx := context.Background()
-	keys := []string{
-		ReviewKeyTraversalPending, ReviewKeyTraversalPendingRetry, ReviewKeyTraversalFailed, ReviewKeyCopyPending, ReviewKeyCopyFailed,
-		ReviewKeyExcluded, ReviewKeyFolders, ReviewKeyFiles, ReviewKeySizeSrc, ReviewKeySizeDst,
-	}
-	for _, key := range keys {
+	for _, key := range canonicalReviewKeys {
 		var n sql.NullInt64
 		err := conn.QueryRowContext(ctx, "SELECT count FROM "+tableStats+" WHERE key = $1", key).Scan(&n)
 		if err != nil && err != sql.ErrNoRows {
@@ -78,10 +134,14 @@ func (db *DB) GetReviewStatsSnapshot() (ReviewStatsSnapshot, error) {
 				out.TraversalPending = v
 			case ReviewKeyTraversalPendingRetry:
 				out.TraversalPendingRetry = v
+			case ReviewKeyTraversalSuccessful:
+				out.TraversalSuccessful = v
 			case ReviewKeyTraversalFailed:
 				out.TraversalFailed = v
 			case ReviewKeyCopyPending:
 				out.CopyPending = v
+			case ReviewKeyCopySuccessful:
+				out.CopySuccessful = v
 			case ReviewKeyCopyFailed:
 				out.CopyFailed = v
 			case ReviewKeyExcluded:
@@ -121,8 +181,10 @@ func (db *DB) GetPathReviewStatsFromDB() (ReviewStatsSnapshot, error) {
 	return ReviewStatsSnapshot{
 		TraversalPending:      srcT.Pending + dstT.Pending,
 		TraversalPendingRetry: 0, // no persisted source; maintained only via deltas historically
+		TraversalSuccessful:   srcT.Successful + dstT.Successful,
 		TraversalFailed:       srcT.Failed + dstT.Failed,
 		CopyPending:           copyCounts.Pending,
+		CopySuccessful:        copyCounts.Successful,
 		CopyFailed:            copyCounts.Failed,
 		Excluded:              int64(merged.Excluded),
 		Folders:               int64(merged.Folders),
@@ -252,25 +314,33 @@ SELECT COALESCE(e.copy_status,'') AS status, count(*)::BIGINT FROM ` + tableSrcN
 	return out, rows.Err()
 }
 
-// GetStatsCount returns the total count for the given key across all depths from src_stats or dst_stats (table = "SRC" or "DST"). E.g. "all pending items total in src_nodes" = GetStatsCount("SRC", StatsKeyTraversalStatus("pending")).
+// GetStatsCount returns the total count for the given key from live nodes+events (table = "SRC" or "DST"). Supports traversal status keys only.
 func (db *DB) GetStatsCount(table, key string) (int64, error) {
 	if key == "" {
 		return 0, nil
 	}
-	tbl := tableSrcStats
+	status := statsKeyToTraversalStatus(key)
+	if status == "" {
+		return 0, nil
+	}
+	return db.getTraversalStatusCountFromLive(table, status)
+}
+
+func (db *DB) getTraversalStatusCountFromLive(table, status string) (int64, error) {
+	t := tableSrcNodes
+	cte := cteSrcCurrentStatus
 	if table == "DST" {
-		tbl = tableDstStats
+		t = tableDstNodes
+		cte = cteDstCurrentStatus
 	}
 	conn, err := db.GetDB()
 	if err != nil {
 		return 0, err
 	}
 	ctx := context.Background()
+	q := `SELECT COUNT(*)::BIGINT FROM ` + t + ` n LEFT JOIN ` + cte + ` e ON n.id = e.id WHERE COALESCE(e.traversal_status,'') = $1`
 	var n sql.NullInt64
-	err = conn.QueryRowContext(ctx, "SELECT COALESCE(SUM(count), 0) FROM "+tbl+" WHERE key = $1", key).Scan(&n)
-	if err == sql.ErrNoRows {
-		return 0, nil
-	}
+	err = conn.QueryRowContext(ctx, q, status).Scan(&n)
 	if err != nil {
 		return 0, err
 	}
@@ -280,25 +350,43 @@ func (db *DB) GetStatsCount(table, key string) (int64, error) {
 	return 0, nil
 }
 
-// GetStatsCountAtDepth returns the count for (depth, key) from src_stats or dst_stats.
+// statsKeyToTraversalStatus returns the status part if key is "traversal/<status>", else "".
+func statsKeyToTraversalStatus(key string) string {
+	const prefix = "traversal/"
+	if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+		return key[len(prefix):]
+	}
+	return ""
+}
+
+// GetStatsCountAtDepth returns the count for (depth, key) from live nodes+events. Supports traversal status keys only (e.g. traversal/pending, traversal/failed).
 func (db *DB) GetStatsCountAtDepth(table string, depth int, key string) (int64, error) {
 	if key == "" {
 		return 0, nil
 	}
-	tbl := tableSrcStats
+	status := statsKeyToTraversalStatus(key)
+	if status == "" {
+		return 0, nil
+	}
+	return db.GetTraversalCountAtDepthFromLive(table, depth, status)
+}
+
+// GetTraversalCountAtDepthFromLive returns the count of nodes at the given depth with the given traversal_status (event-derived).
+func (db *DB) GetTraversalCountAtDepthFromLive(table string, depth int, status string) (int64, error) {
+	t := tableSrcNodes
+	cte := cteSrcCurrentStatus
 	if table == "DST" {
-		tbl = tableDstStats
+		t = tableDstNodes
+		cte = cteDstCurrentStatus
 	}
 	conn, err := db.GetDB()
 	if err != nil {
 		return 0, err
 	}
 	ctx := context.Background()
+	q := `SELECT COUNT(*)::BIGINT FROM ` + t + ` n LEFT JOIN ` + cte + ` e ON n.id = e.id WHERE n.depth = $1 AND COALESCE(e.traversal_status,'') = $2`
 	var n sql.NullInt64
-	err = conn.QueryRowContext(ctx, "SELECT count FROM "+tbl+" WHERE depth = $1 AND key = $2", depth, key).Scan(&n)
-	if err == sql.ErrNoRows {
-		return 0, nil
-	}
+	err = conn.QueryRowContext(ctx, q, depth, status).Scan(&n)
 	if err != nil {
 		return 0, err
 	}
@@ -355,11 +443,11 @@ func (db *DB) GetCopyCountAtDepth(depth int, nodeType string, copyStatus string,
 	}
 }
 
-// GetMaxDepth returns the maximum depth present in the stats table for the given table ("SRC" or "DST"). Used as stop condition for retry sweep.
+// GetMaxDepth returns the maximum depth present in the nodes table for the given table ("SRC" or "DST"). Used as stop condition for retry sweep.
 func (db *DB) GetMaxDepth(table string) (int, error) {
-	tbl := tableSrcStats
+	tbl := tableSrcNodes
 	if table == "DST" {
-		tbl = tableDstStats
+		tbl = tableDstNodes
 	}
 	conn, err := db.GetDB()
 	if err != nil {
@@ -367,15 +455,30 @@ func (db *DB) GetMaxDepth(table string) (int, error) {
 	}
 	ctx := context.Background()
 	var d sql.NullInt64
-	err = conn.QueryRowContext(ctx, "SELECT MAX(depth) FROM "+tbl).Scan(&d)
-	if err != nil || !d.Valid {
+	err = conn.QueryRowContext(ctx, "SELECT COALESCE(MAX(depth), 0) FROM "+tbl).Scan(&d)
+	if err != nil {
 		return 0, err
 	}
-	return int(d.Int64), nil
+	if d.Valid {
+		return int(d.Int64), nil
+	}
+	return 0, nil
 }
 
 // GetPendingTraversalCountAtDepthFromLive returns the count of nodes at the given depth with current traversal_status = 'pending' (event-derived).
 func (db *DB) GetPendingTraversalCountAtDepthFromLive(table string, depth int) (int64, error) {
+	return db.GetTraversalCountAtDepthFromLive(table, depth, StatusPending)
+}
+
+// StatsRow is one row (depth, key, count) for breakdown by level. Key is e.g. traversal/pending.
+type StatsRow struct {
+	Depth int
+	Key   string
+	Count int64
+}
+
+// GetStatsBreakdown returns (depth, key, count) from live nodes+events grouped by depth and traversal_status. Order: depth, key.
+func (db *DB) GetStatsBreakdown(table string) ([]StatsRow, error) {
 	t := tableSrcNodes
 	cte := cteSrcCurrentStatus
 	if table == "DST" {
@@ -384,51 +487,28 @@ func (db *DB) GetPendingTraversalCountAtDepthFromLive(table string, depth int) (
 	}
 	conn, err := db.GetDB()
 	if err != nil {
-		return 0, err
-	}
-	ctx := context.Background()
-	q := `SELECT COUNT(*)::BIGINT FROM ` + t + ` n LEFT JOIN ` + cte + ` e ON n.id = e.id WHERE n.depth = $1 AND COALESCE(e.traversal_status,'') = 'pending'`
-	var n sql.NullInt64
-	err = conn.QueryRowContext(ctx, q, depth).Scan(&n)
-	if err != nil {
-		return 0, err
-	}
-	if n.Valid {
-		return n.Int64, nil
-	}
-	return 0, nil
-}
-
-// StatsRow is one row from src_stats or dst_stats (depth, key, count). For breakdown by level.
-type StatsRow struct {
-	Depth int
-	Key   string
-	Count int64
-}
-
-// GetStatsBreakdown returns all (depth, key, count) rows for the table so callers can see e.g. "level 4 has X pending". Order: depth, key.
-func (db *DB) GetStatsBreakdown(table string) ([]StatsRow, error) {
-	tbl := tableSrcStats
-	if table == "DST" {
-		tbl = tableDstStats
-	}
-	conn, err := db.GetDB()
-	if err != nil {
 		return nil, err
 	}
 	ctx := context.Background()
-	rows, err := conn.QueryContext(ctx, "SELECT depth, key, count FROM "+tbl+" ORDER BY depth, key")
+	q := `SELECT n.depth, COALESCE(e.traversal_status,'') AS status, COUNT(*)::BIGINT FROM ` + t + ` n LEFT JOIN ` + cte + ` e ON n.id = e.id GROUP BY n.depth, 2 ORDER BY 1, 2`
+	rows, err := conn.QueryContext(ctx, q)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []StatsRow
 	for rows.Next() {
-		var r StatsRow
-		if err := rows.Scan(&r.Depth, &r.Key, &r.Count); err != nil {
+		var depth int
+		var status string
+		var count int64
+		if err := rows.Scan(&depth, &status, &count); err != nil {
 			return nil, err
 		}
-		out = append(out, r)
+		if count == 0 {
+			continue
+		}
+		key := StatsKeyTraversalStatus(status)
+		out = append(out, StatsRow{Depth: depth, Key: key, Count: count})
 	}
 	return out, rows.Err()
 }

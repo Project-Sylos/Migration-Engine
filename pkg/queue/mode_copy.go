@@ -236,6 +236,7 @@ func (q *Queue) PullCopyTasks(force bool) {
 		if q.Add(task) {
 			enqueueSuccessCount++
 		}
+
 	}
 
 	// Record pull in RoundInfo; lastPullWasPartial already set from raw DB result count
@@ -463,6 +464,15 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 		EventTime:       time.Now().UnixNano(),
 		Depth:           currentRound,
 	}, false)
+
+	// Folder failure cascades: mark all pending descendants as failed so they aren't
+	// pulled in the file pass (they'd be skipped anyway since the DST parent won't exist).
+	if task.IsFolder() {
+		taskPath := db.NormalizeRootRelativePath(task.LocationPath())
+		if taskPath != "" && taskPath != "/" {
+			database.AppendFailedSubtree(taskPath)
+		}
+	}
 
 	q.removeInProgress(nodeID)
 }

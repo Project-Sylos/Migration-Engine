@@ -2,7 +2,7 @@
 # restore.sh
 # Restores permissions to A/items folder (Linux version)
 
-BaseDir="${HOME}/sylos_retry_test"
+BaseDir="${HOME}/..sylos_retry_test"
 TreeA="${BaseDir}/A/items"
 
 echo "Restoring access to A/items..."

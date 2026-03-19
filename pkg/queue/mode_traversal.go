@@ -295,15 +295,11 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 		database.AppendDiscoveredNodes(childNodesToInsert)
 	}
 	fromRetry := q.GetMode() == QueueModeRetry
-	completionCopyStatus := state.CopyStatus
-	if q.name == "src" {
-		// Traversal completion should not overwrite copy_status; DST comparison/copy flows own that field.
-		completionCopyStatus = ""
-	}
+	// Preserve task's copy_status on completion; DST traversal does comparison and emits copy_status updates for matches.
 	database.AppendStatusEvent(queueType, db.StatusEvent{
 		ID:                  nodeID,
 		TraversalStatus:     db.StatusSuccessful,
-		CopyStatus:          completionCopyStatus,
+		CopyStatus:          state.CopyStatus,
 		EventTime:           time.Now().UnixNano(),
 		Depth:               currentRound,
 		PrevTraversalStatus: state.TraversalStatus,

@@ -32,9 +32,10 @@ type CreateMigrationConfig struct {
 type MigrationSummary struct {
 	ID        string
 	Name      string
-	Phase     Phase
+	Phase     string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+	Live      bool // true when a run is active (traversal/copy/retry); distinct from phase
 }
 
 // MigrationDetails is the full migration record from the DB, for API detail views.
@@ -42,11 +43,12 @@ type MigrationSummary struct {
 type MigrationDetails struct {
 	ID                  string
 	Name                string
-	Phase               Phase
+	Phase               string
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
 	ServiceMetadataJSON string
 	RootConfigJSON      string
+	Live                bool // true when a run is active (traversal/copy/retry); distinct from phase
 }
 
 // MigrationManager owns migration lifecycle authority and persistence access.
@@ -356,7 +358,7 @@ func (m *MigrationManager) ListMigrations(dataDir string) ([]MigrationSummary, e
 		}
 		out := make([]MigrationSummary, 0, len(records))
 		for _, r := range records {
-			out = append(out, MigrationSummary{ID: r.ID, Name: r.Name, Phase: r.Phase, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt})
+			out = append(out, MigrationSummary{ID: r.ID, Name: r.Name, Phase: r.Phase, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt, Live: false})
 		}
 		return out, nil
 	}
@@ -388,7 +390,7 @@ func (m *MigrationManager) ListMigrations(dataDir string) ([]MigrationSummary, e
 			if err != nil || rec == nil {
 				continue
 			}
-			out = append(out, MigrationSummary{ID: rec.ID, Name: rec.Name, Phase: rec.Phase, CreatedAt: rec.CreatedAt, UpdatedAt: rec.UpdatedAt})
+			out = append(out, MigrationSummary{ID: rec.ID, Name: rec.Name, Phase: rec.Phase, CreatedAt: rec.CreatedAt, UpdatedAt: rec.UpdatedAt, Live: false})
 		}
 		return out, nil
 	}
@@ -397,9 +399,9 @@ func (m *MigrationManager) ListMigrations(dataDir string) ([]MigrationSummary, e
 	out := make([]MigrationSummary, 0, len(m.migrations))
 	for id, mig := range m.migrations {
 		if r, ok := m.pendingRecords[id]; ok {
-			out = append(out, MigrationSummary{ID: r.ID, Name: r.Name, Phase: r.Phase, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt})
+			out = append(out, MigrationSummary{ID: r.ID, Name: r.Name, Phase: r.Phase, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt, Live: false})
 		} else {
-			out = append(out, MigrationSummary{ID: mig.ID, Name: mig.Name, Phase: mig.Phase(), CreatedAt: time.Time{}, UpdatedAt: time.Time{}})
+			out = append(out, MigrationSummary{ID: mig.ID, Name: mig.Name, Phase: mig.Phase(), CreatedAt: time.Time{}, UpdatedAt: time.Time{}, Live: mig.IsLive()})
 		}
 	}
 	return out, nil
@@ -418,15 +420,17 @@ func (m *MigrationManager) GetMigrationDetails(id string, migrationDir string) (
 	pending, hasPending := m.pendingRecords[id]
 	existing := m.migrations[id]
 	m.mu.Unlock()
-	if hasPending {
-		return &MigrationDetails{ID: pending.ID, Name: pending.Name, Phase: pending.Phase, CreatedAt: pending.CreatedAt, UpdatedAt: pending.UpdatedAt, ServiceMetadataJSON: pending.ServiceMetadataJSON, RootConfigJSON: pending.RootConfigJSON}, nil
+		if hasPending {
+		return &MigrationDetails{ID: pending.ID, Name: pending.Name, Phase: pending.Phase, CreatedAt: pending.CreatedAt, UpdatedAt: pending.UpdatedAt, ServiceMetadataJSON: pending.ServiceMetadataJSON, RootConfigJSON: pending.RootConfigJSON, Live: false}, nil
 	}
 	if existing != nil && existing.DB != nil {
 		record, err := m.store.getMigration(existing.DB, id)
 		if err != nil || record == nil {
 			return nil, err
 		}
-		return recordToDetails(record), nil
+		d := recordToDetails(record)
+		d.Live = existing.IsLive()
+		return d, nil
 	}
 	if migrationDir != "" {
 		database, err := m.openDB(migrationDir, id)
@@ -451,6 +455,7 @@ func recordToDetails(r *migrationRecord) *MigrationDetails {
 		UpdatedAt:           r.UpdatedAt,
 		ServiceMetadataJSON: r.ServiceMetadataJSON,
 		RootConfigJSON:      r.RootConfigJSON,
+		Live:                false,
 	}
 }
 

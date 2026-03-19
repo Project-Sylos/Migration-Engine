@@ -2,7 +2,7 @@
 # cleanup.sh
 # Restores permissions and removes retry-sweep test folders (Linux version)
 
-BaseDir="${HOME}/sylos_retry_test"
+BaseDir="${HOME}/..sylos_retry_test"
 TreeA="${BaseDir}/A/items"
 
 echo "Cleaning up retry-sweep test artifacts..."

@@ -52,74 +52,6 @@ type phaseAppenders struct {
 // discoveryJobStatsSentinel marks a SealJob as discovery-only (nodes + events, no stats write). Used for traversal discovery and status events.
 const discoveryJobStatsSentinel int64 = -1
 
-// levelStatsKey identifies one (table, depth, key) for level stats.
-type levelStatsKey struct {
-	table string
-	depth int
-	key   string
-}
-
-// buildMergedLevelStats processes jobs in order: seal jobs set counts for that (table, depth); discovery jobs with nodes add +1 per event.
-// Returns one tuple list per table for a single batch upsert (no duplicate keys). Event-only jobs are handled by RecomputeStatsForDepth.
-func buildMergedLevelStats(jobs []SealJob) (srcTuples, dstTuples []struct {
-	depth int
-	key   string
-	count int64
-}) {
-	counts := make(map[levelStatsKey]int64)
-	for _, j := range jobs {
-		if j.Pending >= 0 {
-			// Seal: set totals for this (table, depth).
-			t := j.Table
-			d := j.Depth
-			counts[levelStatsKey{t, d, StatsKeyTraversalStatus(StatusPending)}] = j.Pending
-			counts[levelStatsKey{t, d, StatsKeyTraversalStatus(StatusSuccessful)}] = j.Successful
-			counts[levelStatsKey{t, d, StatsKeyTraversalStatus(StatusFailed)}] = j.Failed
-			counts[levelStatsKey{t, d, StatsKeyCompleted}] = j.Completed
-			if t == "SRC" && j.CopyP >= 0 {
-				counts[levelStatsKey{t, d, StatsKeyCopyStatus(CopyStatusPending)}] = j.CopyP
-				counts[levelStatsKey{t, d, StatsKeyCopyStatus(CopyStatusSuccessful)}] = j.CopyS
-				counts[levelStatsKey{t, d, StatsKeyCopyStatus(CopyStatusFailed)}] = j.CopyF
-			}
-			continue
-		}
-		if j.Pending != discoveryJobStatsSentinel || len(j.Nodes) == 0 {
-			continue
-		}
-		// Discovery with nodes: add +1 per event.
-		for _, e := range j.Events {
-			trav := e.TraversalStatus
-			if trav == "" {
-				trav = StatusPending
-			}
-			k := levelStatsKey{j.Table, j.Depth, StatsKeyTraversalStatus(trav)}
-			counts[k]++
-			if j.Table == "SRC" {
-				copySt := e.CopyStatus
-				if copySt == "" {
-					copySt = CopyStatusPending
-				}
-				if copySt != CopyStatusInProgress {
-					counts[levelStatsKey{"SRC", j.Depth, StatsKeyCopyStatus(copySt)}]++
-				}
-			}
-		}
-	}
-	for k, count := range counts {
-		tup := struct {
-			depth int
-			key   string
-			count int64
-		}{k.depth, k.key, count}
-		if k.table == "SRC" {
-			srcTuples = append(srcTuples, tup)
-		} else {
-			dstTuples = append(dstTuples, tup)
-		}
-	}
-	return srcTuples, dstTuples
-}
-
 // anyToDriverValues converts []any to []driver.Value for DuckDB appender AppendRow.
 func anyToDriverValues(a []any) []driver.Value {
 	out := make([]driver.Value, len(a))
@@ -159,62 +91,61 @@ func dedupeJobsByID(jobs []SealJob) (srcNodes, dstNodes []*NodeState, srcEvents,
 	return srcNodes, dstNodes, srcEvents, dstEvents
 }
 
-// buildEventOnlyStatusDeltas computes per-depth key deltas for event-only jobs.
-// PrevTraversalStatus/PrevCopyStatus are set at enqueue time from the task's loaded state,
-// so no DB query is needed here.
-func buildEventOnlyStatusDeltas(jobs []SealJob) (srcDeltas, dstDeltas []struct {
-	depth int
-	key   string
-	delta int64
-}) {
-	type deltaKey struct {
-		table string
-		depth int
-		key   string
+func addCanonicalReviewDelta(deltas map[string]int64, key string, delta int64) {
+	if key == "" || delta == 0 {
+		return
 	}
-	deltas := make(map[deltaKey]int64)
+	deltas[key] += delta
+}
+
+// buildCanonicalReviewStatsDeltas computes canonical stats-table deltas from buffered jobs.
+// Discovery jobs add new node counts; event-only jobs shift counts from previous -> current status.
+func buildCanonicalReviewStatsDeltas(jobs []SealJob) []ReviewStatsDelta {
+	deltas := make(map[string]int64)
 	for _, j := range jobs {
+		if j.Pending == discoveryJobStatsSentinel && len(j.Nodes) > 0 {
+			for _, e := range j.Events {
+				trav := e.TraversalStatus
+				if trav == "" {
+					trav = StatusPending
+				}
+				addCanonicalReviewDelta(deltas, reviewKeyForTraversalStatus(trav), 1)
+				if j.Table == "SRC" {
+					copySt := e.CopyStatus
+					if copySt == "" {
+						copySt = CopyStatusPending
+					}
+					addCanonicalReviewDelta(deltas, reviewKeyForCopyStatus(copySt), 1)
+				}
+			}
+			continue
+		}
 		if j.Pending != discoveryJobStatsSentinel || len(j.Nodes) > 0 || len(j.Events) == 0 {
 			continue
 		}
 		for _, e := range j.Events {
-			if e.ID == "" {
-				continue
-			}
 			if e.PrevTraversalStatus != e.TraversalStatus {
-				if e.PrevTraversalStatus != "" {
-					deltas[deltaKey{j.Table, e.Depth, StatsKeyTraversalStatus(e.PrevTraversalStatus)}]--
-				}
-				if e.TraversalStatus != "" {
-					deltas[deltaKey{j.Table, e.Depth, StatsKeyTraversalStatus(e.TraversalStatus)}]++
-				}
+				addCanonicalReviewDelta(deltas, reviewKeyForTraversalStatus(e.PrevTraversalStatus), -1)
+				addCanonicalReviewDelta(deltas, reviewKeyForTraversalStatus(e.TraversalStatus), 1)
 			}
-			if j.Table == "SRC" && e.CopyStatus != "" && e.PrevCopyStatus != e.CopyStatus {
-				if e.PrevCopyStatus != "" && e.PrevCopyStatus != CopyStatusInProgress {
-					deltas[deltaKey{"SRC", e.Depth, StatsKeyCopyStatus(e.PrevCopyStatus)}]--
-				}
-				if e.CopyStatus != "" && e.CopyStatus != CopyStatusInProgress {
-					deltas[deltaKey{"SRC", e.Depth, StatsKeyCopyStatus(e.CopyStatus)}]++
-				}
+			if j.Table == "SRC" && e.PrevCopyStatus != e.CopyStatus {
+				addCanonicalReviewDelta(deltas, reviewKeyForCopyStatus(e.PrevCopyStatus), -1)
+				addCanonicalReviewDelta(deltas, reviewKeyForCopyStatus(e.CopyStatus), 1)
+			}
+			if j.FromRetry && e.PrevTraversalStatus == StatusPending &&
+				(e.TraversalStatus == StatusSuccessful || e.TraversalStatus == StatusFailed) {
+				addCanonicalReviewDelta(deltas, ReviewKeyTraversalPendingRetry, -1)
 			}
 		}
 	}
-	for k, d := range deltas {
-		if d == 0 {
+	out := make([]ReviewStatsDelta, 0, len(deltas))
+	for key, delta := range deltas {
+		if delta == 0 {
 			continue
 		}
-		t := struct {
-			depth int
-			key   string
-			delta int64
-		}{k.depth, k.key, d}
-		if k.table == "SRC" {
-			srcDeltas = append(srcDeltas, t)
-		} else {
-			dstDeltas = append(dstDeltas, t)
-		}
+		out = append(out, ReviewStatsDelta{Key: key, Delta: delta})
 	}
-	return srcDeltas, dstDeltas
+	return out
 }
 
 // SealBuffer buffers seal jobs and discovery jobs (nodes + events only), flushes them to the DB asynchronously.
@@ -232,6 +163,7 @@ type SealBuffer struct {
 	queue               []SealJob
 	discoveryQueue      []SealJob         // nodes + events only (no stats); flushed with queue, stats skipped when Pending < 0
 	taskErrorsQueue     []TaskErrorRecord // buffered task errors; flushed with jobs
+	failedSubtreePaths  []string          // SRC folder paths whose pending descendants should be marked failed; flushed with jobs
 	rowsSinceFlush      int
 	lastFlushedDepth    int   // max depth written by completed Flush(); -1 until first flush
 	rowsSinceCheckpoint int64 // appender rows written since last CHECKPOINT
@@ -413,6 +345,19 @@ func (sb *SealBuffer) AddDiscoveryStatusEvent(table string, e StatusEvent, fromR
 	sb.mu.Unlock()
 }
 
+// AddFailedSubtreePath enqueues an SRC folder path for subtree failure propagation.
+// All pending descendants of this path will be marked as copy_status='failed' at flush time.
+func (sb *SealBuffer) AddFailedSubtreePath(parentPath string) {
+	sb.mu.Lock()
+	for sb.rowsSinceFlush >= sb.hardCap {
+		sb.cond.Wait()
+	}
+	sb.failedSubtreePaths = append(sb.failedSubtreePaths, parentPath)
+	sb.rowsSinceFlush++
+	sb.cond.Broadcast()
+	sb.mu.Unlock()
+}
+
 // AddTaskError enqueues one task error for async flush via the seal buffer.
 func (sb *SealBuffer) AddTaskError(rec TaskErrorRecord) {
 	sb.mu.Lock()
@@ -426,20 +371,22 @@ func (sb *SealBuffer) AddTaskError(rec TaskErrorRecord) {
 	sb.mu.Unlock()
 }
 
-func (sb *SealBuffer) drain() ([]SealJob, []TaskErrorRecord) {
+func (sb *SealBuffer) drain() ([]SealJob, []TaskErrorRecord, []string) {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
-	if len(sb.queue) == 0 && len(sb.discoveryQueue) == 0 && len(sb.taskErrorsQueue) == 0 {
-		return nil, nil
+	if len(sb.queue) == 0 && len(sb.discoveryQueue) == 0 && len(sb.taskErrorsQueue) == 0 && len(sb.failedSubtreePaths) == 0 {
+		return nil, nil, nil
 	}
 	out := append(sb.queue, sb.discoveryQueue...)
 	taskErrors := append([]TaskErrorRecord(nil), sb.taskErrorsQueue...)
+	subtreePaths := append([]string(nil), sb.failedSubtreePaths...)
 	sb.queue = make([]SealJob, 0, cap(sb.queue))
 	sb.discoveryQueue = make([]SealJob, 0, cap(sb.discoveryQueue))
 	sb.taskErrorsQueue = make([]TaskErrorRecord, 0, cap(sb.taskErrorsQueue))
+	sb.failedSubtreePaths = sb.failedSubtreePaths[:0]
 	sb.rowsSinceFlush = 0
 	sb.cond.Broadcast()
-	return out, taskErrors
+	return out, taskErrors, subtreePaths
 }
 
 // StartPhase starts a phase (traversal or copy): conn is held for the phase; 4 appenders are created and reused until StopPhase.
@@ -510,8 +457,8 @@ func (sb *SealBuffer) StopPhase() error {
 	return pa.conn.Close()
 }
 
-// phaseFlush runs one transaction per flush when phase is active: drain, BEGIN, upsert nodes, insert events (in tx), task errors, stats, COMMIT. Events and task errors are written inside the tx so requeue on failure does not produce duplicates.
-func (sb *SealBuffer) phaseFlush(jobs []SealJob, taskErrors []TaskErrorRecord) error {
+// phaseFlush runs one transaction per flush when phase is active: drain, BEGIN, upsert nodes, insert events (in tx), task errors, subtree failure propagation, stats, COMMIT.
+func (sb *SealBuffer) phaseFlush(jobs []SealJob, taskErrors []TaskErrorRecord, subtreePaths []string) error {
 	if len(jobs) == 0 && len(taskErrors) == 0 {
 		return nil
 	}
@@ -568,30 +515,19 @@ func (sb *SealBuffer) phaseFlush(jobs []SealJob, taskErrors []TaskErrorRecord) e
 			return fmt.Errorf("record task error: %w", err)
 		}
 	}
-	srcTuples, dstTuples := buildMergedLevelStats(jobs)
-	if len(srcTuples) > 0 {
-		if err := w.UpsertStatsCounts("SRC", srcTuples); err != nil {
+	reviewDeltas := buildCanonicalReviewStatsDeltas(jobs)
+	if len(reviewDeltas) > 0 {
+		if err := w.ApplyReviewStatsDeltas(reviewDeltas); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
 	}
-	if len(dstTuples) > 0 {
-		if err := w.UpsertStatsCounts("DST", dstTuples); err != nil {
+	// Propagate subtree failures: mark all pending descendants of failed folders as failed.
+	// Must run after appender flush so the CTE sees the folder's own events.
+	for _, path := range subtreePaths {
+		if _, err := w.PropagateSubtreeFailure(path); err != nil {
 			_ = tx.Rollback()
-			return err
-		}
-	}
-	srcEvDeltas, dstEvDeltas := buildEventOnlyStatusDeltas(jobs)
-	for _, d := range srcEvDeltas {
-		if err := w.UpdateStatsCountByDelta("SRC", d.depth, d.key, d.delta); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-	}
-	for _, d := range dstEvDeltas {
-		if err := w.UpdateStatsCountByDelta("DST", d.depth, d.key, d.delta); err != nil {
-			_ = tx.Rollback()
-			return err
+			return fmt.Errorf("propagate subtree failure for %s: %w", path, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -630,7 +566,7 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob, taskErrors []TaskErrorRecord) 
 	}
 	srcNodes, dstNodes, srcEvents, dstEvents := dedupeJobsByID(jobs)
 	totalRows := int64(len(srcNodes) + len(dstNodes) + len(srcEvents) + len(dstEvents))
-	srcTuples, dstTuples := buildMergedLevelStats(jobs)
+	reviewDeltas := buildCanonicalReviewStatsDeltas(jobs)
 	ctx, cancel := context.WithTimeout(context.Background(), sb.flushTimeout)
 	defer cancel()
 	if err := sb.db.RunWrite(ctx, func(s *WriteSession) error {
@@ -670,8 +606,7 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob, taskErrors []TaskErrorRecord) 
 		}); err != nil {
 			return err
 		}
-		srcEvDeltas, dstEvDeltas := buildEventOnlyStatusDeltas(jobs)
-		needTx := len(srcNodes) > 0 || len(dstNodes) > 0 || len(srcTuples) > 0 || len(dstTuples) > 0 || len(srcEvDeltas) > 0 || len(dstEvDeltas) > 0 || len(taskErrors) > 0
+		needTx := len(srcNodes) > 0 || len(dstNodes) > 0 || len(reviewDeltas) > 0 || len(taskErrors) > 0
 		if needTx {
 			return s.WithTx(func(w *Writer) error {
 				if err := w.UpsertNodes(tableSrcNodes, srcNodes); err != nil {
@@ -685,23 +620,8 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob, taskErrors []TaskErrorRecord) 
 						return err
 					}
 				}
-				if len(srcTuples) > 0 {
-					if err := w.UpsertStatsCounts("SRC", srcTuples); err != nil {
-						return err
-					}
-				}
-				if len(dstTuples) > 0 {
-					if err := w.UpsertStatsCounts("DST", dstTuples); err != nil {
-						return err
-					}
-				}
-				for _, d := range srcEvDeltas {
-					if err := w.UpdateStatsCountByDelta("SRC", d.depth, d.key, d.delta); err != nil {
-						return err
-					}
-				}
-				for _, d := range dstEvDeltas {
-					if err := w.UpdateStatsCountByDelta("DST", d.depth, d.key, d.delta); err != nil {
+				if len(reviewDeltas) > 0 {
+					if err := w.ApplyReviewStatsDeltas(reviewDeltas); err != nil {
 						return err
 					}
 				}
@@ -738,8 +658,8 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob, taskErrors []TaskErrorRecord) 
 // Flush drains queued jobs and task errors and writes them to the DB. When a phase is active, uses persistent appenders and one tx per flush (append + stats). Otherwise uses legacy per-flush appenders.
 // On write failure, jobs and task errors are re-queued so waiters in WaitUntilFlushedThrough do not block forever.
 func (sb *SealBuffer) Flush() error {
-	jobs, taskErrors := sb.drain()
-	if len(jobs) == 0 && len(taskErrors) == 0 {
+	jobs, taskErrors, subtreePaths := sb.drain()
+	if len(jobs) == 0 && len(taskErrors) == 0 && len(subtreePaths) == 0 {
 		return nil
 	}
 	sb.mu.Lock()
@@ -747,19 +667,19 @@ func (sb *SealBuffer) Flush() error {
 	sb.mu.Unlock()
 	var err error
 	if pa != nil {
-		err = sb.phaseFlush(jobs, taskErrors)
+		err = sb.phaseFlush(jobs, taskErrors, subtreePaths)
 	} else {
 		err = sb.legacyFlush(jobs, taskErrors)
 	}
 	if err != nil {
-		sb.requeue(jobs, taskErrors)
+		sb.requeue(jobs, taskErrors, subtreePaths)
 		return err
 	}
 	return nil
 }
 
-// requeue puts jobs and task errors back on the queue and restores rowsSinceFlush. Call when a flush fails so data is not lost.
-func (sb *SealBuffer) requeue(jobs []SealJob, taskErrors []TaskErrorRecord) {
+// requeue puts jobs, task errors, and subtree paths back on the queue and restores rowsSinceFlush. Call when a flush fails so data is not lost.
+func (sb *SealBuffer) requeue(jobs []SealJob, taskErrors []TaskErrorRecord, subtreePaths []string) {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
 	rows := int64(0)
@@ -768,7 +688,8 @@ func (sb *SealBuffer) requeue(jobs []SealJob, taskErrors []TaskErrorRecord) {
 	}
 	sb.queue = append(sb.queue, jobs...)
 	sb.taskErrorsQueue = append(sb.taskErrorsQueue, taskErrors...)
-	sb.rowsSinceFlush += int(rows) + len(taskErrors)
+	sb.failedSubtreePaths = append(sb.failedSubtreePaths, subtreePaths...)
+	sb.rowsSinceFlush += int(rows) + len(taskErrors) + len(subtreePaths)
 	sb.cond.Broadcast()
 }
 

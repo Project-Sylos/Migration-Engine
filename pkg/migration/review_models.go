@@ -15,10 +15,19 @@ type RetrySweepOptions struct {
 	MaxKnownDepth int
 }
 
+// CopyPhaseOptions are optional overrides for copy phase / copy retry runs. Zero values use last run config.
+type CopyPhaseOptions struct {
+	WorkerCount  int
+	MaxRetries   int
+	LogAddress   string
+	LogLevel     string
+	SkipListener bool
+}
+
 // StopResult reports stop/suspend state after a stop request.
 type StopResult struct {
 	MigrationID   string
-	Phase         Phase
+	Phase         string
 	RuntimeStatus RuntimeState
 	Stopped       bool
 }
@@ -158,20 +167,20 @@ type ReviewStatsRaw struct {
 	SizeDst              int64
 }
 
-// ToPathReviewStats projects raw stats into the API shape using phase: traversal review uses traversal pending/failed and pendingRetries; copy review/completed uses copy pending/failed.
-func (r ReviewStatsRaw) ToPathReviewStats(phase Phase) PathReviewStats {
+// ToPathReviewStats projects raw stats into the API shape using phase.
+func (r ReviewStatsRaw) ToPathReviewStats(phase string) PathReviewStats {
 	var pendingCount, failedCount, pendingRetriesCount int64
 	switch phase {
-	case PhaseReview:
-		pendingCount = r.TraversalPending
+	case PhaseTraversalReview:
+		pendingCount = r.CopyPending
 		failedCount = r.TraversalFailed
 		pendingRetriesCount = r.TraversalPendingRetry
-	case PhaseCopying, PhaseCompleted:
-		pendingCount = r.CopyPending
+	case PhaseCopying, PhaseCopyReview:
+		pendingCount = 0
 		failedCount = r.CopyFailed
 		pendingRetriesCount = r.CopyPending // copy phase: no separate retry counter
 	default:
-		pendingCount = r.TraversalPending
+		pendingCount = r.CopyPending
 		failedCount = r.TraversalFailed
 		pendingRetriesCount = r.TraversalPendingRetry
 	}
