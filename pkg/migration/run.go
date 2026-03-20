@@ -27,7 +27,7 @@ type MigrationConfig struct {
 	WorkerCount     int
 	MaxRetries      int
 	CoordinatorLead int
-	MaxSrcAhead     int           // Max rounds SRC may run ahead of DST (default 3); 0 uses default
+	MaxSrcAhead     int           // Max rounds SRC may run ahead of DST (queue default 2); 0 leaves queue default
 	LogAddress      string
 	LogLevel        string
 	SkipListener    bool

@@ -22,7 +22,7 @@ Each traversal operation is isolated into discrete, non-recursive **tasks** so t
    This keeps each task stateless and lightweight.
 
 3. **Record Results**
-   Children that pass filtering are recorded in per-level in-memory caches (memory-first path) or the database’s buffered APIs. At round advance (seal), the current level is persisted to the database in bulk. The queue pulls by depth and status from cache or keyset queries; the database is the source of truth for sealed state and resume.
+   Children that pass filtering are written through the database layer: the queue **pulls pending work from DuckDB** in batches (keyset by depth/status), workers lease from an in-memory buffer, and **seal** persists completed levels in bulk. The database (including append-only **status events**) is the source of truth for resume.
 
 ---
 
@@ -52,7 +52,7 @@ The Migration Engine serializes traversal data to the database at each round bou
 * When the destination processes its corresponding level, it compares existing nodes against the expected list from the source.
 * Extra items in the destination are logged but not traversed further.
 * The destination can run as fast as possible while staying coordinated with the source.
-* Because each round is sealed to the database (nodes and per-depth stats), the system can resume exactly where it left off after a crash; on resume, level caches are rehydrated from the DB.
+* Because each round is sealed to the database (nodes and per-depth stats), the system can resume after a crash; on resume, queues restore round/cursors and **pull** pending work from the DB again.
 * This maximizes both safety and throughput.
 
 ---
@@ -68,89 +68,49 @@ This design gives users complete visibility and control before any data movement
 
 ---
 
-## Migration State Persistence
+## Migration state and YAML
 
-The Migration Engine includes a comprehensive YAML-based configuration system that automatically saves migration state at critical milestones, enabling pause and resume functionality.
+**This repository’s `migration` package does not expose YAML save/load helpers** (no `SaveMigrationConfig` / `LoadMigrationConfigFromYAML` in the current API).  
 
-### Automatic State Tracking
+- **Resume** is driven by **DuckDB** contents (nodes, status events, stats) plus how the host calls **`LetsMigrate`**, **`MigrationManager`**, and domain methods (`StartTraversal`, retry sweep, copy, …).  
+- A **Sylos API** or other host may persist its own runtime fields (`startedAt`, `completedAt`, etc.); that is outside this module.
 
-Migration state is automatically persisted to a YAML config file. The path defaults to `{database_path}.yaml` (e.g. `migration.duckdb.yaml`) and can be overridden via `DatabaseConfig.ConfigPath`. State is saved at:
-
-- **Root selection** – When source and destination roots are set
-- **Roots seeded** – After root tasks are seeded into the database
-- **Traversal started** – When queues are initialized and ready
-- **Round advancement** – When source or destination rounds advance during traversal
-- **Traversal complete** – When migration finishes
-
-### Serialization and Deserialization
-
-You can save and load migration sessions from YAML files:
-
-**Save (Serialization):**
-```go
-yamlCfg, err := migration.NewMigrationConfigYAML(cfg, status)
-err = migration.SaveMigrationConfig("migration.yaml", yamlCfg)
-```
-
-**Load (Deserialization):**
-```go
-// Load YAML config for inspection
-yamlCfg, err := migration.LoadMigrationConfig("migration.yaml")
-
-// Or reconstruct full config for resuming
-cfg, err := migration.LoadMigrationConfigFromYAML("migration.yaml", adapterFactory)
-result, err := migration.LetsMigrate(cfg) // Resume migration
-```
-
-The YAML config stores:
-- Migration metadata (ID, timestamps)
-- Current state (status, last rounds/levels)
-- Service configurations (source, destination, embedded service configs)
-- Migration options (workers, retries, etc.)
-- Logging and database settings
-
-This enables:
-- **Pause and Resume** - Stop a migration and resume later from the exact checkpoint
-- **State Inspection** - Review migration progress without running
-- **Configuration Portability** - Move migration configs between environments
-- **Audit Trail** - Track when migrations were created, modified, and completed
-
-See `pkg/migration/README.md` for detailed documentation on the configuration system.
+See **`pkg/migration/README.md`** for the real entry points and manager lifecycle.
 
 ---
 
 ## Database architecture
 
-The Migration Engine uses a **single database file** (DuckDB) for all operational state: traversal and copy node data, per-depth stats, logs, and queue metrics. The implementation lives in `pkg/db`; the queue and migration packages use the same `*db.DB` instance.
+The engine uses **DuckDB**. Two deployment shapes:
+
+1. **Legacy single file** – `DatabaseConfig.Path` is set; one `.db` file (and optional multiple rows in the `migrations` table).  
+2. **Per-migration files** – `Path` empty on the manager; each migration has `{migrationDir}/{id}.db` (typical for HTTP APIs).
+
+Implementation: **`pkg/db`**. Queue and migration share the same **`*db.DB`** for a given run.
 
 ### Tables and roles
 
-- **Node tables** (`src_nodes`, `dst_nodes`) – One row per node (path, depth, `traversal_status`, `copy_status`, etc.). **NodeCache is required.** Workers pull tasks from the level cache; at **seal** (end of each round) the queue bulk-appends the completed level to these tables.
-- **Stats tables** (`src_stats`, `dst_stats`) – Per-depth counts by status (e.g. traversal/pending, traversal/successful). Written at seal from in-memory snapshot; used for completion detection and progress.
-- **Other** – `stats` (global key/count), `logs` (log buffer from `pkg/logservice`), `queue_stats` (observer metrics), `task_errors`.
+- **Node tables** (`src_nodes`, `dst_nodes`) – Metadata (path, depth, type, size, …). **Current traversal/copy status** comes from append-only **`src_status_events`** / **`dst_status_events`** (latest event per node), not from long-lived columns on the node row.
+- **Stats** – `src_stats` / `dst_stats` per depth; global **`stats`** table for canonical review counters and similar key/value aggregates.
+- **`migrations`** – Lifecycle row (id, name, **phase**, JSON metadata) when using **`MigrationManager`**.
+- **Other** – `logs`, `queue_stats`, `task_errors`.
 
-Traversal and copy status are columns on the node rows; there are no separate “status buckets.” SRC/DST correlation is by path (and join by path/parent_path in queries like `ListDstBatchWithSrcChildren`). Node IDs are deterministic (e.g. from `db.DeterministicNodeID`) for stable keys and deduplication.
+The queue **pulls** pending tasks via SQL (keyset pagination); **seal** (`SealLevel`, optionally via **SealBuffer**) bulk-writes completed levels. **Retry** mode uses DST cleanup paths documented in **`pkg/queue/README.md`** (and `AddNodeDeletions` where applicable).
 
-### Write path
+All reads and writes use a **single SQL connection** per open `*db.DB`.
 
-1. **During a round**: Task completion updates the level cache and in-memory stats only; no DB write until seal.
-2. **At seal**: The queue calls `database.SealLevel(table, depth, nodes, ...)` to bulk-append the level's nodes and write per-depth stats in one transaction. Round then advances; next pull uses the cache (rehydrated from DB on resume).
-3. **Retry**: `AddNodeDeletions` for DST cleanup when SRC folder completes in retry mode.
-
-All reads and writes use a **single connection** to the database.
-
-See **`pkg/db/README.md`** for schema and transaction APIs.
+See **`pkg/db/README.md`** for schema and APIs.
 
 ---
 
 ## Lifecycle and database ownership
 
-- **Who opens the database**: You can pass an already-open `*db.DB` in `migration.Config.DatabaseInstance`, or leave it nil and set `migration.Config.Database.Path` so the engine calls `db.Open` when it runs.
-- **Who closes it**: If the engine opened the DB (instance was nil), it will close it on exit only when `Config.CloseWhenDone` is true (e.g. standalone/CLI). When you pass `DatabaseInstance` and use the engine as a library, typically `CloseWhenDone` is false so the API keeps the connection after the migration returns. Use `MigrationController.GetDB()` to keep using the same DB after `Wait()`.
-- **Checkpointing**: The engine checkpoints the database at root seeding and when advancing rounds (and on shutdown when using the controller). Checkpoint is serialized inside `pkg/db` so only one connection is used.
-- **Config YAML**: State is saved to a YAML file (default `{Database.Path}.yaml`) at the milestones listed above. Resume by loading that YAML and running again with the same (or a new) database path or instance; the engine inspects the DB and YAML to decide whether to start fresh or resume.
+- **`LetsMigrate`** builds a **`MigrationManager`**, **`CreateMigration`**, optionally seeds roots, runs **`StartTraversal`**, then verification. It opens/closes DBs through the manager for that call path.
+- **`SetupDatabase`**, **`GetMigration`**, and domain **`Migration`** methods are used when the host keeps long-lived migrations (e.g. API with per-migration folders).
+- **`MigrationController`** (`StartMigration`) only provides **`Shutdown`**, **`Done`**, and **`Wait`**—there is no **`GetDB()`** on the controller in this package.
+- **Checkpointing** is handled inside **`pkg/db`** (serialized with the single connection).
 
-See **`pkg/migration/README.md`** for `LetsMigrate`, `StartMigration`, `SetupDatabase`, and config loading.
+See **`pkg/migration/README.md`** for **`PrepareRetrySweep`** / **`PrepareCopyRetry`** when enqueueing background retry work so phase flips **before** HTTP **202**.
 
 ---
 
@@ -159,8 +119,8 @@ See **`pkg/migration/README.md`** for `LetsMigrate`, `StartMigration`, `SetupDat
 | Package       | Role |
 |---------------|------|
 | **pkg/db**    | Database layer: open/close, schema (node/stats/logs tables), seal (bulk append + stats), read queries. Single DuckDB file and connection. |
-| **pkg/queue** | Queue layer: BFS rounds, task pull from cache, completion updates to cache, seal via `SealLevel`, coordinator, observer. NodeCache required; uses `*db.DB` for seal and resume. |
-| **pkg/migration** | Orchestration: open or accept DB, YAML config, root seeding, run traversal/copy via queue, verification. Owns lifecycle (who opens/closes) when used as entrypoint. |
+| **pkg/queue** | Queue layer: BFS rounds, **DB-backed pull** into `pendingBuff`, seal via `SealLevel`, coordinator, observer. Uses `*db.DB` for pulls, seal, and resume. |
+| **pkg/migration** | Orchestration: **`MigrationManager`**, domain **`Migration`**, root seeding, traversal/copy/retry APIs, verification. No YAML helpers in-tree. |
 | **pkg/configs**   | JSON config loaders: buffer config, log service (UDP), Spectra. |
 | **pkg/logservice** | Dual-channel logging: UDP (level-filtered) and persistence to the main DB’s `logs` table via `db.LogBuffer`. |
 
@@ -168,32 +128,28 @@ See **`pkg/migration/README.md`** for `LetsMigrate`, `StartMigration`, `SetupDat
 
 ## Documentation
 
-### Package READMEs
+### Docs in this repo
 
-- **[docs/ENGINE_ARCHITECTURE_OVERVIEW.md](./docs/ENGINE_ARCHITECTURE_OVERVIEW.md)** - Engine-centric lifecycle architecture and ownership model.
-- **[docs/API_USAGE_GUIDE.md](./docs/API_USAGE_GUIDE.md)** - API integration flow: create migration, add roots, traversal, review, copy, logs.
-- **[docs/ENGINE_API_CUTOVER.md](./docs/ENGINE_API_CUTOVER.md)** - API cutover contract from legacy corebridge paths.
-- **[pkg/db/README.md](./pkg/db/README.md)** – Database layer: schema, buffers, appender, Writer, queries.
-- **[pkg/queue/README.md](./pkg/queue/README.md)** – Queue layer: pull/write flow, modes, coordinator, observer.
-- **[pkg/migration/README.md](./pkg/migration/README.md)** – Migration orchestration, config YAML, lifecycle, verification.
-- **[pkg/configs/README.md](./pkg/configs/README.md)** – JSON config loaders (buffer, log service, Spectra).
+- **[docs/algorithms.md](./docs/algorithms.md)** – Algorithm notes.
+- **[docs/item_statuses.md](./docs/item_statuses.md)** – Status semantics.
+- **[pkg/db/README.md](./pkg/db/README.md)** – Schema, seal, Writer, queries.
+- **[pkg/queue/README.md](./pkg/queue/README.md)** – Pull/seal flow, modes, coordinator.
+- **[pkg/migration/README.md](./pkg/migration/README.md)** – Manager, domain lifecycle, **`PrepareRetrySweep`** / async retry.
+- **[pkg/configs/README.md](./pkg/configs/README.md)** – JSON loaders (buffer, log service, Spectra).
 - **[pkg/logservice/README.md](./pkg/logservice/README.md)** – UDP and DB logging.
+- **[pkg/tests/README.md](./pkg/tests/README.md)** – Integration runners layout.
 
-### Testing guides
-
-- **[Ephemeral Mode Guide](./docs/EPHEMERAL_MODE_GUIDE.md)** - Complete integration guide for using Spectra's ephemeral mode for testing migrations without database persistence. Includes configuration examples, performance expectations, and troubleshooting.
-
-- **[Ephemeral Mode Quick Reference](./docs/EPHEMERAL_MODE_QUICK_REF.md)** - Quick reference for ephemeral mode configuration templates and common patterns.
+> **Note:** Filenames like `ENGINE_ARCHITECTURE_OVERVIEW.md` or `EPHEMERAL_MODE_GUIDE.md` are **not** in this repository; they may exist in another Sylos repo (e.g. API or docs site). Use the package READMEs above as the source of truth for this module.
 
 ### Testing
 
-**Lightweight unit tests** (safe for CI and quick feedback):
+**Package tests** (when present):
 
 ```bash
 go test ./pkg/db ./pkg/migration ./pkg/queue
 ```
 
-These cover stats, review models, and queue logic with small in-process DBs. Use them for targeted checks during development.
+These packages may compile with **no `_test.go` files** in some checkouts; the command still verifies the modules build. Add focused tests here when you extend the engine.
 
 **Heavy E2E / integration tests** (run only when doing full validation; they are resource-heavy and can stress the system):
 

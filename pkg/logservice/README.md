@@ -30,7 +30,7 @@ Sender
 
 **Components**:
 - **Sender** (`sender.go`): Holds a `*db.DB` reference and a `*db.LogBuffer`. Routes each log to UDP (when level ≥ threshold) and to `logBuffer.Add(…)` when the buffer is present. Does not own the DB; `Close()` stops the buffer and closes the UDP connection only.
-- **db.LogBuffer** (`pkg/db`): Batches `db.LogEntry` and flushes to the main DB’s `logs` table. Batch size and interval are set in `NewSender` (20,000 and 10s).
+- **db.LogBuffer** (`pkg/db`): Batches `db.LogEntry` and flushes to the main DB’s `logs` table. **`NewSender`** uses batch size **`defaultBatchSize` (50,000)** and flush interval **3s** (`db.NewLogBuffer(logDB, defaultBatchSize, 3 * time.Second)`).
 - **Listener** (`listener.go`): UDP receive loop; parses `LogPacket` JSON, prints `timestamp [level] message [queue]`, and clears the console when the message is `<<CLEAR_SCREEN>>`.
 
 ---
@@ -98,7 +98,7 @@ logservice.LS.Log("debug", "Processing task", "worker", "worker-1", "src")
 ## Buffering and persistence
 
 - **Batch size**: 20,000 entries (`defaultBatchSize` in `sender.go`).
-- **Flush interval**: 10 seconds (`db.NewLogBuffer(…, 3 * time.Second)`).
+- **Flush interval**: **3 seconds** (see `sender.go` + `db.NewLogBuffer`).
 - **Shutdown**: `Close()` calls `logBuffer.Stop()` (stops flush loop and flushes) and closes the UDP connection.
 
 Persistence is to the main database’s `logs` table; schema and `Writer.InsertLog` are in `pkg/db`. Query logs with SQL against that table.
@@ -189,6 +189,6 @@ pkg/logservice/
 
 - **Dual channel**: UDP (level-filtered) and optional DB persistence via `db.LogBuffer` to the main DB’s `logs` table.
 - **Sender** holds a reference to `*db.DB` and creates a `db.LogBuffer` when the DB is non-nil; it does not own or close the DB.
-- **Buffer**: 20k batch size, 10s interval; `Close()` stops and flushes.
+- **Buffer**: 50k batch size, 3s flush interval; `Close()` stops and flushes.
 - **Listener**: `StartListener` spawns a terminal running the listener; `RunListener` runs the loop in-process; `<<CLEAR_SCREEN>>` clears the console.
 - **ClearConsole**: UDP-only; no DB write.

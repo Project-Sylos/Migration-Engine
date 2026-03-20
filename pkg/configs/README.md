@@ -8,7 +8,7 @@ The **configs** package provides utilities for loading and parsing JSON configur
 
 The configs package defines structured types and loader functions for:
 
-- **Buffer Configuration** – Batch size and flush interval for buffered appender and staging-table writes (see `pkg/db`)
+- **Buffer Configuration** – Batch size and flush interval for **seal / appender buffering** (see `pkg/db` `SealBuffer` / `SealBufferOptions`, not a separate “staging” table)
 - **Log Service Configuration** – UDP logging address, port, and minimum log level
 - **Spectra Configuration** – Spectra filesystem simulator settings (root IDs, instance configuration)
 
@@ -20,7 +20,7 @@ Configuration files are expected under a config directory (e.g. `pkg/configs/`);
 
 ### BufferConfig
 
-Maps table names to batch size and flush interval for buffered writes (e.g. staging and node tables in `pkg/db`):
+Maps table names to batch size and flush interval for buffered writes used with DuckDB appenders / seal flushing in `pkg/db`:
 
 ```go
 type BufferTableConfig struct {
@@ -175,9 +175,9 @@ pkg/configs/
 
 This package is used by:
 
-1. **Spectra / migration setup** – `LoadSpectraConfig` for Spectra adapters and root IDs (e.g. in `pkg/migration` config YAML loading)
+1. **Spectra / tests** – `LoadSpectraConfig` for Spectra adapters and root IDs (used by `pkg/tests` and CLI-style setups)
 2. **Log service** – `LoadLogServiceConfig` for UDP log address and level
-3. **Buffered writes** – `LoadBufferConfig` (when `buffers.json` is present) to configure batch size and flush interval for staging and node buffers in `pkg/db`
+3. **Buffered seal / appenders** – `LoadBufferConfig` (when `buffers.json` is present) to tune seal-buffer behavior in `pkg/db`
 
 ---
 

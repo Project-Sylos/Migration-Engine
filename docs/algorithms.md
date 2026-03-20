@@ -7,7 +7,7 @@ For traversal, retry, and copy phases, the engine uses a **Breadth-First Search 
 BFS was chosen because the engine relies on a semi-coupled source–destination traversal model. Level-synchronized processing simplifies:
 
 * Parent/child alignment between source and destination
-* Cache scoping and bounded memory growth
+* **DB-backed frontier** (batched pulls from DuckDB) with bounded in-memory **lease buffers**, rather than unbounded deep stacks
 * Deterministic phase progression
 * Level-based copy execution (folders first, then files)
 

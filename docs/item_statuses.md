@@ -1,5 +1,7 @@
 ## Purpose of this doc
-The purpose of this doc is to explain the various item statuses and schema. 
+The purpose of this doc is to explain the various item statuses and schema.
+
+**Implementation note:** In DuckDB, the **current** traversal/copy values for a node come from the latest row in **`src_status_events`** / **`dst_status_events`** (append-only, `arg_max` by `id`). The `src_nodes` / `dst_nodes` tables hold path/metadata; queries join events for live status. See **`pkg/db/README.md`**.
 
 ### The 2 main statuses
 There are 2 main status fields in Sylos nodes. They are:
