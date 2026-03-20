@@ -346,7 +346,9 @@ func (sb *SealBuffer) AddDiscoveryStatusEvent(table string, e StatusEvent, fromR
 }
 
 // AddFailedSubtreePath enqueues an SRC folder path for subtree failure propagation.
-// All pending descendants of this path will be marked as copy_status='failed' at flush time.
+// All pending descendants of this path will be marked as copy_status='failed' at the next flush
+// (row threshold, flush ticker, or explicit FlushAppenderBuffer e.g. before round advance).
+// Batched with other seal work; do not flush synchronously here.
 func (sb *SealBuffer) AddFailedSubtreePath(parentPath string) {
 	sb.mu.Lock()
 	for sb.rowsSinceFlush >= sb.hardCap {
@@ -553,9 +555,9 @@ func (sb *SealBuffer) phaseFlush(jobs []SealJob, taskErrors []TaskErrorRecord, s
 	return nil
 }
 
-// legacyFlush is used when no phase is active: batch events via appenders, then one tx for nodes, task errors, and stats.
-func (sb *SealBuffer) legacyFlush(jobs []SealJob, taskErrors []TaskErrorRecord) error {
-	if len(jobs) == 0 && len(taskErrors) == 0 {
+// legacyFlush is used when no phase is active: batch events via appenders, then one tx for nodes, task errors, stats, and subtree failure propagation.
+func (sb *SealBuffer) legacyFlush(jobs []SealJob, taskErrors []TaskErrorRecord, subtreePaths []string) error {
+	if len(jobs) == 0 && len(taskErrors) == 0 && len(subtreePaths) == 0 {
 		return nil
 	}
 	maxDepth := -1
@@ -570,50 +572,54 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob, taskErrors []TaskErrorRecord) 
 	ctx, cancel := context.WithTimeout(context.Background(), sb.flushTimeout)
 	defer cancel()
 	if err := sb.db.RunWrite(ctx, func(s *WriteSession) error {
-		conn := s.Conn()
-		if err := conn.Raw(func(driverConn any) error {
-			dc, ok := driverConn.(driver.Conn)
-			if !ok {
-				return fmt.Errorf("seal flush: conn is not driver.Conn")
-			}
-			appSrcEv, err := duckdb.NewAppenderFromConn(dc, "", tableSrcStatusEvents)
-			if err != nil {
-				return err
-			}
-			defer appSrcEv.Close()
-			appDstEv, err := duckdb.NewAppenderFromConn(dc, "", tableDstStatusEvents)
-			if err != nil {
-				return err
-			}
-			defer appDstEv.Close()
-			for _, e := range srcEvents {
-				if err := appSrcEv.AppendRow(anyToDriverValues(SrcStatusEventAppendRowArgs(&e))...); err != nil {
+		if len(srcEvents)+len(dstEvents) > 0 {
+			conn := s.Conn()
+			if err := conn.Raw(func(driverConn any) error {
+				dc, ok := driverConn.(driver.Conn)
+				if !ok {
+					return fmt.Errorf("seal flush: conn is not driver.Conn")
+				}
+				appSrcEv, err := duckdb.NewAppenderFromConn(dc, "", tableSrcStatusEvents)
+				if err != nil {
 					return err
 				}
-			}
-			for _, e := range dstEvents {
-				if err := appDstEv.AppendRow(anyToDriverValues(DstStatusEventAppendRowArgs(&e))...); err != nil {
+				defer appSrcEv.Close()
+				appDstEv, err := duckdb.NewAppenderFromConn(dc, "", tableDstStatusEvents)
+				if err != nil {
 					return err
 				}
-			}
-			if err := appSrcEv.Flush(); err != nil {
+				defer appDstEv.Close()
+				for _, e := range srcEvents {
+					if err := appSrcEv.AppendRow(anyToDriverValues(SrcStatusEventAppendRowArgs(&e))...); err != nil {
+						return err
+					}
+				}
+				for _, e := range dstEvents {
+					if err := appDstEv.AppendRow(anyToDriverValues(DstStatusEventAppendRowArgs(&e))...); err != nil {
+						return err
+					}
+				}
+				if err := appSrcEv.Flush(); err != nil {
+					return err
+				}
+				if err := appDstEv.Flush(); err != nil {
+					return err
+				}
+				return nil
+			}); err != nil {
 				return err
 			}
-			if err := appDstEv.Flush(); err != nil {
-				return err
-			}
-			return nil
-		}); err != nil {
-			return err
 		}
-		needTx := len(srcNodes) > 0 || len(dstNodes) > 0 || len(reviewDeltas) > 0 || len(taskErrors) > 0
+		needTx := len(srcNodes) > 0 || len(dstNodes) > 0 || len(reviewDeltas) > 0 || len(taskErrors) > 0 || len(subtreePaths) > 0
 		if needTx {
 			return s.WithTx(func(w *Writer) error {
-				if err := w.UpsertNodes(tableSrcNodes, srcNodes); err != nil {
-					return err
-				}
-				if err := w.UpsertNodes(tableDstNodes, dstNodes); err != nil {
-					return err
+				if len(srcNodes) > 0 || len(dstNodes) > 0 {
+					if err := w.UpsertNodes(tableSrcNodes, srcNodes); err != nil {
+						return err
+					}
+					if err := w.UpsertNodes(tableDstNodes, dstNodes); err != nil {
+						return err
+					}
 				}
 				for _, te := range taskErrors {
 					if err := w.RecordTaskError(te.QueueType, te.Phase, te.NodeID, te.Message, te.Attempts, te.Path); err != nil {
@@ -623,6 +629,11 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob, taskErrors []TaskErrorRecord) 
 				if len(reviewDeltas) > 0 {
 					if err := w.ApplyReviewStatsDeltas(reviewDeltas); err != nil {
 						return err
+					}
+				}
+				for _, path := range subtreePaths {
+					if _, err := w.PropagateSubtreeFailure(path); err != nil {
+						return fmt.Errorf("propagate subtree failure for %s: %w", path, err)
 					}
 				}
 				return nil
@@ -669,7 +680,7 @@ func (sb *SealBuffer) Flush() error {
 	if pa != nil {
 		err = sb.phaseFlush(jobs, taskErrors, subtreePaths)
 	} else {
-		err = sb.legacyFlush(jobs, taskErrors)
+		err = sb.legacyFlush(jobs, taskErrors, subtreePaths)
 	}
 	if err != nil {
 		sb.requeue(jobs, taskErrors, subtreePaths)

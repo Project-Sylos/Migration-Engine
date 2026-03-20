@@ -29,6 +29,8 @@ func deltaKeyToReviewKey(k string) string {
 		return db.ReviewKeyCopyPending
 	case DeltaCopyFailed:
 		return db.ReviewKeyCopyFailed
+	case DeltaCopySuccessful:
+		return db.ReviewKeyCopySuccessful
 	case DeltaExcluded:
 		return db.ReviewKeyExcluded
 	case DeltaFolders:
@@ -109,6 +111,26 @@ func (s *migrationStore) queryNodes(filter NodeQueryFilter) ([]db.NodeState, err
 	return db.QueryNodesForReview(s.db, table, filter.Depth, filter.Status, filter.Excluded, filter.PathLike, filter.OrderByPath, limit, offset)
 }
 
+// addReviewDeltaLeaveCopyBucketForExclude applies -1 to the copy-status bucket the node is leaving when excluding (copy_status → excluded). Matches Writer.SetNodeExcluded depth stats.
+func addReviewDeltaLeaveCopyBucketForExclude(deltas map[string]int64, copyStatus string) {
+	switch copyStatus {
+	case db.CopyStatusPending, "":
+		addReviewDelta(deltas, DeltaCopyPending, -1)
+	case db.CopyStatusFailed:
+		addReviewDelta(deltas, DeltaCopyFailed, -1)
+	case db.CopyStatusSuccessful:
+		addReviewDelta(deltas, DeltaCopySuccessful, -1)
+	case db.CopyStatusInProgress:
+		// Writer does not decrement in_progress in per-depth stats when switching to excluded.
+	case db.CopyStatusSkipped:
+		// No universal review key for skipped; excluded aggregate still increments.
+	case db.CopyStatusExcludedExplicit, db.CopyStatusExcludedInherited:
+		// Exclude path should not run when already excluded.
+	default:
+		addReviewDelta(deltas, DeltaCopyPending, -1)
+	}
+}
+
 func (s *migrationStore) setNodeExcluded(nodeID string, excluded bool) (int64, map[string]int64, error) {
 	// Exclude/unexclude is SRC-only: only source nodes can be excluded from copy; no DST lookup.
 	node, err := db.GetNodeByID(s.db, "SRC", nodeID)
@@ -133,17 +155,10 @@ func (s *migrationStore) setNodeExcluded(nodeID string, excluded bool) (int64, m
 	deltas := make(map[string]int64)
 	if excluded {
 		addReviewDelta(deltas, DeltaExcluded, 1)
-		switch node.TraversalStatus {
-		case db.StatusPending:
-			addReviewDelta(deltas, DeltaTraversalPending, -1)
-		case db.StatusFailed:
-			addReviewDelta(deltas, DeltaTraversalFailed, -1)
-		default:
-			addReviewDelta(deltas, DeltaTraversalPending, -1)
-		}
+		addReviewDeltaLeaveCopyBucketForExclude(deltas, node.CopyStatus)
 	} else {
 		addReviewDelta(deltas, DeltaExcluded, -1)
-		addReviewDelta(deltas, DeltaTraversalPending, 1)
+		addReviewDelta(deltas, DeltaCopyPending, 1)
 	}
 	if err := s.persistReviewDeltas(deltas); err != nil {
 		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
@@ -380,6 +395,7 @@ func (s *migrationStore) setNodeExcludedWithPropagation(nodeID string, excluded 
 	q := "SRC"
 	rootPath := node.Path
 	var affected int64
+	var buckets db.CopyStatusBucketsSubtreeNotExcluded
 	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
 		return sess.WithTx(func(w *db.Writer) error {
 			excl, notExcl, err := w.CountExcludedInSubtree(q, rootPath)
@@ -392,15 +408,14 @@ func (s *migrationStore) setNodeExcludedWithPropagation(nodeID string, excluded 
 				affected = excl
 			}
 			if excluded {
-				if err := w.InsertExclusionEventsForSubtree(q, rootPath); err != nil {
-					return err
+				var err2 error
+				buckets, err2 = w.CountCopyStatusBucketsSubtreeNotExcluded(rootPath)
+				if err2 != nil {
+					return err2
 				}
-			} else {
-				if err := w.InsertUnexcludeEventsForSubtree(q, rootPath); err != nil {
-					return err
-				}
+				return w.InsertExclusionEventsForSubtree(q, rootPath)
 			}
-			return nil
+			return w.InsertUnexcludeEventsForSubtree(q, rootPath)
 		})
 	})
 	if err != nil {
@@ -409,8 +424,12 @@ func (s *migrationStore) setNodeExcludedWithPropagation(nodeID string, excluded 
 	deltas := make(map[string]int64)
 	if excluded {
 		addReviewDelta(deltas, DeltaExcluded, affected)
+		addReviewDelta(deltas, DeltaCopyPending, -buckets.Pending)
+		addReviewDelta(deltas, DeltaCopyFailed, -buckets.Failed)
+		addReviewDelta(deltas, DeltaCopySuccessful, -buckets.Successful)
 	} else {
 		addReviewDelta(deltas, DeltaExcluded, -affected)
+		addReviewDelta(deltas, DeltaCopyPending, affected)
 	}
 	if err := s.persistReviewDeltas(deltas); err != nil {
 		return 0, nil, fmt.Errorf("persist review deltas: %w", err)

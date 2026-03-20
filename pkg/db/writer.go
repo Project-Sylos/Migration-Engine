@@ -20,7 +20,7 @@ type Writer struct {
 func NodeStateAppendRowArgs(n *NodeState) []any {
 	return []any{
 		n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath,
-		PathHashForJoin(n.Path), PathHashForJoin(n.ParentPath),
+		PathHash(n.Path), PathHash(n.ParentPath),
 		n.Type, n.Size, n.MTime, int32(n.Depth),
 	}
 }
@@ -35,7 +35,7 @@ func (w *Writer) AppenderInsert(table string, nodes []*NodeState) error {
 		_, err := w.tx.ExecContext(ctx,
 			`INSERT INTO `+table+` (id, service_id, parent_id, parent_service_id, path, parent_path, path_hash, parent_path_hash, type, size, mtime, depth)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath, PathHashForJoin(n.Path), PathHashForJoin(n.ParentPath), n.Type, n.Size, n.MTime, n.Depth,
+			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath, PathHash(n.Path), PathHash(n.ParentPath), n.Type, n.Size, n.MTime, n.Depth,
 		)
 		if err != nil {
 			return err
@@ -56,7 +56,7 @@ func (w *Writer) UpsertNodes(table string, nodes []*NodeState) error {
 			`INSERT INTO `+table+` (id, service_id, parent_id, parent_service_id, path, parent_path, path_hash, parent_path_hash, type, size, mtime, depth)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			 ON CONFLICT (id) DO NOTHING`,
-			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath, PathHashForJoin(n.Path), PathHashForJoin(n.ParentPath), n.Type, n.Size, n.MTime, n.Depth,
+			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath, PathHash(n.Path), PathHash(n.ParentPath), n.Type, n.Size, n.MTime, n.Depth,
 		)
 		if err != nil {
 			return fmt.Errorf("insert node %s into %s: %w", n.ID, table, err)
@@ -311,9 +311,14 @@ SELECT n.id, COALESCE((SELECT arg_max(e.traversal_status, e.event_time) FROM src
 // PropagateSubtreeFailure inserts copy_status='failed' events for all SRC descendants of parentPath
 // whose current copy_status is 'pending'. Returns the number of affected nodes. Call inside a transaction.
 func (w *Writer) PropagateSubtreeFailure(parentPath string) (int64, error) {
+	parentPath = NormalizeSubtreeRootPathForPropagation(parentPath)
+	if parentPath == "" || parentPath == "/" {
+		return 0, nil
+	}
+	// Strict descendants only: use starts_with so '_' and '%' in path segments are not LIKE wildcards.
+	prefix := parentPath + "/"
 	ctx := context.Background()
 	eventTime := time.Now().UnixNano()
-	prefix := parentPath + "/%"
 	res, err := w.tx.ExecContext(ctx, `INSERT INTO `+tableSrcStatusEvents+` (id, traversal_status, copy_status, event_time, depth)
 SELECT n.id,
        COALESCE((SELECT arg_max(e.traversal_status, e.event_time) FROM `+tableSrcStatusEvents+` e WHERE e.id = n.id), ''),
@@ -322,7 +327,7 @@ SELECT n.id,
        n.depth
 FROM `+tableSrcNodes+` n
 LEFT JOIN `+cteSrcCurrentStatus+` cur ON n.id = cur.id
-WHERE n.path LIKE $2
+WHERE starts_with(n.path, $2)
   AND COALESCE(cur.copy_status, '') = 'pending'`, eventTime, prefix)
 	if err != nil {
 		return 0, fmt.Errorf("propagate subtree failure for %s: %w", parentPath, err)
@@ -344,7 +349,7 @@ WHERE n.path LIKE $2
 func (w *Writer) InsertDstChildrenTraversalStatusEvents(parentPath, status string) error {
 	ctx := context.Background()
 	eventTime := time.Now().UnixNano()
-	parentHash := PathHashForJoin(parentPath)
+	parentHash := PathHash(parentPath)
 	_, err := w.tx.ExecContext(ctx, `INSERT INTO dst_status_events (id, traversal_status, event_time, depth) SELECT n.id, $1, $2, n.depth FROM dst_nodes n WHERE n.parent_path_hash = $3`, status, eventTime, parentHash)
 	if err != nil {
 		return err
@@ -416,10 +421,43 @@ FROM `+tableSrcNodes+` n LEFT JOIN latest e ON n.id = e.id WHERE n.path LIKE '/%
 	return excluded, notExcluded, err
 }
 
+// CopyStatusBucketsSubtreeNotExcluded holds counts of current SRC copy_status among nodes in the subtree that are not yet excluded (exclude propagation runs on this set).
+type CopyStatusBucketsSubtreeNotExcluded struct {
+	Pending    int64
+	Failed     int64
+	Successful int64
+	Skipped    int64
+	InProgress int64
+}
+
+// CountCopyStatusBucketsSubtreeNotExcluded counts SRC nodes under rootPath whose latest copy_status is not excluded, by bucket. Matches Writer.SetNodeExcluded universal deltas (in_progress and skipped have no separate review-table copy bucket). Call inside a transaction.
+func (w *Writer) CountCopyStatusBucketsSubtreeNotExcluded(rootPath string) (CopyStatusBucketsSubtreeNotExcluded, error) {
+	ctx := context.Background()
+	var out CopyStatusBucketsSubtreeNotExcluded
+	notExcl := `(COALESCE(e.copy_status,'') NOT IN ('excluded_explicit','excluded_inherited'))`
+	base := `WITH latest AS (SELECT id, arg_max(copy_status, event_time) AS copy_status FROM ` + tableSrcStatusEvents + ` WHERE COALESCE(copy_status,'') <> '' GROUP BY id)
+SELECT
+  COUNT(*) FILTER (WHERE ` + notExcl + ` AND COALESCE(e.copy_status,'') IN ('pending',''))::BIGINT,
+  COUNT(*) FILTER (WHERE ` + notExcl + ` AND COALESCE(e.copy_status,'') = 'failed')::BIGINT,
+  COUNT(*) FILTER (WHERE ` + notExcl + ` AND COALESCE(e.copy_status,'') = 'successful')::BIGINT,
+  COUNT(*) FILTER (WHERE ` + notExcl + ` AND COALESCE(e.copy_status,'') = 'skipped')::BIGINT,
+  COUNT(*) FILTER (WHERE ` + notExcl + ` AND COALESCE(e.copy_status,'') = 'in_progress')::BIGINT
+FROM ` + tableSrcNodes + ` n LEFT JOIN latest e ON n.id = e.id WHERE `
+	if rootPath == "/" {
+		err := w.tx.QueryRowContext(ctx, base+`n.path LIKE '/%'`).Scan(
+			&out.Pending, &out.Failed, &out.Successful, &out.Skipped, &out.InProgress)
+		return out, err
+	}
+	prefix := rootPath + "/%"
+	err := w.tx.QueryRowContext(ctx, base+`n.path = $1 OR n.path LIKE $2`, rootPath, prefix).Scan(
+		&out.Pending, &out.Failed, &out.Successful, &out.Skipped, &out.InProgress)
+	return out, err
+}
+
 // CountDstNodesUnderPath returns the number of DST nodes whose parent_path equals parentPath (direct children only). Call inside a transaction.
 func (w *Writer) CountDstNodesUnderPath(parentPath string) (int64, error) {
 	ctx := context.Background()
-	parentHash := PathHashForJoin(parentPath)
+	parentHash := PathHash(parentPath)
 	var n int64
 	err := w.tx.QueryRowContext(ctx, `SELECT COUNT(*)::BIGINT FROM dst_nodes WHERE parent_path_hash = $1`, parentHash).Scan(&n)
 	return n, err
@@ -428,7 +466,7 @@ func (w *Writer) CountDstNodesUnderPath(parentPath string) (int64, error) {
 // CountDstNodesUnderPathWithTraversalStatus returns the number of DST nodes under parentPath (parent_path = parentPath) whose current traversal_status equals status. Call inside a transaction.
 func (w *Writer) CountDstNodesUnderPathWithTraversalStatus(parentPath, status string) (int64, error) {
 	ctx := context.Background()
-	parentHash := PathHashForJoin(parentPath)
+	parentHash := PathHash(parentPath)
 	q := `WITH latest AS (SELECT id, arg_max(traversal_status, event_time) AS traversal_status FROM dst_status_events GROUP BY id)
 SELECT COUNT(*)::BIGINT FROM dst_nodes n JOIN latest e ON n.id = e.id WHERE n.parent_path_hash = $1 AND COALESCE(e.traversal_status,'') = $2`
 	var n int64

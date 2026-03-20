@@ -195,7 +195,7 @@ func backfillPathHash(conn *sql.DB, table string) error {
 		if err := rows.Scan(&id, &path, &parentPath); err != nil {
 			return fmt.Errorf("path_hash backfill scan %s: %w", table, err)
 		}
-		batch = append(batch, struct{ id, pathHash, parentPathHash string }{id, PathHashForJoin(path), PathHashForJoin(parentPath)})
+		batch = append(batch, struct{ id, pathHash, parentPathHash string }{id, PathHash(path), PathHash(parentPath)})
 		if len(batch) >= pathHashMigrationBatchSize {
 			if err := execPathHashBatch(conn, table, batch); err != nil {
 				return err

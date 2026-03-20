@@ -19,7 +19,7 @@ func InsertRootNode(d *DB, table string, state *NodeState) error {
 			_, err := w.tx.ExecContext(context.Background(),
 				`INSERT INTO `+t+` (id, service_id, parent_id, parent_service_id, path, parent_path, path_hash, parent_path_hash, type, size, mtime, depth)
 				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-				state.ID, state.ServiceID, state.ParentID, state.ParentServiceID, state.Path, state.ParentPath, PathHashForJoin(state.Path), PathHashForJoin(state.ParentPath), state.Type, state.Size, state.MTime, state.Depth,
+				state.ID, state.ServiceID, state.ParentID, state.ParentServiceID, state.Path, state.ParentPath, PathHash(state.Path), PathHash(state.ParentPath), state.Type, state.Size, state.MTime, state.Depth,
 			)
 			if err != nil {
 				return err

@@ -343,9 +343,20 @@ func (m *Migration) StartCopy() (queue.QueueStats, error) {
 	return stats, nil
 }
 
-func (m *Migration) RunRetrySweep(opts RetrySweepOptions) (RuntimeStats, error) {
+// PrepareRetrySweep transitions to traversal-in-progress and persists phase immediately.
+// Call this synchronously in the HTTP handler before returning 202 and starting RunRetrySweep in a background task,
+// so clients that poll GET migration see traversal-in-progress before the sweep goroutine runs.
+func (m *Migration) PrepareRetrySweep() error {
 	if m.Phase() != PhaseTraversalReview {
-		return RuntimeStats{}, fmt.Errorf("retry sweep requires awaiting-traversal-review phase")
+		return fmt.Errorf("prepare retry sweep requires awaiting-traversal-review phase")
+	}
+	return m.transitionTo(PhaseTraversing)
+}
+
+func (m *Migration) RunRetrySweep(opts RetrySweepOptions) (RuntimeStats, error) {
+	phase := m.Phase()
+	if phase != PhaseTraversalReview && phase != PhaseTraversing {
+		return RuntimeStats{}, fmt.Errorf("retry sweep requires awaiting-traversal-review phase (or prepared traversal-in-progress)")
 	}
 	m.mu.RLock()
 	lastCfg := m.lastRunConfig
@@ -353,8 +364,10 @@ func (m *Migration) RunRetrySweep(opts RetrySweepOptions) (RuntimeStats, error) 
 	if lastCfg == nil {
 		return RuntimeStats{}, fmt.Errorf("retry sweep requires prior traversal config")
 	}
-	if err := m.transitionTo(PhaseTraversing); err != nil {
-		return RuntimeStats{}, err
+	if phase == PhaseTraversalReview {
+		if err := m.transitionTo(PhaseTraversing); err != nil {
+			return RuntimeStats{}, err
+		}
 	}
 	runCtx := m.beginRun(lastCfg.ShutdownContext)
 	defer func() {
@@ -417,10 +430,20 @@ func (m *Migration) RunRetrySweep(opts RetrySweepOptions) (RuntimeStats, error) 
 	return stats, nil
 }
 
+// PrepareCopyRetry transitions to copy-in-progress and persists phase immediately.
+// Call synchronously before returning 202 and starting RunCopyRetry in a background task, same pattern as PrepareRetrySweep.
+func (m *Migration) PrepareCopyRetry() error {
+	if m.Phase() != PhaseCopyReview {
+		return fmt.Errorf("prepare copy retry requires awaiting-copy-review phase")
+	}
+	return m.transitionTo(PhaseCopying)
+}
+
 // RunCopyRetry runs the copy phase in retry mode (only copy_status = failed). Requires awaiting-copy-review. On success transitions back to awaiting-copy-review.
 func (m *Migration) RunCopyRetry(opts CopyPhaseOptions) (queue.QueueStats, error) {
-	if m.Phase() != PhaseCopyReview {
-		return queue.QueueStats{}, fmt.Errorf("copy retry requires awaiting-copy-review phase")
+	phase := m.Phase()
+	if phase != PhaseCopyReview && phase != PhaseCopying {
+		return queue.QueueStats{}, fmt.Errorf("copy retry requires awaiting-copy-review phase (or prepared copy-in-progress)")
 	}
 	m.mu.RLock()
 	lastCfg := m.lastRunConfig
@@ -428,8 +451,10 @@ func (m *Migration) RunCopyRetry(opts CopyPhaseOptions) (queue.QueueStats, error
 	if lastCfg == nil {
 		return queue.QueueStats{}, fmt.Errorf("copy retry requires prior traversal config")
 	}
-	if err := m.transitionTo(PhaseCopying); err != nil {
-		return queue.QueueStats{}, err
+	if phase == PhaseCopyReview {
+		if err := m.transitionTo(PhaseCopying); err != nil {
+			return queue.QueueStats{}, err
+		}
 	}
 	runCtx := m.beginRun(lastCfg.ShutdownContext)
 	defer func() {

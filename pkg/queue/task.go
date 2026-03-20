@@ -97,12 +97,26 @@ func (t *TaskBase) LocationPath() string {
 }
 
 // IsFolder returns whether this task represents a folder traversal.
+// Copy phase: use TaskType (copy-folder) so folder tasks are recognized even when ServiceID is empty;
+// traversal/retry still use Folder.ServiceID when Type is not copy-folder/copy-file.
 func (t *TaskBase) IsFolder() bool {
+	switch t.Type {
+	case TaskTypeCopyFolder:
+		return true
+	case TaskTypeCopyFile:
+		return false
+	}
 	return t.Folder.ServiceID != ""
 }
 
 // IsFile returns whether this task represents a file operation.
 func (t *TaskBase) IsFile() bool {
+	switch t.Type {
+	case TaskTypeCopyFile:
+		return true
+	case TaskTypeCopyFolder:
+		return false
+	}
 	return t.File.ServiceID != ""
 }
 

@@ -100,6 +100,7 @@ const (
 	DeltaTraversalFailed      = "traversalFailed"
 	DeltaCopyPending          = "copyPending"
 	DeltaCopyFailed           = "copyFailed"
+	DeltaCopySuccessful       = "copySuccessful"
 	DeltaExcluded             = "excluded"
 	DeltaFolders              = "folders"
 	DeltaFiles                = "files"
@@ -171,7 +172,8 @@ type ReviewStatsRaw struct {
 func (r ReviewStatsRaw) ToPathReviewStats(phase string) PathReviewStats {
 	var pendingCount, failedCount, pendingRetriesCount int64
 	switch phase {
-	case PhaseTraversalReview:
+	case PhaseTraversing, PhaseTraversalReview:
+		// Traversing includes initial traversal and traversal retry sweep; same counters as review for API polls.
 		pendingCount = r.CopyPending
 		failedCount = r.TraversalFailed
 		pendingRetriesCount = r.TraversalPendingRetry

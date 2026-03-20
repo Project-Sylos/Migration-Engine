@@ -25,6 +25,16 @@ func NormalizeRootRelativePath(path string) string {
 	return path
 }
 
+// NormalizeSubtreeRootPathForPropagation normalizes a failed folder path so subtree updates match src_nodes.path
+// (root-relative slashes, trim trailing slash except "/").
+func NormalizeSubtreeRootPathForPropagation(path string) string {
+	p := NormalizeRootRelativePath(path)
+	if p != "/" && strings.HasSuffix(p, "/") {
+		p = strings.TrimRight(p, "/")
+	}
+	return p
+}
+
 // NodeState is the in-memory representation of a row in src_nodes or dst_nodes.
 // Path and parent_path are the join keys between SRC and DST.
 type NodeState struct {
@@ -174,12 +184,6 @@ func (o *BatchInsertOperation) flush(w *Writer) error {
 func PathHash(path string) string {
 	sum := sha256.Sum256([]byte(path))
 	return hex.EncodeToString(sum[:16])
-}
-
-// PathHashForJoin returns PathHash(NormalizeRootRelativePath(path)). Use when storing or querying path_hash
-// so that "" and "/" hash to the same value and SRC/DST root joins match.
-func PathHashForJoin(path string) string {
-	return PathHash(NormalizeRootRelativePath(path))
 }
 
 // DeterministicNodeID returns a stable id from (queueType, nodeType, path) for race-safe deduplication.

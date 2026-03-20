@@ -188,7 +188,7 @@ func buildMergedReviewWhere(f ReviewFilter) (clause string, args []any) {
 	param := 1
 	if f.ParentPath != "" {
 		parts = append(parts, `parent_path_hash = $`+strconv.Itoa(param))
-		args = append(args, PathHashForJoin(f.ParentPath))
+		args = append(args, PathHash(f.ParentPath))
 		param++
 	}
 	if f.Query != "" {
@@ -356,7 +356,7 @@ func GetNodeByPath(d *DB, table, path string) (*NodeState, error) {
 	var n NodeState
 	var size sql.NullInt64
 	q := selectNodeColsWithStatus(table) + ` WHERE n.path_hash = $1`
-	err = conn.QueryRowContext(ctx, q, PathHashForJoin(path)).Scan(&n.ID, &n.ServiceID, &n.ParentID, &n.ParentServiceID, &n.Path, &n.ParentPath, &n.Type, &size, &n.MTime, &n.Depth, &n.TraversalStatus, &n.CopyStatus, &n.Excluded, &n.Errors)
+	err = conn.QueryRowContext(ctx, q, PathHash(path)).Scan(&n.ID, &n.ServiceID, &n.ParentID, &n.ParentServiceID, &n.Path, &n.ParentPath, &n.Type, &size, &n.MTime, &n.Depth, &n.TraversalStatus, &n.CopyStatus, &n.Excluded, &n.Errors)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -391,7 +391,7 @@ func GetChildrenByParentPath(d *DB, table, parentPath string, limit int) ([]*Nod
 	}
 	ctx := context.Background()
 	q := selectNodeColsWithStatus(table) + ` WHERE n.parent_path_hash = $1 ORDER BY n.id LIMIT $2`
-	rows, err := conn.QueryContext(ctx, q, PathHashForJoin(parentPath), limit)
+	rows, err := conn.QueryContext(ctx, q, PathHash(parentPath), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -845,7 +845,7 @@ func GetSrcChildrenGroupedByParentPath(d *DB, parentPaths []string) (map[string]
 	const chunk = 500
 	parentPathHashes := make([]string, len(parentPaths))
 	for i, p := range parentPaths {
-		parentPathHashes[i] = PathHashForJoin(p)
+		parentPathHashes[i] = PathHash(p)
 	}
 	nodeAlias, e, cte := statusJoinExpr("SRC")
 	sel := `SELECT ` + nodeAlias + `.parent_path, ` + nodeAlias + `.id, ` + nodeAlias + `.service_id, ` + nodeAlias + `.parent_id, ` + nodeAlias + `.parent_service_id, ` + nodeAlias + `.path, ` + nodeAlias + `.type, ` + nodeAlias + `.size, ` + nodeAlias + `.mtime, ` + nodeAlias + `.depth, COALESCE(` + e + `.traversal_status,'') AS traversal_status, COALESCE(` + e + `.copy_status,'') AS copy_status, (COALESCE(` + e + `.copy_status,'') IN ('excluded_explicit','excluded_inherited')) AS excluded, '' AS errors FROM ` + tableSrcNodes + ` ` + nodeAlias + ` LEFT JOIN ` + cte + ` ` + e + ` ON ` + nodeAlias + `.id = ` + e + `.id WHERE ` + nodeAlias + `.parent_path_hash IN (`

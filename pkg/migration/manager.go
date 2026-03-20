@@ -32,10 +32,10 @@ type CreateMigrationConfig struct {
 type MigrationSummary struct {
 	ID        string
 	Name      string
-	Phase     string
+	Phase     string // From DB; merged with in-memory phase when this process has the migration loaded (see Live).
 	CreatedAt time.Time
 	UpdatedAt time.Time
-	Live      bool // true when a run is active (traversal/copy/retry); distinct from phase
+	Live      bool // true when a run is active (traversal, copy, or retry); merged from in-memory Migration when loaded
 }
 
 // MigrationDetails is the full migration record from the DB, for API detail views.
@@ -43,12 +43,12 @@ type MigrationSummary struct {
 type MigrationDetails struct {
 	ID                  string
 	Name                string
-	Phase               string
+	Phase               string // From DB; merged with in-memory phase when this process has the migration loaded (see Live).
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
 	ServiceMetadataJSON string
 	RootConfigJSON      string
-	Live                bool // true when a run is active (traversal/copy/retry); distinct from phase
+	Live                bool // true when a run is active (traversal, copy, or retry); merged from in-memory Migration when loaded
 }
 
 // MigrationManager owns migration lifecycle authority and persistence access.
@@ -358,7 +358,9 @@ func (m *MigrationManager) ListMigrations(dataDir string) ([]MigrationSummary, e
 		}
 		out := make([]MigrationSummary, 0, len(records))
 		for _, r := range records {
-			out = append(out, MigrationSummary{ID: r.ID, Name: r.Name, Phase: r.Phase, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt, Live: false})
+			s := MigrationSummary{ID: r.ID, Name: r.Name, Phase: r.Phase, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt, Live: false}
+			m.overlayRuntimeFromCacheSummary(r.ID, &s)
+			out = append(out, s)
 		}
 		return out, nil
 	}
@@ -390,7 +392,9 @@ func (m *MigrationManager) ListMigrations(dataDir string) ([]MigrationSummary, e
 			if err != nil || rec == nil {
 				continue
 			}
-			out = append(out, MigrationSummary{ID: rec.ID, Name: rec.Name, Phase: rec.Phase, CreatedAt: rec.CreatedAt, UpdatedAt: rec.UpdatedAt, Live: false})
+			s := MigrationSummary{ID: rec.ID, Name: rec.Name, Phase: rec.Phase, CreatedAt: rec.CreatedAt, UpdatedAt: rec.UpdatedAt, Live: false}
+			m.overlayRuntimeFromCacheSummary(rec.ID, &s)
+			out = append(out, s)
 		}
 		return out, nil
 	}
@@ -414,13 +418,15 @@ func (m *MigrationManager) GetMigrationDetails(id string, migrationDir string) (
 		if err != nil || record == nil {
 			return nil, err
 		}
-		return recordToDetails(record), nil
+		d := recordToDetails(record)
+		m.overlayRuntimeFromCache(id, d)
+		return d, nil
 	}
 	m.mu.Lock()
 	pending, hasPending := m.pendingRecords[id]
 	existing := m.migrations[id]
 	m.mu.Unlock()
-		if hasPending {
+	if hasPending {
 		return &MigrationDetails{ID: pending.ID, Name: pending.Name, Phase: pending.Phase, CreatedAt: pending.CreatedAt, UpdatedAt: pending.UpdatedAt, ServiceMetadataJSON: pending.ServiceMetadataJSON, RootConfigJSON: pending.RootConfigJSON, Live: false}, nil
 	}
 	if existing != nil && existing.DB != nil {
@@ -429,7 +435,7 @@ func (m *MigrationManager) GetMigrationDetails(id string, migrationDir string) (
 			return nil, err
 		}
 		d := recordToDetails(record)
-		d.Live = existing.IsLive()
+		m.overlayRuntimeFromCache(id, d)
 		return d, nil
 	}
 	if migrationDir != "" {
@@ -441,7 +447,9 @@ func (m *MigrationManager) GetMigrationDetails(id string, migrationDir string) (
 		if err != nil || record == nil {
 			return nil, err
 		}
-		return recordToDetails(record), nil
+		d := recordToDetails(record)
+		m.overlayRuntimeFromCache(id, d)
+		return d, nil
 	}
 	return nil, nil
 }
@@ -456,6 +464,32 @@ func recordToDetails(r *migrationRecord) *MigrationDetails {
 		ServiceMetadataJSON: r.ServiceMetadataJSON,
 		RootConfigJSON:      r.RootConfigJSON,
 		Live:                false,
+	}
+}
+
+// runtimeViewFromCache returns live run state and phase from an in-memory Migration, if this process has loaded it.
+// Live exists only on the domain object; DB rows do not encode "running", so list/detail projections must merge when possible.
+func (m *MigrationManager) runtimeViewFromCache(id string) (live bool, phase string, ok bool) {
+	m.mu.Lock()
+	mig := m.migrations[id]
+	m.mu.Unlock()
+	if mig == nil {
+		return false, "", false
+	}
+	return mig.IsLive(), mig.Phase(), true
+}
+
+func (m *MigrationManager) overlayRuntimeFromCache(id string, d *MigrationDetails) {
+	if live, phase, ok := m.runtimeViewFromCache(id); ok {
+		d.Live = live
+		d.Phase = phase
+	}
+}
+
+func (m *MigrationManager) overlayRuntimeFromCacheSummary(id string, s *MigrationSummary) {
+	if live, phase, ok := m.runtimeViewFromCache(id); ok {
+		s.Live = live
+		s.Phase = phase
 	}
 }
 

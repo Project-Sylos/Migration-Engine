@@ -468,7 +468,7 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 	// Folder failure cascades: mark all pending descendants as failed so they aren't
 	// pulled in the file pass (they'd be skipped anyway since the DST parent won't exist).
 	if task.IsFolder() {
-		taskPath := db.NormalizeRootRelativePath(task.LocationPath())
+		taskPath := db.NormalizeSubtreeRootPathForPropagation(task.LocationPath())
 		if taskPath != "" && taskPath != "/" {
 			database.AppendFailedSubtree(taskPath)
 		}
