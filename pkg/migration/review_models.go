@@ -66,6 +66,13 @@ type ListChildrenDiffsResult struct {
 	Offset int
 }
 
+// PathReviewSearchCondition mirrors API/UI search filters (field names lowercase in JSON).
+type PathReviewSearchCondition struct {
+	Field    string `json:"field"`
+	Operator string `json:"operator,omitempty"`
+	Value    any    `json:"value"`
+}
+
 type SearchRequest struct {
 	Query         string
 	Path          string // empty = global search over all review paths
@@ -74,7 +81,11 @@ type SearchRequest struct {
 	SortBy        string
 	SortDirection string
 	FoldersOnly   bool
-	Status        string
+	Status        string // legacy: OR across src/dst traversal + copy_status
+
+	// Structured search (preferred). When non-empty, Status is ignored.
+	Conditions       []PathReviewSearchCondition `json:"conditions,omitempty"`
+	StatusSearchType string                      `json:"statusSearchType,omitempty"` // traversal, copy, both
 }
 
 type SearchResult struct {

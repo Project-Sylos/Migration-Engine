@@ -13,6 +13,10 @@ const (
 	tableStats            = "stats" // universal key/count table for canonical review stats
 	// TableMigrations is the migrations lifecycle table name (used by schema and migration store).
 	TableMigrations = "migrations"
+	// TableMigrationEnvelope holds one row per migration DB: 32-byte envelope master key for Sylos-FS credentials.
+	TableMigrationEnvelope = "migration_envelope"
+	// TableFSCredentialBinding holds per-side connection id, optional creds file path, and serialized root folder for API rehydration.
+	TableFSCredentialBinding = "fs_credential_binding"
 )
 
 // nodeTableDDL returns CREATE TABLE for src_nodes or dst_nodes (metadata only; no status columns).
@@ -129,6 +133,24 @@ func migrationsTableDDL() string {
 		service_metadata_json VARCHAR,
 		root_config_json VARCHAR,
 		runtime_state_json VARCHAR
+	)`
+}
+
+func migrationEnvelopeTableDDL() string {
+	return `CREATE TABLE IF NOT EXISTS ` + TableMigrationEnvelope + ` (
+		singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+		envelope_master_key BLOB NOT NULL
+	)`
+}
+
+func fsCredentialBindingTableDDL() string {
+	return `CREATE TABLE IF NOT EXISTS ` + TableFSCredentialBinding + ` (
+		role VARCHAR PRIMARY KEY,
+		connection_id VARCHAR NOT NULL DEFAULT '',
+		creds_conf_relpath VARCHAR,
+		service_id VARCHAR,
+		root_folder_json VARCHAR,
+		updated_at TIMESTAMP NOT NULL
 	)`
 }
 

@@ -170,16 +170,71 @@ type MergedReviewRow struct {
 
 // ReviewFilter narrows merged review rows for listing, search, and counts.
 // ParentPath: if non-empty, only direct children of this path (uses parent_path_hash).
-// Query: if non-empty, path or name contains this string (case-insensitive).
-// Status: if non-empty, row must match this in src_traversal_status, dst_traversal_status, or copy_status.
-// FoldersOnly: if true, type = 'folder'.
+// Query + QueryField: substring match; QueryField "" or unknown = path OR name; "path" = path only; "name" = name only.
+// Status (legacy): if non-empty and structured status fields are not used, match any of src_traversal, dst_traversal, or copy_status.
+// StatusSearchType + TraversalStatus + CopyStatus: phase-aware filters ("traversal", "copy", "both").
+// TypeFilter: "folder" or "file" (case-insensitive); also FoldersOnly implies folder.
 // ExcludeRoot: if true, exclude path = '/' from results (for global search).
 type ReviewFilter struct {
 	ParentPath  string
 	Query       string
+	QueryField  string
 	Status      string
 	FoldersOnly bool
 	ExcludeRoot bool
+
+	StatusSearchType string
+	TraversalStatus  string
+	CopyStatus       string
+
+	TypeFilter string
+
+	DepthOperator string
+	DepthValue    *int
+	SizeOperator  string
+	SizeValue     *int64
+}
+
+func reviewFilterUsesStructuredStatus(f ReviewFilter) bool {
+	if strings.TrimSpace(f.StatusSearchType) != "" {
+		return true
+	}
+	if strings.TrimSpace(f.TraversalStatus) != "" || strings.TrimSpace(f.CopyStatus) != "" {
+		return true
+	}
+	return false
+}
+
+func appendTraversalStatusClause(parts []string, args []any, param int, value string) ([]string, []any, int) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return parts, args, param
+	}
+	if strings.EqualFold(v, "not_on_src") {
+		parts = append(parts, `LOWER(dst_traversal_status) = $`+strconv.Itoa(param))
+		args = append(args, "not_on_src")
+		param++
+		return parts, args, param
+	}
+	parts = append(parts, `(LOWER(src_traversal_status) = LOWER($`+strconv.Itoa(param)+`) OR LOWER(dst_traversal_status) = LOWER($`+strconv.Itoa(param+1)+`))`)
+	args = append(args, v, v)
+	param += 2
+	return parts, args, param
+}
+
+func appendCopyStatusClause(parts []string, args []any, param int, value string) ([]string, []any, int) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return parts, args, param
+	}
+	if strings.EqualFold(v, "excluded") {
+		parts = append(parts, `(excluded OR LOWER(copy_status) IN ('excluded_explicit','excluded_inherited'))`)
+		return parts, args, param
+	}
+	parts = append(parts, `LOWER(copy_status) = LOWER($`+strconv.Itoa(param)+`)`)
+	args = append(args, v)
+	param++
+	return parts, args, param
 }
 
 // buildMergedReviewWhere returns a WHERE clause and args for the merged CTE. Param placeholders are $1, $2, ...
@@ -193,20 +248,104 @@ func buildMergedReviewWhere(f ReviewFilter) (clause string, args []any) {
 	}
 	if f.Query != "" {
 		q := "%" + strings.ToLower(strings.TrimSpace(f.Query)) + "%"
-		parts = append(parts, `(LOWER(path) LIKE $`+strconv.Itoa(param)+` OR LOWER(name) LIKE $`+strconv.Itoa(param)+`)`)
-		args = append(args, q)
-		param++
+		switch strings.ToLower(strings.TrimSpace(f.QueryField)) {
+		case "path":
+			parts = append(parts, `LOWER(path) LIKE $`+strconv.Itoa(param))
+			args = append(args, q)
+			param++
+		case "name":
+			parts = append(parts, `LOWER(name) LIKE $`+strconv.Itoa(param))
+			args = append(args, q)
+			param++
+		default:
+			parts = append(parts, `(LOWER(path) LIKE $`+strconv.Itoa(param)+` OR LOWER(name) LIKE $`+strconv.Itoa(param)+`)`)
+			args = append(args, q)
+			param++
+		}
 	}
-	if f.Status != "" {
+
+	structured := reviewFilterUsesStructuredStatus(f)
+	if structured {
+		st := strings.ToLower(strings.TrimSpace(f.StatusSearchType))
+		trav := strings.TrimSpace(f.TraversalStatus)
+		copySt := strings.TrimSpace(f.CopyStatus)
+
+		needTrav := trav != "" && (st == "traversal" || st == "both")
+		needCopy := copySt != "" && (st == "copy" || st == "both")
+
+		if st == "" {
+			if trav != "" {
+				parts, args, param = appendTraversalStatusClause(parts, args, param, trav)
+			}
+			if copySt != "" {
+				parts, args, param = appendCopyStatusClause(parts, args, param, copySt)
+			}
+		} else {
+			if needTrav {
+				parts, args, param = appendTraversalStatusClause(parts, args, param, trav)
+			}
+			if needCopy {
+				parts, args, param = appendCopyStatusClause(parts, args, param, copySt)
+			}
+		}
+	} else if f.Status != "" {
 		parts = append(parts, `(src_traversal_status = $`+strconv.Itoa(param)+` OR dst_traversal_status = $`+strconv.Itoa(param)+` OR copy_status = $`+strconv.Itoa(param)+`)`)
 		args = append(args, f.Status)
+		param++
 	}
-	if f.FoldersOnly {
+
+	if f.FoldersOnly || strings.EqualFold(f.TypeFilter, "folder") {
 		parts = append(parts, `type = 'folder'`)
+	} else if strings.EqualFold(f.TypeFilter, "file") {
+		parts = append(parts, `type = 'file'`)
 	}
 	if f.ExcludeRoot {
 		parts = append(parts, `path <> '/'`)
 	}
+
+	if f.DepthValue != nil && f.DepthOperator != "" {
+		col := "depth"
+		op := "="
+		switch strings.ToLower(f.DepthOperator) {
+		case "equals", "=":
+			op = "="
+		case "gt", ">":
+			op = ">"
+		case "gte", ">=":
+			op = ">="
+		case "lt", "<":
+			op = "<"
+		case "lte", "<=":
+			op = "<="
+		default:
+			op = "="
+		}
+		parts = append(parts, col+` `+op+` $`+strconv.Itoa(param))
+		args = append(args, *f.DepthValue)
+		param++
+	}
+	if f.SizeValue != nil && f.SizeOperator != "" {
+		col := "size"
+		op := "="
+		switch strings.ToLower(f.SizeOperator) {
+		case "equals", "=":
+			op = "="
+		case "gt", ">":
+			op = ">"
+		case "gte", ">=":
+			op = ">="
+		case "lt", "<":
+			op = "<"
+		case "lte", "<=":
+			op = "<="
+		default:
+			op = "="
+		}
+		parts = append(parts, col+` `+op+` $`+strconv.Itoa(param))
+		args = append(args, *f.SizeValue)
+		param++
+	}
+
 	if len(parts) == 0 {
 		return "", nil
 	}

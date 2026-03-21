@@ -221,6 +221,28 @@ func (s *migrationStore) updateUpdatedAt(id string) error {
 	return nil
 }
 
+// updateRootConfig replaces root_config_json (serialized run knobs + roots; no FS adapters).
+func (s *migrationStore) updateRootConfig(id string, rootConfigJSON string) error {
+	if s.db == nil {
+		return fmt.Errorf("updateRootConfig requires store db")
+	}
+	conn, err := s.db.GetDB()
+	if err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(
+		context.Background(),
+		`UPDATE `+db.TableMigrations+` SET root_config_json = $1, updated_at = $2 WHERE migration_id = $3`,
+		rootConfigJSON,
+		time.Now().UTC(),
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("update migration %s root_config_json: %w", id, err)
+	}
+	return nil
+}
+
 // updateRuntimeState merges stateJSON into existing runtime_state_json (e.g. last_round_src, last_round_dst, last_copy_round). Pass partial JSON to update only some keys.
 func (s *migrationStore) updateRuntimeState(id string, stateJSON string) error {
 	if s.db == nil || stateJSON == "" {

@@ -93,7 +93,11 @@ Implementation: **`pkg/db`**. Queue and migration share the same **`*db.DB`** fo
 - **Node tables** (`src_nodes`, `dst_nodes`) – Metadata (path, depth, type, size, …). **Current traversal/copy status** comes from append-only **`src_status_events`** / **`dst_status_events`** (latest event per node), not from long-lived columns on the node row.
 - **Stats** – `src_stats` / `dst_stats` per depth; global **`stats`** table for canonical review counters and similar key/value aggregates.
 - **`migrations`** – Lifecycle row (id, name, **phase**, JSON metadata) when using **`MigrationManager`**.
+- **`migration_envelope`** – Single row (`singleton = 1`) with a 32-byte **envelope master key** for Sylos-FS credential encryption (HKDF per connection). Written by the host (e.g. Sylos-API) on first use.
+- **`fs_credential_binding`** – Up to two rows (`source` / `destination`): stable **connection id**, optional **relative path** to a creds/config file under the migration directory (e.g. `spectra-config.json`), **service id**, and **serialized root folder** JSON so adapters can be rebuilt after restart.
 - **Other** – `logs`, `queue_stats`, `task_errors`.
+
+**Security:** The per-migration DuckDB file contains the envelope key in plaintext. Anyone with the file can derive per-connection keys and read encrypted credential material. Restrict filesystem permissions and treat backups as sensitive; a future layer can wrap the envelope key with a server secret without changing the table shape much.
 
 The queue **pulls** pending tasks via SQL (keyset pagination); **seal** (`SealLevel`, optionally via **SealBuffer**) bulk-writes completed levels. **Retry** mode uses DST cleanup paths documented in **`pkg/queue/README.md`** (and `AddNodeDeletions` where applicable).
 

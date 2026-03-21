@@ -66,9 +66,10 @@ Examples: **`roots-set`**, **`filters-set`**, **`traversal-in-progress`**, **`aw
 
 ### Common methods
 
-- **`AddRoots`**, **`StartTraversal`**, **`StartCopy`**
-- **`RunRetrySweep`**, **`PrepareRetrySweep()`** – For **async** HTTP: call **`PrepareRetrySweep()` synchronously** before returning **202**, then run **`RunRetrySweep`** in a background task so polls see **`traversal-in-progress`** immediately.
-- **`RunCopyRetry`**, **`PrepareCopyRetry()`** – Same pattern for copy retry when exposed asynchronously.
+- **`AddRoots`**, **`StartTraversal(cfg)`**, **`StartCopy(cfg)`** – both require live **FS adapters** in **`cfg`**; a JSON snapshot of roots and run knobs (no adapters) is written to **`migrations.root_config_json`** via **`UpdateConfig`** for resumability.
+- **`RunRetrySweep(cfg, opts)`**, **`PrepareRetrySweep()`** – For **async** HTTP: call **`PrepareRetrySweep()` synchronously** before returning **202**, then run **`RunRetrySweep`** with the same **`cfg`** shape as traversal (adapters + roots) in a background task.
+- **`RunCopyRetry(cfg, opts)`**, **`PrepareCopyRetry()`** – Same pattern for copy retry when exposed asynchronously.
+- **`UpdateConfig(cfg)`** – persists **`root_config_json`** only (serializable fields); callers still pass **`cfg`** with adapters for each run.
 - Review helpers: query nodes, path review, exclude, mark retry, etc.
 - **`Stop()`** – stop result with current phase / runtime snapshot.
 

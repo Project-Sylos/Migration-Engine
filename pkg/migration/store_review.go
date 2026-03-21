@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -437,9 +438,129 @@ func (s *migrationStore) setNodeExcludedWithPropagation(nodeID string, excluded 
 	return affected, deltas, nil
 }
 
+func conditionStringValue(v any) (string, bool) {
+	if v == nil {
+		return "", false
+	}
+	switch t := v.(type) {
+	case string:
+		return t, true
+	case float64:
+		return strconv.FormatInt(int64(t), 10), true
+	case int:
+		return strconv.Itoa(t), true
+	case int64:
+		return strconv.FormatInt(t, 10), true
+	default:
+		return fmt.Sprintf("%v", t), true
+	}
+}
+
+func conditionIntValue(v any) (int, bool) {
+	switch t := v.(type) {
+	case int:
+		return t, true
+	case int64:
+		return int(t), true
+	case float64:
+		return int(t), true
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(t))
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func conditionInt64Value(v any) (int64, bool) {
+	switch t := v.(type) {
+	case int:
+		return int64(t), true
+	case int64:
+		return t, true
+	case float64:
+		return int64(t), true
+	case string:
+		n, err := strconv.ParseInt(strings.TrimSpace(t), 10, 64)
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func normalizeDepthSizeOp(op string) string {
+	switch strings.ToLower(strings.TrimSpace(op)) {
+	case "gt", ">":
+		return ">"
+	case "gte", ">=":
+		return ">="
+	case "lt", "<":
+		return "<"
+	case "lte", "<=":
+		return "<="
+	case "equals", "=":
+		return "="
+	default:
+		return "="
+	}
+}
+
+// searchRequestToReviewFilter maps API/UI SearchRequest onto db.ReviewFilter (merged view, status from events).
+func searchRequestToReviewFilter(req SearchRequest) db.ReviewFilter {
+	f := db.ReviewFilter{
+		ParentPath:       strings.TrimSpace(req.Path),
+		Query:            strings.TrimSpace(req.Query),
+		FoldersOnly:      req.FoldersOnly,
+		ExcludeRoot:      req.Path == "",
+		Status:           strings.TrimSpace(req.Status),
+		StatusSearchType: strings.TrimSpace(req.StatusSearchType),
+	}
+	for _, c := range req.Conditions {
+		field := strings.ToLower(strings.TrimSpace(c.Field))
+		switch field {
+		case "path":
+			if s, ok := conditionStringValue(c.Value); ok && strings.TrimSpace(s) != "" {
+				f.Query = strings.TrimSpace(s)
+				f.QueryField = "path"
+			}
+		case "name":
+			if s, ok := conditionStringValue(c.Value); ok && strings.TrimSpace(s) != "" {
+				f.Query = strings.TrimSpace(s)
+				f.QueryField = "name"
+			}
+		case "type":
+			if s, ok := conditionStringValue(c.Value); ok {
+				f.TypeFilter = strings.ToLower(strings.TrimSpace(s))
+			}
+		case "traversalstatus":
+			if s, ok := conditionStringValue(c.Value); ok {
+				f.TraversalStatus = strings.TrimSpace(s)
+			}
+		case "copystatus":
+			if s, ok := conditionStringValue(c.Value); ok {
+				f.CopyStatus = strings.TrimSpace(s)
+			}
+		case "depth":
+			f.DepthOperator = normalizeDepthSizeOp(c.Operator)
+			if n, ok := conditionIntValue(c.Value); ok {
+				f.DepthValue = &n
+			}
+		case "size":
+			f.SizeOperator = normalizeDepthSizeOp(c.Operator)
+			if n, ok := conditionInt64Value(c.Value); ok {
+				f.SizeValue = &n
+			}
+		}
+	}
+	if f.StatusSearchType != "" || f.TraversalStatus != "" || f.CopyStatus != "" {
+		f.Status = ""
+	}
+	return f
+}
+
 func sanitizeSort(sortBy, sortDirection string) string {
 	column := "path"
-	switch strings.ToLower(sortBy) {
+	switch strings.ToLower(strings.TrimSpace(sortBy)) {
 	case "name":
 		column = "name"
 	case "depth":
@@ -448,16 +569,23 @@ func sanitizeSort(sortBy, sortDirection string) string {
 		column = "size"
 	case "type":
 		column = "type"
-	case "status":
+	case "status", "traversalstatus", "traversal_status":
 		column = "src_traversal_status"
+	case "copystatus", "copy_status":
+		column = "copy_status"
 	case "path":
 		column = "path"
 	}
 	direction := "ASC"
-	if strings.EqualFold(sortDirection, "desc") {
+	if strings.EqualFold(strings.TrimSpace(sortDirection), "desc") {
 		direction = "DESC"
 	}
-	return column + " " + direction
+	primary := column + " " + direction
+	// Stable ordering and deterministic pagination when primary values tie.
+	if column == "path" {
+		return primary
+	}
+	return primary + ", path ASC"
 }
 
 func (s *migrationStore) listChildrenDiffs(req ListChildrenDiffsRequest) (ListChildrenDiffsResult, error) {
@@ -501,13 +629,7 @@ func (s *migrationStore) searchPathReviewItems(req SearchRequest) (SearchResult,
 		offset = 0
 	}
 	orderBy := sanitizeSort(req.SortBy, req.SortDirection)
-	f := db.ReviewFilter{
-		ParentPath:  req.Path,
-		Query:       strings.TrimSpace(req.Query),
-		Status:      req.Status,
-		FoldersOnly: req.FoldersOnly,
-		ExcludeRoot: req.Path == "", // global search: exclude root from results
-	}
+	f := searchRequestToReviewFilter(req)
 	rows, total, err := db.ListMergedReviewDiffs(s.db, f, orderBy, limit, offset)
 	if err != nil {
 		return SearchResult{}, err
@@ -541,13 +663,7 @@ func (s *migrationStore) getChildrenDiffsStats(path string, foldersOnly bool) (D
 }
 
 func (s *migrationStore) getSearchStats(req SearchRequest) (DiffsStats, error) {
-	f := db.ReviewFilter{
-		ParentPath:  req.Path,
-		Query:       strings.TrimSpace(req.Query),
-		Status:      req.Status,
-		FoldersOnly: req.FoldersOnly,
-		ExcludeRoot: req.Path == "",
-	}
+	f := searchRequestToReviewFilter(req)
 	stats, err := db.GetMergedReviewStats(s.db, f)
 	if err != nil {
 		return DiffsStats{}, err

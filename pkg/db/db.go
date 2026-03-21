@@ -105,6 +105,8 @@ func schemaDDLs() []string {
 		queueStatsTableDDL(),
 		taskErrorsTableDDL(),
 		migrationsTableDDL(),
+		migrationEnvelopeTableDDL(),
+		fsCredentialBindingTableDDL(),
 	}
 }
 

@@ -119,7 +119,7 @@ func runTest() error {
 	// Phase 2: Run copy phase via the migration lifecycle so DB phase updates match the API flow.
 	fmt.Println("🚀 Phase 3: Copy Phase")
 	fmt.Println("======================")
-	stats, err := migrationInstance.StartCopy()
+	stats, err := migrationInstance.StartCopy(cfg)
 	if err != nil {
 		return fmt.Errorf("copy phase failed: %w", err)
 	}

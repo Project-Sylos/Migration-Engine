@@ -5,6 +5,7 @@ package migration
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -12,6 +13,57 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
+
+const persistedRunConfigVersion = 1
+
+// persistedRunConfig is stored in migrations.root_config_json (JSON). It omits FS adapters and context.
+type persistedRunConfig struct {
+	V                 int            `json:"v"`
+	DatabasePath      string         `json:"databasePath,omitempty"`
+	SourceName        string         `json:"sourceName"`
+	SourceRoot        types.Folder   `json:"sourceRoot"`
+	DestinationName   string         `json:"destinationName"`
+	DestinationRoot   types.Folder   `json:"destinationRoot"`
+	SeedRoots         bool           `json:"seedRoots"`
+	WorkerCount       int            `json:"workerCount"`
+	MaxRetries        int            `json:"maxRetries"`
+	CoordinatorLead   int            `json:"coordinatorLead"`
+	LogAddress        string         `json:"logAddress"`
+	LogLevel          string         `json:"logLevel"`
+	SkipListener      bool           `json:"skipListener"`
+	StartupDelayNanos int64          `json:"startupDelayNanos"`
+	ProgressTickNanos int64          `json:"progressTickNanos"`
+	Verification      VerifyOptions  `json:"verification"`
+	RemoveExistingDB  bool           `json:"removeExistingDb,omitempty"`
+	RequireOpenDB     bool           `json:"requireOpenDb,omitempty"`
+}
+
+func persistedRunConfigFrom(cfg Config) persistedRunConfig {
+	return persistedRunConfig{
+		V:                 persistedRunConfigVersion,
+		DatabasePath:      cfg.Database.Path,
+		RemoveExistingDB:  cfg.Database.RemoveExisting,
+		RequireOpenDB:     cfg.Database.RequireOpen,
+		SourceName:        cfg.Source.Name,
+		SourceRoot:        cfg.Source.Root,
+		DestinationName:   cfg.Destination.Name,
+		DestinationRoot:   cfg.Destination.Root,
+		SeedRoots:         cfg.SeedRoots,
+		WorkerCount:       cfg.WorkerCount,
+		MaxRetries:        cfg.MaxRetries,
+		CoordinatorLead:   cfg.CoordinatorLead,
+		LogAddress:        cfg.LogAddress,
+		LogLevel:          cfg.LogLevel,
+		SkipListener:      cfg.SkipListener,
+		StartupDelayNanos: cfg.StartupDelay.Nanoseconds(),
+		ProgressTickNanos: cfg.ProgressTick.Nanoseconds(),
+		Verification:      cfg.Verification,
+	}
+}
+
+func marshalPersistedRunConfigJSON(cfg Config) ([]byte, error) {
+	return json.Marshal(persistedRunConfigFrom(cfg))
+}
 
 // Service defines a single filesystem service participating in a migration.
 type Service struct {

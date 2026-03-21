@@ -145,10 +145,67 @@ func (m *Migration) syncRecord(record migrationRecord) {
 	m.mu.Unlock()
 }
 
+// UpdateConfig writes a JSON snapshot of cfg (roots, worker knobs, verification; not FS adapters) to migrations.root_config_json.
+func (m *Migration) UpdateConfig(cfg Config) error {
+	raw, err := marshalPersistedRunConfigJSON(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal persisted run config: %w", err)
+	}
+	return m.store.updateRootConfig(m.ID, string(raw))
+}
+
+func (m *Migration) setLastRunConfig(cfg Config) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := cfg
+	c.ShutdownContext = nil
+	m.lastRunConfig = &c
+}
+
 // bindDB attaches the database to a migration that was created without one (pending). Called by the manager when the API passes the migration folder path.
 func (m *Migration) bindDB(database *db.DB) {
 	m.DB = database
 	m.store = newMigrationStore(database)
+}
+
+// EnsureEnvelopeMasterKey returns the 32-byte Sylos-FS envelope master key, generating and persisting it if absent.
+func (m *Migration) EnsureEnvelopeMasterKey() ([]byte, error) {
+	if m.DB == nil {
+		return nil, fmt.Errorf("migration has no database")
+	}
+	return m.store.ensureEnvelopeMasterKey()
+}
+
+// GetEnvelopeMasterKey returns the persisted envelope master key.
+func (m *Migration) GetEnvelopeMasterKey() ([]byte, error) {
+	if m.DB == nil {
+		return nil, fmt.Errorf("migration has no database")
+	}
+	return m.store.getEnvelopeMasterKey()
+}
+
+// UpsertFSCredentialBinding persists one side's FS credential binding (connection id, optional creds path, service id, serialized root folder).
+func (m *Migration) UpsertFSCredentialBinding(binding FSCredentialBinding) error {
+	if m.DB == nil {
+		return fmt.Errorf("migration has no database")
+	}
+	return m.store.upsertFSCredentialBinding(binding)
+}
+
+// GetFSCredentialBinding returns a binding by role ("source" or "destination"), or an error if missing.
+func (m *Migration) GetFSCredentialBinding(role string) (*FSCredentialBinding, error) {
+	if m.DB == nil {
+		return nil, fmt.Errorf("migration has no database")
+	}
+	return m.store.getFSCredentialBinding(role)
+}
+
+// ListFSCredentialBindings returns all persisted FS credential bindings for this migration DB.
+func (m *Migration) ListFSCredentialBindings() ([]FSCredentialBinding, error) {
+	if m.DB == nil {
+		return nil, fmt.Errorf("migration has no database")
+	}
+	return m.store.listFSCredentialBindings()
 }
 
 func (m *Migration) Phase() string {
@@ -247,6 +304,14 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 		return RuntimeStats{}, fmt.Errorf("destination root: %w", err)
 	}
 
+	cfgForRun := cfg
+	cfgForRun.Source.Root = srcRoot
+	cfgForRun.Destination.Root = dstRoot
+	if err := m.UpdateConfig(cfgForRun); err != nil {
+		return RuntimeStats{}, fmt.Errorf("persist migration config: %w", err)
+	}
+	m.setLastRunConfig(cfgForRun)
+
 	runCtx := m.beginRun(cfg.ShutdownContext)
 	defer func() {
 		m.endRun()
@@ -285,28 +350,24 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 	if js, err := json.Marshal(map[string]int{"last_round_src": stats.Src.Round, "last_round_dst": stats.Dst.Round}); err == nil {
 		_ = m.store.updateRuntimeState(m.ID, string(js))
 	}
-	m.mu.Lock()
-	cfgCopy := cfg
-	cfgCopy.ShutdownContext = runCtx
-	m.lastRunConfig = &cfgCopy
-	m.mu.Unlock()
 	m.refreshRuntimeState()
 	return stats, nil
 }
 
-// StartCopy transitions review->copying and runs copy phase.
-func (m *Migration) StartCopy() (queue.QueueStats, error) {
+// StartCopy transitions review->copying and runs copy phase. cfg must include live source/destination adapters (same as StartTraversal).
+func (m *Migration) StartCopy(cfg Config) (queue.QueueStats, error) {
 	if err := m.transitionTo(PhaseCopying); err != nil {
 		return queue.QueueStats{}, err
 	}
-	m.mu.RLock()
-	lastCfg := m.lastRunConfig
-	m.mu.RUnlock()
-	if lastCfg == nil {
-		return queue.QueueStats{}, fmt.Errorf("copy requires a prior traversal run")
+	if cfg.Source.Adapter == nil || cfg.Destination.Adapter == nil {
+		return queue.QueueStats{}, fmt.Errorf("copy requires source and destination adapters in config")
 	}
+	if err := m.UpdateConfig(cfg); err != nil {
+		return queue.QueueStats{}, fmt.Errorf("persist migration config: %w", err)
+	}
+	m.setLastRunConfig(cfg)
 
-	runCtx := m.beginRun(lastCfg.ShutdownContext)
+	runCtx := m.beginRun(cfg.ShutdownContext)
 	defer func() {
 		m.endRun()
 		err := m.store.updateUpdatedAt(m.ID)
@@ -316,15 +377,15 @@ func (m *Migration) StartCopy() (queue.QueueStats, error) {
 	}()
 	stats, err := RunCopyPhase(CopyPhaseConfig{
 		DuckDB:          m.DB,
-		SrcAdapter:      lastCfg.Source.Adapter,
-		DstAdapter:      lastCfg.Destination.Adapter,
-		WorkerCount:     lastCfg.WorkerCount,
-		MaxRetries:      lastCfg.MaxRetries,
-		LogAddress:      lastCfg.LogAddress,
-		LogLevel:        lastCfg.LogLevel,
-		SkipListener:    lastCfg.SkipListener,
-		StartupDelay:    lastCfg.StartupDelay,
-		ProgressTick:    lastCfg.ProgressTick,
+		SrcAdapter:      cfg.Source.Adapter,
+		DstAdapter:      cfg.Destination.Adapter,
+		WorkerCount:     cfg.WorkerCount,
+		MaxRetries:      cfg.MaxRetries,
+		LogAddress:      cfg.LogAddress,
+		LogLevel:        cfg.LogLevel,
+		SkipListener:    cfg.SkipListener,
+		StartupDelay:    cfg.StartupDelay,
+		ProgressTick:    cfg.ProgressTick,
 		ShutdownContext: runCtx,
 	})
 	if err != nil {
@@ -353,23 +414,24 @@ func (m *Migration) PrepareRetrySweep() error {
 	return m.transitionTo(PhaseTraversing)
 }
 
-func (m *Migration) RunRetrySweep(opts RetrySweepOptions) (RuntimeStats, error) {
+func (m *Migration) RunRetrySweep(cfg Config, opts RetrySweepOptions) (RuntimeStats, error) {
 	phase := m.Phase()
 	if phase != PhaseTraversalReview && phase != PhaseTraversing {
 		return RuntimeStats{}, fmt.Errorf("retry sweep requires awaiting-traversal-review phase (or prepared traversal-in-progress)")
 	}
-	m.mu.RLock()
-	lastCfg := m.lastRunConfig
-	m.mu.RUnlock()
-	if lastCfg == nil {
-		return RuntimeStats{}, fmt.Errorf("retry sweep requires prior traversal config")
+	if cfg.Source.Adapter == nil || cfg.Destination.Adapter == nil {
+		return RuntimeStats{}, fmt.Errorf("retry sweep requires source and destination adapters in config")
 	}
+	if err := m.UpdateConfig(cfg); err != nil {
+		return RuntimeStats{}, fmt.Errorf("persist migration config: %w", err)
+	}
+	m.setLastRunConfig(cfg)
 	if phase == PhaseTraversalReview {
 		if err := m.transitionTo(PhaseTraversing); err != nil {
 			return RuntimeStats{}, err
 		}
 	}
-	runCtx := m.beginRun(lastCfg.ShutdownContext)
+	runCtx := m.beginRun(cfg.ShutdownContext)
 	defer func() {
 		m.endRun()
 		err := m.store.updateUpdatedAt(m.ID)
@@ -380,32 +442,32 @@ func (m *Migration) RunRetrySweep(opts RetrySweepOptions) (RuntimeStats, error) 
 
 	workerCount := opts.WorkerCount
 	if workerCount <= 0 {
-		workerCount = lastCfg.WorkerCount
+		workerCount = cfg.WorkerCount
 	}
 	maxRetries := opts.MaxRetries
 	if maxRetries <= 0 {
-		maxRetries = lastCfg.MaxRetries
+		maxRetries = cfg.MaxRetries
 	}
 	logAddress := opts.LogAddress
 	if logAddress == "" {
-		logAddress = lastCfg.LogAddress
+		logAddress = cfg.LogAddress
 	}
 	logLevel := opts.LogLevel
 	if logLevel == "" {
-		logLevel = lastCfg.LogLevel
+		logLevel = cfg.LogLevel
 	}
 
 	stats, err := RunRetrySweep(SweepConfig{
 		DuckDB:       m.DB,
-		SrcAdapter:   lastCfg.Source.Adapter,
-		DstAdapter:   lastCfg.Destination.Adapter,
+		SrcAdapter:   cfg.Source.Adapter,
+		DstAdapter:   cfg.Destination.Adapter,
 		WorkerCount:  workerCount,
 		MaxRetries:   maxRetries,
 		LogAddress:   logAddress,
 		LogLevel:     logLevel,
-		SkipListener: opts.SkipListener || lastCfg.SkipListener,
-		ProgressTick: lastCfg.ProgressTick,
-		StartupDelay: lastCfg.StartupDelay,
+		SkipListener: opts.SkipListener || cfg.SkipListener,
+		ProgressTick: cfg.ProgressTick,
+		StartupDelay: cfg.StartupDelay,
 		MaxKnownDepth: func() int {
 			if opts.MaxKnownDepth != 0 {
 				return opts.MaxKnownDepth
@@ -440,23 +502,24 @@ func (m *Migration) PrepareCopyRetry() error {
 }
 
 // RunCopyRetry runs the copy phase in retry mode (only copy_status = failed). Requires awaiting-copy-review. On success transitions back to awaiting-copy-review.
-func (m *Migration) RunCopyRetry(opts CopyPhaseOptions) (queue.QueueStats, error) {
+func (m *Migration) RunCopyRetry(cfg Config, opts CopyPhaseOptions) (queue.QueueStats, error) {
 	phase := m.Phase()
 	if phase != PhaseCopyReview && phase != PhaseCopying {
 		return queue.QueueStats{}, fmt.Errorf("copy retry requires awaiting-copy-review phase (or prepared copy-in-progress)")
 	}
-	m.mu.RLock()
-	lastCfg := m.lastRunConfig
-	m.mu.RUnlock()
-	if lastCfg == nil {
-		return queue.QueueStats{}, fmt.Errorf("copy retry requires prior traversal config")
+	if cfg.Source.Adapter == nil || cfg.Destination.Adapter == nil {
+		return queue.QueueStats{}, fmt.Errorf("copy retry requires source and destination adapters in config")
 	}
+	if err := m.UpdateConfig(cfg); err != nil {
+		return queue.QueueStats{}, fmt.Errorf("persist migration config: %w", err)
+	}
+	m.setLastRunConfig(cfg)
 	if phase == PhaseCopyReview {
 		if err := m.transitionTo(PhaseCopying); err != nil {
 			return queue.QueueStats{}, err
 		}
 	}
-	runCtx := m.beginRun(lastCfg.ShutdownContext)
+	runCtx := m.beginRun(cfg.ShutdownContext)
 	defer func() {
 		m.endRun()
 		if err := m.store.updateUpdatedAt(m.ID); err != nil {
@@ -465,31 +528,31 @@ func (m *Migration) RunCopyRetry(opts CopyPhaseOptions) (queue.QueueStats, error
 	}()
 	workerCount := opts.WorkerCount
 	if workerCount <= 0 {
-		workerCount = lastCfg.WorkerCount
+		workerCount = cfg.WorkerCount
 	}
 	maxRetries := opts.MaxRetries
 	if maxRetries <= 0 {
-		maxRetries = lastCfg.MaxRetries
+		maxRetries = cfg.MaxRetries
 	}
 	logAddress := opts.LogAddress
 	if logAddress == "" {
-		logAddress = lastCfg.LogAddress
+		logAddress = cfg.LogAddress
 	}
 	logLevel := opts.LogLevel
 	if logLevel == "" {
-		logLevel = lastCfg.LogLevel
+		logLevel = cfg.LogLevel
 	}
 	stats, err := RunCopyRetryPhase(CopyPhaseConfig{
 		DuckDB:          m.DB,
-		SrcAdapter:      lastCfg.Source.Adapter,
-		DstAdapter:      lastCfg.Destination.Adapter,
+		SrcAdapter:      cfg.Source.Adapter,
+		DstAdapter:      cfg.Destination.Adapter,
 		WorkerCount:     workerCount,
 		MaxRetries:      maxRetries,
 		LogAddress:      logAddress,
 		LogLevel:        logLevel,
-		SkipListener:    opts.SkipListener || lastCfg.SkipListener,
-		StartupDelay:    lastCfg.StartupDelay,
-		ProgressTick:    lastCfg.ProgressTick,
+		SkipListener:    opts.SkipListener || cfg.SkipListener,
+		StartupDelay:    cfg.StartupDelay,
+		ProgressTick:    cfg.ProgressTick,
 		ShutdownContext: runCtx,
 	})
 	if err != nil {
