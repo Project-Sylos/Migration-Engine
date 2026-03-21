@@ -33,12 +33,16 @@ func runTest() error {
 
 	fmt.Printf("Home directory: %s\n", homeDir)
 
-	// Set up paths
-	// srcPath := filepath.Join(homeDir, "Documents")
-	// dstPath := filepath.Join(homeDir, "Downloads")
+	// // Set up paths
+	// srcPath := homeDir
+	// dstPath := homeDir
 
-	srcPath := "/"
-	dstPath := "/"
+	// src path is home/sylos_retry_test/A and dst path is home/sylos_retry_test/B
+	srcPath := filepath.Join(homeDir, "sylos_retry_test", "A")
+	dstPath := filepath.Join(homeDir, "sylos_retry_test", "B")
+
+	// srcPath := "/"
+	// dstPath := "/"
 
 	// Normalize paths to absolute
 	srcPath, err = filepath.Abs(srcPath)

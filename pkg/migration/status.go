@@ -47,7 +47,8 @@ func (s MigrationStatus) IsComplete() bool {
 	return !s.HasPending()
 }
 
-// InspectMigrationStatus inspects the DuckDB node data and stats tables and returns a MigrationStatus.
+// InspectMigrationStatus inspects the DuckDB node tables and status_events (current state) and returns a MigrationStatus.
+// Pending/failed counts are derived from status_events (arg_max per id), not from src_stats/dst_stats, so counts are correct even when stats tables were not populated (e.g. DB from API or other tooling).
 func InspectMigrationStatus(database *db.DB) (MigrationStatus, error) {
 	if database == nil {
 		return MigrationStatus{}, fmt.Errorf("database cannot be nil")
@@ -67,54 +68,41 @@ func InspectMigrationStatus(database *db.DB) (MigrationStatus, error) {
 	}
 	status.DstTotal = dstTotal
 
-	// Pending/failed totals from src_stats
-	c, err := database.GetStatsCount("SRC", db.StatsKeyTraversalStatus(db.StatusPending))
+	// Pending/failed from status_events (source of truth), not from stats tables
+	srcCounts, err := database.GetTraversalStatusCountsFromEvents("SRC")
 	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to get stats count: %w", err)
+		return MigrationStatus{}, fmt.Errorf("failed to get SRC traversal counts from events: %w", err)
 	}
-	status.SrcPending = int(c)
-	c, err = database.GetStatsCount("SRC", db.StatsKeyTraversalStatus(db.StatusFailed))
-	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to get stats count: %w", err)
-	}
-	status.SrcFailed = int(c)
+	status.SrcPending = int(srcCounts.Pending)
+	status.SrcFailed = int(srcCounts.Failed)
 
-	// Min pending depth for SRC from stats breakdown
-	breakdown, err := database.GetStatsBreakdown("SRC")
+	dstCounts, err := database.GetTraversalStatusCountsFromEvents("DST")
 	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to get stats breakdown: %w", err)
+		return MigrationStatus{}, fmt.Errorf("failed to get DST traversal counts from events: %w", err)
 	}
-	for _, row := range breakdown {
-		if row.Key == db.StatsKeyTraversalStatus(db.StatusPending) && row.Count > 0 {
-			if status.MinPendingDepthSrc == nil || row.Depth < *status.MinPendingDepthSrc {
-				d := row.Depth
-				status.MinPendingDepthSrc = &d
+	status.DstPending = int(dstCounts.Pending)
+	status.DstFailed = int(dstCounts.Failed)
+
+	// Min pending depth from stats breakdown when available (optional; may be nil if stats not populated)
+	breakdown, err := database.GetStatsBreakdown("SRC")
+	if err == nil {
+		for _, row := range breakdown {
+			if row.Key == db.StatsKeyTraversalStatus(db.StatusPending) && row.Count > 0 {
+				if status.MinPendingDepthSrc == nil || row.Depth < *status.MinPendingDepthSrc {
+					d := row.Depth
+					status.MinPendingDepthSrc = &d
+				}
 			}
 		}
 	}
-
-	// Pending/failed totals from dst_stats
-	c, err = database.GetStatsCount("DST", db.StatsKeyTraversalStatus(db.StatusPending))
-	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to get stats count: %w", err)
-	}
-	status.DstPending = int(c)
-	c, err = database.GetStatsCount("DST", db.StatsKeyTraversalStatus(db.StatusFailed))
-	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to get stats count: %w", err)
-	}
-	status.DstFailed = int(c)
-
-	// Min pending depth for DST from stats breakdown
 	breakdown, err = database.GetStatsBreakdown("DST")
-	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to get stats breakdown: %w", err)
-	}
-	for _, row := range breakdown {
-		if row.Key == db.StatsKeyTraversalStatus(db.StatusPending) && row.Count > 0 {
-			if status.MinPendingDepthDst == nil || row.Depth < *status.MinPendingDepthDst {
-				d := row.Depth
-				status.MinPendingDepthDst = &d
+	if err == nil {
+		for _, row := range breakdown {
+			if row.Key == db.StatsKeyTraversalStatus(db.StatusPending) && row.Count > 0 {
+				if status.MinPendingDepthDst == nil || row.Depth < *status.MinPendingDepthDst {
+					d := row.Depth
+					status.MinPendingDepthDst = &d
+				}
 			}
 		}
 	}

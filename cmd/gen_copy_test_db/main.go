@@ -58,10 +58,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Seed roots: %v\n", err)
 		os.Exit(1)
 	}
-	if err := db.BootstrapRootStats(database); err != nil {
-		fmt.Fprintf(os.Stderr, "Bootstrap stats: %v\n", err)
-		os.Exit(1)
-	}
 
 	fmt.Println("Done. pkg/tests/copy/shared/main_test.db has schema and root nodes.")
 }

@@ -13,7 +13,7 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Spectra/sdk"
-	"codeberg.org/Sylos/Sylos-FS/pkg/fs"
+	"codeberg.org/Sylos/Sylos-FS/pkg/fs/spectra"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -170,7 +170,7 @@ func (f *adapterFactory) buildService(cfg adapterConfig) (migration.Service, typ
 			return migration.Service{}, types.Folder{}, fmt.Errorf("failed to check mode: %w", err)
 		}
 
-		adapter, err := fs.NewSpectraFS(spectraFS, rootID, world, isEphemeral)
+		adapter, err := spectra.NewSpectraFS(spectraFS, rootID, world, isEphemeral)
 		if err != nil {
 			return migration.Service{}, types.Folder{}, fmt.Errorf("spectra adapter: %w", err)
 		}

@@ -52,7 +52,7 @@ func VerifyCopyCompletion(database *db.DB) error {
 
 		for _, nodeType := range nodeTypes {
 			for _, status := range copyStatuses {
-				c, err := database.GetCopyCountAtDepth(level, nodeType, status)
+				c, err := database.GetCopyCountAtDepth(level, nodeType, status, false)
 				if err == nil {
 					switch status {
 					case db.CopyStatusPending:

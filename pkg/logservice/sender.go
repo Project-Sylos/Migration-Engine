@@ -14,7 +14,7 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
-const defaultBatchSize = 20_000
+const defaultBatchSize = 50_000
 
 // LS is the global log service sender instance.
 // It must be initialized via InitGlobalLogger before use.
@@ -41,9 +41,9 @@ func InitGlobalLogger(mainDB *db.DB, addr, level string) error {
 
 // Sender transmits logs over UDP and optionally writes them to the main DB's logs table.
 type Sender struct {
-	logDB     *db.DB        // main DB for log persistence (not owned; do not close)
-	logBuffer *db.LogBuffer // buffered log writer (nil if logDB is nil)
-	Addr      string        // e.g. "127.0.0.1:1997"
+	logDB      *db.DB        // main DB for log persistence (not owned; do not close)
+	logBuffer  *db.LogBuffer // buffered log writer (nil if logDB is nil)
+	Addr       string        // e.g. "127.0.0.1:1997"
 	Level      string        // threshold for UDP output
 	conn       net.Conn
 	minLevelIx int
@@ -88,18 +88,18 @@ func NewSender(logDB *db.DB, addr, level string) (*Sender, error) {
 
 	var logBuffer *db.LogBuffer
 	if logDB != nil {
-		logBuffer = db.NewLogBuffer(logDB, defaultBatchSize, 10*time.Second)
+		logBuffer = db.NewLogBuffer(logDB, defaultBatchSize, 3 * time.Second)
 	}
 
 	return &Sender{
-		logDB:     logDB,
-		logBuffer: logBuffer,
-		Addr:      addr,
-		Level:     level,
-		conn:      conn,
+		logDB:      logDB,
+		logBuffer:  logBuffer,
+		Addr:       addr,
+		Level:      level,
+		conn:       conn,
 		minLevelIx: minIx,
-		buf:       buf,
-		enc:       json.NewEncoder(buf),
+		buf:        buf,
+		enc:        json.NewEncoder(buf),
 	}, nil
 }
 
@@ -188,17 +188,20 @@ func (s *Sender) ClearConsole() error {
 }
 
 // Close terminates the UDP connection and stops the log buffer. Does not close the main DB.
+// Sets conn to nil under mu so any Log() after Close() no-ops instead of writing to a closed connection.
 func (s *Sender) Close() error {
 	if s.logBuffer != nil {
 		s.logBuffer.Stop()
 		s.logBuffer = nil
 	}
-	if s.conn != nil {
-		err := s.conn.Close()
-		if err != nil {
+	s.mu.Lock()
+	conn := s.conn
+	s.conn = nil
+	s.mu.Unlock()
+	if conn != nil {
+		if err := conn.Close(); err != nil {
 			return fmt.Errorf("failed to close UDP connection: %w", err)
 		}
-		s.conn = nil
 	}
 	s.logDB = nil
 	return nil

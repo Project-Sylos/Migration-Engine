@@ -12,36 +12,23 @@ import (
 )
 
 // QueueCoordinator manages round advancement gates for dual-BFS traversal.
-// It enforces: DST cannot advance to round N until SRC has completed rounds N and N+1;
-// SRC may not run ahead of DST by more than MaxSrcAhead rounds (default 3).
+// It enforces: DST cannot advance to round N until SRC has completed rounds N and N+1 (or SRC traversal is done).
+// SRC is not level-gated relative to DST; frontier is streamed to the database in chunks.
 type QueueCoordinator struct {
-	mu          sync.RWMutex
-	srcRound    int
-	srcDone     bool
-	dstRound    int
-	dstDone     bool
-	maxSrcAhead int // SRC may run when srcRound <= dstRound + maxSrcAhead
+	mu       sync.RWMutex
+	srcRound int
+	srcDone  bool
+	dstRound int
+	dstDone  bool
 }
-
-const defaultMaxSrcAhead = 3
 
 // NewQueueCoordinator creates a new coordinator.
 func NewQueueCoordinator() *QueueCoordinator {
 	return &QueueCoordinator{
-		srcRound:    0,
-		srcDone:     false,
-		dstRound:    0,
-		dstDone:     false,
-		maxSrcAhead: defaultMaxSrcAhead,
-	}
-}
-
-// SetMaxSrcAhead sets the maximum rounds SRC may run ahead of DST (default 3).
-func (c *QueueCoordinator) SetMaxSrcAhead(n int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if n >= 0 {
-		c.maxSrcAhead = n
+		srcRound: 0,
+		srcDone:  false,
+		dstRound: 0,
+		dstDone:  false,
 	}
 }
 
@@ -117,30 +104,19 @@ func (c *QueueCoordinator) IsCompleted(queueType string) bool {
 	}
 }
 
-// CanSrcStartRound returns true if SRC can run the given round: srcRound <= dstRound + maxSrcAhead (or SRC is done).
-func (c *QueueCoordinator) CanSrcStartRound(srcRound int) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	// If DST has completed traversal, SRC should proceed unconstrained.
-	// This prevents SRC from stalling behind a fixed dstRound after DST exits early.
-	if c.dstDone {
+// WaitSealBackpressure ensures the seal buffer has flushed through the given round before the caller drops that level from node cache.
+// Call after enqueueing the round's seal data and before dropping the level. Prevents the DB flush buffer from growing unbounded.
+// Returns false if flushing fails; callers should fail closed (do not drop level or advance round).
+func (c *QueueCoordinator) WaitSealBackpressure(_ string, round int, database *db.DB) bool {
+	if database == nil || round < 0 {
 		return true
 	}
-	if c.srcDone {
-		return true
+	if err := database.FlushSealBuffer(); err != nil {
+		fmt.Println("error flushing seal buffer", err)
+		return false
 	}
-	return srcRound <= c.dstRound+c.maxSrcAhead
-}
-
-// WaitSealBackpressure blocks until the seal buffer has flushed through (round-2) when round >= 2.
-// Flushes pending seal jobs first so we don't block on the buffer's interval timer. Call before advancing to the next round.
-// Pulling/processing from cache is not blocked; only round advancement waits. Pass database from the queue.
-func (c *QueueCoordinator) WaitSealBackpressure(round int, database *db.DB) {
-	if database == nil || round < 2 {
-		return
-	}
-	_ = database.FlushSealBuffer()
-	database.WaitUntilSealFlushedThrough(round - 2)
+	database.WaitUntilSealFlushedThrough(round)
+	return true
 }
 
 // CanDstStartRound returns true if DST can start processing the specified round.

@@ -10,16 +10,93 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
+// deltaKeyToReviewKey maps a migration-layer delta key to the universal stats table key.
+func deltaKeyToReviewKey(k string) string {
+	switch k {
+	case DeltaTraversalPending:
+		return db.ReviewKeyTraversalPending
+	case DeltaTraversalPendingRetry:
+		return db.ReviewKeyTraversalPendingRetry
+	case DeltaTraversalFailed:
+		return db.ReviewKeyTraversalFailed
+	case DeltaCopyPending:
+		return db.ReviewKeyCopyPending
+	case DeltaCopyFailed:
+		return db.ReviewKeyCopyFailed
+	case DeltaCopySuccessful:
+		return db.ReviewKeyCopySuccessful
+	case DeltaExcluded:
+		return db.ReviewKeyExcluded
+	case DeltaFolders:
+		return db.ReviewKeyFolders
+	case DeltaFiles:
+		return db.ReviewKeyFiles
+	case DeltaSizeSrc:
+		return db.ReviewKeySizeSrc
+	case DeltaSizeDst:
+		return db.ReviewKeySizeDst
+	default:
+		return ""
+	}
+}
+
+// persistReviewDeltas applies migration-layer deltas to the universal stats table.
+func (s *migrationStore) persistReviewDeltas(deltas map[string]int64) error {
+	if len(deltas) == 0 {
+		return nil
+	}
+	dbDeltas := make([]db.ReviewStatsDelta, 0, len(deltas))
+	for k, v := range deltas {
+		if rk := deltaKeyToReviewKey(k); rk != "" {
+			dbDeltas = append(dbDeltas, db.ReviewStatsDelta{Key: rk, Delta: v})
+		}
+	}
+	if len(dbDeltas) == 0 {
+		return nil
+	}
+	return s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+		return sess.WithTx(func(w *db.Writer) error {
+			return w.ApplyReviewStatsDeltas(dbDeltas)
+		})
+	})
+}
+
+func mergedRowToDiffItem(r db.MergedReviewRow) DiffItem {
+	item := DiffItem{
+			Path:               r.Path,
+			Name:               r.Name,
+			Depth:              r.Depth,
+			Type:               r.Type,
+			SrcNodeID:          r.SrcNodeID,
+			DstNodeID:          r.DstNodeID,
+			SrcTraversalStatus: r.SrcTraversalStatus,
+			DstTraversalStatus: r.DstTraversalStatus,
+			CopyStatus:         db.CopyStatusForDisplay(r.CopyStatus),
+			Excluded:           r.Excluded,
+		Size:               r.Size,
+		MissingOnSource:    r.SrcNodeID == "",
+		MissingOnDest:      r.DstNodeID == "",
+	}
+	if item.MissingOnSource {
+		item.CopyStatus = ""
+	}
+	if item.Name == "" {
+		item.Name = path.Base(item.Path)
+	}
+	return item
+}
+
 func (s *migrationStore) queryNodes(filter NodeQueryFilter) ([]db.NodeState, error) {
-	table := "src_nodes"
+	table := "SRC"
 	if strings.ToUpper(filter.Queue) == "DST" {
-		table = "dst_nodes"
+		table = "DST"
 	}
 	limit := filter.Limit
 	if limit <= 0 {
@@ -32,97 +109,62 @@ func (s *migrationStore) queryNodes(filter NodeQueryFilter) ([]db.NodeState, err
 	if offset < 0 {
 		offset = 0
 	}
-
-	where := make([]string, 0, 4)
-	args := make([]any, 0, 5)
-	argPos := 1
-	if filter.Depth != nil {
-		where = append(where, fmt.Sprintf("depth = $%d", argPos))
-		args = append(args, *filter.Depth)
-		argPos++
-	}
-	if filter.Status != "" {
-		where = append(where, fmt.Sprintf("traversal_status = $%d", argPos))
-		args = append(args, filter.Status)
-		argPos++
-	}
-	if filter.Excluded != nil {
-		where = append(where, fmt.Sprintf("excluded = $%d", argPos))
-		args = append(args, *filter.Excluded)
-		argPos++
-	}
-	if filter.PathLike != "" {
-		where = append(where, fmt.Sprintf("path LIKE $%d", argPos))
-		args = append(args, "%"+filter.PathLike+"%")
-		argPos++
-	}
-
-	query := `SELECT id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth, traversal_status, copy_status, excluded, errors FROM ` + table
-	if len(where) > 0 {
-		query += ` WHERE ` + strings.Join(where, " AND ")
-	}
-	if filter.OrderByPath {
-		query += ` ORDER BY path`
-	} else {
-		query += ` ORDER BY id`
-	}
-	query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argPos, argPos+1)
-	args = append(args, limit, offset)
-
-	conn, err := s.db.GetDB()
-	if err != nil {
-		return nil, err
-	}
-	rows, err := conn.QueryContext(context.Background(), query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("query nodes: %w", err)
-	}
-	defer rows.Close()
-
-	results := make([]db.NodeState, 0, limit)
-	for rows.Next() {
-		var (
-			node db.NodeState
-			size sql.NullInt64
-		)
-		if err := rows.Scan(
-			&node.ID,
-			&node.ServiceID,
-			&node.ParentID,
-			&node.ParentServiceID,
-			&node.Path,
-			&node.ParentPath,
-			&node.Type,
-			&size,
-			&node.MTime,
-			&node.Depth,
-			&node.TraversalStatus,
-			&node.CopyStatus,
-			&node.Excluded,
-			&node.Errors,
-		); err != nil {
-			return nil, fmt.Errorf("query nodes scan: %w", err)
-		}
-		if size.Valid {
-			node.Size = size.Int64
-		}
-		node.Status = node.TraversalStatus
-		results = append(results, node)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("query nodes rows: %w", err)
-	}
-	return results, nil
+	return db.QueryNodesForReview(s.db, table, filter.Depth, filter.Status, filter.Excluded, filter.PathLike, filter.OrderByPath, limit, offset)
 }
 
-func (s *migrationStore) setNodeExcluded(queueType, nodeID string, excluded bool) error {
-	q := strings.ToUpper(queueType)
-	if q != "DST" {
-		q = "SRC"
+// addReviewDeltaLeaveCopyBucketForExclude applies -1 to the copy-status bucket the node is leaving when excluding (copy_status → excluded). Matches Writer.SetNodeExcluded depth stats.
+func addReviewDeltaLeaveCopyBucketForExclude(deltas map[string]int64, copyStatus string) {
+	switch copyStatus {
+	case db.CopyStatusPending, "":
+		addReviewDelta(deltas, DeltaCopyPending, -1)
+	case db.CopyStatusFailed:
+		addReviewDelta(deltas, DeltaCopyFailed, -1)
+	case db.CopyStatusSuccessful:
+		addReviewDelta(deltas, DeltaCopySuccessful, -1)
+	case db.CopyStatusInProgress:
+		// Writer does not decrement in_progress in per-depth stats when switching to excluded.
+	case db.CopyStatusSkipped:
+		// No universal review key for skipped; excluded aggregate still increments.
+	case db.CopyStatusExcludedExplicit, db.CopyStatusExcludedInherited:
+		// Exclude path should not run when already excluded.
+	default:
+		addReviewDelta(deltas, DeltaCopyPending, -1)
 	}
-	return s.db.RunUpdateWriterTx(func(w *db.Writer) error {
-		return w.SetNodeExcluded(q, nodeID, excluded)
+}
+
+func (s *migrationStore) setNodeExcluded(nodeID string, excluded bool) (int64, map[string]int64, error) {
+	// Exclude/unexclude is SRC-only: only source nodes can be excluded from copy; no DST lookup.
+	node, err := db.GetNodeByID(s.db, "SRC", nodeID)
+	if err != nil {
+		return 0, nil, err
+	}
+	if node == nil {
+		return 0, nil, fmt.Errorf("node %s not found in SRC", nodeID)
+	}
+	q := "SRC"
+	if node.Excluded == excluded {
+		return 0, nil, nil
+	}
+	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+		return sess.WithTx(func(w *db.Writer) error {
+			return w.SetNodeExcluded(q, nodeID, excluded)
+		})
 	})
+	if err != nil {
+		return 0, nil, err
+	}
+	deltas := make(map[string]int64)
+	if excluded {
+		addReviewDelta(deltas, DeltaExcluded, 1)
+		addReviewDeltaLeaveCopyBucketForExclude(deltas, node.CopyStatus)
+	} else {
+		addReviewDelta(deltas, DeltaExcluded, -1)
+		addReviewDelta(deltas, DeltaCopyPending, 1)
+	}
+	if err := s.persistReviewDeltas(deltas); err != nil {
+		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+	}
+	return 1, deltas, nil
 }
 
 func (s *migrationStore) listRecentLogs(limit int) ([]LogEntry, error) {
@@ -166,8 +208,10 @@ func (s *migrationStore) listRecentLogs(limit int) ([]LogEntry, error) {
 
 func (s *migrationStore) setNodeTraversalStatus(nodeID, status string) error {
 	// Try SRC first, then DST. This avoids a read-before-write table resolution hop.
-	err := s.db.RunUpdateWriterTx(func(w *db.Writer) error {
-		return w.SetNodeTraversalStatus("SRC", nodeID, status)
+	err := s.db.RunWrite(context.Background(), func(s *db.WriteSession) error {
+		return s.WithTx(func(w *db.Writer) error {
+			return w.SetNodeTraversalStatus("SRC", nodeID, status)
+		})
 	})
 	if err == nil {
 		return nil
@@ -175,8 +219,10 @@ func (s *migrationStore) setNodeTraversalStatus(nodeID, status string) error {
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	err = s.db.RunUpdateWriterTx(func(w *db.Writer) error {
-		return w.SetNodeTraversalStatus("DST", nodeID, status)
+	err = s.db.RunWrite(context.Background(), func(s *db.WriteSession) error {
+		return s.WithTx(func(w *db.Writer) error {
+			return w.SetNodeTraversalStatus("DST", nodeID, status)
+		})
 	})
 	if err == nil {
 		return nil
@@ -187,49 +233,334 @@ func (s *migrationStore) setNodeTraversalStatus(nodeID, status string) error {
 	return err
 }
 
-func (s *migrationStore) setNodeCopyStatus(nodeID, status string) error {
-	return s.db.RunUpdateWriterTx(func(w *db.Writer) error {
-		return w.SetNodeCopyStatus("SRC", nodeID, status)
+func (s *migrationStore) setNodeCopyStatus(nodeID, status string) (int64, map[string]int64, error) {
+	err := s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+		return sess.WithTx(func(w *db.Writer) error {
+			return w.SetNodeCopyStatus("SRC", nodeID, status)
+		})
 	})
+	if err != nil {
+		return 0, nil, err
+	}
+	deltas := make(map[string]int64)
+	if status == db.CopyStatusPending {
+		addReviewDelta(deltas, DeltaCopyFailed, -1)
+		addReviewDelta(deltas, DeltaCopyPending, 1)
+	} else {
+		addReviewDelta(deltas, DeltaCopyPending, -1)
+		addReviewDelta(deltas, DeltaCopyFailed, 1)
+	}
+	if err := s.persistReviewDeltas(deltas); err != nil {
+		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+	}
+	return 1, deltas, nil
 }
 
-func (s *migrationStore) setNodeExcludedWithPropagation(queueType, nodeID string, excluded bool) error {
-	q := strings.ToUpper(queueType)
-	if q != "DST" {
-		q = "SRC"
-	}
-	node, err := db.GetNodeByID(s.db, q, nodeID)
+// markNodeForRetryDiscovery looks up the node by ID in SRC then DST (nodeID is either a SRC or DST node ID).
+// For a SRC node at path P: deletes all DST descendants under P (not the DST node at P), marks SRC and DST node at P as pending. Non-recursive; DST children are removed so they can be re-derived on next traversal.
+func (s *migrationStore) markNodeForRetryDiscovery(nodeID string) (int64, map[string]int64, error) {
+	srcNode, err := db.GetNodeByID(s.db, "SRC", nodeID)
 	if err != nil {
-		return err
+		return 0, nil, err
+	}
+	if srcNode != nil {
+		path := srcNode.Path
+		dstAtPath, _ := db.GetNodeByPath(s.db, "DST", path)
+		var desc db.DstDescendantsReviewStats
+		err := s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+			return sess.WithTx(func(w *db.Writer) error {
+				var err error
+				desc, err = w.CountDstDescendantsReviewStats(path)
+				if err != nil {
+					return err
+				}
+				if err := w.SetNodeTraversalStatus("SRC", nodeID, db.StatusPending); err != nil {
+					return err
+				}
+				if dstAtPath != nil {
+					if err := w.SetNodeTraversalStatus("DST", dstAtPath.ID, db.StatusPending); err != nil {
+						return err
+					}
+					if err := w.DeleteDescendantsUnderPath("DST", path); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		})
+		if err != nil {
+			return 0, nil, err
+		}
+		deltas := make(map[string]int64)
+		addReviewDelta(deltas, DeltaTraversalFailed, -1+-desc.TraversalFailed)
+		addReviewDelta(deltas, DeltaTraversalPendingRetry, 1)
+		addReviewDelta(deltas, DeltaFolders, -desc.Folders)
+		addReviewDelta(deltas, DeltaFiles, -desc.Files)
+		addReviewDelta(deltas, DeltaExcluded, -desc.Excluded)
+		addReviewDelta(deltas, DeltaSizeDst, -desc.SizeDst)
+		if err := s.persistReviewDeltas(deltas); err != nil {
+			return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+		}
+		return 1, deltas, nil
+	}
+	dstNode, err := db.GetNodeByID(s.db, "DST", nodeID)
+	if err != nil || dstNode == nil {
+		if err != nil {
+			return 0, nil, err
+		}
+		return 0, nil, fmt.Errorf("node %s not found", nodeID)
+	}
+	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+		return sess.WithTx(func(w *db.Writer) error {
+			return w.SetNodeTraversalStatus("DST", nodeID, db.StatusPending)
+		})
+	})
+	if err != nil {
+		return 0, nil, err
+	}
+	deltas := make(map[string]int64)
+	addReviewDelta(deltas, DeltaTraversalFailed, -1)
+	addReviewDelta(deltas, DeltaTraversalPendingRetry, 1)
+	if err := s.persistReviewDeltas(deltas); err != nil {
+		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+	}
+	return 1, deltas, nil
+}
+
+// unmarkNodeForRetryDiscovery sets SRC node back to failed and DST node at same path (if any) to not_on_src. Does not recreate DST children that were deleted on mark-for-retry.
+func (s *migrationStore) unmarkNodeForRetryDiscovery(nodeID string) (int64, map[string]int64, error) {
+	srcNode, err := db.GetNodeByID(s.db, "SRC", nodeID)
+	if err != nil {
+		return 0, nil, err
+	}
+	if srcNode != nil {
+		path := srcNode.Path
+		dstAtPath, _ := db.GetNodeByPath(s.db, "DST", path)
+		err := s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+			return sess.WithTx(func(w *db.Writer) error {
+				if err := w.SetNodeTraversalStatus("SRC", nodeID, db.StatusFailed); err != nil {
+					return err
+				}
+				if dstAtPath != nil {
+					if err := w.SetNodeTraversalStatus("DST", dstAtPath.ID, db.StatusNotOnSrc); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		})
+		if err != nil {
+			return 0, nil, err
+		}
+		deltas := make(map[string]int64)
+		addReviewDelta(deltas, DeltaTraversalPendingRetry, -1)
+		addReviewDelta(deltas, DeltaTraversalFailed, 1)
+		if err := s.persistReviewDeltas(deltas); err != nil {
+			return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+		}
+		return 1, deltas, nil
+	}
+	dstNode, err := db.GetNodeByID(s.db, "DST", nodeID)
+	if err != nil || dstNode == nil {
+		if err != nil {
+			return 0, nil, err
+		}
+		return 0, nil, fmt.Errorf("node %s not found", nodeID)
+	}
+	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+		return sess.WithTx(func(w *db.Writer) error {
+			return w.SetNodeTraversalStatus("DST", nodeID, db.StatusFailed)
+		})
+	})
+	if err != nil {
+		return 0, nil, err
+	}
+	deltas := make(map[string]int64)
+	addReviewDelta(deltas, DeltaTraversalPendingRetry, -1)
+	addReviewDelta(deltas, DeltaTraversalFailed, 1)
+	if err := s.persistReviewDeltas(deltas); err != nil {
+		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+	}
+	return 1, deltas, nil
+}
+
+func (s *migrationStore) setNodeExcludedWithPropagation(nodeID string, excluded bool) (int64, map[string]int64, error) {
+	// Exclude/unexclude is SRC-only: only source nodes can be excluded from copy; no DST lookup.
+	node, err := db.GetNodeByID(s.db, "SRC", nodeID)
+	if err != nil {
+		return 0, nil, err
 	}
 	if node == nil {
-		return fmt.Errorf("node %s not found in %s", nodeID, q)
+		return 0, nil, fmt.Errorf("node %s not found in SRC", nodeID)
 	}
-	table := "src_nodes"
-	if q == "DST" {
-		table = "dst_nodes"
-	}
-	conn, err := s.db.GetDB()
+	q := "SRC"
+	rootPath := node.Path
+	var affected int64
+	var buckets db.CopyStatusBucketsSubtreeNotExcluded
+	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+		return sess.WithTx(func(w *db.Writer) error {
+			excl, notExcl, err := w.CountExcludedInSubtree(q, rootPath)
+			if err != nil {
+				return err
+			}
+			if excluded {
+				affected = notExcl
+			} else {
+				affected = excl
+			}
+			if excluded {
+				var err2 error
+				buckets, err2 = w.CountCopyStatusBucketsSubtreeNotExcluded(rootPath)
+				if err2 != nil {
+					return err2
+				}
+				return w.InsertExclusionEventsForSubtree(q, rootPath)
+			}
+			return w.InsertUnexcludeEventsForSubtree(q, rootPath)
+		})
+	})
 	if err != nil {
-		return err
+		return 0, nil, fmt.Errorf("set exclusion with propagation: %w", err)
 	}
-	prefix := node.Path + "/%"
-	_, err = conn.ExecContext(
-		context.Background(),
-		`UPDATE `+table+` SET excluded = $1 WHERE path = $2 OR path LIKE $3`,
-		excluded,
-		node.Path,
-		prefix,
-	)
-	if err != nil {
-		return fmt.Errorf("set exclusion with propagation: %w", err)
+	deltas := make(map[string]int64)
+	if excluded {
+		addReviewDelta(deltas, DeltaExcluded, affected)
+		addReviewDelta(deltas, DeltaCopyPending, -buckets.Pending)
+		addReviewDelta(deltas, DeltaCopyFailed, -buckets.Failed)
+		addReviewDelta(deltas, DeltaCopySuccessful, -buckets.Successful)
+	} else {
+		addReviewDelta(deltas, DeltaExcluded, -affected)
+		addReviewDelta(deltas, DeltaCopyPending, affected)
 	}
-	return nil
+	if err := s.persistReviewDeltas(deltas); err != nil {
+		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+	}
+	return affected, deltas, nil
+}
+
+func conditionStringValue(v any) (string, bool) {
+	if v == nil {
+		return "", false
+	}
+	switch t := v.(type) {
+	case string:
+		return t, true
+	case float64:
+		return strconv.FormatInt(int64(t), 10), true
+	case int:
+		return strconv.Itoa(t), true
+	case int64:
+		return strconv.FormatInt(t, 10), true
+	default:
+		return fmt.Sprintf("%v", t), true
+	}
+}
+
+func conditionIntValue(v any) (int, bool) {
+	switch t := v.(type) {
+	case int:
+		return t, true
+	case int64:
+		return int(t), true
+	case float64:
+		return int(t), true
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(t))
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func conditionInt64Value(v any) (int64, bool) {
+	switch t := v.(type) {
+	case int:
+		return int64(t), true
+	case int64:
+		return t, true
+	case float64:
+		return int64(t), true
+	case string:
+		n, err := strconv.ParseInt(strings.TrimSpace(t), 10, 64)
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func normalizeDepthSizeOp(op string) string {
+	switch strings.ToLower(strings.TrimSpace(op)) {
+	case "gt", ">":
+		return ">"
+	case "gte", ">=":
+		return ">="
+	case "lt", "<":
+		return "<"
+	case "lte", "<=":
+		return "<="
+	case "equals", "=":
+		return "="
+	default:
+		return "="
+	}
+}
+
+// searchRequestToReviewFilter maps API/UI SearchRequest onto db.ReviewFilter (merged view, status from events).
+func searchRequestToReviewFilter(req SearchRequest) db.ReviewFilter {
+	f := db.ReviewFilter{
+		ParentPath:       strings.TrimSpace(req.Path),
+		Query:            strings.TrimSpace(req.Query),
+		FoldersOnly:      req.FoldersOnly,
+		ExcludeRoot:      req.Path == "",
+		Status:           strings.TrimSpace(req.Status),
+		StatusSearchType: strings.TrimSpace(req.StatusSearchType),
+	}
+	for _, c := range req.Conditions {
+		field := strings.ToLower(strings.TrimSpace(c.Field))
+		switch field {
+		case "path":
+			if s, ok := conditionStringValue(c.Value); ok && strings.TrimSpace(s) != "" {
+				f.Query = strings.TrimSpace(s)
+				f.QueryField = "path"
+			}
+		case "name":
+			if s, ok := conditionStringValue(c.Value); ok && strings.TrimSpace(s) != "" {
+				f.Query = strings.TrimSpace(s)
+				f.QueryField = "name"
+			}
+		case "type":
+			if s, ok := conditionStringValue(c.Value); ok {
+				f.TypeFilter = strings.ToLower(strings.TrimSpace(s))
+			}
+		case "traversalstatus":
+			if s, ok := conditionStringValue(c.Value); ok {
+				f.TraversalStatus = strings.TrimSpace(s)
+			}
+		case "copystatus":
+			if s, ok := conditionStringValue(c.Value); ok {
+				f.CopyStatus = strings.TrimSpace(s)
+			}
+		case "depth":
+			f.DepthOperator = normalizeDepthSizeOp(c.Operator)
+			if n, ok := conditionIntValue(c.Value); ok {
+				f.DepthValue = &n
+			}
+		case "size":
+			f.SizeOperator = normalizeDepthSizeOp(c.Operator)
+			if n, ok := conditionInt64Value(c.Value); ok {
+				f.SizeValue = &n
+			}
+		}
+	}
+	if f.StatusSearchType != "" || f.TraversalStatus != "" || f.CopyStatus != "" {
+		f.Status = ""
+	}
+	return f
 }
 
 func sanitizeSort(sortBy, sortDirection string) string {
 	column := "path"
-	switch strings.ToLower(sortBy) {
+	switch strings.ToLower(strings.TrimSpace(sortBy)) {
 	case "name":
 		column = "name"
 	case "depth":
@@ -238,16 +569,23 @@ func sanitizeSort(sortBy, sortDirection string) string {
 		column = "size"
 	case "type":
 		column = "type"
-	case "status":
+	case "status", "traversalstatus", "traversal_status":
 		column = "src_traversal_status"
+	case "copystatus", "copy_status":
+		column = "copy_status"
 	case "path":
 		column = "path"
 	}
 	direction := "ASC"
-	if strings.EqualFold(sortDirection, "desc") {
+	if strings.EqualFold(strings.TrimSpace(sortDirection), "desc") {
 		direction = "DESC"
 	}
-	return column + " " + direction
+	primary := column + " " + direction
+	// Stable ordering and deterministic pagination when primary values tie.
+	if column == "path" {
+		return primary
+	}
+	return primary + ", path ASC"
 }
 
 func (s *migrationStore) listChildrenDiffs(req ListChildrenDiffsRequest) (ListChildrenDiffsResult, error) {
@@ -260,90 +598,19 @@ func (s *migrationStore) listChildrenDiffs(req ListChildrenDiffsRequest) (ListCh
 		offset = 0
 	}
 	orderBy := sanitizeSort(req.SortBy, req.SortDirection)
-
-	conn, err := s.db.GetDB()
+	f := db.ReviewFilter{
+		ParentPath:  req.Path,
+		Status:      req.Status,
+		FoldersOnly: req.FoldersOnly,
+	}
+	rows, total, err := db.ListMergedReviewDiffs(s.db, f, orderBy, limit, offset)
 	if err != nil {
 		return ListChildrenDiffsResult{}, err
 	}
-
-	where := ` WHERE (src_parent_path = $1 OR dst_parent_path = $1) `
-	args := []any{req.Path}
-	if req.FoldersOnly {
-		where += ` AND type = 'folder'`
+	items := make([]DiffItem, 0, len(rows))
+	for i := range rows {
+		items = append(items, mergedRowToDiffItem(rows[i]))
 	}
-	if req.Status != "" {
-		where += ` AND (src_traversal_status = $2 OR dst_traversal_status = $2 OR copy_status = $2)`
-		args = append(args, req.Status)
-	}
-
-	base := `WITH merged AS (
-SELECT
-	COALESCE(s.path, d.path) AS path,
-	COALESCE(s.parent_path, d.parent_path) AS parent_path,
-	COALESCE(s.depth, d.depth, 0) AS depth,
-	COALESCE(s.type, d.type, '') AS type,
-	COALESCE(s.id, '') AS src_node_id,
-	COALESCE(d.id, '') AS dst_node_id,
-	COALESCE(s.traversal_status, '') AS src_traversal_status,
-	COALESCE(d.traversal_status, '') AS dst_traversal_status,
-	COALESCE(s.copy_status, '') AS copy_status,
-	COALESCE(s.excluded, d.excluded, false) AS excluded,
-	COALESCE(s.size, d.size, 0) AS size,
-	COALESCE(s.parent_path, '') AS src_parent_path,
-	COALESCE(d.parent_path, '') AS dst_parent_path,
-	CASE
-		WHEN COALESCE(s.path, d.path) = '' THEN ''
-		WHEN strpos(reverse(COALESCE(s.path, d.path)), '/') = 0 THEN COALESCE(s.path, d.path)
-		ELSE right(COALESCE(s.path, d.path), strpos(reverse(COALESCE(s.path, d.path)), '/') - 1)
-	END AS name
-FROM src_nodes s
-FULL OUTER JOIN dst_nodes d ON s.path = d.path
-)`
-
-	countQuery := base + ` SELECT COUNT(*) FROM merged` + where
-	var total int
-	if err := conn.QueryRowContext(context.Background(), countQuery, args...).Scan(&total); err != nil {
-		return ListChildrenDiffsResult{}, err
-	}
-
-	listQuery := base + ` SELECT path, name, depth, type, src_node_id, dst_node_id, src_traversal_status, dst_traversal_status, copy_status, excluded, size FROM merged` +
-		where + ` ORDER BY ` + orderBy + ` LIMIT $` + fmt.Sprintf("%d", len(args)+1) + ` OFFSET $` + fmt.Sprintf("%d", len(args)+2)
-	queryArgs := append(args, limit, offset)
-	rows, err := conn.QueryContext(context.Background(), listQuery, queryArgs...)
-	if err != nil {
-		return ListChildrenDiffsResult{}, err
-	}
-	defer rows.Close()
-
-	items := make([]DiffItem, 0, limit)
-	for rows.Next() {
-		var item DiffItem
-		if err := rows.Scan(
-			&item.Path,
-			&item.Name,
-			&item.Depth,
-			&item.Type,
-			&item.SrcNodeID,
-			&item.DstNodeID,
-			&item.SrcTraversalStatus,
-			&item.DstTraversalStatus,
-			&item.CopyStatus,
-			&item.Excluded,
-			&item.Size,
-		); err != nil {
-			return ListChildrenDiffsResult{}, err
-		}
-		item.MissingOnSource = item.SrcNodeID == ""
-		item.MissingOnDest = item.DstNodeID == ""
-		if item.Name == "" {
-			item.Name = path.Base(item.Path)
-		}
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
-		return ListChildrenDiffsResult{}, err
-	}
-
 	return ListChildrenDiffsResult{
 		Items:  items,
 		Total:  total,
@@ -353,71 +620,62 @@ FULL OUTER JOIN dst_nodes d ON s.path = d.path
 }
 
 func (s *migrationStore) searchPathReviewItems(req SearchRequest) (SearchResult, error) {
-	listReq := ListChildrenDiffsRequest{
-		Path:          req.Path,
-		Limit:         req.Limit,
-		Offset:        req.Offset,
-		SortBy:        req.SortBy,
-		SortDirection: req.SortDirection,
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 100
 	}
-	res, err := s.listChildrenDiffs(listReq)
+	offset := req.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	orderBy := sanitizeSort(req.SortBy, req.SortDirection)
+	f := searchRequestToReviewFilter(req)
+	rows, total, err := db.ListMergedReviewDiffs(s.db, f, orderBy, limit, offset)
 	if err != nil {
 		return SearchResult{}, err
 	}
-	if strings.TrimSpace(req.Query) == "" {
-		return SearchResult{
-			Items:  res.Items,
-			Total:  res.Total,
-			Limit:  res.Limit,
-			Offset: res.Offset,
-		}, nil
-	}
-	query := strings.ToLower(strings.TrimSpace(req.Query))
-	filtered := make([]DiffItem, 0, len(res.Items))
-	for i := range res.Items {
-		item := res.Items[i]
-		if strings.Contains(strings.ToLower(item.Path), query) || strings.Contains(strings.ToLower(item.Name), query) {
-			filtered = append(filtered, item)
-		}
+	items := make([]DiffItem, 0, len(rows))
+	for i := range rows {
+		items = append(items, mergedRowToDiffItem(rows[i]))
 	}
 	return SearchResult{
-		Items:  filtered,
-		Total:  len(filtered),
-		Limit:  res.Limit,
-		Offset: res.Offset,
+		Items:  items,
+		Total:  total,
+		Limit:  limit,
+		Offset: offset,
 	}, nil
 }
 
 func (s *migrationStore) getChildrenDiffsStats(path string, foldersOnly bool) (DiffsStats, error) {
-	res, err := s.listChildrenDiffs(ListChildrenDiffsRequest{
-		Path:        path,
-		Limit:       10000,
-		Offset:      0,
-		FoldersOnly: foldersOnly,
-	})
+	f := db.ReviewFilter{ParentPath: path, FoldersOnly: foldersOnly}
+	stats, err := db.GetMergedReviewStats(s.db, f)
 	if err != nil {
 		return DiffsStats{}, err
 	}
-	stats := DiffsStats{Total: res.Total}
-	for i := range res.Items {
-		item := res.Items[i]
-		if item.Type == "folder" {
-			stats.Folders++
-		}
-		if item.Type == "file" {
-			stats.Files++
-		}
-		if item.MissingOnSource {
-			stats.MissingOnSource++
-		}
-		if item.MissingOnDest {
-			stats.MissingOnDest++
-		}
-		if item.Excluded {
-			stats.Excluded++
-		}
+	return DiffsStats{
+		Total:           stats.Total,
+		Folders:         stats.Folders,
+		Files:           stats.Files,
+		MissingOnSource: stats.MissingOnSource,
+		MissingOnDest:   stats.MissingOnDest,
+		Excluded:        stats.Excluded,
+	}, nil
+}
+
+func (s *migrationStore) getSearchStats(req SearchRequest) (DiffsStats, error) {
+	f := searchRequestToReviewFilter(req)
+	stats, err := db.GetMergedReviewStats(s.db, f)
+	if err != nil {
+		return DiffsStats{}, err
 	}
-	return stats, nil
+	return DiffsStats{
+		Total:           stats.Total,
+		Folders:         stats.Folders,
+		Files:           stats.Files,
+		MissingOnSource: stats.MissingOnSource,
+		MissingOnDest:   stats.MissingOnDest,
+		Excluded:        stats.Excluded,
+	}, nil
 }
 
 func (s *migrationStore) getQueueMetrics() (QueueMetricsSnapshot, error) {

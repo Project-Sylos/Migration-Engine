@@ -1,7 +1,7 @@
 # restore.ps1
 # Restores permissions to A/items folder
 
-$BaseDir = "$env:USERPROFILE\sylos_retry_test"
+$BaseDir = "$env:USERPROFILE\..sylos_retry_test"
 $TreeA   = "$BaseDir\A\items"
 
 $Icacls = "$env:SystemRoot\System32\icacls.exe"

@@ -68,44 +68,23 @@ func VerifyMigration(database *db.DB, opts VerifyOptions) (VerificationReport, e
 		return report, fmt.Errorf("no nodes discovered - migration did not run")
 	}
 
-	// Status totals from src_stats
-	c, err := database.GetStatsCount("SRC", db.StatsKeyTraversalStatus(db.StatusPending))
+	// Status totals from status_events (COUNT by current traversal_status per node)
+	srcCounts, err := database.GetTraversalStatusCountsFromEvents("SRC")
 	if err != nil {
-		return VerificationReport{}, fmt.Errorf("failed to get stats count: %w", err)
+		return VerificationReport{}, fmt.Errorf("failed to get SRC status counts from events: %w", err)
 	}
-	report.SrcPending = int(c)
-	c, err = database.GetStatsCount("SRC", db.StatsKeyTraversalStatus(db.StatusFailed))
-	if err != nil {
-		return VerificationReport{}, fmt.Errorf("failed to get stats count: %w", err)
-	}
-	report.SrcFailed = int(c)
-	c, err = database.GetStatsCount("SRC", db.StatsKeyTraversalStatus(db.StatusSuccessful))
-	if err != nil {
-		return VerificationReport{}, fmt.Errorf("failed to get stats count: %w", err)
-	}
-	report.SrcSuccessful = int(c)
+	report.SrcPending = int(srcCounts.Pending)
+	report.SrcSuccessful = int(srcCounts.Successful)
+	report.SrcFailed = int(srcCounts.Failed)
 
-	// Status totals from dst_stats
-	c, err = database.GetStatsCount("DST", db.StatsKeyTraversalStatus(db.StatusPending))
+	dstCounts, err := database.GetTraversalStatusCountsFromEvents("DST")
 	if err != nil {
-		return VerificationReport{}, fmt.Errorf("failed to get stats count: %w", err)
+		return VerificationReport{}, fmt.Errorf("failed to get DST status counts from events: %w", err)
 	}
-	report.DstPending = int(c)
-	c, err = database.GetStatsCount("DST", db.StatsKeyTraversalStatus(db.StatusFailed))
-	if err != nil {
-		return VerificationReport{}, fmt.Errorf("failed to get stats count: %w", err)
-	}
-	report.DstFailed = int(c)
-	c, err = database.GetStatsCount("DST", db.StatsKeyTraversalStatus(db.StatusNotOnSrc))
-	if err != nil {
-		return VerificationReport{}, fmt.Errorf("failed to get stats count: %w", err)
-	}
-	report.DstNotOnSrc = int(c)
-	c, err = database.GetStatsCount("DST", db.StatsKeyTraversalStatus(db.StatusSuccessful))
-	if err != nil {
-		return VerificationReport{}, fmt.Errorf("failed to get stats count: %w", err)
-	}
-	report.DstSuccessful = int(c)
+	report.DstPending = int(dstCounts.Pending)
+	report.DstSuccessful = int(dstCounts.Successful)
+	report.DstFailed = int(dstCounts.Failed)
+	report.DstNotOnSrc = int(dstCounts.NotOnSrc)
 
 	return report, nil
 }

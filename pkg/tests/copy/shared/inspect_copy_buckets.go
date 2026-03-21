@@ -58,7 +58,7 @@ func InspectCopyBuckets(dbPath string) error {
 
 			for _, nodeType := range nodeTypes {
 				fmt.Printf("    [%s]: ", nodeType)
-				count, err := dbInstance.GetCopyCountAtDepth(level, nodeType, status)
+				count, err := dbInstance.GetCopyCountAtDepth(level, nodeType, status, false)
 				if err != nil {
 					fmt.Printf("ERROR: %v\n", err)
 					continue

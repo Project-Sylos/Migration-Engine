@@ -4,8 +4,8 @@
 package queue
 
 import (
-	"fmt"
 	"context"
+	"fmt"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
@@ -74,6 +74,42 @@ func (q *Queue) SetCopyPass(pass int) {
 	q.copyPass = pass
 }
 
+// SetCopyResumeDstExistenceWindow enables the copy worker dst ListChildren precheck until the anchor
+// pass+round is left (see AdvanceCopyRound). Only for normal copy mode (not copy-retry); call from
+// RunCopyPhase when resuming a partially completed copy (Successful>0 and Pending>0 in status events).
+func (q *Queue) SetCopyResumeDstExistenceWindow(anchorPass, anchorRound int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.name != "copy" {
+		return
+	}
+	q.copyResumeDstExistenceActive = true
+	q.copyResumeDstExistenceAnchorPass = anchorPass
+	q.copyResumeDstExistenceAnchorRound = anchorRound
+}
+
+func (q *Queue) shouldApplyCopyDstResumeExistenceCheck() bool {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	if q.mode != QueueModeCopy || !q.copyResumeDstExistenceActive {
+		return false
+	}
+	return q.copyPass == q.copyResumeDstExistenceAnchorPass && q.round == q.copyResumeDstExistenceAnchorRound
+}
+
+// noteCopyResumeDstExistenceLeavingAnchorRound clears resume dst precheck after the anchor round finishes
+// (first AdvanceCopyRound call while still positioned on that pass+round).
+func (q *Queue) noteCopyResumeDstExistenceLeavingAnchorRound() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if !q.copyResumeDstExistenceActive {
+		return
+	}
+	if q.copyPass == q.copyResumeDstExistenceAnchorPass && q.round == q.copyResumeDstExistenceAnchorRound {
+		q.copyResumeDstExistenceActive = false
+	}
+}
+
 // SetWorkers sets the workers associated with this queue.
 func (q *Queue) SetWorkers(workers []Worker) {
 	q.mu.Lock()
@@ -92,7 +128,6 @@ func (q *Queue) getDatabase() *db.DB {
 	defer q.mu.RUnlock()
 	return q.database
 }
-
 
 func (q *Queue) getShutdownCtx() context.Context {
 	q.mu.RLock()
@@ -114,10 +149,17 @@ func (q *Queue) GetPendingCount() int {
 	return len(q.pendingBuff)
 }
 
-func (q *Queue) getLastPullWasPartial() bool {
+func (q *Queue) GetLastPullWasPartial() bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.lastPullWasPartial
+}
+
+// GetWorkerCount returns the number of workers registered with this queue.
+func (q *Queue) GetWorkerCount() int {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return len(q.workers)
 }
 
 func (q *Queue) setFirstPullForRound(value bool) {
@@ -247,20 +289,6 @@ func (q *Queue) GetTotalFailed() int {
 	return total
 }
 
-func (q *Queue) isLeased(nodeID string) bool {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	_, exists := q.leasedKeys[nodeID]
-	return exists
-}
-
-func (q *Queue) isInPendingSet(nodeID string) bool {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	_, exists := q.pendingSet[nodeID]
-	return exists
-}
-
 // GetRoundStats returns the statistics for a specific round. Returns nil if the round has no stats yet.
 func (q *Queue) GetRoundStats(round int) *RoundStats {
 	q.mu.RLock()
@@ -313,8 +341,14 @@ func (q *Queue) getAvgInterval() time.Duration {
 // SetState sets the queue lifecycle state.
 func (q *Queue) SetState(state QueueState) {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	q.state = state
+	watchdog := q.watchdog
+	q.mu.Unlock()
+
+	// Stop watchdog when queue completes or stops
+	if (state == QueueStateCompleted || state == QueueStateStopped) && watchdog != nil {
+		watchdog.Stop()
+	}
 }
 
 // SetRound sets the queue's current round. Used for resume operations.
@@ -446,61 +480,8 @@ func (q *Queue) recordTaskCompletion(round int, success bool) {
 	}
 }
 
-// Convenience getters for current round
-func (q *Queue) getCurrentRoundPullCount() int {
-	currentRound := q.GetRound()
-	info := q.getRoundInfoReadOnly(currentRound)
-	if info == nil {
-		return 0
-	}
-	return info.PullCount
-}
-
-// syncLevelStatsFromDB loads stats for the given depth from the DB into the node cache's LevelStats (used when bootstrapping a level from DB).
-func (q *Queue) syncLevelStatsFromDB(database *db.DB, queueType string, depth int) {
-	nc := q.NodeCache()
-	if nc == nil {
-		return
-	}
-	pending, _ := database.GetStatsCountAtDepth(queueType, depth, db.StatsKeyTraversalStatus(db.StatusPending))
-	successful, _ := database.GetStatsCountAtDepth(queueType, depth, db.StatsKeyTraversalStatus(db.StatusSuccessful))
-	failed, _ := database.GetStatsCountAtDepth(queueType, depth, db.StatsKeyTraversalStatus(db.StatusFailed))
-	completed, _ := database.GetStatsCountAtDepth(queueType, depth, db.StatsKeyCompleted)
-	nc.SetLevelStats(depth, pending, successful, failed, completed)
-}
-
-// RehydrateLevelFromDB loads all nodes at the given depth from the DB into this queue's node cache and syncs level stats.
-// Used on resume so the memory-first path can continue from sealed state without re-pulling from DB on first pull.
-func (q *Queue) RehydrateLevelFromDB(depth int) {
-	database := q.getDatabase()
-	nc := q.NodeCache()
-	if database == nil || nc == nil {
-		return
-	}
-	queueType := getQueueType(q.name)
-	level := nc.EnsureLevel(depth)
-	afterID := ""
-	const batchSize = 5000
-	for {
-		results, err := db.ListNodesByDepthKeyset(database, queueType, depth, afterID, "", batchSize)
-		if err != nil {
-			return
-		}
-		for _, r := range results {
-			level.Put(r.Key, r.State)
-		}
-		if len(results) < batchSize {
-			break
-		}
-		afterID = results[len(results)-1].Key
-	}
-	q.syncLevelStatsFromDB(database, queueType, depth)
-	q.SetTraversalCacheLoaded(true)
-}
-
-// SetTraversalCacheLoaded sets whether the level cache has been loaded from DB (e.g. after RehydrateLevelFromDB).
-// Until true, CheckTraversalCompletion returns false so the queue does not complete before round 0 is populated.
-// Call after loading cache at startup; retry/sweeps should set true when their cache is ready.
+// SetTraversalCacheLoaded sets whether we have completed the first pull for the current round.
+// Until true, CheckTraversalCompletion returns false so the queue does not complete before the first pull.
 func (q *Queue) SetTraversalCacheLoaded(loaded bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -511,17 +492,6 @@ func (q *Queue) getTraversalCacheLoaded() bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.traversalCacheLoaded
-}
-
-// getCurrentRoundPulledAmount returns the number of items actually pulled from the DB (returned by our queries) this round.
-// Used with pull count for completion: if pullCount > 0 && pulledAmount == 0 then we queried but found nothing (round/queue done).
-func (q *Queue) getCurrentRoundPulledAmount() int {
-	currentRound := q.GetRound()
-	info := q.getRoundInfoReadOnly(currentRound)
-	if info == nil {
-		return 0
-	}
-	return info.ItemsYielded
 }
 
 func (q *Queue) setLastPullWasPartial(value bool) {
@@ -567,18 +537,6 @@ func (q *Queue) setLastAvgTime(t time.Time) {
 	q.lastAvgTime = t
 }
 
-func (q *Queue) addLeasedKey(nodeID string) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.leasedKeys[nodeID] = struct{}{}
-}
-
-func (q *Queue) removeLeasedKey(nodeID string) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	delete(q.leasedKeys, nodeID)
-}
-
 func (q *Queue) addInProgress(nodeID string, task *TaskBase) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -598,6 +556,18 @@ func (q *Queue) incrementRoundStatsCompleted(round int) {
 	stats.Completed++
 }
 
+// resetRoundStatsCompleted zeros Completed for all rounds. Call when switching copy pass
+// so pass 2 stats (files) don't include pass 1 completions (folders).
+func (q *Queue) resetRoundStatsCompleted() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, stats := range q.roundStats {
+		if stats != nil {
+			stats.Completed = 0
+		}
+	}
+}
+
 func (q *Queue) incrementRoundStatsFailed(round int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -613,9 +583,9 @@ func (q *Queue) getOrCreateRoundStatsUnlocked(round int) *RoundStats {
 	return q.roundStats[round]
 }
 
-// setExpectedFromStatsBucket sets roundStats[round].Expected from the stats table (key 'expected').
-// First tries GetExpectedAtDepth; if missing or 0, computes from pending count and writes to stats.
-// Used at the start of each round so Expected reflects actual DB state and survives restarts.
+// setExpectedFromStatsBucket sets roundStats[round].Expected from the live DB count (or stats for init/resume).
+// For traversal/retry: always compute from live pending count when advancing, to avoid stale stats from prior runs.
+// For copy: compute from live. For init (EnsureRoundExpectedFromStats): try stats first for resume, else compute.
 func (q *Queue) setExpectedFromStatsBucket(round int) {
 	database := q.getDatabase()
 	if database == nil {
@@ -624,58 +594,51 @@ func (q *Queue) setExpectedFromStatsBucket(round int) {
 	queueType := getQueueType(q.name)
 	mode := q.GetMode()
 	var expected int64
-	// Try fast read from stats first
-	expected, err := database.GetStatsCountAtDepth(queueType, round, db.StatsKeyExpected)
-	if err != nil {
-		fmt.Println("error getting stats count at depth", err)
-		return
-	}
-	if expected == 0 {
-		// Compute from live table (stats for this depth may not exist yet when advancing to a new round) and write back
-		switch mode {
-		case QueueModeTraversal:
-			if round == 0 {
-				expected = 1
-			} else {
-				expected, err = database.GetPendingTraversalCountAtDepthFromLive(queueType, round)
-				if err != nil {
-					fmt.Println("error getting pending traversal count at depth from live", err)
-					return
-				}
-			}
-		case QueueModeRetry:
+	var err error
+
+	// For traversal/retry, always compute from live count when advancing (no stale stats from prior runs).
+	// EnsureRoundExpectedFromStats (init/resume) still goes through this; we compute for traversal there too.
+	switch mode {
+	case QueueModeTraversal:
+		if round == 0 {
+			expected = 1
+		} else {
 			expected, err = database.GetPendingTraversalCountAtDepthFromLive(queueType, round)
 			if err != nil {
 				fmt.Println("error getting pending traversal count at depth from live", err)
 				return
 			}
-		case QueueModeCopy:
-			copyPass := q.GetCopyPass()
-			nodeType := db.NodeTypeFolder
-			if copyPass == 2 {
-				nodeType = db.NodeTypeFile
-			}
-			expected, err = database.GetCopyCountAtDepth(round, nodeType, db.CopyStatusPending)
-			if err != nil {
-				fmt.Println("error getting copy count at depth", err)
-				return
-			}
-		default:
+		}
+	case QueueModeRetry:
+		expected, err = database.GetPendingTraversalCountAtDepthFromLive(queueType, round)
+		if err != nil {
+			fmt.Println("error getting pending traversal count at depth from live", err)
 			return
 		}
-		if expected > 0 {
-			err = database.RunUpdateWriterTx(func(w *db.Writer) error {
-				if err != nil {
-					fmt.Println("error running update writer tx", err)
-					return err
-				}
-				return w.SetStatsCountForDepth(queueType, round, db.StatsKeyExpected, expected)
-			})
-			if err != nil {
-				fmt.Println("error setting stats count for depth", err)
-				return
-			}
+	case QueueModeCopy:
+		copyPass := q.GetCopyPass()
+		nodeType := db.NodeTypeFolder
+		if copyPass == 2 {
+			nodeType = db.NodeTypeFile
 		}
+		expected, err = database.GetCopyCountAtDepth(round, nodeType, db.CopyStatusPending, false)
+		if err != nil {
+			fmt.Println("error getting copy count at depth", err)
+			return
+		}
+	case QueueModeCopyRetry:
+		copyPass := q.GetCopyPass()
+		nodeType := db.NodeTypeFolder
+		if copyPass == 2 {
+			nodeType = db.NodeTypeFile
+		}
+		expected, err = database.GetCopyCountAtDepth(round, nodeType, db.CopyStatusFailed, false)
+		if err != nil {
+			fmt.Println("error getting copy count at depth", err)
+			return
+		}
+	default:
+		return
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -737,7 +700,43 @@ func (q *Queue) getStateSnapshot() QueueStateSnapshot {
 	}
 }
 
-// Add enqueues a task into the pending buffer. Returns false if task is nil, has empty ID, or is already in progress/pending.
+func (q *Queue) recordDequeueSkip(reason string, currentRound int) {
+	q.mu.Lock()
+	switch reason {
+	case "old_round":
+		q.dequeueSkipOldRound++
+	case "empty_id":
+		q.dequeueSkipEmptyID++
+	case "already_in_progress":
+		q.dequeueSkipInProgress++
+	}
+	shouldLog := false
+	queueRound := q.round
+	state := q.state
+	workers := len(q.workers)
+	pendingBuf := len(q.pendingBuff)
+	inProgress := len(q.inProgress)
+	oldRoundSkips := q.dequeueSkipOldRound
+	emptyIDSkips := q.dequeueSkipEmptyID
+	inProgressSkips := q.dequeueSkipInProgress
+	if q.name == "dst" && q.coordinator != nil && q.coordinator.IsCompleted("src") {
+		now := time.Now()
+		if q.dequeueDebugLastLogAt.IsZero() || now.Sub(q.dequeueDebugLastLogAt) >= 2*time.Second {
+			q.dequeueDebugLastLogAt = now
+			shouldLog = true
+			q.dequeueSkipOldRound = 0
+			q.dequeueSkipEmptyID = 0
+			q.dequeueSkipInProgress = 0
+		}
+	}
+	q.mu.Unlock()
+	if shouldLog {
+		fmt.Printf("[dequeue-skip] queue=%s currentRound=%d queueRound=%d state=%s workers=%d pendingBuf=%d inProgress=%d oldRound=%d emptyID=%d alreadyInProgress=%d\n",
+			q.name, currentRound, queueRound, state, workers, pendingBuf, inProgress, oldRoundSkips, emptyIDSkips, inProgressSkips)
+	}
+}
+
+// Add enqueues a task into the pending buffer. Returns false if task is nil, has empty ID, or is already in progress.
 func (q *Queue) Add(task *TaskBase) bool {
 	if task == nil {
 		return false
@@ -761,17 +760,11 @@ func (q *Queue) Add(task *TaskBase) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	// Check if already in progress or pending
 	if _, exists := q.inProgress[nodeID]; exists {
 		return false
 	}
-	if _, exists := q.pendingSet[nodeID]; exists {
-		return false
-	}
 
-	// Add to pending buffer and set
 	q.pendingBuff = append(q.pendingBuff, task)
-	q.pendingSet[nodeID] = struct{}{}
 	return true
 }
 
@@ -798,11 +791,9 @@ func (q *Queue) dequeuePending() *TaskBase {
 				}
 			}
 			q.mu.Unlock()
+			q.recordDequeueSkip("empty_id", 0)
 			continue
 		}
-
-		// Remove from pending set
-		delete(q.pendingSet, nodeID)
 
 		// Check if task is for current or future round
 		currentRound := q.round
@@ -811,10 +802,12 @@ func (q *Queue) dequeuePending() *TaskBase {
 		q.mu.Unlock()
 
 		if task.Round < currentRound {
+			q.recordDequeueSkip("old_round", currentRound)
 			continue // Skip old round tasks
 		}
 
 		if inProgress {
+			q.recordDequeueSkip("already_in_progress", currentRound)
 			continue
 		}
 

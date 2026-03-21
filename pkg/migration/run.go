@@ -27,7 +27,6 @@ type MigrationConfig struct {
 	WorkerCount     int
 	MaxRetries      int
 	CoordinatorLead int
-	MaxSrcAhead     int           // Max rounds SRC may run ahead of DST (default 3); 0 uses default
 	LogAddress      string
 	LogLevel        string
 	SkipListener    bool
@@ -79,24 +78,15 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	}
 
 	coordinator := queue.NewQueueCoordinator()
-	if cfg.MaxSrcAhead > 0 {
-		coordinator.SetMaxSrcAhead(cfg.MaxSrcAhead)
-	}
 
-	// In-memory level caches: separate SRC/DST with bridge for DST cross-querying SRC (read-only)
-	caches := queue.NewEngineCaches()
-
+	// DB-backed frontier: no LevelCache for traversal. Queues pull from DuckDB in batches.
 	// Create queues
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
-	srcQueue.SetNodeCache(caches.Src)
-	srcQueue.SetOtherNodeCache(caches.Dst)
 	srcQueue.InitializeWithContext(database, cfg.SrcAdapter, cfg.ShutdownContext)
 	// Note: Queues clean themselves up when they complete (Run() exits when state=QueueStateCompleted)
 	// We only need to explicitly close for forced shutdowns, which is handled via Pause() + shutdown context
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
-	dstQueue.SetNodeCache(caches.Dst)
-	dstQueue.SetOtherNodeCache(caches.Src)
 	dstQueue.InitializeWithContext(database, cfg.DstAdapter, cfg.ShutdownContext)
 	// Note: Queues clean themselves up when they complete (Run() exits when state=QueueStateCompleted)
 	// We only need to explicitly close for forced shutdowns, which is handled via Pause() + shutdown context
@@ -108,6 +98,20 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 	// Give queues a moment to start their Run() goroutines
 	time.Sleep(100 * time.Millisecond)
+
+	// Start traversal phase: drop indexes, persistent appenders. Flush/checkpoint at phase end only.
+	phaseCtx := context.Background()
+	if cfg.ShutdownContext != nil {
+		phaseCtx = cfg.ShutdownContext
+	}
+	if err := database.BeginTraversalPhase(phaseCtx); err != nil {
+		return RuntimeStats{}, fmt.Errorf("begin traversal phase: %w", err)
+	}
+	defer func() {
+		if err := database.EndTraversalPhase(); err != nil {
+			fmt.Println("error ending traversal phase", err)
+		}
+	}()
 
 	// Create observer for database stats publishing (200ms update interval)
 	observer := queue.NewQueueObserver(database, 200*time.Millisecond)
@@ -201,6 +205,8 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		bothCompleted := coordinator.IsCompleted("both")
 
 		if bothCompleted {
+			observer.Stop()
+			time.Sleep(250 * time.Millisecond) // let observer loop exit before we close the logger
 			return completeTraversalRun(database, coordinator, progressTicker, start), nil
 		}
 
@@ -208,6 +214,8 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		case <-progressTicker.C:
 			// Re-check exhaustion from coordinator (queues might have completed during tick)
 			if coordinator.IsCompleted("both") {
+				observer.Stop()
+				time.Sleep(250 * time.Millisecond)
 				return completeTraversalRun(database, coordinator, progressTicker, start), nil
 			}
 
@@ -262,7 +270,7 @@ func snapshotTraversalQueueStats(database *db.DB, coordinator *queue.QueueCoordi
 
 func completeTraversalRun(database *db.DB, coordinator *queue.QueueCoordinator, progressTicker *time.Ticker, start time.Time) RuntimeStats {
 	srcStats, dstStats := snapshotTraversalQueueStats(database, coordinator)
-	fmt.Println("\nMigration complete!")
+	fmt.Println("\nTraversal complete!")
 	progressTicker.Stop()
 	closeGlobalLoggerWithTimeout(1 * time.Second)
 	return RuntimeStats{
@@ -322,14 +330,6 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 		} else {
 			coordinator.MarkCompleted("dst")
 		}
-	}
-
-	// Load current round from DB into node cache so workers pull from cache (startup and resume, including round 0)
-	if srcQueue.NodeCache() != nil {
-		srcQueue.RehydrateLevelFromDB(srcRound)
-	}
-	if dstQueue.NodeCache() != nil {
-		dstQueue.RehydrateLevelFromDB(dstRound)
 	}
 
 	// Don't pull tasks here - let Run() handle the initial pull

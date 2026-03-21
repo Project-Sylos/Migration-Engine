@@ -6,7 +6,6 @@ package queue
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
@@ -19,7 +18,6 @@ import (
 type TraversalWorker struct {
 	id          string
 	queue       *Queue
-	database    *db.DB
 	fsAdapter   types.FSAdapter
 	queueName   string          // "src" or "dst" for logging
 	isDst       bool            // true if this is a destination worker (performs comparison)
@@ -31,7 +29,6 @@ type TraversalWorker struct {
 func NewTraversalWorker(
 	id string,
 	queue *Queue,
-	database *db.DB,
 	adapter types.FSAdapter,
 	queueName string,
 	shutdownCtx context.Context,
@@ -39,7 +36,6 @@ func NewTraversalWorker(
 	return &TraversalWorker{
 		id:          id,
 		queue:       queue,
-		database:    database,
 		fsAdapter:   adapter,
 		queueName:   queueName,
 		isDst:       queueName == "dst",
@@ -106,22 +102,15 @@ func (w *TraversalWorker) Run() {
 		// Execute the task (check for shutdown during execution if needed)
 		err := w.execute(task)
 		if err != nil {
-			// Record task error in main DB for cross-lookup (traversal phase)
-			if w.database != nil {
-				queueType := strings.ToUpper(w.queueName)
-				err := w.database.RunUpdateWriterTx(func(tx *db.Writer) error {
-					return tx.RecordTaskError(queueType, "traversal", task.ID, err.Error(), task.Attempts, task.LocationPath())
-				})
-				if err != nil {
-					fmt.Println("error running update writer tx", err)
-				}
-			}
+			// Mark worker result BEFORE calling ReportTaskResult (for stall diagnostics)
+			task.WorkerResult = "error"
+			task.LastError = err.Error()
 			w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
-			nodeID := task.ID
-			willRetry := w.queue.isInPendingSet(nodeID)
+			willRetry := task.Attempts < w.queue.getMaxRetries()
 			w.logError(task, err, willRetry)
 		} else {
-			// Task succeeded
+			// Mark worker result BEFORE calling ReportTaskResult (for stall diagnostics)
+			task.WorkerResult = "success"
 			w.queue.ReportTaskResult(task, TaskExecutionResultSuccessful)
 		}
 	}
@@ -130,54 +119,72 @@ func (w *TraversalWorker) Run() {
 // execute performs the actual traversal work.
 // It populates task.DiscoveredChildren instead of writing directly to DB.
 func (w *TraversalWorker) execute(task *TaskBase) error {
-	// Only process folder tasks
 	if !task.IsFolder() {
 		return fmt.Errorf("traversal worker received non-folder task")
 	}
 
-	folder := task.Folder
+	parent := w.shutdownCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	wd, ctx := NewProgressWatchdog(parent, traversalStallTimeout)
+	defer wd.Stop()
 
-	// List children using the filesystem adapter.
-	// Pass the folder's depth level and path - required for SpectraFS in ephemeral mode,
-	// optional for persistent mode and other adapters (they'll ignore it).
+	folder := task.Folder
 	depth := folder.DepthLevel
-	result, err := w.fsAdapter.ListChildren(folder.ServiceID, &depth, folder.LocationPath)
+	type listChildrenResult struct {
+		result types.ListResult
+		err    error
+	}
+	listDone := make(chan listChildrenResult, 1)
+	go func(serviceID string, listDepth int, path string) {
+		r, err := w.fsAdapter.ListChildren(serviceID, &listDepth, path)
+		listDone <- listChildrenResult{result: r, err: err}
+	}(folder.ServiceID, depth, folder.LocationPath)
+
+	var (
+		result types.ListResult
+		err    error
+	)
+	select {
+	case out := <-listDone:
+		result = out.result
+		err = out.err
+		if err == nil {
+			wd.Beat()
+		}
+	case <-ctx.Done():
+		err = ctx.Err()
+	case <-w.shutdownCtx.Done():
+		err = fmt.Errorf("list children cancelled by shutdown")
+	}
 	if err != nil {
 		if logservice.LS != nil {
-			err := logservice.LS.Log("error",
+			_ = logservice.LS.Log("error",
 				fmt.Sprintf("Failed to list children: path=%s folderId=%s error=%v",
 					folder.LocationPath, folder.ServiceID, err),
 				"worker", w.id, w.queueName)
-			if err != nil {
-				fmt.Println("error logging", err)
-			}
 		}
 		return fmt.Errorf("failed to list children of %s: %w", folder.LocationPath, err)
 	}
 
-	// Wrap result in a pager so we can process children in fixed-size pages.
-	// This mimics real cloud SDK pagination behavior and keeps per-page work bounded.
-	// TODO: This should be done in the Sylos-FS repo, not at this level. Update this at some point. :)
 	const pageSize = 100
 	pager := types.NewListPager(result, pageSize)
 
-	// Check if this is a dst task with expected children (comparison mode)
 	if w.isDst {
-		// Aggregate all pages into a single ListResult for comparison.
 		aggregated := types.ListResult{}
 		for {
 			page, ok := pager.Next()
 			if !ok {
 				break
 			}
+			wd.Beat()
 			aggregated.Folders = append(aggregated.Folders, page.Folders...)
 			aggregated.Files = append(aggregated.Files, page.Files...)
 		}
-		return w.executeDstComparison(task, aggregated)
+		return w.executeDstComparison(task, aggregated, wd)
 	}
 
-	// Source mode: all discovered children get "Pending" status
-	// DepthLevel is driven by BFS round: children of a task in round N live at depth N+1.
 	task.DiscoveredChildren = make([]ChildResult, 0, len(result.Folders)+len(result.Files))
 
 	for {
@@ -185,9 +192,9 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 		if !ok {
 			break
 		}
+		wd.Beat()
 
 		for _, childFolder := range page.Folders {
-			// Override adapter-provided depth with BFS depth based on current round.
 			childFolder.DepthLevel = task.Round + 1
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				Folder: childFolder,
@@ -197,22 +204,12 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 		}
 
 		for _, childFile := range page.Files {
-			// Override adapter-provided depth with BFS depth based on current round.
 			childFile.DepthLevel = task.Round + 1
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				File:   childFile,
-				Status: db.StatusSuccessful, // Files are immediately successful (no traversal needed)
+				Status: db.StatusSuccessful,
 				IsFile: true,
 			})
-		}
-	}
-
-	// log discovered children count
-	// leave this in for debugging if you need to see if workers are firing off
-	if logservice.LS != nil {
-		err := logservice.LS.Log("info", fmt.Sprintf("Discovered %d children for task %s", len(task.DiscoveredChildren), task.ID), "worker", w.id, w.queueName)
-		if err != nil {
-			fmt.Println("error logging", err)
 		}
 	}
 
@@ -222,7 +219,8 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 // executeDstComparison performs comparison between expected (src) and actual (dst) children.
 // It populates task.DiscoveredChildren with comparison results.
 // Matching is done by Type + Name, not LocationPath.
-func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult types.ListResult) error {
+func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult types.ListResult, wd *ProgressWatchdog) error {
+	wd.Beat()
 	// Extract expected children from task (populated by queue)
 	expectedFolders := task.ExpectedFolders
 	expectedFiles := task.ExpectedFiles
@@ -353,7 +351,7 @@ func compareTimestamps(srcMTime, dstMTime string) string {
 	}
 
 	// If dst is newer, no copy needed - mark as successful
-	if dstTime.After(srcTime) {
+	if dstTime.After(srcTime)  || dstTime.Equal(srcTime) {
 		return "Successful"
 	}
 

@@ -12,7 +12,8 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Spectra/sdk"
-	"codeberg.org/Sylos/Sylos-FS/pkg/fs"
+	"codeberg.org/Sylos/Sylos-FS/pkg/fs/local"
+	"codeberg.org/Sylos/Sylos-FS/pkg/fs/spectra"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -113,12 +114,12 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 		return migration.Config{}, fmt.Errorf("failed to check mode: %w", err)
 	}
 
-	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary", isEphemeral)
+	srcAdapter, err := spectra.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary", isEphemeral)
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create src adapter: %w", err)
 	}
 
-	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1", isEphemeral)
+	dstAdapter, err := spectra.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1", isEphemeral)
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
 	}
@@ -179,12 +180,12 @@ func SetupEphemeralTest(removeMigrationDB bool) (migration.Config, error) {
 	// Create adapters with ephemeral mode enabled.
 	// The adapter will pass depth parameter in ListChildren() calls when needed (ephemeral mode only).
 	// The adapter gets the parent node's depth via GetNode() and passes it to the SDK.
-	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary", true)
+	srcAdapter, err := spectra.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary", true)
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create src adapter: %w", err)
 	}
 
-	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1", true)
+	dstAdapter, err := spectra.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1", true)
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
 	}
@@ -211,10 +212,10 @@ func SetupEphemeralTest(removeMigrationDB bool) (migration.Config, error) {
 		WorkerCount:     10,
 		MaxRetries:      3,
 		CoordinatorLead: 4,
-		SkipListener:    false,
+		SkipListener:    true,
 		LogAddress:      "127.0.0.1:8081",
 		LogLevel:        "trace",
-		StartupDelay:    3 * time.Second, // you should set this to 3 if you set skip listener to false to account for terminal opening delay
+		StartupDelay:    1 * time.Second, // you should set this to 3 if you set skip listener to false to account for terminal opening delay
 		Verification: migration.VerifyOptions{
 			AllowNotOnSrc: true, // Ephemeral mode allows divergent trees (nodes on dst but not src)
 		},
@@ -277,12 +278,12 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 	fmt.Printf("  Destination: %s\n", dstPath)
 
 	// Create LocalFS adapters
-	srcAdapter, err := fs.NewLocalFS(srcPath)
+	srcAdapter, err := local.NewLocalFS(srcPath)
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create src adapter: %w", err)
 	}
 
-	dstAdapter, err := fs.NewLocalFS(dstPath)
+	dstAdapter, err := local.NewLocalFS(dstPath)
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
 	}
@@ -346,7 +347,7 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 		LogAddress:      "127.0.0.1:8081",
 		LogLevel:        "trace",
 		SkipListener:    true,
-		StartupDelay:    3 * time.Second,
+		StartupDelay:    1 * time.Second,
 		Verification:    migration.VerifyOptions{AllowNotOnSrc: true},
 	}
 

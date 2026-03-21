@@ -21,6 +21,7 @@
 package queue
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -555,13 +556,6 @@ func (o *QueueObserver) updateInternalMetrics(queueName string, queue *Queue, cu
 		// (these states are terminal)
 	}
 
-	// Track tasks completed while active
-	if currentState == QueueStateRunning && inProgressCount > 0 {
-		// We're actively processing - track completed tasks
-		// Note: This is tracked per-poll, actual completion tracking happens in completeTask
-		// For now, we'll track this separately if needed
-	}
-
 	// Update state tracking
 	if internal.LastState != currentState {
 		// State changed - reset last state change time
@@ -590,11 +584,11 @@ func (o *QueueObserver) getTotalPendingCount(queueName string) int {
 
 		totalPending := 0
 		for _, level := range levels {
-			count, err := o.database.GetCopyCountAtDepth(level, db.NodeTypeFolder, db.CopyStatusPending)
+			count, err := o.database.GetCopyCountAtDepth(level, db.NodeTypeFolder, db.CopyStatusPending, false)
 			if err == nil {
 				totalPending += int(count)
 			}
-			count, err = o.database.GetCopyCountAtDepth(level, db.NodeTypeFile, db.CopyStatusPending)
+			count, err = o.database.GetCopyCountAtDepth(level, db.NodeTypeFile, db.CopyStatusPending, false)
 			if err == nil {
 				totalPending += int(count)
 			}
@@ -644,11 +638,11 @@ func (o *QueueObserver) getTotalFailedCount(queueName string) int {
 
 		totalFailed := 0
 		for _, level := range levels {
-			count, err := o.database.GetCopyCountAtDepth(level, db.NodeTypeFolder, db.CopyStatusFailed)
+			count, err := o.database.GetCopyCountAtDepth(level, db.NodeTypeFolder, db.CopyStatusFailed, false)
 			if err == nil {
 				totalFailed += int(count)
 			}
-			count, err = o.database.GetCopyCountAtDepth(level, db.NodeTypeFile, db.CopyStatusFailed)
+			count, err = o.database.GetCopyCountAtDepth(level, db.NodeTypeFile, db.CopyStatusFailed, false)
 			if err == nil {
 				totalFailed += int(count)
 			}
@@ -689,29 +683,31 @@ func (o *QueueObserver) publishMetricsToDuckDB(metricsMap map[string]ExternalQue
 		return
 	}
 
-	err := o.database.RunUpdateWriterTx(func(w *db.Writer) error {
-		for queueName, metrics := range metricsMap {
-			key := queueName
-			if queueName != "copy" {
-				key = queueName + "-traversal"
-			}
-			metricsJSON, err := json.Marshal(metrics)
-			if err != nil {
-				if logservice.LS != nil {
-					err := logservice.LS.Log("error",
-						fmt.Sprintf("Failed to marshal metrics for queue %s: %v", queueName, err),
-						"observer", "publish", "")
-					if err != nil {
-						fmt.Println("error logging", err)
-					}
+	err := o.database.RunWrite(context.Background(), func(s *db.WriteSession) error {
+		return s.WithTx(func(w *db.Writer) error {
+			for queueName, metrics := range metricsMap {
+				key := queueName
+				if queueName != "copy" {
+					key = queueName + "-traversal"
 				}
-				continue
+				metricsJSON, err := json.Marshal(metrics)
+				if err != nil {
+					if logservice.LS != nil {
+						err := logservice.LS.Log("error",
+							fmt.Sprintf("Failed to marshal metrics for queue %s: %v", queueName, err),
+							"observer", "publish", "")
+						if err != nil {
+							fmt.Println("error logging", err)
+						}
+					}
+					continue
+				}
+				if err := w.WriteQueueStats(key, string(metricsJSON)); err != nil {
+					return fmt.Errorf("failed to write metrics for %s: %w", key, err)
+				}
 			}
-			if err := w.WriteQueueStats(key, string(metricsJSON)); err != nil {
-				return fmt.Errorf("failed to write metrics for %s: %w", key, err)
-			}
-		}
-		return nil
+			return nil
+		})
 	})
 
 	if err != nil {

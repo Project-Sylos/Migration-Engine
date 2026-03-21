@@ -1,7 +1,7 @@
 # cleanup.ps1
 # Restores permissions and removes retry-sweep test folders
 
-$BaseDir = "$env:USERPROFILE\sylos_retry_test"
+$BaseDir = "$env:USERPROFILE\..sylos_retry_test"
 $TreeA   = "$BaseDir\A\items"
 
 $Icacls = "$env:SystemRoot\System32\icacls.exe"

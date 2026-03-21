@@ -59,10 +59,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Seed roots: %v\n", err)
 		os.Exit(1)
 	}
-	if err := db.BootstrapRootStats(database); err != nil {
-		fmt.Fprintf(os.Stderr, "Bootstrap stats: %v\n", err)
-		os.Exit(1)
-	}
 
 	fmt.Println("Done. pkg/tests/traversal/shared/main_test.db has schema and root nodes.")
 	fmt.Println("Run a test traversal to populate it; then use that DB for retry_sweep or copy tests.")

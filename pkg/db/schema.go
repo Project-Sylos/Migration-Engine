@@ -4,15 +4,22 @@
 package db
 
 const (
-	tableSrcNodes   = "src_nodes"
-	tableDstNodes   = "dst_nodes"
-	tableSrcStats   = "src_stats"
-	tableDstStats   = "dst_stats"
+	tableSrcNodes         = "src_nodes"
+	tableDstNodes         = "dst_nodes"
+	tableSrcStatusEvents  = "src_status_events"
+	tableDstStatusEvents  = "dst_status_events"
+	tableSrcStats         = "src_stats"
+	tableDstStats         = "dst_stats"
+	tableStats            = "stats" // universal key/count table for canonical review stats
 	// TableMigrations is the migrations lifecycle table name (used by schema and migration store).
 	TableMigrations = "migrations"
+	// TableMigrationEnvelope holds one row per migration DB: 32-byte envelope master key for Sylos-FS credentials.
+	TableMigrationEnvelope = "migration_envelope"
+	// TableFSCredentialBinding holds per-side connection id, optional creds file path, and serialized root folder for API rehydration.
+	TableFSCredentialBinding = "fs_credential_binding"
 )
 
-// nodeTableDDL returns CREATE TABLE for src_nodes or dst_nodes.
+// nodeTableDDL returns CREATE TABLE for src_nodes or dst_nodes (metadata only; no status columns).
 func nodeTableDDL(table string) string {
 	return `CREATE TABLE IF NOT EXISTS ` + table + ` (
 		id VARCHAR PRIMARY KEY,
@@ -21,20 +28,39 @@ func nodeTableDDL(table string) string {
 		parent_service_id VARCHAR,
 		path VARCHAR,
 		parent_path VARCHAR,
+		path_hash VARCHAR,
+		parent_path_hash VARCHAR,
 		type VARCHAR,
 		size BIGINT,
 		mtime VARCHAR,
-		depth INTEGER NOT NULL,
-		traversal_status VARCHAR,
-		copy_status VARCHAR,
-		excluded BOOLEAN DEFAULT FALSE,
-		errors VARCHAR
+		depth INTEGER NOT NULL
 	)`
 }
 
-// statsTableDDL returns CREATE TABLE for stats (completed counts, etc.).
+// srcStatusEventsTableDDL returns CREATE TABLE for append-only source status events.
+func srcStatusEventsTableDDL() string {
+	return `CREATE TABLE IF NOT EXISTS ` + tableSrcStatusEvents + ` (
+		id VARCHAR NOT NULL,
+		traversal_status VARCHAR,
+		copy_status VARCHAR,
+		event_time BIGINT NOT NULL,
+		depth INTEGER NOT NULL
+	)`
+}
+
+// dstStatusEventsTableDDL returns CREATE TABLE for append-only destination status events.
+func dstStatusEventsTableDDL() string {
+	return `CREATE TABLE IF NOT EXISTS ` + tableDstStatusEvents + ` (
+		id VARCHAR NOT NULL,
+		traversal_status VARCHAR,
+		event_time BIGINT NOT NULL,
+		depth INTEGER NOT NULL
+	)`
+}
+
+// statsTableDDL returns CREATE TABLE for the universal stats table (key/count for review and other global counters).
 func statsTableDDL() string {
-	return `CREATE TABLE IF NOT EXISTS stats (
+	return `CREATE TABLE IF NOT EXISTS ` + tableStats + ` (
 		key VARCHAR PRIMARY KEY,
 		count BIGINT NOT NULL DEFAULT 0
 	)`
@@ -65,7 +91,7 @@ func dstStatsTableDDL() string {
 // logsTableDDL returns CREATE TABLE for logs.
 func logsTableDDL() string {
 	return `CREATE TABLE IF NOT EXISTS logs (
-		id INTEGER PRIMARY KEY,
+		id VARCHAR PRIMARY KEY,
 		level VARCHAR,
 		message VARCHAR,
 		component VARCHAR,
@@ -105,7 +131,26 @@ func migrationsTableDDL() string {
 		created_at TIMESTAMP NOT NULL,
 		updated_at TIMESTAMP NOT NULL,
 		service_metadata_json VARCHAR,
-		root_config_json VARCHAR
+		root_config_json VARCHAR,
+		runtime_state_json VARCHAR
+	)`
+}
+
+func migrationEnvelopeTableDDL() string {
+	return `CREATE TABLE IF NOT EXISTS ` + TableMigrationEnvelope + ` (
+		singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+		envelope_master_key BLOB NOT NULL
+	)`
+}
+
+func fsCredentialBindingTableDDL() string {
+	return `CREATE TABLE IF NOT EXISTS ` + TableFSCredentialBinding + ` (
+		role VARCHAR PRIMARY KEY,
+		connection_id VARCHAR NOT NULL DEFAULT '',
+		creds_conf_relpath VARCHAR,
+		service_id VARCHAR,
+		root_folder_json VARCHAR,
+		updated_at TIMESTAMP NOT NULL
 	)`
 }
 

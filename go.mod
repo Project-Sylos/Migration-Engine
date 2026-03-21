@@ -4,11 +4,11 @@ go 1.25.6
 
 require (
 	codeberg.org/Sylos/Spectra v0.2.6
-	codeberg.org/Sylos/Sylos-FS v0.1.4
+	codeberg.org/Sylos/Sylos-FS v0.1.6
 	github.com/marcboeker/go-duckdb v1.7.0
 )
 
-require github.com/google/uuid v1.6.0 // indirect
+require github.com/google/uuid v1.6.0
 
 require (
 	github.com/apache/arrow/go/v14 v14.0.2 // indirect
@@ -21,7 +21,7 @@ require (
 	github.com/zeebo/xxh3 v1.0.2 // indirect
 	go.etcd.io/bbolt v1.4.3 // indirect; indirect (required by Spectra)
 	golang.org/x/mod v0.13.0 // indirect
-	golang.org/x/sys v0.39.0 // indirect
+	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/tools v0.14.0 // indirect
 	golang.org/x/xerrors v0.0.0-20220907171357-04be3eba64a2 // indirect
 )

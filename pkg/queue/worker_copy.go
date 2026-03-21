@@ -5,11 +5,12 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"time"
 
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
@@ -24,7 +25,6 @@ const (
 type CopyWorker struct {
 	id          string
 	queue       *Queue
-	database    *db.DB
 	srcAdapter  types.FSAdapter // Source adapter for reading files
 	dstAdapter  types.FSAdapter // Destination adapter for writing files/folders
 	queueName   string          // "copy" for logging
@@ -37,7 +37,6 @@ type CopyWorker struct {
 func NewCopyWorker(
 	id string,
 	queue *Queue,
-	database *db.DB,
 	srcAdapter types.FSAdapter,
 	dstAdapter types.FSAdapter,
 	shutdownCtx context.Context,
@@ -45,7 +44,6 @@ func NewCopyWorker(
 	return &CopyWorker{
 		id:          id,
 		queue:       queue,
-		database:    database,
 		srcAdapter:  srcAdapter,
 		dstAdapter:  dstAdapter,
 		queueName:   "copy",
@@ -113,31 +111,25 @@ func (w *CopyWorker) Run() {
 		// Execute the task (check for shutdown during execution if needed)
 		err := w.execute(task)
 		if err != nil {
-			// Record task error in main DB for cross-lookup (copy phase, SRC only)
-			if w.database != nil {
-				err := w.database.RunUpdateWriterTx(func(tx *db.Writer) error {
-					return tx.RecordTaskError("SRC", "copy", task.ID, err.Error(), task.Attempts, task.LocationPath())
-				})
-				if err != nil {
-					fmt.Println("error running update writer tx", err)
-				}
-			}
+			// Mark worker result BEFORE calling ReportTaskResult (for stall diagnostics)
+			task.WorkerResult = "error"
+			task.LastError = err.Error()
 			if logservice.LS != nil {
+				logMsg := fmt.Sprintf("Copy worker task execution failed: path=%s round=%d pass=%d error=%v",
+					task.LocationPath(), task.Round, task.CopyPass, err)
 				err := logservice.LS.Log("error",
-					fmt.Sprintf("Copy worker task execution failed: path=%s round=%d pass=%d error=%v",
-						task.LocationPath(), task.Round, task.CopyPass, err),
+					logMsg,
 					"worker", w.id, w.queueName)
 				if err != nil {
 					fmt.Println("error logging", err)
 				}
 			}
 			w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
-			// Check if task was retried for logging
-			nodeID := task.ID
-			willRetry := w.queue.isInPendingSet(nodeID)
+			willRetry := task.Attempts < w.queue.getMaxRetries()
 			w.logError(task, err, willRetry)
 		} else {
-			// Task succeeded
+			// Mark worker result BEFORE calling ReportTaskResult (for stall diagnostics)
+			task.WorkerResult = "success"
 			w.queue.ReportTaskResult(task, TaskExecutionResultSuccessful)
 		}
 	}
@@ -147,118 +139,300 @@ func (w *CopyWorker) Run() {
 // For folders: creates the folder on the destination.
 // For files: streams the file from source to destination.
 func (w *CopyWorker) execute(task *TaskBase) error {
+	parent := w.shutdownCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	wd, ctx := NewProgressWatchdog(parent, copyStallTimeout)
+	defer wd.Stop()
+
+	// This whole block of code looks like an x-wing fighter from star wars lol...
 	switch task.CopyPass {
 	case 1:
-		// Pass 1: Create folders
 		if !task.IsFolder() {
 			return fmt.Errorf("copy worker received non-folder task in pass 1")
 		}
-		return w.createFolder(task)
+		return w.createFolder(task, ctx, wd)
 	case 2:
-		// Pass 2: Copy files
 		if !task.IsFile() {
 			return fmt.Errorf("copy worker received non-file task in pass 2")
 		}
-		return w.copyFile(task)
+		return w.copyFile(task, ctx, wd)
 	}
 
 	return fmt.Errorf("invalid copy pass: %d", task.CopyPass)
 }
 
 // createFolder creates a folder on the destination filesystem.
-func (w *CopyWorker) createFolder(task *TaskBase) error {
+// CreateFolder does not take context; we run it in a goroutine and select on ctx.Done() for stall detection.
+func (w *CopyWorker) createFolder(task *TaskBase, ctx context.Context, wd *ProgressWatchdog) error {
 	folder := task.Folder
 
-	// Processing folder task
-
-	// Get destination parent folder ServiceID (should already be populated by queue)
 	dstParentServiceID := task.DstParentID
 	if dstParentServiceID == "" {
 		return fmt.Errorf("task missing DstParentID (ServiceID) for %s", folder.LocationPath)
 	}
 
-	// Create folder on destination using ServiceID
-	// CreateFolder(parentIdentifier string, folderName string) (types.Folder, error)
-	// For LocalFS: parentIdentifier is a path, for SpectraFS: parentIdentifier is a ServiceID
-	createdFolder, err := w.dstAdapter.CreateFolder(dstParentServiceID, folder.DisplayName)
-	if err != nil {
-		return fmt.Errorf("failed to create folder %s in parent %s: %w", folder.DisplayName, dstParentServiceID, err)
+	if w.queue.shouldApplyCopyDstResumeExistenceCheck() {
+		done, err := w.applyResumeCopyDstFolderPrecheck(task, ctx, wd)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
 	}
 
-	// Store created folder info in task for queue to process on completion
-	// The queue will create DST node entry and update join-lookup after task succeeds
-	task.Folder = createdFolder
+	folderName := filepath.Base(folder.LocationPath)
+	if folderName == "" || folderName == "." {
+		folderName = folder.DisplayName
+	}
 
-	return nil
+	wd.Beat()
+	done := make(chan error, 1)
+	go func() {
+		created, err := w.dstAdapter.CreateFolder(dstParentServiceID, folderName)
+		if err != nil {
+			done <- fmt.Errorf("failed to create folder %s in parent %s: %w", folder.DisplayName, dstParentServiceID, err)
+			return
+		}
+		task.Folder = created
+		done <- nil
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return err
+		}
+		wd.Beat()
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("create folder cancelled by watchdog for %s: %w", folder.LocationPath, ctx.Err())
+	}
 }
 
 // copyFile streams a file from source to destination.
-func (w *CopyWorker) copyFile(task *TaskBase) error {
+// Uses a read/write loop with Beat() so the progress watchdog resets while data is flowing.
+func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressWatchdog) error {
 	file := task.File
 
-	// Processing file task
-
-	// Get destination parent folder ServiceID (should already be populated by queue)
 	dstParentServiceID := task.DstParentID
 	if dstParentServiceID == "" {
 		return fmt.Errorf("task missing DstParentID (ServiceID) for file %s", file.LocationPath)
 	}
 
-	// Get context for FS operations (use shutdownCtx if available, otherwise background)
-	ctx := w.shutdownCtx
-	if ctx == nil {
-		ctx = context.Background()
+	if w.queue.shouldApplyCopyDstResumeExistenceCheck() {
+		skipCopy, err := w.applyResumeCopyDstFilePrecheck(task, ctx, wd)
+		if err != nil {
+			return err
+		}
+		if skipCopy {
+			return nil
+		}
 	}
 
-	// Step 1: Open source file for reading
-	// OpenRead returns an io.ReadCloser for streaming reads
 	srcReader, err := w.srcAdapter.OpenRead(ctx, file.ServiceID)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("open source cancelled by watchdog for %s: %w", file.LocationPath, err)
+		}
 		return fmt.Errorf("failed to open source file %s for reading: %w", file.LocationPath, err)
 	}
 	defer srcReader.Close()
+	wd.Beat()
 
-	// Step 2: Create destination file with metadata
-	// CreateFile creates the file metadata and returns a types.File with ServiceID populated
-	createdFile, err := w.dstAdapter.CreateFile(ctx, dstParentServiceID, file.DisplayName, file.Size, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create destination file %s in parent %s: %w", file.DisplayName, dstParentServiceID, err)
+	fileName := filepath.Base(file.LocationPath)
+	if fileName == "" || fileName == "." {
+		fileName = file.DisplayName
 	}
+	createdFile, err := w.dstAdapter.CreateFile(ctx, dstParentServiceID, fileName, file.Size, nil)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("create file cancelled by watchdog for %s: %w", file.LocationPath, err)
+		}
+		return fmt.Errorf("failed to create destination file %s in parent %s: %w", fileName, dstParentServiceID, err)
+	}
+	// All of these beats are making me wanna jam. 
+	wd.Beat()
 
-	// Step 3: Open destination file for writing
-	// OpenWrite returns an io.WriteCloser for streaming writes
 	dstWriter, err := w.dstAdapter.OpenWrite(ctx, createdFile.ServiceID)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("open write cancelled by watchdog for %s: %w", file.LocationPath, err)
+		}
 		return fmt.Errorf("failed to open destination file %s for writing: %w", createdFile.ServiceID, err)
 	}
+	wd.Beat()
 
-	// Step 4: Worker owns the copy loop - stream data directly from source to destination
-	// io.CopyBuffer handles the streaming efficiently with our buffer
-	bytesTransferred, err := io.CopyBuffer(dstWriter, srcReader, w.copyBuffer)
-	if err != nil {
-		// Close writer on copy error (may fail, but we already have the copy error)
-		err := dstWriter.Close()
-		if err != nil {
-			fmt.Println("error closing destination writer", err)
+	var bytesTransferred int64
+	buf := w.copyBuffer
+	for {
+		n, readErr := srcReader.Read(buf)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			_ = dstWriter.Close()
+			if errors.Is(readErr, context.Canceled) || errors.Is(readErr, context.DeadlineExceeded) {
+				return fmt.Errorf("copy cancelled by watchdog for %s: %w", file.LocationPath, readErr)
+			}
+			return fmt.Errorf("failed to copy file data for %s: %w", file.LocationPath, readErr)
 		}
-		return fmt.Errorf("failed to copy file data for %s: %w", file.LocationPath, err)
+		if n > 0 {
+			_, writeErr := dstWriter.Write(buf[:n])
+			if writeErr != nil {
+				_ = dstWriter.Close()
+				if errors.Is(writeErr, context.Canceled) || errors.Is(writeErr, context.DeadlineExceeded) {
+					return fmt.Errorf("copy cancelled by watchdog for %s: %w", file.LocationPath, writeErr)
+				}
+				return fmt.Errorf("failed to copy file data for %s: %w", file.LocationPath, writeErr)
+			}
+			bytesTransferred += int64(n)
+			wd.Beat()
+		}
+		if readErr == io.EOF {
+			break
+		}
 	}
 
-	// Step 5: Close writer to commit the upload
-	// Close() finalizes the upload - if it fails, the upload failed
-	// This is NOT deferred because we need to check the error to know if upload succeeded
 	if err := dstWriter.Close(); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("commit cancelled by watchdog for %s: %w", file.LocationPath, err)
+		}
 		return fmt.Errorf("failed to commit upload for file %s: %w", file.DisplayName, err)
 	}
 
-	// Track bytes transferred
 	task.BytesTransferred = bytesTransferred
-
-	// Store created file info in task for queue to process on completion
-	// The queue will create DST node entry and update join-lookup after task succeeds
 	task.File = createdFile
-
 	return nil
+}
+
+// applyResumeCopyDstFolderPrecheck lists the dst parent and short-circuits if the folder already exists
+// or errors on name/type clash. Used only when shouldApplyCopyDstResumeExistenceCheck() is true.
+func (w *CopyWorker) applyResumeCopyDstFolderPrecheck(task *TaskBase, ctx context.Context, wd *ProgressWatchdog) (done bool, err error) {
+	folder := task.Folder
+	dstParentServiceID := task.DstParentID
+	parentPath, parentDepth, err := copyTaskParentListArgs(task)
+	if err != nil {
+		return false, err
+	}
+	aggregated, err := w.listDstChildrenAggregated(dstParentServiceID, parentPath, parentDepth, ctx, wd)
+	if err != nil {
+		return false, fmt.Errorf("list destination children before folder create for %s: %w", folder.LocationPath, err)
+	}
+	folderMap, fileMap := copyTaskChildMaps(aggregated, task.Round)
+	matchKey := folder.Type + ":" + folder.DisplayName
+	if existing, ok := folderMap[matchKey]; ok {
+		task.Folder = existing
+		wd.Beat()
+		return true, nil
+	}
+	if _, ok := fileMap[types.NodeTypeFile+":"+folder.DisplayName]; ok {
+		return false, fmt.Errorf("destination has file %q but task expects folder at %s", folder.DisplayName, folder.LocationPath)
+	}
+	return false, nil
+}
+
+// applyResumeCopyDstFilePrecheck lists the dst parent and skips copy when the file exists and is up to date
+// (same mtime rule as traversal dst comparison). Used only when shouldApplyCopyDstResumeExistenceCheck() is true.
+func (w *CopyWorker) applyResumeCopyDstFilePrecheck(task *TaskBase, ctx context.Context, wd *ProgressWatchdog) (skipCopy bool, err error) {
+	file := task.File
+	dstParentServiceID := task.DstParentID
+	parentPath, parentDepth, err := copyTaskParentListArgs(task)
+	if err != nil {
+		return false, err
+	}
+	aggregated, err := w.listDstChildrenAggregated(dstParentServiceID, parentPath, parentDepth, ctx, wd)
+	if err != nil {
+		return false, fmt.Errorf("list destination children before file copy for %s: %w", file.LocationPath, err)
+	}
+	folderMap, fileMap := copyTaskChildMaps(aggregated, task.Round)
+	matchKey := file.Type + ":" + file.DisplayName
+	if _, ok := folderMap[types.NodeTypeFolder+":"+file.DisplayName]; ok {
+		return false, fmt.Errorf("destination has folder %q but task expects file at %s", file.DisplayName, file.LocationPath)
+	}
+	if existing, ok := fileMap[matchKey]; ok {
+		if compareTimestamps(file.LastUpdated, existing.LastUpdated) == "Successful" {
+			task.File = existing
+			wd.Beat()
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// copyTaskParentListArgs returns parent path and depth for ListChildren on the destination parent,
+// matching traversal dst usage (normalized root-relative path; depth = parent level).
+func copyTaskParentListArgs(task *TaskBase) (parentPath string, parentDepth int, err error) {
+	loc := types.NormalizeLocationPath(task.LocationPath())
+	if loc == "" || loc == "/" {
+		return "", 0, fmt.Errorf("task missing or root LocationPath")
+	}
+	parentPath = types.NormalizeLocationPath(filepath.Dir(loc))
+	parentDepth = task.Round - 1
+	if parentDepth < 0 {
+		parentDepth = 0
+	}
+	return parentPath, parentDepth, nil
+}
+
+// copyTaskChildMaps indexes listed dst children by Type+DisplayName (same as traversal dst comparison).
+func copyTaskChildMaps(aggregated types.ListResult, childRound int) (map[string]types.Folder, map[string]types.File) {
+	folderMap := make(map[string]types.Folder)
+	for _, f := range aggregated.Folders {
+		f.DepthLevel = childRound
+		folderMap[f.Type+":"+f.DisplayName] = f
+	}
+	fileMap := make(map[string]types.File)
+	for _, f := range aggregated.Files {
+		f.DepthLevel = childRound
+		fileMap[f.Type+":"+f.DisplayName] = f
+	}
+	return folderMap, fileMap
+}
+
+// listDstChildrenAggregated lists immediate children of the dst parent and merges pager pages (traversal pattern).
+func (w *CopyWorker) listDstChildrenAggregated(dstParentID, parentPath string, parentDepth int, ctx context.Context, wd *ProgressWatchdog) (types.ListResult, error) {
+	type listChildrenResult struct {
+		result types.ListResult
+		err    error
+	}
+	listDone := make(chan listChildrenResult, 1)
+	depth := parentDepth
+	go func() {
+		r, err := w.dstAdapter.ListChildren(dstParentID, &depth, parentPath)
+		listDone <- listChildrenResult{result: r, err: err}
+	}()
+
+	var shutdownCh <-chan struct{}
+	if w.shutdownCtx != nil {
+		shutdownCh = w.shutdownCtx.Done()
+	}
+
+	var out listChildrenResult
+	select {
+	case out = <-listDone:
+		if out.err != nil {
+			return types.ListResult{}, out.err
+		}
+		wd.Beat()
+	case <-ctx.Done():
+		return types.ListResult{}, fmt.Errorf("list destination children cancelled: %w", ctx.Err())
+	case <-shutdownCh:
+		return types.ListResult{}, fmt.Errorf("list destination children cancelled by shutdown")
+	}
+
+	const pageSize = 100
+	pager := types.NewListPager(out.result, pageSize)
+	var aggregated types.ListResult
+	for {
+		page, ok := pager.Next()
+		if !ok {
+			break
+		}
+		wd.Beat()
+		aggregated.Folders = append(aggregated.Folders, page.Folders...)
+		aggregated.Files = append(aggregated.Files, page.Files...)
+	}
+	return aggregated, nil
 }
 
 // logError logs a failed task execution.
