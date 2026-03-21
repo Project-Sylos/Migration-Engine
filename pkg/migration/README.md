@@ -66,14 +66,12 @@ Examples: **`roots-set`**, **`filters-set`**, **`traversal-in-progress`**, **`aw
 
 ### Common methods
 
-- **`AddRoots`**, **`StartTraversal(cfg)`**, **`StartCopy(cfg)`** – both require live **FS adapters** in **`cfg`**; a JSON snapshot of roots and run knobs (no adapters) is written to **`migrations.root_config_json`** via **`UpdateConfig`** for resumability.
+- **`AddRoots`**, **`StartTraversal(cfg)`**, **`StartCopy(cfg)`** – require live **FS adapters** in **`cfg`**; **`UpdateConfig`** persists **`root_config_json`**. **`StartCopy`** may be called again while phase is **`copy-in-progress`** to resume after a crash; **`RunCopyPhase`** rescans pending depths and may enable a one-round dst existence precheck when events show both successful and pending copy work (`copy.go`).
 - **`RunRetrySweep(cfg, opts)`**, **`PrepareRetrySweep()`** – For **async** HTTP: call **`PrepareRetrySweep()` synchronously** before returning **202**, then run **`RunRetrySweep`** with the same **`cfg`** shape as traversal (adapters + roots) in a background task.
 - **`RunCopyRetry(cfg, opts)`**, **`PrepareCopyRetry()`** – Same pattern for copy retry when exposed asynchronously.
 - **`UpdateConfig(cfg)`** – persists **`root_config_json`** only (serializable fields); callers still pass **`cfg`** with adapters for each run.
 - Review helpers: query nodes, path review, exclude, mark retry, etc.
 - **`Stop()`** – stop result with current phase / runtime snapshot.
-
-**`RunMigration`** / **`RunCopyPhase`** configuration type **`MigrationConfig`** (`run.go`, `copy.go`) includes **`MaxSrcAhead`** (queue default **2** when unset).
 
 ---
 

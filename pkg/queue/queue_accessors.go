@@ -74,6 +74,42 @@ func (q *Queue) SetCopyPass(pass int) {
 	q.copyPass = pass
 }
 
+// SetCopyResumeDstExistenceWindow enables the copy worker dst ListChildren precheck until the anchor
+// pass+round is left (see AdvanceCopyRound). Only for normal copy mode (not copy-retry); call from
+// RunCopyPhase when resuming a partially completed copy (Successful>0 and Pending>0 in status events).
+func (q *Queue) SetCopyResumeDstExistenceWindow(anchorPass, anchorRound int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.name != "copy" {
+		return
+	}
+	q.copyResumeDstExistenceActive = true
+	q.copyResumeDstExistenceAnchorPass = anchorPass
+	q.copyResumeDstExistenceAnchorRound = anchorRound
+}
+
+func (q *Queue) shouldApplyCopyDstResumeExistenceCheck() bool {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	if q.mode != QueueModeCopy || !q.copyResumeDstExistenceActive {
+		return false
+	}
+	return q.copyPass == q.copyResumeDstExistenceAnchorPass && q.round == q.copyResumeDstExistenceAnchorRound
+}
+
+// noteCopyResumeDstExistenceLeavingAnchorRound clears resume dst precheck after the anchor round finishes
+// (first AdvanceCopyRound call while still positioned on that pass+round).
+func (q *Queue) noteCopyResumeDstExistenceLeavingAnchorRound() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if !q.copyResumeDstExistenceActive {
+		return
+	}
+	if q.copyPass == q.copyResumeDstExistenceAnchorPass && q.round == q.copyResumeDstExistenceAnchorRound {
+		q.copyResumeDstExistenceActive = false
+	}
+}
+
 // SetWorkers sets the workers associated with this queue.
 func (q *Queue) SetWorkers(workers []Worker) {
 	q.mu.Lock()

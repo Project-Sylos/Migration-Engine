@@ -11,7 +11,7 @@ The queue layer drives **source** and **destination** traversal and **copy** usi
 1. **Pull** – `PullTraversalTasks` / `PullRetryTasks` / `PullCopyTasks` refill `pendingBuff` from SQL (`ListNodesByDepthKeyset`, `ListDstBatchWithSrcChildren`, copy keysets, etc.). Only one pull runs at a time (`getPulling` / `setPulling`).
 2. **Lease** – Workers take tasks from `pendingBuff` into `inProgress`.
 3. **Complete** – `ReportTaskResult` updates state and enqueues **seal** work (nodes + per-depth stats) through the DB layer.
-4. **Coordinator** – DST may start round *N* only when SRC has completed rounds *N* and *N+1* (or SRC is done). SRC may stay at most **`maxSrcAhead`** rounds ahead of DST (queue default **2**; set **`MigrationConfig.MaxSrcAhead`** in `RunMigration` to override).
+4. **Coordinator** – DST may start round *N* only when SRC has completed rounds *N* and *N+1* (or SRC traversal is done). SRC is not round-gated against DST; work is pulled and sealed to DuckDB in batches, so SRC can advance as fast as workers allow.
 
 ---
 
@@ -26,11 +26,11 @@ The queue layer drives **source** and **destination** traversal and **copy** usi
 | `mode_retry.go` | `PullRetryTasks`; DST cleanup on SRC folder complete in retry mode |
 | `mode_copy.go` | `PullCopyTasks`, copy completion, `CheckCopyCompletion` |
 | `worker_traversal.go` | List children / compare → `ReportTaskResult` |
-| `worker_copy.go` | Folder/file copy → `ReportTaskResult` |
+| `worker_copy.go` | Folder/file copy → `ReportTaskResult`; optional dst list precheck when resuming partial copy (one anchor round only) |
 | `worker/interface.go` | `Worker` interface |
 | `task.go` | `TaskBase`, task types, `ChildResult` |
 | `seeding.go` | Root seeding helpers used with `pkg/db` |
-| `coordinator.go` | `QueueCoordinator`, `CanDstStartRound`, `CanSrcStartRound`, `SetMaxSrcAhead` |
+| `coordinator.go` | `QueueCoordinator`, `CanDstStartRound`, round tracking for SRC/DST |
 | `observer.go` | Polls stats / queues, writes `queue_stats` |
 | `queue_watchdog.go` / `progress_watchdog.go` | Timeouts / progress |
 
@@ -62,5 +62,5 @@ Resume uses the same DuckDB file: `initializeQueues` in `pkg/migration/run.go` r
 ## Summary
 
 - **DB-backed pulls** into `pendingBuff`; **seal** persists levels/stats.
-- **Coordinator** enforces DST lag and SRC-ahead cap (**default 2**, configurable).
+- **Coordinator** enforces DST lag behind SRC (two-round lead); SRC has no coordinator throttle.
 - **Modes:** traversal, retry, copy, copy-retry.

@@ -12,36 +12,23 @@ import (
 )
 
 // QueueCoordinator manages round advancement gates for dual-BFS traversal.
-// It enforces: DST cannot advance to round N until SRC has completed rounds N and N+1;
-// SRC may not run ahead of DST by more than MaxSrcAhead rounds (default 2).
+// It enforces: DST cannot advance to round N until SRC has completed rounds N and N+1 (or SRC traversal is done).
+// SRC is not level-gated relative to DST; frontier is streamed to the database in chunks.
 type QueueCoordinator struct {
-	mu          sync.RWMutex
-	srcRound    int
-	srcDone     bool
-	dstRound    int
-	dstDone     bool
-	maxSrcAhead int // SRC may run when srcRound <= dstRound + maxSrcAhead
+	mu       sync.RWMutex
+	srcRound int
+	srcDone  bool
+	dstRound int
+	dstDone  bool
 }
-
-const defaultMaxSrcAhead = 2
 
 // NewQueueCoordinator creates a new coordinator.
 func NewQueueCoordinator() *QueueCoordinator {
 	return &QueueCoordinator{
-		srcRound:    0,
-		srcDone:     false,
-		dstRound:    0,
-		dstDone:     false,
-		maxSrcAhead: defaultMaxSrcAhead,
-	}
-}
-
-// SetMaxSrcAhead sets the maximum rounds SRC may run ahead of DST (default 2; override via MigrationConfig.MaxSrcAhead > 0).
-func (c *QueueCoordinator) SetMaxSrcAhead(n int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if n >= 0 {
-		c.maxSrcAhead = n
+		srcRound: 0,
+		srcDone:  false,
+		dstRound: 0,
+		dstDone:  false,
 	}
 }
 

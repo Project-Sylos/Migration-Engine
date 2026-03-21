@@ -29,6 +29,26 @@ type CopyPhaseConfig struct {
 	ShutdownContext context.Context
 }
 
+// applyCopyResumeDstExistenceWindow enables the copy queue's one-shot dst ListChildren precheck when
+// restarting after partial copy progress (see queue.SetCopyResumeDstExistenceWindow).
+// Uses GetCopyStatusCountsFromEvents: requires both successful and pending SRC copy rows.
+// If any folder copy is still pending, anchors pass 1 at startRound; if only file copies are pending,
+// anchors pass 2 at the minimum depth that still has pending files (so empty shallow file rounds
+// do not consume the window before real work runs).
+func applyCopyResumeDstExistenceWindow(q *queue.Queue, duckDB *db.DB, startRound, minFolderPendingLevel, minFilePendingLevel int) {
+	counts, err := duckDB.GetCopyStatusCountsFromEvents()
+	if err != nil || counts.Successful <= 0 || counts.Pending <= 0 {
+		return
+	}
+	if minFolderPendingLevel != -1 {
+		q.SetCopyResumeDstExistenceWindow(1, startRound)
+		return
+	}
+	if minFilePendingLevel != -1 {
+		q.SetCopyResumeDstExistenceWindow(2, minFilePendingLevel)
+	}
+}
+
 // RunCopyRetryPhase runs the copy phase in retry mode: only copy_status = failed items are pulled.
 // Uses the same two-pass BFS and max-depth guarded completion as traversal retry.
 func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
@@ -209,33 +229,36 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	copyQueue.SetMode(queue.QueueModeCopy)
 	copyQueue.SetCopyPass(1) // Start with pass 1 (folders)
 
-	// Find minimum level with pending copy tasks (skip round 0)
-	// Start at round 1 since round 0 (root) is skipped
-	// Use -1 as sentinel to indicate we haven't found any pending level yet
-	minLevel := -1
+	// Minimum depth with pending folder / file copy (skip round 0). Used for start round and resume dst precheck anchor.
+	minFolderPendingLevel := -1
+	minFilePendingLevel := -1
 	levels, err := db.GetAllLevels(duckDB, "SRC")
 	if err == nil && len(levels) > 0 {
-		// Find minimum level with pending copy tasks (start with folders since pass 1 is folders)
 		for _, level := range levels {
 			if level == 0 {
 				continue // Skip round 0
 			}
-			// Check folder tasks (pass 1 starts with folders)
-			c, err := duckDB.GetCopyCountAtDepth(level, db.NodeTypeFolder, db.CopyStatusPending, true)
-			if err == nil && c > 0 {
-				// First pending level found OR current level is smaller than what we've found
-				if minLevel == -1 || level < minLevel {
-					minLevel = level
+			cf, err1 := duckDB.GetCopyCountAtDepth(level, db.NodeTypeFolder, db.CopyStatusPending, true)
+			if err1 == nil && cf > 0 {
+				if minFolderPendingLevel == -1 || level < minFolderPendingLevel {
+					minFolderPendingLevel = level
+				}
+			}
+			cn, err2 := duckDB.GetCopyCountAtDepth(level, db.NodeTypeFile, db.CopyStatusPending, true)
+			if err2 == nil && cn > 0 {
+				if minFilePendingLevel == -1 || level < minFilePendingLevel {
+					minFilePendingLevel = level
 				}
 			}
 		}
 	}
 
-	// If no pending levels found, default to level 1
-	if minLevel == -1 {
-		minLevel = 1
+	startRound := 1
+	if minFolderPendingLevel != -1 {
+		startRound = minFolderPendingLevel
 	}
-	copyQueue.SetRound(minLevel) // Set initial round
+	copyQueue.SetRound(startRound)
+	applyCopyResumeDstExistenceWindow(copyQueue, duckDB, startRound, minFolderPendingLevel, minFilePendingLevel)
 	copyQueue.EnsureRoundExpectedFromStats()
 
 	// Set max known depth from DB so copy completion and round advancement know the full depth range.
@@ -346,7 +369,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 
 	// Wait for copy phase completion
 	start := time.Now()
-	lastRound := minLevel // Initialize to starting round
+	lastRound := startRound // Initialize to starting round
 	tickCount := 0
 	for {
 		// Check for shutdown

@@ -55,6 +55,8 @@ func (q *Queue) CheckCopyCompletion(currentRound int) bool {
 // Round completion is determined by lastPullWasPartial (memory/keyset only); we never query the DB for in-round advancement.
 // When called, the current round has just completed - we always advance to currentRound+1.
 func (q *Queue) AdvanceCopyRound() {
+	q.noteCopyResumeDstExistenceLeavingAnchorRound()
+
 	currentRound := q.GetRound()
 	copyPass := q.GetCopyPass()
 	maxKnownDepth := q.getMaxKnownDepth()

@@ -200,6 +200,10 @@ type Queue struct {
 	maxKnownDepth int // Maximum known depth from previous traversal (for retry sweep)
 	// Copy phase specific fields
 	copyPass int // Current copy pass (1 for folders, 2 for files)
+	// Resume-only: dst ListChildren precheck (see SetCopyResumeDstExistenceWindow, AdvanceCopyRound).
+	copyResumeDstExistenceActive      bool
+	copyResumeDstExistenceAnchorPass  int
+	copyResumeDstExistenceAnchorRound int
 	// Discovery tracking for metrics
 	filesDiscoveredTotal   int64 // Total files discovered (monotonic counter)
 	foldersDiscoveredTotal int64 // Total folders discovered (monotonic counter)
@@ -1048,7 +1052,7 @@ func (q *Queue) Run() {
 		currentRound := q.GetRound()
 		coordinator := q.getCoordinator()
 
-		// GATE CHECK: DST may only start round when SRC is far enough ahead; SRC may not run more than maxAhead rounds ahead of DST.
+		// GATE CHECK: DST may only start round N when SRC has finished rounds N and N+1 (or SRC is done). SRC is not gated.
 		if coordinator != nil {
 			if q.name == "dst" {
 				canStartRound := coordinator.CanDstStartRound(currentRound)
@@ -1059,10 +1063,6 @@ func (q *Queue) Run() {
 					time.Sleep(50 * time.Millisecond)
 					continue
 				}
-				if state == QueueStateWaiting {
-					q.SetState(QueueStateRunning)
-				}
-			} else if q.name == "src" && (mode == QueueModeTraversal || mode == QueueModeRetry) {
 				if state == QueueStateWaiting {
 					q.SetState(QueueStateRunning)
 				}

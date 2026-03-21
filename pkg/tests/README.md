@@ -30,7 +30,7 @@ There is **no** top-level `pkg/tests/normal/` or `pkg/tests/retry_sweep/`—thos
 
 ## Shared utilities (`traversal/shared`, `copy/shared`)
 
-- Build **`migration.Config`** with Spectra adapters, worker counts, coordinator lead, log address, verification options.
+- Build **`migration.Config`** with Spectra adapters, worker counts, log address, verification options.
 - **`SetupTest`**-style helpers control whether to wipe Spectra DB and migration DuckDB before a run (see each `setup.go`).
 
 ---

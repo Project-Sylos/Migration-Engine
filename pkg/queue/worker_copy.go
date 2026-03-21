@@ -173,6 +173,16 @@ func (w *CopyWorker) createFolder(task *TaskBase, ctx context.Context, wd *Progr
 		return fmt.Errorf("task missing DstParentID (ServiceID) for %s", folder.LocationPath)
 	}
 
+	if w.queue.shouldApplyCopyDstResumeExistenceCheck() {
+		done, err := w.applyResumeCopyDstFolderPrecheck(task, ctx, wd)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+	}
+
 	folderName := filepath.Base(folder.LocationPath)
 	if folderName == "" || folderName == "." {
 		folderName = folder.DisplayName
@@ -210,6 +220,16 @@ func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressW
 	dstParentServiceID := task.DstParentID
 	if dstParentServiceID == "" {
 		return fmt.Errorf("task missing DstParentID (ServiceID) for file %s", file.LocationPath)
+	}
+
+	if w.queue.shouldApplyCopyDstResumeExistenceCheck() {
+		skipCopy, err := w.applyResumeCopyDstFilePrecheck(task, ctx, wd)
+		if err != nil {
+			return err
+		}
+		if skipCopy {
+			return nil
+		}
 	}
 
 	srcReader, err := w.srcAdapter.OpenRead(ctx, file.ServiceID)
@@ -283,6 +303,136 @@ func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressW
 	task.BytesTransferred = bytesTransferred
 	task.File = createdFile
 	return nil
+}
+
+// applyResumeCopyDstFolderPrecheck lists the dst parent and short-circuits if the folder already exists
+// or errors on name/type clash. Used only when shouldApplyCopyDstResumeExistenceCheck() is true.
+func (w *CopyWorker) applyResumeCopyDstFolderPrecheck(task *TaskBase, ctx context.Context, wd *ProgressWatchdog) (done bool, err error) {
+	folder := task.Folder
+	dstParentServiceID := task.DstParentID
+	parentPath, parentDepth, err := copyTaskParentListArgs(task)
+	if err != nil {
+		return false, err
+	}
+	aggregated, err := w.listDstChildrenAggregated(dstParentServiceID, parentPath, parentDepth, ctx, wd)
+	if err != nil {
+		return false, fmt.Errorf("list destination children before folder create for %s: %w", folder.LocationPath, err)
+	}
+	folderMap, fileMap := copyTaskChildMaps(aggregated, task.Round)
+	matchKey := folder.Type + ":" + folder.DisplayName
+	if existing, ok := folderMap[matchKey]; ok {
+		task.Folder = existing
+		wd.Beat()
+		return true, nil
+	}
+	if _, ok := fileMap[types.NodeTypeFile+":"+folder.DisplayName]; ok {
+		return false, fmt.Errorf("destination has file %q but task expects folder at %s", folder.DisplayName, folder.LocationPath)
+	}
+	return false, nil
+}
+
+// applyResumeCopyDstFilePrecheck lists the dst parent and skips copy when the file exists and is up to date
+// (same mtime rule as traversal dst comparison). Used only when shouldApplyCopyDstResumeExistenceCheck() is true.
+func (w *CopyWorker) applyResumeCopyDstFilePrecheck(task *TaskBase, ctx context.Context, wd *ProgressWatchdog) (skipCopy bool, err error) {
+	file := task.File
+	dstParentServiceID := task.DstParentID
+	parentPath, parentDepth, err := copyTaskParentListArgs(task)
+	if err != nil {
+		return false, err
+	}
+	aggregated, err := w.listDstChildrenAggregated(dstParentServiceID, parentPath, parentDepth, ctx, wd)
+	if err != nil {
+		return false, fmt.Errorf("list destination children before file copy for %s: %w", file.LocationPath, err)
+	}
+	folderMap, fileMap := copyTaskChildMaps(aggregated, task.Round)
+	matchKey := file.Type + ":" + file.DisplayName
+	if _, ok := folderMap[types.NodeTypeFolder+":"+file.DisplayName]; ok {
+		return false, fmt.Errorf("destination has folder %q but task expects file at %s", file.DisplayName, file.LocationPath)
+	}
+	if existing, ok := fileMap[matchKey]; ok {
+		if compareTimestamps(file.LastUpdated, existing.LastUpdated) == "Successful" {
+			task.File = existing
+			wd.Beat()
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// copyTaskParentListArgs returns parent path and depth for ListChildren on the destination parent,
+// matching traversal dst usage (normalized root-relative path; depth = parent level).
+func copyTaskParentListArgs(task *TaskBase) (parentPath string, parentDepth int, err error) {
+	loc := types.NormalizeLocationPath(task.LocationPath())
+	if loc == "" || loc == "/" {
+		return "", 0, fmt.Errorf("task missing or root LocationPath")
+	}
+	parentPath = types.NormalizeLocationPath(filepath.Dir(loc))
+	parentDepth = task.Round - 1
+	if parentDepth < 0 {
+		parentDepth = 0
+	}
+	return parentPath, parentDepth, nil
+}
+
+// copyTaskChildMaps indexes listed dst children by Type+DisplayName (same as traversal dst comparison).
+func copyTaskChildMaps(aggregated types.ListResult, childRound int) (map[string]types.Folder, map[string]types.File) {
+	folderMap := make(map[string]types.Folder)
+	for _, f := range aggregated.Folders {
+		f.DepthLevel = childRound
+		folderMap[f.Type+":"+f.DisplayName] = f
+	}
+	fileMap := make(map[string]types.File)
+	for _, f := range aggregated.Files {
+		f.DepthLevel = childRound
+		fileMap[f.Type+":"+f.DisplayName] = f
+	}
+	return folderMap, fileMap
+}
+
+// listDstChildrenAggregated lists immediate children of the dst parent and merges pager pages (traversal pattern).
+func (w *CopyWorker) listDstChildrenAggregated(dstParentID, parentPath string, parentDepth int, ctx context.Context, wd *ProgressWatchdog) (types.ListResult, error) {
+	type listChildrenResult struct {
+		result types.ListResult
+		err    error
+	}
+	listDone := make(chan listChildrenResult, 1)
+	depth := parentDepth
+	go func() {
+		r, err := w.dstAdapter.ListChildren(dstParentID, &depth, parentPath)
+		listDone <- listChildrenResult{result: r, err: err}
+	}()
+
+	var shutdownCh <-chan struct{}
+	if w.shutdownCtx != nil {
+		shutdownCh = w.shutdownCtx.Done()
+	}
+
+	var out listChildrenResult
+	select {
+	case out = <-listDone:
+		if out.err != nil {
+			return types.ListResult{}, out.err
+		}
+		wd.Beat()
+	case <-ctx.Done():
+		return types.ListResult{}, fmt.Errorf("list destination children cancelled: %w", ctx.Err())
+	case <-shutdownCh:
+		return types.ListResult{}, fmt.Errorf("list destination children cancelled by shutdown")
+	}
+
+	const pageSize = 100
+	pager := types.NewListPager(out.result, pageSize)
+	var aggregated types.ListResult
+	for {
+		page, ok := pager.Next()
+		if !ok {
+			break
+		}
+		wd.Beat()
+		aggregated.Folders = append(aggregated.Folders, page.Folders...)
+		aggregated.Files = append(aggregated.Files, page.Files...)
+	}
+	return aggregated, nil
 }
 
 // logError logs a failed task execution.

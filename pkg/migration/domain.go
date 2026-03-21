@@ -91,13 +91,13 @@ type TraversalSummary struct {
 	// CopyStatusCounts are SRC-only counts by copy_status (pending, successful, failed, skipped) from status_events.
 	CopyStatusCounts CopyStatusCounts
 	// Merged review totals (one row per path in merged view; use for API foldersCount, filesCount, excludedCount).
-	FoldersCount   int
-	FilesCount     int
-	ExcludedCount  int
-	TotalFileSizeSrc  int64
-	TotalFileSizeDst  int64
-	FoldersRatio   float64 // FoldersCount / total, rounded to 2 decimals
-	FilesRatio     float64 // FilesCount / total, rounded to 2 decimals
+	FoldersCount     int
+	FilesCount       int
+	ExcludedCount    int
+	TotalFileSizeSrc int64
+	TotalFileSizeDst int64
+	FoldersRatio     float64 // FoldersCount / total, rounded to 2 decimals
+	FilesRatio       float64 // FilesCount / total, rounded to 2 decimals
 }
 
 // CopyStatusCounts holds copy status counts for the API (e.g. copyStatusCounts response).
@@ -112,7 +112,7 @@ type CopyStatusCounts struct {
 type Migration struct {
 	ID      string
 	Name    string
-	DB      *db.DB // this migration's DB (per-migration or shared in legacy mode)
+	DB      *db.DB          // this migration's DB (per-migration or shared in legacy mode)
 	store   *migrationStore // store bound to this migration's DB
 	manager *MigrationManager
 
@@ -682,27 +682,27 @@ func (m *Migration) GetTraversalSummary() (TraversalSummary, error) {
 		filesRatio = roundRatio(float64(merged.Files)/float64(total), 2)
 	}
 	return TraversalSummary{
-		SrcTotal:         status.SrcTotal,
-		DstTotal:         status.DstTotal,
-		SrcPending:       status.SrcPending,
-		DstPending:       status.DstPending,
-		SrcFailed:        status.SrcFailed,
-		DstFailed:        status.DstFailed,
-		SrcExcluded:      srcExcluded,
-		DstExcluded:      dstExcluded,
+		SrcTotal:    status.SrcTotal,
+		DstTotal:    status.DstTotal,
+		SrcPending:  status.SrcPending,
+		DstPending:  status.DstPending,
+		SrcFailed:   status.SrcFailed,
+		DstFailed:   status.DstFailed,
+		SrcExcluded: srcExcluded,
+		DstExcluded: dstExcluded,
 		CopyStatusCounts: CopyStatusCounts{
 			Pending:    int(copyCounts.Pending),
 			Successful: int(copyCounts.Successful),
 			Failed:     int(copyCounts.Failed),
 			Skipped:    int(copyCounts.Skipped),
 		},
-		FoldersCount:      merged.Folders,
-		FilesCount:        merged.Files,
-		ExcludedCount:     merged.Excluded,
-		TotalFileSizeSrc:  merged.SizeSrc,
-		TotalFileSizeDst:  merged.SizeDst,
-		FoldersRatio:      foldersRatio,
-		FilesRatio:        filesRatio,
+		FoldersCount:     merged.Folders,
+		FilesCount:       merged.Files,
+		ExcludedCount:    merged.Excluded,
+		TotalFileSizeSrc: merged.SizeSrc,
+		TotalFileSizeDst: merged.SizeDst,
+		FoldersRatio:     foldersRatio,
+		FilesRatio:       filesRatio,
 	}, nil
 }
 

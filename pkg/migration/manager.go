@@ -54,16 +54,16 @@ type MigrationDetails struct {
 // MigrationManager owns migration lifecycle authority and persistence access.
 // Either Path is set (legacy single DB for all migrations) or the API passes the migration folder path per migration (CreateMigration with MigrationDir, or GetMigration(id, migrationDir)).
 type MigrationManager struct {
-	db             *db.DB              // legacy single DB; nil when using per-migration paths
-	store          *migrationStore     // used for create/get/list/delete with explicit db
+	db             *db.DB          // legacy single DB; nil when using per-migration paths
+	store          *migrationStore // used for create/get/list/delete with explicit db
 	migrations     map[string]*Migration
 	pendingRecords map[string]migrationRecord // migrations created without a path (no DB yet); key = id
 	mu             sync.Mutex
 	ownsDB         bool
-	openDBs        map[string]*db.DB   // cache: key = absolute DB file path
+	openDBs        map[string]*db.DB // cache: key = absolute DB file path
 	openDBsMu      sync.Mutex
 	// pendingLocks serializes "pending → persist" per migration id so only one goroutine runs openDB + createMigration + bindDB for a given id.
-	pendingMu   sync.Mutex
+	pendingMu    sync.Mutex
 	pendingLocks map[string]*sync.Mutex
 }
 
@@ -527,4 +527,3 @@ func migrationNameFromConfig(cfg Config) string {
 	}
 	return "migration"
 }
-

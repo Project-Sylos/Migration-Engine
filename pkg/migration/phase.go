@@ -7,12 +7,12 @@ import "fmt"
 
 // Phase is the migration lifecycle state, stored as the canonical status string (lowercase-with-hyphens).
 const (
-	PhaseCreated         string = "roots-set"                  // Initial state; after user sets roots. TODO: when filter creation module lands, transition to filters-set before traversal.
-	PhaseFiltersSet      string = "filters-set"                // Ready for traversal
-	PhaseTraversing      string = "traversal-in-progress"      // Traversal running
-	PhaseTraversalReview string = "awaiting-traversal-review"  // Traversal done, user can review; can retry traversal or start copy
-	PhaseCopying         string = "copy-in-progress"           // Copy phase running
-	PhaseCopyReview      string = "awaiting-copy-review"       // Copy done, user can review; can retry copy
+	PhaseCreated         string = "roots-set"                 // Initial state; after user sets roots. TODO: when filter creation module lands, transition to filters-set before traversal.
+	PhaseFiltersSet      string = "filters-set"               // Ready for traversal
+	PhaseTraversing      string = "traversal-in-progress"     // Traversal running
+	PhaseTraversalReview string = "awaiting-traversal-review" // Traversal done, user can review; can retry traversal or start copy
+	PhaseCopying         string = "copy-in-progress"          // Copy phase running
+	PhaseCopyReview      string = "awaiting-copy-review"      // Copy done, user can review; can retry copy
 )
 
 // ParsePhase parses a phase string from the DB. Accepts new lowercase-with-hyphens values and legacy PascalCase values.

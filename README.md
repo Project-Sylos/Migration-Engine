@@ -48,10 +48,10 @@ The Migration Engine serializes traversal data to the database at each round bou
 * Source and destination are traversed **in rounds**.
 * **Round 0**: traverse the source root and list its children.
 * **Round 1**: traverse those children; destination traversal remains coordinated behind the source.
-* The destination queue is gated by the `QueueCoordinator`; the source may run at most a few rounds ahead of the destination (configurable, default 3).
+* The destination queue is gated by the `QueueCoordinator`: it may start round *N* only after the source has completed rounds *N* and *N+1* (or source traversal is finished). The source queue has no coordinator pacing cap; frontier work is streamed to the database in batches, so the source can advance as fast as workers allow.
 * When the destination processes its corresponding level, it compares existing nodes against the expected list from the source.
 * Extra items in the destination are logged but not traversed further.
-* The destination can run as fast as possible while staying coordinated with the source.
+* The destination runs as fast as the gate allows; the source is not artificially held back to match destination speed.
 * Because each round is sealed to the database (nodes and per-depth stats), the system can resume after a crash; on resume, queues restore round/cursors and **pull** pending work from the DB again.
 * This maximizes both safety and throughput.
 

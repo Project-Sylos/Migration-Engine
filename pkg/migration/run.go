@@ -27,7 +27,6 @@ type MigrationConfig struct {
 	WorkerCount     int
 	MaxRetries      int
 	CoordinatorLead int
-	MaxSrcAhead     int           // Max rounds SRC may run ahead of DST (queue default 2); 0 leaves queue default
 	LogAddress      string
 	LogLevel        string
 	SkipListener    bool
@@ -79,9 +78,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	}
 
 	coordinator := queue.NewQueueCoordinator()
-	if cfg.MaxSrcAhead > 0 {
-		coordinator.SetMaxSrcAhead(cfg.MaxSrcAhead)
-	}
 
 	// DB-backed frontier: no LevelCache for traversal. Queues pull from DuckDB in batches.
 	// Create queues
@@ -335,7 +331,6 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 			coordinator.MarkCompleted("dst")
 		}
 	}
-
 
 	// Don't pull tasks here - let Run() handle the initial pull
 	// DST will check coordinator when it needs to advance
