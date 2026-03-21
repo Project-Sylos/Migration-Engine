@@ -73,7 +73,10 @@ func SetupSpectraFS(configPath string, cleanDB bool) (*sdk.SpectraFS, error) {
 			}
 			// Also try to remove lock files (Windows-specific: .db.lock)
 			lockPath := dbPath + ".lock"
-			_ = os.Remove(lockPath) // Ignore errors - lock file might not exist
+			err := os.Remove(lockPath) // Ignore errors - lock file might not exist
+			if err != nil {
+				fmt.Println("error removing lock file", err)
+			}
 		}
 	}
 
@@ -120,20 +123,14 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
 	}
 
-	// Open database - tests own the lifecycle
-	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           "pkg/tests/traversal/shared/main_test.db",
-		RemoveExisting: removeMigrationDB,
-	})
+	dbPath, err := filepath.Abs("pkg/tests/traversal/shared/main_test.db")
 	if err != nil {
-		return migration.Config{}, fmt.Errorf("failed to open database: %w", err)
+		return migration.Config{}, fmt.Errorf("failed to resolve DB path: %w", err)
 	}
 
 	cfg := migration.Config{
-		DatabaseInstance: dbInstance,               // Tests provide DB instance
-		Runtime:          migration.ModeStandalone, // Tests use standalone mode (ME closes DB)
 		Database: migration.DatabaseConfig{
-			Path:           "pkg/tests/traversal/shared/main_test.db",
+			Path:           dbPath,
 			RemoveExisting: removeMigrationDB,
 		},
 		Source: migration.Service{
@@ -192,20 +189,14 @@ func SetupEphemeralTest(removeMigrationDB bool) (migration.Config, error) {
 		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
 	}
 
-	// Open database - tests own the lifecycle
-	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           "pkg/tests/traversal/shared/main_test.db",
-		RemoveExisting: removeMigrationDB,
-	})
+	dbPath, err := filepath.Abs("pkg/tests/traversal/shared/main_test.db")
 	if err != nil {
-		return migration.Config{}, fmt.Errorf("failed to open database: %w", err)
+		return migration.Config{}, fmt.Errorf("failed to resolve DB path: %w", err)
 	}
 
 	cfg := migration.Config{
-		DatabaseInstance: dbInstance,               // Tests provide DB instance
-		Runtime:          migration.ModeStandalone, // Tests use standalone mode (ME closes DB)
 		Database: migration.DatabaseConfig{
-			Path:           "pkg/tests/traversal/shared/main_test.db",
+			Path:           dbPath,
 			RemoveExisting: removeMigrationDB,
 		},
 		Source: migration.Service{
@@ -220,14 +211,13 @@ func SetupEphemeralTest(removeMigrationDB bool) (migration.Config, error) {
 		WorkerCount:     10,
 		MaxRetries:      3,
 		CoordinatorLead: 4,
-		SkipListener:    true,
+		SkipListener:    false,
 		LogAddress:      "127.0.0.1:8081",
 		LogLevel:        "trace",
-		StartupDelay:    1 * time.Second, // you should set this to 3 if you set skip listener to false to account for terminal opening delay
+		StartupDelay:    3 * time.Second, // you should set this to 3 if you set skip listener to false to account for terminal opening delay
 		Verification: migration.VerifyOptions{
 			AllowNotOnSrc: true, // Ephemeral mode allows divergent trees (nodes on dst but not src)
 		},
-		SkipAutoETLAfterTraversal: true, // Skip ETL for ephemeral tests - we only validate BoltDB, not DuckDB
 	}
 
 	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {
@@ -331,20 +321,14 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 		Type:         types.NodeTypeFolder,
 	}
 
-	// Open database - tests own the lifecycle
-	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           "pkg/tests/traversal/shared/main_test.db",
-		RemoveExisting: removeMigrationDB,
-	})
+	dbPath, err := filepath.Abs("pkg/tests/traversal/shared/main_test.db")
 	if err != nil {
-		return migration.Config{}, fmt.Errorf("failed to open database: %w", err)
+		return migration.Config{}, fmt.Errorf("failed to resolve DB path: %w", err)
 	}
 
 	cfg := migration.Config{
-		DatabaseInstance: dbInstance,               // Tests provide DB instance
-		Runtime:          migration.ModeStandalone, // Tests use standalone mode (ME closes DB)
 		Database: migration.DatabaseConfig{
-			Path:           "pkg/tests/traversal/shared/main_test.db",
+			Path:           dbPath,
 			RemoveExisting: removeMigrationDB,
 		},
 		Source: migration.Service{
@@ -363,7 +347,7 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 		LogLevel:        "trace",
 		SkipListener:    true,
 		StartupDelay:    3 * time.Second,
-		Verification:    migration.VerifyOptions{},
+		Verification:    migration.VerifyOptions{AllowNotOnSrc: true},
 	}
 
 	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {

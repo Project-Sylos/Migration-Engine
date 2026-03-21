@@ -4,122 +4,99 @@
 package queue
 
 import (
+	"fmt"
 	"sync"
 
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 )
 
-// YAMLUpdateCallback is a function that updates the YAML config file when rounds advance.
-// It's called from a background goroutine to avoid blocking.
-type YAMLUpdateCallback func(srcRound, dstRound int)
-
 // QueueCoordinator manages round advancement gates for dual-BFS traversal.
-// It enforces the invariant: "DST cannot advance to round N until SRC has completed rounds N and N+1."
-// This is a simple gate - queues manage themselves, coordinator only controls when DST can advance.
+// It enforces: DST cannot advance to round N until SRC has completed rounds N and N+1;
+// SRC may not run ahead of DST by more than MaxSrcAhead rounds (default 3).
 type QueueCoordinator struct {
-	mu           sync.RWMutex
-	srcRound     int                // Current SRC round
-	srcDone      bool               // SRC has completed traversal
-	dstRound     int                // Current DST round
-	dstDone      bool               // DST has completed traversal
-	yamlUpdateCB YAMLUpdateCallback // Optional callback for YAML updates on round advance
+	mu          sync.RWMutex
+	srcRound    int
+	srcDone     bool
+	dstRound    int
+	dstDone     bool
+	maxSrcAhead int // SRC may run when srcRound <= dstRound + maxSrcAhead
 }
+
+const defaultMaxSrcAhead = 3
 
 // NewQueueCoordinator creates a new coordinator.
 func NewQueueCoordinator() *QueueCoordinator {
 	return &QueueCoordinator{
-		srcRound: 0,
-		srcDone:  false,
-		dstRound: 0,
-		dstDone:  false,
+		srcRound:    0,
+		srcDone:     false,
+		dstRound:    0,
+		dstDone:     false,
+		maxSrcAhead: defaultMaxSrcAhead,
 	}
 }
 
-// SetYAMLUpdateCallback sets a callback function that will be invoked (in a background goroutine)
-// whenever a round advances. This allows automatic YAML config updates.
-func (c *QueueCoordinator) SetYAMLUpdateCallback(cb YAMLUpdateCallback) {
+// SetMaxSrcAhead sets the maximum rounds SRC may run ahead of DST (default 3).
+func (c *QueueCoordinator) SetMaxSrcAhead(n int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.yamlUpdateCB = cb
-}
-
-// UpdateSrcRound updates SRC's current round.
-func (c *QueueCoordinator) UpdateSrcRound(round int) {
-	c.mu.Lock()
-	oldRound := c.srcRound
-	c.srcRound = round
-	cb := c.yamlUpdateCB
-	c.mu.Unlock()
-
-	// If round changed and we have a callback, update YAML in background
-	if oldRound != round && cb != nil {
-		go func() {
-			c.mu.RLock()
-			srcR := c.srcRound
-			dstR := c.dstRound
-			c.mu.RUnlock()
-			cb(srcR, dstR)
-		}()
+	if n >= 0 {
+		c.maxSrcAhead = n
 	}
 }
 
-// UpdateDstRound updates DST's current round.
-func (c *QueueCoordinator) UpdateDstRound(round int) {
+// UpdateRound updates the current round for SRC or DST.
+func (c *QueueCoordinator) UpdateRound(which string, round int) {
 	c.mu.Lock()
-	oldRound := c.dstRound
-	c.dstRound = round
-	cb := c.yamlUpdateCB
-	c.mu.Unlock()
-
-	// If round changed and we have a callback, update YAML in background
-	if oldRound != round && cb != nil {
-		go func() {
-			c.mu.RLock()
-			srcR := c.srcRound
-			dstR := c.dstRound
-			c.mu.RUnlock()
-			cb(srcR, dstR)
-		}()
+	defer c.mu.Unlock()
+	switch which {
+	case "src":
+		c.srcRound = round
+	case "dst":
+		c.dstRound = round
 	}
 }
 
-// GetSrcRound returns SRC's current round.
-func (c *QueueCoordinator) GetSrcRound() int {
+// GetRound returns the current round for SRC or DST.
+func (c *QueueCoordinator) GetRound(which string) int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.srcRound
-}
-
-// GetDstRound returns DST's current round.
-func (c *QueueCoordinator) GetDstRound() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.dstRound
-}
-
-// MarkSrcCompleted marks SRC as completed.
-func (c *QueueCoordinator) MarkSrcCompleted() {
-	c.mu.Lock()
-	c.srcDone = true
-	c.mu.Unlock()
-	// Log outside of lock to avoid deadlock
-	if logservice.LS != nil {
-		_ = logservice.LS.Log("debug",
-			"Coordinator: SRC marked as completed",
-			"coordinator", "mark", "coordinator")
+	switch which {
+	case "src":
+		return c.srcRound
+	case "dst":
+		return c.dstRound
+	default:
+		return -1
 	}
 }
 
-// MarkDstCompleted marks DST as completed.
-func (c *QueueCoordinator) MarkDstCompleted() {
+// MarkCompleted marks SRC or DST as completed based on the argument ("src" or "dst").
+func (c *QueueCoordinator) MarkCompleted(which string) {
 	c.mu.Lock()
-	c.dstDone = true
+	switch which {
+	case "src":
+		c.srcDone = true
+	case "dst":
+		c.dstDone = true
+	}
 	c.mu.Unlock()
-	// Log outside of lock to avoid deadlock
 	if logservice.LS != nil {
-		_ = logservice.LS.Log("debug",
-			"Coordinator: DST marked as completed",
+		var whichMsg string
+		switch which {
+		case "src":
+			whichMsg = "SRC"
+		case "dst":
+			whichMsg = "DST"
+		default:
+			whichMsg = which
+		}
+		err := logservice.LS.Log("debug",
+			"Coordinator: "+whichMsg+" marked as completed",
 			"coordinator", "mark", "coordinator")
+		if err != nil {
+			fmt.Println("error logging", err)
+		}
 	}
 }
 
@@ -140,6 +117,32 @@ func (c *QueueCoordinator) IsCompleted(queueType string) bool {
 	}
 }
 
+// CanSrcStartRound returns true if SRC can run the given round: srcRound <= dstRound + maxSrcAhead (or SRC is done).
+func (c *QueueCoordinator) CanSrcStartRound(srcRound int) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	// If DST has completed traversal, SRC should proceed unconstrained.
+	// This prevents SRC from stalling behind a fixed dstRound after DST exits early.
+	if c.dstDone {
+		return true
+	}
+	if c.srcDone {
+		return true
+	}
+	return srcRound <= c.dstRound+c.maxSrcAhead
+}
+
+// WaitSealBackpressure blocks until the seal buffer has flushed through (round-2) when round >= 2.
+// Flushes pending seal jobs first so we don't block on the buffer's interval timer. Call before advancing to the next round.
+// Pulling/processing from cache is not blocked; only round advancement waits. Pass database from the queue.
+func (c *QueueCoordinator) WaitSealBackpressure(round int, database *db.DB) {
+	if database == nil || round < 2 {
+		return
+	}
+	_ = database.FlushSealBuffer()
+	database.WaitUntilSealFlushedThrough(round - 2)
+}
+
 // CanDstStartRound returns true if DST can start processing the specified round.
 // DST can start round N if:
 //   - SRC has completed traversal entirely (DST can proceed freely), OR
@@ -152,15 +155,10 @@ func (c *QueueCoordinator) CanDstStartRound(targetRound int) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	// If SRC is done, DST can always proceed at full speed (unless DST is also done)
-	// This allows DST to catch up and finish as quickly as possible once SRC completes
 	if c.srcDone {
 		return !c.dstDone
 	}
 
-	// DST can start round N if SRC has completed rounds N and N+1
-	// SRC completes round N when it advances to N+1, completes round N+1 when it advances to N+2
-	// So DST can start round N if SRC is at round N+2 or higher
 	requiredSrcRound := targetRound + 2
 	return c.srcRound >= requiredSrcRound && !c.dstDone
 }

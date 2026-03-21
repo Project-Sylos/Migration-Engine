@@ -14,12 +14,12 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
-// TraversalWorker executes traversal tasks by listing children and recording them to BoltDB.
+// TraversalWorker executes traversal tasks by listing children and recording them to DuckDB.
 // Each worker runs independently in its own goroutine, continuously polling the queue for work.
 type TraversalWorker struct {
 	id          string
 	queue       *Queue
-	boltDB      *db.DB
+	database    *db.DB
 	fsAdapter   types.FSAdapter
 	queueName   string          // "src" or "dst" for logging
 	isDst       bool            // true if this is a destination worker (performs comparison)
@@ -31,7 +31,7 @@ type TraversalWorker struct {
 func NewTraversalWorker(
 	id string,
 	queue *Queue,
-	boltInstance *db.DB,
+	database *db.DB,
 	adapter types.FSAdapter,
 	queueName string,
 	shutdownCtx context.Context,
@@ -39,7 +39,7 @@ func NewTraversalWorker(
 	return &TraversalWorker{
 		id:          id,
 		queue:       queue,
-		boltDB:      boltInstance,
+		database:    database,
 		fsAdapter:   adapter,
 		queueName:   queueName,
 		isDst:       queueName == "dst",
@@ -53,7 +53,10 @@ func NewTraversalWorker(
 // When queue is exhausted, the worker exits.
 func (w *TraversalWorker) Run() {
 	if logservice.LS != nil {
-		_ = logservice.LS.Log("info", "Worker started", "worker", w.id, w.queueName)
+		err := logservice.LS.Log("info", "Worker started", "worker", w.id, w.queueName)
+		if err != nil {
+			fmt.Println("error logging", err)
+		}
 	}
 
 	for {
@@ -63,7 +66,10 @@ func (w *TraversalWorker) Run() {
 			case <-w.shutdownCtx.Done():
 				// Shutdown triggered - exit immediately
 				if logservice.LS != nil {
-					_ = logservice.LS.Log("info", "Worker exiting - shutdown requested", "worker", w.id, w.queueName)
+					err := logservice.LS.Log("info", "Worker exiting - shutdown requested", "worker", w.id, w.queueName)
+					if err != nil {
+						fmt.Println("error logging", err)
+					}
 				}
 				return
 			default:
@@ -81,7 +87,10 @@ func (w *TraversalWorker) Run() {
 		// Check if queue is exhausted (traversal complete) - exit worker
 		if w.queue.IsExhausted() {
 			if logservice.LS != nil {
-				_ = logservice.LS.Log("info", "Worker exiting - queue exhausted", "worker", w.id, w.queueName)
+				err := logservice.LS.Log("info", "Worker exiting - queue exhausted", "worker", w.id, w.queueName)
+				if err != nil {
+					fmt.Println("error logging", err)
+				}
 			}
 			return
 		}
@@ -98,9 +107,14 @@ func (w *TraversalWorker) Run() {
 		err := w.execute(task)
 		if err != nil {
 			// Record task error in main DB for cross-lookup (traversal phase)
-			if w.boltDB != nil {
+			if w.database != nil {
 				queueType := strings.ToUpper(w.queueName)
-				_, _ = db.RecordTaskError(w.boltDB, queueType, "traversal", task.ID, err.Error(), task.Attempts, task.LocationPath())
+				err := w.database.RunUpdateWriterTx(func(tx *db.Writer) error {
+					return tx.RecordTaskError(queueType, "traversal", task.ID, err.Error(), task.Attempts, task.LocationPath())
+				})
+				if err != nil {
+					fmt.Println("error running update writer tx", err)
+				}
 			}
 			w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
 			nodeID := task.ID
@@ -130,16 +144,20 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 	result, err := w.fsAdapter.ListChildren(folder.ServiceID, &depth, folder.LocationPath)
 	if err != nil {
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("error",
+			err := logservice.LS.Log("error",
 				fmt.Sprintf("Failed to list children: path=%s folderId=%s error=%v",
 					folder.LocationPath, folder.ServiceID, err),
 				"worker", w.id, w.queueName)
+			if err != nil {
+				fmt.Println("error logging", err)
+			}
 		}
 		return fmt.Errorf("failed to list children of %s: %w", folder.LocationPath, err)
 	}
 
 	// Wrap result in a pager so we can process children in fixed-size pages.
 	// This mimics real cloud SDK pagination behavior and keeps per-page work bounded.
+	// TODO: This should be done in the Sylos-FS repo, not at this level. Update this at some point. :)
 	const pageSize = 100
 	pager := types.NewListPager(result, pageSize)
 
@@ -186,6 +204,15 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 				Status: db.StatusSuccessful, // Files are immediately successful (no traversal needed)
 				IsFile: true,
 			})
+		}
+	}
+
+	// log discovered children count
+	// leave this in for debugging if you need to see if workers are firing off
+	if logservice.LS != nil {
+		err := logservice.LS.Log("info", fmt.Sprintf("Discovered %d children for task %s", len(task.DiscoveredChildren), task.ID), "worker", w.id, w.queueName)
+		if err != nil {
+			fmt.Println("error logging", err)
 		}
 	}
 
@@ -335,7 +362,7 @@ func compareTimestamps(srcMTime, dstMTime string) string {
 }
 
 // logError logs a failed task execution.
-func (w *TraversalWorker) logError(task *TaskBase, err error, willRetry bool) {
+func (w *TraversalWorker) logError(task *TaskBase, paramErr error, willRetry bool) {
 	if logservice.LS == nil {
 		return // Logger not initialized
 	}
@@ -345,11 +372,14 @@ func (w *TraversalWorker) logError(task *TaskBase, err error, willRetry bool) {
 		retryMsg = "max retries exceeded"
 	}
 
-	_ = logservice.LS.Log(
+	err := logservice.LS.Log(
 		"error",
-		fmt.Sprintf("Failed to traverse %s: %v (%s)", path, err, retryMsg),
+		fmt.Sprintf("Failed to traverse %s: %v (%s)", path, paramErr, retryMsg),
 		"worker",
 		w.id,
 		w.queueName,
 	)
+	if err != nil {
+		fmt.Println("error logging", err)
+	}
 }

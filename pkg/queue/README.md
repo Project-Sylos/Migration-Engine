@@ -1,403 +1,200 @@
-# Queue System
+# Queue Package
 
-The queue layer drives source/destination traversal using BoltDB as the operational database. Two autonomous queues (src/dst) perform breadth-first traversal in rounds, with the destination always staying at least three rounds behind unless the source has completed. Round coordination is handled by a shared `QueueCoordinator`, while persistence, propagation, and retries are handled entirely inside `queue.Queue`.
-
----
-
-## High-level Flow
-
-1. **Workers** execute tasks leased from BoltDB. They list filesystem children (and for dst, compare against expectations) then return the enriched `TaskBase` to the queue.
-2. **Queue completion** writes directly to BoltDB:
-   - Traversal-status transitions (pending → successful) for the processed node.
-   - Copy-status updates when dst determines src is newer.
-   - Child inserts for the next BFS level.
-3. **Atomic writes** ensure all BoltDB operations are immediately visible. Tasks are pulled in batches from status buckets, and all writes are atomic within transactions.
-4. **Coordinator gating** enforces the lead window. DST queues check the coordinator gate at the start of each round iteration in the `Run()` loop, ensuring dst only proceeds when src is sufficiently ahead (or already done). Gating happens when STARTING a round, not when advancing.
-
-The result is predictable, race-free traversal with BoltDB serving as the single source of truth.
+The queue layer drives source/destination traversal and copy using the database (`pkg/db`). Two queues (src and dst) perform breadth-first traversal in rounds, with the destination gated by a shared `QueueCoordinator`. The **memory-first** flow keeps per-level state in `NodeCache`/`LevelCache`; the DB is only written at **seal** (round advance). The coordinator enforces a configurable SRC-ahead gate (default 3 rounds).
 
 ---
 
-## Core Components
+## High-level flow
 
-| File                  | Responsibility                                                                 |
-| --------------------- | ----------------------------------------------------------------------------- |
-| `queue.go`            | BoltDB-backed queue, buffers, leasing, completion, coordinator integration    |
-| `worker.go`           | Worker loop (lease → execute → return results)                                |
-| `worker_traversal.go` | Traversal-specific worker execution logic                                     |
-| `task.go`             | Task definitions shared by both queues                                        |
-| `seeding.go`          | Helpers for inserting initial root tasks into BoltDB                          |
-| `coordinator.go`      | Enforces the src/dst lead window                                              |
-| `db_helpers.go`       | Helper functions for querying BoltDB buckets                                  |
-| `bolt_helpers.go`     | Conversion utilities between tasks and node states                            |
-| `mode_traversal.go`   | Task pulling logic for normal traversal mode                                  |
-| `mode_retry.go`       | Task pulling logic for retry sweep mode                                       |
+1. **Workers** lease tasks from an in-memory buffer refilled by **pulling**: **NodeCache is required**; pull from the level cache (e.g. `LevelCache.ListPending`, `ListPendingCopy`).
+2. **Completion** updates: the queue updates the level cache (status, children, copy status) and per-level stats; no DB write until seal.
+3. **Round advancement**: when the current round is complete, the queue calls **seal** (in `advanceToNextRound`): snapshot the level from cache, call `database.SealLevel(...)` to bulk-append nodes and write stats for that depth, then drop the level and (for traversal) promote N+1 to N.
+4. **Coordinator gating**: DST may start a round only when SRC is far enough ahead; SRC may not run more than `MaxSrcAhead` rounds ahead of DST (default 3, configurable via `MigrationConfig.MaxSrcAhead`).
 
 ---
 
-## Task Model
+## Relationship with pkg/db
+
+- **Database**: The queue holds a `*db.DB` reference. **NodeCache is required.** Hot-path reads and writes use the cache; the DB is only used at seal (`SealLevel`: bulk append nodes + stats snapshot) and for resume rehydration (`RehydrateLevelFromDB`).
+- **Pulls**: From cache: `LevelCache.ListPending`, `ListPendingCopy`, `ListChildrenByParentPath`. Results become `TaskBase` and are added to `pendingBuff`.
+- **Seal**: `database.SealLevel(table, depth, nodes, pending, successful, failed, completed, copyP, copyS, copyF)` persists one level to the DB and writes per-depth stats. Copy stats (copyP, copyS, copyF) are used for SRC in copy phase; pass -1 for traversal-only.
+- **Completion checks**: Completion uses in-memory level stats and cache state. Observer reads from stats tables and writes `queue_stats`.
+
+---
+
+## Core components
+
+| File                  | Responsibility |
+|-----------------------|----------------|
+| `queue.go`            | Queue struct, Run loop, seal (advanceToNextRound → SealLevel), coordinator gates, leasing |
+| `level_cache.go`      | LevelCache, NodeCache, **EngineCaches**: per-level nodes and stats; SRC/DST separate caches with bridge for DST cross-querying SRC (read-only); ListPending, ListPendingCopy, DropLevel, PromoteLevel |
+| `queue_accessors.go`  | Thread-safe getters/setters, keyset cursors, syncLevelStatsFromDB, RehydrateLevelFromDB |
+| `queue_batch.go`      | BuildExpectedMapsFromDstWithChildren, batch load expected children for DST tasks |
+| `mode_traversal.go`   | PullTraversalTasks (from cache), traversal completion (cache update only) |
+| `mode_retry.go`       | PullRetryTasks; DST cleanup on SRC folder complete |
+| `mode_copy.go`        | PullCopyTasks (from cache), copy completion (cache update only), CheckCopyCompletion |
+| `worker_traversal.go` | TraversalWorker: lease → list children / compare → ReportTaskResult |
+| `worker_copy.go`      | CopyWorker: lease → create folder / copy file → ReportTaskResult |
+| `worker/interface.go` | Worker interface |
+| `task.go`             | TaskBase, ChildResult, task types |
+| `seeding.go`          | SeedRootTask, SeedRootTasks (insert root nodes, BootstrapRootStats) |
+| `coordinator.go`      | QueueCoordinator: CanDstStartRound, CanSrcStartRound, SetMaxSrcAhead (default 3) |
+| `observer.go`         | Polls queues, reads stats from DB, writes queue_stats |
+
+---
+
+## Task model
 
 ```go
 type TaskBase struct {
-    Type               TaskType
-    Folder             fsservices.Folder
-    File               fsservices.File
+    ID                 string
+    Type               string   // e.g. TaskTypeSrcTraversal, TaskTypeDstTraversal, TaskTypeCopyFolder
+    Folder             types.Folder
+    File               types.File
     Locked             bool
     Attempts           int
     Status             string
+    ExpectedFolders    []types.Folder   // DST: expected from SRC
+    ExpectedFiles      []types.File
+    ExpectedSrcIDMap   map[string]string
+    ExpectedSrcNodeMeta map[string]SrcNodeMeta
+    RetryDstCleanup   *RetryDstCleanup  // Retry mode: DST counterpart + children for cleanup
     DiscoveredChildren []ChildResult
-    ExpectedFolders    []fsservices.Folder
-    ExpectedFiles      []fsservices.File
     Round              int
+    LeaseTime          time.Time
+    // ...
 }
 ```
 
-* `Round` identifies the BFS depth. It is used by the coordinator, stats, and resumption logic.
-* `DiscoveredChildren` is filled by workers and consumed by the queue to create next-round tasks.
-* Destination workers populate `Expected*` when they need to compare against source output.
+- **Round** is the BFS depth; used by coordinator, stats, and pull queries.
+- **DiscoveredChildren** is filled by workers and used by the queue to build node inserts and status updates.
+- DST tasks get **Expected*** and **ExpectedSrcIDMap** from the pull (e.g. `ListDstBatchWithSrcChildren` or batch load by parent path).
 
 ---
 
-## BoltDB Storage Architecture
+## Storage
 
-All node state is stored in BoltDB using bucket hierarchies:
-
-### Bucket Structure
-
-```
-/SRC
-  /nodes                  → pathHash: NodeState JSON
-  /children               → parentHash: []childHash JSON
-  /levels
-    /00000001
-      /pending            → pathHash: empty (membership)
-      /successful         → pathHash: empty
-      /failed             → pathHash: empty
-
-/DST
-  (same structure + /not_on_src status)
-```
-
-### Key Operations
-
-**Completion writes perform three operations atomically:**
-
-1. **Node Inserts** – New children discovered in the current round are inserted into:
-   - `/nodes` bucket (full NodeState data)
-   - `/levels/{nextRound}/pending` bucket (membership)
-   - `/children` bucket (parent-child relationship)
-
-2. **Status Updates** – Parent nodes transition from pending to successful:
-   - Update NodeState in `/nodes` bucket
-   - Remove from `/levels/{level}/pending`
-   - Add to `/levels/{level}/successful`
-
-3. **Copy Updates** – Destination workers signal that src is newer:
-   - Update CopyStatus field in NodeState metadata
-
-All writes are:
-- **Atomic** – Each transaction succeeds or fails as a unit
-- **Immediately Visible** – No MVCC delays; reads see latest committed state
-- **Race-Free** – BoltDB's single-writer eliminates key visibility issues
+- **Cache (required)**: **NodeCache is required.** Active levels (current and next) live in `LevelCache` per queue. **EngineCaches** holds separate `Src` and `Dst` `NodeCache`s: each queue mutates its own; DST cross-queries SRC (read-only via `OtherNodeCache()`) for expected children (e.g. `ListChildrenByParentPath`). Copy phase uses `Src` for the SRC table and `Dst` for cross-check. Task completion updates the cache and in-memory `LevelStats`. At seal, the level is bulk-appended to the DB and stats are written; the level is then dropped (and N+1 promoted for traversal).
+- **Database** (`pkg/db`): Node tables (`src_nodes`, `dst_nodes`), stats tables (`src_stats`, `dst_stats`). Seal writes nodes and stats in one transaction. Resume uses `RehydrateLevelFromDB` to refill the cache from the DB.
+- **queue_stats**: Observer writes per-queue metrics JSON for external APIs.
 
 ---
 
-## Worker Workflow
+## Worker workflow
 
 ```go
-task := w.queue.Lease()                    // reads from status buckets
-err := w.execute(task)                     // list children / compare timestamps
+task := w.queue.Lease()           // from pendingBuff (refilled by pull from DB)
+err := w.execute(task)           // list children or compare / copy
 if err != nil {
-    w.queue.ReportTaskResult(task, Failed)  // requeue or drop based on retry budget
+    w.queue.ReportTaskResult(task, Failed)
 } else {
-    w.queue.ReportTaskResult(task, Successful)  // atomic writes: inserts + status updates
+    w.queue.ReportTaskResult(task, Successful)  // updates level cache and stats
 }
 ```
 
-**Task Lifecycle:**
-- Tasks are pulled from BoltDB and added to `pendingBuff`
-- When leased, tasks move from `pendingBuff` to `inProgress`
-- On completion/failure, tasks are removed from `inProgress` and results are written to BoltDB
-- `ReportTaskResult()` handles both success and failure cases, and triggers task pulling when the buffer is low
-
-Destination workers compute comparison results and store them in the NodeState metadata (TraversalStatus field).
+- **Lease**: Task is taken from `pendingBuff` and added to `inProgress`; its key is tracked so it is not pulled again (status updated in cache).
+- **ReportTaskResult**: The queue updates the level cache and stats. Seal persists at round advance via `SealLevel`.
 
 ---
 
-## Task Leasing and Pulling
+## Task pulling
 
-Workers lease tasks from the current round's pending bucket. Task pulling is coordinated to prevent race conditions and duplicate processing.
+- **Pulling flag**: Only one pull runs at a time (`getPulling` / `setPulling`).
+- **Cache-only**: **NodeCache is required.** Pull uses `LevelCache.ListPending` / `ListPendingCopy` for the current round; DB is used only when the level is missing (e.g. resume) or for parent/expected lookups.
+- **State checks**: Pull only when queue is running and pending count is at or below the low-water mark (or when forced).
+- **Coordinator**: DST checks `CanDstStartRound(currentRound)`; SRC checks `CanSrcStartRound(currentRound)` (SRC may not run more than `MaxSrcAhead` rounds ahead of DST).
 
-### Pulling Architecture
+**Traversal**: From cache: `GetLevel(round).ListPending(cursor, batchSize)` (DST gets expected from other cache).
 
-**Pulling Flag Protection**:
-Both traversal and retry modes use a `pulling` flag to prevent concurrent pull operations:
+**Copy**: From cache: `GetLevel(round).ListPendingCopy(cursor, limit, nodeType)`.
 
-```go
-// Check if already pulling (prevents concurrent pulls)
-if q.getPulling() {
-    return
-}
-
-// Set pulling flag and defer clearing
-q.setPulling(true)
-defer func() {
-    q.setPulling(false)
-}()
-```
-
-This ensures only one thread can execute pull logic at a time, preventing:
-- Duplicate task pulls from stale views
-- Race conditions between buffer writes and task pulls
-- Over-pulling beyond the configured batch size
-
-**Buffer Flushing Before Pulls**:
-Both modes force-flush the OutputBuffer before pulling tasks:
-
-```go
-// Force-flush buffer before pulling tasks
-outputBuffer := q.getOutputBuffer()
-if outputBuffer != nil {
-    outputBuffer.Flush()
-}
-```
-
-This ensures all pending writes (status updates, child inserts, deletions) are persisted to BoltDB before new tasks are pulled, preventing:
-- Re-pulling tasks that were just completed but not yet written to DB
-- Stale status views causing duplicate processing
-- Non-deterministic behavior based on flush timing
-
-**State Checks**:
-Before pulling, both modes verify the queue state:
-
-```go
-// Get state snapshot
-snapshot := q.getStateSnapshot()
-
-if !force {
-    // Only pull if queue is running and buffer is low
-    if snapshot.State != QueueStateRunning || snapshot.PendingCount > snapshot.PullLowWM {
-        return
-    }
-} else {
-    // Even when forcing, don't pull if paused
-    if snapshot.State == QueueStatePaused {
-        return
-    }
-}
-```
-
-**Coordinator Gating (DST Queues)**:
-DST queues check the coordinator gate before pulling:
-
-```go
-// For DST: Check coordinator gate before pulling
-coordinator := q.getCoordinator()
-if q.name == "dst" && coordinator != nil {
-    canStartRound := coordinator.CanDstStartRound(currentRound)
-    if !canStartRound {
-        // Can't start this round yet - wait for SRC to advance
-        return
-    }
-}
-```
-
-This ensures DST stays at least 3 rounds behind SRC (or waits for SRC completion).
-
-### Batch Fetching
-
-```go
-// Pull up to 1000 tasks from /SRC/levels/{round}/pending
-batch, err := db.BatchFetchWithKeys(boltDB, queueType, currentRound, db.StatusPending, defaultLeaseBatchSize)
-
-// For each item in batch:
-for _, item := range batch {
-    // Skip ULIDs already leased (prevents duplicate pulls)
-    if q.isLeased(item.Key) {
-        continue
-    }
-    
-    // Mark as leased
-    q.addLeasedKey(item.Key)
-    
-    // Convert to TaskBase
-    task := nodeStateToTask(item.State, taskType)
-    
-    // Enqueue for workers
-    q.enqueuePending(task)
-}
-```
-
-**Benefits of this architecture:**
-- Direct bucket access (no prefix scans needed)
-- Consistent snapshot within transaction
-- Race-free status transitions
-- Prevents duplicate processing via pulling flag and lease tracking
-- Deterministic behavior via buffer flushing
-- Proper coordination between SRC and DST queues
+**Retry**: Same as traversal but over multiple depths (up to `maxKnownDepth`).
 
 ---
 
 ## Coordinator
 
-The `QueueCoordinator` manages the lead window between source and destination queues:
-
-- `CanSrcAdvance` ensures src is never more than `maxLead` rounds ahead of dst (unless dst completed).
-- `CanDstAdvance` requires `(dstRound + 3 <= srcRound)` (or src completed) to guarantee the next round's source data is present.
-- Completion flags (`UpdateSrcCompleted`, `UpdateDstCompleted`) fire when a queue reaches max depth.
-
-Queues call `WaitForCoordinatorGate(reason)` right after seeding and whenever they advance rounds. This mirrors the steady-state gating and keeps the lead window consistent even during startup/resume.
+- **QueueCoordinator** keeps SRC and DST round numbers and enforces gating.
+- **CanDstStartRound**: DST may start round N only when SRC has completed rounds N and N+1 (SRC round >= N+2) or SRC is complete.
+- **CanSrcStartRound**: SRC may run round R only when R <= dstRound + MaxSrcAhead (default 3); configurable via `SetMaxSrcAhead` / `MigrationConfig.MaxSrcAhead`.
+- Completion is marked when a queue reaches max depth. Round updates are reported via `UpdateRound` when advancing.
 
 ---
 
-## Queue Modes
+## Queue modes
 
-The queue system supports two operating modes:
+### Traversal (`QueueModeTraversal`)
 
-### 1. Traversal Mode (Normal Operation)
+- Pull: from cache (`ListPending`).
+- Completion: update cache (status, children, stats). At seal: `SealLevel` bulk-appends level and writes stats; level dropped, N+1 promoted.
+- DST uses coordinator gate and gets expected children from SRC (cache or `ListDstBatchWithSrcChildren`).
 
-**Mode**: `QueueModeTraversal`
+### Retry (`QueueModeRetry`)
 
-**Purpose**: Standard BFS traversal discovering nodes level-by-level.
+- Pull: pending/failed across known depths. On SRC folder success: DST cleanup (mark DST parent pending, `AddNodeDeletions` for children). Same cache-only path as traversal.
 
-**Behavior**:
-- Pulls pending tasks from current round's status buckets
-- Advances rounds when all pending tasks at current level are complete
-- DST queue waits for SRC to be at least 3 rounds ahead (coordinator gating)
-- Expected children for DST tasks are loaded from SRC via join-lookup tables
+### Copy (`QueueModeCopy`)
 
-**Implementation**: `mode_traversal.go` - `PullTraversalTasks()`
-
-### 2. Retry Mode (Retry Sweeps)
-
-**Mode**: `QueueModeRetry`
-
-**Purpose**: Re-traverse failed or marked pending subtrees to discover new/changed content.
-
-**Behavior**:
-- Scans all known levels (up to `maxKnownDepth`) for pending/failed tasks
-- Re-processes marked subtrees as if doing fresh traversal
-- For SRC tasks: On successful completion, triggers DST cleanup
-  - Marks corresponding DST parent nodes as pending
-  - Deletes DST children to allow fresh re-discovery
-- For DST tasks: Loads expected children from SRC (same as traversal mode)
-- Uses same coordinator gating as traversal mode
-
-**Implementation**: `mode_retry.go` - `PullRetryTasks()`
-
-**DST Cleanup Logic**:
-When a SRC folder task completes successfully in retry mode:
-1. Lookup corresponding DST node using join-lookup table (`src-to-dst`)
-2. Mark DST parent as `pending` (queued via OutputBuffer)
-3. Query DST children bucket for child node IDs
-4. Delete all DST children (queued via OutputBuffer using `AddNodeDeletion`)
-5. DST queue will re-process the parent and discover fresh children
-
-This ensures DST stays synchronized with SRC during retry sweeps without duplicate nodes.
+- Pull: from cache (`ListPendingCopy`).
+- Completion: update SRC copy status and DST node in cache. At seal, both SRC and DST levels are sealed with copy stats for SRC.
+- Completion check: no pending/in-progress for current pass (from cache stats).
 
 ---
 
-## Retry & State
+## Completion checking
 
-* `ReportTaskResult()` handles both successful and failed task completion, writing directly to BoltDB. Failed tasks return to pending status immediately (or are marked failed after max retries).
-* `QueueState` (`Running`, `Paused`, `Completed`, `Waiting`) controls queue behavior. Workers observe these states before leasing.
-* Stats (`queue.Stats`) use in-memory counters (pending buffer, in-progress map) for fast reads without database queries.
-
-## Completion Checking
-
-Completion checks are performed by the `Run()` polling loop, not event-driven from task completion. This avoids race conditions where multiple workers complete tasks simultaneously.
-
-**Centralized Logic:**
-- `checkCompletion()` is a unified method that handles both round completion and DST queue completion
-- Uses `CompletionCheckOptions` to configure behavior (flush buffer, advance round, mark DST complete, etc.)
-- All completion checks force-flush the output buffer before querying the database to ensure writes are persisted
-
-**DST Completion:**
-- DST queues check for completion at multiple points: before pulling tasks (for rounds > 0), after getting coordinator gate approval, and periodically in the polling loop
-- Round 0 is skipped for DST completion checks (bootstrap round)
-- Uses `RequireFirstPull` flag to prevent false positives on the first pull attempt
+- **Run() loop** polls; completion is not event-driven from task completion.
+- **checkCompletion**: Checks in-memory state (in-progress, pending, last pull partial) and, for copy mode, cache stats for pending/in_progress.
+- **Round complete**: `advanceToNextRound` runs seal (bulk append + stats snapshot via `SealLevel`, then drop/promote level).
+- **Final completion**: When the first pull of a round returns 0 items and in-progress and pending are 0, the queue is marked completed (mode-specific in `CheckTraversalCompletion` / `CheckCopyCompletion`).
 
 ---
 
-## Benefits of the BoltDB Model
+## Observer
 
-1. **Single source of truth** – Tasks live only in BoltDB; no secondary in-memory structures to reconcile.
-2. **Immediate visibility** – Atomic transactions ensure all operations are immediately visible without delays.
-3. **Race-free** – Single-writer model ensures consistent state transitions.
-4. **Crash resilience** – On resume, we simply scan BoltDB buckets to rebuild state; no volatile queues to reconstruct.
-5. **Simplicity** – Bucket-based storage with natural hierarchies.
-6. **Atomicity** – Each BoltDB transaction guarantees all-or-nothing consistency.
-7. **Performance** – BoltDB's B-tree provides excellent read/write performance without background compaction.
-
----
-
-## Direct Writes
-
-The queue writes directly to BoltDB when tasks complete or fail:
-
-```go
-// On task completion, writes are atomic:
-// 1. Update parent status: pending → successful
-// 2. Insert all discovered children
-err := database.Update(func(tx *bolt.Tx) error {
-    // Both operations in single transaction
-    updateNodeStatusInTx(tx, queueType, level, oldStatus, newStatus, path)
-    batchInsertNodesInTx(tx, childOperations)
-    return nil
-})
-```
-
-This ensures immediate consistency without buffering delays.
-
-**Order of operations:**
-1. Status updates processed first (parent transitions)
-2. Then inserts (children added)
-3. All in single atomic transaction
-
-This ensures readers never see inconsistent state (e.g., parent updated but children missing).
-
----
-
-## Round Advancement
-
-Round advancement is controlled by the `Run()` polling loop, which checks for completion every 100ms. This polling-based approach avoids race conditions that can occur with event-driven completion checks.
-
-**Completion Detection:**
-- The `Run()` loop periodically checks if a round is complete using the condition: `inProgress == 0 && pendingBuff == 0 && lastPullWasPartial == true`
-- `lastPullWasPartial` is set when a pull operation returns fewer tasks than requested (`len(batch) < defaultLeaseBatchSize`), indicating the round may be exhausted
-- When these conditions are met, the loop calls `checkCompletion()` which:
-  1. Force-flushes the output buffer to ensure all writes are persisted
-  2. Verifies the round is truly complete (no in-progress, no pending, last pull was partial)
-  3. Advances to the next round if complete
-  4. Pulls tasks from the new round's pending bucket
-
-**Buffer Flushing:**
-- Before any completion check queries the database, the output buffer is force-flushed to ensure all pending writes (status updates, child inserts) are persisted
-- This prevents false positives where tasks exist in the buffer but haven't been written to the database yet
-
-**Coordinator Gating:**
-- DST queues check the coordinator gate at the start of each round iteration (before pulling tasks)
-- SRC queues advance freely without gating
-- Gating only happens when STARTING a round, not when advancing
+- Polls queues periodically and reads stats from the database (`GetStatsCountAtDepth`, etc.) to compute pending/failed totals.
+- Writes aggregated metrics to the `queue_stats` table via `database.RunUpdateWriterTx` and `Writer.WriteQueueStats` (keyed e.g. by `src-traversal`, `dst-traversal`, `copy`).
 
 ---
 
 ## Resumption
 
-To resume a migration:
+- Open the existing database (same file as before).
+- **InspectMigrationStatus** (in `pkg/migration`) reads node counts and stats from the DB to get pending/failed and min pending depth.
+- Set queue round from that state. `RehydrateLevelFromDB(depth)` is called for each queue so the level cache is refilled from the DB and level stats are synced; workers then pull from cache. The DB is the source of truth for sealed state.
 
-1. Open existing BoltDB database
-2. Scan all level buckets to find minimum pending level for each queue
-3. Set queue round to that level
-4. Workers start leasing from pending buckets at that level
-5. Coordinator enforces lead window as normal
+---
 
-No special resumption logic needed; the bucket structure naturally represents the current state.
+## File layout
+
+```
+pkg/queue/
+├── queue.go           # Queue struct, Run, advanceToNextRound (seal), Lease, ReportTaskResult, InitializeWithContext
+├── level_cache.go     # LevelCache, NodeCache (per-level nodes and stats)
+├── level_cache_test.go
+├── coordinator.go     # QueueCoordinator, CanDstStartRound, CanSrcStartRound, SetMaxSrcAhead
+├── coordinator_test.go
+├── queue_accessors.go # Getters/setters, syncLevelStatsFromDB, RehydrateLevelFromDB
+├── queue_batch.go     # BuildExpectedMapsFromDstWithChildren, BatchLoadExpectedChildrenByDSTIDs
+├── mode_traversal.go  # PullTraversalTasks, traversal completion (cache only)
+├── mode_retry.go      # PullRetryTasks
+├── mode_copy.go       # PullCopyTasks, copy completion, CheckCopyCompletion
+├── worker_traversal.go
+├── worker_copy.go
+├── worker/
+│   └── interface.go
+├── task.go
+├── seeding.go
+├── observer.go
+└── README.md
+```
 
 ---
 
 ## Summary
 
-The queue layer uses BoltDB's bucket hierarchies to coordinate BFS traversal. Workers execute tasks; the queue owns persistence, propagation, and coordination. The coordinator gates enforce the src/dst lead window, and external behavior (round advancement, retry semantics, logging) remains unchanged—but with simpler internals, no MVCC races, and guaranteed consistency.
-
-**Key architectural win:** Status is membership in a bucket, not encoded in a key. This makes transitions atomic and intuitive.
+- **Cache + seal**: **NodeCache is required.** Hot-path reads/writes use per-level caches; the DB is written only at seal (`SealLevel`) and used for resume rehydration.
+- **Pull**: From cache (ListPending / ListPendingCopy) or DB keyset queries; results go into `pendingBuff` and are leased to workers.
+- **Seal**: At round advance, sealed level is bulk-appended to the DB and stats snapshot written; level is dropped (and N+1 promoted for traversal).
+- **Coordinator** enforces DST lead (SRC ahead by N+2) and SRC-ahead cap (default 3). **Observer** reads stats from the DB and writes `queue_stats`.
+- **Modes**: Traversal (BFS by round), Retry (re-process pending/failed, DST cleanup), Copy (by copy_status and type, two passes).

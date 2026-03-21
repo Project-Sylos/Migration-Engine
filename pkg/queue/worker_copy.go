@@ -24,7 +24,7 @@ const (
 type CopyWorker struct {
 	id          string
 	queue       *Queue
-	boltDB      *db.DB
+	database    *db.DB
 	srcAdapter  types.FSAdapter // Source adapter for reading files
 	dstAdapter  types.FSAdapter // Destination adapter for writing files/folders
 	queueName   string          // "copy" for logging
@@ -37,7 +37,7 @@ type CopyWorker struct {
 func NewCopyWorker(
 	id string,
 	queue *Queue,
-	boltInstance *db.DB,
+	database *db.DB,
 	srcAdapter types.FSAdapter,
 	dstAdapter types.FSAdapter,
 	shutdownCtx context.Context,
@@ -45,7 +45,7 @@ func NewCopyWorker(
 	return &CopyWorker{
 		id:          id,
 		queue:       queue,
-		boltDB:      boltInstance,
+		database:    database,
 		srcAdapter:  srcAdapter,
 		dstAdapter:  dstAdapter,
 		queueName:   "copy",
@@ -60,7 +60,10 @@ func NewCopyWorker(
 // When queue is exhausted, the worker exits.
 func (w *CopyWorker) Run() {
 	if logservice.LS != nil {
-		_ = logservice.LS.Log("info", "Copy worker started", "worker", w.id, w.queueName)
+		err := logservice.LS.Log("info", "Copy worker started", "worker", w.id, w.queueName)
+		if err != nil {
+			fmt.Println("error logging", err)
+		}
 	}
 
 	for {
@@ -70,7 +73,10 @@ func (w *CopyWorker) Run() {
 			case <-w.shutdownCtx.Done():
 				// Shutdown triggered - exit immediately
 				if logservice.LS != nil {
-					_ = logservice.LS.Log("info", "Copy worker exiting - shutdown requested", "worker", w.id, w.queueName)
+					err := logservice.LS.Log("info", "Copy worker exiting - shutdown requested", "worker", w.id, w.queueName)
+					if err != nil {
+						fmt.Println("error logging", err)
+					}
 				}
 				return
 			default:
@@ -88,7 +94,10 @@ func (w *CopyWorker) Run() {
 		// Check if queue is exhausted (copy complete) - exit worker
 		if w.queue.IsExhausted() {
 			if logservice.LS != nil {
-				_ = logservice.LS.Log("info", "Copy worker exiting - queue exhausted", "worker", w.id, w.queueName)
+				err := logservice.LS.Log("info", "Copy worker exiting - queue exhausted", "worker", w.id, w.queueName)
+				if err != nil {
+					fmt.Println("error logging", err)
+				}
 			}
 			return
 		}
@@ -105,14 +114,22 @@ func (w *CopyWorker) Run() {
 		err := w.execute(task)
 		if err != nil {
 			// Record task error in main DB for cross-lookup (copy phase, SRC only)
-			if w.boltDB != nil {
-				_, _ = db.RecordTaskError(w.boltDB, "SRC", "copy", task.ID, err.Error(), task.Attempts, task.LocationPath())
+			if w.database != nil {
+				err := w.database.RunUpdateWriterTx(func(tx *db.Writer) error {
+					return tx.RecordTaskError("SRC", "copy", task.ID, err.Error(), task.Attempts, task.LocationPath())
+				})
+				if err != nil {
+					fmt.Println("error running update writer tx", err)
+				}
 			}
 			if logservice.LS != nil {
-				_ = logservice.LS.Log("error",
+				err := logservice.LS.Log("error",
 					fmt.Sprintf("Copy worker task execution failed: path=%s round=%d pass=%d error=%v",
 						task.LocationPath(), task.Round, task.CopyPass, err),
 					"worker", w.id, w.queueName)
+				if err != nil {
+					fmt.Println("error logging", err)
+				}
 			}
 			w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
 			// Check if task was retried for logging
@@ -220,7 +237,10 @@ func (w *CopyWorker) copyFile(task *TaskBase) error {
 	bytesTransferred, err := io.CopyBuffer(dstWriter, srcReader, w.copyBuffer)
 	if err != nil {
 		// Close writer on copy error (may fail, but we already have the copy error)
-		_ = dstWriter.Close()
+		err := dstWriter.Close()
+		if err != nil {
+			fmt.Println("error closing destination writer", err)
+		}
 		return fmt.Errorf("failed to copy file data for %s: %w", file.LocationPath, err)
 	}
 
@@ -242,7 +262,7 @@ func (w *CopyWorker) copyFile(task *TaskBase) error {
 }
 
 // logError logs a failed task execution.
-func (w *CopyWorker) logError(task *TaskBase, err error, willRetry bool) {
+func (w *CopyWorker) logError(task *TaskBase, paramErr error, willRetry bool) {
 	if logservice.LS == nil {
 		return // Logger not initialized
 	}
@@ -252,11 +272,14 @@ func (w *CopyWorker) logError(task *TaskBase, err error, willRetry bool) {
 		retryMsg = "max retries exceeded"
 	}
 
-	_ = logservice.LS.Log(
+	err := logservice.LS.Log(
 		"error",
-		fmt.Sprintf("Failed to copy %s: %v (%s)", path, err, retryMsg),
+		fmt.Sprintf("Failed to copy %s: %v (%s)", path, paramErr, retryMsg),
 		"worker",
 		w.id,
 		w.queueName,
 	)
+	if err != nil {
+		fmt.Println("error logging", err)
+	}
 }

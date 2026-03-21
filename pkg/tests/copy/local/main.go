@@ -80,7 +80,7 @@ func runTest() error {
 		return fmt.Errorf("traversal setup failed: %w", err)
 	}
 
-	// Run traversal phase (LetsMigrate runs traversal and closes DB in ModeStandalone)
+	// Run traversal phase (LetsMigrate runs traversal using manager-owned DB lifecycle)
 	result, err := migration.LetsMigrate(cfg)
 	if err != nil {
 		return fmt.Errorf("traversal failed: %w", err)
@@ -89,18 +89,18 @@ func runTest() error {
 	fmt.Println()
 
 	// Phase 2: Run copy phase
-	// Reopen database (LetsMigrate closed it in ModeStandalone mode)
+	// Reopen database for explicit copy-phase call.
 	fmt.Println("🚀 Phase 3: Copy Phase")
 	fmt.Println("======================")
-	boltDB, srcAdapter, dstAdapter, err := shared.SetupLocalCopyTest(srcPath, dstPath, false) // Don't remove existing DB
+	database, srcAdapter, dstAdapter, err := shared.SetupLocalCopyTest(srcPath, dstPath, false) // Don't remove existing DB
 	if err != nil {
 		return fmt.Errorf("copy setup failed: %w", err)
 	}
-	defer boltDB.Close()
+	defer database.Close()
 
 	// Run copy phase
 	stats, err := migration.RunCopyPhase(migration.CopyPhaseConfig{
-		BoltDB:          boltDB,
+		DuckDB:          database,
 		SrcAdapter:      srcAdapter,
 		DstAdapter:      dstAdapter,
 		WorkerCount:     10,
@@ -121,7 +121,7 @@ func runTest() error {
 	fmt.Println("✓ Phase 4: Verification")
 	fmt.Println("========================")
 	shared.PrintCopyVerification(stats)
-	if err := shared.VerifyCopyCompletion(boltDB); err != nil {
+	if err := shared.VerifyCopyCompletion(database); err != nil {
 		return fmt.Errorf("verification failed: %w", err)
 	}
 
@@ -177,20 +177,14 @@ func setupTraversalConfig(srcPath, dstPath string) (migration.Config, error) {
 		Type:         types.NodeTypeFolder,
 	}
 
-	// Open database - use copy/shared DB path
-	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           "pkg/tests/copy/shared/main_test.db",
-		RemoveExisting: true, // Clean DB for fresh traversal
-	})
+	// Open database - use copy/shared DB path (absolute to avoid split-brain across connections)
+	dbPath, err := filepath.Abs("pkg/tests/copy/shared/main_test.db")
 	if err != nil {
-		return migration.Config{}, fmt.Errorf("failed to open database: %w", err)
+		return migration.Config{}, fmt.Errorf("failed to resolve DB path: %w", err)
 	}
-
 	cfg := migration.Config{
-		DatabaseInstance: dbInstance,
-		Runtime:          migration.ModeStandalone, // Will close DB after traversal
 		Database: migration.DatabaseConfig{
-			Path:           "pkg/tests/copy/shared/main_test.db",
+			Path:           dbPath,
 			RemoveExisting: true,
 		},
 		Source: migration.Service{

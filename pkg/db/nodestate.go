@@ -4,65 +4,124 @@
 package db
 
 import (
-	"encoding/json"
-	"fmt"
+	"crypto/sha256"
+	"encoding/hex"
 )
 
-// NodeState represents the state of a node stored in BoltDB.
-// This is used during traversal and copy phases.
+// NodeState is the in-memory representation of a row in src_nodes or dst_nodes.
+// Path and parent_path are the join keys between SRC and DST.
 type NodeState struct {
-	ID                string `json:"id"`                // ULID for internal use (database keys)
-	ServiceID         string `json:"service_id"`        // FS identifier (from Folder/File.ServiceID)
-	ParentID          string `json:"parent_id"`         // Parent's ULID (internal ID)
-	ParentServiceID   string `json:"parent_service_id"` // Parent's FS identifier
-	ParentPath        string `json:"parent_path"`       // Parent's relative path (for querying children)
-	SrcID             string `json:"src_id,omitempty"`  // Corresponding SRC node ULID (DST nodes only)
-	Name              string `json:"name"`
-	Path              string `json:"path"` // Relative to root (normalized, used for cross-service matching)
-	Type              string `json:"type"` // "file" or "folder"
-	Size              int64  `json:"size,omitempty"`
-	MTime             string `json:"mtime"` // Last modified time
-	Depth             int    `json:"depth"`
-	TraversalStatus   string `json:"traversal_status"`   // "pending", "successful", "failed", "not_on_src"
-	CopyStatus        string `json:"copy_status"`        // "pending", "successful", "failed" (for future copy phase)
-	Status            string `json:"status,omitempty"`   // Legacy: Comparison status for dst nodes
-	ExplicitExcluded  bool   `json:"explicit_excluded"`  // Set by API, not modified by engine
-	InheritedExcluded bool   `json:"inherited_excluded"` // Set by exclusion sweep engine
-	Errors            []ErrorRef `json:"errors,omitempty"` // Task error refs (id + phase) for O(1) lookup in errors bucket
+	ID               string // Internal ULID-like id (deterministic from queueType, nodeType, path)
+	ServiceID        string // FS id
+	ParentID         string // Parent's internal id
+	ParentServiceID  string
+	Path             string // Join key with other table
+	ParentPath       string // Join key for children
+	Name             string // Display name (for task/UI)
+	Type             string // "folder" or "file"
+	Size             int64
+	MTime            string
+	Depth            int
+	TraversalStatus  string // pending, successful, failed, not_on_src (dst)
+	CopyStatus       string // pending, in_progress, successful, failed (src)
+	Excluded         bool
+	Errors           string // JSON placeholder for log refs
+	Status           string // Alias for TraversalStatus (used by queue taskToNodeState)
+	SrcID            string // Optional: corresponding SRC node id (join is by path; used during seeding for DST root)
 }
 
-// ErrorRef points to a task error entry in the errors bucket (phase sub-bucket, key = id).
-type ErrorRef struct {
-	ID    string `json:"id"`    // UUID of the error entry
-	Phase string `json:"phase"` // Sub-bucket: src_traversal, src_copy, dst_traversal, dst_copy
-}
-
-// NodeMeta holds Depth and TraversalStatus for batch lookups (e.g. retry DST cleanup).
+// NodeMeta is a subset of NodeState for batch lookups.
 type NodeMeta struct {
+	ID              string
 	Depth           int
+	Type            string
 	TraversalStatus string
+	CopyStatus      string
 }
 
-// Serialize converts NodeState to bytes for storage in BoltDB.
-func (ns *NodeState) Serialize() ([]byte, error) {
-	return json.Marshal(ns)
+// InsertOperation represents a single node insert in a batch.
+type InsertOperation struct {
+	QueueType string   // "SRC" or "DST"
+	Level     int      // depth
+	Status    string   // initial traversal_status
+	State     *NodeState
 }
 
-// DeserializeNodeState creates a NodeState from bytes stored in BoltDB.
-func DeserializeNodeState(data []byte) (*NodeState, error) {
-	var ns NodeState
-	if err := json.Unmarshal(data, &ns); err != nil {
-		return nil, fmt.Errorf("failed to deserialize NodeState: %w", err)
+// FetchResult is one row from a keyset list (id + full state).
+type FetchResult struct {
+	Key   string
+	State *NodeState
+}
+
+// WriteOperation is an operation that can be buffered and flushed via the writer.
+type WriteOperation interface {
+	flush(w *Writer) error
+}
+
+// StatusUpdateOperation represents a traversal status transition (e.g. pending → successful).
+type StatusUpdateOperation struct {
+	QueueType string
+	Level     int
+	OldStatus string
+	NewStatus string
+	NodeID    string
+}
+
+func (o *StatusUpdateOperation) flush(w *Writer) error {
+	// Status updates are applied via cache + SealLevel; no staging write.
+	return nil
+}
+
+// BatchInsertOperation is a batch of node inserts.
+type BatchInsertOperation struct {
+	Operations []InsertOperation
+}
+
+func (o *BatchInsertOperation) flush(w *Writer) error {
+	if len(o.Operations) == 0 {
+		return nil
 	}
-	return &ns, nil
+	srcNodes := make([]*NodeState, 0)
+	dstNodes := make([]*NodeState, 0)
+	for _, op := range o.Operations {
+		if op.State == nil {
+			continue
+		}
+		s := op.State
+		if s.TraversalStatus == "" {
+			s.TraversalStatus = op.Status
+		}
+		if s.Status == "" {
+			s.Status = s.TraversalStatus
+		}
+		table := op.QueueType
+		if table == "DST" {
+			dstNodes = append(dstNodes, s)
+		} else {
+			srcNodes = append(srcNodes, s)
+		}
+	}
+	if len(srcNodes) > 0 {
+		if err := w.AppenderInsert(tableSrcNodes, srcNodes); err != nil {
+			return err
+		}
+	}
+	if len(dstNodes) > 0 {
+		if err := w.AppenderInsert(tableDstNodes, dstNodes); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// SerializeStringSlice converts a string slice to bytes.
-func SerializeStringSlice(slice []string) ([]byte, error) {
-	return json.Marshal(slice)
-}
-
-// DeserializeStringSlice converts bytes to a string slice.
-func DeserializeStringSlice(data []byte, slice *[]string) error {
-	return json.Unmarshal(data, slice)
+// DeterministicNodeID returns a stable id from (queueType, nodeType, path) for race-safe deduplication.
+func DeterministicNodeID(queueType, nodeType, path string) string {
+	h := sha256.New()
+	h.Write([]byte(queueType))
+	h.Write([]byte("\x00"))
+	h.Write([]byte(nodeType))
+	h.Write([]byte("\x00"))
+	h.Write([]byte(path))
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum[:16]) // 32 hex chars
 }

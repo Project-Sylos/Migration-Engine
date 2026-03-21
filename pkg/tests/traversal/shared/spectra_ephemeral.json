@@ -1,23 +1,23 @@
 {
   "mode": "ephemeral",
   "seed": {
-    "max_depth": 6,
+    "max_depth": 5,
     "max_folders": 50,
     "folder_backoff_factor": 0.8,
     "folder_depth_decay_factor": 0.80,
     "max_files": 50,
     "file_backoff_factor": 0.8,
     "file_depth_decay_factor": 0.80,
-    "seed": 42,
+    "seed": 40,
     "file_binary_seed": 0,
-    "enable_cache": false
+    "enable_cache": false,
+    "diverging_tree_mode": false
   },
   "api": {
     "host": "localhost",
     "port": 8086
   },
   "secondary_tables": {
-    "s1": 0.7,
-    "s2": 0.3
+    "s1": 0.9
   }
 }

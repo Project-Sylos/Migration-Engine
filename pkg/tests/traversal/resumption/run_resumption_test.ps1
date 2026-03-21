@@ -14,12 +14,9 @@ Write-Host ""
 # Clean up existing test databases ONLY at the start for a fresh test
 # The DB will persist between Phase 1 (kill) and Phase 2 (resume)
 # Final cleanup happens at the end after verification
-$mainDB = "pkg/tests/traversal/shared/main_test.db"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Write-Host "Cleaning up test databases for fresh test run..." -ForegroundColor Yellow
-Remove-Item -Path $mainDB -ErrorAction SilentlyContinue
-Remove-Item -Path ($mainDB -replace '\.db$','_logs.db') -ErrorAction SilentlyContinue
-Remove-Item -Path "pkg/tests/traversal/shared/main_test.yaml" -ErrorAction SilentlyContinue
-Write-Host "Cleanup complete" -ForegroundColor Green
+& "$ScriptDir\..\shared\cleanup.ps1"
 Write-Host ""
 
 # Phase 1: Start migration and kill it midway
@@ -109,21 +106,6 @@ Write-Host "Phase 1 Duration: $($phase1Duration.TotalSeconds) seconds" -Foregrou
 Write-Host ""
 
 # Verify shutdown state was saved
-if (Test-Path "pkg/tests/traversal/shared/main_test.yaml") {
-    Write-Host "YAML config file exists (suspended state saved)" -ForegroundColor Green
-    
-    # Read YAML to check status
-    $yamlContent = Get-Content "pkg/tests/traversal/shared/main_test.yaml" -Raw
-    if ($yamlContent -match 'state:\s*\r?\n\s*status\s*:\s*(suspended|running)') {
-        Write-Host "Migration state indicates suspension or ready to resume" -ForegroundColor Green
-    } else {
-        Write-Host "Warning: YAML status not found or unexpected" -ForegroundColor Yellow
-    }
-} else {
-    Write-Host "YAML config file not found - shutdown may not have saved state!" -ForegroundColor Red
-    exit 1
-}
-
 if (Test-Path "pkg/tests/traversal/shared/main_test.db") {
     Write-Host "Database file exists (checkpoint saved)" -ForegroundColor Green
 } else {
@@ -159,23 +141,9 @@ Write-Host ""
 if ($exitCode -eq 0) {
     Write-Host "TEST PASSED - Migration successfully resumed and completed!" -ForegroundColor Green
     
-    # Verify final state
-    if (Test-Path "pkg/tests/traversal/shared/main_test.yaml") {
-        $finalYaml = Get-Content "pkg/tests/traversal/shared/main_test.yaml" -Raw
-        if ($finalYaml -match 'status:\s*completed') {
-            Write-Host "Final YAML status is 'completed'" -ForegroundColor Green
-        } else {
-            Write-Host "Warning: Final status may not be 'completed'" -ForegroundColor Yellow
-        }
-    }
-    
     # Clean up test databases after successful test completion
     Write-Host ""
-    Write-Host "Cleaning up test databases after successful test..." -ForegroundColor Yellow
-    Remove-Item -Path $mainDB -ErrorAction SilentlyContinue
-    Remove-Item -Path ($mainDB -replace '\.db$','_logs.db') -ErrorAction SilentlyContinue
-    Remove-Item -Path "pkg/tests/traversal/shared/main_test.yaml" -ErrorAction SilentlyContinue
-    Write-Host "Cleanup complete" -ForegroundColor Green
+    & "$ScriptDir\..\shared\cleanup.ps1"
 } else {
     Write-Host "TEST FAILED - Migration resumption did not complete successfully" -ForegroundColor Red
     Write-Host "Test databases preserved for inspection" -ForegroundColor Yellow

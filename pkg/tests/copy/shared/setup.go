@@ -74,7 +74,10 @@ func SetupSpectraFS(configPath string, cleanDB bool) (*sdk.SpectraFS, error) {
 			}
 			// Also try to remove lock files (Windows-specific: .db.lock)
 			lockPath := dbPath + ".lock"
-			_ = os.Remove(lockPath) // Ignore errors - lock file might not exist
+			err := os.Remove(lockPath) // Ignore errors - lock file might not exist
+			if err != nil {
+				fmt.Println("error removing lock file", err)
+			}
 		}
 	}
 
@@ -132,54 +135,92 @@ func LoadSpectraRoots(spectraFS *sdk.SpectraFS) (types.Folder, types.Folder, err
 // SetupCopyTest sets up the database and adapters for copy phase testing.
 // cleanSpectraDB controls whether to delete the existing Spectra DB (use false for copy tests).
 // removeMigrationDB controls whether to remove the migration database (use false to use pre-provisioned DB).
-// Returns the BoltDB instance, source adapter, destination adapter, and error.
+// Returns the database instance, source adapter, destination adapter, and error.
 func SetupCopyTest(cleanSpectraDB bool, removeMigrationDB bool) (*db.DB, types.FSAdapter, types.FSAdapter, error) {
-	fmt.Println("Loading Spectra configuration...")
-
-	// Create SpectraFS instance (SDK should load existing DB data if file exists)
-	spectraFS, err := SetupSpectraFS("pkg/tests/copy/shared/spectra.json", cleanSpectraDB)
+	cfg, err := SetupCopyTestConfig(cleanSpectraDB, removeMigrationDB)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	database, _, err := migration.SetupDatabase(migration.DatabaseConfig{
+		Path:           cfg.Database.Path,
+		RemoveExisting: false,
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return database, cfg.Source.Adapter, cfg.Destination.Adapter, nil
+}
+
+// SetupCopyTestConfig returns a full migration.Config for the copy test (Spectra roots, DB at copy/shared/main_test.db).
+// Use with migration.LetsMigrate to run traversal and produce a DuckDB ready for copy-phase tests.
+// cleanSpectraDB: false to keep existing Spectra DB. removeMigrationDB: true to create a fresh migration DB.
+func SetupCopyTestConfig(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, error) {
+	fmt.Println("Loading Spectra configuration...")
+
+	spectraFS, err := SetupSpectraFS("pkg/tests/copy/shared/spectra.json", cleanSpectraDB)
+	if err != nil {
+		return migration.Config{}, err
 	}
 
 	srcRoot, dstRoot, err := LoadSpectraRoots(spectraFS)
 	if err != nil {
-		return nil, nil, nil, err
+		return migration.Config{}, err
 	}
 
-	// Check if we're in ephemeral mode
 	isEphemeral, err := isEphemeralMode("pkg/tests/copy/shared/spectra.json")
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to check mode: %w", err)
+		return migration.Config{}, fmt.Errorf("failed to check mode: %w", err)
 	}
 
 	srcAdapter, err := fs.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary", isEphemeral)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create src adapter: %w", err)
+		return migration.Config{}, fmt.Errorf("failed to create src adapter: %w", err)
 	}
 
 	dstAdapter, err := fs.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1", isEphemeral)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create dst adapter: %w", err)
+		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
 	}
 
-	// Open database - tests own the lifecycle
-	// Use RemoveExisting: false to use pre-provisioned DB
-	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           "pkg/tests/copy/shared/main_test.db",
-		RemoveExisting: removeMigrationDB,
-	})
+	dbPath, err := filepath.Abs("pkg/tests/copy/shared/main_test.db")
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to open database: %w", err)
+		return migration.Config{}, fmt.Errorf("failed to resolve DB path: %w", err)
+	}
+	cfg := migration.Config{
+		Database: migration.DatabaseConfig{
+			Path:           dbPath,
+			RemoveExisting: removeMigrationDB,
+		},
+		Source: migration.Service{
+			Name:    "Spectra-Primary",
+			Adapter: srcAdapter,
+		},
+		Destination: migration.Service{
+			Name:    "Spectra-S1",
+			Adapter: dstAdapter,
+		},
+		SeedRoots:       true,
+		WorkerCount:     10,
+		MaxRetries:      3,
+		CoordinatorLead: 4,
+		SkipListener:    true,
+		LogAddress:      "127.0.0.1:8081",
+		LogLevel:        "trace",
+		StartupDelay:    1 * time.Second,
+		Verification:    migration.VerifyOptions{},
 	}
 
-	return dbInstance, srcAdapter, dstAdapter, nil
+	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {
+		return migration.Config{}, err
+	}
+
+	return cfg, nil
 }
 
 // SetupLocalCopyTest sets up the database and adapters for local filesystem copy phase testing.
 // srcPath and dstPath are absolute paths to the source and destination directories.
 // removeMigrationDB controls whether to remove the migration database (use true for fresh test).
-// Returns the BoltDB instance, source adapter, destination adapter, and error.
+// Returns the DuckDB instance, source adapter, destination adapter, and error.
 func SetupLocalCopyTest(srcPath, dstPath string, removeMigrationDB bool) (*db.DB, types.FSAdapter, types.FSAdapter, error) {
 	fmt.Printf("Setting up local filesystem copy test...\n")
 	fmt.Printf("  Source: %s\n", srcPath)
@@ -207,10 +248,13 @@ func SetupLocalCopyTest(srcPath, dstPath string, removeMigrationDB bool) (*db.DB
 		return nil, nil, nil, fmt.Errorf("destination path does not exist or is not accessible: %s (error: %w)", dstPath, err)
 	}
 
-	// Open database - tests own the lifecycle
-	// Use pkg/tests/copy/shared/main_test.db for copy tests
+	// Open database - tests own the lifecycle (absolute path to avoid split-brain across connections)
+	dbPath, err := filepath.Abs("pkg/tests/copy/shared/main_test.db")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to resolve DB path: %w", err)
+	}
 	dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           "pkg/tests/copy/shared/main_test.db",
+		Path:           dbPath,
 		RemoveExisting: removeMigrationDB,
 	})
 	if err != nil {

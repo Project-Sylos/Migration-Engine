@@ -15,12 +15,9 @@ echo ""
 # Clean up existing test databases ONLY at the start for a fresh test
 # The DB will persist between Phase 1 (kill) and Phase 2 (resume)
 # Final cleanup happens at the end after verification
-mainDB="pkg/tests/traversal/shared/main_test.db"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 echo "Cleaning up test databases for fresh test run..."
-rm -f "$mainDB"
-rm -f "${mainDB%.db}_logs.db"
-rm -f "pkg/tests/traversal/shared/main_test.yaml"
-echo "Cleanup complete"
+bash "$SCRIPT_DIR/../shared/cleanup.sh"
 echo ""
 
 # Phase 1: Start migration and kill it midway
@@ -67,20 +64,6 @@ echo "Phase 1 Duration: ${phase1Duration} seconds"
 echo ""
 
 # Verify shutdown state was saved
-if [ -f "pkg/tests/traversal/shared/main_test.yaml" ]; then
-    echo "YAML config file exists (suspended state saved)"
-    
-    # Read YAML to check status
-    if grep -qE 'state:\s*\n\s*status\s*:\s*(suspended|running)' "pkg/tests/traversal/shared/main_test.yaml" 2>/dev/null; then
-        echo "Migration state indicates suspension or ready to resume"
-    else
-        echo "Warning: YAML status not found or unexpected"
-    fi
-else
-    echo "YAML config file not found - shutdown may not have saved state!"
-    exit 1
-fi
-
 if [ -f "pkg/tests/traversal/shared/main_test.db" ]; then
     echo "Database file exists (checkpoint saved)"
 else
@@ -115,23 +98,10 @@ echo ""
 
 if [ $exitCode -eq 0 ]; then
     echo "TEST PASSED - Migration successfully resumed and completed!"
-    
-    # Verify final state
-    if [ -f "pkg/tests/traversal/shared/main_test.yaml" ]; then
-        if grep -qE 'status:\s*completed' "pkg/tests/traversal/shared/main_test.yaml" 2>/dev/null; then
-            echo "Final YAML status is 'completed'"
-        else
-            echo "Warning: Final status may not be 'completed'"
-        fi
-    fi
-    
+        
     # Clean up test databases after successful test completion
     echo ""
-    echo "Cleaning up test databases after successful test..."
-    rm -f "$mainDB"
-    rm -f "${mainDB%.db}_logs.db"
-    rm -f "pkg/tests/traversal/shared/main_test.yaml"
-    echo "Cleanup complete"
+    bash "$SCRIPT_DIR/../shared/cleanup.sh"
 else
     echo "TEST FAILED - Migration resumption did not complete successfully"
     echo "Test databases preserved for inspection"

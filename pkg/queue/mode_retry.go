@@ -15,8 +15,8 @@ import (
 // Checks maxKnownDepth and scans all known levels up to maxKnownDepth, then uses normal traversal logic for deeper levels.
 // Uses getter/setter methods - no direct mutex access.
 func (q *Queue) PullRetryTasks(force bool) {
-	boltDB := q.getBoltDB()
-	if boltDB == nil {
+	database := q.getDatabase()
+	if database == nil {
 		return
 	}
 
@@ -27,7 +27,7 @@ func (q *Queue) PullRetryTasks(force bool) {
 	}
 
 	// Don't pull if queue is completed (prevents deadlock on coordinator gate)
-	if q.getState() == QueueStateCompleted {
+	if q.State() == QueueStateCompleted {
 		return
 	}
 
@@ -37,13 +37,6 @@ func (q *Queue) PullRetryTasks(force bool) {
 	defer func() {
 		q.setPulling(false)
 	}()
-
-	// Force-flush buffer before pulling tasks to ensure we don't pull tasks
-	// that are waiting in the buffer to be written
-	outputBuffer := q.getOutputBuffer()
-	if outputBuffer != nil {
-		outputBuffer.Flush()
-	}
 
 	// Get state snapshot
 	snapshot := q.getStateSnapshot()
@@ -73,32 +66,56 @@ func (q *Queue) PullRetryTasks(force bool) {
 		}
 	}
 
-	// If maxKnownDepth is not set, try to compute it from existing levels
+	// If maxKnownDepth is not set, get it from the stats table (max depth with any stats)
 	if maxKnownDepth == -1 {
-		levels, err := boltDB.GetAllLevels(getQueueType(q.name))
-		if err == nil && len(levels) > 0 {
-			maxKnownDepth = 0
-			for _, level := range levels {
-				if level > maxKnownDepth {
-					maxKnownDepth = level
-				}
-			}
-			q.setMaxKnownDepth(maxKnownDepth)
+		d, err := database.GetMaxDepth(getQueueType(q.name))
+		if err == nil {
+			q.SetMaxKnownDepth(d)
+			maxKnownDepth = d
 		}
 	}
 
-	// If current round <= maxKnownDepth, scan all known levels with pending/failed status
+	// If current round <= maxKnownDepth, scan all known levels with pending status (keyset + status filter)
 	if maxKnownDepth >= 0 && currentRound <= maxKnownDepth {
-		// For retry sweep up to maxKnownDepth, pull from current round
-		// All tasks should have been moved to pending before this sweep, so we only need to pull pending
 		queueType := getQueueType(q.name)
 		batchSize := effectiveLeaseBatchSize()
-		batch, err := db.BatchFetchWithKeys(boltDB, queueType, currentRound, db.StatusPending, batchSize)
+		var batch []db.FetchResult
+		var expectedFoldersMap map[string][]types.Folder
+		var expectedFilesMap map[string][]types.File
+		var srcIDMap map[string]map[string]string
+		var srcIDToMeta map[string]SrcNodeMeta
+		var err error
+
+		if q.name == "dst" {
+			var childrenByDstID map[string][]*db.NodeState
+			batch, childrenByDstID, err = db.ListDstBatchWithSrcChildren(database, currentRound, q.getDstKeysetCursor(), batchSize, db.StatusPending)
+			if err == nil && len(batch) > 0 {
+				q.setDstKeysetCursor(batch[len(batch)-1].Key)
+				expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta = BuildExpectedMapsFromDstWithChildren(batch, childrenByDstID)
+			}
+			if err != nil {
+				batch = nil
+			}
+		} else {
+			batch, err = db.ListNodesByDepthKeyset(database, queueType, currentRound, q.getSrcKeysetCursor(), db.StatusPending, batchSize)
+			if err == nil && len(batch) > 0 {
+				q.setSrcKeysetCursor(batch[len(batch)-1].Key)
+			}
+		}
 		if err != nil {
 			if logservice.LS != nil {
-				_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to fetch retry batch from BoltDB: %v", err), "queue", q.name, q.name)
+				err := logservice.LS.Log("debug", fmt.Sprintf("Failed to fetch retry batch: %v", err), "queue", q.name, q.name)
+				if err != nil {
+					fmt.Println("error logging", err)
+				}
 			}
 			return
+		}
+		if len(batch) == 0 && q.name == "dst" {
+			expectedFoldersMap = make(map[string][]types.Folder)
+			expectedFilesMap = make(map[string][]types.File)
+			srcIDMap = make(map[string]map[string]string)
+			srcIDToMeta = make(map[string]SrcNodeMeta)
 		}
 
 		taskType := TaskTypeSrcTraversal
@@ -120,57 +137,19 @@ func (q *Queue) PullRetryTasks(force bool) {
 				}
 			}
 			if len(srcFolderIDs) > 0 {
-				var err error
-				retryDstCleanupMap, err = BatchLoadRetryDstCleanup(boltDB, srcFolderIDs)
-				if err != nil {
+				var loadErr error
+				retryDstCleanupMap, loadErr = BatchLoadRetryDstCleanup(database, srcFolderIDs)
+				if loadErr != nil {
 					if logservice.LS != nil {
-						_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to batch load retry DST cleanup: %v", err), "queue", q.name, q.name)
+						err := logservice.LS.Log("debug", fmt.Sprintf("Failed to batch load retry DST cleanup: %v", loadErr), "queue", q.name, q.name)
+						if err != nil {
+							fmt.Println("error logging", err)
+						}
 					}
 					retryDstCleanupMap = make(map[string]*RetryDstCleanup)
 				}
 			} else {
 				retryDstCleanupMap = make(map[string]*RetryDstCleanup)
-			}
-		}
-
-		// For DST: Batch-load expected children (same as traversal mode)
-		var expectedFoldersMap map[string][]types.Folder
-		var expectedFilesMap map[string][]types.File
-		var srcIDMap map[string]map[string]string
-		var srcIDToMeta map[string]SrcNodeMeta
-		if q.name == "dst" {
-			// Collect DST parent IDs for batch loading
-			var dstParentIDs []string
-			dstIDToPath := make(map[string]string)
-			for _, item := range batch {
-				if q.isLeased(item.Key) {
-					continue
-				}
-				task := nodeStateToTask(item.State, taskType)
-				if task.IsFolder() {
-					dstParentIDs = append(dstParentIDs, item.State.ID)
-					dstIDToPath[item.State.ID] = task.Folder.LocationPath
-				}
-			}
-
-			// Batch-load expected children
-			if len(dstParentIDs) > 0 {
-				var err error
-				expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta, err = BatchLoadExpectedChildrenByDSTIDs(boltDB, dstParentIDs, dstIDToPath)
-				if err != nil {
-					if logservice.LS != nil {
-						_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to batch load expected children in retry mode: %v", err), "queue", q.name, q.name)
-					}
-					expectedFoldersMap = make(map[string][]types.Folder)
-					expectedFilesMap = make(map[string][]types.File)
-					srcIDMap = make(map[string]map[string]string)
-					srcIDToMeta = make(map[string]SrcNodeMeta)
-				}
-			} else {
-				expectedFoldersMap = make(map[string][]types.Folder)
-				expectedFilesMap = make(map[string][]types.File)
-				srcIDMap = make(map[string]map[string]string)
-				srcIDToMeta = make(map[string]SrcNodeMeta)
 			}
 		}
 
@@ -213,7 +192,7 @@ func (q *Queue) PullRetryTasks(force bool) {
 			}
 
 			// Enqueue task - only mark as leased if enqueue succeeds
-			if q.enqueuePending(task) {
+			if q.Add(task) {
 				q.addLeasedKey(item.Key)
 				enqueuedCount++
 			}
@@ -227,6 +206,7 @@ func (q *Queue) PullRetryTasks(force bool) {
 
 		// Record pull in RoundInfo
 		q.recordPull(currentRound, len(batch), wasPartial)
+		q.setFirstPullForRound(false)
 
 		return
 	}

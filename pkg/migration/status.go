@@ -47,85 +47,77 @@ func (s MigrationStatus) IsComplete() bool {
 	return !s.HasPending()
 }
 
-// InspectMigrationStatus inspects the BoltDB node data and returns a MigrationStatus.
-func InspectMigrationStatus(boltDB *db.DB) (MigrationStatus, error) {
-	if boltDB == nil {
-		return MigrationStatus{}, fmt.Errorf("boltDB cannot be nil")
+// InspectMigrationStatus inspects the DuckDB node data and stats tables and returns a MigrationStatus.
+func InspectMigrationStatus(database *db.DB) (MigrationStatus, error) {
+	if database == nil {
+		return MigrationStatus{}, fmt.Errorf("database cannot be nil")
 	}
 
 	status := MigrationStatus{}
 
-	// Count all src nodes
-	srcTotal, err := boltDB.CountNodes("SRC")
+	srcTotal, err := db.CountNodes(database, "SRC")
 	if err != nil {
 		return MigrationStatus{}, fmt.Errorf("failed to count src nodes: %w", err)
 	}
 	status.SrcTotal = srcTotal
 
-	// Count all dst nodes
-	dstTotal, err := boltDB.CountNodes("DST")
+	dstTotal, err := db.CountNodes(database, "DST")
 	if err != nil {
 		return MigrationStatus{}, fmt.Errorf("failed to count dst nodes: %w", err)
 	}
 	status.DstTotal = dstTotal
 
-	// Count pending and failed nodes for src across all levels
-	srcLevels, err := boltDB.GetAllLevels("SRC")
+	// Pending/failed totals from src_stats
+	c, err := database.GetStatsCount("SRC", db.StatsKeyTraversalStatus(db.StatusPending))
 	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to get src levels: %w", err)
+		return MigrationStatus{}, fmt.Errorf("failed to get stats count: %w", err)
 	}
+	status.SrcPending = int(c)
+	c, err = database.GetStatsCount("SRC", db.StatsKeyTraversalStatus(db.StatusFailed))
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("failed to get stats count: %w", err)
+	}
+	status.SrcFailed = int(c)
 
-	var srcPendingCount, srcFailedCount int
-	var minSrcDepth *int
-
-	for _, level := range srcLevels {
-		pendingCount, err := boltDB.CountStatusBucket("SRC", level, db.StatusPending)
-		if err == nil {
-			srcPendingCount += pendingCount
-			if pendingCount > 0 && (minSrcDepth == nil || level < *minSrcDepth) {
-				d := level
-				minSrcDepth = &d
+	// Min pending depth for SRC from stats breakdown
+	breakdown, err := database.GetStatsBreakdown("SRC")
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("failed to get stats breakdown: %w", err)
+	}
+	for _, row := range breakdown {
+		if row.Key == db.StatsKeyTraversalStatus(db.StatusPending) && row.Count > 0 {
+			if status.MinPendingDepthSrc == nil || row.Depth < *status.MinPendingDepthSrc {
+				d := row.Depth
+				status.MinPendingDepthSrc = &d
 			}
 		}
-
-		failedCount, err := boltDB.CountStatusBucket("SRC", level, db.StatusFailed)
-		if err == nil {
-			srcFailedCount += failedCount
-		}
 	}
 
-	status.SrcPending = srcPendingCount
-	status.SrcFailed = srcFailedCount
-	status.MinPendingDepthSrc = minSrcDepth
-
-	// Count pending and failed nodes for dst across all levels
-	dstLevels, err := boltDB.GetAllLevels("DST")
+	// Pending/failed totals from dst_stats
+	c, err = database.GetStatsCount("DST", db.StatsKeyTraversalStatus(db.StatusPending))
 	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to get dst levels: %w", err)
+		return MigrationStatus{}, fmt.Errorf("failed to get stats count: %w", err)
 	}
+	status.DstPending = int(c)
+	c, err = database.GetStatsCount("DST", db.StatsKeyTraversalStatus(db.StatusFailed))
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("failed to get stats count: %w", err)
+	}
+	status.DstFailed = int(c)
 
-	var dstPendingCount, dstFailedCount int
-	var minDstDepth *int
-
-	for _, level := range dstLevels {
-		pendingCount, err := boltDB.CountStatusBucket("DST", level, db.StatusPending)
-		if err == nil {
-			dstPendingCount += pendingCount
-			if pendingCount > 0 && (minDstDepth == nil || level < *minDstDepth) {
-				d := level
-				minDstDepth = &d
+	// Min pending depth for DST from stats breakdown
+	breakdown, err = database.GetStatsBreakdown("DST")
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("failed to get stats breakdown: %w", err)
+	}
+	for _, row := range breakdown {
+		if row.Key == db.StatsKeyTraversalStatus(db.StatusPending) && row.Count > 0 {
+			if status.MinPendingDepthDst == nil || row.Depth < *status.MinPendingDepthDst {
+				d := row.Depth
+				status.MinPendingDepthDst = &d
 			}
 		}
-
-		failedCount, err := boltDB.CountStatusBucket("DST", level, db.StatusFailed)
-		if err == nil {
-			dstFailedCount += failedCount
-		}
 	}
-
-	status.DstPending = dstPendingCount
-	status.DstFailed = dstFailedCount
-	status.MinPendingDepthDst = minDstDepth
 
 	return status, nil
 }

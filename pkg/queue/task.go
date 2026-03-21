@@ -13,7 +13,6 @@ import (
 const (
 	TaskTypeSrcTraversal = "src-traversal"
 	TaskTypeDstTraversal = "dst-traversal"
-	TaskTypeExclusion    = "exclusion"
 	TaskTypeUpload       = "upload"
 	TaskTypeCopy         = "copy"
 	TaskTypeCopyFolder   = "copy-folder" // Copy phase: create folder
@@ -60,8 +59,6 @@ type TaskBase struct {
 	DiscoveredChildren  []ChildResult      // Children discovered during execution
 	Round              int               // The round this task belongs to (for buffer coordination)
 	LeaseTime          time.Time         // Time when task was leased (for execution time tracking)
-	ExclusionMode      string            // Exclusion mode: "exclude" or "unexclude" (exclusion tasks only)
-	PreviousStatus     string            // Previous status before exclusion (for status bucket tracking)
 	// Copy phase specific fields
 	CopyPass         int    // Copy pass number (1 for folders, 2 for files)
 	BytesTransferred int64  // Bytes transferred for file copy tasks

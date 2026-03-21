@@ -23,6 +23,30 @@ type LogPacket struct {
 	Queue     string    `json:"queue,omitempty"`
 }
 
+// StartListenerDiscard binds the UDP port and discards all received packets in a goroutine.
+// Use when SkipListener is true: the sender's UDP writes succeed (port is open) and no
+// "error logging" prints occur, but nothing is displayed—logs are still persisted to the DB.
+func StartListenerDiscard(addr string) {
+	go func() {
+		udpAddr, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			return
+		}
+		conn, err := net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 4096)
+		for {
+			_, _, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+}
+
 // StartListener spawns a new terminal window with a UDP listener on the given address.
 // This is the default behavior when called from main application.
 func StartListener(addr string) error {

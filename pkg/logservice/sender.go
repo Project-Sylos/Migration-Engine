@@ -8,69 +8,40 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
+const defaultBatchSize = 20_000
+
 // LS is the global log service sender instance.
 // It must be initialized via InitGlobalLogger before use.
 var LS *Sender
 
 // InitGlobalLogger initializes the global LS instance.
-// Logs are persisted to a dedicated Bolt file derived from mainDB.Path() (e.g. migration.db -> migration_logs.db).
-// If mainDB.Path() is empty, log persistence is skipped (UDP only).
+// Logs are persisted to the main DB's logs table when mainDB is non-nil (single DuckDB).
 func InitGlobalLogger(mainDB *db.DB, addr, level string) error {
-	var logDB *db.DB
-	if mainDB != nil {
-		logDBPath := deriveLogDBPath(mainDB.Path())
-		if logDBPath != "" {
-			var err error
-			logDB, err = db.OpenLogDB(db.Options{Path: logDBPath})
-			if err != nil {
-				return fmt.Errorf("failed to open log DB: %w", err)
-			}
-		}
-	}
-	sender, err := NewSender(logDB, addr, level)
+	sender, err := NewSender(mainDB, addr, level)
 	if err != nil {
-		if logDB != nil {
-			_ = logDB.Close()
-		}
 		return fmt.Errorf("failed to initialize global logger: %w", err)
 	}
 	LS = sender
 
 	if err := LS.Log("info", "Test log", "test", "test"); err != nil {
-		_ = LS.Close()
+		err = LS.Close()
+		if err != nil {
+			return fmt.Errorf("failed to close logger: %w", err)
+		}
 		return fmt.Errorf("failed to send test log: %w", err)
 	}
 	return nil
 }
 
-// deriveLogDBPath returns the path for the dedicated log DB file (e.g. migration.db -> migration_logs.db).
-// Returns empty string if mainPath is empty (no log persistence).
-func deriveLogDBPath(mainPath string) string {
-	mainPath = strings.TrimSpace(mainPath)
-	if mainPath == "" {
-		return ""
-	}
-	dir := filepath.Dir(mainPath)
-	base := filepath.Base(mainPath)
-	ext := filepath.Ext(base)
-	name := strings.TrimSuffix(base, ext)
-	if name == "" {
-		name = "migration"
-	}
-	return filepath.Join(dir, name+"_logs.db")
-}
-
-// Sender transmits logs over UDP and optionally writes them to a dedicated log DB.
+// Sender transmits logs over UDP and optionally writes them to the main DB's logs table.
 type Sender struct {
-	logDB     *db.DB        // dedicated log Bolt DB (owned by Sender when set; closed in Close())
+	logDB     *db.DB        // main DB for log persistence (not owned; do not close)
 	logBuffer *db.LogBuffer // buffered log writer (nil if logDB is nil)
 	Addr      string        // e.g. "127.0.0.1:1997"
 	Level      string        // threshold for UDP output
@@ -117,7 +88,7 @@ func NewSender(logDB *db.DB, addr, level string) (*Sender, error) {
 
 	var logBuffer *db.LogBuffer
 	if logDB != nil {
-		logBuffer = db.NewLogBuffer(logDB, 500, 2*time.Second)
+		logBuffer = db.NewLogBuffer(logDB, defaultBatchSize, 10*time.Second)
 	}
 
 	return &Sender{
@@ -168,6 +139,11 @@ func (s *Sender) Log(level, message, entity, entityID string, queues ...string) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Conn may be nil if Close() was already called (e.g. migration finished, workers still exiting).
+	if s.conn == nil {
+		return nil
+	}
+
 	s.tmp.Timestamp = timestamp
 	s.tmp.Level = level
 	s.tmp.Message = message
@@ -190,6 +166,10 @@ func (s *Sender) ClearConsole() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.conn == nil {
+		return nil
+	}
+
 	// Build special log packet (with only what the listener expects).
 	s.tmp.Timestamp = time.Now()
 	s.tmp.Level = "info"
@@ -207,19 +187,19 @@ func (s *Sender) ClearConsole() error {
 	return err
 }
 
-// Close terminates the UDP connection, stops the log buffer, and closes the log DB if owned.
+// Close terminates the UDP connection and stops the log buffer. Does not close the main DB.
 func (s *Sender) Close() error {
 	if s.logBuffer != nil {
 		s.logBuffer.Stop()
 		s.logBuffer = nil
 	}
 	if s.conn != nil {
-		_ = s.conn.Close()
+		err := s.conn.Close()
+		if err != nil {
+			return fmt.Errorf("failed to close UDP connection: %w", err)
+		}
 		s.conn = nil
 	}
-	if s.logDB != nil {
-		_ = s.logDB.Close()
-		s.logDB = nil
-	}
+	s.logDB = nil
 	return nil
 }
