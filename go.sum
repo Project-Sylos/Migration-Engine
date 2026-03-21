@@ -1,7 +1,7 @@
 codeberg.org/Sylos/Spectra v0.2.6 h1:2ZZOCIOvlbGLsL/Qq5czt21V0ocpxsOdZwKmt5tsKUI=
 codeberg.org/Sylos/Spectra v0.2.6/go.mod h1:KjvOgFn7tFUtebNeNEAMU5/8eVPY33XyfYbfslQ7hIE=
-codeberg.org/Sylos/Sylos-FS v0.1.5 h1:AYgXkaoXcdKeNLVEypPvZKo+LsNicc7X+dbDI4hO9mA=
-codeberg.org/Sylos/Sylos-FS v0.1.5/go.mod h1:Ug6aEOfHJijA9O2tvbkm72OnNGzmX4L5V1xqTcXFepg=
+codeberg.org/Sylos/Sylos-FS v0.1.6 h1:hH2f0yq5VSt69/9eWTE1bOtM66iiBj2NflvBOXcZAr4=
+codeberg.org/Sylos/Sylos-FS v0.1.6/go.mod h1:Ug6aEOfHJijA9O2tvbkm72OnNGzmX4L5V1xqTcXFepg=
 github.com/apache/arrow/go/v14 v14.0.2 h1:N8OkaJEOfI3mEZt07BIkvo4sC6XDbL+48MBPWO5IONw=
 github.com/apache/arrow/go/v14 v14.0.2/go.mod h1:u3fgh3EdgN/YQ8cVQRguVW3R+seMybFg8QBQ5LU+eBY=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=

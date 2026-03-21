@@ -4,7 +4,7 @@ go 1.25.6
 
 require (
 	codeberg.org/Sylos/Spectra v0.2.6
-	codeberg.org/Sylos/Sylos-FS v0.1.5
+	codeberg.org/Sylos/Sylos-FS v0.1.6
 	github.com/marcboeker/go-duckdb v1.7.0
 )
 
