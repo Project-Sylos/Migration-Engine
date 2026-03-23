@@ -36,9 +36,7 @@ Algorithm:
 4. Folders are marked `traversal_status = pending`.
 5. Child folders are inserted into the level cache rather than traversed immediately. They are processed when the engine advances to the next BFS level.
 
-Source traversal is largely independent, except for user-defined filters applied before traversal begins.
-
-However, source traversal is bounded: it is not permitted to advance more than **three levels beyond the destination traversal level**. This bound prevents uncontrolled cache growth and excessive memory consumption.
+Source traversal is largely independent, it can advance to whatever round it wants unlike dst traversal which is dependent on src's current completed round number.
 
 ---
 
