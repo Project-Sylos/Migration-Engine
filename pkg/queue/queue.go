@@ -20,6 +20,7 @@ type RoundInfo struct {
 	Round           int       // Round number
 	PullCount       int       // Number of pull operations (queries) performed this round
 	ItemsYielded    int       // Pulled amount: total items actually returned from DB queries this round (like completed count but for pulls)
+	LastBatchYield  int       // Items returned in the most recent pull only (for terminal-frontier checks; ItemsYielded is cumulative)
 	ExpectedCount   int       // Expected items from DB (if known)
 	TasksCompleted  int       // Successfully completed tasks
 	TasksFailed     int       // Failed tasks
@@ -62,6 +63,12 @@ const (
 	maxLeaseBatchSize     = 10_000 // Upper bound for pull (lease) batch size
 	refillFromDBBatchSize = 10_000 // Batch size when refilling queue from DuckDB (ID-offset pagination)
 )
+
+// QueueSizing configures optional per-queue batch sizes. Nil or zero fields use package defaults.
+type QueueSizing struct {
+	LeaseBatchSize  int
+	RefillBatchSize int
+}
 
 // effectiveLeaseBatchSize returns the lease batch size capped by maxLeaseBatchSize.
 func effectiveLeaseBatchSize() int {
@@ -221,16 +228,34 @@ type Queue struct {
 	traversalCacheLoaded bool
 	// Watchdog for detecting stalled queues
 	watchdog *QueueWatchdog
+	// Per-queue sizing (0 = use package defaults via effectiveLeaseBatch / effectiveRefillBatch).
+	leaseBatchSize  int
+	refillBatchSize int
 }
 
-// NewQueue creates a new Queue instance.
-func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCoordinator) *Queue {
+func pendingBuffCapFromLeaseSizing(leaseConfigured int) int {
+	if leaseConfigured <= 0 {
+		return effectiveLeaseBatchSize()
+	}
+	if leaseConfigured > maxLeaseBatchSize {
+		return maxLeaseBatchSize
+	}
+	return leaseConfigured
+}
+
+// NewQueue creates a new Queue instance. sizing may be nil for default lease/refill batch sizes.
+func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCoordinator, sizing *QueueSizing) *Queue {
+	leaseBZ, refillBZ := 0, 0
+	if sizing != nil {
+		leaseBZ = sizing.LeaseBatchSize
+		refillBZ = sizing.RefillBatchSize
+	}
 	return &Queue{
 		name:                name,
 		mode:                QueueModeTraversal, // Default to traversal mode
 		state:               QueueStateRunning,
 		inProgress:          make(map[string]*TaskBase),
-		pendingBuff:         make([]*TaskBase, 0, effectiveLeaseBatchSize()),
+		pendingBuff:         make([]*TaskBase, 0, pendingBuffCapFromLeaseSizing(leaseBZ)),
 		maxRetries:          maxRetries,
 		round:               0,
 		workers:             make([]Worker, 0, workerCount),
@@ -242,6 +267,8 @@ func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCo
 		avgInterval:         5 * time.Second,               // Calculate average every 5 seconds
 		lastAvgTime:         time.Now(),
 		maxKnownDepth:       -1, // -1 means not set yet
+		leaseBatchSize:      leaseBZ,
+		refillBatchSize:     refillBZ,
 	}
 }
 
@@ -416,8 +443,10 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 	// For traversal/sweep completion check (handles all modes)
 	// Called when first pull returns 0 entries - decides if we're completely done
 	if opts.CheckFinalCompletion {
-		// Soft queue checks: if we have tasks in progress or in buffer, we're not done
-		if q.InProgressCount() > 0 || q.GetPendingCount() > 0 {
+		// Soft queue checks: if we have tasks in progress or in buffer, we're not done.
+		// Also wait for any in-flight DB pull: a worker may be past the "empty" snapshot but
+		// not yet enqueued, or may still record stats for a round we are about to leave.
+		if q.InProgressCount() > 0 || q.GetPendingCount() > 0 || q.getPulling() {
 			return false
 		}
 
@@ -433,8 +462,9 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 
 	// For round completion check
 	if opts.CheckRoundComplete {
-		// Check state first
-		if q.State() != QueueStateRunning {
+		// DST may sit in Waiting while SRC catches up; we still advance completed rounds and refresh bookkeeping.
+		st := q.State()
+		if st != QueueStateRunning && !(q.name == "dst" && st == QueueStateWaiting) {
 			return false
 		}
 
@@ -462,6 +492,9 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			if !lastPullWasPartial {
 				return false
 			}
+			if q.getPulling() {
+				return false
+			}
 			info := q.getRoundInfoReadOnly(currentRound)
 			if info == nil || info.PullCount == 0 {
 				return false
@@ -480,6 +513,9 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			if !lastPullWasPartial {
 				return false
 			}
+			if q.getPulling() {
+				return false
+			}
 			info := q.getRoundInfoReadOnly(currentRound)
 			if info == nil || info.PullCount == 0 {
 				return false
@@ -492,6 +528,9 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 
 		// Round is complete if: no in-progress, no pending, and last pull was partial
 		if inProgressCount > 0 || pendingBuffCount > 0 || !lastPullWasPartial {
+			return false
+		}
+		if q.getPulling() {
 			return false
 		}
 
@@ -547,6 +586,15 @@ func (q *Queue) markComplete(format string, args ...any) bool {
 		q.name, totalTasksProcessed, totalChildrenDiscovered)
 
 	q.SetState(QueueStateCompleted)
+
+	// Durability: flush seal buffer so this queue's work is persisted while the peer queue may still run.
+	// CHECKPOINT is deferred to phase end (traversal/retry/copy complete) so one queue finishing first
+	// does not block the other on a global checkpoint.
+	if database := q.getDatabase(); database != nil {
+		if err := database.FlushSealBuffer(); err != nil {
+			fmt.Printf("[%s Queue Complete] flush seal buffer: %v\n", q.name, err)
+		}
+	}
 
 	// Notify coordinator
 	coordinator := q.getCoordinator()
@@ -797,7 +845,7 @@ func (q *Queue) Clear() {
 
 	// Clear in-progress tracking
 	q.inProgress = make(map[string]*TaskBase)
-	q.pendingBuff = make([]*TaskBase, 0, effectiveLeaseBatchSize())
+	q.pendingBuff = make([]*TaskBase, 0, q.effectiveLeaseBatch())
 	q.pulling = false
 
 	// DuckDB clearing would require deleting all buckets - typically not needed
@@ -996,8 +1044,8 @@ func (q *Queue) GetTotalCompleted() int {
 }
 
 // Run is the main queue coordination loop. It has an outer loop for rounds and an inner loop
-// for each round. The outer loop checks coordinator gates before starting each round (DST only).
-// The inner loop processes tasks until the round is complete.
+// for each round. For DST, the coordinator gate only blocks starting new pulls (PullTraversalTasks);
+// the inner loop still runs so round completion and advancement can proceed while Waiting.
 func (q *Queue) Run() {
 	// DST queue runs traversal or retry; copy is the only mode DST skips
 	mode := q.GetMode()
@@ -1052,20 +1100,14 @@ func (q *Queue) Run() {
 		currentRound := q.GetRound()
 		coordinator := q.getCoordinator()
 
-		// GATE CHECK: DST may only start round N when SRC has finished rounds N and N+1 (or SRC is done). SRC is not gated.
-		if coordinator != nil {
-			if q.name == "dst" {
-				canStartRound := coordinator.CanDstStartRound(currentRound)
-				if !canStartRound {
-					if state != QueueStateWaiting {
-						q.SetState(QueueStateWaiting)
-					}
-					time.Sleep(50 * time.Millisecond)
-					continue
-				}
+		// GATE: DST pulls for round N are blocked until SRC is two rounds ahead or done; do not skip the inner loop.
+		if coordinator != nil && q.name == "dst" {
+			if coordinator.CanDstStartRound(currentRound) {
 				if state == QueueStateWaiting {
 					q.SetState(QueueStateRunning)
 				}
+			} else if state != QueueStateWaiting {
+				q.SetState(QueueStateWaiting)
 			}
 		}
 

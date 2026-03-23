@@ -71,6 +71,15 @@ func (wd *QueueWatchdog) monitor() {
 }
 
 func (wd *QueueWatchdog) checkForStall() {
+	if wd.queue.State() == QueueStatePaused {
+		wd.Beat()
+		return
+	}
+	if wd.queue.sealIOWaitActive() {
+		wd.Beat()
+		return
+	}
+
 	lastBeat := time.Unix(0, wd.lastProgress.Load())
 	elapsed := time.Since(lastBeat)
 

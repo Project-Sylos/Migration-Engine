@@ -129,6 +129,11 @@ func (q *Queue) getDatabase() *db.DB {
 	return q.database
 }
 
+func (q *Queue) sealIOWaitActive() bool {
+	d := q.getDatabase()
+	return d != nil && d.SealIOWaitActive()
+}
+
 func (q *Queue) getShutdownCtx() context.Context {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
@@ -174,9 +179,42 @@ func (q *Queue) getMaxRetries() int {
 	return q.maxRetries
 }
 
+func (q *Queue) effectiveLeaseBatch() int {
+	q.mu.RLock()
+	n := q.leaseBatchSize
+	q.mu.RUnlock()
+	if n <= 0 {
+		return effectiveLeaseBatchSize()
+	}
+	if n > maxLeaseBatchSize {
+		return maxLeaseBatchSize
+	}
+	return n
+}
+
+func (q *Queue) effectiveRefillBatch() int {
+	q.mu.RLock()
+	n := q.refillBatchSize
+	q.mu.RUnlock()
+	if n <= 0 {
+		return refillFromDBBatchSize
+	}
+	return n
+}
+
+// EffectiveLeaseBatchSize returns the capped lease batch size used for pulls and pending buffer sizing.
+func (q *Queue) EffectiveLeaseBatchSize() int {
+	return q.effectiveLeaseBatch()
+}
+
+// EffectiveRefillBatchSize returns the batch size used for traversal DB refills (keyset pagination).
+func (q *Queue) EffectiveRefillBatchSize() int {
+	return q.effectiveRefillBatch()
+}
+
 // getPullLowWM returns the low watermark for pulling more work: 25% of lease batch size, minimum 1.
 func (q *Queue) getPullLowWM() int {
-	bs := effectiveLeaseBatchSize()
+	bs := q.effectiveLeaseBatch()
 	wm := bs / 4
 	if wm < 1 {
 		wm = 1
@@ -396,6 +434,13 @@ func (q *Queue) SetMaxKnownDepth(depth int) {
 	q.maxKnownDepth = depth
 }
 
+// GetMaxKnownDepth returns the configured max depth (-1 if unset / auto).
+func (q *Queue) GetMaxKnownDepth() int {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.maxKnownDepth
+}
+
 // getRoundInfo returns the RoundInfo for the specified round, creating it if it doesn't exist.
 func (q *Queue) getRoundInfo(round int) *RoundInfo {
 	q.mu.Lock()
@@ -439,6 +484,7 @@ func (q *Queue) recordPull(round int, itemsYielded int, wasPartial bool) {
 
 	info := q.roundInfoMap[round]
 	info.PullCount++
+	info.LastBatchYield = itemsYielded
 	info.ItemsYielded += itemsYielded
 	info.LastPullTime = time.Now()
 	info.LastPartialPull = wasPartial
@@ -682,7 +728,14 @@ type QueueStateSnapshot struct {
 func (q *Queue) getStateSnapshot() QueueStateSnapshot {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
-	wm := effectiveLeaseBatchSize() / 4
+	leaseCap := effectiveLeaseBatchSize()
+	if q.leaseBatchSize > 0 {
+		leaseCap = q.leaseBatchSize
+		if leaseCap > maxLeaseBatchSize {
+			leaseCap = maxLeaseBatchSize
+		}
+	}
+	wm := leaseCap / 4
 	if wm < 1 {
 		wm = 1
 	}

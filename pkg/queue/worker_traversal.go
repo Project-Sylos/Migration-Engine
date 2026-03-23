@@ -127,7 +127,7 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 	if parent == nil {
 		parent = context.Background()
 	}
-	wd, ctx := NewProgressWatchdog(parent, traversalStallTimeout)
+	wd, ctx := NewProgressWatchdog(parent, traversalStallTimeout, w.queue.sealIOWaitActive)
 	defer wd.Stop()
 
 	folder := task.Folder

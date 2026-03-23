@@ -1,14 +1,14 @@
 {
   "mode": "ephemeral",
   "seed": {
-    "max_depth": 4,
-    "max_folders": 20,
+    "max_depth": 6,
+    "max_folders": 50,
     "folder_backoff_factor": 0.9,
     "folder_depth_decay_factor": 0.9,
-    "max_files": 20,
+    "max_files": 50,
     "file_backoff_factor": 0.9,
     "file_depth_decay_factor": 0.9,
-    "seed": 40,
+    "seed": 0,
     "file_binary_seed": 0,
     "enable_cache": false,
     "diverging_tree_mode": true

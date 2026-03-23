@@ -62,16 +62,20 @@ There is **no** `GetDB()` / `Result()` / `Error()` on the controller in the curr
 
 ### Phases (string constants)
 
-Examples: **`roots-set`**, **`filters-set`**, **`traversal-in-progress`**, **`awaiting-traversal-review`**, **`copy-in-progress`**, **`awaiting-copy-review`** (`phase.go`).
+Examples: **`roots-set`**, **`filters-set`**, **`traversal-in-progress`**, **`traversal-suspended`**, **`awaiting-traversal-review`**, **`copy-in-progress`**, **`copy-suspended`**, **`awaiting-copy-review`** (`phase.go`).
+
+**Soft suspend:** While phase is **`traversal-in-progress`** or **`copy-in-progress`**, **`Stop()`** requests a **coordinated suspend** (pause queues, drop non-leased pending work, drain in-flight tasks, flush seal/appender buffers, checkpoint, persist **`runtime_state_json`** under **`suspend_v1`** plus legacy round keys). The phase becomes **`traversal-suspended`** or **`copy-suspended`**. **Hard cancel** still uses **`ShutdownContext`** cancellation (abbreviated shutdown, not the full soft path).
+
+**Resume:** **`StartTraversal(cfg)`** from **`traversal-suspended`** reloads **`suspend_v1`** and restarts with **retry-style** queues (round 0, persisted max depth and batch sizing) so the frontier is rebuilt from DuckDB—not from restored in-memory buffers. **`StartCopy(cfg)`** from **`copy-suspended`** restores tuning from **`suspend_v1`**; pending depths and copy passes still come from **DB scans** in **`RunCopyPhase`**.
 
 ### Common methods
 
-- **`AddRoots`**, **`StartTraversal(cfg)`**, **`StartCopy(cfg)`** – require live **FS adapters** in **`cfg`**; **`UpdateConfig`** persists **`root_config_json`**. **`StartCopy`** may be called again while phase is **`copy-in-progress`** to resume after a crash; **`RunCopyPhase`** rescans pending depths and may enable a one-round dst existence precheck when events show both successful and pending copy work (`copy.go`).
-- **`RunRetrySweep(cfg, opts)`**, **`PrepareRetrySweep()`** – For **async** HTTP: call **`PrepareRetrySweep()` synchronously** before returning **202**, then run **`RunRetrySweep`** with the same **`cfg`** shape as traversal (adapters + roots) in a background task.
+- **`AddRoots`**, **`StartTraversal(cfg)`**, **`StartCopy(cfg)`** – require live **FS adapters** in **`cfg`**; **`UpdateConfig`** persists **`root_config_json`**. **`StartTraversal`** accepts **`filters-set`** or **`traversal-suspended`**. **`StartCopy`** accepts **`awaiting-traversal-review`** or **`copy-suspended`** (and may be called again while phase is **`copy-in-progress`**); **`RunCopyPhase`** rescans pending depths and may enable a one-round dst existence precheck when events show both successful and pending copy work (`copy.go`).
+- **`RunRetrySweep(cfg, opts)`**, **`PrepareRetrySweep()`** – For **async** HTTP: call **`PrepareRetrySweep()` synchronously** before returning **202**, then run **`RunRetrySweep`** with the same **`cfg`** shape as traversal (adapters + roots) in a background task. Both accept phase **`awaiting-traversal-review`** or **`traversal-suspended`** (after soft suspend). **`PrepareCopyRetry`** / **`RunCopyRetry`** similarly accept **`awaiting-copy-review`** or **`copy-suspended`**.
 - **`RunCopyRetry(cfg, opts)`**, **`PrepareCopyRetry()`** – Same pattern for copy retry when exposed asynchronously.
 - **`UpdateConfig(cfg)`** – persists **`root_config_json`** only (serializable fields); callers still pass **`cfg`** with adapters for each run.
 - Review helpers: query nodes, path review, exclude, mark retry, etc.
-- **`Stop()`** – stop result with current phase / runtime snapshot.
+- **`Stop()`** – for live traversal/copy, sets **soft suspend** (see above) and returns **`StopResult.SoftSuspendRequested`**. For other live phases, cancels the run context. **`runtime_state_json`** is updated when the suspend drain finishes (asynchronous relative to **`Stop()`** returning).
 
 ---
 
@@ -88,7 +92,7 @@ Examples: **`roots-set`**, **`filters-set`**, **`traversal-in-progress`**, **`aw
 
 Engine retry sweep re-processes pending/failed traversal work (**`pkg/queue`** retry mode). DST cleanup on SRC folder completion is described in **`pkg/queue/README.md`**.
 
-**Automated scenario:** **`pkg/tests/traversal/retry_sweep/`** (see **`pkg/tests/README.md`**).
+**Automated scenario:** **`pkg/tests/traversal/retry_sweep/`** (see **`pkg/tests/README.md`**). **Soft suspend** is covered by unit tests on **`suspend_v1`** merge/parse in **`suspend_state_test.go`**; full stack interrupt tests can extend the same runners with **`Stop()`** during traversal/copy.
 
 ---
 

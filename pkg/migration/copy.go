@@ -16,17 +16,21 @@ import (
 
 // CopyPhaseConfig configures the copy phase execution.
 type CopyPhaseConfig struct {
-	DuckDB          *db.DB
-	SrcAdapter      types.FSAdapter
-	DstAdapter      types.FSAdapter
-	WorkerCount     int
-	MaxRetries      int
-	LogAddress      string
-	LogLevel        string
-	SkipListener    bool
-	StartupDelay    time.Duration
-	ProgressTick    time.Duration
-	ShutdownContext context.Context
+	DuckDB               *db.DB
+	SrcAdapter           types.FSAdapter
+	DstAdapter           types.FSAdapter
+	WorkerCount          int
+	MaxRetries           int
+	LogAddress           string
+	LogLevel             string
+	SkipListener         bool
+	StartupDelay         time.Duration
+	ProgressTick         time.Duration
+	ShutdownContext      context.Context
+	ResumeCopy           *RuntimeSuspendV1
+	SoftSuspendRequested func() bool
+	ObserverPollInterval time.Duration
+	OnQueueObserver      func(*queue.QueueObserver)
 }
 
 // applyCopyResumeDstExistenceWindow enables the copy queue's one-shot dst ListChildren precheck when
@@ -77,7 +81,7 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 			return queue.QueueStats{}, fmt.Errorf("failed to initialize logger: %w", err)
 		}
 	}
-	copyQueue := queue.NewQueue("copy", cfg.MaxRetries, cfg.WorkerCount, nil)
+	copyQueue := queue.NewQueue("copy", cfg.MaxRetries, cfg.WorkerCount, nil, nil)
 	copyQueue.SetMode(queue.QueueModeCopyRetry)
 	copyQueue.SetCopyPass(1)
 	minLevel := -1
@@ -112,26 +116,42 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		return queue.QueueStats{}, fmt.Errorf("begin copy phase: %w", err)
 	}
 	defer func() {
+		if err := duckDB.CheckpointWithRetry(context.Background(), 8); err != nil {
+			fmt.Println("checkpoint after copy retry phase:", err)
+		}
+	}()
+	defer func() {
 		if err := duckDB.EndCopyPhase(); err != nil {
 			fmt.Println("error ending copy phase", err)
 		}
 	}()
-	observer := queue.NewQueueObserver(duckDB, 200*time.Millisecond)
+	obsPoll := observerPollFromConfigAndSuspend(cfg.ObserverPollInterval, nil)
+	observer := queue.NewQueueObserver(duckDB, obsPoll)
 	observer.Start()
 	defer observer.Stop()
+	if cfg.OnQueueObserver != nil {
+		defer cfg.OnQueueObserver(nil)
+	}
 	copyQueue.SetObserver(observer)
+	if cfg.OnQueueObserver != nil {
+		cfg.OnQueueObserver(observer)
+	}
 	statsChan := make(chan queue.QueueStats, 10)
 	copyQueue.SetStatsChannel(statsChan)
-	progressTick := cfg.ProgressTick
+	progressTick := progressTickFromConfigAndSuspend(cfg.ProgressTick, nil, 2*time.Second)
 	if progressTick <= 0 {
 		progressTick = 2 * time.Second
 	}
 	progressTicker := time.NewTicker(progressTick)
 	defer progressTicker.Stop()
+	progressCtx, progressCancel := context.WithCancel(context.Background())
+	defer progressCancel()
 	go func() {
 		var lastStats *queue.QueueStats
 		for {
 			select {
+			case <-progressCtx.Done():
+				return
 			case stats := <-statsChan:
 				lastStats = &stats
 			case <-progressTicker.C:
@@ -159,6 +179,7 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	}()
 	copyQueue.PullTasksIfNeeded(true)
 	start := time.Now()
+	wc, mr := cfg.WorkerCount, cfg.MaxRetries
 	for {
 		if shutdownCtx != nil {
 			select {
@@ -167,6 +188,17 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 				return queue.QueueStats{}, fmt.Errorf("copy retry shutdown requested")
 			default:
 			}
+		}
+
+		if cfg.SoftSuspendRequested != nil && cfg.SoftSuspendRequested() {
+			waitCtx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+			stats, suspend, err := performCopySoftSuspend(waitCtx, duckDB, copyQueue, observer, cfg, wc, mr)
+			cancel()
+			if err != nil {
+				return stats, fmt.Errorf("copy retry soft suspend: %w", err)
+			}
+			fmt.Print("\n")
+			return stats, newCopySuspendedError(stats, suspend)
 		}
 		if copyQueue.IsExhausted() {
 			stats := copyQueue.Stats()
@@ -224,8 +256,12 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		}
 	}
 
+	sizing := queueSizingFromSuspend(cfg.ResumeCopy)
+	wc := effectiveWorkerCount(cfg.WorkerCount, cfg.ResumeCopy)
+	mr := effectiveMaxRetries(cfg.MaxRetries, cfg.ResumeCopy)
+
 	// Create copy queue (single queue, not dual like traversal)
-	copyQueue := queue.NewQueue("copy", cfg.MaxRetries, cfg.WorkerCount, nil) // No coordinator needed for copy
+	copyQueue := queue.NewQueue("copy", mr, wc, nil, sizing) // No coordinator needed for copy
 	copyQueue.SetMode(queue.QueueModeCopy)
 	copyQueue.SetCopyPass(1) // Start with pass 1 (folders)
 
@@ -263,7 +299,9 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 
 	// Set max known depth from DB so copy completion and round advancement know the full depth range.
 	// Must be set before any tasks are pulled or completion checks run.
-	if maxDepth, err := duckDB.GetMaxDepth("SRC"); err == nil {
+	if cfg.ResumeCopy != nil && cfg.ResumeCopy.MaxKnownDepth > 0 {
+		copyQueue.SetMaxKnownDepth(cfg.ResumeCopy.MaxKnownDepth)
+	} else if maxDepth, err := duckDB.GetMaxDepth("SRC"); err == nil {
 		copyQueue.SetMaxKnownDepth(maxDepth)
 	}
 
@@ -303,42 +341,57 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	}
 	copyQueue.InitializeCopyWithContext(duckDB, cfg.SrcAdapter, cfg.DstAdapter, shutdownCtx)
 
-	// Start copy phase: drop indexes, persistent appenders. Flush/checkpoint at phase end only.
+	// Start copy phase: drop indexes, persistent appenders. CHECKPOINT once after phase teardown (defer order below).
 	if err := duckDB.BeginCopyPhase(shutdownCtx); err != nil {
 		return queue.QueueStats{}, fmt.Errorf("begin copy phase: %w", err)
 	}
+	defer func() {
+		if err := duckDB.CheckpointWithRetry(context.Background(), 8); err != nil {
+			fmt.Println("checkpoint after copy phase:", err)
+		}
+	}()
 	defer func() {
 		if err := duckDB.EndCopyPhase(); err != nil {
 			fmt.Println("error ending copy phase", err)
 		}
 	}()
 
-	// Create observer for stats publishing
-	observer := queue.NewQueueObserver(duckDB, 200*time.Millisecond)
+	obsPoll := observerPollFromConfigAndSuspend(cfg.ObserverPollInterval, cfg.ResumeCopy)
+	observer := queue.NewQueueObserver(duckDB, obsPoll)
 	observer.Start()
 	defer observer.Stop()
+	if cfg.OnQueueObserver != nil {
+		defer cfg.OnQueueObserver(nil)
+	}
 
 	// Register copy queue with observer
 	observer.RegisterQueue("copy", copyQueue)
 	copyQueue.SetObserver(observer)
+	if cfg.OnQueueObserver != nil {
+		cfg.OnQueueObserver(observer)
+	}
 
 	// Set up stats channel for progress updates
 	statsChan := make(chan queue.QueueStats, 10)
 	copyQueue.SetStatsChannel(statsChan)
 
-	// Start progress ticker
-	progressTick := cfg.ProgressTick
+	progressTick := progressTickFromConfigAndSuspend(cfg.ProgressTick, cfg.ResumeCopy, 2*time.Second)
 	if progressTick <= 0 {
 		progressTick = 2 * time.Second
 	}
 	progressTicker := time.NewTicker(progressTick)
 	defer progressTicker.Stop()
 
+	progressCtx, progressCancel := context.WithCancel(context.Background())
+	defer progressCancel()
+
 	// Start stats consumer goroutine
 	go func() {
 		var lastStats *queue.QueueStats
 		for {
 			select {
+			case <-progressCtx.Done():
+				return
 			case stats := <-statsChan:
 				lastStats = &stats
 			case <-progressTicker.C:
@@ -372,7 +425,6 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	lastRound := startRound // Initialize to starting round
 	tickCount := 0
 	for {
-		// Check for shutdown
 		if shutdownCtx != nil {
 			select {
 			case <-shutdownCtx.Done():
@@ -380,6 +432,17 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 				return queue.QueueStats{}, fmt.Errorf("copy phase shutdown requested")
 			default:
 			}
+		}
+
+		if cfg.SoftSuspendRequested != nil && cfg.SoftSuspendRequested() {
+			waitCtx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+			stats, suspend, err := performCopySoftSuspend(waitCtx, duckDB, copyQueue, observer, cfg, wc, mr)
+			cancel()
+			if err != nil {
+				return stats, fmt.Errorf("copy soft suspend: %w", err)
+			}
+			fmt.Print("\n")
+			return stats, newCopySuspendedError(stats, suspend)
 		}
 
 		// Check if queue is completed

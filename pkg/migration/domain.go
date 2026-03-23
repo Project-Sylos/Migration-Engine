@@ -6,8 +6,10 @@ package migration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
@@ -116,13 +118,18 @@ type Migration struct {
 	store   *migrationStore // store bound to this migration's DB
 	manager *MigrationManager
 
-	mu            sync.RWMutex
-	phase         string
-	runtimeState  RuntimeState
-	logRing       *logRing
-	lastRunConfig *Config
-	runCancel     context.CancelFunc
-	running       bool
+	mu                   sync.RWMutex
+	phase                string
+	runtimeState         RuntimeState
+	logRing              *logRing
+	lastRunConfig        *Config
+	runCancel            context.CancelFunc
+	running              bool
+	softSuspendRequested atomic.Bool
+	// persistRecord holds the last known migrations row (refreshed on DB sync); used to avoid DuckDB reads on hot API paths while Live.
+	persistRecord atomic.Value // migrationRecord
+	// activeQueueObs is set for the duration of traversal/copy/retry runs so queue metrics APIs can read memory instead of queue_stats.
+	activeQueueObs atomic.Pointer[queue.QueueObserver]
 }
 
 func newMigration(manager *MigrationManager, record migrationRecord, database *db.DB) *Migration {
@@ -135,6 +142,7 @@ func newMigration(manager *MigrationManager, record migrationRecord, database *d
 		phase:   record.Phase,
 		logRing: newLogRing(256),
 	}
+	m.persistRecord.Store(record)
 	return m
 }
 
@@ -143,6 +151,25 @@ func (m *Migration) syncRecord(record migrationRecord) {
 	m.Name = record.Name
 	m.phase = record.Phase
 	m.mu.Unlock()
+	m.persistRecord.Store(record)
+}
+
+func (m *Migration) setActiveQueueObserver(o *queue.QueueObserver) {
+	m.activeQueueObs.Store(o)
+}
+
+// cachedMigrationDetailsForLiveAPI returns details from the last persisted migration row without querying DuckDB.
+func (m *Migration) cachedMigrationDetailsForLiveAPI() (*MigrationDetails, bool) {
+	v := m.persistRecord.Load()
+	if v == nil {
+		return nil, false
+	}
+	rec, ok := v.(migrationRecord)
+	if !ok || rec.ID == "" {
+		return nil, false
+	}
+	d := recordToDetails(&rec)
+	return d, true
 }
 
 // UpdateConfig writes a JSON snapshot of cfg (roots, worker knobs, verification; not FS adapters) to migrations.root_config_json.
@@ -231,6 +258,13 @@ func (m *Migration) transitionTo(next string) error {
 		return err
 	}
 	m.phase = next
+	if v := m.persistRecord.Load(); v != nil {
+		if rec, ok := v.(migrationRecord); ok {
+			rec.Phase = next
+			rec.UpdatedAt = time.Now().UTC()
+			m.persistRecord.Store(rec)
+		}
+	}
 	m.logRing.add(LogEntry{
 		Timestamp: time.Now().UTC(),
 		Level:     "info",
@@ -239,16 +273,30 @@ func (m *Migration) transitionTo(next string) error {
 	return nil
 }
 
-func (m *Migration) beginRun(shutdownCtx context.Context) context.Context {
+// beginRun returns the per-run context and its cancel function. Call cancelRun when the run is finished
+// (success, error, or soft suspend) so queue Run loops and workers exit; otherwise they keep polling while paused.
+func (m *Migration) beginRun(shutdownCtx context.Context) (runCtx context.Context, cancelRun context.CancelFunc) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.softSuspendRequested.Store(false)
 	if shutdownCtx == nil {
 		shutdownCtx = context.Background()
 	}
 	runCtx, cancel := context.WithCancel(shutdownCtx)
 	m.runCancel = cancel
 	m.running = true
-	return runCtx
+	return runCtx, cancel
+}
+
+func (m *Migration) runtimeStateJSON() string {
+	if m.DB == nil {
+		return ""
+	}
+	rec, err := m.store.getMigration(m.DB, m.ID)
+	if err != nil || rec == nil {
+		return ""
+	}
+	return rec.RuntimeStateJSON
 }
 
 func (m *Migration) endRun() {
@@ -289,10 +337,22 @@ func (m *Migration) AddRoots(srcRoot, dstRoot types.Folder) (RootSeedSummary, er
 	return summary, nil
 }
 
-// StartTraversal begins traversal lifecycle and transitions to awaiting-traversal-review on success. Requires filters-set.
+// StartTraversal begins traversal lifecycle and transitions to awaiting-traversal-review on success.
+// Requires filters-set, or traversal-suspended to resume after soft suspend.
 func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
+	prevPhase := m.Phase()
+	if prevPhase != PhaseFiltersSet && prevPhase != PhaseTraversalSuspended && prevPhase != PhaseCreated {
+		return RuntimeStats{}, fmt.Errorf("start traversal requires filters-set or traversal-suspended phase, got %s", prevPhase)
+	}
 	if err := m.transitionTo(PhaseTraversing); err != nil {
 		return RuntimeStats{}, err
+	}
+
+	var resume *RuntimeSuspendV1
+	if prevPhase == PhaseTraversalSuspended {
+		if s, ok := parseRuntimeSuspendV1(m.runtimeStateJSON()); ok && s.Kind == "traversal" {
+			resume = &s
+		}
 	}
 
 	srcRoot, err := normalizeRootFolder(cfg.Source.Root)
@@ -312,8 +372,9 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 	}
 	m.setLastRunConfig(cfgForRun)
 
-	runCtx := m.beginRun(cfg.ShutdownContext)
+	runCtx, cancelRun := m.beginRun(cfg.ShutdownContext)
 	defer func() {
+		cancelRun()
 		m.endRun()
 		err = m.store.updateUpdatedAt(m.ID)
 		if err != nil {
@@ -321,24 +382,41 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 		}
 	}()
 	stats, err := RunMigration(MigrationConfig{
-		DB:              m.DB,
-		DBPath:          cfg.Database.Path,
-		SrcAdapter:      cfg.Source.Adapter,
-		DstAdapter:      cfg.Destination.Adapter,
-		SrcRoot:         srcRoot,
-		DstRoot:         dstRoot,
-		SrcServiceName:  cfg.Source.Name,
-		WorkerCount:     cfg.WorkerCount,
-		MaxRetries:      cfg.MaxRetries,
-		CoordinatorLead: cfg.CoordinatorLead,
-		LogAddress:      cfg.LogAddress,
-		LogLevel:        cfg.LogLevel,
-		SkipListener:    cfg.SkipListener,
-		StartupDelay:    cfg.StartupDelay,
-		ProgressTick:    cfg.ProgressTick,
-		ShutdownContext: runCtx,
+		DB:                   m.DB,
+		DBPath:               cfg.Database.Path,
+		SrcAdapter:           cfg.Source.Adapter,
+		DstAdapter:           cfg.Destination.Adapter,
+		SrcRoot:              srcRoot,
+		DstRoot:              dstRoot,
+		SrcServiceName:       cfg.Source.Name,
+		WorkerCount:          cfg.WorkerCount,
+		MaxRetries:           cfg.MaxRetries,
+		CoordinatorLead:      cfg.CoordinatorLead,
+		LogAddress:           cfg.LogAddress,
+		LogLevel:             cfg.LogLevel,
+		SkipListener:         cfg.SkipListener,
+		StartupDelay:         cfg.StartupDelay,
+		ProgressTick:         cfg.ProgressTick,
+		ShutdownContext:      runCtx,
+		ResumeTraversal:      resume,
+		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
+		OnQueueObserver:      func(o *queue.QueueObserver) { m.setActiveQueueObserver(o) },
 	})
 	if err != nil {
+		if errors.Is(err, ErrTraversalSoftSuspended) {
+			rstats, sus, ok := AsTraversalSuspended(err)
+			if ok {
+				if patch, e2 := traversalSuspendRuntimeMergePatch(sus); e2 == nil {
+					_ = m.store.updateRuntimeState(m.ID, patch)
+				}
+				if e3 := m.transitionTo(PhaseTraversalSuspended); e3 != nil {
+					return rstats, e3
+				}
+				m.softSuspendRequested.Store(false)
+				m.refreshRuntimeState()
+				return rstats, nil
+			}
+		}
 		return RuntimeStats{}, err
 	}
 	if err := m.transitionTo(PhaseTraversalReview); err != nil {
@@ -355,9 +433,21 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 }
 
 // StartCopy transitions review->copying and runs copy phase. cfg must include live source/destination adapters (same as StartTraversal).
+// Requires awaiting-traversal-review or copy-suspended (resume after soft suspend).
 func (m *Migration) StartCopy(cfg Config) (queue.QueueStats, error) {
+	prevPhase := m.Phase()
+	if prevPhase != PhaseTraversalReview && prevPhase != PhaseCopySuspended {
+		return queue.QueueStats{}, fmt.Errorf("start copy requires awaiting-traversal-review or copy-suspended phase, got %s", prevPhase)
+	}
 	if err := m.transitionTo(PhaseCopying); err != nil {
 		return queue.QueueStats{}, err
+	}
+
+	var resumeCopy *RuntimeSuspendV1
+	if prevPhase == PhaseCopySuspended {
+		if s, ok := parseRuntimeSuspendV1(m.runtimeStateJSON()); ok && s.Kind == "copy" {
+			resumeCopy = &s
+		}
 	}
 	if cfg.Source.Adapter == nil || cfg.Destination.Adapter == nil {
 		return queue.QueueStats{}, fmt.Errorf("copy requires source and destination adapters in config")
@@ -367,8 +457,9 @@ func (m *Migration) StartCopy(cfg Config) (queue.QueueStats, error) {
 	}
 	m.setLastRunConfig(cfg)
 
-	runCtx := m.beginRun(cfg.ShutdownContext)
+	runCtx, cancelRun := m.beginRun(cfg.ShutdownContext)
 	defer func() {
+		cancelRun()
 		m.endRun()
 		err := m.store.updateUpdatedAt(m.ID)
 		if err != nil {
@@ -376,19 +467,36 @@ func (m *Migration) StartCopy(cfg Config) (queue.QueueStats, error) {
 		}
 	}()
 	stats, err := RunCopyPhase(CopyPhaseConfig{
-		DuckDB:          m.DB,
-		SrcAdapter:      cfg.Source.Adapter,
-		DstAdapter:      cfg.Destination.Adapter,
-		WorkerCount:     cfg.WorkerCount,
-		MaxRetries:      cfg.MaxRetries,
-		LogAddress:      cfg.LogAddress,
-		LogLevel:        cfg.LogLevel,
-		SkipListener:    cfg.SkipListener,
-		StartupDelay:    cfg.StartupDelay,
-		ProgressTick:    cfg.ProgressTick,
-		ShutdownContext: runCtx,
+		DuckDB:               m.DB,
+		SrcAdapter:           cfg.Source.Adapter,
+		DstAdapter:           cfg.Destination.Adapter,
+		WorkerCount:          cfg.WorkerCount,
+		MaxRetries:           cfg.MaxRetries,
+		LogAddress:           cfg.LogAddress,
+		LogLevel:             cfg.LogLevel,
+		SkipListener:         cfg.SkipListener,
+		StartupDelay:         cfg.StartupDelay,
+		ProgressTick:         cfg.ProgressTick,
+		ShutdownContext:      runCtx,
+		ResumeCopy:           resumeCopy,
+		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
+		OnQueueObserver:      func(o *queue.QueueObserver) { m.setActiveQueueObserver(o) },
 	})
 	if err != nil {
+		if errors.Is(err, ErrCopySoftSuspended) {
+			cstats, sus, ok := AsCopySuspended(err)
+			if ok {
+				if patch, e2 := copySuspendRuntimeMergePatch(sus); e2 == nil {
+					_ = m.store.updateRuntimeState(m.ID, patch)
+				}
+				if e3 := m.transitionTo(PhaseCopySuspended); e3 != nil {
+					return cstats, e3
+				}
+				m.softSuspendRequested.Store(false)
+				m.refreshRuntimeState()
+				return cstats, nil
+			}
+		}
 		return queue.QueueStats{}, err
 	}
 	if err := m.transitionTo(PhaseCopyReview); err != nil {
@@ -407,17 +515,19 @@ func (m *Migration) StartCopy(cfg Config) (queue.QueueStats, error) {
 // PrepareRetrySweep transitions to traversal-in-progress and persists phase immediately.
 // Call this synchronously in the HTTP handler before returning 202 and starting RunRetrySweep in a background task,
 // so clients that poll GET migration see traversal-in-progress before the sweep goroutine runs.
+// Allowed from awaiting-traversal-review or traversal-suspended (resume after soft suspend).
 func (m *Migration) PrepareRetrySweep() error {
-	if m.Phase() != PhaseTraversalReview {
-		return fmt.Errorf("prepare retry sweep requires awaiting-traversal-review phase")
+	phase := m.Phase()
+	if phase != PhaseTraversalReview && phase != PhaseTraversalSuspended {
+		return fmt.Errorf("prepare retry sweep requires awaiting-traversal-review or traversal-suspended phase")
 	}
 	return m.transitionTo(PhaseTraversing)
 }
 
 func (m *Migration) RunRetrySweep(cfg Config, opts RetrySweepOptions) (RuntimeStats, error) {
 	phase := m.Phase()
-	if phase != PhaseTraversalReview && phase != PhaseTraversing {
-		return RuntimeStats{}, fmt.Errorf("retry sweep requires awaiting-traversal-review phase (or prepared traversal-in-progress)")
+	if phase != PhaseTraversalReview && phase != PhaseTraversing && phase != PhaseTraversalSuspended {
+		return RuntimeStats{}, fmt.Errorf("retry sweep requires awaiting-traversal-review, traversal-suspended, or prepared traversal-in-progress")
 	}
 	if cfg.Source.Adapter == nil || cfg.Destination.Adapter == nil {
 		return RuntimeStats{}, fmt.Errorf("retry sweep requires source and destination adapters in config")
@@ -426,13 +536,14 @@ func (m *Migration) RunRetrySweep(cfg Config, opts RetrySweepOptions) (RuntimeSt
 		return RuntimeStats{}, fmt.Errorf("persist migration config: %w", err)
 	}
 	m.setLastRunConfig(cfg)
-	if phase == PhaseTraversalReview {
+	if phase == PhaseTraversalReview || phase == PhaseTraversalSuspended {
 		if err := m.transitionTo(PhaseTraversing); err != nil {
 			return RuntimeStats{}, err
 		}
 	}
-	runCtx := m.beginRun(cfg.ShutdownContext)
+	runCtx, cancelRun := m.beginRun(cfg.ShutdownContext)
 	defer func() {
+		cancelRun()
 		m.endRun()
 		err := m.store.updateUpdatedAt(m.ID)
 		if err != nil {
@@ -474,9 +585,25 @@ func (m *Migration) RunRetrySweep(cfg Config, opts RetrySweepOptions) (RuntimeSt
 			}
 			return -1
 		}(),
-		ShutdownContext: runCtx,
+		ShutdownContext:      runCtx,
+		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
+		OnQueueObserver:      func(o *queue.QueueObserver) { m.setActiveQueueObserver(o) },
 	})
 	if err != nil {
+		if errors.Is(err, ErrTraversalSoftSuspended) {
+			rstats, sus, ok := AsTraversalSuspended(err)
+			if ok {
+				if patch, e2 := traversalSuspendRuntimeMergePatch(sus); e2 == nil {
+					_ = m.store.updateRuntimeState(m.ID, patch)
+				}
+				if e3 := m.transitionTo(PhaseTraversalSuspended); e3 != nil {
+					return rstats, e3
+				}
+				m.softSuspendRequested.Store(false)
+				m.refreshRuntimeState()
+				return rstats, nil
+			}
+		}
 		return RuntimeStats{}, err
 	}
 	if err := m.transitionTo(PhaseTraversalReview); err != nil {
@@ -494,18 +621,20 @@ func (m *Migration) RunRetrySweep(cfg Config, opts RetrySweepOptions) (RuntimeSt
 
 // PrepareCopyRetry transitions to copy-in-progress and persists phase immediately.
 // Call synchronously before returning 202 and starting RunCopyRetry in a background task, same pattern as PrepareRetrySweep.
+// Allowed from awaiting-copy-review or copy-suspended.
 func (m *Migration) PrepareCopyRetry() error {
-	if m.Phase() != PhaseCopyReview {
-		return fmt.Errorf("prepare copy retry requires awaiting-copy-review phase")
+	phase := m.Phase()
+	if phase != PhaseCopyReview && phase != PhaseCopySuspended {
+		return fmt.Errorf("prepare copy retry requires awaiting-copy-review or copy-suspended phase")
 	}
 	return m.transitionTo(PhaseCopying)
 }
 
-// RunCopyRetry runs the copy phase in retry mode (only copy_status = failed). Requires awaiting-copy-review. On success transitions back to awaiting-copy-review.
+// RunCopyRetry runs the copy phase in retry mode (only copy_status = failed). On success transitions back to awaiting-copy-review.
 func (m *Migration) RunCopyRetry(cfg Config, opts CopyPhaseOptions) (queue.QueueStats, error) {
 	phase := m.Phase()
-	if phase != PhaseCopyReview && phase != PhaseCopying {
-		return queue.QueueStats{}, fmt.Errorf("copy retry requires awaiting-copy-review phase (or prepared copy-in-progress)")
+	if phase != PhaseCopyReview && phase != PhaseCopying && phase != PhaseCopySuspended {
+		return queue.QueueStats{}, fmt.Errorf("copy retry requires awaiting-copy-review, copy-suspended, or prepared copy-in-progress")
 	}
 	if cfg.Source.Adapter == nil || cfg.Destination.Adapter == nil {
 		return queue.QueueStats{}, fmt.Errorf("copy retry requires source and destination adapters in config")
@@ -514,13 +643,14 @@ func (m *Migration) RunCopyRetry(cfg Config, opts CopyPhaseOptions) (queue.Queue
 		return queue.QueueStats{}, fmt.Errorf("persist migration config: %w", err)
 	}
 	m.setLastRunConfig(cfg)
-	if phase == PhaseCopyReview {
+	if phase == PhaseCopyReview || phase == PhaseCopySuspended {
 		if err := m.transitionTo(PhaseCopying); err != nil {
 			return queue.QueueStats{}, err
 		}
 	}
-	runCtx := m.beginRun(cfg.ShutdownContext)
+	runCtx, cancelRun := m.beginRun(cfg.ShutdownContext)
 	defer func() {
+		cancelRun()
 		m.endRun()
 		if err := m.store.updateUpdatedAt(m.ID); err != nil {
 			fmt.Println("error updating updated at", err)
@@ -543,19 +673,35 @@ func (m *Migration) RunCopyRetry(cfg Config, opts CopyPhaseOptions) (queue.Queue
 		logLevel = cfg.LogLevel
 	}
 	stats, err := RunCopyRetryPhase(CopyPhaseConfig{
-		DuckDB:          m.DB,
-		SrcAdapter:      cfg.Source.Adapter,
-		DstAdapter:      cfg.Destination.Adapter,
-		WorkerCount:     workerCount,
-		MaxRetries:      maxRetries,
-		LogAddress:      logAddress,
-		LogLevel:        logLevel,
-		SkipListener:    opts.SkipListener || cfg.SkipListener,
-		StartupDelay:    cfg.StartupDelay,
-		ProgressTick:    cfg.ProgressTick,
-		ShutdownContext: runCtx,
+		DuckDB:               m.DB,
+		SrcAdapter:           cfg.Source.Adapter,
+		DstAdapter:           cfg.Destination.Adapter,
+		WorkerCount:          workerCount,
+		MaxRetries:           maxRetries,
+		LogAddress:           logAddress,
+		LogLevel:             logLevel,
+		SkipListener:         opts.SkipListener || cfg.SkipListener,
+		StartupDelay:         cfg.StartupDelay,
+		ProgressTick:         cfg.ProgressTick,
+		ShutdownContext:      runCtx,
+		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
+		OnQueueObserver:      func(o *queue.QueueObserver) { m.setActiveQueueObserver(o) },
 	})
 	if err != nil {
+		if errors.Is(err, ErrCopySoftSuspended) {
+			cstats, sus, ok := AsCopySuspended(err)
+			if ok {
+				if patch, e2 := copySuspendRuntimeMergePatch(sus); e2 == nil {
+					_ = m.store.updateRuntimeState(m.ID, patch)
+				}
+				if e3 := m.transitionTo(PhaseCopySuspended); e3 != nil {
+					return cstats, e3
+				}
+				m.softSuspendRequested.Store(false)
+				m.refreshRuntimeState()
+				return cstats, nil
+			}
+		}
 		return queue.QueueStats{}, err
 	}
 	if err := m.transitionTo(PhaseCopyReview); err != nil {
@@ -575,22 +721,38 @@ func (m *Migration) Stop() (StopResult, error) {
 	m.mu.RLock()
 	cancel := m.runCancel
 	running := m.running
+	phase := m.phase
 	m.mu.RUnlock()
-	if cancel != nil {
-		cancel()
-	}
-	return StopResult{
+
+	result := StopResult{
 		MigrationID:   m.ID,
 		Phase:         m.Phase(),
 		RuntimeStatus: m.GetRuntimeStatus(),
 		Stopped:       running,
-	}, nil
+	}
+
+	if !running {
+		return result, nil
+	}
+
+	switch phase {
+	case PhaseTraversing, PhaseCopying:
+		m.softSuspendRequested.Store(true)
+		result.SoftSuspendRequested = true
+		return result, nil
+	default:
+		if cancel != nil {
+			cancel()
+		}
+		return result, nil
+	}
 }
 
 // QueryNodes provides review-phase node search/filter without exposing SQL to API.
 func (m *Migration) QueryNodes(filter NodeQueryFilter) ([]db.NodeState, error) {
 	phase := m.Phase()
-	if phase != PhaseTraversalReview && phase != PhaseCopying && phase != PhaseCopyReview {
+	if phase != PhaseTraversalReview && phase != PhaseTraversalSuspended &&
+		phase != PhaseCopying && phase != PhaseCopySuspended && phase != PhaseCopyReview {
 		return nil, fmt.Errorf("query nodes is only available after traversal reaches review phase")
 	}
 	return m.store.queryNodes(filter)
@@ -865,7 +1027,24 @@ func (m *Migration) GetSearchStats(req SearchRequest) (DiffsStats, error) {
 }
 
 func (m *Migration) GetQueueMetrics() (QueueMetricsSnapshot, error) {
+	if o := m.activeQueueObs.Load(); o != nil {
+		if raw, ok := o.LastQueueMetricsForAPI(); ok && len(raw) > 0 {
+			return queueMetricsSnapshotFromRawJSON(raw), nil
+		}
+	}
 	return m.store.getQueueMetrics()
+}
+
+func queueMetricsSnapshotFromRawJSON(raw map[string][]byte) QueueMetricsSnapshot {
+	out := QueueMetricsSnapshot{Queues: make(map[string]map[string]any, len(raw))}
+	for key, blob := range raw {
+		var parsed map[string]any
+		if err := json.Unmarshal(blob, &parsed); err != nil {
+			parsed = map[string]any{"raw": string(blob)}
+		}
+		out.Queues[key] = parsed
+	}
+	return out
 }
 
 func (m *Migration) GetLogs(limit int, groupByLevel bool) (LogsProjection, error) {

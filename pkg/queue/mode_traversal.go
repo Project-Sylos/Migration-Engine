@@ -54,16 +54,22 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		}
 	}
 
-	batchSize := refillFromDBBatchSize
+	batchSize := q.effectiveRefillBatch()
 	requestLimit := batchSize + 1
 	var count int
 	if q.name == "dst" {
 		afterID := q.getDstKeysetCursor()
 		dstBatch, childrenByDstID, err := db.ListDstBatchWithSrcChildren(database, currentRound, afterID, requestLimit, db.StatusPending)
 		if err != nil {
+			if q.GetRound() != currentRound {
+				return
+			}
 			q.setLastPullWasPartial(true)
 			q.recordPull(currentRound, 0, true)
 			q.setFirstPullForRound(false)
+			return
+		}
+		if q.GetRound() != currentRound {
 			return
 		}
 		processLimit := batchSize
@@ -101,9 +107,15 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		queueType := getQueueType(q.name)
 		results, err := db.ListNodesByDepthKeyset(database, queueType, currentRound, afterID, db.StatusPending, requestLimit)
 		if err != nil {
+			if q.GetRound() != currentRound {
+				return
+			}
 			q.setLastPullWasPartial(true)
 			q.recordPull(currentRound, 0, true)
 			q.setFirstPullForRound(false)
+			return
+		}
+		if q.GetRound() != currentRound {
 			return
 		}
 		processLimit := batchSize
@@ -460,42 +472,38 @@ func (q *Queue) CheckTraversalCompletion(currentRound int) bool {
 
 	info := q.getRoundInfoReadOnly(currentRound)
 	pullCount := 0
-	pulledAmount := 0
 	if info != nil {
 		pullCount = info.PullCount
-		pulledAmount = info.ItemsYielded
 	}
-	attemptedPull := pullCount > 0
-	wasFirstPull := pullCount == 1
-	if !attemptedPull {
+	if pullCount == 0 {
 		q.PullTasksIfNeeded(true)
 		info = q.getRoundInfoReadOnly(currentRound)
 		pullCount = 0
-		pulledAmount = 0
 		if info != nil {
 			pullCount = info.PullCount
-			pulledAmount = info.ItemsYielded
 		}
-		attemptedPull = pullCount > 0
-		wasFirstPull = pullCount == 1
-		if !attemptedPull {
+		if pullCount == 0 {
 			return false
 		}
+	}
+	info = q.getRoundInfoReadOnly(currentRound)
+	if info == nil {
+		return false
 	}
 
 	mode := q.GetMode()
 
 	switch mode {
 	case QueueModeTraversal:
-		// Only complete when the first pull of this round actually returned 0 items (we checked and found nothing).
-		if !wasFirstPull || pulledAmount != 0 {
+		// Terminal empty frontier: last keyset pull was partial and returned no rows (use LastBatchYield; ItemsYielded is cumulative).
+		if !info.LastPartialPull || info.LastBatchYield != 0 {
 			return false
 		}
-		return q.markComplete("No pending tasks found for round %d - traversal complete (first pull)", currentRound)
+		return q.markComplete("No pending tasks found for round %d - traversal complete (empty frontier)", currentRound)
 	case QueueModeRetry:
 		// Per algorithms.md: only apply "pull -> see nothing -> end" when currentRound >= maxKnownDepth.
 		// Otherwise a round may have 0 retry items while deeper levels still do; return false so we advance the round.
-		if !wasFirstPull || pulledAmount != 0 {
+		if !info.LastPartialPull || info.LastBatchYield != 0 {
 			return false
 		}
 		maxKnownDepth := q.getMaxKnownDepth()

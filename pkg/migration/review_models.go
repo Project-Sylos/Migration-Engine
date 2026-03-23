@@ -30,6 +30,8 @@ type StopResult struct {
 	Phase         string
 	RuntimeStatus RuntimeState
 	Stopped       bool
+	// SoftSuspendRequested is true when a live traversal/copy run was asked to soft-suspend (drain + persist); completion is asynchronous.
+	SoftSuspendRequested bool
 }
 
 // DiffItem is a path review row comparing source and destination state.
@@ -183,12 +185,12 @@ type ReviewStatsRaw struct {
 func (r ReviewStatsRaw) ToPathReviewStats(phase string) PathReviewStats {
 	var pendingCount, failedCount, pendingRetriesCount int64
 	switch phase {
-	case PhaseTraversing, PhaseTraversalReview:
+	case PhaseTraversing, PhaseTraversalSuspended, PhaseTraversalReview:
 		// Traversing includes initial traversal and traversal retry sweep; same counters as review for API polls.
 		pendingCount = r.CopyPending
 		failedCount = r.TraversalFailed
 		pendingRetriesCount = r.TraversalPendingRetry
-	case PhaseCopying, PhaseCopyReview:
+	case PhaseCopying, PhaseCopySuspended, PhaseCopyReview:
 		pendingCount = 0
 		failedCount = r.CopyFailed
 		pendingRetriesCount = r.CopyPending // copy phase: no separate retry counter

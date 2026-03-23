@@ -33,6 +33,7 @@ The queue layer drives **source** and **destination** traversal and **copy** usi
 | `coordinator.go` | `QueueCoordinator`, `CanDstStartRound`, round tracking for SRC/DST |
 | `observer.go` | Polls stats / queues, writes `queue_stats` |
 | `queue_watchdog.go` / `progress_watchdog.go` | Timeouts / progress |
+| `queue_soft_suspend.go` | Pause-side helpers: stop watchdog, clear pending buffer, wait for in-flight zero |
 
 ---
 
@@ -56,6 +57,12 @@ See **`pkg/db/README.md`** for schema (**`src_status_events`**, **`dst_status_ev
 ## Resumption
 
 Resume uses the same DuckDB file: `initializeQueues` in `pkg/migration/run.go` restores rounds and cursors from DB state so pulls continue from the correct frontier.
+
+**Soft suspend** (`Pause`, clear **`pendingBuff`**, drain **`inProgress`**, flush/checkpoint at the migration layer) does **not** persist leased or pending task IDs; after **`traversal-suspended`** / **`copy-suspended`**, **`pkg/migration`** restarts with persisted **`suspend_v1`** (worker count, retries, optional **`QueueSizing`** lease/refill batches, observer/progress tick hints, max depth, last rounds) and rebuilds work from DuckDB.
+
+**`QueueSizing`** (optional last argument to **`NewQueue`**) overrides default lease and traversal refill batch sizes so suspend/resume can reproduce the same pull behavior.
+
+The **queue watchdog** treats **`QueueStatePaused`** as non-stall (no dump spam during intentional suspend).
 
 ---
 

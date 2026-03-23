@@ -17,6 +17,9 @@
 // Stats can be retrieved from DuckDB using:
 //   statsJSON, err := database.GetQueueStats("src-traversal")
 //   allStats, err := database.GetAllQueueStats()
+//
+// For low-latency APIs while a run is active, use LastQueueMetricsForAPI(): same JSON as written to
+// queue_stats, updated every observer tick without requiring a DB read.
 
 package queue
 
@@ -107,6 +110,9 @@ type QueueObserver struct {
 		files   int64
 		time    time.Time
 	} // Previous copy totals and time for each queue
+	// lastAPIMetrics: marshaled ExternalQueueMetrics per queue_stats key (e.g. src-traversal), for O(1) API reads.
+	lastAPIMetricsMu sync.RWMutex
+	lastAPIMetrics   map[string][]byte
 }
 
 const (
@@ -230,6 +236,9 @@ func (o *QueueObserver) Stop() {
 		files   int64
 		time    time.Time
 	})
+	o.lastAPIMetricsMu.Lock()
+	o.lastAPIMetrics = nil
+	o.lastAPIMetricsMu.Unlock()
 }
 
 // observeLoop is the main loop that polls queues directly and publishes metrics to DuckDB.
@@ -275,12 +284,58 @@ func (o *QueueObserver) observeLoop() {
 				}
 			}
 
-			// Publish all collected metrics to DuckDB
-			if len(metrics) > 0 && o.database != nil {
-				o.publishMetricsToDuckDB(metrics)
+			if len(metrics) > 0 {
+				o.storeLastAPIMetrics(metrics)
+				if o.database != nil {
+					o.publishMetricsToDuckDB(metrics)
+				}
 			}
 		}
 	}
+}
+
+func queueStatsKeyForAPI(queueName string) string {
+	if queueName == "copy" {
+		return queueName
+	}
+	return queueName + "-traversal"
+}
+
+func (o *QueueObserver) storeLastAPIMetrics(metrics map[string]ExternalQueueMetrics) {
+	cache := make(map[string][]byte, len(metrics))
+	for queueName, met := range metrics {
+		key := queueStatsKeyForAPI(queueName)
+		b, err := json.Marshal(met)
+		if err != nil {
+			continue
+		}
+		cp := make([]byte, len(b))
+		copy(cp, b)
+		cache[key] = cp
+	}
+	if len(cache) == 0 {
+		return
+	}
+	o.lastAPIMetricsMu.Lock()
+	o.lastAPIMetrics = cache
+	o.lastAPIMetricsMu.Unlock()
+}
+
+// LastQueueMetricsForAPI returns a copy of the latest marshaled metrics per queue_stats key.
+// Keys match DuckDB queue_stats.queue_key (e.g. "src-traversal"). False if no tick has run yet.
+func (o *QueueObserver) LastQueueMetricsForAPI() (map[string][]byte, bool) {
+	o.lastAPIMetricsMu.RLock()
+	defer o.lastAPIMetricsMu.RUnlock()
+	if len(o.lastAPIMetrics) == 0 {
+		return nil, false
+	}
+	out := make(map[string][]byte, len(o.lastAPIMetrics))
+	for k, v := range o.lastAPIMetrics {
+		cp := make([]byte, len(v))
+		copy(cp, v)
+		out[k] = cp
+	}
+	return out, true
 }
 
 // pollQueue polls a queue directly and calculates both external and internal metrics.
@@ -366,6 +421,10 @@ func (o *QueueObserver) calculateDiscoveryRate(queueName string, filesTotal, fol
 		return 0.0
 	}
 
+	if o.database != nil && o.database.SealIOWaitActive() {
+		return o.prevEMARates[queueName]
+	}
+
 	// Calculate current instantaneous rate
 	timeDelta := now.Sub(prev.time).Seconds()
 	if timeDelta <= 0 {
@@ -415,6 +474,10 @@ func (o *QueueObserver) calculateBytesPerSecond(queueName string, bytesTotal int
 			time:    now,
 		}
 		return 0.0
+	}
+
+	if o.database != nil && o.database.SealIOWaitActive() {
+		return o.prevEMARates[queueName+"-bytes"]
 	}
 
 	// Calculate current instantaneous rate
@@ -471,6 +534,10 @@ func (o *QueueObserver) calculateItemsPerSecond(queueName string, foldersTotal, 
 		return 0.0
 	}
 
+	if o.database != nil && o.database.SealIOWaitActive() {
+		return o.prevEMARates[queueName+"-items"]
+	}
+
 	// Calculate current instantaneous rate
 	timeDelta := now.Sub(prev.time).Seconds()
 	if timeDelta <= 0 {
@@ -516,6 +583,11 @@ func (o *QueueObserver) updateInternalMetrics(queueName string, queue *Queue, cu
 		}
 		o.internalMetrics[queueName] = internal
 		return // First poll, just initialize
+	}
+
+	if o.database != nil && o.database.SealIOWaitActive() {
+		internal.LastStateChangeTime = now
+		return
 	}
 
 	// Calculate time delta since last poll
@@ -686,10 +758,7 @@ func (o *QueueObserver) publishMetricsToDuckDB(metricsMap map[string]ExternalQue
 	err := o.database.RunWrite(context.Background(), func(s *db.WriteSession) error {
 		return s.WithTx(func(w *db.Writer) error {
 			for queueName, metrics := range metricsMap {
-				key := queueName
-				if queueName != "copy" {
-					key = queueName + "-traversal"
-				}
+				key := queueStatsKeyForAPI(queueName)
 				metricsJSON, err := json.Marshal(metrics)
 				if err != nil {
 					if logservice.LS != nil {

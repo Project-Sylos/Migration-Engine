@@ -152,7 +152,7 @@ func (q *Queue) PullCopyTasks(force bool) {
 		nodeType = db.NodeTypeFile
 	}
 
-	batchSize := effectiveLeaseBatchSize()
+	batchSize := q.effectiveLeaseBatch()
 	copyStatusFilter := db.CopyStatusPending
 	if q.GetMode() == QueueModeCopyRetry {
 		copyStatusFilter = db.CopyStatusFailed

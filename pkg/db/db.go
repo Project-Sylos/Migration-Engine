@@ -6,9 +6,11 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
+	"time"
 
 	_ "github.com/marcboeker/go-duckdb"
 )
@@ -227,13 +229,21 @@ func execPathHashBatch(conn *sql.DB, table string, batch []struct{ id, pathHash,
 	return nil
 }
 
-// Close closes the database connection. Stops the seal buffer first (flushing any pending seal and discovery jobs).
+// Close closes the database connection. Stops the seal buffer first (flushing any pending seal and discovery jobs), then CHECKPOINT on disk (graceful shutdown durability).
 func (db *DB) Close() error {
 	if db.sealBuffer != nil {
 		db.sealBuffer.Stop()
 	}
-	err := db.conn.Close()
-	return err
+	var errs []error
+	if db.path != ":memory:" {
+		if err := db.Checkpoint(); err != nil {
+			errs = append(errs, fmt.Errorf("checkpoint on close: %w", err))
+		}
+	}
+	if err := db.conn.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // Path returns the database file path (or ":memory:").
@@ -241,8 +251,9 @@ func (db *DB) Path() string {
 	return db.path
 }
 
-// Checkpoint runs CHECKPOINT on the main conn, guarded by checkpointMu. Call at root seeding and round advancement only.
+// Checkpoint runs CHECKPOINT on the main conn, guarded by checkpointMu.
 // Uses a single connection; running CHECKPOINT on multiple connections causes "Could not remove file X.wal: No such file or directory".
+// On success, resets the seal buffer periodic checkpoint schedule (rows + timer) so external checkpoints do not immediately retrigger a periodic one.
 func (db *DB) Checkpoint() error {
 	if db.path == ":memory:" {
 		return nil
@@ -250,7 +261,51 @@ func (db *DB) Checkpoint() error {
 	db.checkpointMu.Lock()
 	defer db.checkpointMu.Unlock()
 	_, err := db.conn.Exec("CHECKPOINT")
-	return err
+	if err != nil {
+		return err
+	}
+	if db.sealBuffer != nil {
+		db.sealBuffer.onCheckpointOK()
+	}
+	return nil
+}
+
+// CheckpointWithRetry runs CHECKPOINT up to maxAttempts times with exponential backoff between failures.
+// DuckDB may reject CHECKPOINT while another write transaction is open; waiting often allows graceful suspend to complete.
+// Honors ctx cancellation between attempts. If maxAttempts <= 0, uses 5.
+func (db *DB) CheckpointWithRetry(ctx context.Context, maxAttempts int) error {
+	if db.path == ":memory:" {
+		return nil
+	}
+	if maxAttempts <= 0 {
+		maxAttempts = 5
+	}
+	backoff := 50 * time.Millisecond
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("checkpoint retry: %w", err)
+		}
+		fmt.Println("checkpoint retry", attempt)
+		lastErr = db.Checkpoint()
+		if lastErr == nil {
+			fmt.Println("checkpoint retry success", attempt)
+			return nil
+		}
+		if attempt == maxAttempts {
+			fmt.Println("checkpoint retry failed", attempt)
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("checkpoint retry: %w", ctx.Err())
+		case <-time.After(backoff):
+		}
+		if backoff < 2*time.Second {
+			backoff *= 2
+		}
+	}
+	return fmt.Errorf("checkpoint after %d attempts: %w", maxAttempts, lastErr)
 }
 
 // GetDB returns the underlying *sql.DB for read-only queries (main conn).
@@ -294,7 +349,7 @@ type NodeDeletion struct {
 }
 
 // SealLevel persists a sealed level from memory cache to the DB (bulk append + stats snapshot). copyP/copyS/copyF are used for SRC copy stats when >= 0.
-// Payload is enqueued to the seal buffer, which writes and checkpoints asynchronously.
+// Payload is enqueued to the seal buffer, which flushes asynchronously. CHECKPOINT policy: periodic (rows + interval, see SealBufferOptions), phase end (migration runners), soft suspend, seeding, and Close.
 func (db *DB) SealLevel(table string, depth int, nodes []*NodeState, pending, successful, failed, completed int64, copyP, copyS, copyF int64) error {
 	if table != "SRC" && table != "DST" {
 		return nil
@@ -332,6 +387,11 @@ func (db *DB) FlushSealBuffer() error {
 // WaitUntilSealFlushedThrough blocks until the seal buffer has written at least the given depth (for backpressure: don't run more than one round ahead of flushed state).
 func (db *DB) WaitUntilSealFlushedThrough(depth int) {
 	db.sealBuffer.WaitUntilFlushedThrough(depth)
+}
+
+// SealIOWaitActive reports whether the seal buffer is flushing, waiting on flush depth, or producers are blocked on hard-cap backpressure. Queue stall and progress watchdogs use this to avoid false stalls during long seal I/O.
+func (db *DB) SealIOWaitActive() bool {
+	return db != nil && db.sealBuffer != nil && db.sealBuffer.IOWaitActive()
 }
 
 // AppendDiscoveredNodes adds discovered nodes (and their initial status events) to the seal buffer discovery queue. Call from traversal completion; flush is async until FlushAppenderBuffer.
@@ -442,14 +502,15 @@ func (db *DB) BeginTraversalPhase(ctx context.Context) error {
 	return nil
 }
 
-// EndTraversalPhase flushes remaining seal jobs, closes phase appenders, checkpoints to flush WAL and free memory, then rebuilds indexes.
-func (db *DB) EndTraversalPhase() error {
-	if err := db.sealBuffer.StopPhase(); err != nil {
-		return err
-	}
-	if err := db.Checkpoint(); err != nil {
-		return err
-	}
+// EnsureBulkPhaseSecondaryIndexes recreates secondary indexes after a bulk traversal/copy phase
+// (same set as dropped in BeginTraversalPhase / BeginCopyPhase): three per node table (path_hash,
+// parent_path_hash, depth) and two per status-events table (id, id+event_time). Uses conservative
+// PRAGMA settings during creation to reduce OOM risk on large tables.
+//
+// When indexes already exist (e.g. normal EndTraversalPhase), duckdb_indexes is consulted so missing
+// names are skipped—avoiding redundant full-table index builds. Call after retry sweep if the DB may
+// have been left without indexes after an interrupted traversal run.
+func (db *DB) EnsureBulkPhaseSecondaryIndexes() error {
 	runtime.GC()
 	if _, err := db.conn.Exec("PRAGMA threads=1"); err != nil {
 		return err
@@ -457,23 +518,30 @@ func (db *DB) EndTraversalPhase() error {
 	if _, err := db.conn.Exec("PRAGMA memory_limit='2GB'"); err != nil {
 		return err
 	}
-	// reset defaults after indexes are created. :)
-	// Duck DB index creation on large tables is super memory hungry so we are essentially trying to limit this to prevent OOM crashes.
 	defer func() {
 		_, _ = db.conn.Exec("PRAGMA threads=4")
 		_, _ = db.conn.Exec("PRAGMA memory_limit='4GB'")
 	}()
 	for _, table := range []string{tableSrcNodes, tableDstNodes} {
-		if err := EnsureNodeTableIndexes(db, table); err != nil {
+		if err := EnsureNodeTableIndexesIfMissing(db, table); err != nil {
 			return err
 		}
 	}
 	for _, table := range []string{tableSrcStatusEvents, tableDstStatusEvents} {
-		if err := EnsureStatusEventTableIndexes(db, table); err != nil {
+		if err := EnsureStatusEventTableIndexesIfMissing(db, table); err != nil {
 			return err
 		}
 	}
-	return db.Checkpoint()
+	return nil
+}
+
+// EndTraversalPhase flushes remaining seal jobs, closes phase appenders, then rebuilds indexes.
+// CHECKPOINT is not run here: callers run it once after both traversal/retry/copy queues finish (see migration run/copy/sweeps), plus periodic seal policy, suspend, and Close.
+func (db *DB) EndTraversalPhase() error {
+	if err := db.sealBuffer.StopPhase(); err != nil {
+		return err
+	}
+	return db.EnsureBulkPhaseSecondaryIndexes()
 }
 
 // BeginCopyPhase starts the copy phase (same as traversal: drop indexes, persistent appenders).
@@ -481,7 +549,7 @@ func (db *DB) BeginCopyPhase(ctx context.Context) error {
 	return db.BeginTraversalPhase(ctx)
 }
 
-// EndCopyPhase ends the copy phase (flush, close appenders, rebuild indexes, checkpoint).
+// EndCopyPhase ends the copy phase (flush, close appenders, rebuild indexes).
 func (db *DB) EndCopyPhase() error {
 	return db.EndTraversalPhase()
 }

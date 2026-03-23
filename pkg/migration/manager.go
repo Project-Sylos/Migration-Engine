@@ -250,6 +250,11 @@ func (m *MigrationManager) GetMigration(id string, migrationDir string) (*Migrat
 	snap := m.snapshotMigrationEntry(id)
 	if snap.Migration != nil {
 		if snap.HasDB {
+			if snap.Migration.IsLive() {
+				if _, ok := snap.Migration.cachedMigrationDetailsForLiveAPI(); ok {
+					return snap.Migration, nil
+				}
+			}
 			record, err := m.store.getMigration(snap.Migration.DB, id)
 			if err != nil {
 				return nil, err
@@ -273,6 +278,11 @@ func (m *MigrationManager) GetMigration(id string, migrationDir string) (*Migrat
 
 		after := m.snapshotMigrationEntry(id)
 		if after.Migration != nil && after.HasDB {
+			if after.Migration.IsLive() {
+				if _, ok := after.Migration.cachedMigrationDetailsForLiveAPI(); ok {
+					return after.Migration, nil
+				}
+			}
 			if persisted, _ := m.store.getMigration(after.Migration.DB, id); persisted != nil {
 				after.Migration.syncRecord(*persisted)
 			}
@@ -430,6 +440,12 @@ func (m *MigrationManager) GetMigrationDetails(id string, migrationDir string) (
 		return &MigrationDetails{ID: pending.ID, Name: pending.Name, Phase: pending.Phase, CreatedAt: pending.CreatedAt, UpdatedAt: pending.UpdatedAt, ServiceMetadataJSON: pending.ServiceMetadataJSON, RootConfigJSON: pending.RootConfigJSON, Live: false}, nil
 	}
 	if existing != nil && existing.DB != nil {
+		if existing.IsLive() {
+			if d, ok := existing.cachedMigrationDetailsForLiveAPI(); ok {
+				m.overlayRuntimeFromCache(id, d)
+				return d, nil
+			}
+		}
 		record, err := m.store.getMigration(existing.DB, id)
 		if err != nil || record == nil {
 			return nil, err

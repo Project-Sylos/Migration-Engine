@@ -143,7 +143,7 @@ func (w *CopyWorker) execute(task *TaskBase) error {
 	if parent == nil {
 		parent = context.Background()
 	}
-	wd, ctx := NewProgressWatchdog(parent, copyStallTimeout)
+	wd, ctx := NewProgressWatchdog(parent, copyStallTimeout, w.queue.sealIOWaitActive)
 	defer wd.Stop()
 
 	// This whole block of code looks like an x-wing fighter from star wars lol...

@@ -32,6 +32,11 @@ type SweepConfig struct {
 	MaxKnownDepth          int    // Maximum known depth from previous traversal (-1 to auto-detect)
 	SkipAutoETLBeforeRetry bool   // If true, skip automatic ETL from DuckDB to DuckDB before retry sweep
 	DuckDBPath             string // Optional: Path to DuckDB file (auto-derived from DuckDB path if empty and ETL is enabled)
+	SoftSuspendRequested   func() bool
+	ObserverPollInterval   time.Duration
+	OnQueueObserver        func(*queue.QueueObserver)
+	LeaseBatchSize         int
+	RefillBatchSize        int
 }
 
 // RunRetrySweep runs a retry sweep to re-process failed or pending tasks from a previous traversal.
@@ -87,7 +92,6 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	// Create coordinator for round advancement gates (retry uses traversal-like coordination)
 	coordinator := queue.NewQueueCoordinator()
 
-
 	// Get max known depth from config or detect from stats table
 	maxKnownDepth := cfg.MaxKnownDepth
 	if maxKnownDepth < 0 {
@@ -100,13 +104,18 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 		}
 	}
 
+	var qsz *queue.QueueSizing
+	if cfg.LeaseBatchSize > 0 || cfg.RefillBatchSize > 0 {
+		qsz = &queue.QueueSizing{LeaseBatchSize: cfg.LeaseBatchSize, RefillBatchSize: cfg.RefillBatchSize}
+	}
+
 	// Create queues in retry mode
-	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
+	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator, qsz)
 	srcQueue.SetMode(queue.QueueModeRetry)
 	srcQueue.SetMaxKnownDepth(maxKnownDepth)
 	srcQueue.InitializeWithContext(duckDB, cfg.SrcAdapter, cfg.ShutdownContext)
 
-	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
+	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator, qsz)
 	dstQueue.SetMode(queue.QueueModeRetry)
 	if cfg.MaxKnownDepth >= 0 {
 		dstQueue.SetMaxKnownDepth(cfg.MaxKnownDepth)
@@ -129,19 +138,31 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	srcQueue.PullTasksIfNeeded(true)
 	dstQueue.PullTasksIfNeeded(true)
 
-	// Create observer for stats publishing
-	observer := queue.NewQueueObserver(duckDB, 500*time.Millisecond)
+	obsPoll := cfg.ObserverPollInterval
+	if obsPoll <= 0 {
+		obsPoll = 500 * time.Millisecond
+	}
+	observer := queue.NewQueueObserver(duckDB, obsPoll)
 	observer.Start()
 	defer observer.Stop()
+	if cfg.OnQueueObserver != nil {
+		defer cfg.OnQueueObserver(nil)
+	}
 
 	srcQueue.SetObserver(observer)
 	dstQueue.SetObserver(observer)
+	if cfg.OnQueueObserver != nil {
+		cfg.OnQueueObserver(observer)
+	}
 
 	// Set up stats channels for progress updates
 	srcStatsChan := make(chan queue.QueueStats, 10)
 	dstStatsChan := make(chan queue.QueueStats, 10)
 	srcQueue.SetStatsChannel(srcStatsChan)
 	dstQueue.SetStatsChannel(dstStatsChan)
+
+	statsCtx, statsCancel := context.WithCancel(context.Background())
+	defer statsCancel()
 
 	// Start stats consumer goroutine for progress updates
 	go func() {
@@ -150,6 +171,8 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 
 		for {
 			select {
+			case <-statsCtx.Done():
+				return
 			case srcStats := <-srcStatsChan:
 				lastSrcStats = &srcStats
 				if lastDstStats != nil {
@@ -211,13 +234,13 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	defer progressTicker.Stop()
 	start := time.Now()
 
+	wc, mr := cfg.WorkerCount, cfg.MaxRetries
+
 	// Wait for both queues to complete
 	for {
-		// Check for force shutdown
 		if cfg.ShutdownContext != nil {
 			select {
 			case <-cfg.ShutdownContext.Done():
-				// Force shutdown
 				srcQueue.Pause()
 				dstQueue.Pause()
 
@@ -233,6 +256,24 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 				}, fmt.Errorf("retry sweep suspended by force shutdown")
 			default:
 			}
+		}
+
+		if cfg.SoftSuspendRequested != nil && cfg.SoftSuspendRequested() {
+			mcfg := MigrationConfig{
+				ProgressTick:         cfg.ProgressTick,
+				ObserverPollInterval: cfg.ObserverPollInterval,
+			}
+			if mcfg.ObserverPollInterval <= 0 {
+				mcfg.ObserverPollInterval = obsPoll
+			}
+			waitCtx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+			stats, suspend, err := performTraversalSoftSuspend(waitCtx, duckDB, srcQueue, dstQueue, observer, coordinator, mcfg, start, wc, mr)
+			cancel()
+			if err != nil {
+				return stats, fmt.Errorf("retry sweep soft suspend: %w", err)
+			}
+			fmt.Print("\n")
+			return stats, newTraversalSuspendedError(stats, suspend)
 		}
 
 		// Check if both queues are completed
@@ -262,6 +303,17 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 				case <-closeDone:
 				case <-closeCtx.Done():
 				}
+			}
+
+			if err := duckDB.EnsureBulkPhaseSecondaryIndexes(); err != nil {
+				return RuntimeStats{
+					Duration: time.Since(start),
+					Src:      srcStats,
+					Dst:      dstStats,
+				}, fmt.Errorf("retry sweep complete but secondary indexes: %w", err)
+			}
+			if err := duckDB.CheckpointWithRetry(context.Background(), 8); err != nil {
+				fmt.Println("checkpoint after retry sweep:", err)
 			}
 
 			return RuntimeStats{
@@ -298,6 +350,17 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 					case <-closeDone:
 					case <-closeCtx.Done():
 					}
+				}
+
+				if err := duckDB.EnsureBulkPhaseSecondaryIndexes(); err != nil {
+					return RuntimeStats{
+						Duration: time.Since(start),
+						Src:      srcStats,
+						Dst:      dstStats,
+					}, fmt.Errorf("retry sweep complete but secondary indexes: %w", err)
+				}
+				if err := duckDB.CheckpointWithRetry(context.Background(), 8); err != nil {
+					fmt.Println("checkpoint after retry sweep:", err)
 				}
 
 				return RuntimeStats{

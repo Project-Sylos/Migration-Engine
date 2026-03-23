@@ -34,6 +34,13 @@ type MigrationConfig struct {
 	ProgressTick    time.Duration
 	ResumeStatus    *MigrationStatus
 	ShutdownContext context.Context
+	// ResumeTraversal: non-nil after traversal-suspended; retry-style frontier rebuild (round 0, persisted max depth / sizing).
+	ResumeTraversal *RuntimeSuspendV1
+	// SoftSuspendRequested is polled in the run loop; when true, queues drain and state is flushed (see ErrTraversalSoftSuspended).
+	SoftSuspendRequested func() bool
+	ObserverPollInterval time.Duration
+	// OnQueueObserver is called with the live observer after queues register, and with nil when the run exits (before observer.Stop).
+	OnQueueObserver func(*queue.QueueObserver)
 }
 
 // RuntimeStats captures execution statistics at the end of a migration run.
@@ -79,27 +86,48 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 	coordinator := queue.NewQueueCoordinator()
 
+	sizing := queueSizingFromSuspend(cfg.ResumeTraversal)
+	wc := effectiveWorkerCount(cfg.WorkerCount, cfg.ResumeTraversal)
+	mr := effectiveMaxRetries(cfg.MaxRetries, cfg.ResumeTraversal)
+
 	// DB-backed frontier: no LevelCache for traversal. Queues pull from DuckDB in batches.
-	// Create queues
-	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator)
-	srcQueue.InitializeWithContext(database, cfg.SrcAdapter, cfg.ShutdownContext)
-	// Note: Queues clean themselves up when they complete (Run() exits when state=QueueStateCompleted)
-	// We only need to explicitly close for forced shutdowns, which is handled via Pause() + shutdown context
+	srcQueue := queue.NewQueue("src", mr, wc, coordinator, sizing)
+	dstQueue := queue.NewQueue("dst", mr, wc, coordinator, sizing)
 
-	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator)
-	dstQueue.InitializeWithContext(database, cfg.DstAdapter, cfg.ShutdownContext)
-	// Note: Queues clean themselves up when they complete (Run() exits when state=QueueStateCompleted)
-	// We only need to explicitly close for forced shutdowns, which is handled via Pause() + shutdown context
-
-	// Initialize queues with resume state if available
-	if err := initializeQueues(cfg, srcQueue, dstQueue, coordinator); err != nil {
-		return RuntimeStats{}, err
+	if cfg.ResumeTraversal != nil {
+		srcQueue.SetMode(queue.QueueModeRetry)
+		dstQueue.SetMode(queue.QueueModeRetry)
+		maxKD := cfg.ResumeTraversal.MaxKnownDepth
+		if maxKD <= 0 {
+			if d, err := database.GetMaxDepth("SRC"); err == nil {
+				maxKD = d
+			}
+		}
+		srcQueue.SetMaxKnownDepth(maxKD)
+		dstQueue.SetMaxKnownDepth(maxKD)
 	}
 
-	// Give queues a moment to start their Run() goroutines
-	time.Sleep(100 * time.Millisecond)
+	srcQueue.InitializeWithContext(database, cfg.SrcAdapter, cfg.ShutdownContext)
+	dstQueue.InitializeWithContext(database, cfg.DstAdapter, cfg.ShutdownContext)
 
-	// Start traversal phase: drop indexes, persistent appenders. Flush/checkpoint at phase end only.
+	if cfg.ResumeTraversal != nil {
+		srcQueue.SetRound(0)
+		dstQueue.SetRound(0)
+		srcQueue.EnsureRoundExpectedFromStats()
+		dstQueue.EnsureRoundExpectedFromStats()
+		srcQueue.SetTraversalCacheLoaded(true)
+		dstQueue.SetTraversalCacheLoaded(true)
+		time.Sleep(500 * time.Millisecond)
+		srcQueue.PullTasksIfNeeded(true)
+		dstQueue.PullTasksIfNeeded(true)
+	} else {
+		if err := initializeQueues(cfg, srcQueue, dstQueue, coordinator); err != nil {
+			return RuntimeStats{}, err
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Start traversal phase: drop indexes, persistent appenders. CHECKPOINT runs once after phase teardown (defer order below), not per-queue complete.
 	phaseCtx := context.Background()
 	if cfg.ShutdownContext != nil {
 		phaseCtx = cfg.ShutdownContext
@@ -108,25 +136,39 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		return RuntimeStats{}, fmt.Errorf("begin traversal phase: %w", err)
 	}
 	defer func() {
+		if err := database.CheckpointWithRetry(context.Background(), 8); err != nil {
+			fmt.Println("checkpoint after traversal phase:", err)
+		}
+	}()
+	defer func() {
 		if err := database.EndTraversalPhase(); err != nil {
 			fmt.Println("error ending traversal phase", err)
 		}
 	}()
 
-	// Create observer for database stats publishing (200ms update interval)
-	observer := queue.NewQueueObserver(database, 200*time.Millisecond)
+	obsPoll := observerPollFromConfigAndSuspend(cfg.ObserverPollInterval, cfg.ResumeTraversal)
+	observer := queue.NewQueueObserver(database, obsPoll)
 	observer.Start()      // Start observer loop immediately
 	defer observer.Stop() // Ensure observer is stopped on exit
+	if cfg.OnQueueObserver != nil {
+		defer cfg.OnQueueObserver(nil)
+	}
 
 	// Register queues with observer (observer will poll queues directly)
 	srcQueue.SetObserver(observer)
 	dstQueue.SetObserver(observer)
+	if cfg.OnQueueObserver != nil {
+		cfg.OnQueueObserver(observer)
+	}
 
 	// Set up stats channels for UDP logging (after queues are running)
 	srcStatsChan := make(chan queue.QueueStats, 10)
 	dstStatsChan := make(chan queue.QueueStats, 10)
 	srcQueue.SetStatsChannel(srcStatsChan)
 	dstQueue.SetStatsChannel(dstStatsChan)
+
+	statsCtx, statsCancel := context.WithCancel(context.Background())
+	defer statsCancel()
 
 	// Start stats consumer goroutine for progress updates (fmt output, not log service)
 	// Accumulate stats from both channels and print them together
@@ -136,6 +178,8 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 		for {
 			select {
+			case <-statsCtx.Done():
+				return
 			case srcStats := <-srcStatsChan:
 				lastSrcStats = &srcStats
 				printTraversalProgress(srcQueue, dstQueue, lastSrcStats, lastDstStats)
@@ -146,8 +190,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		}
 	}()
 
-	// Ensure ProgressTick is positive (default to 1 second if not set)
-	progressTick := cfg.ProgressTick
+	progressTick := progressTickFromConfigAndSuspend(cfg.ProgressTick, cfg.ResumeTraversal, time.Second)
 	if progressTick <= 0 {
 		progressTick = 1 * time.Second
 	}
@@ -156,26 +199,19 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	start := time.Now()
 
 	for {
-		// Check for force shutdown (context cancellation)
+		// Hard shutdown: context canceled (fatal / external cancel).
 		if cfg.ShutdownContext != nil {
 			select {
 			case <-cfg.ShutdownContext.Done():
-				// Force shutdown: pause queues, checkpoint DB, and save suspended state
-				// Use timeout context to prevent hanging on cleanup operations
 				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 8*time.Second)
 				defer cleanupCancel()
 
-				// Pause queues to stop new task leasing (workers will exit via shutdown context)
 				srcQueue.Pause()
 				dstQueue.Pause()
 
-				// Give workers a moment to finish current tasks (they check shutdown context in their loop)
-				// This is non-blocking - workers will exit when they check context in next iteration
 				select {
 				case <-time.After(200 * time.Millisecond):
-					// Continue with cleanup
 				case <-cleanupCtx.Done():
-					// Timeout - skip cleanup and exit immediately
 					fmt.Printf("⚠️  Cleanup timeout - exiting immediately to prevent hang\n")
 					srcStats, dstStats := snapshotTraversalQueueStats(database, coordinator)
 					return RuntimeStats{
@@ -185,10 +221,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 					}, errors.New("migration suspended by force shutdown (cleanup timeout)")
 				}
 
-				// Get stats directly (non-blocking)
 				srcStats, dstStats := snapshotTraversalQueueStats(database, coordinator)
-
-				// DuckDB doesn't need checkpointing - data is already persisted
 
 				return RuntimeStats{
 					Duration: time.Since(start),
@@ -196,8 +229,18 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 					Dst:      dstStats,
 				}, errors.New("migration suspended by force shutdown")
 			default:
-				// Continue normal execution
 			}
+		}
+
+		if cfg.SoftSuspendRequested != nil && cfg.SoftSuspendRequested() {
+			waitCtx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+			stats, suspend, err := performTraversalSoftSuspend(waitCtx, database, srcQueue, dstQueue, observer, coordinator, cfg, start, wc, mr)
+			cancel()
+			if err != nil {
+				return stats, fmt.Errorf("traversal soft suspend: %w", err)
+			}
+			fmt.Print("\n")
+			return stats, newTraversalSuspendedError(stats, suspend)
 		}
 
 		// Check exhaustion status from coordinator (source of truth)
