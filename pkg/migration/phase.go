@@ -48,6 +48,10 @@ func canTransition(from, to string) bool {
 	if from == to {
 		return true
 	}
+
+	// This section kind of feels like tribal knowledge wizardry. 
+	// We should probably have some note that explains WHY certain phases are allowed to transition to other certain phases. But oh well. 
+	// TODO: Explain this better please.
 	switch from {
 	case PhaseCreated:
 		// Allow transition to either filters-set (intended) or directly to traversal-in-progress (temporary).

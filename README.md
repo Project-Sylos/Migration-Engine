@@ -135,6 +135,7 @@ See **`pkg/migration/README.md`** for **`PrepareRetrySweep`** / **`PrepareCopyRe
 ### Docs in this repo
 
 - **[docs/algorithms.md](./docs/algorithms.md)** – Algorithm notes.
+- **[docs/autoscaler.md](./docs/autoscaler.md)** – Autoscaler design: pipeline, knobs, profiles, telemetry (living doc).
 - **[docs/item_statuses.md](./docs/item_statuses.md)** – Status semantics.
 - **[pkg/db/README.md](./pkg/db/README.md)** – Schema, seal, Writer, queries.
 - **[pkg/queue/README.md](./pkg/queue/README.md)** – Pull/seal flow, modes, coordinator.

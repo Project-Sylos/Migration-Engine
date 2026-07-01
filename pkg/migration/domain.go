@@ -4,6 +4,7 @@
 package migration
 
 import (
+	"slices"
 	"context"
 	"encoding/json"
 	"errors"
@@ -436,7 +437,8 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 // Requires awaiting-traversal-review or copy-suspended (resume after soft suspend).
 func (m *Migration) StartCopy(cfg Config) (queue.QueueStats, error) {
 	prevPhase := m.Phase()
-	if prevPhase != PhaseTraversalReview && prevPhase != PhaseCopySuspended {
+	validCopyStartPhases := []string{PhaseTraversalReview, PhaseCopySuspended, PhaseCopyReview}
+	if !slices.Contains(validCopyStartPhases, prevPhase) {
 		return queue.QueueStats{}, fmt.Errorf("start copy requires awaiting-traversal-review or copy-suspended phase, got %s", prevPhase)
 	}
 	if err := m.transitionTo(PhaseCopying); err != nil {

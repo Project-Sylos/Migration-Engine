@@ -1124,6 +1124,23 @@ func (q *Queue) Run() {
 			}
 
 			innerState := q.State()
+			roundToCheck := q.GetRound()
+
+			// DST can enter Waiting before SRC is far enough ahead, then remain inside this
+			// polling loop. Re-check the coordinator gate here so DST wakes back up once SRC
+			// advances or completes, and force a pull for the newly-open round.
+			if coordinator != nil && q.name == "dst" {
+				if coordinator.CanDstStartRound(roundToCheck) {
+					if innerState == QueueStateWaiting {
+						q.SetState(QueueStateRunning)
+						q.PullTasksIfNeeded(true)
+						innerState = q.State()
+					}
+				} else if innerState != QueueStateWaiting {
+					q.SetState(QueueStateWaiting)
+					innerState = QueueStateWaiting
+				}
+			}
 
 			// If paused, block here
 			if innerState == QueueStatePaused {
@@ -1135,9 +1152,6 @@ func (q *Queue) Run() {
 			if innerState == QueueStateStopped || innerState == QueueStateCompleted {
 				return
 			}
-
-			// Get current state snapshot
-			roundToCheck := q.GetRound()
 
 			// 1. Check phase completion (pass switch or copy/traversal done)
 			if q.checkCompletion(roundToCheck, CompletionCheckOptions{CheckFinalCompletion: true}) {
