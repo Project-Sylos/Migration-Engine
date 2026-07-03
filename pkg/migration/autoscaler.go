@@ -16,12 +16,39 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/scaling"
 )
 
+const defaultAutoscalerInterval = 3 * time.Second
+
 // AutoscalerConfig controls in-engine autoscaler behavior.
+// Autoscaler is enabled by default for all migration runs; set DisableAutoscaler to opt out.
 type AutoscalerConfig struct {
-	Enabled   bool
-	Interval  time.Duration
-	OnEvent   func(scaling.ScalingEvent)
-	DebugAIMD bool // probe cooldown + scale-up diagnostics on stdout
+	// DisableAutoscaler turns off the control loop (explicit opt-out).
+	DisableAutoscaler bool
+	Enabled           bool // deprecated: use DisableAutoscaler; kept for callers that set Enabled: true explicitly
+	Interval          time.Duration
+	OnEvent           func(scaling.ScalingEvent)
+	DebugAIMD         bool // probe cooldown + scale-up diagnostics on stdout
+}
+
+// DefaultAutoscalerConfig returns enabled autoscaler settings used when none are supplied.
+func DefaultAutoscalerConfig() AutoscalerConfig {
+	return AutoscalerConfig{
+		Enabled:  true,
+		Interval: defaultAutoscalerInterval,
+	}
+}
+
+// Resolve applies migration-engine defaults. Autoscaler runs unless DisableAutoscaler is set.
+func (c AutoscalerConfig) Resolve() AutoscalerConfig {
+	out := c
+	if out.DisableAutoscaler {
+		out.Enabled = false
+		return out
+	}
+	out.Enabled = true
+	if out.Interval <= 0 {
+		out.Interval = defaultAutoscalerInterval
+	}
+	return out
 }
 
 // autoscalerRunContext holds autoscaler lifecycle for a migration run.
@@ -101,6 +128,7 @@ func startAutoscalerActuators(
 	specs []autoscalerQueueSpec,
 	adapters ...fstypes.FSAdapter,
 ) *autoscalerRunContext {
+	cfg = cfg.Resolve()
 	if !cfg.Enabled || observer == nil {
 		return nil
 	}

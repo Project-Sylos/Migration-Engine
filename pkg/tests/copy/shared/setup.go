@@ -209,6 +209,7 @@ func SetupCopyTestConfig(cleanSpectraDB bool, removeMigrationDB bool) (migration
 		LogLevel:        "trace",
 		StartupDelay:    1 * time.Second,
 		Verification:    migration.VerifyOptions{},
+		Autoscaler:      migration.DefaultAutoscalerConfig(),
 	}
 
 	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {

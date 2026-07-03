@@ -168,6 +168,7 @@ func SetupTest(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, e
 		LogLevel:        "trace",
 		StartupDelay:    1 * time.Second, // you should set this to 3 if you set skip listener to false to account for terminal opening delay
 		Verification:    migration.VerifyOptions{},
+		Autoscaler:      migration.DefaultAutoscalerConfig(),
 	}
 
 	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {
@@ -231,6 +232,7 @@ func SetupEphemeralTest(removeMigrationDB bool) (migration.Config, error) {
 		Verification: migration.VerifyOptions{
 			AllowNotOnSrc: true, // Ephemeral mode allows divergent trees (nodes on dst but not src)
 		},
+		Autoscaler: migration.DefaultAutoscalerConfig(),
 	}
 
 	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {
@@ -300,7 +302,7 @@ func SetupEphemeralThrottleTest(removeMigrationDB bool, workerCount int, autosca
 		LogLevel:        "trace",
 		StartupDelay:    500 * time.Millisecond,
 		ProgressTick:    time.Second,
-		Autoscaler:      autoscaler,
+		Autoscaler:      autoscaler.Resolve(),
 		Verification: migration.VerifyOptions{
 			AllowNotOnSrc: true,
 		},
@@ -456,7 +458,7 @@ func SetupLocalTestWithOptions(srcPath, dstPath string, opts LocalTestOptions) (
 		SkipListener:    true,
 		StartupDelay:    1 * time.Second,
 		ProgressTick:    progressTick,
-		Autoscaler:      opts.Autoscaler,
+		Autoscaler:      opts.Autoscaler.Resolve(),
 		Verification:    migration.VerifyOptions{AllowNotOnSrc: true},
 	}
 

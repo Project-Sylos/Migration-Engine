@@ -90,14 +90,12 @@ func runTest() error {
 		RemoveMigrationDB: true,
 		WorkerCount:       20,
 		ProgressTick:      time.Second,
-		Autoscaler: migration.AutoscalerConfig{
-			Enabled:   true,
-			Interval:  3 * time.Second,
-			DebugAIMD: true,
-			OnEvent:   logScalingEvent,
-		},
 	}
-	fmt.Println("  autoscaler: enabled")
+	autoscaler := migration.DefaultAutoscalerConfig()
+	autoscaler.DebugAIMD = true
+	autoscaler.OnEvent = logScalingEvent
+	localOpts.Autoscaler = autoscaler
+	fmt.Println("  autoscaler: enabled (default)")
 
 	cfg, err := shared.SetupLocalTestWithOptions(srcMount, dstMount, localOpts)
 	if err != nil {

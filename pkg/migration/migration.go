@@ -99,6 +99,7 @@ type Config struct {
 	ShutdownContext context.Context
 
 	// Autoscaler enables in-engine throughput tuning during traversal/copy.
+	// Enabled by default; see AutoscalerConfig.Resolve and DisableAutoscaler.
 	Autoscaler AutoscalerConfig
 }
 
