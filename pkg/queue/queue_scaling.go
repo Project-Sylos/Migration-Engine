@@ -15,6 +15,8 @@ import (
 
 type managedWorker struct {
 	cancel context.CancelFunc
+	idle   atomic.Bool
+	retire atomic.Bool
 }
 
 // workerPool holds dynamic worker lifecycle state.
@@ -25,9 +27,10 @@ type workerPool struct {
 	traversalAdapter types.FSAdapter
 	copySrcAdapter   types.FSAdapter
 	copyDstAdapter   types.FSAdapter
-	isCopy           bool
-	listPageSize     atomic.Int64
-	interOpDelay     atomic.Int64 // nanoseconds; autoscaler pacing fallback at worker floor
+	isCopy            bool
+	listPageSize      atomic.Int64
+	interOpDelay      atomic.Int64 // nanoseconds; autoscaler pacing fallback at worker floor
+	rateLimitSources  []RateLimitTelemetry
 }
 
 func (q *Queue) initWorkerPool(traversalAdapter types.FSAdapter) {
@@ -147,15 +150,18 @@ func (q *Queue) SetTargetWorkerCount(target int) error {
 	if target > cur {
 		for i := cur; i < target; i++ {
 			workerCtx, cancel := context.WithCancel(shutdownCtx)
-			q.pool.handles = append(q.pool.handles, managedWorker{cancel: cancel})
+			h := managedWorker{cancel: cancel}
+			h.idle.Store(true)
+			q.pool.handles = append(q.pool.handles, h)
 			id := q.pool.nextID
 			q.pool.nextID++
+			handle := &q.pool.handles[len(q.pool.handles)-1]
 			if q.pool.isCopy {
-				w := NewCopyWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.copySrcAdapter, q.pool.copyDstAdapter, shutdownCtx, workerCtx)
+				w := NewCopyWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.copySrcAdapter, q.pool.copyDstAdapter, shutdownCtx, workerCtx, &handle.idle, &handle.retire)
 				q.workers = append(q.workers, w)
 				go w.Run()
 			} else {
-				w := NewTraversalWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.traversalAdapter, q.name, shutdownCtx, workerCtx)
+				w := NewTraversalWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.traversalAdapter, q.name, shutdownCtx, workerCtx, &handle.idle, &handle.retire)
 				q.workers = append(q.workers, w)
 				go w.Run()
 			}
@@ -163,9 +169,14 @@ func (q *Queue) SetTargetWorkerCount(target int) error {
 		q.applyWorkerHintLocked()
 		return nil
 	}
-	// Scale down: cancel excess workers from the end; they exit after current task.
+	// Scale down: cancel idle workers immediately; busy workers finish their task then exit via retire flag.
 	for i := cur - 1; i >= target; i-- {
-		q.pool.handles[i].cancel()
+		h := &q.pool.handles[i]
+		if h.idle.Load() {
+			h.cancel()
+		} else {
+			h.retire.Store(true)
+		}
 	}
 	q.pool.handles = q.pool.handles[:target]
 	q.workers = q.workers[:target]

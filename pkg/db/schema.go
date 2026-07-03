@@ -44,7 +44,8 @@ func srcStatusEventsTableDDL() string {
 		traversal_status VARCHAR,
 		copy_status VARCHAR,
 		event_time BIGINT NOT NULL,
-		depth INTEGER NOT NULL
+		depth INTEGER NOT NULL,
+		error_log_id VARCHAR
 	)`
 }
 
@@ -54,7 +55,8 @@ func dstStatusEventsTableDDL() string {
 		id VARCHAR NOT NULL,
 		traversal_status VARCHAR,
 		event_time BIGINT NOT NULL,
-		depth INTEGER NOT NULL
+		depth INTEGER NOT NULL,
+		error_log_id VARCHAR
 	)`
 }
 
@@ -94,6 +96,7 @@ func logsTableDDL() string {
 		id VARCHAR PRIMARY KEY,
 		level VARCHAR,
 		message VARCHAR,
+		detail VARCHAR,
 		component VARCHAR,
 		entity VARCHAR,
 		entity_id VARCHAR,

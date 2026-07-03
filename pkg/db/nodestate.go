@@ -94,6 +94,10 @@ type StatusEvent struct {
 	CopyStatus       string // src only; empty for dst
 	EventTime        int64
 	Depth            int
+	ErrorLogID       string // links to logs.id when this event records a task failure
+	ErrorLogMessage  string // transient: full log line written to logs.message at seal flush
+	ErrorLogDetail   string // transient: bare error written to logs.detail at seal flush
+	ErrorLogQueue    string // transient: logs.queue at seal flush
 	// PrevTraversalStatus and PrevCopyStatus carry the status that was current before this event.
 	// Set at enqueue time (task already has the loaded state); used by the seal buffer to compute
 	// per-depth level-stat deltas without re-querying the events table.
@@ -184,6 +188,21 @@ func (o *BatchInsertOperation) flush(w *Writer) error {
 func PathHash(path string) string {
 	sum := sha256.Sum256([]byte(path))
 	return hex.EncodeToString(sum[:16])
+}
+
+// NodeInsertPathFields returns normalized path columns and hashes for node table inserts.
+// Depth-0 rows keep parent_path as stored (typically "" for roots). Deeper rows normalize
+// parent_path so "" and "/" both resolve to the root join key PathHash("/").
+func NodeInsertPathFields(path, parentPath string, depth int) (normPath, normParentPath, pathHash, parentPathHash string) {
+	normPath = NormalizeRootRelativePath(path)
+	if depth == 0 {
+		normParentPath = parentPath
+	} else {
+		normParentPath = NormalizeRootRelativePath(parentPath)
+	}
+	pathHash = PathHash(normPath)
+	parentPathHash = PathHash(normParentPath)
+	return normPath, normParentPath, pathHash, parentPathHash
 }
 
 // DeterministicNodeID returns a stable id from (queueType, nodeType, path) for race-safe deduplication.

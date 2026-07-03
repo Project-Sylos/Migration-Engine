@@ -113,13 +113,24 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 		qsz = &queue.QueueSizing{LeaseBatchSize: cfg.LeaseBatchSize, RefillBatchSize: cfg.RefillBatchSize}
 	}
 
+	_, _, runProfile := resolveServiceProfiles(MigrationConfig{
+		SrcAdapter: cfg.SrcAdapter,
+		DstAdapter: cfg.DstAdapter,
+		SrcService: cfg.SrcService,
+		DstService: cfg.DstService,
+	})
+	if qsz == nil {
+		qsz = queueSizingFromProfileOrSuspend(nil, runProfile)
+	}
+	wc := resolveWorkersForProfile(cfg.WorkerCount, nil, runProfile)
+
 	// Create queues in retry mode
-	srcQueue := queue.NewQueue("src", cfg.MaxRetries, cfg.WorkerCount, coordinator, qsz)
+	srcQueue := queue.NewQueue("src", cfg.MaxRetries, wc, coordinator, qsz)
 	srcQueue.SetMode(queue.QueueModeRetry)
 	srcQueue.SetMaxKnownDepth(maxKnownDepth)
 	srcQueue.InitializeWithContext(duckDB, cfg.SrcAdapter, cfg.ShutdownContext)
 
-	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, cfg.WorkerCount, coordinator, qsz)
+	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, wc, coordinator, qsz)
 	dstQueue.SetMode(queue.QueueModeRetry)
 	if cfg.MaxKnownDepth >= 0 {
 		dstQueue.SetMaxKnownDepth(cfg.MaxKnownDepth)
@@ -256,7 +267,7 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	defer progressTicker.Stop()
 	start := time.Now()
 
-	wc, mr := cfg.WorkerCount, cfg.MaxRetries
+	mr := cfg.MaxRetries
 
 	// Wait for both queues to complete
 	for {

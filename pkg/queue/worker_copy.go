@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
@@ -30,6 +31,8 @@ type CopyWorker struct {
 	queueName   string
 	shutdownCtx context.Context
 	workerCtx   context.Context
+	idle        *atomic.Bool
+	retire      *atomic.Bool
 	copyBuffer  []byte
 }
 
@@ -40,6 +43,8 @@ func NewCopyWorker(
 	dstAdapter types.FSAdapter,
 	shutdownCtx context.Context,
 	workerCtx context.Context,
+	idle *atomic.Bool,
+	retire *atomic.Bool,
 ) *CopyWorker {
 	if workerCtx == nil {
 		workerCtx = shutdownCtx
@@ -52,8 +57,26 @@ func NewCopyWorker(
 		queueName:   "copy",
 		shutdownCtx: shutdownCtx,
 		workerCtx:   workerCtx,
+		idle:        idle,
+		retire:      retire,
 		copyBuffer:  make([]byte, defaultCopyBufferSize),
 	}
+}
+
+func (w *CopyWorker) setBusy() {
+	if w.idle != nil {
+		w.idle.Store(false)
+	}
+}
+
+func (w *CopyWorker) setIdle() {
+	if w.idle != nil {
+		w.idle.Store(true)
+	}
+}
+
+func (w *CopyWorker) shouldRetire() bool {
+	return w.retire != nil && w.retire.Load()
 }
 
 // Run is the main worker loop. It continuously polls the queue for tasks.
@@ -97,6 +120,13 @@ func (w *CopyWorker) Run() {
 			}
 		}
 
+		if w.shouldRetire() {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("info", "Copy worker exiting - scale down retire", "worker", w.id, w.queueName)
+			}
+			return
+		}
+
 		// Check lifecycle state
 		if w.queue.IsPaused() {
 			// Queue is paused, sleep and continue polling
@@ -115,6 +145,17 @@ func (w *CopyWorker) Run() {
 			return
 		}
 
+		if wait := w.queue.RateLimitedWaitDuration(); wait > 0 {
+			waitCtx := w.workerCtx
+			if waitCtx == nil {
+				waitCtx = w.shutdownCtx
+			}
+			if err := w.queue.WaitRateLimited(waitCtx, wait); err != nil {
+				return
+			}
+			continue
+		}
+
 		// Try to lease a task from the queue
 		task := w.queue.Lease()
 		if task == nil {
@@ -123,29 +164,42 @@ func (w *CopyWorker) Run() {
 			continue
 		}
 
+		w.setBusy()
 		// Execute the task (check for shutdown during execution if needed)
 		err := w.execute(task)
+		w.setIdle()
 		if err != nil {
 			// Mark worker result BEFORE calling ReportTaskResult (for stall diagnostics)
-			task.WorkerResult = "error"
 			task.LastError = err.Error()
-			if logservice.LS != nil {
-				logMsg := fmt.Sprintf("Copy worker task execution failed: path=%s round=%d pass=%d error=%v",
-					task.LocationPath(), task.Round, task.CopyPass, err)
-				err := logservice.LS.Log("error",
-					logMsg,
-					"worker", w.id, w.queueName)
-				if err != nil {
-					fmt.Println("error logging", err)
+			if IsThrottleError(err) {
+				task.WorkerResult = "rate_limited"
+				w.queue.ReportTaskResult(task, TaskExecutionResultRateLimited)
+			} else {
+				task.WorkerResult = "error"
+				if logservice.LS != nil {
+					logMsg := fmt.Sprintf("Copy worker task execution failed: path=%s round=%d pass=%d error=%v",
+						task.LocationPath(), task.Round, task.CopyPass, err)
+					err := logservice.LS.Log("error",
+						logMsg,
+						"worker", w.id, w.queueName)
+					if err != nil {
+						fmt.Println("error logging", err)
+					}
 				}
+				w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
+				willRetry := task.Attempts < w.queue.getMaxRetries()
+				w.logError(task, err, willRetry)
 			}
-			w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
-			willRetry := task.Attempts < w.queue.getMaxRetries()
-			w.logError(task, err, willRetry)
 		} else {
 			// Mark worker result BEFORE calling ReportTaskResult (for stall diagnostics)
 			task.WorkerResult = "success"
 			w.queue.ReportTaskResult(task, TaskExecutionResultSuccessful)
+		}
+		if w.shouldRetire() {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("info", "Copy worker exiting - scale down retire", "worker", w.id, w.queueName)
+			}
+			return
 		}
 	}
 }
@@ -181,7 +235,6 @@ func (w *CopyWorker) execute(task *TaskBase) error {
 }
 
 // createFolder creates a folder on the destination filesystem.
-// CreateFolder does not take context; we run it in a goroutine and select on ctx.Done() for stall detection.
 func (w *CopyWorker) createFolder(task *TaskBase, ctx context.Context, wd *ProgressWatchdog) error {
 	folder := task.Folder
 
@@ -208,7 +261,7 @@ func (w *CopyWorker) createFolder(task *TaskBase, ctx context.Context, wd *Progr
 	wd.Beat()
 	done := make(chan error, 1)
 	go func() {
-		created, err := w.dstAdapter.CreateFolder(dstParentServiceID, folderName)
+		created, err := w.dstAdapter.CreateFolder(ctx, dstParentServiceID, folderName)
 		if err != nil {
 			done <- fmt.Errorf("failed to create folder %s in parent %s: %w", folder.DisplayName, dstParentServiceID, err)
 			return
@@ -415,7 +468,7 @@ func (w *CopyWorker) listDstChildrenAggregated(dstParentID, parentPath string, p
 	listDone := make(chan listChildrenResult, 1)
 	depth := parentDepth
 	go func() {
-		r, err := w.dstAdapter.ListChildren(dstParentID, &depth, parentPath)
+		r, err := w.dstAdapter.ListChildren(ctx, dstParentID, &depth, parentPath)
 		listDone <- listChildrenResult{result: r, err: err}
 	}()
 

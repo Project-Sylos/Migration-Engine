@@ -3,7 +3,24 @@
 
 package scaling
 
-// ListPageIncreaseAllowed reports whether raising page size would reduce multi-page lists.
+// ApplyQueueListPagination sets initial list page size from a provider profile.
+func ApplyQueueListPagination(q QueueActuator, profile FSPerformanceProfile) {
+	if q == nil {
+		return
+	}
+	size := profile.DefaultListPageSize
+	if size <= 0 {
+		size = 100
+	}
+	if min := profile.MinListPageSize; min > 0 && size < min {
+		size = min
+	}
+	if max := profile.MaxListPageSize; max > 0 && size > max {
+		size = max
+	}
+	q.SetListPageSize(size)
+}
+
 // p95ListItems must come from recent ListChildren result sizes; zero means insufficient data.
 func ListPageIncreaseAllowed(curPageSize, p95ListItems int) bool {
 	if curPageSize <= 0 || p95ListItems <= 0 {

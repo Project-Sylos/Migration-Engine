@@ -79,10 +79,21 @@ func performTraversalSoftSuspend(
 	srcQueue.ClearPendingBufferForSuspend()
 	dstQueue.ClearPendingBufferForSuspend()
 
-	if err := srcQueue.WaitInProgressZero(waitCtx, 50*time.Millisecond); err != nil {
+	mergedCtx, cancelMerged := mergeWaitContexts(waitCtx, cfg.ShutdownContext)
+	defer cancelMerged()
+
+	if err := srcQueue.WaitInProgressZero(mergedCtx, 50*time.Millisecond); err != nil {
+		if cfg.ShutdownContext != nil && cfg.ShutdownContext.Err() != nil {
+			srcQueue.AbandonInProgressTasks()
+			dstQueue.AbandonInProgressTasks()
+		}
 		return RuntimeStats{}, RuntimeSuspendV1{}, fmt.Errorf("src queue drain in-flight: %w", err)
 	}
-	if err := dstQueue.WaitInProgressZero(waitCtx, 50*time.Millisecond); err != nil {
+	if err := dstQueue.WaitInProgressZero(mergedCtx, 50*time.Millisecond); err != nil {
+		if cfg.ShutdownContext != nil && cfg.ShutdownContext.Err() != nil {
+			srcQueue.AbandonInProgressTasks()
+			dstQueue.AbandonInProgressTasks()
+		}
 		return RuntimeStats{}, RuntimeSuspendV1{}, fmt.Errorf("dst queue drain in-flight: %w", err)
 	}
 
@@ -146,7 +157,13 @@ func performCopySoftSuspend(
 	copyQueue.StopWatchdog()
 	copyQueue.ClearPendingBufferForSuspend()
 
-	if err := copyQueue.WaitInProgressZero(waitCtx, 50*time.Millisecond); err != nil {
+	mergedCtx, cancelMerged := mergeWaitContexts(waitCtx, cfg.ShutdownContext)
+	defer cancelMerged()
+
+	if err := copyQueue.WaitInProgressZero(mergedCtx, 50*time.Millisecond); err != nil {
+		if cfg.ShutdownContext != nil && cfg.ShutdownContext.Err() != nil {
+			copyQueue.AbandonInProgressTasks()
+		}
 		return queue.QueueStats{}, RuntimeSuspendV1{}, fmt.Errorf("copy queue drain in-flight: %w", err)
 	}
 

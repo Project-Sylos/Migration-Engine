@@ -762,6 +762,33 @@ func (m *Migration) Stop() (StopResult, error) {
 	}
 }
 
+// ForceStop cancels the active run context and abandons in-flight queue work.
+// Use after a soft-suspend grace period when workers are stuck (e.g. FS retry loops).
+func (m *Migration) ForceStop() (StopResult, error) {
+	m.mu.RLock()
+	cancel := m.runCancel
+	running := m.running
+	m.mu.RUnlock()
+
+	result := StopResult{
+		MigrationID:   m.ID,
+		Phase:         m.Phase(),
+		RuntimeStatus: m.GetRuntimeStatus(),
+		Stopped:       running,
+		ForceStopped:  running,
+	}
+
+	if !running {
+		return result, nil
+	}
+
+	m.softSuspendRequested.Store(false)
+	if cancel != nil {
+		cancel()
+	}
+	return result, nil
+}
+
 // QueryNodes provides review-phase node search/filter without exposing SQL to API.
 func (m *Migration) QueryNodes(filter NodeQueryFilter) ([]db.NodeState, error) {
 	phase := m.Phase()

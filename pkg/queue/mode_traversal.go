@@ -447,13 +447,15 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 	}
 
 	if nodeID != "" {
-		database.AppendStatusEvent(queueType, db.StatusEvent{
+		ev := db.StatusEvent{
 			ID:                  nodeID,
 			TraversalStatus:     db.StatusFailed,
 			EventTime:           time.Now().UnixNano(),
 			Depth:               currentRound,
 			PrevTraversalStatus: db.StatusPending,
-		}, q.GetMode() == QueueModeRetry)
+		}
+		db.AttachTaskFailureLog(&ev, "traversal", q.name, nodeID, task.LocationPath(), task.Attempts, task.LastError)
+		database.AppendStatusEvent(queueType, ev, q.GetMode() == QueueModeRetry)
 	}
 
 	q.removeInProgress(nodeID)

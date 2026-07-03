@@ -12,9 +12,81 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
+// copyHasPendingDBWorkAtRound reports whether src_nodes still has copy work for the current pass at depth round.
+func (q *Queue) copyHasPendingDBWorkAtRound(round int) bool {
+	database := q.getDatabase()
+	if database == nil || round <= 0 {
+		return false
+	}
+	nodeType := db.NodeTypeFolder
+	if q.GetCopyPass() == 2 {
+		nodeType = db.NodeTypeFile
+	}
+	copyStatus := db.CopyStatusPending
+	if q.GetMode() == QueueModeCopyRetry {
+		copyStatus = db.CopyStatusFailed
+	}
+	count, err := database.GetCopyCountAtDepth(round, nodeType, copyStatus, true)
+	return err == nil && count > 0
+}
+
+// minDepthWithPendingCopyWork returns the shallowest depth (>0) with pending copy work for copyPass (1=folders, 2=files), or -1.
+func (q *Queue) minDepthWithPendingCopyWork(copyPass int) int {
+	database := q.getDatabase()
+	if database == nil {
+		return -1
+	}
+	nodeType := db.NodeTypeFolder
+	if copyPass == 2 {
+		nodeType = db.NodeTypeFile
+	}
+	copyStatus := db.CopyStatusPending
+	if q.GetMode() == QueueModeCopyRetry {
+		copyStatus = db.CopyStatusFailed
+	}
+	levels, err := db.GetAllLevels(database, "SRC")
+	if err != nil {
+		return -1
+	}
+	min := -1
+	for _, level := range levels {
+		if level <= 0 {
+			continue
+		}
+		c, err := database.GetCopyCountAtDepth(level, nodeType, copyStatus, true)
+		if err == nil && c > 0 {
+			if min == -1 || level < min {
+				min = level
+			}
+		}
+	}
+	return min
+}
+
+// copyRoundAdvanceNeedsDBRetry is true when the in-memory round looks exhausted but DuckDB still has copy work at this depth.
+func (q *Queue) copyRoundAdvanceNeedsDBRetry(round int) bool {
+	mode := q.GetMode()
+	if mode != QueueModeCopy && mode != QueueModeCopyRetry {
+		return false
+	}
+	if q.GetPendingCount() > 0 || q.InProgressCount() > 0 || q.getPulling() {
+		return false
+	}
+	return q.copyHasPendingDBWorkAtRound(round)
+}
+
+// retryCopyPullForRound resets the keyset cursor and re-pulls when DB still has work at this depth.
+func (q *Queue) retryCopyPullForRound(round int, reason string) {
+	if logservice.LS != nil {
+		_ = logservice.LS.Log("warning", reason, "queue", q.name, q.name)
+	}
+	q.resetThisQueueKeysetCursor()
+	q.setLastPullWasPartial(false)
+	q.pullWithRetryIfNeeded(true)
+}
+
 // CheckCopyCompletion checks if the copy phase should switch passes or complete.
 // Only called when we're past maxKnownDepth - the pass has exhausted itself round-by-round.
-// Trust the per-round logic; no re-checking of pending/inProgress/wasFirstPull.
 func (q *Queue) CheckCopyCompletion(currentRound int) bool {
 	database := q.getDatabase()
 	if database == nil {
@@ -36,14 +108,41 @@ func (q *Queue) CheckCopyCompletion(currentRound int) bool {
 	}
 
 	if copyPass == 1 {
-		// Pass 1 (folders) done - switch to pass 2 (files); find starting round
+		if minDepth := q.minDepthWithPendingCopyWork(1); minDepth > 0 {
+			q.retryCopyPullForRound(minDepth, fmt.Sprintf(
+				"Pass 1 folder sweep finished but pending folders remain (e.g. depth %d); re-running folder pass",
+				minDepth,
+			))
+			q.SetRound(minDepth)
+			q.setExpectedFromStatsBucket(minDepth)
+			return false
+		}
+		// Pass 1 (folders) done - switch to pass 2 (files)
+		if logservice.LS != nil {
+			_ = logservice.LS.Log("info", "Copy pass 1 (folders) complete — starting pass 2 (files)", "queue", q.name, q.name)
+		}
 		q.SetCopyPass(2)
 		q.resetRoundStatsCompleted()
+		q.resetThisQueueKeysetCursor()
 
-		q.SetRound(1)
-		q.setExpectedFromStatsBucket(1)
+		startRound := 1
+		if minFile := q.minDepthWithPendingCopyWork(2); minFile > 0 {
+			startRound = minFile
+		}
+		q.SetRound(startRound)
+		q.setExpectedFromStatsBucket(startRound)
 		q.setLastPullWasPartial(false)
+		q.pullWithRetryIfNeeded(true)
+		return false
+	}
 
+	if minDepth := q.minDepthWithPendingCopyWork(2); minDepth > 0 {
+		q.retryCopyPullForRound(minDepth, fmt.Sprintf(
+			"Pass 2 file sweep finished but pending files remain (e.g. depth %d); re-running file pass at depth %d",
+			minDepth, minDepth,
+		))
+		q.SetRound(minDepth)
+		q.setExpectedFromStatsBucket(minDepth)
 		return false
 	}
 
@@ -222,16 +321,25 @@ func (q *Queue) PullCopyTasks(force bool) PullResult {
 			}
 			continue
 		}
-		if item.DstParentServiceID == "" {
+		dstParentServiceID := item.DstParentServiceID
+		if dstParentServiceID == "" {
+			parentPath := db.NormalizeRootRelativePath(item.State.ParentPath)
+			if parentPath == "/" {
+				if _, rootState, ok := db.GetRootNode(database, "DST"); ok && rootState != nil && rootState.ServiceID != "" {
+					dstParentServiceID = rootState.ServiceID
+				}
+			}
+		}
+		if dstParentServiceID == "" {
 			if logservice.LS != nil {
-				err := logservice.LS.Log("warning", fmt.Sprintf("No DST parent for %s (parent %s) - DST may not exist yet", item.State.Path, item.State.ParentID), "queue", q.name, q.name)
+				err := logservice.LS.Log("error", fmt.Sprintf("No DST parent for %s (parent_path=%s parent_id=%s) — skipping copy task", item.State.Path, item.State.ParentPath, item.State.ParentID), "queue", q.name, q.name)
 				if err != nil {
 					fmt.Println("error logging", err)
 				}
 			}
 			continue
 		}
-		task.DstParentID = item.DstParentServiceID
+		task.DstParentID = dstParentServiceID
 
 		if q.Add(task) {
 			enqueueSuccessCount++
@@ -458,14 +566,16 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 		database.AppendTaskError("SRC", "copy", nodeID, task.LastError, task.Attempts, task.LocationPath())
 	}
 
-	database.AppendStatusEvent("SRC", db.StatusEvent{
+	copyEv := db.StatusEvent{
 		ID:              nodeID,
 		TraversalStatus: task.SrcTraversalStatus,
 		CopyStatus:      db.CopyStatusFailed,
 		PrevCopyStatus:  task.CopyStatus,
 		EventTime:       time.Now().UnixNano(),
 		Depth:           currentRound,
-	}, false)
+	}
+	db.AttachTaskFailureLog(&copyEv, "copy", q.name, nodeID, task.LocationPath(), task.Attempts, task.LastError)
+	database.AppendStatusEvent("SRC", copyEv, false)
 
 	// Folder failure cascades: mark all pending descendants as failed so they aren't
 	// pulled in the file pass (they'd be skipped anyway since the DST parent won't exist).

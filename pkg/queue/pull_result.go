@@ -149,6 +149,11 @@ func (q *Queue) tryCommitRoundAdvance(currentRound int) bool {
 	if !q.confirmRoundAdvanceGate(currentRound) {
 		if q.GetPendingCount() == 0 && q.InProgressCount() == 0 && !q.GetLastPullWasPartial() {
 			q.pullWithRetryIfNeeded(true)
+		} else if q.copyRoundAdvanceNeedsDBRetry(currentRound) {
+			q.retryCopyPullForRound(currentRound, fmt.Sprintf(
+				"Copy pass %d round %d keyset exhausted but DB still has pending work; re-pulling",
+				q.GetCopyPass(), currentRound,
+			))
 		}
 		if !q.confirmRoundAdvanceGate(currentRound) {
 			return false
@@ -174,6 +179,14 @@ func (q *Queue) tryCommitRoundAdvance(currentRound int) bool {
 	}
 
 	if !q.confirmRoundAdvanceGate(currentRound) {
+		return false
+	}
+
+	if q.copyRoundAdvanceNeedsDBRetry(currentRound) {
+		q.retryCopyPullForRound(currentRound, fmt.Sprintf(
+			"Copy pass %d round %d ready to advance but DB still has pending work; re-pulling before round advance",
+			q.GetCopyPass(), currentRound,
+		))
 		return false
 	}
 

@@ -689,6 +689,14 @@ func (sb *SealBuffer) phaseFlush(jobs []SealJob, taskErrors []TaskErrorRecord, s
 				return err
 			}
 		}
+		if err := flushFailureLogsFromEvents(w, srcEvents, "src"); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if err := flushFailureLogsFromEvents(w, dstEvents, "dst"); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
 		for _, te := range taskErrors {
 			if err := w.RecordTaskError(te.QueueType, te.Phase, te.NodeID, te.Message, te.Attempts, te.Path); err != nil {
 				_ = tx.Rollback()
@@ -848,6 +856,14 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob, taskErrors []TaskErrorRecord, 
 			}
 		}
 		w := &Writer{tx: tx}
+		if err := flushFailureLogsFromEvents(w, srcEvents, "src"); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if err := flushFailureLogsFromEvents(w, dstEvents, "dst"); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
 		for _, te := range taskErrors {
 			if err := w.RecordTaskError(te.QueueType, te.Phase, te.NodeID, te.Message, te.Attempts, te.Path); err != nil {
 				_ = tx.Rollback()

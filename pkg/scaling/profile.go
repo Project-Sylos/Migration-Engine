@@ -95,6 +95,25 @@ var profiles = map[string]FSPerformanceProfile{
 		MinRefillBatch:      500,
 		MaxInterOpDelay:     2 * time.Second,
 	},
+	"google_drive": {
+		ProviderID:               "google_drive",
+		MinWorkers:               1,
+		DefaultWorkers:           2,
+		MaxWorkers:               8,
+		MinListPageSize:          20,
+		DefaultListPageSize:      50,
+		MaxListPageSize:          200,
+		ListPageStep:             20,
+		PreferLargePages:         false,
+		WorkerStepDownOnThrottle: 2,
+		DefaultLeaseBatch:        50,
+		MaxLeaseBatch:            200,
+		MinLeaseBatch:            25,
+		DefaultRefillBatch:       200,
+		MaxRefillBatch:           500,
+		MinRefillBatch:           50,
+		MaxInterOpDelay:          10 * time.Second,
+	},
 }
 
 // LookupProfile returns the profile for providerID or serviceName, else generic.

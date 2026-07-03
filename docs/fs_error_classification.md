@@ -178,6 +178,27 @@ See [autoscaler.md — Remaining work](./autoscaler.md#remaining-work) for imple
 
 ---
 
+## Cloud adapters (Google Drive and template)
+
+OAuth cloud adapters follow the Spectra pattern:
+
+| Signal | Google Drive | Adapter action |
+|--------|--------------|----------------|
+| HTTP 401 | Unauthorized | Clear in-memory access token; refresh via stored refresh token; retry |
+| HTTP 429 / 403 quota | Rate limit / quota | `FSErrorThrottle`; honor `Retry-After` when present |
+| HTTP 404 | Not found | `FSErrorFatal` |
+| 5xx / timeout | Transient | `FSErrorRetryable` |
+
+**Scaling:** `google_drive` profile in `pkg/scaling/profile.go` — conservative defaults (2 workers, max 8; list pages 50 default / 200 max; `PreferLargePages: false`; lease/refill batches 50–200). Adapter reports API max page size only; profile values are operational defaults.
+
+**Backend groups:** When source and destination share one cloud account, Sylos-API sets `BackendGroupID = "conn:" + connectionID` so autoscaler rate-limit signals aggregate per account.
+
+**Token refresh:** Separate from UI OAuth; adapter/session calls the provider token endpoint on 401. Refresh tokens are encrypted on disk; access tokens never persist.
+
+Add provider-specific rows to this table as each adapter lands (Dropbox, OneDrive, etc.). See Sylos-FS `docs/cloud_provider_checklist.md`.
+
+---
+
 ## Open questions
 
 - Should `suspected_rate_limit` be a distinct `FSDegradationKind` or folded into `FSDegradationRateLimit` with a confidence flag?

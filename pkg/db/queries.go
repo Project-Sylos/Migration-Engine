@@ -862,7 +862,7 @@ func queryCopyKeysetWindow(ctx context.Context, conn *sql.DB, depth int, nodeTyp
 	args = append(args, window)
 
 	q := `WITH cand AS (
-	SELECT id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth
+	SELECT id, service_id, parent_id, parent_service_id, path, parent_path, parent_path_hash, type, size, mtime, depth
 	FROM ` + tableSrcNodes + ` n
 	` + candWhere + `
 	ORDER BY n.id
@@ -890,8 +890,7 @@ SELECT c.id, c.service_id, c.parent_id, c.parent_service_id, c.path, c.parent_pa
 FROM cand c
 LEFT JOIN trav ON trav.id = c.id
 LEFT JOIN cpy ON cpy.id = c.id
-LEFT JOIN ` + tableSrcNodes + ` parent ON parent.id = c.parent_id
-LEFT JOIN ` + tableDstNodes + ` dst_parent ON dst_parent.path_hash = parent.path_hash
+LEFT JOIN ` + tableDstNodes + ` dst_parent ON dst_parent.path_hash = c.parent_path_hash
 ORDER BY c.id`
 	rows, err := conn.QueryContext(ctx, q, args...)
 	if err != nil {

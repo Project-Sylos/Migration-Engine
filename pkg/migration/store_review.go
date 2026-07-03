@@ -93,6 +93,78 @@ func mergedRowToDiffItem(r db.MergedReviewRow) DiffItem {
 	return item
 }
 
+func diffItemNeedsSrcFailureLog(item DiffItem) bool {
+	if item.SrcNodeID == "" {
+		return false
+	}
+	if strings.EqualFold(item.SrcTraversalStatus, db.StatusFailed) {
+		return true
+	}
+	return strings.EqualFold(item.CopyStatus, db.CopyStatusFailed)
+}
+
+func diffItemNeedsDstFailureLog(item DiffItem) bool {
+	if item.DstNodeID == "" {
+		return false
+	}
+	return strings.EqualFold(item.DstTraversalStatus, db.StatusFailed)
+}
+
+func (s *migrationStore) enrichDiffItemsWithFailureLogs(items []DiffItem) error {
+	if s == nil || s.db == nil || len(items) == 0 {
+		return nil
+	}
+	ctx := context.Background()
+
+	srcIDs := make([]string, 0)
+	dstIDs := make([]string, 0)
+	for _, item := range items {
+		if diffItemNeedsSrcFailureLog(item) {
+			srcIDs = append(srcIDs, item.SrcNodeID)
+		}
+		if diffItemNeedsDstFailureLog(item) {
+			dstIDs = append(dstIDs, item.DstNodeID)
+		}
+	}
+
+	srcLogByNode, err := db.LatestSrcFailureLogIDsByNodeIDs(ctx, s.db, srcIDs)
+	if err != nil {
+		return fmt.Errorf("load src failure log ids: %w", err)
+	}
+	dstLogByNode, err := db.LatestDstFailureLogIDsByNodeIDs(ctx, s.db, dstIDs)
+	if err != nil {
+		return fmt.Errorf("load dst failure log ids: %w", err)
+	}
+
+	logIDs := make([]string, 0, len(srcLogByNode)+len(dstLogByNode))
+	for _, id := range srcLogByNode {
+		logIDs = append(logIDs, id)
+	}
+	for _, id := range dstLogByNode {
+		logIDs = append(logIDs, id)
+	}
+	logsByID, err := db.GetFailureLogsByIDs(ctx, s.db, logIDs)
+	if err != nil {
+		return fmt.Errorf("load failure logs: %w", err)
+	}
+
+	for i := range items {
+		if logID, ok := srcLogByNode[items[i].SrcNodeID]; ok {
+			items[i].SrcFailureLogID = logID
+			if log, ok := logsByID[logID]; ok {
+				items[i].SrcFailureMessage = db.FailureLogDisplayText(log)
+			}
+		}
+		if logID, ok := dstLogByNode[items[i].DstNodeID]; ok {
+			items[i].DstFailureLogID = logID
+			if log, ok := logsByID[logID]; ok {
+				items[i].DstFailureMessage = db.FailureLogDisplayText(log)
+			}
+		}
+	}
+	return nil
+}
+
 func (s *migrationStore) queryNodes(filter NodeQueryFilter) ([]db.NodeState, error) {
 	table := "SRC"
 	if strings.ToUpper(filter.Queue) == "DST" {
@@ -611,6 +683,9 @@ func (s *migrationStore) listChildrenDiffs(req ListChildrenDiffsRequest) (ListCh
 	for i := range rows {
 		items = append(items, mergedRowToDiffItem(rows[i]))
 	}
+	if err := s.enrichDiffItemsWithFailureLogs(items); err != nil {
+		return ListChildrenDiffsResult{}, err
+	}
 	return ListChildrenDiffsResult{
 		Items:  items,
 		Total:  total,
@@ -637,6 +712,9 @@ func (s *migrationStore) searchPathReviewItems(req SearchRequest) (SearchResult,
 	items := make([]DiffItem, 0, len(rows))
 	for i := range rows {
 		items = append(items, mergedRowToDiffItem(rows[i]))
+	}
+	if err := s.enrichDiffItemsWithFailureLogs(items); err != nil {
+		return SearchResult{}, err
 	}
 	return SearchResult{
 		Items:  items,

@@ -6,6 +6,7 @@ package queue
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
@@ -23,6 +24,8 @@ type TraversalWorker struct {
 	isDst       bool
 	shutdownCtx context.Context
 	workerCtx   context.Context
+	idle        *atomic.Bool
+	retire      *atomic.Bool
 }
 
 func NewTraversalWorker(
@@ -32,6 +35,8 @@ func NewTraversalWorker(
 	queueName string,
 	shutdownCtx context.Context,
 	workerCtx context.Context,
+	idle *atomic.Bool,
+	retire *atomic.Bool,
 ) *TraversalWorker {
 	if workerCtx == nil {
 		workerCtx = shutdownCtx
@@ -44,7 +49,25 @@ func NewTraversalWorker(
 		isDst:       queueName == "dst",
 		shutdownCtx: shutdownCtx,
 		workerCtx:   workerCtx,
+		idle:        idle,
+		retire:      retire,
 	}
+}
+
+func (w *TraversalWorker) setBusy() {
+	if w.idle != nil {
+		w.idle.Store(false)
+	}
+}
+
+func (w *TraversalWorker) setIdle() {
+	if w.idle != nil {
+		w.idle.Store(true)
+	}
+}
+
+func (w *TraversalWorker) shouldRetire() bool {
+	return w.retire != nil && w.retire.Load()
 }
 
 // Run is the main worker loop. It continuously polls the queue for tasks.
@@ -88,6 +111,13 @@ func (w *TraversalWorker) Run() {
 			}
 		}
 
+		if w.shouldRetire() {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("info", "Worker exiting - scale down retire", "worker", w.id, w.queueName)
+			}
+			return
+		}
+
 		// Check lifecycle state
 		if w.queue.IsPaused() {
 			// Queue is paused, sleep and continue polling
@@ -106,6 +136,17 @@ func (w *TraversalWorker) Run() {
 			return
 		}
 
+		if wait := w.queue.RateLimitedWaitDuration(); wait > 0 {
+			waitCtx := w.workerCtx
+			if waitCtx == nil {
+				waitCtx = w.shutdownCtx
+			}
+			if err := w.queue.WaitRateLimited(waitCtx, wait); err != nil {
+				return
+			}
+			continue
+		}
+
 		// Try to lease a task from the queue
 		task := w.queue.Lease()
 		if task == nil {
@@ -114,19 +155,31 @@ func (w *TraversalWorker) Run() {
 			continue
 		}
 
+		w.setBusy()
 		// Execute the task (check for shutdown during execution if needed)
 		err := w.execute(task)
+		w.setIdle()
 		if err != nil {
-			// Mark worker result BEFORE calling ReportTaskResult (for stall diagnostics)
-			task.WorkerResult = "error"
 			task.LastError = err.Error()
-			w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
-			willRetry := task.Attempts < w.queue.getMaxRetries()
-			w.logError(task, err, willRetry)
+			if IsThrottleError(err) {
+				task.WorkerResult = "rate_limited"
+				w.queue.ReportTaskResult(task, TaskExecutionResultRateLimited)
+			} else {
+				task.WorkerResult = "error"
+				w.queue.ReportTaskResult(task, TaskExecutionResultFailed)
+				willRetry := task.Attempts < w.queue.getMaxRetries()
+				w.logError(task, err, willRetry)
+			}
 		} else {
 			// Mark worker result BEFORE calling ReportTaskResult (for stall diagnostics)
 			task.WorkerResult = "success"
 			w.queue.ReportTaskResult(task, TaskExecutionResultSuccessful)
+		}
+		if w.shouldRetire() {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("info", "Worker exiting - scale down retire", "worker", w.id, w.queueName)
+			}
+			return
 		}
 	}
 }
@@ -155,7 +208,7 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 	}
 	listDone := make(chan listChildrenResult, 1)
 	go func(serviceID string, listDepth int, path string) {
-		r, err := w.fsAdapter.ListChildren(serviceID, &listDepth, path)
+		r, err := w.fsAdapter.ListChildren(ctx, serviceID, &listDepth, path)
 		listDone <- listChildrenResult{result: r, err: err}
 	}(folder.ServiceID, depth, folder.LocationPath)
 

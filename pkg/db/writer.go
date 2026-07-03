@@ -18,9 +18,10 @@ type Writer struct {
 
 // NodeStateAppendRowArgs returns the column values for one NodeState (metadata only) in table order for use with duckdb.Appender.AppendRow.
 func NodeStateAppendRowArgs(n *NodeState) []any {
+	path, parentPath, pathHash, parentPathHash := NodeInsertPathFields(n.Path, n.ParentPath, n.Depth)
 	return []any{
-		n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath,
-		PathHash(n.Path), PathHash(n.ParentPath),
+		n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, path, parentPath,
+		pathHash, parentPathHash,
 		n.Type, n.Size, n.MTime, int32(n.Depth),
 	}
 }
@@ -32,10 +33,11 @@ func (w *Writer) AppenderInsert(table string, nodes []*NodeState) error {
 	}
 	ctx := context.Background()
 	for _, n := range nodes {
+		path, parentPath, pathHash, parentPathHash := NodeInsertPathFields(n.Path, n.ParentPath, n.Depth)
 		_, err := w.tx.ExecContext(ctx,
 			`INSERT INTO `+table+` (id, service_id, parent_id, parent_service_id, path, parent_path, path_hash, parent_path_hash, type, size, mtime, depth)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath, PathHash(n.Path), PathHash(n.ParentPath), n.Type, n.Size, n.MTime, n.Depth,
+			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, path, parentPath, pathHash, parentPathHash, n.Type, n.Size, n.MTime, n.Depth,
 		)
 		if err != nil {
 			return err
@@ -52,11 +54,12 @@ func (w *Writer) UpsertNodes(table string, nodes []*NodeState) error {
 	}
 	ctx := context.Background()
 	for _, n := range nodes {
+		path, parentPath, pathHash, parentPathHash := NodeInsertPathFields(n.Path, n.ParentPath, n.Depth)
 		_, err := w.tx.ExecContext(ctx,
 			`INSERT INTO `+table+` (id, service_id, parent_id, parent_service_id, path, parent_path, path_hash, parent_path_hash, type, size, mtime, depth)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			 ON CONFLICT (id) DO NOTHING`,
-			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, n.Path, n.ParentPath, PathHash(n.Path), PathHash(n.ParentPath), n.Type, n.Size, n.MTime, n.Depth,
+			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, path, parentPath, pathHash, parentPathHash, n.Type, n.Size, n.MTime, n.Depth,
 		)
 		if err != nil {
 			return fmt.Errorf("insert node %s into %s: %w", n.ID, table, err)
@@ -65,14 +68,14 @@ func (w *Writer) UpsertNodes(table string, nodes []*NodeState) error {
 	return nil
 }
 
-// SrcStatusEventAppendRowArgs returns column values for one row in src_status_events (id, traversal_status, copy_status, event_time, depth) for appender.
+// SrcStatusEventAppendRowArgs returns column values for one row in src_status_events for appender.
 func SrcStatusEventAppendRowArgs(e *StatusEvent) []any {
-	return []any{e.ID, e.TraversalStatus, e.CopyStatus, e.EventTime, int32(e.Depth)}
+	return []any{e.ID, e.TraversalStatus, e.CopyStatus, e.EventTime, int32(e.Depth), e.ErrorLogID}
 }
 
-// DstStatusEventAppendRowArgs returns column values for one row in dst_status_events (id, traversal_status, event_time, depth) for appender.
+// DstStatusEventAppendRowArgs returns column values for one row in dst_status_events for appender.
 func DstStatusEventAppendRowArgs(e *StatusEvent) []any {
-	return []any{e.ID, e.TraversalStatus, e.EventTime, int32(e.Depth)}
+	return []any{e.ID, e.TraversalStatus, e.EventTime, int32(e.Depth), e.ErrorLogID}
 }
 
 // BatchInsertSrcStatusEvents inserts status events into src_status_events inside the current transaction. Used by seal flush so events are atomic with nodes/stats.
@@ -83,8 +86,8 @@ func (w *Writer) BatchInsertSrcStatusEvents(events []StatusEvent) error {
 	ctx := context.Background()
 	for _, e := range events {
 		_, err := w.tx.ExecContext(ctx,
-			`INSERT INTO `+tableSrcStatusEvents+` (id, traversal_status, copy_status, event_time, depth) VALUES ($1, $2, $3, $4, $5)`,
-			e.ID, e.TraversalStatus, e.CopyStatus, e.EventTime, e.Depth,
+			`INSERT INTO `+tableSrcStatusEvents+` (id, traversal_status, copy_status, event_time, depth, error_log_id) VALUES ($1, $2, $3, $4, $5, $6)`,
+			e.ID, e.TraversalStatus, e.CopyStatus, e.EventTime, e.Depth, nullIfEmpty(e.ErrorLogID),
 		)
 		if err != nil {
 			return fmt.Errorf("insert src_status_event %s: %w", e.ID, err)
@@ -101,8 +104,8 @@ func (w *Writer) BatchInsertDstStatusEvents(events []StatusEvent) error {
 	ctx := context.Background()
 	for _, e := range events {
 		_, err := w.tx.ExecContext(ctx,
-			`INSERT INTO `+tableDstStatusEvents+` (id, traversal_status, event_time, depth) VALUES ($1, $2, $3, $4)`,
-			e.ID, e.TraversalStatus, e.EventTime, e.Depth,
+			`INSERT INTO `+tableDstStatusEvents+` (id, traversal_status, event_time, depth, error_log_id) VALUES ($1, $2, $3, $4, $5)`,
+			e.ID, e.TraversalStatus, e.EventTime, e.Depth, nullIfEmpty(e.ErrorLogID),
 		)
 		if err != nil {
 			return fmt.Errorf("insert dst_status_event %s: %w", e.ID, err)
@@ -384,16 +387,23 @@ func (w *Writer) InsertStatusEvent(table string, e *StatusEvent) error {
 	ctx := context.Background()
 	if table == "DST" {
 		_, err := w.tx.ExecContext(ctx,
-			`INSERT INTO `+tableDstStatusEvents+` (id, traversal_status, event_time, depth) VALUES ($1, $2, $3, $4)`,
-			e.ID, e.TraversalStatus, e.EventTime, e.Depth,
+			`INSERT INTO `+tableDstStatusEvents+` (id, traversal_status, event_time, depth, error_log_id) VALUES ($1, $2, $3, $4, $5)`,
+			e.ID, e.TraversalStatus, e.EventTime, e.Depth, nullIfEmpty(e.ErrorLogID),
 		)
 		return err
 	}
 	_, err := w.tx.ExecContext(ctx,
-		`INSERT INTO `+tableSrcStatusEvents+` (id, traversal_status, copy_status, event_time, depth) VALUES ($1, $2, $3, $4, $5)`,
-		e.ID, e.TraversalStatus, e.CopyStatus, e.EventTime, e.Depth,
+		`INSERT INTO `+tableSrcStatusEvents+` (id, traversal_status, copy_status, event_time, depth, error_log_id) VALUES ($1, $2, $3, $4, $5, $6)`,
+		e.ID, e.TraversalStatus, e.CopyStatus, e.EventTime, e.Depth, nullIfEmpty(e.ErrorLogID),
 	)
 	return err
+}
+
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // DeleteNode deletes the node from the given table (for retry DST cleanup).
@@ -779,6 +789,15 @@ func (w *Writer) InsertLog(id string, level, message, component, entity, entityI
 	_, err := w.tx.ExecContext(context.Background(),
 		`INSERT INTO logs (id, level, message, component, entity, entity_id, queue) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		id, level, message, component, entity, entityID, queue,
+	)
+	return err
+}
+
+// InsertTaskFailureLog inserts a task_failure log row with structured detail (bare error) separate from message.
+func (w *Writer) InsertTaskFailureLog(id, level, message, detail, entity, entityID, queue string) error {
+	_, err := w.tx.ExecContext(context.Background(),
+		`INSERT INTO logs (id, level, message, detail, component, entity, entity_id, queue) VALUES ($1, $2, $3, $4, 'task_failure', $5, $6, $7)`,
+		id, level, message, nullIfEmpty(detail), entity, entityID, queue,
 	)
 	return err
 }

@@ -552,8 +552,9 @@ func (q *Queue) markComplete(format string, args ...any) bool {
 type TaskExecutionResult string
 
 const (
-	TaskExecutionResultSuccessful TaskExecutionResult = "successful"
-	TaskExecutionResultFailed     TaskExecutionResult = "failed"
+	TaskExecutionResultSuccessful   TaskExecutionResult = "successful"
+	TaskExecutionResultFailed       TaskExecutionResult = "failed"
+	TaskExecutionResultRateLimited  TaskExecutionResult = "rate_limited"
 )
 
 // ReportTaskResult reports the result of a task execution and handles post-processing.
@@ -571,6 +572,8 @@ func (q *Queue) ReportTaskResult(task *TaskBase, result TaskExecutionResult) {
 		q.completeTask(task, executionDelta)
 	case TaskExecutionResultFailed:
 		q.failTask(task, executionDelta)
+	case TaskExecutionResultRateLimited:
+		q.yieldTaskOnRateLimit(task, executionDelta)
 	default:
 		if logservice.LS != nil {
 			err := logservice.LS.Log("error",

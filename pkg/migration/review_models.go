@@ -32,6 +32,8 @@ type StopResult struct {
 	Stopped       bool
 	// SoftSuspendRequested is true when a live traversal/copy run was asked to soft-suspend (drain + persist); completion is asynchronous.
 	SoftSuspendRequested bool
+	// ForceStopped is true when Stop() grace expired and the run context was canceled to end a stuck run.
+	ForceStopped bool
 }
 
 // DiffItem is a path review row comparing source and destination state.
@@ -49,6 +51,10 @@ type DiffItem struct {
 	MissingOnSource    bool
 	MissingOnDest      bool
 	Size               int64
+	SrcFailureLogID    string
+	SrcFailureMessage  string
+	DstFailureLogID    string
+	DstFailureMessage  string
 }
 
 type ListChildrenDiffsRequest struct {

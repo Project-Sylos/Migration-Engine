@@ -114,7 +114,6 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	if shutdownCtx == nil {
 		shutdownCtx = context.Background()
 	}
-	copyQueue.InitializeCopyWithContext(duckDB, cfg.SrcAdapter, cfg.DstAdapter, shutdownCtx)
 	if err := duckDB.BeginCopyPhase(shutdownCtx); err != nil {
 		return queue.QueueStats{}, fmt.Errorf("begin copy phase: %w", err)
 	}
@@ -128,6 +127,11 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 			fmt.Println("error ending copy phase", err)
 		}
 	}()
+	copyQueue.InitializeCopyWithContext(duckDB, cfg.SrcAdapter, cfg.DstAdapter, shutdownCtx)
+	copyQueue.SetRateLimitTelemetry(
+		rateLimitBridgeForAdapter(cfg.SrcAdapter),
+		rateLimitBridgeForAdapter(cfg.DstAdapter),
+	)
 	obsPoll := observerPollFromConfigAndSuspend(cfg.ObserverPollInterval, nil)
 	observer := queue.NewQueueObserver(duckDB, obsPoll)
 	observer.Start()
@@ -196,8 +200,8 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		if shutdownCtx != nil {
 			select {
 			case <-shutdownCtx.Done():
-				copyQueue.Pause()
-				return queue.QueueStats{}, fmt.Errorf("copy retry shutdown requested")
+				performCopyForceStop(duckDB, copyQueue, observer)
+				return copyForceStopStats(copyQueue), forceStopErr("copy retry")
 			default:
 			}
 		}
@@ -268,8 +272,14 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		}
 	}
 
-	sizing := queueSizingFromSuspend(cfg.ResumeCopy)
-	wc := effectiveWorkerCount(cfg.WorkerCount, cfg.ResumeCopy)
+	_, _, runProfile := resolveServiceProfiles(MigrationConfig{
+		SrcAdapter: cfg.SrcAdapter,
+		DstAdapter: cfg.DstAdapter,
+		SrcService: cfg.SrcService,
+		DstService: cfg.DstService,
+	})
+	sizing := queueSizingFromProfileOrSuspend(cfg.ResumeCopy, runProfile)
+	wc := resolveWorkersForProfile(cfg.WorkerCount, cfg.ResumeCopy, runProfile)
 	mr := effectiveMaxRetries(cfg.MaxRetries, cfg.ResumeCopy)
 
 	// Create copy queue (single queue, not dual like traversal)
@@ -346,14 +356,11 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		}
 	}
 
-	// Initialize copy queue with both source and destination adapters
+	// Begin copy phase before starting workers so pulls see copy-phase DB state.
 	shutdownCtx := cfg.ShutdownContext
 	if shutdownCtx == nil {
 		shutdownCtx = context.Background()
 	}
-	copyQueue.InitializeCopyWithContext(duckDB, cfg.SrcAdapter, cfg.DstAdapter, shutdownCtx)
-
-	// Start copy phase: drop indexes, persistent appenders. CHECKPOINT once after phase teardown (defer order below).
 	if err := duckDB.BeginCopyPhase(shutdownCtx); err != nil {
 		return queue.QueueStats{}, fmt.Errorf("begin copy phase: %w", err)
 	}
@@ -367,6 +374,12 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 			fmt.Println("error ending copy phase", err)
 		}
 	}()
+
+	copyQueue.InitializeCopyWithContext(duckDB, cfg.SrcAdapter, cfg.DstAdapter, shutdownCtx)
+	copyQueue.SetRateLimitTelemetry(
+		rateLimitBridgeForAdapter(cfg.SrcAdapter),
+		rateLimitBridgeForAdapter(cfg.DstAdapter),
+	)
 
 	obsPoll := observerPollFromConfigAndSuspend(cfg.ObserverPollInterval, cfg.ResumeCopy)
 	observer := queue.NewQueueObserver(duckDB, obsPoll)
@@ -438,7 +451,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		}
 	}()
 
-	// Wait for copy phase completion
+	copyQueue.PullTasksIfNeeded(true)
 	start := time.Now()
 	lastRound := startRound // Initialize to starting round
 	tickCount := 0
@@ -446,8 +459,8 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		if shutdownCtx != nil {
 			select {
 			case <-shutdownCtx.Done():
-				copyQueue.Pause()
-				return queue.QueueStats{}, fmt.Errorf("copy phase shutdown requested")
+				performCopyForceStop(duckDB, copyQueue, observer)
+				return copyForceStopStats(copyQueue), forceStopErr("copy")
 			default:
 			}
 		}

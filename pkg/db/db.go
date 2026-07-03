@@ -80,6 +80,14 @@ func Open(opts Options) (*DB, error) {
 		_ = conn.Close()
 		return nil, err
 	}
+	if err := migrateStatusEventErrorLogID(conn); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := migrateLogsDetail(conn); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	if path != ":memory:" {
 		if _, err := conn.Exec("CHECKPOINT"); err != nil {
 			_ = conn.Close()
@@ -138,6 +146,47 @@ func migrateMigrationsRuntimeState(conn *sql.DB) error {
 	_, err = conn.ExecContext(ctx, "ALTER TABLE "+TableMigrations+" ADD COLUMN runtime_state_json VARCHAR")
 	if err != nil {
 		return fmt.Errorf("runtime_state_json migration add column: %w", err)
+	}
+	return nil
+}
+
+// migrateStatusEventErrorLogID adds error_log_id to status event tables when missing.
+func migrateStatusEventErrorLogID(conn *sql.DB) error {
+	ctx := context.Background()
+	for _, table := range []string{tableSrcStatusEvents, tableDstStatusEvents} {
+		var exists int64
+		err := conn.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM information_schema.columns WHERE table_name = $1 AND column_name = 'error_log_id'",
+			table,
+		).Scan(&exists)
+		if err != nil {
+			return fmt.Errorf("error_log_id migration check %s: %w", table, err)
+		}
+		if exists > 0 {
+			continue
+		}
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN error_log_id VARCHAR"); err != nil {
+			return fmt.Errorf("error_log_id migration add column %s: %w", table, err)
+		}
+	}
+	return nil
+}
+
+// migrateLogsDetail adds detail to logs for structured task failure text (bare error vs full message line).
+func migrateLogsDetail(conn *sql.DB) error {
+	ctx := context.Background()
+	var exists int64
+	err := conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'logs' AND column_name = 'detail'",
+	).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("logs detail migration check: %w", err)
+	}
+	if exists > 0 {
+		return nil
+	}
+	if _, err := conn.ExecContext(ctx, "ALTER TABLE logs ADD COLUMN detail VARCHAR"); err != nil {
+		return fmt.Errorf("logs detail migration add column: %w", err)
 	}
 	return nil
 }

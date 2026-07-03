@@ -5,7 +5,6 @@ package migration
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -92,8 +91,9 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 	coordinator := queue.NewQueueCoordinator()
 
-	sizing := queueSizingFromSuspend(cfg.ResumeTraversal)
-	wc := effectiveWorkerCount(cfg.WorkerCount, cfg.ResumeTraversal)
+	_, _, runProfile := resolveServiceProfiles(cfg)
+	sizing := queueSizingFromProfileOrSuspend(cfg.ResumeTraversal, runProfile)
+	wc := resolveWorkersForProfile(cfg.WorkerCount, cfg.ResumeTraversal, runProfile)
 	mr := effectiveMaxRetries(cfg.MaxRetries, cfg.ResumeTraversal)
 
 	// DB-backed frontier: no LevelCache for traversal. Queues pull from DuckDB in batches.
@@ -115,6 +115,8 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 	srcQueue.InitializeWithContext(database, cfg.SrcAdapter, cfg.ShutdownContext)
 	dstQueue.InitializeWithContext(database, cfg.DstAdapter, cfg.ShutdownContext)
+	srcQueue.SetRateLimitTelemetry(rateLimitBridgeForAdapter(cfg.SrcAdapter))
+	dstQueue.SetRateLimitTelemetry(rateLimitBridgeForAdapter(cfg.DstAdapter))
 
 	srcListProfile := scaling.ApplyAdapterListPagination(
 		scaling.LookupProfile(cfg.SrcService.ProviderID, cfg.SrcService.Name),
@@ -124,6 +126,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		scaling.LookupProfile(cfg.DstService.ProviderID, cfg.DstService.Name),
 		cfg.DstAdapter,
 	)
+	// Per-queue list pagination uses each side's profile; worker pool uses merged runProfile above.
 	scaling.ApplyQueueListPagination(srcQueue, srcListProfile)
 	scaling.ApplyQueueListPagination(dstQueue, dstListProfile)
 
@@ -228,31 +231,13 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		if cfg.ShutdownContext != nil {
 			select {
 			case <-cfg.ShutdownContext.Done():
-				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 8*time.Second)
-				defer cleanupCancel()
-
-				srcQueue.Pause()
-				dstQueue.Pause()
-
-				select {
-				case <-time.After(200 * time.Millisecond):
-				case <-cleanupCtx.Done():
-					fmt.Printf("⚠️  Cleanup timeout - exiting immediately to prevent hang\n")
-					srcStats, dstStats := snapshotTraversalQueueStats(database, coordinator)
-					return RuntimeStats{
-						Duration: time.Since(start),
-						Src:      srcStats,
-						Dst:      dstStats,
-					}, errors.New("migration suspended by force shutdown (cleanup timeout)")
-				}
-
+				performTraversalForceStop(database, srcQueue, dstQueue, observer)
 				srcStats, dstStats := snapshotTraversalQueueStats(database, coordinator)
-
 				return RuntimeStats{
 					Duration: time.Since(start),
 					Src:      srcStats,
 					Dst:      dstStats,
-				}, errors.New("migration suspended by force shutdown")
+				}, forceStopErr("traversal")
 			default:
 			}
 		}

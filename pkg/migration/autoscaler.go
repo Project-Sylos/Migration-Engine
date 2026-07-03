@@ -257,3 +257,12 @@ func sameBackend(src, dst fstypes.FSAdapter) bool {
 	}
 	return s.GetSDKInstance() == d.GetSDKInstance()
 }
+
+// rateLimitBridgeForAdapter exposes FS degradation telemetry to queue workers for throttle idle windows.
+func rateLimitBridgeForAdapter(adapter fstypes.FSAdapter) queue.RateLimitTelemetry {
+	bridge := combinedRateLimitBridge(adapter)
+	if bridge.TakeHits == nil {
+		return nil
+	}
+	return bridge
+}
