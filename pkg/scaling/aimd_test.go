@@ -1,0 +1,187 @@
+// Copyright 2025 Sylos contributors
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+package scaling
+
+import (
+	"testing"
+	"time"
+)
+
+func TestAIMDDecreaseMultiplicative(t *testing.T) {
+	p := DefaultAIMDPolicy(time.Second)
+	st := &queueAIMDState{}
+	now := time.Now()
+
+	got := p.DecreaseTarget(20, 1, 32, st, now)
+	if got != 10 {
+		t.Fatalf("decrease 20: got %d want 10", got)
+	}
+	if st.ssthresh != 10 {
+		t.Fatalf("ssthresh: got %d want 10", st.ssthresh)
+	}
+
+	got = p.DecreaseTarget(3, 1, 32, st, now.Add(2*time.Second))
+	if got != 1 {
+		t.Fatalf("decrease 3: got %d want 1", got)
+	}
+}
+
+func TestAIMDSlowStartThenAdditive(t *testing.T) {
+	p := AIMDPolicy{DecreaseFactor: 0.5, AdditiveStep: 1, ProbeCooldown: 0}
+	st := &queueAIMDState{}
+	_ = p.DecreaseTarget(20, 1, 32, st, time.Now()) // ssthresh=10, workers would be 10
+
+	now := time.Now().Add(time.Minute)
+	cur := 10
+
+	target, ok := p.IncreaseTarget(cur, 1, 32, st, now)
+	if !ok || target != 11 {
+		t.Fatalf("at ssthresh additive: got (%d,%v) want (11,true)", target, ok)
+	}
+
+	st.ssthresh = 0
+	cur = 4
+	target, ok = p.IncreaseTarget(cur, 1, 32, st, now)
+	if !ok || target != 8 {
+		t.Fatalf("slow start double: got (%d,%v) want (8,true)", target, ok)
+	}
+}
+
+func TestAIMDProbeCooldown(t *testing.T) {
+	p := DefaultAIMDPolicy(30 * time.Second)
+	st := &queueAIMDState{}
+	_ = p.DecreaseTarget(20, 1, 32, st, time.Now())
+
+	now := st.lastDecrease.Add(10 * time.Second)
+	_, ok := p.IncreaseTarget(10, 1, 32, st, now)
+	if ok {
+		t.Fatal("expected probe blocked during cooldown")
+	}
+
+	now = st.lastDecrease.Add(31 * time.Second)
+	target, ok := p.IncreaseTarget(10, 1, 32, st, now)
+	if !ok || target != 11 {
+		t.Fatalf("after cooldown: got (%d,%v) want (11,true)", target, ok)
+	}
+}
+
+func TestAIMDSawtoothSequence(t *testing.T) {
+	p := AIMDPolicy{DecreaseFactor: 0.5, AdditiveStep: 1, ProbeCooldown: 0}
+	st := &queueAIMDState{}
+	now := time.Now()
+
+	workers := 20
+	// Hit ceiling → halve.
+	workers = p.DecreaseTarget(workers, 1, 32, st, now)
+	if workers != 10 {
+		t.Fatalf("after throttle: %d", workers)
+	}
+
+	// Climb back: at ssthresh, additive only (+1 per tick).
+	for i := 0; i < 5; i++ {
+		now = now.Add(time.Second)
+		next, ok := p.IncreaseTarget(workers, 1, 32, st, now)
+		if !ok {
+			t.Fatalf("tick %d: increase blocked at %d", i, workers)
+		}
+		workers = next
+	}
+	if workers != 15 {
+		t.Fatalf("after 5 additive steps from 10: got %d want 15", workers)
+	}
+}
+
+func TestFormatScalingEventInterOpDelay(t *testing.T) {
+	got := FormatScalingEvent("src", "InterOpDelayMs", 0, 2000, PressureFSThrottle)
+	want := "autoscaler queue=src knob=InterOpDelay 0ms->2ms pressure=FS_THROTTLE"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+	got = FormatScalingEvent("src", "InterOpDelayMs", 2000, 4000, PressureFSThrottle)
+	if got != "autoscaler queue=src knob=InterOpDelay 2ms->4ms pressure=FS_THROTTLE" {
+		t.Fatalf("double step: got %q", got)
+	}
+	got = FormatScalingEvent("src", "InterOpDelayMs", 0, 100, PressureFSThrottle)
+	if got != "autoscaler queue=src knob=InterOpDelay 0ms->0.10ms pressure=FS_THROTTLE" {
+		t.Fatalf("sub-ms: got %q", got)
+	}
+}
+
+func TestFSOpRateForInterOpDelay(t *testing.T) {
+	got := FSOpRateForInterOpDelay(49, 1, 800)
+	if got != 800 {
+		t.Fatalf("peak per worker: got %v want 800", got)
+	}
+	got = FSOpRateForInterOpDelay(400, 20, 0)
+	if got != 400 {
+		t.Fatalf("aggregate at 20 workers: got %v want 400", got)
+	}
+}
+
+func TestInterOpDelayFromThroughput(t *testing.T) {
+	got := InterOpDelayFromThroughput(1000)
+	if got != 2*time.Millisecond {
+		t.Fatalf("1000 ops/s: got %v want 2ms", got)
+	}
+	got = InterOpDelayFromThroughput(500)
+	if got != 4*time.Millisecond {
+		t.Fatalf("500 ops/s: got %v want 4ms", got)
+	}
+	if InterOpDelayFromThroughput(0) != 0 {
+		t.Fatal("zero throughput should return 0")
+	}
+}
+
+func TestAIMDInterOpDelayAtWorkerFloor(t *testing.T) {
+	p := AIMDPolicy{DecreaseFactor: 0.5, AdditiveStep: 1, ProbeCooldown: 0, InitialInterOpDelay: time.Millisecond, MinInterOpDelayStep: 100 * time.Microsecond}
+	st := &queueAIMDState{}
+	max := 5 * time.Second
+	now := time.Now()
+
+	got := p.IncreaseInterOpDelay(0, max, 1000, st, now)
+	if got != 2*time.Millisecond {
+		t.Fatalf("seed delay: got %v want 2ms", got)
+	}
+	if st.delaySeed != 2*time.Millisecond {
+		t.Fatalf("delaySeed: got %v want 2ms", st.delaySeed)
+	}
+
+	got = p.IncreaseInterOpDelay(got, max, 1000, st, now)
+	if got != 4*time.Millisecond {
+		t.Fatalf("double delay: got %v want 4ms", got)
+	}
+
+	now = now.Add(time.Minute)
+	target, ok := p.DecreaseInterOpDelay(4*time.Millisecond, st, now)
+	if !ok || target != 2*time.Millisecond {
+		t.Fatalf("halve delay: got (%v,%v) want (2ms,true)", target, ok)
+	}
+
+	target, ok = p.DecreaseInterOpDelay(2*time.Millisecond, st, now)
+	if !ok || target != 0 {
+		t.Fatalf("clear delay at seed: got (%v,%v) want (0,true)", target, ok)
+	}
+}
+
+func TestAIMDInterOpDelayFallbackWhenNoThroughput(t *testing.T) {
+	p := DefaultAIMDPolicy(0)
+	st := &queueAIMDState{}
+	got := p.IncreaseInterOpDelay(0, 5*time.Second, 0, st, time.Now())
+	if got != time.Millisecond {
+		t.Fatalf("fallback seed: got %v want 1ms", got)
+	}
+}
+
+func TestAIMDInterOpDelayProbeCooldown(t *testing.T) {
+	p := DefaultAIMDPolicy(30 * time.Second)
+	st := &queueAIMDState{}
+	now := time.Now()
+	_ = p.IncreaseInterOpDelay(0, 5*time.Second, 1000, st, now)
+
+	now = st.delayLastIncrease.Add(5 * time.Second)
+	_, ok := p.DecreaseInterOpDelay(2*time.Millisecond, st, now)
+	if ok {
+		t.Fatal("expected delay recovery blocked during cooldown")
+	}
+}

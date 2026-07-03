@@ -1,0 +1,69 @@
+{
+  "mode": "ephemeral",
+  "seed": {
+    "max_depth": 6,
+    "max_folders": 20,
+    "folder_backoff_factor": 0.9,
+    "folder_depth_decay_factor": 0.9,
+    "max_files": 50,
+    "file_backoff_factor": 0.9,
+    "file_depth_decay_factor": 0.9,
+    "seed": 42,
+    "diverging_tree_mode": true
+  },
+  "api": {
+    "host": "localhost",
+    "port": 8086
+  },
+  "secondary_tables": {
+    "s1": 0.9
+  },
+  "chaos": {
+    "enabled": true,
+    "rate_limits": {
+      "poll_interval_ms": 1000,
+      "global": {
+        "calls_per_second": 0,
+        "burst": 0
+      },
+      "operations": {
+        "list_children": {
+          "calls_per_second": 5000,
+          "burst": 5000
+        },
+        "create_folder": {
+          "calls_per_second": 5000,
+          "burst": 5000
+        },
+        "upload_file": {
+          "calls_per_second": 1000,
+          "burst": 1000
+        },
+        "get_file_data": {
+          "calls_per_second": 1000,
+          "burst": 1000
+        },
+        "get_node": {
+          "calls_per_second": 5000,
+          "burst": 5000
+        }
+      },
+      "bandwidth": {
+        "bytes_per_second": 1073741824,
+        "burst_bytes": 1073741824
+      }
+    },
+    "backoff": {
+      "base_retry_after_ms": 100,
+      "exponential_factor": 2
+    },
+    "latency": {
+      "list_children_ms": 0,
+      "jitter_ms": 0
+    },
+    "packet_loss": {
+      "probability": 0.0,
+      "retry_after_ms": 500
+    }
+  }
+}

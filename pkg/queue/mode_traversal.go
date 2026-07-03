@@ -14,16 +14,16 @@ import (
 
 // PullTraversalTasks refills the queue from DuckDB for the current round (ID-offset pagination, ~10K batch).
 // SRC: ListNodesByDepthKeyset; DST: ListDstBatchWithSrcChildren (join for expected children). Pushed directly to queue.
-func (q *Queue) PullTraversalTasks(force bool) {
+func (q *Queue) PullTraversalTasks(force bool) PullResult {
 	database := q.getDatabase()
 	if database == nil {
-		return
+		return PullResult{Status: PullAborted}
 	}
 	if q.getPulling() {
-		return
+		return PullResult{Round: q.GetRound(), Status: PullSkipped}
 	}
 	if q.State() == QueueStateCompleted {
-		return
+		return PullResult{Status: PullAborted}
 	}
 	// Allow first refill attempt without prior cache hydration (DB-backed frontier).
 	if !q.getTraversalCacheLoaded() {
@@ -39,18 +39,16 @@ func (q *Queue) PullTraversalTasks(force bool) {
 	snapshot := q.getStateSnapshot()
 	if !force {
 		if snapshot.State != QueueStateRunning || snapshot.PendingCount > snapshot.PullLowWM {
-			return
+			return PullResult{Round: snapshot.Round, Status: PullSkipped}
 		}
-	} else {
-		if snapshot.State == QueueStatePaused {
-			return
-		}
+	} else if snapshot.State == QueueStatePaused {
+		return PullResult{Round: snapshot.Round, Status: PullAborted}
 	}
 	currentRound := snapshot.Round
 	coordinator := q.getCoordinator()
 	if q.name == "dst" && coordinator != nil {
 		if !coordinator.CanDstStartRound(currentRound) {
-			return
+			return PullResult{Round: currentRound, Status: PullSkipped}
 		}
 	}
 
@@ -62,15 +60,15 @@ func (q *Queue) PullTraversalTasks(force bool) {
 		dstBatch, childrenByDstID, err := db.ListDstBatchWithSrcChildren(database, currentRound, afterID, requestLimit, db.StatusPending)
 		if err != nil {
 			if q.GetRound() != currentRound {
-				return
+				return PullResult{Round: currentRound, QueriedDB: true, Status: PullStaleRound}
 			}
 			q.setLastPullWasPartial(true)
 			q.recordPull(currentRound, 0, true)
 			q.setFirstPullForRound(false)
-			return
+			return PullResult{Round: currentRound, Yield: 0, Partial: true, QueriedDB: true, Status: PullOK}
 		}
 		if q.GetRound() != currentRound {
-			return
+			return PullResult{Round: currentRound, QueriedDB: true, Status: PullStaleRound}
 		}
 		processLimit := batchSize
 		if len(dstBatch) <= batchSize {
@@ -101,22 +99,26 @@ func (q *Queue) PullTraversalTasks(force bool) {
 			}
 			q.setDstKeysetCursor(dstBatch[cursorIdx].Key)
 		}
-		q.setLastPullWasPartial(len(dstBatch) <= batchSize)
+		partial := len(dstBatch) <= batchSize
+		q.setLastPullWasPartial(partial)
+		q.recordPull(currentRound, count, partial)
+		q.setFirstPullForRound(false)
+		return PullResult{Round: currentRound, Yield: count, Partial: partial, QueriedDB: true, Status: PullOK}
 	} else {
 		afterID := q.getSrcKeysetCursor()
 		queueType := getQueueType(q.name)
 		results, err := db.ListNodesByDepthKeyset(database, queueType, currentRound, afterID, db.StatusPending, requestLimit)
 		if err != nil {
 			if q.GetRound() != currentRound {
-				return
+				return PullResult{Round: currentRound, QueriedDB: true, Status: PullStaleRound}
 			}
 			q.setLastPullWasPartial(true)
 			q.recordPull(currentRound, 0, true)
 			q.setFirstPullForRound(false)
-			return
+			return PullResult{Round: currentRound, Yield: 0, Partial: true, QueriedDB: true, Status: PullOK}
 		}
 		if q.GetRound() != currentRound {
-			return
+			return PullResult{Round: currentRound, QueriedDB: true, Status: PullStaleRound}
 		}
 		processLimit := batchSize
 		if len(results) <= batchSize {
@@ -140,10 +142,12 @@ func (q *Queue) PullTraversalTasks(force bool) {
 			}
 			q.setSrcKeysetCursor(results[cursorIdx].Key)
 		}
-		q.setLastPullWasPartial(len(results) <= batchSize)
+		partial := len(results) <= batchSize
+		q.setLastPullWasPartial(partial)
+		q.recordPull(currentRound, count, partial)
+		q.setFirstPullForRound(false)
+		return PullResult{Round: currentRound, Yield: count, Partial: partial, QueriedDB: true, Status: PullOK}
 	}
-	q.recordPull(currentRound, count, q.GetLastPullWasPartial())
-	q.setFirstPullForRound(false)
 }
 
 // CompleteTraversalTask handles successful completion of traversal/retry tasks.
@@ -470,23 +474,12 @@ func (q *Queue) CheckTraversalCompletion(currentRound int) bool {
 		return false
 	}
 
-	info := q.getRoundInfoReadOnly(currentRound)
-	pullCount := 0
-	if info != nil {
-		pullCount = info.PullCount
-	}
-	if pullCount == 0 {
-		q.PullTasksIfNeeded(true)
-		info = q.getRoundInfoReadOnly(currentRound)
-		pullCount = 0
-		if info != nil {
-			pullCount = info.PullCount
-		}
-		if pullCount == 0 {
+	if !q.roundHasCountedPull(currentRound) {
+		if res := q.pullWithRetryIfNeeded(true); !res.OK() {
 			return false
 		}
 	}
-	info = q.getRoundInfoReadOnly(currentRound)
+	info := q.getRoundInfoReadOnly(currentRound)
 	if info == nil {
 		return false
 	}
@@ -560,6 +553,6 @@ func (q *Queue) AdvanceTraversalRound() {
 		}
 	}
 
-	// Pull tasks for the new round
-	q.PullTasksIfNeeded(true)
+	// Pull tasks for the new round (must record a DB-committed pull for completion/advance gates).
+	q.pullWithRetryIfNeeded(true)
 }

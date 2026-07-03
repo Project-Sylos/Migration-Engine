@@ -19,20 +19,23 @@ type TraversalWorker struct {
 	id          string
 	queue       *Queue
 	fsAdapter   types.FSAdapter
-	queueName   string          // "src" or "dst" for logging
-	isDst       bool            // true if this is a destination worker (performs comparison)
-	shutdownCtx context.Context // Context for shutdown signaling (optional)
+	queueName   string
+	isDst       bool
+	shutdownCtx context.Context
+	workerCtx   context.Context
 }
 
-// NewTraversalWorker creates a worker that executes traversal tasks.
-// shutdownCtx is optional - if provided, the worker will check for cancellation and exit on shutdown.
 func NewTraversalWorker(
 	id string,
 	queue *Queue,
 	adapter types.FSAdapter,
 	queueName string,
 	shutdownCtx context.Context,
+	workerCtx context.Context,
 ) *TraversalWorker {
+	if workerCtx == nil {
+		workerCtx = shutdownCtx
+	}
 	return &TraversalWorker{
 		id:          id,
 		queue:       queue,
@@ -40,6 +43,7 @@ func NewTraversalWorker(
 		queueName:   queueName,
 		isDst:       queueName == "dst",
 		shutdownCtx: shutdownCtx,
+		workerCtx:   workerCtx,
 	}
 }
 
@@ -60,7 +64,6 @@ func (w *TraversalWorker) Run() {
 		if w.shutdownCtx != nil {
 			select {
 			case <-w.shutdownCtx.Done():
-				// Shutdown triggered - exit immediately
 				if logservice.LS != nil {
 					err := logservice.LS.Log("info", "Worker exiting - shutdown requested", "worker", w.id, w.queueName)
 					if err != nil {
@@ -69,7 +72,19 @@ func (w *TraversalWorker) Run() {
 				}
 				return
 			default:
-				// Continue normal execution
+			}
+		}
+		if w.workerCtx != nil {
+			select {
+			case <-w.workerCtx.Done():
+				if logservice.LS != nil {
+					err := logservice.LS.Log("info", "Worker exiting - scale down", "worker", w.id, w.queueName)
+					if err != nil {
+						fmt.Println("error logging", err)
+					}
+				}
+				return
+			default:
 			}
 		}
 
@@ -130,6 +145,8 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 	wd, ctx := NewProgressWatchdog(parent, traversalStallTimeout, w.queue.sealIOWaitActive)
 	defer wd.Stop()
 
+	w.queue.WaitInterOp(w.workerCtx)
+
 	folder := task.Folder
 	depth := folder.DepthLevel
 	type listChildrenResult struct {
@@ -168,7 +185,13 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 		return fmt.Errorf("failed to list children of %s: %w", folder.LocationPath, err)
 	}
 
-	const pageSize = 100
+	w.queue.RecordListFill(len(result.Folders) + len(result.Files))
+
+	const defaultPage = 100
+	pageSize := w.queue.GetListPageSize()
+	if pageSize <= 0 {
+		pageSize = defaultPage
+	}
 	pager := types.NewListPager(result, pageSize)
 
 	if w.isDst {

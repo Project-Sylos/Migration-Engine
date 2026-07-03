@@ -34,6 +34,23 @@ func isEphemeralMode(configPath string) (bool, error) {
 	return config.Mode == "ephemeral", nil
 }
 
+// IsChaosEnabled reports whether the Spectra config has chaos.enabled set.
+func IsChaosEnabled(configPath string) (bool, error) {
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		return false, fmt.Errorf("failed to read config file: %w", err)
+	}
+	var config struct {
+		Chaos *struct {
+			Enabled bool `json:"enabled"`
+		} `json:"chaos"`
+	}
+	if err := json.Unmarshal(configData, &config); err != nil {
+		return false, fmt.Errorf("failed to parse config file: %w", err)
+	}
+	return config.Chaos != nil && config.Chaos.Enabled, nil
+}
+
 // SetupSpectraFS creates a SpectraFS instance, handling DB cleanup appropriately.
 // Since each test run is a separate process, we can't rely on in-memory state.
 // Instead, we check if the DB file exists (from the config) and only clean it if explicitly requested.
@@ -180,14 +197,9 @@ func SetupEphemeralTest(removeMigrationDB bool) (migration.Config, error) {
 	// Create adapters with ephemeral mode enabled.
 	// The adapter will pass depth parameter in ListChildren() calls when needed (ephemeral mode only).
 	// The adapter gets the parent node's depth via GetNode() and passes it to the SDK.
-	srcAdapter, err := spectra.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary", true)
+	srcAdapter, dstAdapter, err := NewSharedSpectraAdapters(spectraFS, srcRoot, dstRoot, true)
 	if err != nil {
-		return migration.Config{}, fmt.Errorf("failed to create src adapter: %w", err)
-	}
-
-	dstAdapter, err := spectra.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1", true)
-	if err != nil {
-		return migration.Config{}, fmt.Errorf("failed to create dst adapter: %w", err)
+		return migration.Config{}, err
 	}
 
 	dbPath, err := filepath.Abs("pkg/tests/traversal/shared/main_test.db")
@@ -225,6 +237,77 @@ func SetupEphemeralTest(removeMigrationDB bool) (migration.Config, error) {
 		return migration.Config{}, err
 	}
 
+	return cfg, nil
+}
+
+// NewSharedSpectraAdapters creates src/dst adapters sharing one degradation state (same SDK backend).
+func NewSharedSpectraAdapters(spectraFS *sdk.SpectraFS, srcRoot, dstRoot types.Folder, ephemeral bool) (*spectra.SpectraFS, *spectra.SpectraFS, error) {
+	deg := types.NewFSDegradationState()
+	srcAdapter, err := spectra.NewSpectraFS(spectraFS, srcRoot.ServiceID, "primary", ephemeral, spectra.WithDegradationState(deg))
+	if err != nil {
+		return nil, nil, fmt.Errorf("create src adapter: %w", err)
+	}
+	dstAdapter, err := spectra.NewSpectraFS(spectraFS, dstRoot.ServiceID, "s1", ephemeral, spectra.WithDegradationState(deg))
+	if err != nil {
+		return nil, nil, fmt.Errorf("create dst adapter: %w", err)
+	}
+	return srcAdapter, dstAdapter, nil
+}
+
+// SetupEphemeralThrottleTest builds ephemeral Spectra config with chaos rate limits for autoscaler testing.
+func SetupEphemeralThrottleTest(removeMigrationDB bool, workerCount int, autoscaler migration.AutoscalerConfig) (migration.Config, error) {
+	fmt.Println("Loading Spectra ephemeral throttle configuration...")
+	spectraFS, err := sdk.New("pkg/tests/traversal/shared/spectra_ephemeral_autoscaler_throttle.json")
+	if err != nil {
+		return migration.Config{}, fmt.Errorf("spectra throttle config: %w", err)
+	}
+	srcRoot, dstRoot, err := LoadSpectraRoots(spectraFS)
+	if err != nil {
+		return migration.Config{}, err
+	}
+	srcAdapter, dstAdapter, err := NewSharedSpectraAdapters(spectraFS, srcRoot, dstRoot, true)
+	if err != nil {
+		return migration.Config{}, err
+	}
+	if workerCount <= 0 {
+		workerCount = 20
+	}
+	dbPath, err := filepath.Abs("pkg/tests/traversal/shared/main_test.db")
+	if err != nil {
+		return migration.Config{}, err
+	}
+	cfg := migration.Config{
+		Database: migration.DatabaseConfig{
+			Path:           dbPath,
+			RemoveExisting: removeMigrationDB,
+		},
+		Source: migration.Service{
+			Name:       "Spectra-Primary",
+			Adapter:    srcAdapter,
+			ProviderID: "spectra",
+		},
+		Destination: migration.Service{
+			Name:       "Spectra-S1",
+			Adapter:    dstAdapter,
+			ProviderID: "spectra",
+		},
+		SeedRoots:       true,
+		WorkerCount:     workerCount,
+		MaxRetries:      3,
+		CoordinatorLead: 4,
+		SkipListener:    true,
+		LogAddress:      "127.0.0.1:8081",
+		LogLevel:        "trace",
+		StartupDelay:    500 * time.Millisecond,
+		ProgressTick:    time.Second,
+		Autoscaler:      autoscaler,
+		Verification: migration.VerifyOptions{
+			AllowNotOnSrc: true,
+		},
+	}
+	if err := cfg.SetRootFolders(srcRoot, dstRoot); err != nil {
+		return migration.Config{}, err
+	}
 	return cfg, nil
 }
 
@@ -269,10 +352,25 @@ func LoadSpectraRoots(spectraFS *sdk.SpectraFS) (types.Folder, types.Folder, err
 	return srcFolder, dstFolder, nil
 }
 
+// LocalTestOptions configures SetupLocalTestWithOptions.
+type LocalTestOptions struct {
+	RemoveMigrationDB bool
+	WorkerCount       int
+	ProgressTick      time.Duration
+	Autoscaler        migration.AutoscalerConfig
+}
+
 // SetupLocalTest assembles a local filesystem-backed migration configuration.
 // srcPath and dstPath are absolute paths to the source and destination directories.
 // removeMigrationDB controls whether to remove the migration database (use false for resumption tests).
 func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.Config, error) {
+	return SetupLocalTestWithOptions(srcPath, dstPath, LocalTestOptions{
+		RemoveMigrationDB: removeMigrationDB,
+	})
+}
+
+// SetupLocalTestWithOptions assembles a local filesystem-backed migration configuration.
+func SetupLocalTestWithOptions(srcPath, dstPath string, opts LocalTestOptions) (migration.Config, error) {
 	fmt.Printf("Setting up local filesystem migration...\n")
 	fmt.Printf("  Source: %s\n", srcPath)
 	fmt.Printf("  Destination: %s\n", dstPath)
@@ -327,10 +425,19 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 		return migration.Config{}, fmt.Errorf("failed to resolve DB path: %w", err)
 	}
 
+	workerCount := opts.WorkerCount
+	if workerCount <= 0 {
+		workerCount = 10
+	}
+	progressTick := opts.ProgressTick
+	if progressTick <= 0 {
+		progressTick = time.Second
+	}
+
 	cfg := migration.Config{
 		Database: migration.DatabaseConfig{
 			Path:           dbPath,
-			RemoveExisting: removeMigrationDB,
+			RemoveExisting: opts.RemoveMigrationDB,
 		},
 		Source: migration.Service{
 			Name:    "Local-Src",
@@ -341,13 +448,15 @@ func SetupLocalTest(srcPath, dstPath string, removeMigrationDB bool) (migration.
 			Adapter: dstAdapter,
 		},
 		SeedRoots:       true,
-		WorkerCount:     10,
+		WorkerCount:     workerCount,
 		MaxRetries:      3,
 		CoordinatorLead: 4,
 		LogAddress:      "127.0.0.1:8081",
 		LogLevel:        "trace",
 		SkipListener:    true,
 		StartupDelay:    1 * time.Second,
+		ProgressTick:    progressTick,
+		Autoscaler:      opts.Autoscaler,
 		Verification:    migration.VerifyOptions{AllowNotOnSrc: true},
 	}
 

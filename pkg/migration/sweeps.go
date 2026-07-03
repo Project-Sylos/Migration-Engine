@@ -11,6 +11,7 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -37,6 +38,9 @@ type SweepConfig struct {
 	OnQueueObserver        func(*queue.QueueObserver)
 	LeaseBatchSize         int
 	RefillBatchSize        int
+	Autoscaler             AutoscalerConfig
+	SrcService             Service
+	DstService             Service
 }
 
 // RunRetrySweep runs a retry sweep to re-process failed or pending tasks from a previous traversal.
@@ -122,6 +126,17 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	}
 	dstQueue.InitializeWithContext(duckDB, cfg.DstAdapter, cfg.ShutdownContext)
 
+	srcListProfile := scaling.ApplyAdapterListPagination(
+		scaling.LookupProfile(cfg.SrcService.ProviderID, cfg.SrcService.Name),
+		cfg.SrcAdapter,
+	)
+	dstListProfile := scaling.ApplyAdapterListPagination(
+		scaling.LookupProfile(cfg.DstService.ProviderID, cfg.DstService.Name),
+		cfg.DstAdapter,
+	)
+	scaling.ApplyQueueListPagination(srcQueue, srcListProfile)
+	scaling.ApplyQueueListPagination(dstQueue, dstListProfile)
+
 	// Set initial rounds to 0 for retry sweep
 	srcQueue.SetRound(0)
 	dstQueue.SetRound(0)
@@ -154,6 +169,13 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	if cfg.OnQueueObserver != nil {
 		cfg.OnQueueObserver(observer)
 	}
+
+	runCtx := cfg.ShutdownContext
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
+	asCtx := startAutoscaler(runCtx, cfg.Autoscaler, observer, duckDB, srcQueue, dstQueue, cfg.SrcService, cfg.DstService)
+	defer asCtx.stop()
 
 	// Set up stats channels for progress updates
 	srcStatsChan := make(chan queue.QueueStats, 10)

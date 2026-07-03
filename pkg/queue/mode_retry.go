@@ -12,23 +12,16 @@ import (
 )
 
 // PullRetryTasks pulls retry tasks from failed/pending status buckets.
-// Checks maxKnownDepth and scans all known levels up to maxKnownDepth, then uses normal traversal logic for deeper levels.
-// Uses getter/setter methods - no direct mutex access.
-func (q *Queue) PullRetryTasks(force bool) {
+func (q *Queue) PullRetryTasks(force bool) PullResult {
 	database := q.getDatabase()
 	if database == nil {
-		return
+		return PullResult{Status: PullAborted}
 	}
-
-	// Check pulling flag FIRST before any other logic
-	// This prevents multiple threads from executing pull logic concurrently
 	if q.getPulling() {
-		return
+		return PullResult{Round: q.GetRound(), Status: PullSkipped}
 	}
-
-	// Don't pull if queue is completed (prevents deadlock on coordinator gate)
 	if q.State() == QueueStateCompleted {
-		return
+		return PullResult{Status: PullAborted}
 	}
 
 	// Set pulling flag early and defer clearing it
@@ -42,15 +35,11 @@ func (q *Queue) PullRetryTasks(force bool) {
 	snapshot := q.getStateSnapshot()
 
 	if !force {
-		// Only pull if queue is running (not paused or completed)
 		if snapshot.State != QueueStateRunning || snapshot.PendingCount > snapshot.PullLowWM {
-			return
+			return PullResult{Round: snapshot.Round, Status: PullSkipped}
 		}
-	} else {
-		// Even when forcing, don't pull if paused
-		if snapshot.State == QueueStatePaused {
-			return
-		}
+	} else if snapshot.State == QueueStatePaused {
+		return PullResult{Round: snapshot.Round, Status: PullAborted}
 	}
 
 	currentRound := snapshot.Round
@@ -61,8 +50,7 @@ func (q *Queue) PullRetryTasks(force bool) {
 	if q.name == "dst" && coordinator != nil {
 		canStartRound := coordinator.CanDstStartRound(currentRound)
 		if !canStartRound {
-			// Can't start this round yet - wait for coordinator gate
-			return
+			return PullResult{Round: currentRound, Status: PullSkipped}
 		}
 	}
 
@@ -123,7 +111,7 @@ func (q *Queue) PullRetryTasks(force bool) {
 					fmt.Println("error logging", err)
 				}
 			}
-			return
+			return PullResult{Round: currentRound, Status: PullSkipped}
 		}
 		if len(batch) == 0 && q.name == "dst" {
 			expectedFoldersMap = make(map[string][]types.Folder)
@@ -202,18 +190,12 @@ func (q *Queue) PullRetryTasks(force bool) {
 			}
 		}
 
-		// lastPullWasPartial = keyspace exhausted (got <= batchSize from DB)
-		q.setLastPullWasPartial(rawResultCount <= batchSize)
-
-		// Record pull in RoundInfo
-		q.recordPull(currentRound, enqueuedCount, q.GetLastPullWasPartial())
+		partial := rawResultCount <= batchSize
+		q.setLastPullWasPartial(partial)
+		q.recordPull(currentRound, enqueuedCount, partial)
 		q.setFirstPullForRound(false)
-
-		return
+		return PullResult{Round: currentRound, Yield: enqueuedCount, Partial: partial, QueriedDB: true, Status: PullOK}
 	}
 
-	// For rounds > maxKnownDepth, use normal traversal pull logic
-	// This allows discovering new deeper levels
-	// Note: PullTraversalTasks will handle incrementing counters itself
-	q.PullTraversalTasks(force)
+	return q.PullTraversalTasks(force)
 }

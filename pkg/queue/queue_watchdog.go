@@ -92,7 +92,12 @@ func (wd *QueueWatchdog) checkForStall() {
 	pending := wd.queue.GetPendingCount()
 
 	if inProgress == 0 && pending == 0 {
-		return // No work, not a stall
+		st := wd.queue.State()
+		if st == QueueStateRunning && elapsed >= wd.stallTimeout {
+			wd.dumpCompletionStall(elapsed)
+			wd.Beat()
+		}
+		return
 	}
 
 	// Queue appears stalled - dump state
@@ -177,5 +182,30 @@ func (wd *QueueWatchdog) dumpState(stalledFor time.Duration, inProgress, pending
 	}
 	wd.queue.mu.RUnlock()
 
+	fmt.Printf("========================================\n\n")
+}
+
+func (wd *QueueWatchdog) dumpCompletionStall(stalledFor time.Duration) {
+	round := wd.queue.GetRound()
+	info := wd.queue.getRoundInfoReadOnly(round)
+	fmt.Printf("\n")
+	fmt.Printf("========================================\n")
+	fmt.Printf("QUEUE WATCHDOG: COMPLETION STALL\n")
+	fmt.Printf("========================================\n")
+	fmt.Printf("Queue: %s\n", wd.queue.Name())
+	fmt.Printf("Stalled for: %v\n", stalledFor.Round(time.Second))
+	fmt.Printf("State: %s\n", wd.queue.State())
+	fmt.Printf("Mode: %s\n", wd.queue.GetMode())
+	fmt.Printf("Round: %d\n", round)
+	fmt.Printf("Pending: 0 | InProgress: 0\n")
+	fmt.Printf("Pulling: %v\n", wd.queue.getPulling())
+	fmt.Printf("LastPullWasPartial: %v\n", wd.queue.GetLastPullWasPartial())
+	if info != nil {
+		fmt.Printf("RoundInfo[%d]: PullCount=%d LastPartialPull=%v LastBatchYield=%d\n",
+			round, info.PullCount, info.LastPartialPull, info.LastBatchYield)
+	} else {
+		fmt.Printf("RoundInfo[%d]: (none)\n", round)
+	}
+	fmt.Printf("HasCountedPull: %v\n", wd.queue.roundHasCountedPull(round))
 	fmt.Printf("========================================\n\n")
 }

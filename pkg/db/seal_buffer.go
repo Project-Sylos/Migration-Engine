@@ -270,6 +270,10 @@ type SealBuffer struct {
 	flushActive    int32
 	depthWaiters   int32
 	hardCapWaiters int32
+	// Autoscaler telemetry (atomic; HWM/hits/flushes reset on TelemetrySnapshot read).
+	telemetryHWM          int64
+	telemetryHardCapHits  int64
+	telemetryFlushCount   int64
 }
 
 // SealBufferOptions configures the seal buffer. Zero value uses defaults.
@@ -329,6 +333,7 @@ func NewSealBuffer(db *DB, opts SealBufferOptions) *SealBuffer {
 // waitBelowHardCapLocked blocks until rowsSinceFlush < hardCap. sb.mu must be held.
 func (sb *SealBuffer) waitBelowHardCapLocked() {
 	for sb.rowsSinceFlush >= sb.hardCap {
+		sb.noteHardCapHit()
 		atomic.AddInt32(&sb.hardCapWaiters, 1)
 		sb.cond.Wait()
 		atomic.AddInt32(&sb.hardCapWaiters, -1)
@@ -424,6 +429,7 @@ func (sb *SealBuffer) Add(table string, depth int, nodes []*NodeState, pending, 
 		CopyF:      copyF,
 	})
 	sb.rowsSinceFlush += n
+	sb.noteRowsLocked(int64(sb.rowsSinceFlush))
 	sb.cond.Broadcast()
 	sb.mu.Unlock()
 	// Flush immediately after each seal so the queue holds at most one round (max 1 job).
@@ -544,6 +550,7 @@ func (sb *SealBuffer) drain() ([]SealJob, []TaskErrorRecord, []string) {
 	sb.taskErrorsQueue = make([]TaskErrorRecord, 0, cap(sb.taskErrorsQueue))
 	sb.failedSubtreePaths = sb.failedSubtreePaths[:0]
 	sb.rowsSinceFlush = 0
+	sb.noteFlushComplete()
 	sb.cond.Broadcast()
 	return out, taskErrors, subtreePaths
 }

@@ -67,9 +67,11 @@ func marshalPersistedRunConfigJSON(cfg Config) ([]byte, error) {
 
 // Service defines a single filesystem service participating in a migration.
 type Service struct {
-	Name    string
-	Adapter types.FSAdapter
-	Root    types.Folder
+	Name           string
+	Adapter        types.FSAdapter
+	Root           types.Folder
+	ProviderID     string // optional: "spectra", "local", "generic"
+	BackendGroupID string // optional: shared rate-limit pool id
 }
 
 // Config aggregates all of the knobs required to run the migration engine once.
@@ -94,9 +96,10 @@ type Config struct {
 	Verification VerifyOptions
 
 	// ShutdownContext is an optional context for force shutdown control.
-	// If not provided, LetsMigrate will create one internally.
-	// Set this when using StartMigration for programmatic shutdown control.
 	ShutdownContext context.Context
+
+	// Autoscaler enables in-engine throughput tuning during traversal/copy.
+	Autoscaler AutoscalerConfig
 }
 
 // Result captures the outcome of a migration run.

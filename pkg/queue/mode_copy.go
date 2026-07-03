@@ -80,7 +80,7 @@ func (q *Queue) AdvanceCopyRound() {
 		if completed {
 			return
 		}
-		q.PullTasksIfNeeded(true)
+		q.pullWithRetryIfNeeded(true)
 		return
 	}
 
@@ -101,27 +101,22 @@ func (q *Queue) AdvanceCopyRound() {
 	}
 
 	// Pull tasks for the new round
-	q.PullTasksIfNeeded(true)
+	q.pullWithRetryIfNeeded(true)
 }
 
 // PullCopyTasks pulls copy tasks from DuckDB for the current round.
 // Pulls from SRC copy status buckets, filters by pass (folders vs files), and skips round 0.
 // Uses getter/setter methods - no direct mutex access.
-func (q *Queue) PullCopyTasks(force bool) {
+func (q *Queue) PullCopyTasks(force bool) PullResult {
 	database := q.getDatabase()
 	if database == nil {
-		return
+		return PullResult{Status: PullAborted}
 	}
-
-	// Check pulling flag FIRST before any other logic
-	// This prevents multiple threads from executing pull logic concurrently
 	if q.getPulling() {
-		return
+		return PullResult{Round: q.GetRound(), Status: PullSkipped}
 	}
-
-	// Don't pull if queue is completed
 	if q.State() == QueueStateCompleted {
-		return
+		return PullResult{Status: PullAborted}
 	}
 
 	// Set pulling flag early and defer clearing it
@@ -135,15 +130,15 @@ func (q *Queue) PullCopyTasks(force bool) {
 
 	snapshot := q.getStateSnapshot()
 	if snapshot.State == QueueStatePaused {
-		return
+		return PullResult{Round: snapshot.Round, Status: PullAborted}
 	}
 	if !force && snapshot.PendingCount > snapshot.PullLowWM {
-		return
+		return PullResult{Round: snapshot.Round, Status: PullSkipped}
 	}
 
 	currentRound := snapshot.Round
 	if currentRound == 0 {
-		return
+		return PullResult{Round: 0, Status: PullSkipped}
 	}
 
 	copyPass := q.GetCopyPass()
@@ -164,7 +159,10 @@ func (q *Queue) PullCopyTasks(force bool) {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("error", fmt.Sprintf("ListNodesCopyKeyset failed: %v", err), "queue", q.name, q.name)
 		}
-		return
+		return PullResult{Round: currentRound, Status: PullSkipped}
+	}
+	if q.GetRound() != currentRound {
+		return PullResult{Round: currentRound, QueriedDB: true, Status: PullStaleRound}
 	}
 	// Process at most batchSize items this pull; the extra (+1) is only for exhaustion detection
 	processLimit := min(batchSize, len(results))
@@ -241,9 +239,11 @@ func (q *Queue) PullCopyTasks(force bool) {
 
 	}
 
-	// Record pull in RoundInfo; lastPullWasPartial already set from raw DB result count
-	q.recordPull(currentRound, enqueueSuccessCount, q.GetLastPullWasPartial())
+	partial := len(results) <= batchSize
+	q.setLastPullWasPartial(partial)
+	q.recordPull(currentRound, enqueueSuccessCount, partial)
 	q.setFirstPullForRound(false)
+	return PullResult{Round: currentRound, Yield: enqueueSuccessCount, Partial: partial, QueriedDB: true, Status: PullOK}
 }
 
 // nodeStateToCopyTask converts a NodeState to a copy TaskBase.

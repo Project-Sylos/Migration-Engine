@@ -25,22 +25,25 @@ const (
 type CopyWorker struct {
 	id          string
 	queue       *Queue
-	srcAdapter  types.FSAdapter // Source adapter for reading files
-	dstAdapter  types.FSAdapter // Destination adapter for writing files/folders
-	queueName   string          // "copy" for logging
-	shutdownCtx context.Context // Context for shutdown signaling (optional)
-	copyBuffer  []byte          // Reusable buffer for streaming
+	srcAdapter  types.FSAdapter
+	dstAdapter  types.FSAdapter
+	queueName   string
+	shutdownCtx context.Context
+	workerCtx   context.Context
+	copyBuffer  []byte
 }
 
-// NewCopyWorker creates a worker that executes copy tasks.
-// shutdownCtx is optional - if provided, the worker will check for cancellation and exit on shutdown.
 func NewCopyWorker(
 	id string,
 	queue *Queue,
 	srcAdapter types.FSAdapter,
 	dstAdapter types.FSAdapter,
 	shutdownCtx context.Context,
+	workerCtx context.Context,
 ) *CopyWorker {
+	if workerCtx == nil {
+		workerCtx = shutdownCtx
+	}
 	return &CopyWorker{
 		id:          id,
 		queue:       queue,
@@ -48,6 +51,7 @@ func NewCopyWorker(
 		dstAdapter:  dstAdapter,
 		queueName:   "copy",
 		shutdownCtx: shutdownCtx,
+		workerCtx:   workerCtx,
 		copyBuffer:  make([]byte, defaultCopyBufferSize),
 	}
 }
@@ -69,7 +73,6 @@ func (w *CopyWorker) Run() {
 		if w.shutdownCtx != nil {
 			select {
 			case <-w.shutdownCtx.Done():
-				// Shutdown triggered - exit immediately
 				if logservice.LS != nil {
 					err := logservice.LS.Log("info", "Copy worker exiting - shutdown requested", "worker", w.id, w.queueName)
 					if err != nil {
@@ -78,7 +81,19 @@ func (w *CopyWorker) Run() {
 				}
 				return
 			default:
-				// Continue normal execution
+			}
+		}
+		if w.workerCtx != nil {
+			select {
+			case <-w.workerCtx.Done():
+				if logservice.LS != nil {
+					err := logservice.LS.Log("info", "Copy worker exiting - scale down", "worker", w.id, w.queueName)
+					if err != nil {
+						fmt.Println("error logging", err)
+					}
+				}
+				return
+			default:
 			}
 		}
 
@@ -145,6 +160,8 @@ func (w *CopyWorker) execute(task *TaskBase) error {
 	}
 	wd, ctx := NewProgressWatchdog(parent, copyStallTimeout, w.queue.sealIOWaitActive)
 	defer wd.Stop()
+
+	w.queue.WaitInterOp(w.workerCtx)
 
 	// This whole block of code looks like an x-wing fighter from star wars lol...
 	switch task.CopyPass {
@@ -414,6 +431,7 @@ func (w *CopyWorker) listDstChildrenAggregated(dstParentID, parentPath string, p
 			return types.ListResult{}, out.err
 		}
 		wd.Beat()
+		w.queue.RecordListFill(len(out.result.Folders) + len(out.result.Files))
 	case <-ctx.Done():
 		return types.ListResult{}, fmt.Errorf("list destination children cancelled: %w", ctx.Err())
 	case <-shutdownCh:

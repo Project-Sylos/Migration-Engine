@@ -14,6 +14,7 @@ pkg/tests/
 │   ├── shared/           # setup.go, verify.go, test_utils.go, spectra.json, cleanup scripts
 │   ├── normal/           # Happy-path traversal (main.go, run.sh / run.ps1)
 │   ├── ephemeral/        # Ephemeral Spectra mode
+│   ├── autoscaler_throttle/  # Spectra chaos rate limits + autoscaler scale-back
 │   ├── local/            # Local-focused runner
 │   ├── resumption/       # Shutdown + resume (run_resumption_test.sh / .ps1)
 │   └── retry_sweep/      # Mark retry, subtree behavior, re-run sweep (main.go, run.sh / run.ps1)
@@ -41,6 +42,7 @@ There is **no** top-level `pkg/tests/normal/` or `pkg/tests/retry_sweep/`—thos
 |------|---------|
 | **`traversal/normal`** | Fresh traversal to completion; **`migration.LetsMigrate`**. |
 | **`traversal/ephemeral`** | Same idea with ephemeral Spectra config. |
+| **`traversal/autoscaler_throttle`** | Ephemeral Spectra with chaos rate limits; asserts autoscaler worker step-down under throttle. |
 | **`traversal/local`** | Local-oriented entry (see `main.go`). |
 | **`traversal/resumption`** | **`StartMigration`**, interrupt, then **`LetsMigrate`** again with `-resume` (see script + `main.go`). |
 | **`traversal/retry_sweep`** | Full migration, then mark-for-retry / subtree / **`RunRetrySweep`** (engine retry sweep)—uses **DuckDB** tables and status events, not legacy “level bucket” storage. |

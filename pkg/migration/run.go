@@ -12,6 +12,7 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -41,6 +42,11 @@ type MigrationConfig struct {
 	ObserverPollInterval time.Duration
 	// OnQueueObserver is called with the live observer after queues register, and with nil when the run exits (before observer.Stop).
 	OnQueueObserver func(*queue.QueueObserver)
+
+	Autoscaler AutoscalerConfig
+
+	SrcService Service
+	DstService Service
 }
 
 // RuntimeStats captures execution statistics at the end of a migration run.
@@ -110,6 +116,17 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	srcQueue.InitializeWithContext(database, cfg.SrcAdapter, cfg.ShutdownContext)
 	dstQueue.InitializeWithContext(database, cfg.DstAdapter, cfg.ShutdownContext)
 
+	srcListProfile := scaling.ApplyAdapterListPagination(
+		scaling.LookupProfile(cfg.SrcService.ProviderID, cfg.SrcService.Name),
+		cfg.SrcAdapter,
+	)
+	dstListProfile := scaling.ApplyAdapterListPagination(
+		scaling.LookupProfile(cfg.DstService.ProviderID, cfg.DstService.Name),
+		cfg.DstAdapter,
+	)
+	scaling.ApplyQueueListPagination(srcQueue, srcListProfile)
+	scaling.ApplyQueueListPagination(dstQueue, dstListProfile)
+
 	if cfg.ResumeTraversal != nil {
 		srcQueue.SetRound(0)
 		dstQueue.SetRound(0)
@@ -161,17 +178,25 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		cfg.OnQueueObserver(observer)
 	}
 
+	runCtx := cfg.ShutdownContext
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
+	asCtx := startAutoscaler(runCtx, cfg.Autoscaler, observer, database, srcQueue, dstQueue, cfg.SrcService, cfg.DstService)
+	defer asCtx.stop()
+
 	// Set up stats channels for UDP logging (after queues are running)
 	srcStatsChan := make(chan queue.QueueStats, 10)
 	dstStatsChan := make(chan queue.QueueStats, 10)
 	srcQueue.SetStatsChannel(srcStatsChan)
 	dstQueue.SetStatsChannel(dstStatsChan)
 
+	printTraversalProgressFromQueues(srcQueue, dstQueue)
+
 	statsCtx, statsCancel := context.WithCancel(context.Background())
 	defer statsCancel()
 
 	// Start stats consumer goroutine for progress updates (fmt output, not log service)
-	// Accumulate stats from both channels and print them together
 	go func() {
 		var lastSrcStats *queue.QueueStats
 		var lastDstStats *queue.QueueStats
@@ -255,6 +280,8 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 		select {
 		case <-progressTicker.C:
+			// Live progress each tick (survives scaling-event newlines and \r-only lines in some terminals).
+			printTraversalProgressFromQueues(srcQueue, dstQueue)
 			// Re-check exhaustion from coordinator (queues might have completed during tick)
 			if coordinator.IsCompleted("both") {
 				observer.Stop()
@@ -270,10 +297,22 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 func printTraversalProgress(srcQueue, dstQueue *queue.Queue, lastSrcStats, lastDstStats *queue.QueueStats) {
 	if lastSrcStats == nil || lastDstStats == nil {
+		printTraversalProgressFromQueues(srcQueue, dstQueue)
 		return
 	}
-	srcRoundStats := srcQueue.GetRoundStats(lastSrcStats.Round)
-	dstRoundStats := dstQueue.GetRoundStats(lastDstStats.Round)
+	printTraversalProgressLine(srcQueue, dstQueue, *lastSrcStats, *lastDstStats)
+}
+
+func printTraversalProgressFromQueues(srcQueue, dstQueue *queue.Queue) {
+	if srcQueue == nil || dstQueue == nil {
+		return
+	}
+	printTraversalProgressLine(srcQueue, dstQueue, srcQueue.Stats(), dstQueue.Stats())
+}
+
+func printTraversalProgressLine(srcQueue, dstQueue *queue.Queue, srcLive, dstLive queue.QueueStats) {
+	srcRoundStats := srcQueue.GetRoundStats(srcLive.Round)
+	dstRoundStats := dstQueue.GetRoundStats(dstLive.Round)
 	srcExpected, srcCompleted := 0, 0
 	if srcRoundStats != nil {
 		srcExpected = srcRoundStats.Expected
@@ -284,9 +323,9 @@ func printTraversalProgress(srcQueue, dstQueue *queue.Queue, lastSrcStats, lastD
 		dstExpected = dstRoundStats.Expected
 		dstCompleted = dstRoundStats.Completed
 	}
-	fmt.Printf("\r  Src: Round %d (Expected:%d Completed:%d) | Dst: Round %d (Expected:%d Completed:%d)   ",
-		lastSrcStats.Round, srcExpected, srcCompleted,
-		lastDstStats.Round, dstExpected, dstCompleted)
+	fmt.Printf("\r  Src: Round %d (Exp:%d Comp:%d Pend:%d W:%d) | Dst: Round %d (Exp:%d Comp:%d Pend:%d W:%d)   ",
+		srcLive.Round, srcExpected, srcCompleted, srcLive.Pending, srcLive.Workers,
+		dstLive.Round, dstExpected, dstCompleted, dstLive.Pending, dstLive.Workers)
 }
 
 func snapshotTraversalQueueStats(database *db.DB, coordinator *queue.QueueCoordinator) (queue.QueueStats, queue.QueueStats) {

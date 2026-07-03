@@ -394,6 +394,21 @@ func (db *DB) SealIOWaitActive() bool {
 	return db != nil && db.sealBuffer != nil && db.sealBuffer.IOWaitActive()
 }
 
+// SealBufferTelemetry returns seal buffer gauges and read-and-reset event counters.
+func (db *DB) SealBufferTelemetry() SealBufferTelemetry {
+	if db == nil || db.sealBuffer == nil {
+		return SealBufferTelemetry{}
+	}
+	return db.sealBuffer.TelemetrySnapshot()
+}
+
+// UpdateSealBufferOptions hot-updates seal buffer tuning knobs.
+func (db *DB) UpdateSealBufferOptions(opts SealBufferOptions) {
+	if db != nil && db.sealBuffer != nil {
+		db.sealBuffer.UpdateOptions(opts)
+	}
+}
+
 // AppendDiscoveredNodes adds discovered nodes (and their initial status events) to the seal buffer discovery queue. Call from traversal completion; flush is async until FlushAppenderBuffer.
 func (db *DB) AppendDiscoveredNodes(ops []InsertOperation) {
 	if db.sealBuffer != nil && len(ops) > 0 {

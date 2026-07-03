@@ -402,6 +402,9 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 		ResumeTraversal:      resume,
 		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
 		OnQueueObserver:      func(o *queue.QueueObserver) { m.setActiveQueueObserver(o) },
+		Autoscaler:           cfg.Autoscaler,
+		SrcService:           cfg.Source,
+		DstService:           cfg.Destination,
 	})
 	if err != nil {
 		if errors.Is(err, ErrTraversalSoftSuspended) {
@@ -483,6 +486,9 @@ func (m *Migration) StartCopy(cfg Config) (queue.QueueStats, error) {
 		ResumeCopy:           resumeCopy,
 		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
 		OnQueueObserver:      func(o *queue.QueueObserver) { m.setActiveQueueObserver(o) },
+		Autoscaler:           cfg.Autoscaler,
+		SrcService:           cfg.Source,
+		DstService:           cfg.Destination,
 	})
 	if err != nil {
 		if errors.Is(err, ErrCopySoftSuspended) {
@@ -590,6 +596,9 @@ func (m *Migration) RunRetrySweep(cfg Config, opts RetrySweepOptions) (RuntimeSt
 		ShutdownContext:      runCtx,
 		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
 		OnQueueObserver:      func(o *queue.QueueObserver) { m.setActiveQueueObserver(o) },
+		Autoscaler:           cfg.Autoscaler,
+		SrcService:           cfg.Source,
+		DstService:           cfg.Destination,
 	})
 	if err != nil {
 		if errors.Is(err, ErrTraversalSoftSuspended) {
@@ -688,6 +697,9 @@ func (m *Migration) RunCopyRetry(cfg Config, opts CopyPhaseOptions) (queue.Queue
 		ShutdownContext:      runCtx,
 		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
 		OnQueueObserver:      func(o *queue.QueueObserver) { m.setActiveQueueObserver(o) },
+		Autoscaler:           cfg.Autoscaler,
+		SrcService:           cfg.Source,
+		DstService:           cfg.Destination,
 	})
 	if err != nil {
 		if errors.Is(err, ErrCopySoftSuspended) {

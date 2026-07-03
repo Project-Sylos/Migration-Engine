@@ -95,6 +95,7 @@ type QueueObserver struct {
 	running        bool // Whether the observe loop is running
 	// Internal metrics (in-memory only, for autoscaling)
 	internalMetrics map[string]*InternalQueueMetrics // Per-queue internal metrics
+	rateLimitSources map[string]RateLimitTelemetry
 	// EMA rate tracking
 	prevEMARates map[string]float64 // Previous EMA values for rate smoothing (key: queueName)
 	// Discovery totals tracking for delta calculation
@@ -110,6 +111,10 @@ type QueueObserver struct {
 		files   int64
 		time    time.Time
 	} // Previous copy totals and time for each queue
+	prevTaskCompletionTotals map[string]struct {
+		tasks int64
+		time  time.Time
+	}
 	// lastAPIMetrics: marshaled ExternalQueueMetrics per queue_stats key (e.g. src-traversal), for O(1) API reads.
 	lastAPIMetricsMu sync.RWMutex
 	lastAPIMetrics   map[string][]byte
@@ -146,6 +151,10 @@ func NewQueueObserver(database *db.DB, updateInterval time.Duration) *QueueObser
 			files   int64
 			time    time.Time
 		}),
+		prevTaskCompletionTotals: make(map[string]struct {
+			tasks int64
+			time  time.Time
+		}),
 	}
 }
 
@@ -172,8 +181,10 @@ func (o *QueueObserver) UnregisterQueue(queueName string) {
 	delete(o.queues, queueName)
 	delete(o.internalMetrics, queueName)
 	delete(o.prevEMARates, queueName)
+	delete(o.prevEMARates, queueName+"-tasks")
 	delete(o.prevDiscoveryTotals, queueName)
 	delete(o.prevCopyTotals, queueName)
+	delete(o.prevTaskCompletionTotals, queueName)
 }
 
 // Start begins the observer loop that publishes stats to DuckDB.
@@ -367,9 +378,11 @@ func (o *QueueObserver) pollQueue(queueName string, queue *Queue) *ExternalQueue
 
 	// Update internal metrics (state tracking)
 	o.updateInternalMetrics(queueName, queue, currentState, now)
+	o.updateRateLimitMetrics(queueName, now)
 
 	// Calculate EMA-smoothed discovery rate (traversal phase)
 	discoveryRate := o.calculateDiscoveryRate(queueName, filesTotal, foldersTotal, now)
+	o.calculateTaskCompletionRate(queueName, queue.GetTasksCompletedTotal(), now)
 
 	// Calculate copy phase rates (EMA-smoothed)
 	itemsPerSecond := o.calculateItemsPerSecond(queueName, foldersCreatedTotal, filesCreatedTotal, now)
@@ -450,6 +463,46 @@ func (o *QueueObserver) calculateDiscoveryRate(queueName string, filesTotal, fol
 		time:    now,
 	}
 
+	return newEMA
+}
+
+// calculateTaskCompletionRate calculates EMA-smoothed traversal/copy task completion rate (≈ FS ops/sec).
+func (o *QueueObserver) calculateTaskCompletionRate(queueName string, tasksTotal int64, now time.Time) float64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	prev, hasPrev := o.prevTaskCompletionTotals[queueName]
+	if !hasPrev {
+		o.prevTaskCompletionTotals[queueName] = struct {
+			tasks int64
+			time  time.Time
+		}{tasks: tasksTotal, time: now}
+		o.prevEMARates[queueName+"-tasks"] = 0
+		return 0
+	}
+
+	if o.database != nil && o.database.SealIOWaitActive() {
+		return o.prevEMARates[queueName+"-tasks"]
+	}
+
+	timeDelta := now.Sub(prev.time).Seconds()
+	if timeDelta <= 0 {
+		return o.prevEMARates[queueName+"-tasks"]
+	}
+
+	taskDelta := tasksTotal - prev.tasks
+	if taskDelta < 0 {
+		taskDelta = 0
+	}
+	currentRate := float64(taskDelta) / timeDelta
+
+	prevEMA := o.prevEMARates[queueName+"-tasks"]
+	newEMA := emaAlpha*currentRate + (1-emaAlpha)*prevEMA
+	o.prevEMARates[queueName+"-tasks"] = newEMA
+	o.prevTaskCompletionTotals[queueName] = struct {
+		tasks int64
+		time  time.Time
+	}{tasks: tasksTotal, time: now}
 	return newEMA
 }
 
@@ -636,6 +689,36 @@ func (o *QueueObserver) updateInternalMetrics(queueName string, queue *Queue, cu
 	} else {
 		// Same state - update last state change time for next delta calculation
 		internal.LastStateChangeTime = now
+	}
+}
+
+func (o *QueueObserver) updateRateLimitMetrics(queueName string, now time.Time) {
+	o.mu.Lock()
+	src, ok := o.rateLimitSources[queueName]
+	internal := o.internalMetrics[queueName]
+	o.mu.Unlock()
+	if !ok || src == nil || internal == nil {
+		return
+	}
+	hits := src.TakeRecentHits()
+	if hits > 0 {
+		o.mu.Lock()
+		if m := o.internalMetrics[queueName]; m != nil {
+			m.TimeRateLimited += time.Duration(hits) * 50 * time.Millisecond
+		}
+		o.mu.Unlock()
+	}
+	until := src.RateLimitedUntil()
+	if until.After(now) {
+		o.mu.Lock()
+		if m := o.internalMetrics[queueName]; m != nil {
+			delta := until.Sub(now)
+			if delta > o.updateInterval {
+				delta = o.updateInterval
+			}
+			m.TimeRateLimited += delta
+		}
+		o.mu.Unlock()
 	}
 }
 

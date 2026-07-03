@@ -67,6 +67,13 @@ func (q *Queue) incrementTasksCompletedTotal() {
 	q.tasksCompletedTotal++
 }
 
+// GetTasksCompletedTotal returns completed traversal/copy tasks (≈ FS op completions).
+func (q *Queue) GetTasksCompletedTotal() int64 {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.tasksCompletedTotal
+}
+
 // SetCopyPass sets the current copy pass.
 func (q *Queue) SetCopyPass(pass int) {
 	q.mu.Lock()
@@ -854,11 +861,7 @@ func (q *Queue) dequeuePending() *TaskBase {
 		_, inProgress := q.inProgress[nodeID]
 		q.mu.Unlock()
 
-		if task.Round < currentRound {
-			q.recordDequeueSkip("old_round", currentRound)
-			continue // Skip old round tasks
-		}
-
+		// Lease tasks even when task.Round < queue round (buffered work from before round advance).
 		if inProgress {
 			q.recordDequeueSkip("already_in_progress", currentRound)
 			continue

@@ -31,6 +31,9 @@ type CopyPhaseConfig struct {
 	SoftSuspendRequested func() bool
 	ObserverPollInterval time.Duration
 	OnQueueObserver      func(*queue.QueueObserver)
+	Autoscaler           AutoscalerConfig
+	SrcService           Service
+	DstService           Service
 }
 
 // applyCopyResumeDstExistenceWindow enables the copy queue's one-shot dst ListChildren precheck when
@@ -132,10 +135,19 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	if cfg.OnQueueObserver != nil {
 		defer cfg.OnQueueObserver(nil)
 	}
+	observer.RegisterQueue("copy", copyQueue)
 	copyQueue.SetObserver(observer)
 	if cfg.OnQueueObserver != nil {
 		cfg.OnQueueObserver(observer)
 	}
+
+	runCtx := shutdownCtx
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
+	asCtx := startCopyAutoscaler(runCtx, cfg.Autoscaler, observer, duckDB, copyQueue, cfg.SrcService, cfg.DstService)
+	defer asCtx.stop()
+
 	statsChan := make(chan queue.QueueStats, 10)
 	copyQueue.SetStatsChannel(statsChan)
 	progressTick := progressTickFromConfigAndSuspend(cfg.ProgressTick, nil, 2*time.Second)
@@ -364,12 +376,18 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		defer cfg.OnQueueObserver(nil)
 	}
 
-	// Register copy queue with observer
 	observer.RegisterQueue("copy", copyQueue)
 	copyQueue.SetObserver(observer)
 	if cfg.OnQueueObserver != nil {
 		cfg.OnQueueObserver(observer)
 	}
+
+	runCtx := shutdownCtx
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
+	asCtx := startCopyAutoscaler(runCtx, cfg.Autoscaler, observer, duckDB, copyQueue, cfg.SrcService, cfg.DstService)
+	defer asCtx.stop()
 
 	// Set up stats channel for progress updates
 	statsChan := make(chan queue.QueueStats, 10)
