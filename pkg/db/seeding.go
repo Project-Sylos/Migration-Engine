@@ -44,10 +44,10 @@ func InsertRootNode(d *DB, table string, state *NodeState) error {
 				return err
 			}
 			deltas := []ReviewStatsDelta{
-				{Key: reviewKeyForTraversalStatus(trav), Delta: 1},
+				{Key: reviewKeyForStatus("traversal", trav), Delta: 1},
 			}
 			if table == "SRC" {
-				if key := reviewKeyForCopyStatus(copyStatus); key != "" {
+				if key := reviewKeyForStatus("copy", copyStatus); key != "" {
 					deltas = append(deltas, ReviewStatsDelta{Key: key, Delta: 1})
 				}
 			}

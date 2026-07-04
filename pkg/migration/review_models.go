@@ -64,7 +64,8 @@ type ListChildrenDiffsRequest struct {
 	SortBy        string
 	SortDirection string
 	FoldersOnly   bool
-	Status        string
+	TraversalStatus string
+	CopyStatus      string
 }
 
 type ListChildrenDiffsResult struct {
@@ -89,11 +90,12 @@ type SearchRequest struct {
 	SortBy        string
 	SortDirection string
 	FoldersOnly   bool
-	Status        string // legacy: OR across src/dst traversal + copy_status
 
-	// Structured search (preferred). When non-empty, Status is ignored.
+	// Structured search. StatusSearchType + TraversalStatus + CopyStatus filter rows.
 	Conditions       []PathReviewSearchCondition `json:"conditions,omitempty"`
 	StatusSearchType string                      `json:"statusSearchType,omitempty"` // traversal, copy, both
+	TraversalStatus  string                      `json:"traversalStatus,omitempty"`
+	CopyStatus       string                      `json:"copyStatus,omitempty"`
 }
 
 type SearchResult struct {

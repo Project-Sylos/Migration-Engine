@@ -174,30 +174,12 @@ func newCopySuspendState(
 	}
 }
 
-// traversalSuspendRuntimeMergePatch returns JSON for updateRuntimeState (merges suspend_v1 and legacy keys).
+// traversalSuspendRuntimeMergePatch returns JSON for updateRuntimeState with suspend_v1 payload.
 func traversalSuspendRuntimeMergePatch(s RuntimeSuspendV1) (string, error) {
 	merged, err := mergeRuntimeSuspendV1(make(map[string]any), s)
 	if err != nil {
 		return "", err
 	}
-	merged["last_round_src"] = s.LastRoundSrc
-	merged["last_round_dst"] = s.LastRoundDst
-	merged["max_known_depth"] = s.MaxKnownDepth
-	raw, err := json.Marshal(merged)
-	if err != nil {
-		return "", err
-	}
-	return string(raw), nil
-}
-
-// copySuspendRuntimeMergePatch returns JSON for updateRuntimeState after copy soft suspend.
-func copySuspendRuntimeMergePatch(s RuntimeSuspendV1) (string, error) {
-	merged, err := mergeRuntimeSuspendV1(make(map[string]any), s)
-	if err != nil {
-		return "", err
-	}
-	merged["last_copy_round"] = s.LastKnownCopyRound
-	merged["max_known_depth"] = s.MaxKnownDepth
 	raw, err := json.Marshal(merged)
 	if err != nil {
 		return "", err

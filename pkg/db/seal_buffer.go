@@ -188,13 +188,13 @@ func buildCanonicalReviewStatsDeltas(jobs []SealJob) []ReviewStatsDelta {
 				if trav == "" {
 					trav = StatusPending
 				}
-				addCanonicalReviewDelta(deltas, reviewKeyForTraversalStatus(trav), 1)
+				addCanonicalReviewDelta(deltas, reviewKeyForStatus("traversal", trav), 1)
 				if j.Table == "SRC" {
 					copySt := e.CopyStatus
 					if copySt == "" {
 						copySt = CopyStatusPending
 					}
-					addCanonicalReviewDelta(deltas, reviewKeyForCopyStatus(copySt), 1)
+					addCanonicalReviewDelta(deltas, reviewKeyForStatus("copy", copySt), 1)
 				}
 			}
 			continue
@@ -204,12 +204,12 @@ func buildCanonicalReviewStatsDeltas(jobs []SealJob) []ReviewStatsDelta {
 		}
 		for _, e := range j.Events {
 			if e.PrevTraversalStatus != e.TraversalStatus {
-				addCanonicalReviewDelta(deltas, reviewKeyForTraversalStatus(e.PrevTraversalStatus), -1)
-				addCanonicalReviewDelta(deltas, reviewKeyForTraversalStatus(e.TraversalStatus), 1)
+				addCanonicalReviewDelta(deltas, reviewKeyForStatus("traversal", e.PrevTraversalStatus), -1)
+				addCanonicalReviewDelta(deltas, reviewKeyForStatus("traversal", e.TraversalStatus), 1)
 			}
 			if j.Table == "SRC" && e.PrevCopyStatus != e.CopyStatus {
-				addCanonicalReviewDelta(deltas, reviewKeyForCopyStatus(e.PrevCopyStatus), -1)
-				addCanonicalReviewDelta(deltas, reviewKeyForCopyStatus(e.CopyStatus), 1)
+				addCanonicalReviewDelta(deltas, reviewKeyForStatus("copy", e.PrevCopyStatus), -1)
+				addCanonicalReviewDelta(deltas, reviewKeyForStatus("copy", e.CopyStatus), 1)
 			}
 			if j.FromRetry && e.PrevTraversalStatus == StatusPending &&
 				(e.TraversalStatus == StatusSuccessful || e.TraversalStatus == StatusFailed) {
@@ -515,7 +515,7 @@ func (sb *SealBuffer) AddDiscoveryStatusEvent(table string, e StatusEvent, fromR
 
 // AddFailedSubtreePath enqueues an SRC folder path for subtree failure propagation.
 // All pending descendants of this path will be marked as copy_status='failed' at the next flush
-// (row threshold, flush ticker, or explicit FlushAppenderBuffer e.g. before round advance).
+// (row threshold, flush ticker, or explicit FlushSealBuffer e.g. before round advance).
 // Batched with other seal work; do not flush synchronously here.
 func (sb *SealBuffer) AddFailedSubtreePath(parentPath string) {
 	sb.mu.Lock()
@@ -556,7 +556,7 @@ func (sb *SealBuffer) drain() ([]SealJob, []TaskErrorRecord, []string) {
 }
 
 // StartPhase starts a phase (traversal or copy): conn is held for the phase; 4 appenders are created and reused until StopPhase.
-// Call from DB.BeginTraversalPhase / BeginCopyPhase. Must not be called when a phase is already active.
+// Call from DB.BeginTraversalPhase. Must not be called when a phase is already active.
 func (sb *SealBuffer) StartPhase(conn *sql.Conn) error {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
@@ -602,7 +602,7 @@ func (sb *SealBuffer) StartPhase(conn *sql.Conn) error {
 	return nil
 }
 
-// StopPhase flushes any remaining jobs (one tx), closes appenders and conn, and clears phase. Call from DB.EndTraversalPhase / EndCopyPhase.
+// StopPhase flushes any remaining jobs (one tx), closes appenders and conn, and clears phase. Call from DB.EndTraversalPhase.
 func (sb *SealBuffer) StopPhase() error {
 	sb.mu.Lock()
 	pa := sb.phase
@@ -736,8 +736,8 @@ func (sb *SealBuffer) phaseFlush(jobs []SealJob, taskErrors []TaskErrorRecord, s
 	return nil
 }
 
-// legacyFlush is used when no phase is active: one tx with temporary appenders for missing nodes/events, task errors, stats, and subtree failure propagation.
-func (sb *SealBuffer) legacyFlush(jobs []SealJob, taskErrors []TaskErrorRecord, subtreePaths []string) error {
+// ephemeralAppenderFlush runs when no migration phase is active: one tx with temporary appenders for nodes/events, task errors, stats, and subtree failure propagation.
+func (sb *SealBuffer) ephemeralAppenderFlush(jobs []SealJob, taskErrors []TaskErrorRecord, subtreePaths []string) error {
 	if len(jobs) == 0 && len(taskErrors) == 0 && len(subtreePaths) == 0 {
 		return nil
 	}
@@ -757,7 +757,7 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob, taskErrors []TaskErrorRecord, 
 		conn := s.Conn()
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
-			return fmt.Errorf("legacyFlush begin tx: %w", err)
+			return fmt.Errorf("ephemeralAppenderFlush begin tx: %w", err)
 		}
 		srcNodes, err = missingNodesForAppender(ctx, tx, tableSrcNodes, srcNodes)
 		if err != nil {
@@ -899,7 +899,7 @@ func (sb *SealBuffer) legacyFlush(jobs []SealJob, taskErrors []TaskErrorRecord, 
 	return nil
 }
 
-// Flush drains queued jobs and task errors and writes them to the DB. When a phase is active, uses persistent appenders and one tx per flush (append + stats). Otherwise uses legacy per-flush appenders.
+// Flush drains queued jobs and task errors and writes them to the DB. When a phase is active, uses persistent appenders and one tx per flush (append + stats). Otherwise uses ephemeral per-flush appenders.
 // On write failure, jobs and task errors are re-queued so waiters in WaitUntilFlushedThrough do not block forever.
 func (sb *SealBuffer) Flush() error {
 	atomic.StoreInt32(&sb.flushActive, 1)
@@ -919,7 +919,7 @@ func (sb *SealBuffer) Flush() error {
 	if pa != nil {
 		err = sb.phaseFlush(jobs, taskErrors, subtreePaths)
 	} else {
-		err = sb.legacyFlush(jobs, taskErrors, subtreePaths)
+		err = sb.ephemeralAppenderFlush(jobs, taskErrors, subtreePaths)
 	}
 	if err != nil {
 		sb.requeue(jobs, taskErrors, subtreePaths)

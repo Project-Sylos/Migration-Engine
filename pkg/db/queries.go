@@ -263,15 +263,13 @@ type MergedReviewRow struct {
 // ReviewFilter narrows merged review rows for listing, search, and counts.
 // ParentPath: if non-empty, only direct children of this path (uses parent_path_hash).
 // Query + QueryField: substring match; QueryField "" or unknown = path OR name; "path" = path only; "name" = name only.
-// Status (legacy): if non-empty and structured status fields are not used, match any of src_traversal, dst_traversal, or copy_status.
-// StatusSearchType + TraversalStatus + CopyStatus: phase-aware filters ("traversal", "copy", "both").
+// StatusSearchType + TraversalStatus + CopyStatus filter merged review rows ("traversal", "copy", "both").
 // TypeFilter: "folder" or "file" (case-insensitive); also FoldersOnly implies folder.
 // ExcludeRoot: if true, exclude path = '/' from results (for global search).
 type ReviewFilter struct {
 	ParentPath  string
 	Query       string
 	QueryField  string
-	Status      string
 	FoldersOnly bool
 	ExcludeRoot bool
 
@@ -380,10 +378,6 @@ func buildMergedReviewWhere(f ReviewFilter) (clause string, args []any) {
 				parts, args, param = appendCopyStatusClause(parts, args, param, copySt)
 			}
 		}
-	} else if f.Status != "" {
-		parts = append(parts, `(src_traversal_status = $`+strconv.Itoa(param)+` OR dst_traversal_status = $`+strconv.Itoa(param)+` OR copy_status = $`+strconv.Itoa(param)+`)`)
-		args = append(args, f.Status)
-		param++
 	}
 
 	if f.FoldersOnly || strings.EqualFold(f.TypeFilter, "folder") {
@@ -551,7 +545,7 @@ func GetNodeByID(d *DB, table, id string) (*NodeState, error) {
 	if queueType != "SRC" && queueType != "DST" {
 		queueType = "SRC"
 	}
-	conn, err := d.GetDBForPulls(queueType)
+	conn, err := d.GetDB()
 	if err != nil {
 		return nil, err
 	}
@@ -579,7 +573,7 @@ func GetNodeByPath(d *DB, table, path string) (*NodeState, error) {
 	if queueType != "SRC" && queueType != "DST" {
 		queueType = "SRC"
 	}
-	conn, err := d.GetDBForPulls(queueType)
+	conn, err := d.GetDB()
 	if err != nil {
 		return nil, err
 	}
@@ -808,7 +802,7 @@ func ListNodesByDepthKeyset(d *DB, table string, depth int, afterID, statusFilte
 	if queueType != "SRC" && queueType != "DST" {
 		queueType = "SRC"
 	}
-	conn, err := d.GetDBForPulls(queueType)
+	conn, err := d.GetDB()
 	if err != nil {
 		return nil, err
 	}
@@ -917,7 +911,7 @@ ORDER BY c.id`
 
 // ListNodesCopyKeyset returns src_nodes at depth with current copy_status = statusFilter (event-derived), ordered by id. Pass CopyStatusPending for copy phase, CopyStatusFailed for copy-retry.
 func ListNodesCopyKeyset(d *DB, depth int, nodeType, afterID string, limit int, statusFilter string) ([]FetchResult, error) {
-	conn, err := d.GetDBForPulls("SRC")
+	conn, err := d.GetDB()
 	if err != nil {
 		return nil, err
 	}
@@ -1039,7 +1033,7 @@ func CountNodes(d *DB, table string) (int, error) {
 	if queueType != "SRC" && queueType != "DST" {
 		queueType = "SRC"
 	}
-	conn, err := d.GetDBForPulls(queueType)
+	conn, err := d.GetDB()
 	if err != nil {
 		return 0, err
 	}
@@ -1283,7 +1277,7 @@ ORDER BY ch.parent_path_hash, ch.id`
 
 // ListDstBatchWithSrcChildren returns the next batch of DST nodes at depth (keyset afterID, limit) and their SRC children (join by parent_path_hash = d.path_hash). Status from events, aggregated only for ids in each window / child set (not whole tables).
 func ListDstBatchWithSrcChildren(d *DB, depth int, afterID string, limit int, traversalStatus string) ([]FetchResult, map[string][]*NodeState, error) {
-	conn, err := d.GetDBForPulls("DST")
+	conn, err := d.GetDB()
 	if err != nil {
 		return nil, nil, err
 	}

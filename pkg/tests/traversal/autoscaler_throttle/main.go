@@ -31,7 +31,6 @@ func runTest() error {
 	fmt.Println("📋 Phase 1: Setup")
 	fmt.Println("================")
 	cfg, err := shared.SetupEphemeralThrottleTest(true, initialWorkers, migration.AutoscalerConfig{
-		Enabled:   true,
 		Interval:  3 * time.Second,
 		DebugAIMD: true,
 		OnEvent: func(ev scaling.ScalingEvent) {

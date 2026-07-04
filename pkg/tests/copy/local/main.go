@@ -78,14 +78,18 @@ func runTest() error {
 		return fmt.Errorf("traversal setup failed: %w", err)
 	}
 
-	manager, err := migration.NewMigrationManager(cfg.Database)
-	if err != nil {
-		return fmt.Errorf("failed to create migration manager: %w", err)
-	}
+	manager := migration.NewMigrationManager()
 	defer manager.Close()
 
+	dir, id := migration.MigrationDirAndIDFromDBPath(cfg.Database.Path)
+	if cfg.Database.RemoveExisting {
+		_ = os.Remove(cfg.Database.Path)
+	}
+
 	migrationInstance, err := manager.CreateMigration(migration.CreateMigrationConfig{
-		Name: filepath.Base(cfg.Database.Path),
+		MigrationDir: dir,
+		MigrationID:  id,
+		Name:         id,
 		ServiceMetadata: map[string]string{
 			"source_name":      cfg.Source.Name,
 			"destination_name": cfg.Destination.Name,

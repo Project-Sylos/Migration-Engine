@@ -81,10 +81,7 @@ See **`pkg/migration/README.md`** for the real entry points and manager lifecycl
 
 ## Database architecture
 
-The engine uses **DuckDB**. Two deployment shapes:
-
-1. **Legacy single file** – `DatabaseConfig.Path` is set; one `.db` file (and optional multiple rows in the `migrations` table).  
-2. **Per-migration files** – `Path` empty on the manager; each migration has `{migrationDir}/{id}.db` (typical for HTTP APIs).
+The engine uses **DuckDB**. Each migration has its own file at `{migrationDir}/{id}.db`. Standalone runs (`LetsMigrate`, tests) pass `DatabaseConfig.Path` pointing at that file; the engine derives folder and id from the path.
 
 Implementation: **`pkg/db`**. Queue and migration share the same **`*db.DB`** for a given run.
 

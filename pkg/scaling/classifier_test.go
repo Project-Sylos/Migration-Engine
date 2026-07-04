@@ -36,6 +36,20 @@ func TestClassifyUnderfeed(t *testing.T) {
 	}
 }
 
+func TestClassifyUnderfeedWithBusyWorkers(t *testing.T) {
+	p := Classify(ClassifierInput{
+		Internal: map[string]queue.InternalMetricsSnapshot{
+			"copy": {TimeWaitingOnQueue: time.Second},
+		},
+		InProgress: map[string]int{"copy": 4},
+		Pending:    map[string]int{"copy": 100},
+		MemoryLevel: MemoryGreen,
+	})
+	if p != PressureUnderfeed {
+		t.Fatalf("got %s want UNDERFEED with busy workers", p)
+	}
+}
+
 func TestClampInt(t *testing.T) {
 	if got := ClampInt(50, 1, 32); got != 32 {
 		t.Fatalf("clamp high: got %d", got)

@@ -163,7 +163,7 @@ func (q *Queue) tryCommitRoundAdvance(currentRound int) bool {
 			if attempt > 0 {
 				time.Sleep(flushRetryBackoff)
 			}
-			err = database.FlushAppenderBuffer()
+			err = database.FlushSealBuffer()
 			if err == nil {
 				break
 			}

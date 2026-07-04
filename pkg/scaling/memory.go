@@ -98,6 +98,9 @@ func readMemTotalAvailableKB() (totalKB, availKB int64) {
 			}
 		}
 	}
+	if err := sc.Err(); err != nil {
+		return 0, 0
+	}
 	return totalKB, availKB
 }
 
@@ -117,6 +120,9 @@ func readProcessRSSKB() int64 {
 				return v
 			}
 		}
+	}
+	if err := sc.Err(); err != nil {
+		return 0
 	}
 	return 0
 }

@@ -56,22 +56,19 @@ var canonicalReviewKeys = []string{
 	ReviewKeySizeDst,
 }
 
-var legacyReviewKeys = []string{
-	"review/traversal/pending",
-	"review/traversal/pending_retry",
-	"review/traversal/successful",
-	"review/traversal/failed",
-	"review/copy/pending",
-	"review/copy/successful",
-	"review/copy/failed",
-	"review/excluded",
-	"review/folders",
-	"review/files",
-	"review/size/src",
-	"review/size/dst",
-}
-
-func reviewKeyForTraversalStatus(status string) string {
+func reviewKeyForStatus(phase, status string) string {
+	if phase == "copy" {
+		switch status {
+		case CopyStatusPending:
+			return ReviewKeyCopyPending
+		case CopyStatusSuccessful:
+			return ReviewKeyCopySuccessful
+		case CopyStatusFailed:
+			return ReviewKeyCopyFailed
+		default:
+			return ""
+		}
+	}
 	switch status {
 	case StatusPending:
 		return ReviewKeyTraversalPending
@@ -79,19 +76,6 @@ func reviewKeyForTraversalStatus(status string) string {
 		return ReviewKeyTraversalSuccessful
 	case StatusFailed:
 		return ReviewKeyTraversalFailed
-	default:
-		return ""
-	}
-}
-
-func reviewKeyForCopyStatus(status string) string {
-	switch status {
-	case CopyStatusPending:
-		return ReviewKeyCopyPending
-	case CopyStatusSuccessful:
-		return ReviewKeyCopySuccessful
-	case CopyStatusFailed:
-		return ReviewKeyCopyFailed
 	default:
 		return ""
 	}
@@ -463,11 +447,6 @@ func (db *DB) GetMaxDepth(table string) (int, error) {
 		return int(d.Int64), nil
 	}
 	return 0, nil
-}
-
-// GetPendingTraversalCountAtDepthFromLive returns the count of nodes at the given depth with current traversal_status = 'pending' (event-derived).
-func (db *DB) GetPendingTraversalCountAtDepthFromLive(table string, depth int) (int64, error) {
-	return db.GetTraversalCountAtDepthFromLive(table, depth, StatusPending)
 }
 
 // StatsRow is one row (depth, key, count) for breakdown by level. Key is e.g. traversal/pending.

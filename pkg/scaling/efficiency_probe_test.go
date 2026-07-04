@@ -107,12 +107,3 @@ func TestSsthreshRecovery(t *testing.T) {
 		t.Fatalf("ssthresh=%d want 6", st.ssthresh)
 	}
 }
-
-func TestMergeCopyProfiles(t *testing.T) {
-	src := FSPerformanceProfile{MaxWorkers: 32, MaxInterOpDelay: 2 * time.Second}
-	dst := FSPerformanceProfile{MaxWorkers: 16, MaxInterOpDelay: 5 * time.Second}
-	got := MergeCopyProfiles(src, dst)
-	if got.MaxWorkers != 16 || got.MaxInterOpDelay != 5*time.Second {
-		t.Fatalf("got %+v", got)
-	}
-}

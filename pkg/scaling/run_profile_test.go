@@ -6,40 +6,46 @@ package scaling
 import (
 	"testing"
 	"time"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 )
 
-func TestMergeRunProfilesConservative(t *testing.T) {
-	gdrive := LookupProfile("google_drive", "")
-	local := LookupProfile("local", "")
-	merged := MergeRunProfiles(gdrive, local)
-	if merged.DefaultWorkers != 2 {
-		t.Fatalf("DefaultWorkers=%d want 2", merged.DefaultWorkers)
+func TestComposePipelineMinListProfiles(t *testing.T) {
+	gdrive := LookupOperationProfile("google_drive", "", OpListChildren)
+	local := LookupOperationProfile("local", "", OpListChildren)
+	merged := ComposePipelineMin(
+		OperationProfile{DefaultWorkers: gdrive.DefaultWorkers, MaxWorkers: gdrive.MaxWorkers},
+		OperationProfile{DefaultWorkers: local.DefaultWorkers, MaxWorkers: local.MaxWorkers},
+	)
+	if merged.DefaultWorkers != 6 {
+		t.Fatalf("DefaultWorkers=%d want 6", merged.DefaultWorkers)
 	}
-	if merged.MaxWorkers != 8 {
-		t.Fatalf("MaxWorkers=%d want 8", merged.MaxWorkers)
-	}
-	if merged.DefaultListPageSize != 50 {
-		t.Fatalf("DefaultListPageSize=%d want 50", merged.DefaultListPageSize)
-	}
-	if merged.DefaultLeaseBatch != 50 {
-		t.Fatalf("DefaultLeaseBatch=%d want 50", merged.DefaultLeaseBatch)
-	}
-	if merged.MaxInterOpDelay != 10*time.Second {
-		t.Fatalf("MaxInterOpDelay=%v", merged.MaxInterOpDelay)
-	}
-	if merged.PreferLargePages {
-		t.Fatal("expected PreferLargePages false")
+	if merged.MaxWorkers != 16 {
+		t.Fatalf("MaxWorkers=%d want 16", merged.MaxWorkers)
 	}
 }
 
-func TestMergeRunProfilesGenericDst(t *testing.T) {
-	gdrive := LookupProfile("google_drive", "")
-	generic := LookupProfile("generic", "")
-	merged := MergeRunProfiles(gdrive, generic)
-	if merged.DefaultWorkers != 2 {
-		t.Fatalf("DefaultWorkers=%d want 2", merged.DefaultWorkers)
+func TestComposePipelineMinCopyPass2(t *testing.T) {
+	gdrive := LookupOperationProfile("google_drive", "", OpDownload)
+	generic := LookupOperationProfile("generic", "", OpUpload)
+	merged := ComposePipelineMin(gdrive, generic)
+	if merged.MaxWorkers != 16 {
+		t.Fatalf("MaxWorkers=%d want 16", merged.MaxWorkers)
 	}
-	if merged.MaxWorkers != 8 {
-		t.Fatalf("MaxWorkers=%d want 8", merged.MaxWorkers)
+}
+
+func TestResolveEffectiveProfileTraversalSrc(t *testing.T) {
+	ctx := queue.ScalingContext{
+		QueueName:   "src",
+		Mode:        queue.ScalingModeTraversal,
+		SrcProvider: "google_drive",
+		DstProvider: "local",
+	}
+	prof := ResolveEffectiveProfile(ctx, nil, nil)
+	if prof.DefaultListPageSize != 100 {
+		t.Fatalf("DefaultListPageSize=%d want 100", prof.DefaultListPageSize)
+	}
+	if prof.MaxInterOpDelay != 5*time.Second {
+		t.Fatalf("MaxInterOpDelay=%v", prof.MaxInterOpDelay)
 	}
 }

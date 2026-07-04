@@ -53,14 +53,23 @@ func (o *QueueObserver) SnapshotThroughputRate(queueName string) float64 {
 	return 0
 }
 
+// SnapshotBytesPerSecond returns EMA bytes/sec for copy phase queues.
+func (o *QueueObserver) SnapshotBytesPerSecond(queueName string) float64 {
+	return o.snapshotEMARate(queueName, "-bytes")
+}
+
 // SnapshotTaskCompletionRate returns EMA task completions/sec (≈ FS list/copy ops per second).
 func (o *QueueObserver) SnapshotTaskCompletionRate(queueName string) float64 {
+	return o.snapshotEMARate(queueName, "-tasks")
+}
+
+func (o *QueueObserver) snapshotEMARate(queueName, suffix string) float64 {
 	if o == nil {
 		return 0
 	}
 	o.mu.RLock()
 	defer o.mu.RUnlock()
-	return o.prevEMARates[queueName+"-tasks"]
+	return o.prevEMARates[queueName+suffix]
 }
 
 // SnapshotInternalMetrics returns per-queue internal metrics (does not reset time buckets).

@@ -91,14 +91,21 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 	coordinator := queue.NewQueueCoordinator()
 
-	_, _, runProfile := resolveServiceProfiles(cfg)
-	sizing := queueSizingFromProfileOrSuspend(cfg.ResumeTraversal, runProfile)
-	wc := resolveWorkersForProfile(cfg.WorkerCount, cfg.ResumeTraversal, runProfile)
+	srcCtx := scalingContextForTraversal("src", cfg.SrcService, cfg.DstService, queue.QueueModeTraversal)
+	dstCtx := scalingContextForTraversal("dst", cfg.SrcService, cfg.DstService, queue.QueueModeTraversal)
+	if cfg.ResumeTraversal != nil {
+		srcCtx.Mode = queue.ScalingModeRetry
+		dstCtx.Mode = queue.ScalingModeRetry
+	}
+	srcSizing := queueSizingForScalingContext(srcCtx, cfg.ResumeTraversal)
+	dstSizing := queueSizingForScalingContext(dstCtx, cfg.ResumeTraversal)
+	srcWC := resolveWorkersForScalingContext(srcCtx, cfg.WorkerCount, cfg.ResumeTraversal)
+	dstWC := resolveWorkersForScalingContext(dstCtx, cfg.WorkerCount, cfg.ResumeTraversal)
 	mr := effectiveMaxRetries(cfg.MaxRetries, cfg.ResumeTraversal)
 
 	// DB-backed frontier: no LevelCache for traversal. Queues pull from DuckDB in batches.
-	srcQueue := queue.NewQueue("src", mr, wc, coordinator, sizing)
-	dstQueue := queue.NewQueue("dst", mr, wc, coordinator, sizing)
+	srcQueue := queue.NewQueue("src", mr, srcWC, coordinator, srcSizing)
+	dstQueue := queue.NewQueue("dst", mr, dstWC, coordinator, dstSizing)
 
 	if cfg.ResumeTraversal != nil {
 		srcQueue.SetMode(queue.QueueModeRetry)
@@ -118,15 +125,15 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	srcQueue.SetRateLimitTelemetry(rateLimitBridgeForAdapter(cfg.SrcAdapter))
 	dstQueue.SetRateLimitTelemetry(rateLimitBridgeForAdapter(cfg.DstAdapter))
 
-	srcListProfile := scaling.ApplyAdapterListPagination(
-		scaling.LookupProfile(cfg.SrcService.ProviderID, cfg.SrcService.Name),
-		cfg.SrcAdapter,
+	srcListProfile := scaling.ResolveEffectiveProfile(
+		scalingContextForTraversal("src", cfg.SrcService, cfg.DstService, queue.QueueModeTraversal),
+		cfg.SrcAdapter, cfg.DstAdapter,
 	)
-	dstListProfile := scaling.ApplyAdapterListPagination(
-		scaling.LookupProfile(cfg.DstService.ProviderID, cfg.DstService.Name),
-		cfg.DstAdapter,
+	dstListProfile := scaling.ResolveEffectiveProfile(
+		scalingContextForTraversal("dst", cfg.SrcService, cfg.DstService, queue.QueueModeTraversal),
+		cfg.SrcAdapter, cfg.DstAdapter,
 	)
-	// Per-queue list pagination uses each side's profile; worker pool uses merged runProfile above.
+	// Per-queue list pagination uses each side's operation profile at init.
 	scaling.ApplyQueueListPagination(srcQueue, srcListProfile)
 	scaling.ApplyQueueListPagination(dstQueue, dstListProfile)
 
@@ -244,7 +251,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 		if cfg.SoftSuspendRequested != nil && cfg.SoftSuspendRequested() {
 			waitCtx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
-			stats, suspend, err := performTraversalSoftSuspend(waitCtx, database, srcQueue, dstQueue, observer, coordinator, cfg, start, wc, mr)
+			stats, suspend, err := performTraversalSoftSuspend(waitCtx, database, srcQueue, dstQueue, observer, coordinator, cfg, start, srcWC, mr)
 			cancel()
 			if err != nil {
 				return stats, fmt.Errorf("traversal soft suspend: %w", err)

@@ -41,7 +41,7 @@ func TestLatestFailureLogIDsByNodeIDsAndGetLogs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	byNode, err := LatestSrcFailureLogIDsByNodeIDs(context.Background(), database, []string{"node-a", "missing"})
+	byNode, err := LatestFailureLogIDsByNodeIDs(context.Background(), database, tableSrcStatusEvents, []string{"node-a", "missing"})
 	if err != nil {
 		t.Fatal(err)
 	}

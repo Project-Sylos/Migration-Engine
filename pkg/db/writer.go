@@ -824,11 +824,6 @@ func (w *Writer) WriteQueueStats(queueKey, metricsJSON string) error {
 // WriteReviewStatsSnapshot writes the full canonical review stats snapshot to the universal stats table (replaces counts for review keys).
 func (w *Writer) WriteReviewStatsSnapshot(s ReviewStatsSnapshot) error {
 	ctx := context.Background()
-	for _, key := range legacyReviewKeys {
-		if _, err := w.tx.ExecContext(ctx, `DELETE FROM `+tableStats+` WHERE key = $1`, key); err != nil {
-			return err
-		}
-	}
 	pairs := []struct {
 		key   string
 		count int64

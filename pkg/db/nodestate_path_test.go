@@ -6,7 +6,7 @@ package db
 import "testing"
 
 func TestNodeInsertPathFields_depth1EmptyParentMatchesRoot(t *testing.T) {
-	_, normParent, _, parentHash := NodeInsertPathFields("/DMT", "", 1)
+	_, normParent, _, parentHash := NodeInsertPathFields("/alpha", "", 1)
 	if normParent != "/" {
 		t.Fatalf("normParent=%q want /", normParent)
 	}

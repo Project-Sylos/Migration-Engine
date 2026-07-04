@@ -107,12 +107,6 @@ type queueAIMDState struct {
 	fsBackoffUntil         time.Time // block further FS throttle step-down until retry-after (+ min probe cooldown)
 }
 
-func (s *queueAIMDState) ensure() {
-	if s == nil {
-		return
-	}
-}
-
 // DecreaseTarget computes the worker target after pressure (multiplicative decrease).
 // Records ssthresh as the new operating ceiling for slow-start / congestion avoidance.
 func (p AIMDPolicy) DecreaseTarget(cur, minWorkers, maxWorkers int, state *queueAIMDState, now time.Time) int {

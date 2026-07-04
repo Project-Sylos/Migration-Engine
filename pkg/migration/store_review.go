@@ -127,11 +127,11 @@ func (s *migrationStore) enrichDiffItemsWithFailureLogs(items []DiffItem) error 
 		}
 	}
 
-	srcLogByNode, err := db.LatestSrcFailureLogIDsByNodeIDs(ctx, s.db, srcIDs)
+	srcLogByNode, err := db.LatestFailureLogIDsByNodeIDs(ctx, s.db, db.TableSrcStatusEvents, srcIDs)
 	if err != nil {
 		return fmt.Errorf("load src failure log ids: %w", err)
 	}
-	dstLogByNode, err := db.LatestDstFailureLogIDsByNodeIDs(ctx, s.db, dstIDs)
+	dstLogByNode, err := db.LatestFailureLogIDsByNodeIDs(ctx, s.db, db.TableDstStatusEvents, dstIDs)
 	if err != nil {
 		return fmt.Errorf("load dst failure log ids: %w", err)
 	}
@@ -584,8 +584,9 @@ func searchRequestToReviewFilter(req SearchRequest) db.ReviewFilter {
 		Query:            strings.TrimSpace(req.Query),
 		FoldersOnly:      req.FoldersOnly,
 		ExcludeRoot:      req.Path == "",
-		Status:           strings.TrimSpace(req.Status),
 		StatusSearchType: strings.TrimSpace(req.StatusSearchType),
+		TraversalStatus:  strings.TrimSpace(req.TraversalStatus),
+		CopyStatus:       strings.TrimSpace(req.CopyStatus),
 	}
 	for _, c := range req.Conditions {
 		field := strings.ToLower(strings.TrimSpace(c.Field))
@@ -623,9 +624,6 @@ func searchRequestToReviewFilter(req SearchRequest) db.ReviewFilter {
 				f.SizeValue = &n
 			}
 		}
-	}
-	if f.StatusSearchType != "" || f.TraversalStatus != "" || f.CopyStatus != "" {
-		f.Status = ""
 	}
 	return f
 }
@@ -671,9 +669,10 @@ func (s *migrationStore) listChildrenDiffs(req ListChildrenDiffsRequest) (ListCh
 	}
 	orderBy := sanitizeSort(req.SortBy, req.SortDirection)
 	f := db.ReviewFilter{
-		ParentPath:  req.Path,
-		Status:      req.Status,
-		FoldersOnly: req.FoldersOnly,
+		ParentPath:      req.Path,
+		FoldersOnly:     req.FoldersOnly,
+		TraversalStatus: strings.TrimSpace(req.TraversalStatus),
+		CopyStatus:      strings.TrimSpace(req.CopyStatus),
 	}
 	rows, total, err := db.ListMergedReviewDiffs(s.db, f, orderBy, limit, offset)
 	if err != nil {

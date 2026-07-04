@@ -55,16 +55,16 @@ This section describes what the autoscaler **does today**. Code lives in `pkg/sc
 migration.Config{
     WorkerCount: 10, // initial workers per queue (before autoscaler adjusts)
     Autoscaler: migration.AutoscalerConfig{
-        Enabled:  true,
         Interval: 10 * time.Second, // default if zero
         OnEvent:  func(ev scaling.ScalingEvent) { /* optional hook */ },
+        // DisableAutoscaler: true, // opt out
     },
     // Service.ProviderID selects FS profile ("spectra", "local", "generic")
     // Service.BackendGroupID optional; same Spectra SDK instance auto-merges groups
 }
 ```
 
-When `Enabled` is false (default), no control loop runs. Integration test: `pkg/tests/traversal/autoscaler_throttle/` (`Interval: 3s`, 20 workers, Spectra chaos).
+Autoscaler runs by default. Set **`DisableAutoscaler: true`** to turn off the control loop. Integration test: `pkg/tests/traversal/autoscaler_throttle/` (`Interval: 3s`, 20 workers, Spectra chaos).
 
 ### Control loop (each tick)
 
@@ -78,9 +78,10 @@ When `Enabled` is false (default), no control loop runs. Integration test: `pkg/
 
 On each tick (`scaling.Autoscaler.tick`):
 
-1. **Snapshot** per-queue `InProgress`, `Pending`, observer internal metrics, seal telemetry (read-and-reset), and memory sample (`MemAvailable` + process RSS from `/proc`, autoscaler tick only).
-2. **Classify** → exactly one `PressureClass` (priority order below).
-3. **Actuate:**
+1. **Resolve profiles** — read each queue's `ScalingContext()` (mode, copy pass, src/dst provider), compose the effective operation profile, merge adapter list pagination when `list_children` is active, and reconcile worker caps when the effective max drops (e.g. copy pass 1 → 2).
+2. **Snapshot** per-queue `InProgress`, `Pending`, observer internal metrics, seal telemetry (read-and-reset), and memory sample (`MemAvailable` + process RSS from `/proc`, autoscaler tick only).
+3. **Classify** → exactly one `PressureClass` (priority order below).
+4. **Actuate:**
    - `FS_THROTTLE` or `MEMORY_PRESSURE` → step **down** (workers, `ListPageSize` ↑ on FS throttle, inter-op delay at floor)
    - `UNDERFEED` → step **up** if memory is green (delay recovery first, then workers, `ListPageSize` ↓ toward default)
    - `NONE` → no change
@@ -107,8 +108,9 @@ Scale-up runs on **`NONE`** (TCP-style calm probe after cooldown) and **`UNDERFE
 **UNDERFEED** additionally requires all of the following for a queue:
 
 - `TimeWaitingOnQueue > 500ms`
-- `InProgress == 0` (no worker mid-task)
 - `Pending > 0` (work waiting in the local buffer)
+
+Workers may be busy (`InProgress > 0`); underfeed still fires when the pending buffer is starved while workers wait on the queue.
 
 During a throttle-heavy run, ticks often stay on `FS_THROTTLE` — calm probes do not run until rate-limit hits stop for a tick. **Probe cooldown** blocks scale-up for `2 × tick interval` (6s in the integration test) after each decrease.
 
@@ -128,7 +130,7 @@ Priority (first match wins):
 |-------|------------------------------|---------------------|
 | `MEMORY_PRESSURE` | Host RAM use ≥ **90%** (`MemTotal` − `MemAvailable`), **or** seal hard-cap hits since last tick | AIMD worker ↓; batch/seal knobs ↓ |
 | `FS_THROTTLE` | Any `RateLimitHitsSinceLastPoll > 0` on src/dst (from FS degradation telemetry) | AIMD worker ↓ (or inter-op delay ↑ at floor); **at most one step-down per retry-after window** |
-| `UNDERFEED` | `TimeWaitingOnQueue > 500ms` **and** `InProgress == 0` **and** `Pending > 0` for a queue | AIMD delay ↓ then worker ↑ (memory must be green) |
+| `UNDERFEED` | `TimeWaitingOnQueue > 500ms` **and** `Pending > 0` for a queue | AIMD delay ↓ then worker ↑ (memory must be green) |
 | `NONE` | Otherwise | **Calm AIMD probe:** worker ↑ (or inter-op delay ↓ at floor) when probe cooldown elapsed and host memory green |
 
 **Explicitly not a trigger:** `SealIOWaitActive()` (slow DuckDB flush). SealBuffer already blocks producers on hard cap; we only scale when that shows up as **memory** signals (HWM / hard-cap hits / host MemAvailable red).
@@ -208,15 +210,73 @@ On **`UNDERFEED`** worker step-up, page size **halves toward** `DefaultListPageS
 | `LocalFS` | 20 | 100 | 1,000 | no |
 | `generic` profile fallback | 20 | 100 | 10,000 | yes |
 
-### FS performance profiles (`pkg/scaling/profile.go`)
+### Operation-based FS profiles (`pkg/scaling/operation_profile.go`)
 
-Lookup: `Service.ProviderID` → `Service.Name` → `generic`.
+Scaling bounds are keyed by **provider + operation**, not by queue role or migration phase. Each queue exposes a `ScalingContext` (mode, copy pass, src/dst provider IDs, backend group IDs). The autoscaler **re-resolves** the effective profile every tick from that context.
 
-| Profile | DefaultWorkers | MaxWorkers (group total if shared) | MaxInterOpDelay | List pages |
-|---------|----------------|--------------------------------------|-----------------|------------|
-| `generic` | 10 | 32 | 5s | 20–10,000 |
-| `spectra` | 10 | 32 | 5s | 20–10,000 |
-| `local` | 8 | 64 | 2s | 20–1,000 |
+**Operations (v1):**
+
+| Operation | FS adapter touchpoints |
+|-----------|------------------------|
+| `list_children` | Traversal src/dst `ListChildren` |
+| `create_folder` | Copy pass 1 dst `CreateFolder` |
+| `download` | Copy pass 2 src `OpenRead` (incl. GDrive export) |
+| `upload` | Copy pass 2 dst `OpenWrite` / upload commit |
+
+**Compose rules:**
+
+| Context | Active ops | Effective profile |
+|---------|------------|-------------------|
+| Traversal `src` | `list_children` on src provider | `src.list_children` (+ adapter pagination merge) |
+| Traversal `dst` | `list_children` on dst provider | `dst.list_children` |
+| Copy pass 1 | `create_folder` (dst only) | `dst.create_folder` |
+| Copy pass 2 | `download` + `upload` | `ComposePipelineMin(src.download, dst.upload)` — min on workers/default/max/inter-op; list knobs omitted |
+| Copy retry | Same as copy by pass | Same resolver |
+
+When src and dst share one backend (`BackendGroupID`), **`MaxWorkers` is still a combined cap** across src+dst for traversal; copy uses a single queue budget from the composed pass profile.
+
+**Profile shape:**
+
+```go
+type OperationProfile struct {
+    MinWorkers, DefaultWorkers, MaxWorkers int
+    MaxInterOpDelay time.Duration
+    // list_children only:
+    MinListPageSize, DefaultListPageSize, MaxListPageSize int
+    ListPageStep int
+    PreferLargePages bool
+    DefaultLeaseBatch, MaxLeaseBatch, MinLeaseBatch int
+    DefaultRefillBatch, MaxRefillBatch, MinRefillBatch int
+}
+```
+
+Resolved profiles map to the actuator shape `FSPerformanceProfile` via `ToActuatorProfile`. Unknown providers fall back to `generic` operation profiles.
+
+**Built-in providers:** `generic`, `local`, `google_drive`, `spectra`.
+
+| Provider | list_children | create_folder | download | upload |
+|----------|---------------|---------------|----------|--------|
+| `generic` | workers 10/32, pages 100/10k | workers 8/32 | workers 8/32 | workers 8/32 |
+| `local` | workers 8/64, pages 100/1k | workers 8/64 | workers 8/64 | workers 8/64 |
+| `google_drive` | pages 100/500, workers 6/16 | workers 4/12 | workers 8/16 | workers 8/16 |
+| `spectra` | **all max caps = 0** | **0** | **0** | **0** |
+
+**Zero-cap semantics (`MaxWorkers == 0`, etc.):** Spectra chaos limits vary per test config, so Spectra operation profiles do not encode fixed throughput caps. **`0` = no provider-imposed ceiling** — AIMD + throttle/memory gating only:
+
+| Field | `0` means |
+|-------|-----------|
+| `MaxWorkers` | Uncapped — autoscaler uses `UnboundedMaxWorkers` (32) as fallback ceiling |
+| `DefaultWorkers` | Conservative startup (`DefaultWorkersForUnbounded` = 2); AIMD probes up |
+| `MaxListPageSize`, batch maxes, etc. | No cap — adapter/runtime defaults or AIMD list-page logic |
+| `MaxInterOpDelay` | Generic autoscaler default (5s) |
+
+**Compose with zero caps:** `ComposePipelineMin` treats `0` as "no limit from this leg" (same as `minPositive` — if one side is 0, the other side's cap wins). GDrive→Spectra copy pass 2 uses GDrive download cap; Spectra upload leg contributes no ceiling.
+
+**Copy pass 2 efficiency probe:** When classifying calm/underfeed probes on the copy queue in pass 2, throughput rate prefers `SnapshotBytesPerSecond("copy")` (bytes/sec EMA) over items/sec so export-bound GDrive→local runs get meaningful efficiency signals.
+
+**FS operation name mapping:** Sylos-FS degradation signals carry operation strings (`ListChildren`, `OpenRead`, `UploadFile`, etc.). `scaling.MapFSOperation` / `ClassifyFSOperation` map these to `FSOperation` for future per-op throttle filtering (v1: shared degradation bridge unchanged).
+
+**Profile bound reconciliation:** When the effective `MaxWorkers` **drops** (copy pass 1→2, tighter upload cap), the autoscaler clamps `SetTargetWorkerCount` immediately instead of waiting for throttle. When max **rises**, existing underfeed/calm-probe paths apply.
 
 ### Backend grouping
 
@@ -373,7 +433,7 @@ Each knob should have **Min**, **Default**, **Max**, and **Current** (runtime). 
 
 ## FS performance profiles
 
-Profiles live in the Migration Engine repo (`pkg/scaling/profile.go`). **List pagination min/max/default** are defined on each Sylos-FS adapter (`pkg/types/listpagination.go`, implemented on `SpectraFS`, `LocalFS`, and future cloud adapters). ME merges adapter limits at FS connect / run startup; profile map list-page fields are fallbacks when an adapter does not implement `FSListChildrenPagination`.
+Profiles live in `pkg/scaling/operation_profile.go`. `pkg/scaling/profile.go` defines the actuator shape (`FSPerformanceProfile`); use `ToActuatorProfile(LookupOperationProfile(...))` for the provider's `list_children` profile. **List pagination min/max/default** are defined on each Sylos-FS adapter (`pkg/types/listpagination.go`, implemented on `SpectraFS`, `LocalFS`, and future cloud adapters). ME merges adapter limits when `list_children` is the active operation via `scaling.ApplyAdapterListPagination`.
 
 Lookup order:
 
@@ -381,7 +441,23 @@ Lookup order:
 2. `Service.Name`
 3. `generic` fallback
 
-### Implemented shape
+### Implemented shapes
+
+**Operation profile** (source of truth for autoscaler):
+
+```go
+type OperationProfile struct {
+    MinWorkers, DefaultWorkers, MaxWorkers int
+    MaxInterOpDelay time.Duration
+    MinListPageSize, DefaultListPageSize, MaxListPageSize int
+    ListPageStep int
+    PreferLargePages bool
+    DefaultLeaseBatch, MaxLeaseBatch, MinLeaseBatch int
+    DefaultRefillBatch, MaxRefillBatch, MinRefillBatch int
+}
+```
+
+**Actuator profile** (runtime knobs on queues):
 
 ```go
 type FSPerformanceProfile struct {
@@ -396,7 +472,7 @@ type FSPerformanceProfile struct {
 }
 ```
 
-Built-in profiles: `generic`, `spectra`, `local`. When src/dst share one backend, **`MaxWorkers` is the combined cap** for the group. Independent backends: each queue scales within its own profile bounds.
+Built-in providers: `generic`, `spectra`, `local`, `google_drive`. When src/dst share one backend, **`MaxWorkers` is the combined cap** for the group during traversal. Copy pass profiles compose src download + dst upload legs independently of traversal list profiles.
 
 ### Provider scope
 
@@ -441,8 +517,6 @@ Spectra SDK/API middleware uses **fixed poll windows** (default 1s) to count usa
 - **operations** — per-endpoint call caps (`list_children`, `create_folder`, `upload_file`, `get_file_data`, `get_node`); keep **list** high for traversal, **copy/read/write** ops tighter (~1000 calls/sec)
 - **bandwidth** — bytes read/written per window (~1 GiB/s default in test configs; writes charged at request time, reads after `GetFileData`)
 - **backoff.exponential_factor** — retry-after = `base * factor^attempt` on consecutive rejections (default `2` → 1×, 2×, 4×…; use e.g. `1.5` for gentler penalties or `3`+ for harsher chaos)
-
-Legacy flat `chaos.rate_limit.requests_per_second` still maps to `global` for backward compatibility.
 
 Reference chaos limits (high list, tighter copy/read/write): `pkg/tests/traversal/shared/spectra_ephemeral_throttle.json`.
 
@@ -745,7 +819,11 @@ Spectra lays groundwork for FS struct / performance profile shape; real backends
 | Spectra chaos harness | **Done** |
 | SealBuffer telemetry → memory pressure | **Done** |
 | Memory gate on scale-up (Linux meminfo + RSS) | **Done** |
-| FS profiles (`generic`, `spectra`, `local`) | **Done** |
+| FS profiles (`generic`, `spectra`, `local`, `google_drive`) | **Done** |
+| Operation-based profile resolver (per-op compose, copy pass) | **Done** |
+| Dynamic profile re-resolve each autoscaler tick | **Done** |
+| Copy pass 2 bytes/sec efficiency probe | **Done** |
+| `MapFSOperation` degradation string mapping | **Done** |
 | `BackendRegistry` registration | **Done** |
 | Integration test (Spectra throttle) | **Done** |
 | Setters: batches, seal opts | **Done** (memory pressure actuation) |

@@ -15,7 +15,7 @@ type FailureLog struct {
 	ID        string
 	Level     string
 	Message   string
-	Detail    string // bare error text for UI; empty on legacy rows
+	Detail    string // bare error text for UI; empty when detail was not stored separately
 	Component string
 }
 
@@ -116,14 +116,4 @@ func GetFailureLogsByIDs(ctx context.Context, d *DB, logIDs []string) (map[strin
 		out[row.ID] = row
 	}
 	return out, rows.Err()
-}
-
-// LatestSrcFailureLogIDsByNodeIDs loads latest failure log ids from src_status_events.
-func LatestSrcFailureLogIDsByNodeIDs(ctx context.Context, d *DB, nodeIDs []string) (map[string]string, error) {
-	return LatestFailureLogIDsByNodeIDs(ctx, d, tableSrcStatusEvents, nodeIDs)
-}
-
-// LatestDstFailureLogIDsByNodeIDs loads latest failure log ids from dst_status_events.
-func LatestDstFailureLogIDsByNodeIDs(ctx context.Context, d *DB, nodeIDs []string) (map[string]string, error) {
-	return LatestFailureLogIDsByNodeIDs(ctx, d, tableDstStatusEvents, nodeIDs)
 }

@@ -656,14 +656,14 @@ func (q *Queue) setExpectedFromStatsBucket(round int) {
 		if round == 0 {
 			expected = 1
 		} else {
-			expected, err = database.GetPendingTraversalCountAtDepthFromLive(queueType, round)
+			expected, err = database.GetTraversalCountAtDepthFromLive(queueType, round, db.StatusPending)
 			if err != nil {
 				fmt.Println("error getting pending traversal count at depth from live", err)
 				return
 			}
 		}
 	case QueueModeRetry:
-		expected, err = database.GetPendingTraversalCountAtDepthFromLive(queueType, round)
+		expected, err = database.GetTraversalCountAtDepthFromLive(queueType, round, db.StatusPending)
 		if err != nil {
 			fmt.Println("error getting pending traversal count at depth from live", err)
 			return

@@ -57,9 +57,9 @@ func (a *Autoscaler) stepDownMemoryKnobs(now time.Time, pressure PressureClass) 
 	}
 
 	oldRows := a.sealRows
-	newRows := halveInt(oldRows, minSealRowThreshold)
+	newRows, _ := halveTowardMin(oldRows, minSealRowThreshold)
 	oldFlush := time.Duration(a.sealFlushMs) * time.Millisecond
-	newFlush := halveDuration(oldFlush, minSealFlushInterval)
+	newFlush, _ := halveDurationTowardMin(oldFlush, minSealFlushInterval)
 
 	opts := db.SealBufferOptions{}
 	changed := false
@@ -214,26 +214,18 @@ func halveTowardMin(cur, min int) (int, bool) {
 	return next, true
 }
 
-func halveInt(cur, min int) int {
+func halveDurationTowardMin(cur, min time.Duration) (time.Duration, bool) {
 	if cur <= min {
-		return cur
+		return cur, false
 	}
 	next := cur / 2
 	if next < min {
-		return min
+		next = min
 	}
-	return next
-}
-
-func halveDuration(cur, min time.Duration) time.Duration {
-	if cur <= min {
-		return cur
+	if next >= cur {
+		return cur, false
 	}
-	next := cur / 2
-	if next < min {
-		return min
-	}
-	return next
+	return next, true
 }
 
 // SetMemorySampler replaces the memory sampler (tests).

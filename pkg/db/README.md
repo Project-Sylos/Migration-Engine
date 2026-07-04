@@ -44,7 +44,7 @@ Seal: **`SealLevel`** bulk-appends node rows and writes per-depth stats; when **
 
 ## Read paths
 
-- **`GetDB()`** / **`GetDBForPulls(queueType)`** – Single connection (`MaxOpenConns(1)`).
+- **`GetDB()`** – Single connection (`MaxOpenConns(1)`).
 - Keyset pulls, `GetNodeByID`, merged review queries, stats readers—see **`queries.go`** / **`stats.go`**.
 
 ---

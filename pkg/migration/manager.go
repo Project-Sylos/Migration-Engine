@@ -52,19 +52,16 @@ type MigrationDetails struct {
 }
 
 // MigrationManager owns migration lifecycle authority and persistence access.
-// Either Path is set (legacy single DB for all migrations) or the API passes the migration folder path per migration (CreateMigration with MigrationDir, or GetMigration(id, migrationDir)).
+// Each migration has its own DuckDB file at {migrationDir}/{id}.db.
 type MigrationManager struct {
-	db             *db.DB          // legacy single DB; nil when using per-migration paths
-	store          *migrationStore // used for create/get/list/delete with explicit db
+	store          *migrationStore
 	migrations     map[string]*Migration
 	pendingRecords map[string]migrationRecord // migrations created without a path (no DB yet); key = id
 	mu             sync.Mutex
-	ownsDB         bool
 	openDBs        map[string]*db.DB // cache: key = absolute DB file path
 	openDBsMu      sync.Mutex
-	// pendingLocks serializes "pending → persist" per migration id so only one goroutine runs openDB + createMigration + bindDB for a given id.
-	pendingMu    sync.Mutex
-	pendingLocks map[string]*sync.Mutex
+	pendingMu      sync.Mutex
+	pendingLocks   map[string]*sync.Mutex
 }
 
 var migrationIDCounter int64
@@ -75,33 +72,15 @@ func nextMigrationID() string {
 	return fmt.Sprintf("migration-%d-%d", now, seq)
 }
 
-// NewMigrationManager opens the migration DB (legacy single-DB when Path is set) or creates a manager that uses per-migration paths (when Path is empty and the API will pass MigrationDir / migrationDir per call).
-func NewMigrationManager(cfg DatabaseConfig) (*MigrationManager, error) {
-	if cfg.Path != "" {
-		database, _, err := SetupDatabase(cfg)
-		if err != nil {
-			return nil, err
-		}
-		return newMigrationManager(database, true), nil
+// NewMigrationManager creates a manager that opens one DuckDB file per migration folder.
+func NewMigrationManager() *MigrationManager {
+	return &MigrationManager{
+		store:          &migrationStore{},
+		migrations:     make(map[string]*Migration),
+		pendingRecords: make(map[string]migrationRecord),
+		pendingLocks:   make(map[string]*sync.Mutex),
+		openDBs:        make(map[string]*db.DB),
 	}
-	// No Path: API will pass migration folder path when creating or loading each migration.
-	return newMigrationManager(nil, false), nil
-}
-
-func newMigrationManager(database *db.DB, ownsDB bool) *MigrationManager {
-	m := &MigrationManager{
-		store:      newMigrationStore(database),
-		migrations: make(map[string]*Migration),
-		openDBs:    make(map[string]*db.DB),
-		ownsDB:     ownsDB,
-	}
-	if database != nil {
-		m.db = database
-	} else {
-		m.pendingRecords = make(map[string]migrationRecord)
-		m.pendingLocks = make(map[string]*sync.Mutex)
-	}
-	return m
 }
 
 func (m *MigrationManager) getPendingLock(id string) *sync.Mutex {
@@ -113,21 +92,15 @@ func (m *MigrationManager) getPendingLock(id string) *sync.Mutex {
 	return m.pendingLocks[id]
 }
 
-// Close releases manager-owned resources (single DB in legacy mode, or all open per-migration DBs).
+// Close releases all open per-migration DB handles owned by this manager.
 func (m *MigrationManager) Close() error {
-	if m.db == nil {
-		m.openDBsMu.Lock()
-		for _, database := range m.openDBs {
-			_ = database.Close()
-		}
-		m.openDBs = make(map[string]*db.DB)
-		m.openDBsMu.Unlock()
-		return nil
+	m.openDBsMu.Lock()
+	defer m.openDBsMu.Unlock()
+	for _, database := range m.openDBs {
+		_ = database.Close()
 	}
-	if !m.ownsDB {
-		return nil
-	}
-	return m.db.Close()
+	m.openDBs = make(map[string]*db.DB)
+	return nil
 }
 
 // openDB opens (or returns cached) the DB for the given migration folder path and ID. migrationDir is the absolute path to the folder for this migration (e.g. data/{id}); the DB file is migrationDir/id.db.
@@ -205,23 +178,6 @@ func (m *MigrationManager) CreateMigration(cfg CreateMigrationConfig) (*Migratio
 		return instance, nil
 	}
 
-	// Single-DB mode (e.g. local test): use the manager's DB so the migration has a DB immediately.
-	if m.db != nil {
-		if err := m.store.createMigration(m.db, record); err != nil {
-			return nil, err
-		}
-		persisted, err := m.store.getMigration(m.db, id)
-		if err != nil {
-			return nil, err
-		}
-		if persisted != nil {
-			record = *persisted
-		}
-		instance := newMigration(m, record, m.db)
-		m.migrations[id] = instance
-		return instance, nil
-	}
-
 	// No path yet: return migration with generated ID; DB will be created when API calls GetMigration(id, migrationDir).
 	if m.pendingRecords == nil {
 		m.pendingRecords = make(map[string]migrationRecord)
@@ -245,7 +201,7 @@ func isDuplicateKey(err error) bool {
 		strings.Contains(msg, "constraint violation")
 }
 
-// GetMigration loads or returns a cached migration. When using per-migration DBs, pass the absolute path to that migration's folder (e.g. data/{id}); the engine creates or opens the DB at migrationDir/id.db. When migrationDir is empty, uses the legacy single DB (Path must have been set when creating the manager).
+// GetMigration loads or returns a cached migration. Pass the absolute path to that migration's folder (e.g. data/{id}); the engine creates or opens the DB at migrationDir/id.db.
 func (m *MigrationManager) GetMigration(id string, migrationDir string) (*Migration, error) {
 	snap := m.snapshotMigrationEntry(id)
 	if snap.Migration != nil {
@@ -264,7 +220,6 @@ func (m *MigrationManager) GetMigration(id string, migrationDir string) (*Migrat
 			}
 			return snap.Migration, nil
 		}
-		// Pending migration (no DB yet): need migrationDir to create the DB. Serialize per id so only one goroutine runs openDB + createMigration + bindDB.
 		if migrationDir == "" {
 			return nil, fmt.Errorf("migration %q has no database yet: pass the migration folder path (e.g. data/%s) so the engine can create the DB", id, id)
 		}
@@ -321,21 +276,9 @@ func (m *MigrationManager) GetMigration(id string, migrationDir string) (*Migrat
 	}
 
 	if migrationDir == "" {
-		// Legacy single DB
-		legacyDB := m.getLegacyDB()
-		if legacyDB == nil {
-			return nil, nil
-		}
-		record, err := m.store.getMigration(nil, id)
-		if err != nil || record == nil {
-			return nil, err
-		}
-		instance := newMigration(m, *record, legacyDB)
-		m.putMigration(id, instance)
-		return instance, nil
+		return nil, fmt.Errorf("migration %q not loaded: pass migrationDir to open its DB", id)
 	}
 
-	// Per-migration: load from disk
 	dbPath := MigrationDBPath(migrationDir, id)
 	if absDir, err := filepath.Abs(migrationDir); err == nil {
 		dbPath = MigrationDBPath(absDir, id)
@@ -359,21 +302,8 @@ func (m *MigrationManager) GetMigration(id string, migrationDir string) (*Migrat
 	return instance, nil
 }
 
-// ListMigrations returns migration summaries. When using a single DB (Path set), dataDir is ignored. When using per-migration DBs, pass dataDir to scan for migration folders (e.g. data); each subdir dataDir/{id} is expected to contain {id}.db. When dataDir is empty and no single DB, returns only in-memory migrations (current process).
+// ListMigrations returns migration summaries. Pass dataDir to scan for migration folders (e.g. data); each subdir dataDir/{id} is expected to contain {id}.db. When dataDir is empty, returns only in-memory migrations for this process.
 func (m *MigrationManager) ListMigrations(dataDir string) ([]MigrationSummary, error) {
-	if m.db != nil {
-		records, err := m.store.listMigrations(nil)
-		if err != nil {
-			return nil, err
-		}
-		out := make([]MigrationSummary, 0, len(records))
-		for _, r := range records {
-			s := MigrationSummary{ID: r.ID, Name: r.Name, Phase: r.Phase, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt, Live: false}
-			m.overlayRuntimeFromCacheSummary(r.ID, &s)
-			out = append(out, s)
-		}
-		return out, nil
-	}
 	if dataDir != "" {
 		absDir, _ := filepath.Abs(dataDir)
 		entries, err := os.ReadDir(absDir)
@@ -403,7 +333,7 @@ func (m *MigrationManager) ListMigrations(dataDir string) ([]MigrationSummary, e
 				continue
 			}
 			s := MigrationSummary{ID: rec.ID, Name: rec.Name, Phase: rec.Phase, CreatedAt: rec.CreatedAt, UpdatedAt: rec.UpdatedAt, Live: false}
-			m.overlayRuntimeFromCacheSummary(rec.ID, &s)
+			m.overlayRuntimeFromCache(rec.ID, &s.Live, &s.Phase)
 			out = append(out, s)
 		}
 		return out, nil
@@ -421,17 +351,8 @@ func (m *MigrationManager) ListMigrations(dataDir string) ([]MigrationSummary, e
 	return out, nil
 }
 
-// GetMigrationDetails returns the full migration record. When using per-migration DBs, pass migrationDir (path to that migration's folder) if the migration is not already loaded in memory.
+// GetMigrationDetails returns the full migration record. Pass migrationDir (path to that migration's folder) if the migration is not already loaded in memory.
 func (m *MigrationManager) GetMigrationDetails(id string, migrationDir string) (*MigrationDetails, error) {
-	if m.db != nil {
-		record, err := m.store.getMigration(nil, id)
-		if err != nil || record == nil {
-			return nil, err
-		}
-		d := recordToDetails(record)
-		m.overlayRuntimeFromCache(id, d)
-		return d, nil
-	}
 	m.mu.Lock()
 	pending, hasPending := m.pendingRecords[id]
 	existing := m.migrations[id]
@@ -442,7 +363,7 @@ func (m *MigrationManager) GetMigrationDetails(id string, migrationDir string) (
 	if existing != nil && existing.DB != nil {
 		if existing.IsLive() {
 			if d, ok := existing.cachedMigrationDetailsForLiveAPI(); ok {
-				m.overlayRuntimeFromCache(id, d)
+				m.overlayRuntimeFromCache(id, &d.Live, &d.Phase)
 				return d, nil
 			}
 		}
@@ -451,7 +372,7 @@ func (m *MigrationManager) GetMigrationDetails(id string, migrationDir string) (
 			return nil, err
 		}
 		d := recordToDetails(record)
-		m.overlayRuntimeFromCache(id, d)
+		m.overlayRuntimeFromCache(id, &d.Live, &d.Phase)
 		return d, nil
 	}
 	if migrationDir != "" {
@@ -464,7 +385,7 @@ func (m *MigrationManager) GetMigrationDetails(id string, migrationDir string) (
 			return nil, err
 		}
 		d := recordToDetails(record)
-		m.overlayRuntimeFromCache(id, d)
+		m.overlayRuntimeFromCache(id, &d.Live, &d.Phase)
 		return d, nil
 	}
 	return nil, nil
@@ -495,29 +416,19 @@ func (m *MigrationManager) runtimeViewFromCache(id string) (live bool, phase str
 	return mig.IsLive(), mig.Phase(), true
 }
 
-func (m *MigrationManager) overlayRuntimeFromCache(id string, d *MigrationDetails) {
-	if live, phase, ok := m.runtimeViewFromCache(id); ok {
-		d.Live = live
-		d.Phase = phase
+func (m *MigrationManager) overlayRuntimeFromCache(id string, live *bool, phase *string) {
+	if l, p, ok := m.runtimeViewFromCache(id); ok {
+		*live = l
+		*phase = p
 	}
 }
 
-func (m *MigrationManager) overlayRuntimeFromCacheSummary(id string, s *MigrationSummary) {
-	if live, phase, ok := m.runtimeViewFromCache(id); ok {
-		s.Live = live
-		s.Phase = phase
-	}
-}
-
-// DeleteMigration removes the migration from memory and, when a DB exists, deletes its record. When using per-migration DBs, pass migrationDir so the engine can open the DB, delete the row, and close it; otherwise only in-memory state is removed.
+// DeleteMigration removes the migration from memory and, when a DB exists, deletes its record. Pass migrationDir so the engine can open the DB, delete the row, and close it; otherwise only in-memory state is removed.
 func (m *MigrationManager) DeleteMigration(id string, migrationDir string) error {
 	m.mu.Lock()
 	delete(m.migrations, id)
 	delete(m.pendingRecords, id)
 	m.mu.Unlock()
-	if m.db != nil {
-		return m.store.deleteMigration(m.db, id)
-	}
 	if migrationDir == "" {
 		return nil
 	}
@@ -539,7 +450,60 @@ func (m *MigrationManager) DeleteMigration(id string, migrationDir string) error
 
 func migrationNameFromConfig(cfg Config) string {
 	if cfg.Database.Path != "" {
-		return filepath.Base(cfg.Database.Path)
+		_, id := MigrationDirAndIDFromDBPath(cfg.Database.Path)
+		return id
 	}
 	return "migration"
+}
+
+type migrationEntrySnapshot struct {
+	Migration  *Migration
+	HasDB      bool
+	HasPending bool
+	Pending    migrationRecord
+}
+
+func (m *MigrationManager) snapshotMigrationEntry(id string) migrationEntrySnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var snap migrationEntrySnapshot
+	snap.Migration = m.migrations[id]
+	if snap.Migration != nil {
+		snap.HasDB = snap.Migration.DB != nil
+	}
+	if m.pendingRecords != nil {
+		if r, ok := m.pendingRecords[id]; ok {
+			snap.HasPending = true
+			snap.Pending = r
+		}
+	}
+	return snap
+}
+
+func (m *MigrationManager) putMigration(id string, instance *Migration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.migrations[id] = instance
+}
+
+func (m *MigrationManager) tryBindDuplicateMigration(id string, database *db.DB) *Migration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := m.migrations[id]
+	if out != nil && m.pendingRecords != nil {
+		delete(m.pendingRecords, id)
+	}
+	if out != nil {
+		out.bindDB(database)
+	}
+	return out
+}
+
+func (m *MigrationManager) bindPendingMigrationDB(id string, existing *Migration, database *db.DB) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pendingRecords != nil {
+		delete(m.pendingRecords, id)
+	}
+	existing.bindDB(database)
 }

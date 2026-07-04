@@ -236,6 +236,11 @@ type Queue struct {
 	// Throttle pull-retry exhaustion logs (one line per round per interval).
 	pullRetryWarnRound int
 	pullRetryWarnAt    time.Time
+	// Operation-based autoscaler context (provider IDs and backend groups).
+	scalingSrcProvider string
+	scalingDstProvider string
+	scalingSrcGroupID  string
+	scalingDstGroupID  string
 }
 
 func pendingBuffCapFromLeaseSizing(leaseConfigured int) int {
@@ -461,7 +466,7 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			return q.confirmRoundAdvanceGate(currentRound)
 		}
 
-		// Legacy fallback for any future modes
+		// Default completion gate for queue modes without dedicated round logic.
 		inProgressCount := q.InProgressCount()
 		pendingBuffCount := q.GetPendingCount()
 		lastPullWasPartial := q.GetLastPullWasPartial()

@@ -20,7 +20,7 @@ const (
 	PhaseCopyReview           string = "awaiting-copy-review"      // Copy done, user can review; can retry copy
 )
 
-// ParsePhase parses a phase string from the DB. Accepts new lowercase-with-hyphens values and legacy PascalCase values.
+// ParsePhase parses a canonical phase string from the DB (lowercase-with-hyphens).
 func ParsePhase(v string) (string, error) {
 	validPhases := []string{
 		PhaseCreated,

@@ -13,6 +13,9 @@ const (
 	tableStats            = "stats" // universal key/count table for canonical review stats
 	// TableMigrations is the migrations lifecycle table name (used by schema and migration store).
 	TableMigrations = "migrations"
+	// TableSrcStatusEvents / TableDstStatusEvents are status event table names.
+	TableSrcStatusEvents = "src_status_events"
+	TableDstStatusEvents = "dst_status_events"
 	// TableMigrationEnvelope holds one row per migration DB: 32-byte envelope master key for Sylos-FS credentials.
 	TableMigrationEnvelope = "migration_envelope"
 	// TableFSCredentialBinding holds per-side connection id, optional creds file path, and serialized root folder for API rehydration.

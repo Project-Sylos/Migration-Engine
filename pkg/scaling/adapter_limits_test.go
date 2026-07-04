@@ -23,7 +23,7 @@ func (stubAdapter) ListChildrenPagination() fstypes.ListChildrenPagination {
 }
 
 func TestApplyAdapterListPaginationFromAdapter(t *testing.T) {
-	base := LookupProfile("generic", "")
+	base := ToActuatorProfile(LookupOperationProfile("generic", "", OpListChildren))
 	got := ApplyAdapterListPagination(base, stubAdapter{})
 	if got.MinListPageSize != 50 || got.MaxListPageSize != 500 || got.DefaultListPageSize != 100 {
 		t.Fatalf("expected conservative merge with profile, got %+v", got)
@@ -34,13 +34,13 @@ func TestApplyAdapterListPaginationFromAdapter(t *testing.T) {
 }
 
 func TestApplyAdapterListPaginationAdapterDisablesPreferLarge(t *testing.T) {
-	base := LookupProfile("google_drive", "")
+	base := ToActuatorProfile(LookupOperationProfile("google_drive", "", OpListChildren))
 	got := ApplyAdapterListPagination(base, googledrivePaginationAdapter{})
 	if got.PreferLargePages {
 		t.Fatal("adapter PreferLargePages=false should disable profile prefer large")
 	}
-	if got.MaxListPageSize != 200 {
-		t.Fatalf("MaxListPageSize=%d want 200", got.MaxListPageSize)
+	if got.MaxListPageSize != 500 {
+		t.Fatalf("MaxListPageSize=%d want 500", got.MaxListPageSize)
 	}
 }
 
@@ -54,7 +54,7 @@ func (googledrivePaginationAdapter) ListChildrenPagination() fstypes.ListChildre
 }
 
 func TestApplyAdapterListPaginationFallback(t *testing.T) {
-	base := LookupProfile("generic", "")
+	base := ToActuatorProfile(LookupOperationProfile("generic", "", OpListChildren))
 	got := ApplyAdapterListPagination(base, nil)
 	if got.MinListPageSize != base.MinListPageSize || got.MaxListPageSize != base.MaxListPageSize {
 		t.Fatalf("nil adapter should keep profile defaults: %+v", got)

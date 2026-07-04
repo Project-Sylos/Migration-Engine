@@ -25,18 +25,27 @@ func queueSizingFromSuspend(s *RuntimeSuspendV1) *queue.QueueSizing {
 	}
 }
 
-func effectiveWorkerCount(cfgWorker int, s *RuntimeSuspendV1) int {
-	if s != nil && s.WorkerCount > 0 {
-		return s.WorkerCount
+func effectiveSuspendInt(cfg, suspend int) int {
+	if suspend > 0 {
+		return suspend
 	}
-	return cfgWorker
+	return cfg
+}
+
+func effectiveWorkerCount(cfgWorker int, s *RuntimeSuspendV1) int {
+	suspend := 0
+	if s != nil {
+		suspend = s.WorkerCount
+	}
+	return effectiveSuspendInt(cfgWorker, suspend)
 }
 
 func effectiveMaxRetries(cfgRetries int, s *RuntimeSuspendV1) int {
-	if s != nil && s.MaxRetries > 0 {
-		return s.MaxRetries
+	suspend := 0
+	if s != nil {
+		suspend = s.MaxRetries
 	}
-	return cfgRetries
+	return effectiveSuspendInt(cfgRetries, suspend)
 }
 
 func observerPollFromConfigAndSuspend(cfg time.Duration, s *RuntimeSuspendV1) time.Duration {
@@ -99,9 +108,6 @@ func performTraversalSoftSuspend(
 
 	if err := database.FlushSealBuffer(); err != nil {
 		return RuntimeStats{}, RuntimeSuspendV1{}, fmt.Errorf("flush seal buffer: %w", err)
-	}
-	if err := database.FlushAppenderBuffer(); err != nil {
-		return RuntimeStats{}, RuntimeSuspendV1{}, fmt.Errorf("flush appender buffer: %w", err)
 	}
 	if err := database.CheckpointWithRetry(waitCtx, 5); err != nil {
 		return RuntimeStats{}, RuntimeSuspendV1{}, fmt.Errorf("checkpoint: %w", err)
@@ -169,9 +175,6 @@ func performCopySoftSuspend(
 
 	if err := database.FlushSealBuffer(); err != nil {
 		return queue.QueueStats{}, RuntimeSuspendV1{}, fmt.Errorf("flush seal buffer: %w", err)
-	}
-	if err := database.FlushAppenderBuffer(); err != nil {
-		return queue.QueueStats{}, RuntimeSuspendV1{}, fmt.Errorf("flush appender buffer: %w", err)
 	}
 	if err := database.CheckpointWithRetry(waitCtx, 5); err != nil {
 		return queue.QueueStats{}, RuntimeSuspendV1{}, fmt.Errorf("checkpoint: %w", err)

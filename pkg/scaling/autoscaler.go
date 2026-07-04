@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
+
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
@@ -39,6 +41,9 @@ type QueueActuator interface {
 	ListItemsP95() int
 	GetPendingCount() int
 	InProgressCount() int
+	ScalingContext() queue.ScalingContext
+	ScalingSrcAdapter() fstypes.FSAdapter
+	ScalingDstAdapter() fstypes.FSAdapter
 }
 
 // Autoscaler runs the control loop during a migration.
@@ -48,6 +53,7 @@ type Autoscaler struct {
 	database    *db.DB
 	queues      map[string]QueueActuator
 	profiles    map[string]FSPerformanceProfile
+	adapters    AdaptersForScaling
 	registry    *BackendRegistry
 	interval    time.Duration
 	aimd        AIMDPolicy
@@ -77,6 +83,8 @@ type Config struct {
 	// DebugAIMD prints probe cooldown and scale-up attempt diagnostics to stdout.
 	// Also enabled when ME_AUTOSCALER_DEBUG_AIMD=1.
 	DebugAIMD bool
+	// Adapters are fallbacks for operation profile resolution when queue-local adapters are unset.
+	Adapters AdaptersForScaling
 }
 
 // NewAutoscaler builds an autoscaler for the given queues.
@@ -112,6 +120,7 @@ func NewAutoscaler(database *db.DB, observer *queue.QueueObserver, registry *Bac
 		database:   database,
 		queues:     actuators,
 		profiles:   profiles,
+		adapters:   cfg.Adapters,
 		registry:   registry,
 		interval:   interval,
 		aimd:       aimd,
@@ -142,6 +151,8 @@ func (a *Autoscaler) Run(ctx context.Context) {
 }
 
 func (a *Autoscaler) tick() {
+	a.refreshProfiles()
+	a.reconcileProfileBounds()
 	a.updateFSOpRatePeaks()
 	inProgress := make(map[string]int)
 	pending := make(map[string]int)
@@ -330,6 +341,14 @@ func (a *Autoscaler) throughputRate(queueName string) float64 {
 	if a == nil || a.observer == nil {
 		return 0
 	}
+	if q := a.queues[queueName]; q != nil {
+		ctx := q.ScalingContext()
+		if (ctx.Mode == queue.ScalingModeCopy || ctx.Mode == queue.ScalingModeCopyRetry) && ctx.CopyPass == 2 {
+			if rate := a.observer.SnapshotBytesPerSecond(queueName); rate > 0 {
+				return rate
+			}
+		}
+	}
 	return a.observer.SnapshotThroughputRate(queueName)
 }
 
@@ -468,7 +487,7 @@ func (a *Autoscaler) applyGroupEfficiencyProbeBeforeScaleUp(groupID string, queu
 	return true
 }
 
-func (a *Autoscaler) abortGroupEfficiencyProbeOnPressure(st *queueAIMDState, workersAfter int, now time.Time) {
+func (a *Autoscaler) abortGroupEfficiencyProbeOnPressure(st *queueAIMDState, workersAfter int) {
 	if st == nil || !st.probePending {
 		return
 	}

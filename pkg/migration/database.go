@@ -7,13 +7,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
-// DatabaseConfig defines how the migration engine should prepare its backing store.
+// DatabaseConfig defines how the migration engine opens a DuckDB file for a run or test.
 type DatabaseConfig struct {
-	// Path is the DuckDB file path for legacy single-DB mode (all migrations in one file). When empty, the manager uses per-migration DBs; the API passes each migration's folder path to CreateMigration (MigrationDir) and GetMigration (migrationDir).
+	// Path is the DuckDB file for this migration (e.g. {migrationDir}/{id}.db).
 	Path string
 	// RemoveExisting deletes the database file if it already exists before creating a new database.
 	RemoveExisting bool
@@ -21,6 +22,16 @@ type DatabaseConfig struct {
 	// When true (API mode): DB instance must be provided and already open, error if nil/closed.
 	// When false (standalone mode): Can auto-open DB if instance is nil or not open.
 	RequireOpen bool
+}
+
+// MigrationDirAndIDFromDBPath splits a migration DB file path into its folder and migration id.
+// For /data/migration-1/migration-1.db returns (/data/migration-1, migration-1).
+func MigrationDirAndIDFromDBPath(dbPath string) (migrationDir, migrationID string) {
+	abs, err := filepath.Abs(dbPath)
+	if err != nil {
+		abs = dbPath
+	}
+	return filepath.Dir(abs), strings.TrimSuffix(filepath.Base(abs), ".db")
 }
 
 // MigrationDBPath returns the per-migration DB path when the API passes the folder for that migration.
@@ -57,7 +68,7 @@ func SetupDatabase(cfg DatabaseConfig) (*db.DB, bool, error) {
 	}
 
 	// Secondary indexes on node and status-event tables are not created here: BeginTraversalPhase /
-	// BeginCopyPhase drop them before bulk inserts, and EndTraversalPhase / EndCopyPhase (or
+	// BeginTraversalPhase drops them before bulk inserts, and EndTraversalPhase (or
 	// EnsureBulkPhaseSecondaryIndexes after retry) recreate them. Creating them at open would be
 	// redundant for new migrations and wasted work before the first phase.
 	return database, wasFresh, nil

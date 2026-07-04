@@ -362,11 +362,6 @@ func (db *DB) GetDB() (*sql.DB, error) {
 	return db.conn, nil
 }
 
-// GetDBForPulls returns the main connection for pull queries. queueType is "SRC" or "DST" (both use same conn).
-func (db *DB) GetDBForPulls(queueType string) (*sql.DB, error) {
-	return db.conn, nil
-}
-
 // AddNodeDeletion deletes a node immediately (retry DST cleanup).
 func (db *DB) AddNodeDeletion(table, nodeID string) error {
 	return db.RunWrite(context.Background(), func(s *WriteSession) error {
@@ -458,7 +453,7 @@ func (db *DB) UpdateSealBufferOptions(opts SealBufferOptions) {
 	}
 }
 
-// AppendDiscoveredNodes adds discovered nodes (and their initial status events) to the seal buffer discovery queue. Call from traversal completion; flush is async until FlushAppenderBuffer.
+// AppendDiscoveredNodes adds discovered nodes (and their initial status events) to the seal buffer discovery queue. Call from traversal completion; flush is async until FlushSealBuffer.
 func (db *DB) AppendDiscoveredNodes(ops []InsertOperation) {
 	if db.sealBuffer != nil && len(ops) > 0 {
 		db.sealBuffer.AddDiscoveryNodes(ops)
@@ -492,14 +487,6 @@ func (db *DB) AppendFailedSubtree(parentPath string) {
 	if db.sealBuffer != nil {
 		db.sealBuffer.AddFailedSubtreePath(parentPath)
 	}
-}
-
-// FlushAppenderBuffer flushes the seal buffer (including discovery queue) and returns when all pending nodes and status events are persisted. Call before round advance.
-func (db *DB) FlushAppenderBuffer() error {
-	if db.sealBuffer == nil {
-		return nil
-	}
-	return db.sealBuffer.Flush()
 }
 
 // WriteSession is the handle passed to RunWrite. Caller must not retain conn after the callback returns.
@@ -567,7 +554,7 @@ func (db *DB) BeginTraversalPhase(ctx context.Context) error {
 }
 
 // EnsureBulkPhaseSecondaryIndexes recreates secondary indexes after a bulk traversal/copy phase
-// (same set as dropped in BeginTraversalPhase / BeginCopyPhase): three per node table (path_hash,
+// (same set as dropped in BeginTraversalPhase): three per node table (path_hash,
 // parent_path_hash, depth) and two per status-events table (id, id+event_time). Uses conservative
 // PRAGMA settings during creation to reduce OOM risk on large tables.
 //
@@ -608,12 +595,3 @@ func (db *DB) EndTraversalPhase() error {
 	return db.EnsureBulkPhaseSecondaryIndexes()
 }
 
-// BeginCopyPhase starts the copy phase (same as traversal: drop indexes, persistent appenders).
-func (db *DB) BeginCopyPhase(ctx context.Context) error {
-	return db.BeginTraversalPhase(ctx)
-}
-
-// EndCopyPhase ends the copy phase (flush, close appenders, rebuild indexes).
-func (db *DB) EndCopyPhase() error {
-	return db.EndTraversalPhase()
-}

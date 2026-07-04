@@ -45,7 +45,6 @@ func runTest() error {
 	}
 	cfg.WorkerCount = workers
 	cfg.Autoscaler = migration.AutoscalerConfig{
-		Enabled:  true,
 		Interval: 500 * time.Millisecond,
 		OnEvent: func(ev scaling.ScalingEvent) {
 			mu.Lock()

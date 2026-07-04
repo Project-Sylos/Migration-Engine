@@ -7,7 +7,10 @@ import (
 	"testing"
 	"time"
 
+	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
+
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 )
 
 type memActuator struct {
@@ -27,6 +30,11 @@ func (m *memActuator) SetListPageSize(int)            {}
 func (m *memActuator) ListItemsP95() int              { return 0 }
 func (m *memActuator) GetPendingCount() int           { return 0 }
 func (m *memActuator) InProgressCount() int           { return 0 }
+func (m *memActuator) ScalingContext() queue.ScalingContext {
+	return queue.ScalingContext{QueueName: "src", Mode: queue.ScalingModeTraversal, SrcProvider: "local"}
+}
+func (m *memActuator) ScalingSrcAdapter() fstypes.FSAdapter { return nil }
+func (m *memActuator) ScalingDstAdapter() fstypes.FSAdapter { return nil }
 
 func TestStepDownMemoryKnobs(t *testing.T) {
 	act := &memActuator{lease: 1000, refill: 8000}
@@ -38,7 +46,7 @@ func TestStepDownMemoryKnobs(t *testing.T) {
 
 	var events []ScalingEvent
 	sc := NewAutoscaler(database, nil, nil, map[string]FSPerformanceProfile{
-		"src": LookupProfile("local", ""),
+		"src": ToActuatorProfile(LookupOperationProfile("local", "", OpListChildren)),
 	}, map[string]QueueActuator{"src": act}, Config{
 		Enabled: true,
 		OnEvent: func(ev ScalingEvent) { events = append(events, ev) },

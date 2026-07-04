@@ -100,7 +100,7 @@ func (a *Autoscaler) debugScaleUpBlocked(scope, reason string) {
 	a.debugWorkerScaleUpResult(scope, 0, 0, reason)
 }
 
-func (a *Autoscaler) debugScaleUpProbe(scope string, st *queueAIMDState, workersBefore int, target int, rateBefore float64, now time.Time) {
+func (a *Autoscaler) debugScaleUpProbe(scope string, st *queueAIMDState, workersBefore int, target int, rateBefore float64) {
 	if !a.debugAIMD {
 		return
 	}

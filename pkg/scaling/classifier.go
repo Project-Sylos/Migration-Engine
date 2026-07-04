@@ -43,7 +43,7 @@ func Classify(in ClassifierInput) PressureClass {
 		}
 	}
 	for name, snap := range in.Internal {
-		if snap.TimeWaitingOnQueue > 500*time.Millisecond && in.InProgress[name] == 0 && in.Pending[name] > 0 {
+		if snap.TimeWaitingOnQueue > 500*time.Millisecond && in.Pending[name] > 0 {
 			return PressureUnderfeed
 		}
 	}

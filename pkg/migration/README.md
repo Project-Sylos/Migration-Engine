@@ -22,8 +22,7 @@ Higher-level **API / HTTP integration** (routes, background tasks, runtime cache
 Used by **`LetsMigrate`** / **`StartMigration`**:
 
 - **`Database`** – **`DatabaseConfig`** (`Path`, `RemoveExisting`, `RequireOpen`).  
-  - **Non-empty `Path`:** legacy **single** DuckDB file (all migrations in that DB’s `migrations` table, if used).  
-  - **Empty `Path`:** **per-migration** DB files; the host passes **`MigrationDir`** / **`migrationDir`** into **`CreateMigration`** / **`GetMigration`** (see **`manager.go`**).
+  - **`Path`:** DuckDB file for this migration (`{dir}/{id}.db`). Standalone runs set this directly; the HTTP API passes **`MigrationDir`** / **`migrationDir`** into **`CreateMigration`** / **`GetMigration`** instead.
 - **`Source`**, **`Destination`** – **`Service`** with **`types.FSAdapter`** and **`types.Folder`**. **Adapters must be non-nil**; the engine does not construct or close them.
 - **`SeedRoots`**, **`WorkerCount`**, **`MaxRetries`**, **`CoordinatorLead`**, **`LogAddress`**, **`LogLevel`**, **`SkipListener`**, **`StartupDelay`**, **`ProgressTick`**, **`Verification`**, **`ShutdownContext`**.
 
@@ -51,7 +50,7 @@ There is **no** `GetDB()` / `Result()` / `Error()` on the controller in the curr
 
 ## `MigrationManager` (`manager.go`)
 
-- **`NewMigrationManager(DatabaseConfig)`** – Opens legacy DB when `Path` is set; otherwise returns a manager that opens **`{dir}/{id}.db`** per migration.
+- **`NewMigrationManager()`** – Returns a manager that opens **`{migrationDir}/{id}.db`** per migration.
 - **`CreateMigration`**, **`GetMigration`**, **`ListMigrations`**, **`GetMigrationDetails`**, **`DeleteMigration`**, **`Close`**.
 
 **`GetMigrationDetails` / `ListMigrations`** merge **`Live`** and **`Phase`** from an in-memory **`Migration`** when this process has loaded it (so `live` matches `running`); otherwise phase comes from the DB row.
@@ -64,7 +63,7 @@ There is **no** `GetDB()` / `Result()` / `Error()` on the controller in the curr
 
 Examples: **`roots-set`**, **`filters-set`**, **`traversal-in-progress`**, **`traversal-suspended`**, **`awaiting-traversal-review`**, **`copy-in-progress`**, **`copy-suspended`**, **`awaiting-copy-review`** (`phase.go`).
 
-**Soft suspend:** While phase is **`traversal-in-progress`** or **`copy-in-progress`**, **`Stop()`** requests a **coordinated suspend** (pause queues, drop non-leased pending work, drain in-flight tasks, flush seal/appender buffers, checkpoint, persist **`runtime_state_json`** under **`suspend_v1`** plus legacy round keys). The phase becomes **`traversal-suspended`** or **`copy-suspended`**. **Hard cancel** still uses **`ShutdownContext`** cancellation (abbreviated shutdown, not the full soft path).
+**Soft suspend:** While phase is **`traversal-in-progress`** or **`copy-in-progress`**, **`Stop()`** requests a **coordinated suspend** (pause queues, drop non-leased pending work, drain in-flight tasks, flush seal/appender buffers, checkpoint, persist **`runtime_state_json.suspend_v1`**). The phase becomes **`traversal-suspended`** or **`copy-suspended`**. **Hard cancel** still uses **`ShutdownContext`** cancellation (abbreviated shutdown, not the full soft path).
 
 **Resume:** **`StartTraversal(cfg)`** from **`traversal-suspended`** reloads **`suspend_v1`** and restarts with **retry-style** queues (round 0, persisted max depth and batch sizing) so the frontier is rebuilt from DuckDB—not from restored in-memory buffers. **`StartCopy(cfg)`** from **`copy-suspended`** restores tuning from **`suspend_v1`**; pending depths and copy passes still come from **DB scans** in **`RunCopyPhase`**.
 

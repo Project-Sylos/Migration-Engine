@@ -16,6 +16,12 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
+const (
+	flatCopyFolderA = "alpha"
+	flatCopyFolderB = "bravo"
+	flatCopyFile    = "sample.txt"
+)
+
 // memCopyAdapter is a minimal in-memory FS for flat copy integration tests.
 type memCopyAdapter struct {
 	rootID   string
@@ -141,7 +147,10 @@ func (w *memWriteCloser) Close() error {
 	return nil
 }
 
-func seedFlatCopyLayout(t *testing.T, database *db.DB, legacyMalformedParentHash bool) {
+// seedFlatCopyLayout inserts a flat SRC tree: two folders and one file at depth 1.
+// When wrongParentPathHash is true, rows are inserted with an incorrect parent_path_hash
+// to exercise copy pull join logic against malformed path metadata.
+func seedFlatCopyLayout(t *testing.T, database *db.DB, wrongParentPathHash bool) {
 	t.Helper()
 	const srcRootService = "src-root"
 	const dstRootService = "dst-root"
@@ -168,9 +177,9 @@ func seedFlatCopyLayout(t *testing.T, database *db.DB, legacyMalformedParentHash
 		size int64
 	}
 	children := []child{
-		{name: "DMT", typ: db.NodeTypeFolder},
-		{name: "Interview Prep", typ: db.NodeTypeFolder},
-		{name: "notes.txt", typ: db.NodeTypeFile, size: 12},
+		{name: flatCopyFolderA, typ: db.NodeTypeFolder},
+		{name: flatCopyFolderB, typ: db.NodeTypeFolder},
+		{name: flatCopyFile, typ: db.NodeTypeFile, size: 12},
 	}
 
 	err := database.RunWrite(context.Background(), func(s *db.WriteSession) error {
@@ -185,7 +194,7 @@ func seedFlatCopyLayout(t *testing.T, database *db.DB, legacyMalformedParentHash
 					ParentID:        srcRootID,
 					ParentServiceID: srcRootService,
 					Path:            path,
-					ParentPath:      "", // simulate discovery encoding before normalization fix
+					ParentPath:      "",
 					Type:            ch.typ,
 					Size:            ch.size,
 					MTime:           now,
@@ -193,7 +202,7 @@ func seedFlatCopyLayout(t *testing.T, database *db.DB, legacyMalformedParentHash
 					TraversalStatus: db.StatusSuccessful,
 					CopyStatus:      db.CopyStatusPending,
 				}
-				if legacyMalformedParentHash {
+				if wrongParentPathHash {
 					conn, err := database.GetDB()
 					if err != nil {
 						return err
@@ -202,7 +211,7 @@ func seedFlatCopyLayout(t *testing.T, database *db.DB, legacyMalformedParentHash
 						`INSERT INTO src_nodes (id, service_id, parent_id, parent_service_id, path, parent_path, path_hash, parent_path_hash, type, size, mtime, depth)
 						 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
 						node.ID, node.ServiceID, node.ParentID, node.ParentServiceID, node.Path, node.ParentPath,
-						db.PathHash(node.Path), db.PathHash(""), // wrong hash on purpose
+						db.PathHash(node.Path), db.PathHash(""),
 						node.Type, node.Size, node.MTime, node.Depth,
 					)
 					if err != nil {
@@ -240,7 +249,7 @@ func TestRunCopyPhase_flatLayoutPass1FoldersBeforePass2(t *testing.T) {
 
 	src := newMemCopyAdapter("src-root", "src")
 	dst := newMemCopyAdapter("dst-root", "dst")
-	src.fileData["src-notes.txt"] = []byte("hello notes!")
+	src.fileData["src-"+flatCopyFile] = []byte("hello sample")
 
 	_, err = RunCopyPhase(CopyPhaseConfig{
 		DuckDB:       database,
@@ -254,7 +263,7 @@ func TestRunCopyPhase_flatLayoutPass1FoldersBeforePass2(t *testing.T) {
 		t.Fatalf("RunCopyPhase: %v", err)
 	}
 
-	for _, folder := range []string{"DMT", "Interview Prep"} {
+	for _, folder := range []string{flatCopyFolderA, flatCopyFolderB} {
 		c, err := database.GetCopyCountAtDepth(1, db.NodeTypeFolder, db.CopyStatusPending, true)
 		if err != nil {
 			t.Fatalf("pending folder count: %v", err)
@@ -273,13 +282,13 @@ func TestRunCopyPhase_flatLayoutPass1FoldersBeforePass2(t *testing.T) {
 		t.Fatal(err)
 	}
 	if filePending > 0 {
-		t.Fatalf("notes.txt still pending")
+		t.Fatalf("%s still pending", flatCopyFile)
 	}
 
 	// Pass 1 must create folders before pass 2 copies files.
 	firstFile := -1
 	for i, op := range dst.ops {
-		if op == "file:notes.txt" {
+		if op == "file:"+flatCopyFile {
 			firstFile = i
 			break
 		}
@@ -288,7 +297,7 @@ func TestRunCopyPhase_flatLayoutPass1FoldersBeforePass2(t *testing.T) {
 		t.Fatal("file never copied")
 	}
 	for i := 0; i < firstFile; i++ {
-		if dst.ops[i] != "folder:DMT" && dst.ops[i] != "folder:Interview Prep" {
+		if dst.ops[i] != "folder:"+flatCopyFolderA && dst.ops[i] != "folder:"+flatCopyFolderB {
 			t.Fatalf("unexpected op before file copy: %s (ops=%v)", dst.ops[i], dst.ops)
 		}
 	}
@@ -297,8 +306,8 @@ func TestRunCopyPhase_flatLayoutPass1FoldersBeforePass2(t *testing.T) {
 	}
 }
 
-func TestRunCopyPhase_flatLayoutLegacyMalformedParentHash(t *testing.T) {
-	database, err := db.Open(db.Options{Path: t.TempDir() + "/flat_copy_legacy.db"})
+func TestRunCopyPhase_flatLayoutWrongParentPathHash(t *testing.T) {
+	database, err := db.Open(db.Options{Path: t.TempDir() + "/flat_copy_wrong_hash.db"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +317,7 @@ func TestRunCopyPhase_flatLayoutLegacyMalformedParentHash(t *testing.T) {
 
 	src := newMemCopyAdapter("src-root", "src")
 	dst := newMemCopyAdapter("dst-root", "dst")
-	src.fileData["src-notes.txt"] = []byte("hello notes!")
+	src.fileData["src-"+flatCopyFile] = []byte("hello sample")
 
 	_, err = RunCopyPhase(CopyPhaseConfig{
 		DuckDB:       database,
@@ -327,6 +336,6 @@ func TestRunCopyPhase_flatLayoutLegacyMalformedParentHash(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c > 0 {
-		t.Fatalf("legacy malformed rows: %d folders still pending", c)
+		t.Fatalf("wrong parent_path_hash rows: %d folders still pending", c)
 	}
 }

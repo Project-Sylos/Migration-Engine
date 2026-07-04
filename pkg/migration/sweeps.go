@@ -113,37 +113,34 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 		qsz = &queue.QueueSizing{LeaseBatchSize: cfg.LeaseBatchSize, RefillBatchSize: cfg.RefillBatchSize}
 	}
 
-	_, _, runProfile := resolveServiceProfiles(MigrationConfig{
-		SrcAdapter: cfg.SrcAdapter,
-		DstAdapter: cfg.DstAdapter,
-		SrcService: cfg.SrcService,
-		DstService: cfg.DstService,
-	})
+	srcCtx := scalingContextForTraversal("src", cfg.SrcService, cfg.DstService, queue.QueueModeRetry)
+	dstCtx := scalingContextForTraversal("dst", cfg.SrcService, cfg.DstService, queue.QueueModeRetry)
 	if qsz == nil {
-		qsz = queueSizingFromProfileOrSuspend(nil, runProfile)
+		qsz = queueSizingForScalingContext(srcCtx, nil)
 	}
-	wc := resolveWorkersForProfile(cfg.WorkerCount, nil, runProfile)
+	srcWC := resolveWorkersForScalingContext(srcCtx, cfg.WorkerCount, nil)
+	dstWC := resolveWorkersForScalingContext(dstCtx, cfg.WorkerCount, nil)
 
 	// Create queues in retry mode
-	srcQueue := queue.NewQueue("src", cfg.MaxRetries, wc, coordinator, qsz)
+	srcQueue := queue.NewQueue("src", cfg.MaxRetries, srcWC, coordinator, qsz)
 	srcQueue.SetMode(queue.QueueModeRetry)
 	srcQueue.SetMaxKnownDepth(maxKnownDepth)
 	srcQueue.InitializeWithContext(duckDB, cfg.SrcAdapter, cfg.ShutdownContext)
 
-	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, wc, coordinator, qsz)
+	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, dstWC, coordinator, qsz)
 	dstQueue.SetMode(queue.QueueModeRetry)
 	if cfg.MaxKnownDepth >= 0 {
 		dstQueue.SetMaxKnownDepth(cfg.MaxKnownDepth)
 	}
 	dstQueue.InitializeWithContext(duckDB, cfg.DstAdapter, cfg.ShutdownContext)
 
-	srcListProfile := scaling.ApplyAdapterListPagination(
-		scaling.LookupProfile(cfg.SrcService.ProviderID, cfg.SrcService.Name),
-		cfg.SrcAdapter,
+	srcListProfile := scaling.ResolveEffectiveProfile(
+		scalingContextForTraversal("src", cfg.SrcService, cfg.DstService, queue.QueueModeRetry),
+		cfg.SrcAdapter, cfg.DstAdapter,
 	)
-	dstListProfile := scaling.ApplyAdapterListPagination(
-		scaling.LookupProfile(cfg.DstService.ProviderID, cfg.DstService.Name),
-		cfg.DstAdapter,
+	dstListProfile := scaling.ResolveEffectiveProfile(
+		scalingContextForTraversal("dst", cfg.SrcService, cfg.DstService, queue.QueueModeRetry),
+		cfg.SrcAdapter, cfg.DstAdapter,
 	)
 	scaling.ApplyQueueListPagination(srcQueue, srcListProfile)
 	scaling.ApplyQueueListPagination(dstQueue, dstListProfile)
@@ -300,7 +297,7 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 				mcfg.ObserverPollInterval = obsPoll
 			}
 			waitCtx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
-			stats, suspend, err := performTraversalSoftSuspend(waitCtx, duckDB, srcQueue, dstQueue, observer, coordinator, mcfg, start, wc, mr)
+			stats, suspend, err := performTraversalSoftSuspend(waitCtx, duckDB, srcQueue, dstQueue, observer, coordinator, mcfg, start, srcWC, mr)
 			cancel()
 			if err != nil {
 				return stats, fmt.Errorf("retry sweep soft suspend: %w", err)

@@ -84,7 +84,12 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 			return queue.QueueStats{}, fmt.Errorf("failed to initialize logger: %w", err)
 		}
 	}
-	copyQueue := queue.NewQueue("copy", cfg.MaxRetries, cfg.WorkerCount, nil, nil)
+	copyCtx := scalingContextForCopy(cfg.SrcService, cfg.DstService, 1, queue.QueueModeCopyRetry)
+	sizing := queueSizingForScalingContext(copyCtx, cfg.ResumeCopy)
+	wc := resolveWorkersForScalingContext(copyCtx, cfg.WorkerCount, cfg.ResumeCopy)
+	mr := effectiveMaxRetries(cfg.MaxRetries, cfg.ResumeCopy)
+
+	copyQueue := queue.NewQueue("copy", mr, wc, nil, sizing)
 	copyQueue.SetMode(queue.QueueModeCopyRetry)
 	copyQueue.SetCopyPass(1)
 	minLevel := -1
@@ -114,7 +119,7 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	if shutdownCtx == nil {
 		shutdownCtx = context.Background()
 	}
-	if err := duckDB.BeginCopyPhase(shutdownCtx); err != nil {
+	if err := duckDB.BeginTraversalPhase(shutdownCtx); err != nil {
 		return queue.QueueStats{}, fmt.Errorf("begin copy phase: %w", err)
 	}
 	defer func() {
@@ -123,7 +128,7 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		}
 	}()
 	defer func() {
-		if err := duckDB.EndCopyPhase(); err != nil {
+		if err := duckDB.EndTraversalPhase(); err != nil {
 			fmt.Println("error ending copy phase", err)
 		}
 	}()
@@ -195,7 +200,6 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	}()
 	copyQueue.PullTasksIfNeeded(true)
 	start := time.Now()
-	wc, mr := cfg.WorkerCount, cfg.MaxRetries
 	for {
 		if shutdownCtx != nil {
 			select {
@@ -272,14 +276,9 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		}
 	}
 
-	_, _, runProfile := resolveServiceProfiles(MigrationConfig{
-		SrcAdapter: cfg.SrcAdapter,
-		DstAdapter: cfg.DstAdapter,
-		SrcService: cfg.SrcService,
-		DstService: cfg.DstService,
-	})
-	sizing := queueSizingFromProfileOrSuspend(cfg.ResumeCopy, runProfile)
-	wc := resolveWorkersForProfile(cfg.WorkerCount, cfg.ResumeCopy, runProfile)
+	copyCtx := scalingContextForCopy(cfg.SrcService, cfg.DstService, 1, queue.QueueModeCopy)
+	sizing := queueSizingForScalingContext(copyCtx, cfg.ResumeCopy)
+	wc := resolveWorkersForScalingContext(copyCtx, cfg.WorkerCount, cfg.ResumeCopy)
 	mr := effectiveMaxRetries(cfg.MaxRetries, cfg.ResumeCopy)
 
 	// Create copy queue (single queue, not dual like traversal)
@@ -361,7 +360,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	if shutdownCtx == nil {
 		shutdownCtx = context.Background()
 	}
-	if err := duckDB.BeginCopyPhase(shutdownCtx); err != nil {
+	if err := duckDB.BeginTraversalPhase(shutdownCtx); err != nil {
 		return queue.QueueStats{}, fmt.Errorf("begin copy phase: %w", err)
 	}
 	defer func() {
@@ -370,7 +369,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		}
 	}()
 	defer func() {
-		if err := duckDB.EndCopyPhase(); err != nil {
+		if err := duckDB.EndTraversalPhase(); err != nil {
 			fmt.Println("error ending copy phase", err)
 		}
 	}()

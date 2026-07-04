@@ -462,7 +462,7 @@ func (q *Queue) FailTraversalTask(task *TaskBase, executionDelta time.Duration) 
 }
 
 // CheckTraversalCompletion checks if traversal/retry phase should complete.
-// DB-backed: no pending at depth (from GetPendingTraversalCountAtDepthFromLive), attempted pull, first pull returned 0.
+// DB-backed: no pending at depth (from GetTraversalCountAtDepthFromLive with StatusPending), attempted pull, first pull returned 0.
 func (q *Queue) CheckTraversalCompletion(currentRound int) bool {
 	if q.State() == QueueStateWaiting {
 		return false

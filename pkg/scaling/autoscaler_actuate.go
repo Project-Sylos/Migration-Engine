@@ -27,10 +27,10 @@ func (a *Autoscaler) stepUpWorkers(internal map[string]queue.InternalMetricsSnap
 			}
 			var reason string
 			var try bool
-			if trigger == scaleUpUnderfeed && a.groupWantsScaleUp(queues, internal, inProgress, pending) {
+			if trigger == scaleUpUnderfeed && a.groupWantsScaleUp(queues, internal, pending) {
 				try = true
 				for _, name := range queues {
-					if queueUnderfeed(name, internal, inProgress, pending) {
+					if queueUnderfeed(name, internal, pending) {
 						snap := internal[name]
 						reason = fmt.Sprintf("UNDERFEED wait=%s in_progress=%d pending=%d", snap.TimeWaitingOnQueue.Round(time.Millisecond), inProgress[name], pending[name])
 						break
@@ -54,7 +54,7 @@ func (a *Autoscaler) stepUpWorkers(internal map[string]queue.InternalMetricsSnap
 		}
 		var reason string
 		var try bool
-		if trigger == scaleUpUnderfeed && queueUnderfeed(name, internal, inProgress, pending) {
+		if trigger == scaleUpUnderfeed && queueUnderfeed(name, internal, pending) {
 			try = true
 			snap := internal[name]
 			reason = fmt.Sprintf("UNDERFEED wait=%s in_progress=%d pending=%d", snap.TimeWaitingOnQueue.Round(time.Millisecond), inProgress[name], pending[name])
@@ -184,7 +184,7 @@ func (a *Autoscaler) stepDownSharedGroup(groupID string, queues []string, intern
 	targetTotal := a.aimd.DecreaseTarget(totalCur, minTotal, maxTotal, st, now)
 	if targetTotal < totalCur {
 		if a.lastClass == PressureFSThrottle {
-			a.abortGroupEfficiencyProbeOnPressure(st, targetTotal, now)
+			a.abortGroupEfficiencyProbeOnPressure(st, targetTotal)
 			st.noteFSBackoff(now, rateLimitedUntil, a.aimd.ProbeCooldown)
 		}
 		a.debugAIMDPrint(fmt.Sprintf("  aimd decrease [group:%s]: total workers %d->%d", groupID, totalCur, targetTotal))
@@ -336,12 +336,12 @@ func (a *Autoscaler) stepUpSharedGroup(groupID string, queues []string, internal
 	targetTotal, ok := a.aimd.IncreaseTarget(totalCur, minPer*len(queues), maxTotal, st, now)
 	if !ok || targetTotal <= totalCur {
 		if a.debugAIMD {
-			reason := increaseTargetBlockReason(totalCur, maxTotal, st, a.aimd, now)
-			a.debugScaleUpBlocked("group:"+groupID, reason)
+			blockReason := increaseTargetBlockReason(totalCur, maxTotal, st, a.aimd, now)
+			a.debugScaleUpBlocked("group:"+groupID, blockReason)
 		}
 		return
 	}
-	a.debugScaleUpProbe("group:"+groupID, st, totalCur, targetTotal, rateBefore, now)
+	a.debugScaleUpProbe("group:"+groupID, st, totalCur, targetTotal, rateBefore)
 	a.recordEfficiencyProbe(st, totalCur, rateBefore, now)
 	split := SplitWorkersTotal(targetTotal, queues, minPer)
 	for name, target := range split {
@@ -444,7 +444,7 @@ func (a *Autoscaler) stepUpIndependentQueue(name string, q QueueActuator, intern
 	if err := q.SetTargetWorkerCount(target); err != nil {
 		return
 	}
-	a.debugScaleUpProbe(name, st, cur, target, rateBefore, now)
+	a.debugScaleUpProbe(name, st, cur, target, rateBefore)
 	a.recordEfficiencyProbe(st, cur, rateBefore, now)
 	a.clearInterOpDelay(name, q, st, now)
 	a.maybeDecreaseListPage(name, q, profile, now)
@@ -497,17 +497,17 @@ func (a *Autoscaler) maybeDecreaseListPage(name string, q QueueActuator, profile
 	a.emit(ScalingEvent{Queue: name, Knob: "ListPageSize", OldValue: cur, NewValue: next, Pressure: PressureUnderfeed, At: now})
 }
 
-func queueUnderfeed(name string, internal map[string]queue.InternalMetricsSnapshot, inProgress, pending map[string]int) bool {
+func queueUnderfeed(name string, internal map[string]queue.InternalMetricsSnapshot, pending map[string]int) bool {
 	snap, ok := internal[name]
 	if !ok {
 		return false
 	}
-	return snap.TimeWaitingOnQueue > 500*time.Millisecond && inProgress[name] == 0 && pending[name] > 0
+	return snap.TimeWaitingOnQueue > 500*time.Millisecond && pending[name] > 0
 }
 
-func (a *Autoscaler) groupWantsScaleUp(queues []string, internal map[string]queue.InternalMetricsSnapshot, inProgress, pending map[string]int) bool {
+func (a *Autoscaler) groupWantsScaleUp(queues []string, internal map[string]queue.InternalMetricsSnapshot, pending map[string]int) bool {
 	for _, name := range queues {
-		if queueUnderfeed(name, internal, inProgress, pending) {
+		if queueUnderfeed(name, internal, pending) {
 			return true
 		}
 	}

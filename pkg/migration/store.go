@@ -25,8 +25,7 @@ type migrationRecord struct {
 }
 
 type migrationStore struct {
-	// db is used only in legacy single-DB mode. When nil, callers pass per-migration db to each method.
-	db *db.DB
+	db *db.DB // set on Migration-bound stores only
 }
 
 func newMigrationStore(database *db.DB) *migrationStore {
@@ -35,7 +34,7 @@ func newMigrationStore(database *db.DB) *migrationStore {
 
 func (s *migrationStore) createMigration(database *db.DB, record migrationRecord) error {
 	if database == nil {
-		database = s.db
+		return fmt.Errorf("database required")
 	}
 	conn, err := database.GetDB()
 	if err != nil {
@@ -71,7 +70,7 @@ func (s *migrationStore) createMigration(database *db.DB, record migrationRecord
 
 func (s *migrationStore) getMigration(database *db.DB, id string) (*migrationRecord, error) {
 	if database == nil {
-		database = s.db
+		return nil, fmt.Errorf("database required")
 	}
 	conn, err := database.GetDB()
 	if err != nil {
@@ -109,64 +108,9 @@ func (s *migrationStore) getMigration(database *db.DB, id string) (*migrationRec
 	return &record, nil
 }
 
-func (s *migrationStore) listMigrationsFromDB(database *db.DB) ([]migrationRecord, error) {
-	if database == nil {
-		database = s.db
-	}
-	conn, err := database.GetDB()
-	if err != nil {
-		return nil, err
-	}
-	rows, err := conn.QueryContext(
-		context.Background(),
-		`SELECT migration_id, name, phase, created_at, updated_at, service_metadata_json, root_config_json, COALESCE(runtime_state_json,'')
-		 FROM `+db.TableMigrations+` ORDER BY created_at DESC`,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("list migrations: %w", err)
-	}
-	defer rows.Close()
-
-	records := make([]migrationRecord, 0)
-	for rows.Next() {
-		var (
-			record   migrationRecord
-			phaseRaw string
-		)
-		if err := rows.Scan(
-			&record.ID,
-			&record.Name,
-			&phaseRaw,
-			&record.CreatedAt,
-			&record.UpdatedAt,
-			&record.ServiceMetadataJSON,
-			&record.RootConfigJSON,
-			&record.RuntimeStateJSON,
-		); err != nil {
-			return nil, fmt.Errorf("list migrations scan: %w", err)
-		}
-		record.Phase, err = ParsePhase(phaseRaw)
-		if err != nil {
-			return nil, fmt.Errorf("parse phase for migration %s: %w", record.ID, err)
-		}
-		records = append(records, record)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list migrations rows: %w", err)
-	}
-	return records, nil
-}
-
-func (s *migrationStore) listMigrations(database *db.DB) ([]migrationRecord, error) {
-	if database == nil {
-		database = s.db
-	}
-	return s.listMigrationsFromDB(database)
-}
-
 func (s *migrationStore) deleteMigration(database *db.DB, id string) error {
 	if database == nil {
-		database = s.db
+		return fmt.Errorf("database required")
 	}
 	conn, err := database.GetDB()
 	if err != nil {
@@ -179,71 +123,67 @@ func (s *migrationStore) deleteMigration(database *db.DB, id string) error {
 	return nil
 }
 
-func (s *migrationStore) updatePhase(id string, phase string) error {
+func (s *migrationStore) withConn(op string, fn func(*sql.DB) error) error {
 	if s.db == nil {
-		return fmt.Errorf("updatePhase requires store db")
+		return fmt.Errorf("%s requires store db", op)
 	}
 	conn, err := s.db.GetDB()
 	if err != nil {
 		return err
 	}
-	_, err = conn.ExecContext(
-		context.Background(),
-		`UPDATE `+db.TableMigrations+` SET phase = $1, updated_at = $2 WHERE migration_id = $3`,
-		phase,
-		time.Now().UTC(),
-		id,
-	)
-	if err != nil {
-		return fmt.Errorf("update migration %s phase: %w", id, err)
-	}
-	return nil
+	return fn(conn)
+}
+
+func (s *migrationStore) updatePhase(id string, phase string) error {
+	return s.withConn("updatePhase", func(conn *sql.DB) error {
+		_, err := conn.ExecContext(
+			context.Background(),
+			`UPDATE `+db.TableMigrations+` SET phase = $1, updated_at = $2 WHERE migration_id = $3`,
+			phase,
+			time.Now().UTC(),
+			id,
+		)
+		if err != nil {
+			return fmt.Errorf("update migration %s phase: %w", id, err)
+		}
+		return nil
+	})
 }
 
 // updateUpdatedAt sets updated_at to now for the migration (e.g. after roots inserted or run ended).
 func (s *migrationStore) updateUpdatedAt(id string) error {
-	if s.db == nil {
-		return fmt.Errorf("updateUpdatedAt requires store db")
-	}
-	conn, err := s.db.GetDB()
-	if err != nil {
-		return err
-	}
-	_, err = conn.ExecContext(
-		context.Background(),
-		`UPDATE `+db.TableMigrations+` SET updated_at = $1 WHERE migration_id = $2`,
-		time.Now().UTC(),
-		id,
-	)
-	if err != nil {
-		return fmt.Errorf("update migration %s updated_at: %w", id, err)
-	}
-	return nil
+	return s.withConn("updateUpdatedAt", func(conn *sql.DB) error {
+		_, err := conn.ExecContext(
+			context.Background(),
+			`UPDATE `+db.TableMigrations+` SET updated_at = $1 WHERE migration_id = $2`,
+			time.Now().UTC(),
+			id,
+		)
+		if err != nil {
+			return fmt.Errorf("update migration %s updated_at: %w", id, err)
+		}
+		return nil
+	})
 }
 
 // updateRootConfig replaces root_config_json (serialized run knobs + roots; no FS adapters).
 func (s *migrationStore) updateRootConfig(id string, rootConfigJSON string) error {
-	if s.db == nil {
-		return fmt.Errorf("updateRootConfig requires store db")
-	}
-	conn, err := s.db.GetDB()
-	if err != nil {
-		return err
-	}
-	_, err = conn.ExecContext(
-		context.Background(),
-		`UPDATE `+db.TableMigrations+` SET root_config_json = $1, updated_at = $2 WHERE migration_id = $3`,
-		rootConfigJSON,
-		time.Now().UTC(),
-		id,
-	)
-	if err != nil {
-		return fmt.Errorf("update migration %s root_config_json: %w", id, err)
-	}
-	return nil
+	return s.withConn("updateRootConfig", func(conn *sql.DB) error {
+		_, err := conn.ExecContext(
+			context.Background(),
+			`UPDATE `+db.TableMigrations+` SET root_config_json = $1, updated_at = $2 WHERE migration_id = $3`,
+			rootConfigJSON,
+			time.Now().UTC(),
+			id,
+		)
+		if err != nil {
+			return fmt.Errorf("update migration %s root_config_json: %w", id, err)
+		}
+		return nil
+	})
 }
 
-// updateRuntimeState merges stateJSON into existing runtime_state_json (e.g. last_round_src, last_round_dst, last_copy_round). Pass partial JSON to update only some keys.
+// updateRuntimeState merges stateJSON into existing runtime_state_json (suspend_v1 and other keys). Pass partial JSON to update only some keys.
 func (s *migrationStore) updateRuntimeState(id string, stateJSON string) error {
 	if s.db == nil || stateJSON == "" {
 		return nil

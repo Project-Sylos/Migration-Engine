@@ -45,7 +45,7 @@ There is **no** top-level `pkg/tests/normal/` or `pkg/tests/retry_sweep/`—thos
 | **`traversal/autoscaler_throttle`** | Ephemeral Spectra with chaos rate limits; asserts autoscaler worker step-down under throttle. |
 | **`traversal/local`** | Local-oriented entry (see `main.go`). |
 | **`traversal/resumption`** | **`StartMigration`**, interrupt, then **`LetsMigrate`** again with `-resume` (see script + `main.go`). |
-| **`traversal/retry_sweep`** | Full migration, then mark-for-retry / subtree / **`RunRetrySweep`** (engine retry sweep)—uses **DuckDB** tables and status events, not legacy “level bucket” storage. |
+| **`traversal/retry_sweep`** | Full migration, then mark-for-retry / subtree / **`RunRetrySweep`** (engine retry sweep)—uses **DuckDB** tables and status events. |
 | **`copy/normal`**, **`copy/local`** | Copy-phase exercises after a traversal DB exists. |
 
 ---

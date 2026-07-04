@@ -22,7 +22,7 @@ type managedWorker struct {
 // workerPool holds dynamic worker lifecycle state.
 type workerPool struct {
 	mu              sync.Mutex
-	handles         []managedWorker
+	handles         []*managedWorker
 	nextID          int
 	traversalAdapter types.FSAdapter
 	copySrcAdapter   types.FSAdapter
@@ -150,18 +150,17 @@ func (q *Queue) SetTargetWorkerCount(target int) error {
 	if target > cur {
 		for i := cur; i < target; i++ {
 			workerCtx, cancel := context.WithCancel(shutdownCtx)
-			h := managedWorker{cancel: cancel}
+			h := &managedWorker{cancel: cancel}
 			h.idle.Store(true)
 			q.pool.handles = append(q.pool.handles, h)
 			id := q.pool.nextID
 			q.pool.nextID++
-			handle := &q.pool.handles[len(q.pool.handles)-1]
 			if q.pool.isCopy {
-				w := NewCopyWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.copySrcAdapter, q.pool.copyDstAdapter, shutdownCtx, workerCtx, &handle.idle, &handle.retire)
+				w := NewCopyWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.copySrcAdapter, q.pool.copyDstAdapter, shutdownCtx, workerCtx, &h.idle, &h.retire)
 				q.workers = append(q.workers, w)
 				go w.Run()
 			} else {
-				w := NewTraversalWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.traversalAdapter, q.name, shutdownCtx, workerCtx, &handle.idle, &handle.retire)
+				w := NewTraversalWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.traversalAdapter, q.name, shutdownCtx, workerCtx, &h.idle, &h.retire)
 				q.workers = append(q.workers, w)
 				go w.Run()
 			}
@@ -171,7 +170,7 @@ func (q *Queue) SetTargetWorkerCount(target int) error {
 	}
 	// Scale down: cancel idle workers immediately; busy workers finish their task then exit via retire flag.
 	for i := cur - 1; i >= target; i-- {
-		h := &q.pool.handles[i]
+		h := q.pool.handles[i]
 		if h.idle.Load() {
 			h.cancel()
 		} else {

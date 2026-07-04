@@ -115,7 +115,7 @@ type CopyStatusCounts struct {
 type Migration struct {
 	ID      string
 	Name    string
-	DB      *db.DB          // this migration's DB (per-migration or shared in legacy mode)
+	DB      *db.DB          // this migration's DB (per-migration file or shared manager DB)
 	store   *migrationStore // store bound to this migration's DB
 	manager *MigrationManager
 
@@ -429,9 +429,6 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 	if err := m.DB.ResyncReviewStats(); err != nil {
 		fmt.Println("warning: resync review stats after StartTraversal:", err)
 	}
-	if js, err := json.Marshal(map[string]int{"last_round_src": stats.Src.Round, "last_round_dst": stats.Dst.Round}); err == nil {
-		_ = m.store.updateRuntimeState(m.ID, string(js))
-	}
 	m.refreshRuntimeState()
 	return stats, nil
 }
@@ -494,7 +491,7 @@ func (m *Migration) StartCopy(cfg Config) (queue.QueueStats, error) {
 		if errors.Is(err, ErrCopySoftSuspended) {
 			cstats, sus, ok := AsCopySuspended(err)
 			if ok {
-				if patch, e2 := copySuspendRuntimeMergePatch(sus); e2 == nil {
+				if patch, e2 := traversalSuspendRuntimeMergePatch(sus); e2 == nil {
 					_ = m.store.updateRuntimeState(m.ID, patch)
 				}
 				if e3 := m.transitionTo(PhaseCopySuspended); e3 != nil {
@@ -512,9 +509,6 @@ func (m *Migration) StartCopy(cfg Config) (queue.QueueStats, error) {
 	}
 	if err := m.DB.ResyncReviewStats(); err != nil {
 		fmt.Println("warning: resync review stats after StartCopy:", err)
-	}
-	if js, err := json.Marshal(map[string]int{"last_copy_round": stats.Round}); err == nil {
-		_ = m.store.updateRuntimeState(m.ID, string(js))
 	}
 	m.refreshRuntimeState()
 	return stats, nil
@@ -623,9 +617,6 @@ func (m *Migration) RunRetrySweep(cfg Config, opts RetrySweepOptions) (RuntimeSt
 	if err := m.DB.ResyncReviewStats(); err != nil {
 		fmt.Println("warning: resync review stats after RunRetrySweep:", err)
 	}
-	if js, err := json.Marshal(map[string]int{"last_round_src": stats.Src.Round, "last_round_dst": stats.Dst.Round}); err == nil {
-		_ = m.store.updateRuntimeState(m.ID, string(js))
-	}
 	m.refreshRuntimeState()
 	return stats, nil
 }
@@ -705,7 +696,7 @@ func (m *Migration) RunCopyRetry(cfg Config, opts CopyPhaseOptions) (queue.Queue
 		if errors.Is(err, ErrCopySoftSuspended) {
 			cstats, sus, ok := AsCopySuspended(err)
 			if ok {
-				if patch, e2 := copySuspendRuntimeMergePatch(sus); e2 == nil {
+				if patch, e2 := traversalSuspendRuntimeMergePatch(sus); e2 == nil {
 					_ = m.store.updateRuntimeState(m.ID, patch)
 				}
 				if e3 := m.transitionTo(PhaseCopySuspended); e3 != nil {
@@ -723,9 +714,6 @@ func (m *Migration) RunCopyRetry(cfg Config, opts CopyPhaseOptions) (queue.Queue
 	}
 	if err := m.DB.ResyncReviewStats(); err != nil {
 		fmt.Println("warning: resync review stats after RunCopyRetry:", err)
-	}
-	if js, err := json.Marshal(map[string]int{"last_copy_round": stats.Round}); err == nil {
-		_ = m.store.updateRuntimeState(m.ID, string(js))
 	}
 	m.refreshRuntimeState()
 	return stats, nil

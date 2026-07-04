@@ -54,7 +54,6 @@ func performTraversalForceStop(
 	flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = database.FlushSealBuffer()
-	_ = database.FlushAppenderBuffer()
 	_ = database.CheckpointWithRetry(flushCtx, 1)
 }
 
@@ -74,13 +73,7 @@ func performCopyForceStop(
 	flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = database.FlushSealBuffer()
-	_ = database.FlushAppenderBuffer()
 	_ = database.CheckpointWithRetry(flushCtx, 1)
-}
-
-func traversalForceStopStats(database *db.DB, coordinator *queue.QueueCoordinator) RuntimeStats {
-	srcStats, dstStats := snapshotTraversalQueueStats(database, coordinator)
-	return RuntimeStats{Src: srcStats, Dst: dstStats}
 }
 
 func copyForceStopStats(copyQueue *queue.Queue) queue.QueueStats {

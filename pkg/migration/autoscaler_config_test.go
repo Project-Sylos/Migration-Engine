@@ -12,7 +12,7 @@ import (
 
 func TestAutoscalerConfig_Resolve_defaultsOn(t *testing.T) {
 	got := (AutoscalerConfig{}).Resolve()
-	if !got.Enabled {
+	if !got.Enabled() {
 		t.Fatal("expected enabled by default")
 	}
 	if got.Interval != defaultAutoscalerInterval {
@@ -22,7 +22,7 @@ func TestAutoscalerConfig_Resolve_defaultsOn(t *testing.T) {
 
 func TestAutoscalerConfig_Resolve_disableOptOut(t *testing.T) {
 	got := AutoscalerConfig{DisableAutoscaler: true}.Resolve()
-	if got.Enabled {
+	if got.Enabled() {
 		t.Fatal("expected disabled when DisableAutoscaler is set")
 	}
 }
@@ -34,7 +34,7 @@ func TestAutoscalerConfig_Resolve_preservesCallbacks(t *testing.T) {
 		DebugAIMD: true,
 		Interval:  5 * time.Second,
 	}.Resolve()
-	if !got.Enabled {
+	if !got.Enabled() {
 		t.Fatal("expected enabled")
 	}
 	if got.Interval != 5*time.Second {

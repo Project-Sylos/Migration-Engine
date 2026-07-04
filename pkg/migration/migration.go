@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
@@ -222,14 +223,10 @@ func LetsMigrate(cfg Config) (Result, error) {
 		return Result{}, fmt.Errorf("destination root: %w", err)
 	}
 
-	manager, err := NewMigrationManager(cfg.Database)
-	if err != nil {
-		return Result{}, err
-	}
+	manager := NewMigrationManager()
 	defer manager.Close()
 
-	result := Result{RootsSeeded: cfg.SeedRoots}
-	migrationInstance, err := manager.CreateMigration(CreateMigrationConfig{
+	createCfg := CreateMigrationConfig{
 		Name: migrationNameFromConfig(cfg),
 		ServiceMetadata: map[string]string{
 			"source_name":      cfg.Source.Name,
@@ -239,11 +236,21 @@ func LetsMigrate(cfg Config) (Result, error) {
 			"source_root_id":      srcRoot.ServiceID,
 			"destination_root_id": dstRoot.ServiceID,
 		},
-	})
+	}
+	if cfg.Database.Path != "" {
+		if cfg.Database.RemoveExisting {
+			_ = os.Remove(cfg.Database.Path)
+		}
+		dir, id := MigrationDirAndIDFromDBPath(cfg.Database.Path)
+		createCfg.MigrationDir = dir
+		createCfg.MigrationID = id
+	}
+	migrationInstance, err := manager.CreateMigration(createCfg)
 	if err != nil {
 		return Result{}, err
 	}
 
+	result := Result{RootsSeeded: cfg.SeedRoots}
 	if cfg.SeedRoots {
 		summary, err := SeedRootTasks(srcRoot, dstRoot, migrationInstance.DB)
 		if err != nil {

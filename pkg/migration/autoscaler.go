@@ -21,9 +21,7 @@ const defaultAutoscalerInterval = 3 * time.Second
 // AutoscalerConfig controls in-engine autoscaler behavior.
 // Autoscaler is enabled by default for all migration runs; set DisableAutoscaler to opt out.
 type AutoscalerConfig struct {
-	// DisableAutoscaler turns off the control loop (explicit opt-out).
 	DisableAutoscaler bool
-	Enabled           bool // deprecated: use DisableAutoscaler; kept for callers that set Enabled: true explicitly
 	Interval          time.Duration
 	OnEvent           func(scaling.ScalingEvent)
 	DebugAIMD         bool // probe cooldown + scale-up diagnostics on stdout
@@ -32,19 +30,18 @@ type AutoscalerConfig struct {
 // DefaultAutoscalerConfig returns enabled autoscaler settings used when none are supplied.
 func DefaultAutoscalerConfig() AutoscalerConfig {
 	return AutoscalerConfig{
-		Enabled:  true,
 		Interval: defaultAutoscalerInterval,
 	}
+}
+
+// Enabled reports whether the autoscaler control loop should run.
+func (c AutoscalerConfig) Enabled() bool {
+	return !c.DisableAutoscaler
 }
 
 // Resolve applies migration-engine defaults. Autoscaler runs unless DisableAutoscaler is set.
 func (c AutoscalerConfig) Resolve() AutoscalerConfig {
 	out := c
-	if out.DisableAutoscaler {
-		out.Enabled = false
-		return out
-	}
-	out.Enabled = true
 	if out.Interval <= 0 {
 		out.Interval = defaultAutoscalerInterval
 	}
@@ -79,6 +76,8 @@ func startAutoscaler(
 	srcQueue, dstQueue *queue.Queue,
 	srcService, dstService Service,
 ) *autoscalerRunContext {
+	same := sameBackend(srcService.Adapter, dstService.Adapter)
+	wireQueueScalingContext(srcQueue, dstQueue, nil, srcService, dstService, same)
 	return startAutoscalerActuators(ctx, cfg, observer, database, map[string]scaling.QueueActuator{
 		"src": srcQueue,
 		"dst": dstQueue,
@@ -96,27 +95,18 @@ func startCopyAutoscaler(
 	copyQueue *queue.Queue,
 	srcService, dstService Service,
 ) *autoscalerRunContext {
-	srcProfile := scaling.ApplyAdapterListPagination(
-		scaling.LookupProfile(srcService.ProviderID, srcService.Name),
-		srcService.Adapter,
-	)
-	dstProfile := scaling.ApplyAdapterListPagination(
-		scaling.LookupProfile(dstService.ProviderID, dstService.Name),
-		dstService.Adapter,
-	)
-	copyProfile := scaling.MergeCopyProfiles(srcProfile, dstProfile)
+	wireQueueScalingContext(nil, nil, copyQueue, srcService, dstService, false)
 	return startAutoscalerActuators(ctx, cfg, observer, database, map[string]scaling.QueueActuator{
 		"copy": copyQueue,
 	}, []autoscalerQueueSpec{
-		{Name: "copy", Service: srcService, InitialWorkers: copyQueue.GetWorkerCount(), ProfileOverride: copyProfile},
+		{Name: "copy", Service: srcService, InitialWorkers: copyQueue.GetWorkerCount()},
 	}, srcService.Adapter, dstService.Adapter)
 }
 
 type autoscalerQueueSpec struct {
-	Name            string
-	Service         Service
-	InitialWorkers  int
-	ProfileOverride scaling.FSPerformanceProfile // optional (copy merged profile)
+	Name           string
+	Service        Service
+	InitialWorkers int
 }
 
 func startAutoscalerActuators(
@@ -129,7 +119,7 @@ func startAutoscalerActuators(
 	adapters ...fstypes.FSAdapter,
 ) *autoscalerRunContext {
 	cfg = cfg.Resolve()
-	if !cfg.Enabled || observer == nil {
+	if cfg.DisableAutoscaler || observer == nil {
 		return nil
 	}
 
@@ -138,6 +128,14 @@ func startAutoscalerActuators(
 		for _, spec := range specs {
 			observer.RegisterRateLimitTelemetry(spec.Name, bridge)
 		}
+	}
+
+	var srcAdapter, dstAdapter fstypes.FSAdapter
+	if len(adapters) >= 1 {
+		srcAdapter = adapters[0]
+	}
+	if len(adapters) >= 2 {
+		dstAdapter = adapters[1]
 	}
 
 	registry := scaling.NewBackendRegistry()
@@ -157,11 +155,14 @@ func startAutoscalerActuators(
 	}
 
 	for _, spec := range specs {
-		profile := spec.ProfileOverride
-		if profile.ProviderID == "" && profile.MaxWorkers == 0 {
-			profile = scaling.ApplyAdapterListPagination(
-				scaling.LookupProfile(spec.Service.ProviderID, spec.Service.Name),
-				spec.Service.Adapter,
+		q := actuators[spec.Name]
+		var profile scaling.FSPerformanceProfile
+		if q != nil {
+			sctx := q.ScalingContext()
+			profile = scaling.ResolveEffectiveProfile(sctx, srcAdapter, dstAdapter)
+		} else {
+			profile = scaling.ToActuatorProfile(
+				scaling.LookupOperationProfile(spec.Service.ProviderID, spec.Service.Name, scaling.OpListChildren),
 			)
 		}
 		groupID := scaling.ResolveGroupID(spec.Service.BackendGroupID, "", spec.Name)
@@ -183,6 +184,10 @@ func startAutoscalerActuators(
 		Interval:  cfg.Interval,
 		OnEvent:   cfg.OnEvent,
 		DebugAIMD: cfg.DebugAIMD,
+		Adapters: scaling.AdaptersForScaling{
+			Src: srcAdapter,
+			Dst: dstAdapter,
+		},
 	})
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -240,13 +245,6 @@ func degradationStateFrom(adapter fstypes.FSAdapter) *fstypes.FSDegradationState
 		return r.GetDegradationState()
 	}
 	return nil
-}
-
-func sharedDegradationState(src, dst fstypes.FSAdapter) *fstypes.FSDegradationState {
-	if s := degradationStateFrom(src); s != nil {
-		return s
-	}
-	return degradationStateFrom(dst)
 }
 
 func sameBackend(src, dst fstypes.FSAdapter) bool {
