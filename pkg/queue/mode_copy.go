@@ -12,81 +12,9 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
-// copyHasPendingDBWorkAtRound reports whether src_nodes still has copy work for the current pass at depth round.
-func (q *Queue) copyHasPendingDBWorkAtRound(round int) bool {
-	database := q.getDatabase()
-	if database == nil || round <= 0 {
-		return false
-	}
-	nodeType := db.NodeTypeFolder
-	if q.GetCopyPass() == 2 {
-		nodeType = db.NodeTypeFile
-	}
-	copyStatus := db.CopyStatusPending
-	if q.GetMode() == QueueModeCopyRetry {
-		copyStatus = db.CopyStatusFailed
-	}
-	count, err := database.GetCopyCountAtDepth(round, nodeType, copyStatus, true)
-	return err == nil && count > 0
-}
-
-// minDepthWithPendingCopyWork returns the shallowest depth (>0) with pending copy work for copyPass (1=folders, 2=files), or -1.
-func (q *Queue) minDepthWithPendingCopyWork(copyPass int) int {
-	database := q.getDatabase()
-	if database == nil {
-		return -1
-	}
-	nodeType := db.NodeTypeFolder
-	if copyPass == 2 {
-		nodeType = db.NodeTypeFile
-	}
-	copyStatus := db.CopyStatusPending
-	if q.GetMode() == QueueModeCopyRetry {
-		copyStatus = db.CopyStatusFailed
-	}
-	levels, err := db.GetAllLevels(database, "SRC")
-	if err != nil {
-		return -1
-	}
-	min := -1
-	for _, level := range levels {
-		if level <= 0 {
-			continue
-		}
-		c, err := database.GetCopyCountAtDepth(level, nodeType, copyStatus, true)
-		if err == nil && c > 0 {
-			if min == -1 || level < min {
-				min = level
-			}
-		}
-	}
-	return min
-}
-
-// copyRoundAdvanceNeedsDBRetry is true when the in-memory round looks exhausted but DuckDB still has copy work at this depth.
-func (q *Queue) copyRoundAdvanceNeedsDBRetry(round int) bool {
-	mode := q.GetMode()
-	if mode != QueueModeCopy && mode != QueueModeCopyRetry {
-		return false
-	}
-	if q.GetPendingCount() > 0 || q.InProgressCount() > 0 || q.getPulling() {
-		return false
-	}
-	return q.copyHasPendingDBWorkAtRound(round)
-}
-
-// retryCopyPullForRound resets the keyset cursor and re-pulls when DB still has work at this depth.
-func (q *Queue) retryCopyPullForRound(round int, reason string) {
-	if logservice.LS != nil {
-		_ = logservice.LS.Log("warning", reason, "queue", q.name, q.name)
-	}
-	q.resetThisQueueKeysetCursor()
-	q.setLastPullWasPartial(false)
-	q.pullWithRetryIfNeeded(true)
-}
-
 // CheckCopyCompletion checks if the copy phase should switch passes or complete.
 // Only called when we're past maxKnownDepth - the pass has exhausted itself round-by-round.
+// Trust the per-round logic; no re-checking of pending/inProgress/wasFirstPull.
 func (q *Queue) CheckCopyCompletion(currentRound int) bool {
 	database := q.getDatabase()
 	if database == nil {
@@ -108,41 +36,14 @@ func (q *Queue) CheckCopyCompletion(currentRound int) bool {
 	}
 
 	if copyPass == 1 {
-		if minDepth := q.minDepthWithPendingCopyWork(1); minDepth > 0 {
-			q.retryCopyPullForRound(minDepth, fmt.Sprintf(
-				"Pass 1 folder sweep finished but pending folders remain (e.g. depth %d); re-running folder pass",
-				minDepth,
-			))
-			q.SetRound(minDepth)
-			q.setExpectedFromStatsBucket(minDepth)
-			return false
-		}
-		// Pass 1 (folders) done - switch to pass 2 (files)
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("info", "Copy pass 1 (folders) complete — starting pass 2 (files)", "queue", q.name, q.name)
-		}
+		// Pass 1 (folders) done - switch to pass 2 (files); find starting round
 		q.SetCopyPass(2)
 		q.resetRoundStatsCompleted()
-		q.resetThisQueueKeysetCursor()
 
-		startRound := 1
-		if minFile := q.minDepthWithPendingCopyWork(2); minFile > 0 {
-			startRound = minFile
-		}
-		q.SetRound(startRound)
-		q.setExpectedFromStatsBucket(startRound)
+		q.SetRound(1)
+		q.setExpectedFromStatsBucket(1)
 		q.setLastPullWasPartial(false)
-		q.pullWithRetryIfNeeded(true)
-		return false
-	}
 
-	if minDepth := q.minDepthWithPendingCopyWork(2); minDepth > 0 {
-		q.retryCopyPullForRound(minDepth, fmt.Sprintf(
-			"Pass 2 file sweep finished but pending files remain (e.g. depth %d); re-running file pass at depth %d",
-			minDepth, minDepth,
-		))
-		q.SetRound(minDepth)
-		q.setExpectedFromStatsBucket(minDepth)
 		return false
 	}
 
