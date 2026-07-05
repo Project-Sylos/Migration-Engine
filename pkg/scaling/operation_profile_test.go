@@ -45,6 +45,21 @@ func TestLookupOperationProfileGoogleDrive(t *testing.T) {
 	}
 }
 
+func TestLookupOperationProfileDropbox(t *testing.T) {
+	dl := LookupOperationProfile("dropbox", "", OpDownload)
+	if dl.MaxWorkers != 16 || dl.DefaultWorkers != 8 {
+		t.Fatalf("download profile: %+v", dl)
+	}
+	list := LookupOperationProfile("dropbox", "", OpListChildren)
+	if list.MaxListPageSize != 500 || list.DefaultWorkers != 6 {
+		t.Fatalf("list_children profile: %+v", list)
+	}
+	cf := LookupOperationProfile("dropbox", "", OpCreateFolder)
+	if cf.MaxWorkers != 12 {
+		t.Fatalf("create_folder MaxWorkers=%d want 12", cf.MaxWorkers)
+	}
+}
+
 func TestSpectraAllOpsUncapped(t *testing.T) {
 	pop := LookupProviderOperations("spectra", "")
 	for _, op := range []FSOperation{OpListChildren, OpCreateFolder, OpDownload, OpUpload} {

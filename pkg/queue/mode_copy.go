@@ -414,6 +414,11 @@ func (q *Queue) FailCopyTask(task *TaskBase, executionDelta time.Duration) {
 
 	task.Attempts++
 
+	// Permanent FS errors should not retry — they block round completion and waste API quota.
+	if IsNonRetryableCopyError(task.LastError) {
+		task.Attempts = maxRetries
+	}
+
 	// Check if we should retry
 	if task.Attempts < maxRetries {
 		// Retry: re-enqueue to memory, DON'T write to DuckDB (stays as in-progress)

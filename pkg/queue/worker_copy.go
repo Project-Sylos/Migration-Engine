@@ -316,7 +316,9 @@ func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressW
 	if fileName == "" || fileName == "." {
 		fileName = file.DisplayName
 	}
-	createdFile, err := w.dstAdapter.CreateFile(ctx, dstParentServiceID, fileName, file.Size, nil)
+	srcLocationPath := file.LocationPath
+	createMeta := map[string]string{"location_path": srcLocationPath}
+	createdFile, err := w.dstAdapter.CreateFile(ctx, dstParentServiceID, fileName, file.Size, createMeta)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return fmt.Errorf("create file cancelled by watchdog for %s: %w", file.LocationPath, err)
@@ -370,7 +372,14 @@ func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressW
 		return fmt.Errorf("failed to commit upload for file %s: %w", file.DisplayName, err)
 	}
 
+	if committed, ok := dstWriter.(interface{ CommittedServiceID() string }); ok {
+		if id := committed.CommittedServiceID(); id != "" {
+			createdFile.ServiceID = id
+		}
+	}
+
 	task.BytesTransferred = bytesTransferred
+	createdFile.LocationPath = srcLocationPath
 	task.File = createdFile
 	return nil
 }

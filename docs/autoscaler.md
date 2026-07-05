@@ -270,13 +270,14 @@ type OperationProfile struct {
 
 Resolved profiles map to the actuator shape `FSPerformanceProfile` via `ToActuatorProfile`. Unknown providers fall back to `generic` operation profiles.
 
-**Built-in providers:** `generic`, `local`, `google_drive`, `spectra`.
+**Built-in providers:** `generic`, `local`, `google_drive`, `dropbox`, `spectra`.
 
 | Provider | list_children | create_folder | download | upload |
 |----------|---------------|---------------|----------|--------|
 | `generic` | workers 10/32, pages 100/10k | workers 8/32 | workers 8/32 | workers 8/32 |
 | `local` | workers 8/64, pages 100/1k | workers 8/64 | workers 8/64 | workers 8/64 |
 | `google_drive` | pages 100/500, workers 6/16 | workers 4/12 | workers 8/16 | workers 8/16 |
+| `dropbox` | pages 100/500, workers 6/16 | workers 4/12 | workers 8/16 | workers 8/16 |
 | `spectra` | **all max caps = 0** | **0** | **0** | **0** |
 
 **Zero-cap semantics (`MaxWorkers == 0`, etc.):** Spectra chaos limits vary per test config, so Spectra operation profiles do not encode fixed throughput caps. **`0` = no provider-imposed ceiling** — AIMD + throttle/memory gating only:
@@ -491,7 +492,7 @@ type FSPerformanceProfile struct {
 }
 ```
 
-Built-in providers: `generic`, `spectra`, `local`, `google_drive`. When src/dst share one backend, **`MaxWorkers` is the combined cap** for the group during traversal. Copy pass profiles compose src download + dst upload legs independently of traversal list profiles.
+Built-in providers: `generic`, `spectra`, `local`, `google_drive`, `dropbox`. When src/dst share one backend, **`MaxWorkers` is the combined cap** for the group during traversal. Copy pass profiles compose src download + dst upload legs independently of traversal list profiles.
 
 ### Provider scope
 

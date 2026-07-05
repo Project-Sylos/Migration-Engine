@@ -46,6 +46,7 @@ var operationProfiles = map[string]ProviderOperationProfiles{
 	"spectra":      buildSpectraOperationProfiles(),
 	"local":        buildLocalOperationProfiles(),
 	"google_drive": buildGoogleDriveOperationProfiles(),
+	"dropbox":      buildDropboxOperationProfiles(),
 }
 
 func genericListProfile() OperationProfile {
@@ -166,6 +167,41 @@ func buildGoogleDriveOperationProfiles() ProviderOperationProfiles {
 	}
 	return ProviderOperationProfiles{
 		ProviderID: "google_drive",
+		Ops: map[FSOperation]OperationProfile{
+			OpListChildren: list,
+			OpCreateFolder: createFolder,
+			OpDownload:     transfer,
+			OpUpload:       transfer,
+		},
+	}
+}
+
+func buildDropboxOperationProfiles() ProviderOperationProfiles {
+	list := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 6, MaxWorkers: 16,
+		MaxInterOpDelay:     5 * time.Second,
+		MinListPageSize:     20,
+		DefaultListPageSize: 100,
+		MaxListPageSize:     500,
+		ListPageStep:        20,
+		PreferLargePages:    false,
+		DefaultLeaseBatch:   100,
+		MaxLeaseBatch:       500,
+		MinLeaseBatch:       25,
+		DefaultRefillBatch:  500,
+		MaxRefillBatch:      1000,
+		MinRefillBatch:      100,
+	}
+	createFolder := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 4, MaxWorkers: 12,
+		MaxInterOpDelay: 5 * time.Second,
+	}
+	transfer := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 8, MaxWorkers: 16,
+		MaxInterOpDelay: 5 * time.Second,
+	}
+	return ProviderOperationProfiles{
+		ProviderID: "dropbox",
 		Ops: map[FSOperation]OperationProfile{
 			OpListChildren: list,
 			OpCreateFolder: createFolder,

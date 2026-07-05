@@ -84,6 +84,29 @@ func IsThrottleError(err error) bool {
 	return false
 }
 
+// IsNonRetryableCopyError reports permanent FS failures that should not consume copy retry budget.
+func IsNonRetryableCopyError(errMsg string) bool {
+	msg := strings.ToLower(strings.TrimSpace(errMsg))
+	if msg == "" {
+		return false
+	}
+	for _, frag := range []string{
+		"no_write_permission",
+		"path/not_found",
+		"malformed_path",
+		"insufficient_space",
+		"disallowed_name",
+		"access_restricted",
+		"cannot create files or folders at team space root",
+		"missing scope",
+	} {
+		if strings.Contains(msg, frag) {
+			return true
+		}
+	}
+	return false
+}
+
 // yieldTaskOnRateLimit returns a leased task to the pending buffer without incrementing attempts.
 func (q *Queue) yieldTaskOnRateLimit(task *TaskBase, executionDelta time.Duration) {
 	q.recordExecutionTime(executionDelta)

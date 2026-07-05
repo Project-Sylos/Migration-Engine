@@ -178,24 +178,27 @@ See [autoscaler.md — Remaining work](./autoscaler.md#remaining-work) for imple
 
 ---
 
-## Cloud adapters (Google Drive and template)
+## Cloud adapters (Google Drive, Dropbox, and template)
 
 OAuth cloud adapters follow the Spectra pattern:
 
-| Signal | Google Drive | Adapter action |
-|--------|--------------|----------------|
-| HTTP 401 | Unauthorized | Clear in-memory access token; refresh via stored refresh token; retry |
-| HTTP 429 / 403 quota | Rate limit / quota | `FSErrorThrottle`; honor `Retry-After` when present |
-| HTTP 404 | Not found | `FSErrorFatal` |
-| 5xx / timeout | Transient | `FSErrorRetryable` |
+| Signal | Google Drive | Dropbox | Adapter action |
+|--------|--------------|---------|----------------|
+| HTTP 401 | Unauthorized | Unauthorized / `invalid_access_token` | Clear in-memory access token; refresh via stored refresh token; retry |
+| HTTP 429 / quota | Rate limit / quota | `too_many_requests` / `too_many_write_operations` | `FSErrorThrottle`; honor `Retry-After` header **and** JSON `retry_after` |
+| HTTP 404 | Not found | `path/not_found` | `FSErrorFatal` |
+| HTTP 409 | — | `path/conflict` (some) | Retryable or fatal per `.tag` |
+| 5xx / timeout | Transient | Transient | `FSErrorRetryable` |
 
-**Scaling:** `google_drive` profile in `pkg/scaling/profile.go` — conservative defaults (2 workers, max 8; list pages 50 default / 200 max; `PreferLargePages: false`; lease/refill batches 50–200). Adapter reports API max page size only; profile values are operational defaults.
+**Scaling:** `google_drive` and `dropbox` profiles in `pkg/scaling/operation_profile.go` — conservative defaults (list workers 6/16, transfer 8/16; list pages 100 default / 500 max; `PreferLargePages: false`). Adapter reports API max page size only; profile values are operational defaults.
+
+**Dropbox roots:** Business accounts expose multiple browse roots (My Dropbox, team space, team folders, shared folders). Non-home roots require the `Dropbox-API-Path-Root` namespace header on `files/*` calls. See Sylos-FS `pkg/fs/dropbox/session.go` `ListRoots`.
 
 **Backend groups:** When source and destination share one cloud account, Sylos-API sets `BackendGroupID = "conn:" + connectionID` so autoscaler rate-limit signals aggregate per account.
 
 **Token refresh:** Separate from UI OAuth; adapter/session calls the provider token endpoint on 401. Refresh tokens are encrypted on disk; access tokens never persist.
 
-Add provider-specific rows to this table as each adapter lands (Dropbox, OneDrive, etc.). See Sylos-FS `docs/cloud_provider_checklist.md`.
+Add provider-specific rows to this table as each adapter lands (OneDrive, etc.). See Sylos-FS `docs/cloud_provider_checklist.md`.
 
 ---
 
