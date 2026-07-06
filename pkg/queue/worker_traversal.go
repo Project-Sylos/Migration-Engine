@@ -294,7 +294,7 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 
 // executeDstComparison performs comparison between expected (src) and actual (dst) children.
 // It populates task.DiscoveredChildren with comparison results.
-// Matching is done by Type + Name, not LocationPath.
+// Matching uses Type + bare child name derived from LocationPath (adapters may put a full path in DisplayName).
 func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult types.ListResult, wd *ProgressWatchdog) error {
 	wd.Beat()
 	// Extract expected children from task (populated by queue)
@@ -307,12 +307,12 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 
 	task.DiscoveredChildren = make([]ChildResult, 0)
 
-	// Build maps for quick lookup by Type+Name (matching key)
+	// Build maps for quick lookup by canonical Type:Name match key.
 	actualFolderMap := make(map[string]types.Folder)
 	for _, f := range actualResult.Folders {
 		// Override adapter-provided depth with BFS depth based on current round.
 		f.DepthLevel = task.Round + 1
-		matchKey := f.Type + ":" + f.DisplayName
+		matchKey := dstChildMatchKey(f.Type, f.DisplayName, f.LocationPath)
 		actualFolderMap[matchKey] = f
 	}
 
@@ -320,25 +320,25 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 	for _, f := range actualResult.Files {
 		// Override adapter-provided depth with BFS depth based on current round.
 		f.DepthLevel = task.Round + 1
-		matchKey := f.Type + ":" + f.DisplayName
+		matchKey := dstChildMatchKey(f.Type, f.DisplayName, f.LocationPath)
 		actualFileMap[matchKey] = f
 	}
 
 	expectedFolderMap := make(map[string]types.Folder)
 	for _, f := range expectedFolders {
-		matchKey := f.Type + ":" + f.DisplayName
+		matchKey := dstChildMatchKey(f.Type, f.DisplayName, f.LocationPath)
 		expectedFolderMap[matchKey] = f
 	}
 
 	expectedFileMap := make(map[string]types.File)
 	for _, f := range expectedFiles {
-		matchKey := f.Type + ":" + f.DisplayName
+		matchKey := dstChildMatchKey(f.Type, f.DisplayName, f.LocationPath)
 		expectedFileMap[matchKey] = f
 	}
 
-	// Compare folders by Type + Name
+	// Compare folders by canonical Type:Name key.
 	for _, expectedFolder := range expectedFolders {
-		matchKey := expectedFolder.Type + ":" + expectedFolder.DisplayName
+		matchKey := dstChildMatchKey(expectedFolder.Type, expectedFolder.DisplayName, expectedFolder.LocationPath)
 		if actualFolder, exists := actualFolderMap[matchKey]; exists {
 
 			// Get SRC node ID from map
@@ -357,7 +357,7 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 
 	// Check for extra folders on dst (not on src)
 	for _, actualFolder := range actualResult.Folders {
-		matchKey := actualFolder.Type + ":" + actualFolder.DisplayName
+		matchKey := dstChildMatchKey(actualFolder.Type, actualFolder.DisplayName, actualFolder.LocationPath)
 		if _, exists := expectedFolderMap[matchKey]; !exists {
 			// Folder exists on dst but not src: mark as "NotOnSrc"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
@@ -369,9 +369,9 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 		}
 	}
 
-	// Compare files by Type + Name
+	// Compare files by canonical Type:Name key.
 	for _, expectedFile := range expectedFiles {
-		matchKey := expectedFile.Type + ":" + expectedFile.DisplayName
+		matchKey := dstChildMatchKey(expectedFile.Type, expectedFile.DisplayName, expectedFile.LocationPath)
 		if actualFile, exists := actualFileMap[matchKey]; exists {
 			// Get SRC node ID from map
 			srcID := srcIDMap[matchKey]
@@ -397,7 +397,7 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 
 	// Check for extra files on dst (not on src)
 	for _, actualFile := range actualResult.Files {
-		matchKey := actualFile.Type + ":" + actualFile.DisplayName
+		matchKey := dstChildMatchKey(actualFile.Type, actualFile.DisplayName, actualFile.LocationPath)
 		if _, exists := expectedFileMap[matchKey]; !exists {
 			// File exists on dst but not src: mark as "not_on_src"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{

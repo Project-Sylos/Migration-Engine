@@ -29,11 +29,11 @@ func BuildExpectedMapsFromDstWithChildren(dstBatch []db.FetchResult, childrenByD
 		var files []types.File
 		idMap := make(map[string]string)
 		for _, n := range nodes {
-			displayName := n.Name
-			if displayName == "" && n.Path != "" {
-				displayName = n.Path
+			displayName := dstChildMatchName(n.Name, n.Path)
+			if displayName == "" && n.Name != "" {
+				displayName = n.Name
 			}
-			matchKey := n.Type + ":" + displayName
+			matchKey := dstChildMatchKey(n.Type, displayName, n.Path)
 			idMap[matchKey] = n.ID
 			srcIDToMeta[n.ID] = SrcNodeMeta{Depth: n.Depth, TraversalStatus: n.TraversalStatus, CopyStatus: n.CopyStatus}
 			if n.Type == types.NodeTypeFolder {
@@ -111,11 +111,11 @@ func BatchLoadExpectedChildrenByDSTIDs(database *db.DB, dstParentIDs []string, d
 		var files []types.File
 		idMap := make(map[string]string)
 		for _, n := range nodes {
-			displayName := n.Name
-			if displayName == "" && n.Path != "" {
-				displayName = n.Path
+			displayName := dstChildMatchName(n.Name, n.Path)
+			if displayName == "" && n.Name != "" {
+				displayName = n.Name
 			}
-			matchKey := n.Type + ":" + displayName
+			matchKey := dstChildMatchKey(n.Type, displayName, n.Path)
 			idMap[matchKey] = n.ID
 			srcIDToMeta[n.ID] = SrcNodeMeta{Depth: n.Depth, TraversalStatus: n.TraversalStatus, CopyStatus: n.CopyStatus}
 			if n.Type == types.NodeTypeFolder {

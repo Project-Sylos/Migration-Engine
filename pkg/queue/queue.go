@@ -233,9 +233,6 @@ type Queue struct {
 	refillBatchSize int
 	pool            workerPool
 	listFill        listFillTracker
-	// Throttle pull-retry exhaustion logs (one line per round per interval).
-	pullRetryWarnRound int
-	pullRetryWarnAt    time.Time
 	// Operation-based autoscaler context (provider IDs and backend groups).
 	scalingSrcProvider string
 	scalingDstProvider string
@@ -457,19 +454,62 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			return false
 		}
 
-		mode := q.GetMode()
-		if mode == QueueModeTraversal || mode == QueueModeRetry ||
-			mode == QueueModeCopy || mode == QueueModeCopyRetry {
-			if opts.AdvanceRoundIfComplete {
-				return q.tryCommitRoundAdvance(currentRound)
-			}
-			return q.confirmRoundAdvanceGate(currentRound)
-		}
-
-		// Default completion gate for queue modes without dedicated round logic.
 		inProgressCount := q.InProgressCount()
 		pendingBuffCount := q.GetPendingCount()
 		lastPullWasPartial := q.GetLastPullWasPartial()
+		mode := q.GetMode()
+		if inProgressCount == 0 && pendingBuffCount == 0 && !lastPullWasPartial {
+			// We may be at round-end but never observed a terminal pull yet.
+			// Force one pull attempt so partial/empty state is recorded and completion can progress.
+			q.PullTasksIfNeeded(true)
+			inProgressCount = q.InProgressCount()
+			pendingBuffCount = q.GetPendingCount()
+			lastPullWasPartial = q.GetLastPullWasPartial()
+		}
+
+		// Round completion: memory state only. DB is a stale snapshot during the round.
+		// Complete when: pending empty, in-progress 0, and last pull was partial (keyspace exhausted).
+		if mode == QueueModeTraversal || mode == QueueModeRetry {
+			if inProgressCount > 0 || pendingBuffCount > 0 {
+				return false
+			}
+			if !lastPullWasPartial {
+				return false
+			}
+			if q.getPulling() {
+				return false
+			}
+			info := q.getRoundInfoReadOnly(currentRound)
+			if info == nil || info.PullCount == 0 {
+				return false
+			}
+			if opts.AdvanceRoundIfComplete {
+				q.advanceToNextRound()
+			}
+			return true
+		}
+
+		if mode == QueueModeCopy || mode == QueueModeCopyRetry {
+			if inProgressCount > 0 || pendingBuffCount > 0 {
+				return false
+			}
+			if !lastPullWasPartial {
+				return false
+			}
+			if q.getPulling() {
+				return false
+			}
+			info := q.getRoundInfoReadOnly(currentRound)
+			if info == nil || info.PullCount == 0 {
+				return false
+			}
+			if opts.AdvanceRoundIfComplete {
+				q.advanceToNextRound()
+			}
+			return true
+		}
+
+		// Default completion gate for queue modes without dedicated round logic.
 		if inProgressCount > 0 || pendingBuffCount > 0 || !lastPullWasPartial {
 			return false
 		}
@@ -481,7 +521,7 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			return false
 		}
 		if opts.AdvanceRoundIfComplete {
-			return q.tryCommitRoundAdvance(currentRound)
+			q.advanceToNextRound()
 		}
 		return true
 	}
@@ -1102,3 +1142,49 @@ func (q *Queue) Run() {
 
 const flushRetryAttempts = 5
 const flushRetryBackoff = 100 * time.Millisecond
+
+// advanceToNextRound advances the queue to the next round.
+// For traversal/retry: force-flush seal buffer then reset cursor and advance (frontier is in DB).
+// For copy mode: flush seal buffer then reset cursor and advance.
+// If flush fails after retries, round is not advanced so the observer can retry.
+func (q *Queue) advanceToNextRound() {
+	database := q.getDatabase()
+	mode := q.GetMode()
+
+	if database != nil {
+		var err error
+		for attempt := 0; attempt < flushRetryAttempts; attempt++ {
+			if attempt > 0 {
+				time.Sleep(flushRetryBackoff)
+			}
+			err = database.FlushSealBuffer()
+			if err == nil {
+				break
+			}
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("warning", fmt.Sprintf("flush before round advance failed (attempt %d/%d): %v", attempt+1, flushRetryAttempts, err), "queue", q.name, q.name)
+			} else {
+				fmt.Println("error flushing seal buffer before round advance:", err)
+			}
+		}
+		if err != nil {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("error", "aborting round advance: flush did not succeed after retries", "queue", q.name, q.name)
+			}
+			return
+		}
+	}
+	q.resetThisQueueKeysetCursor()
+
+	state := q.State()
+	if state == QueueStateWaiting {
+		q.SetState(QueueStateRunning)
+	}
+
+	if mode == QueueModeCopy || mode == QueueModeCopyRetry {
+		q.AdvanceCopyRound()
+		return
+	}
+
+	q.AdvanceTraversalRound()
+}

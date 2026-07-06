@@ -4,7 +4,6 @@
 package queue
 
 import (
-	"fmt"
 	"time"
 )
 
@@ -36,7 +35,6 @@ func (r PullResult) OK() bool { return r.Status == PullOK }
 const (
 	pullRetryMaxAttempts = 8
 	pullRetryMaxWall     = 100 * time.Millisecond
-	pullRetryLogInterval = 5 * time.Second
 )
 
 // pullTasksOnce dispatches a single pull attempt for the queue mode.
@@ -92,9 +90,6 @@ func (q *Queue) pullWithRetry(force bool) PullResult {
 		}
 		attempts++
 		if attempts >= pullRetryMaxAttempts || time.Since(start) >= pullRetryMaxWall {
-			if last.Status == PullSkipped {
-				q.logPullRetryExhausted(attempts)
-			}
 			return last
 		}
 		time.Sleep(backoff)
@@ -102,20 +97,6 @@ func (q *Queue) pullWithRetry(force bool) PullResult {
 			backoff *= 2
 		}
 	}
-}
-
-func (q *Queue) logPullRetryExhausted(attempts int) {
-	round := q.GetRound()
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	now := time.Now()
-	if q.pullRetryWarnRound == round && now.Sub(q.pullRetryWarnAt) < pullRetryLogInterval {
-		return
-	}
-	q.pullRetryWarnRound = round
-	q.pullRetryWarnAt = now
-	fmt.Printf("[pull-retry] queue=%s round=%d exhausted after %d attempts (contention; will retry on next tick)\n",
-		q.name, round, attempts)
 }
 
 // roundHasCountedPull reports whether RoundInfo has at least one DB-committed pull for the round.
@@ -142,51 +123,4 @@ func (q *Queue) confirmRoundAdvanceGate(currentRound int) bool {
 	}
 	info := q.roundInfoMap[currentRound]
 	return info != nil && info.PullCount > 0
-}
-
-// tryCommitRoundAdvance flushes, re-verifies the round gate under lock, and advances to the next round.
-func (q *Queue) tryCommitRoundAdvance(currentRound int) bool {
-	if !q.confirmRoundAdvanceGate(currentRound) {
-		if q.GetPendingCount() == 0 && q.InProgressCount() == 0 && !q.GetLastPullWasPartial() {
-			q.pullWithRetryIfNeeded(true)
-		}
-		if !q.confirmRoundAdvanceGate(currentRound) {
-			return false
-		}
-	}
-
-	database := q.getDatabase()
-	mode := q.GetMode()
-	if database != nil {
-		var err error
-		for attempt := 0; attempt < flushRetryAttempts; attempt++ {
-			if attempt > 0 {
-				time.Sleep(flushRetryBackoff)
-			}
-			err = database.FlushSealBuffer()
-			if err == nil {
-				break
-			}
-		}
-		if err != nil {
-			return false
-		}
-	}
-
-	if !q.confirmRoundAdvanceGate(currentRound) {
-		return false
-	}
-
-	q.resetThisQueueKeysetCursor()
-	state := q.State()
-	if state == QueueStateWaiting {
-		q.SetState(QueueStateRunning)
-	}
-
-	if mode == QueueModeCopy || mode == QueueModeCopyRetry {
-		q.AdvanceCopyRound()
-		return true
-	}
-	q.AdvanceTraversalRound()
-	return true
 }

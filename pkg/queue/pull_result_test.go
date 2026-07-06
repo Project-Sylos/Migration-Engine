@@ -85,15 +85,6 @@ func TestShouldDeferForcePull(t *testing.T) {
 	}
 }
 
-func TestPullRetryExhaustedLogThrottled(t *testing.T) {
-	q := NewQueue("src", 3, 1, nil, nil)
-	q.logPullRetryExhausted(8)
-	q.logPullRetryExhausted(8) // second call within interval should not panic
-	if q.pullRetryWarnRound != q.GetRound() {
-		t.Fatalf("expected warn round %d, got %d", q.GetRound(), q.pullRetryWarnRound)
-	}
-}
-
 func TestPullResultOK(t *testing.T) {
 	if !(PullResult{Status: PullOK}).OK() {
 		t.Fatal("PullOK should be OK")
