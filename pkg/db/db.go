@@ -19,8 +19,9 @@ const pathHashMigrationBatchSize = 5000
 
 // Options configures DB open behavior.
 type Options struct {
-	Path       string             // Path to DuckDB file (e.g. "migration.duckdb")
-	SealBuffer *SealBufferOptions // Optional overrides for seal buffer; nil uses defaults. Seal buffer is always created.
+	Path          string // Path to DuckDB file (e.g. "migration.duckdb")
+	EncryptionKey []byte // nil = plaintext open; non-nil = DuckDB native encryption via ATTACH
+	SealBuffer    *SealBufferOptions // Optional overrides for seal buffer; nil uses defaults. Seal buffer is always created.
 }
 
 // DefaultOptions returns default options.
@@ -43,12 +44,17 @@ func Open(opts Options) (*DB, error) {
 	if path == "" {
 		path = ":memory:"
 	}
-	conn, err := sql.Open("duckdb", path)
+	conn, resolvedPath, err := openConnection(opts)
 	if err != nil {
 		return nil, err
 	}
-	// Two conns so the phase can hold one (persistent appenders) while SealLevelDepth0 or other RunWrite callers can use the other.
-	conn.SetMaxOpenConns(2)
+	// Encrypted DBs ATTACH into an in-memory catalog; additional pooled connections
+	// would not repeat ATTACH/USE, so unqualified table names break (e.g. users vs sylos_main.users).
+	if len(opts.EncryptionKey) > 0 && path != ":memory:" {
+		conn.SetMaxOpenConns(1)
+	} else {
+		conn.SetMaxOpenConns(2)
+	}
 	// Limit DuckDB memory and threads to avoid OOM during stress testing
 	if _, err := conn.Exec("PRAGMA memory_limit='4GB'"); err != nil {
 		err := conn.Close()
@@ -71,7 +77,7 @@ func Open(opts Options) (*DB, error) {
 		}
 		return nil, err
 	}
-	db := &DB{path: path, conn: conn}
+	db := &DB{path: resolvedPath, conn: conn}
 	if err := migrateMigrationsRuntimeState(conn); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -85,6 +91,10 @@ func Open(opts Options) (*DB, error) {
 		return nil, err
 	}
 	if err := migrateLogsDetail(conn); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := migrateOAuthCredentialsTable(conn); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
@@ -115,8 +125,8 @@ func schemaDDLs() []string {
 		queueStatsTableDDL(),
 		taskErrorsTableDDL(),
 		migrationsTableDDL(),
-		migrationEnvelopeTableDDL(),
 		fsCredentialBindingTableDDL(),
+		oauthCredentialsTableDDL(),
 	}
 }
 
@@ -187,6 +197,26 @@ func migrateLogsDetail(conn *sql.DB) error {
 	}
 	if _, err := conn.ExecContext(ctx, "ALTER TABLE logs ADD COLUMN detail VARCHAR"); err != nil {
 		return fmt.Errorf("logs detail migration add column: %w", err)
+	}
+	return nil
+}
+
+// migrateOAuthCredentialsTable creates oauth_credentials on existing migration DBs.
+func migrateOAuthCredentialsTable(conn *sql.DB) error {
+	ctx := context.Background()
+	var exists int64
+	err := conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_name = $1",
+		TableOAuthCredentials,
+	).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("oauth_credentials migration check: %w", err)
+	}
+	if exists > 0 {
+		return nil
+	}
+	if _, err := conn.ExecContext(ctx, oauthCredentialsTableDDL()); err != nil {
+		return fmt.Errorf("oauth_credentials migration create table: %w", err)
 	}
 	return nil
 }

@@ -5,18 +5,12 @@ package migration
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
-	"errors"
 	"fmt"
-	"io"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
-
-// Envelope key size matches Sylos-FS pkg/credentials.KeySize (AES-256).
-const envelopeMasterKeySize = 32
 
 // FS credential roles (match roots.SetRootRequest.Role).
 const (
@@ -31,72 +25,6 @@ type FSCredentialBinding struct {
 	CredsConfRelPath string
 	ServiceID        string
 	RootFolderJSON   string
-}
-
-func (s *migrationStore) ensureEnvelopeMasterKey() ([]byte, error) {
-	if s.db == nil {
-		return nil, fmt.Errorf("ensureEnvelopeMasterKey requires store db")
-	}
-	conn, err := s.db.GetDB()
-	if err != nil {
-		return nil, err
-	}
-	ctx := context.Background()
-	tx, err := conn.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	var key []byte
-	err = tx.QueryRowContext(ctx,
-		`SELECT envelope_master_key FROM `+db.TableMigrationEnvelope+` WHERE singleton = 1`,
-	).Scan(&key)
-	if err == nil && len(key) == envelopeMasterKeySize {
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-		return key, nil
-	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("read envelope key: %w", err)
-	}
-
-	key = make([]byte, envelopeMasterKeySize)
-	if _, err := io.ReadFull(rand.Reader, key); err != nil {
-		return nil, fmt.Errorf("generate envelope key: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO `+db.TableMigrationEnvelope+` (singleton, envelope_master_key) VALUES (1, ?)`,
-		key,
-	); err != nil {
-		return nil, fmt.Errorf("insert envelope key: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return key, nil
-}
-
-func (s *migrationStore) getEnvelopeMasterKey() ([]byte, error) {
-	if s.db == nil {
-		return nil, fmt.Errorf("getEnvelopeMasterKey requires store db")
-	}
-	conn, err := s.db.GetDB()
-	if err != nil {
-		return nil, err
-	}
-	var key []byte
-	err = conn.QueryRowContext(context.Background(),
-		`SELECT envelope_master_key FROM `+db.TableMigrationEnvelope+` WHERE singleton = 1`,
-	).Scan(&key)
-	if err != nil {
-		return nil, err
-	}
-	if len(key) != envelopeMasterKeySize {
-		return nil, fmt.Errorf("invalid envelope key length %d", len(key))
-	}
-	return key, nil
 }
 
 func (s *migrationStore) upsertFSCredentialBinding(binding FSCredentialBinding) error {

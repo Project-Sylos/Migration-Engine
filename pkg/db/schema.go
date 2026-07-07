@@ -16,10 +16,10 @@ const (
 	// TableSrcStatusEvents / TableDstStatusEvents are status event table names.
 	TableSrcStatusEvents = "src_status_events"
 	TableDstStatusEvents = "dst_status_events"
-	// TableMigrationEnvelope holds one row per migration DB: 32-byte envelope master key for Sylos-FS credentials.
-	TableMigrationEnvelope = "migration_envelope"
 	// TableFSCredentialBinding holds per-side connection id, optional creds file path, and serialized root folder for API rehydration.
 	TableFSCredentialBinding = "fs_credential_binding"
+	// TableOAuthCredentials stores plaintext OAuth refresh token JSON keyed by connection id (file encryption protects at rest).
+	TableOAuthCredentials = "oauth_credentials"
 )
 
 // nodeTableDDL returns CREATE TABLE for src_nodes or dst_nodes (metadata only; no status columns).
@@ -142,13 +142,6 @@ func migrationsTableDDL() string {
 	)`
 }
 
-func migrationEnvelopeTableDDL() string {
-	return `CREATE TABLE IF NOT EXISTS ` + TableMigrationEnvelope + ` (
-		singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-		envelope_master_key BLOB NOT NULL
-	)`
-}
-
 func fsCredentialBindingTableDDL() string {
 	return `CREATE TABLE IF NOT EXISTS ` + TableFSCredentialBinding + ` (
 		role VARCHAR PRIMARY KEY,
@@ -156,6 +149,14 @@ func fsCredentialBindingTableDDL() string {
 		creds_conf_relpath VARCHAR,
 		service_id VARCHAR,
 		root_folder_json VARCHAR,
+		updated_at TIMESTAMP NOT NULL
+	)`
+}
+
+func oauthCredentialsTableDDL() string {
+	return `CREATE TABLE IF NOT EXISTS ` + TableOAuthCredentials + ` (
+		connection_id VARCHAR PRIMARY KEY,
+		creds_json VARCHAR NOT NULL,
 		updated_at TIMESTAMP NOT NULL
 	)`
 }

@@ -2,6 +2,8 @@
 
 Heavy **scenario** tests (Spectra, real queues, DuckDB on disk). They are **`package main`** runners under **`pkg/tests/traversal/`** and **`pkg/tests/copy/`**, not `go test` packages—run them with **`go run`** or the shell/PowerShell scripts next to each scenario.
 
+Scenario databases use **plaintext** DuckDB files (`EncryptionKey == nil` in `db.Open`). Production encryption is applied only when the Sylos API supplies keys.
+
 Do **not** rely on `go test ./...` for these; use the scripts when you want full validation.
 
 ---

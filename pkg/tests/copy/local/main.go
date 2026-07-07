@@ -217,7 +217,7 @@ func setupTraversalConfig(srcPath, dstPath string) (migration.Config, error) {
 }
 
 func assertMigrationPhase(manager *migration.MigrationManager, migrationID, expected string) error {
-	details, err := manager.GetMigrationDetails(migrationID, "")
+	details, err := manager.GetMigrationDetails(migrationID, "", nil)
 	if err != nil {
 		return fmt.Errorf("failed to load migration details for %s: %w", migrationID, err)
 	}

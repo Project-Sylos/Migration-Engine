@@ -196,22 +196,6 @@ func (m *Migration) bindDB(database *db.DB) {
 	m.store = newMigrationStore(database)
 }
 
-// EnsureEnvelopeMasterKey returns the 32-byte Sylos-FS envelope master key, generating and persisting it if absent.
-func (m *Migration) EnsureEnvelopeMasterKey() ([]byte, error) {
-	if m.DB == nil {
-		return nil, fmt.Errorf("migration has no database")
-	}
-	return m.store.ensureEnvelopeMasterKey()
-}
-
-// GetEnvelopeMasterKey returns the persisted envelope master key.
-func (m *Migration) GetEnvelopeMasterKey() ([]byte, error) {
-	if m.DB == nil {
-		return nil, fmt.Errorf("migration has no database")
-	}
-	return m.store.getEnvelopeMasterKey()
-}
-
 // UpsertFSCredentialBinding persists one side's FS credential binding (connection id, optional creds path, service id, serialized root folder).
 func (m *Migration) UpsertFSCredentialBinding(binding FSCredentialBinding) error {
 	if m.DB == nil {
@@ -234,6 +218,30 @@ func (m *Migration) ListFSCredentialBindings() ([]FSCredentialBinding, error) {
 		return nil, fmt.Errorf("migration has no database")
 	}
 	return m.store.listFSCredentialBindings()
+}
+
+// UpsertOAuthCredentials stores plaintext OAuth refresh credentials JSON for a connection.
+func (m *Migration) UpsertOAuthCredentials(connectionID string, credsJSON []byte) error {
+	if m.DB == nil {
+		return fmt.Errorf("migration has no database")
+	}
+	return m.store.upsertOAuthCredentials(connectionID, credsJSON)
+}
+
+// GetOAuthCredentials returns stored OAuth credentials JSON for a connection.
+func (m *Migration) GetOAuthCredentials(connectionID string) ([]byte, error) {
+	if m.DB == nil {
+		return nil, fmt.Errorf("migration has no database")
+	}
+	return m.store.getOAuthCredentials(connectionID)
+}
+
+// DeleteOAuthCredentials removes stored OAuth credentials for a connection.
+func (m *Migration) DeleteOAuthCredentials(connectionID string) error {
+	if m.DB == nil {
+		return fmt.Errorf("migration has no database")
+	}
+	return m.store.deleteOAuthCredentials(connectionID)
 }
 
 func (m *Migration) Phase() string {

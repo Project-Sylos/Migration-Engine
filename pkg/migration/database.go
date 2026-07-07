@@ -16,6 +16,8 @@ import (
 type DatabaseConfig struct {
 	// Path is the DuckDB file for this migration (e.g. {migrationDir}/{id}.db).
 	Path string
+	// EncryptionKey enables DuckDB native encryption; nil keeps plaintext (tests).
+	EncryptionKey []byte
 	// RemoveExisting deletes the database file if it already exists before creating a new database.
 	RemoveExisting bool
 	// RequireOpen determines whether the DB instance must already be open (true) or can be auto-opened (false).
@@ -61,6 +63,7 @@ func SetupDatabase(cfg DatabaseConfig) (*db.DB, bool, error) {
 
 	opts := db.DefaultOptions()
 	opts.Path = cfg.Path
+	opts.EncryptionKey = cfg.EncryptionKey
 	opts.SealBuffer = &db.SealBufferOptions{} // async seal with default interval/threshold
 	database, err := db.Open(opts)
 	if err != nil {

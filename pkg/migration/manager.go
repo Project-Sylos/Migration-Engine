@@ -26,6 +26,8 @@ type CreateMigrationConfig struct {
 	MigrationDir string
 	// MigrationID is optional; when set with MigrationDir, this ID is used (API pre-generated ID and created the folder).
 	MigrationID string
+	// EncryptionKey enables DuckDB native encryption for the migration DB; nil keeps plaintext (tests).
+	EncryptionKey []byte
 }
 
 // MigrationSummary is a compact projection returned by ListMigrations.
@@ -103,27 +105,40 @@ func (m *MigrationManager) Close() error {
 	return nil
 }
 
-// openDB opens (or returns cached) the DB for the given migration folder path and ID. migrationDir is the absolute path to the folder for this migration (e.g. data/{id}); the DB file is migrationDir/id.db.
-func (m *MigrationManager) openDB(migrationDir, id string) (*db.DB, error) {
+// ResetState closes open DB handles and clears in-memory migration caches.
+func (m *MigrationManager) ResetState() error {
+	if err := m.Close(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.migrations = make(map[string]*Migration)
+	m.pendingRecords = make(map[string]migrationRecord)
+	m.mu.Unlock()
+	return nil
+}
+
+// openDB opens (or returns cached) the DB for the given migration folder path and ID.
+func (m *MigrationManager) openDB(migrationDir, id string, encryptionKey []byte) (*db.DB, error) {
 	absDir, err := filepath.Abs(migrationDir)
 	if err != nil {
 		return nil, fmt.Errorf("migration dir: %w", err)
 	}
 	dbPath := MigrationDBPath(absDir, id)
+	cacheKey := dbPath
 	m.openDBsMu.Lock()
 	defer m.openDBsMu.Unlock()
-	if database := m.openDBs[dbPath]; database != nil {
+	if database := m.openDBs[cacheKey]; database != nil {
 		return database, nil
 	}
 	if err := os.MkdirAll(absDir, 0755); err != nil {
 		return nil, fmt.Errorf("create migration dir: %w", err)
 	}
-	cfg := DatabaseConfig{Path: dbPath}
+	cfg := DatabaseConfig{Path: dbPath, EncryptionKey: encryptionKey}
 	database, _, err := SetupDatabase(cfg)
 	if err != nil {
 		return nil, err
 	}
-	m.openDBs[dbPath] = database
+	m.openDBs[cacheKey] = database
 	return database, nil
 }
 
@@ -154,7 +169,7 @@ func (m *MigrationManager) CreateMigration(cfg CreateMigrationConfig) (*Migratio
 	}
 
 	if cfg.MigrationDir != "" {
-		database, err := m.openDB(cfg.MigrationDir, id)
+		database, err := m.openDB(cfg.MigrationDir, id, cfg.EncryptionKey)
 		if err != nil {
 			return nil, err
 		}
@@ -201,8 +216,8 @@ func isDuplicateKey(err error) bool {
 		strings.Contains(msg, "constraint violation")
 }
 
-// GetMigration loads or returns a cached migration. Pass the absolute path to that migration's folder (e.g. data/{id}); the engine creates or opens the DB at migrationDir/id.db.
-func (m *MigrationManager) GetMigration(id string, migrationDir string) (*Migration, error) {
+// GetMigration loads or returns a cached migration. encryptionKey is required for API opens; pass nil for plaintext test DBs.
+func (m *MigrationManager) GetMigration(id string, migrationDir string, encryptionKey []byte) (*Migration, error) {
 	snap := m.snapshotMigrationEntry(id)
 	if snap.Migration != nil {
 		if snap.HasDB {
@@ -248,7 +263,7 @@ func (m *MigrationManager) GetMigration(id string, migrationDir string) (*Migrat
 		}
 		existing := after.Migration
 
-		database, err := m.openDB(migrationDir, id)
+		database, err := m.openDB(migrationDir, id, encryptionKey)
 		if err != nil {
 			return nil, err
 		}
@@ -286,7 +301,7 @@ func (m *MigrationManager) GetMigration(id string, migrationDir string) (*Migrat
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		return nil, nil
 	}
-	database, err := m.openDB(migrationDir, id)
+	database, err := m.openDB(migrationDir, id, encryptionKey)
 	if err != nil {
 		return nil, err
 	}
@@ -324,7 +339,7 @@ func (m *MigrationManager) ListMigrations(dataDir string) ([]MigrationSummary, e
 			if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 				continue
 			}
-			database, err := m.openDB(migrationDir, id)
+			database, err := m.openDB(migrationDir, id, nil)
 			if err != nil {
 				continue
 			}
@@ -352,7 +367,7 @@ func (m *MigrationManager) ListMigrations(dataDir string) ([]MigrationSummary, e
 }
 
 // GetMigrationDetails returns the full migration record. Pass migrationDir (path to that migration's folder) if the migration is not already loaded in memory.
-func (m *MigrationManager) GetMigrationDetails(id string, migrationDir string) (*MigrationDetails, error) {
+func (m *MigrationManager) GetMigrationDetails(id string, migrationDir string, encryptionKey []byte) (*MigrationDetails, error) {
 	m.mu.Lock()
 	pending, hasPending := m.pendingRecords[id]
 	existing := m.migrations[id]
@@ -376,7 +391,7 @@ func (m *MigrationManager) GetMigrationDetails(id string, migrationDir string) (
 		return d, nil
 	}
 	if migrationDir != "" {
-		database, err := m.openDB(migrationDir, id)
+		database, err := m.openDB(migrationDir, id, encryptionKey)
 		if err != nil {
 			return nil, err
 		}
@@ -424,7 +439,7 @@ func (m *MigrationManager) overlayRuntimeFromCache(id string, live *bool, phase 
 }
 
 // DeleteMigration removes the migration from memory and, when a DB exists, deletes its record. Pass migrationDir so the engine can open the DB, delete the row, and close it; otherwise only in-memory state is removed.
-func (m *MigrationManager) DeleteMigration(id string, migrationDir string) error {
+func (m *MigrationManager) DeleteMigration(id string, migrationDir string, encryptionKey []byte) error {
 	m.mu.Lock()
 	delete(m.migrations, id)
 	delete(m.pendingRecords, id)
@@ -434,7 +449,7 @@ func (m *MigrationManager) DeleteMigration(id string, migrationDir string) error
 	}
 	absDir, _ := filepath.Abs(migrationDir)
 	dbPath := MigrationDBPath(absDir, id)
-	database, err := m.openDB(migrationDir, id)
+	database, err := m.openDB(migrationDir, id, encryptionKey)
 	if err != nil {
 		return err
 	}
