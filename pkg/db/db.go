@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/duckdb/duckdb-go/v2"
+	_ "github.com/marcboeker/go-duckdb"
 )
 
 const pathHashMigrationBatchSize = 5000

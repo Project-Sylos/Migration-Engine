@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	duckdb "github.com/duckdb/duckdb-go/v2"
+	duckdb "github.com/marcboeker/go-duckdb"
 )
 
 const (

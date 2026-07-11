@@ -14,7 +14,7 @@ import (
 	"strings"
 	"sync"
 
-	duckdb "github.com/duckdb/duckdb-go/v2"
+	duckdb "github.com/marcboeker/go-duckdb"
 )
 
 const encryptedCatalog = "sylos_main"
@@ -49,7 +49,7 @@ func openConnection(opts Options) (*sql.DB, string, error) {
 	)
 	useSQL := fmt.Sprintf("USE %s", encryptedCatalog)
 
-	// duckdb-go shares one DuckDB instance across pooled connections; ATTACH runs once, USE on every conn.
+	// go-duckdb shares one DuckDB instance across pooled connections; ATTACH runs once, USE on every conn.
 	var attachOnce sync.Once
 	var attachErr error
 

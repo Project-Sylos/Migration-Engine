@@ -5,20 +5,21 @@ go 1.26.0
 require (
 	codeberg.org/Sylos/Spectra v0.2.6
 	codeberg.org/Sylos/Sylos-FS v0.1.6
-	github.com/duckdb/duckdb-go/v2 v2.10504.0
+	github.com/marcboeker/go-duckdb v1.7.0
 )
 
 require github.com/google/uuid v1.6.0
 
 require (
-	github.com/apache/arrow-go/v18 v18.5.1 // indirect
-	github.com/duckdb/duckdb-go-bindings v0.10504.0 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/darwin-amd64 v0.10504.0 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/darwin-arm64 v0.10504.0 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/linux-amd64 v0.10504.0 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/linux-arm64 v0.10504.0 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/windows-amd64 v0.10504.0 // indirect
-	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
+	github.com/apache/arrow/go/v14 v14.0.2 // indirect
+	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
+	github.com/mitchellh/mapstructure v1.5.0 // indirect
+	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
+	github.com/stretchr/testify v1.11.1 // indirect
+	gonum.org/v1/gonum v0.16.0 // indirect
+)
+
+require (
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/pkg/sftp v1.13.10 // indirect
 	golang.org/x/crypto v0.53.0 // indirect
