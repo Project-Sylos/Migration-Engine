@@ -118,6 +118,8 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		}
 		srcQueue.SetMaxKnownDepth(maxKD)
 		dstQueue.SetMaxKnownDepth(maxKD)
+		seedQueueCountersFromDB(database, srcQueue, "src-traversal", db.QueueStatsPhaseTraversal)
+		seedQueueCountersFromDB(database, dstQueue, "dst-traversal", db.QueueStatsPhaseTraversal)
 	}
 
 	srcQueue.InitializeWithContext(database, cfg.SrcAdapter, cfg.ShutdownContext)
@@ -140,10 +142,15 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	if cfg.ResumeTraversal != nil {
 		srcQueue.SetRound(0)
 		dstQueue.SetRound(0)
+		if coordinator != nil {
+			coordinator.UpdateRound("src", 0)
+			coordinator.UpdateRound("dst", 0)
+		}
 		srcQueue.EnsureRoundExpectedFromStats()
 		dstQueue.EnsureRoundExpectedFromStats()
 		srcQueue.SetTraversalCacheLoaded(true)
 		dstQueue.SetTraversalCacheLoaded(true)
+		logTraversalResumePositionCheck(cfg.ResumeTraversal, srcQueue, dstQueue)
 		time.Sleep(500 * time.Millisecond)
 		srcQueue.PullTasksIfNeeded(true)
 		dstQueue.PullTasksIfNeeded(true)
@@ -250,7 +257,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		}
 
 		if cfg.SoftSuspendRequested != nil && cfg.SoftSuspendRequested() {
-			waitCtx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+			waitCtx, cancel := softSuspendWaitContext(cfg.ShutdownContext)
 			stats, suspend, err := performTraversalSoftSuspend(waitCtx, database, srcQueue, dstQueue, observer, coordinator, cfg, start, srcWC, mr)
 			cancel()
 			if err != nil {
@@ -325,13 +332,13 @@ func snapshotTraversalQueueStats(database *db.DB, coordinator *queue.QueueCoordi
 	dstRound := coordinator.GetRound("dst")
 	srcPending := 0
 	dstPending := 0
-	c, err := database.GetStatsCountAtDepth("SRC", srcRound, db.StatsKeyTraversalStatus(db.StatusPending))
+	c, err := database.GetStatsCountAtDepth("SRC", srcRound, db.StatsKey(db.StatsKindTraversal,db.StatusPending))
 	if err != nil {
 		fmt.Println("error getting stats count at depth", err)
 		return queue.QueueStats{}, queue.QueueStats{}
 	}
 	srcPending = int(c)
-	c, err = database.GetStatsCountAtDepth("DST", dstRound, db.StatsKeyTraversalStatus(db.StatusPending))
+	c, err = database.GetStatsCountAtDepth("DST", dstRound, db.StatsKey(db.StatsKindTraversal,db.StatusPending))
 	if err != nil {
 		fmt.Println("error getting stats count at depth", err)
 		return queue.QueueStats{}, queue.QueueStats{}

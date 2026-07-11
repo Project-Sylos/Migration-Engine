@@ -6,6 +6,7 @@ package queue
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -376,13 +377,18 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 			// Get SRC node ID from map
 			srcID := srcIDMap[matchKey]
 
-			// Compare timestamps to determine copy status for SRC node
-			// If DST is newer: no copy needed (successful)
-			// If SRC is newer or equal: copy needed (pending)
+			// Compare timestamps to determine copy status for SRC node.
+			// If DST is newer or equal: no copy needed (successful).
+			// If SRC is newer: copy needed (pending).
 			srcCopyStatus := db.CopyStatusPending
-			if compareTimestamps(expectedFile.LastUpdated, actualFile.LastUpdated) == "Successful" {
-				// DST is newer, no copy needed
+			switch compareTimestamps(expectedFile.LastUpdated, actualFile.LastUpdated) {
+			case "Successful":
 				srcCopyStatus = db.CopyStatusSuccessful
+			case "Unparseable":
+				// Provider mtimes missing or non-RFC3339: same-size match on both sides is treated as in sync.
+				if expectedFile.Size > 0 && expectedFile.Size == actualFile.Size {
+					srcCopyStatus = db.CopyStatusSuccessful
+				}
 			}
 
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
@@ -412,27 +418,30 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 	return nil
 }
 
-// compareTimestamps compares src and dst timestamps and returns the appropriate status.
-// Returns:
-// - "Successful" if dst is newer (no copy needed)
-// - "Pending" if src is newer (copy needed) or if timestamps are equal
+// compareTimestamps compares src and dst timestamps for copy skip decisions.
 func compareTimestamps(srcMTime, dstMTime string) string {
-	// Parse timestamps (RFC3339 format)
-	srcTime, err1 := time.Parse(time.RFC3339, srcMTime)
-	dstTime, err2 := time.Parse(time.RFC3339, dstMTime)
-
-	// If parsing fails, default to "Pending" (conservative - assume copy needed)
-	if err1 != nil || err2 != nil {
-		return "Pending"
+	srcTime, srcOK := parseItemMTime(srcMTime)
+	dstTime, dstOK := parseItemMTime(dstMTime)
+	if !srcOK || !dstOK {
+		return "Unparseable"
 	}
-
-	// If dst is newer, no copy needed - mark as successful
-	if dstTime.After(srcTime)  || dstTime.Equal(srcTime) {
+	if !dstTime.Before(srcTime) {
 		return "Successful"
 	}
-
-	// If src is newer or equal, copy is needed - mark as pending
 	return "Pending"
+}
+
+func parseItemMTime(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
 }
 
 // logError logs a failed task execution.

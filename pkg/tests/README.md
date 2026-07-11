@@ -49,6 +49,7 @@ There is **no** top-level `pkg/tests/normal/` or `pkg/tests/retry_sweep/`—thos
 | **`traversal/resumption`** | **`StartMigration`**, interrupt, then **`LetsMigrate`** again with `-resume` (see script + `main.go`). |
 | **`traversal/retry_sweep`** | Full migration, then mark-for-retry / subtree / **`RunRetrySweep`** (engine retry sweep)—uses **DuckDB** tables and status events. |
 | **`copy/normal`**, **`copy/local`** | Copy-phase exercises after a traversal DB exists. |
+| **`delete/local`** | Full pipeline traversal → copy → delete; asserts source tree empty. |
 
 ---
 

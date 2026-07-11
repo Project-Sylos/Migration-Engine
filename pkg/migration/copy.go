@@ -92,6 +92,7 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	copyQueue := queue.NewQueue("copy", mr, wc, nil, sizing)
 	copyQueue.SetMode(queue.QueueModeCopyRetry)
 	copyQueue.SetCopyPass(1)
+	seedQueueCountersFromDB(duckDB, copyQueue, "copy", db.QueueStatsPhaseCopy)
 	minLevel := -1
 	levels, err := db.GetAllLevels(duckDB, "SRC")
 	if err == nil && len(levels) > 0 {
@@ -211,7 +212,7 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		}
 
 		if cfg.SoftSuspendRequested != nil && cfg.SoftSuspendRequested() {
-			waitCtx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+			waitCtx, cancel := softSuspendWaitContext(cfg.ShutdownContext)
 			stats, suspend, err := performCopySoftSuspend(waitCtx, duckDB, copyQueue, observer, cfg, wc, mr)
 			cancel()
 			if err != nil {
@@ -285,6 +286,9 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	copyQueue := queue.NewQueue("copy", mr, wc, nil, sizing) // No coordinator needed for copy
 	copyQueue.SetMode(queue.QueueModeCopy)
 	copyQueue.SetCopyPass(1) // Start with pass 1 (folders)
+	if cfg.ResumeCopy != nil {
+		seedQueueCountersFromDB(duckDB, copyQueue, "copy", db.QueueStatsPhaseCopy)
+	}
 
 	// Minimum depth with pending folder / file copy (skip round 0). Used for start round and resume dst precheck anchor.
 	minFolderPendingLevel := -1
@@ -317,6 +321,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	copyQueue.SetRound(startRound)
 	applyCopyResumeDstExistenceWindow(copyQueue, duckDB, startRound, minFolderPendingLevel, minFilePendingLevel)
 	copyQueue.EnsureRoundExpectedFromStats()
+	logCopyResumePositionCheck(cfg.ResumeCopy, copyQueue, startRound)
 
 	// Set max known depth from DB so copy completion and round advancement know the full depth range.
 	// Must be set before any tasks are pulled or completion checks run.
@@ -465,7 +470,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		}
 
 		if cfg.SoftSuspendRequested != nil && cfg.SoftSuspendRequested() {
-			waitCtx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+			waitCtx, cancel := softSuspendWaitContext(cfg.ShutdownContext)
 			stats, suspend, err := performCopySoftSuspend(waitCtx, duckDB, copyQueue, observer, cfg, wc, mr)
 			cancel()
 			if err != nil {

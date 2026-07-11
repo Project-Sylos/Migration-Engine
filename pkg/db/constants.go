@@ -25,6 +25,26 @@ const (
 	CopyStatusExcluded          = "excluded"          // display value for UI (both explicit and inherited)
 )
 
+// Delete status values (src_status_events only). Stats keys use: pending, deleted, failed.
+const (
+	DeleteStatusPending = "pending"
+	DeleteStatusDeleted = "deleted"
+	DeleteStatusFailed  = "failed"
+	DeleteStatusSkipped = "skipped" // opted out of source removal during cleanup planning
+)
+
+// DeletePendingIfCopySuccessful returns delete_status=pending when copy becomes successful and delete is not yet set.
+func DeletePendingIfCopySuccessful(copyStatus, currentDeleteStatus string) string {
+	if copyStatus != CopyStatusSuccessful {
+		return ""
+	}
+	switch currentDeleteStatus {
+	case DeleteStatusPending, DeleteStatusDeleted, DeleteStatusFailed, DeleteStatusSkipped:
+		return ""
+	}
+	return DeleteStatusPending
+}
+
 // CopyStatusForDisplay returns the copy_status to show in the UI. Internal excluded_explicit and excluded_inherited both become "excluded".
 func CopyStatusForDisplay(status string) string {
 	switch status {

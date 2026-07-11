@@ -18,6 +18,9 @@ const (
 	PhaseCopying              string = "copy-in-progress"          // Copy phase running
 	PhaseCopySuspended        string = "copy-suspended"            // Copy stopped via soft suspend; resume with StartCopy
 	PhaseCopyReview           string = "awaiting-copy-review"      // Copy done, user can review; can retry copy
+	PhaseDeleting             string = "delete-in-progress"          // Delete phase running
+	PhaseDeleteSuspended      string = "delete-suspended"            // Delete stopped via soft suspend
+	PhaseDeleteReview         string = "awaiting-delete-review"      // Delete done, user can review; can retry delete
 )
 
 // ParsePhase parses a canonical phase string from the DB (lowercase-with-hyphens).
@@ -31,6 +34,9 @@ func ParsePhase(v string) (string, error) {
 		PhaseCopying,
 		PhaseCopySuspended,
 		PhaseCopyReview,
+		PhaseDeleting,
+		PhaseDeleteSuspended,
+		PhaseDeleteReview,
 	}
 	if slices.Contains(validPhases, v) {
 		return v, nil
@@ -69,7 +75,13 @@ func canTransition(from, to string) bool {
 	case PhaseCopySuspended:
 		return to == PhaseCopying
 	case PhaseCopyReview:
-		return to == PhaseCopying
+		return to == PhaseCopying || to == PhaseDeleting
+	case PhaseDeleting:
+		return to == PhaseDeleteReview || to == PhaseDeleteSuspended
+	case PhaseDeleteSuspended:
+		return to == PhaseDeleting
+	case PhaseDeleteReview:
+		return to == PhaseDeleting
 	default:
 		return false
 	}

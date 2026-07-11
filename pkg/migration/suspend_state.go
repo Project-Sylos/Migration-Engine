@@ -174,8 +174,8 @@ func newCopySuspendState(
 	}
 }
 
-// traversalSuspendRuntimeMergePatch returns JSON for updateRuntimeState with suspend_v1 payload.
-func traversalSuspendRuntimeMergePatch(s RuntimeSuspendV1) (string, error) {
+// suspendRuntimeMergePatch returns JSON for updateRuntimeState with suspend_v1 payload.
+func suspendRuntimeMergePatch(s RuntimeSuspendV1) (string, error) {
 	merged, err := mergeRuntimeSuspendV1(make(map[string]any), s)
 	if err != nil {
 		return "", err

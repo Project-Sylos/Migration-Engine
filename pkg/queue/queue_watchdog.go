@@ -15,12 +15,14 @@ const (
 )
 
 // QueueWatchdog monitors queue progress and dumps state when stalled.
-// A stall is detected when no tasks complete for the configured timeout
-// while tasks remain in-progress or pending.
+// A user-facing stall is detected when no tasks complete for the configured
+// timeout while tasks remain in-progress or pending. Idle queues that have
+// drained the current round (partial pull, empty buffers) are not flagged.
 type QueueWatchdog struct {
 	queue        *Queue
 	stallTimeout time.Duration
 	lastProgress atomic.Int64 // UnixNano of last progress
+	possibleStall atomic.Bool
 	stopCh       chan struct{}
 	stopped      atomic.Bool
 }
@@ -35,12 +37,25 @@ func NewQueueWatchdog(q *Queue, stallTimeout time.Duration) *QueueWatchdog {
 		stallTimeout: stallTimeout,
 		stopCh:       make(chan struct{}),
 	}
-	wd.Beat() // Initialize with current time
+	wd.resetTimer()
 	return wd
 }
 
 // Beat records progress (call when a task completes).
 func (wd *QueueWatchdog) Beat() {
+	wd.resetTimer()
+	wd.possibleStall.Store(false)
+}
+
+// PossibleStall reports whether the watchdog recently detected a stall.
+func (wd *QueueWatchdog) PossibleStall() bool {
+	if wd == nil {
+		return false
+	}
+	return wd.possibleStall.Load()
+}
+
+func (wd *QueueWatchdog) resetTimer() {
 	wd.lastProgress.Store(time.Now().UnixNano())
 }
 
@@ -72,11 +87,11 @@ func (wd *QueueWatchdog) monitor() {
 
 func (wd *QueueWatchdog) checkForStall() {
 	if wd.queue.State() == QueueStatePaused {
-		wd.Beat()
+		wd.resetTimer()
 		return
 	}
 	if wd.queue.sealIOWaitActive() {
-		wd.Beat()
+		wd.resetTimer()
 		return
 	}
 
@@ -94,17 +109,25 @@ func (wd *QueueWatchdog) checkForStall() {
 	if inProgress == 0 && pending == 0 {
 		st := wd.queue.State()
 		if st == QueueStateRunning && elapsed >= wd.stallTimeout {
+			round := wd.queue.GetRound()
+			if wd.queue.confirmRoundAdvanceGate(round) {
+				// Round keyspace exhausted; coordinator advances round or checks completion.
+				wd.resetTimer()
+				return
+			}
+			// Diagnostic only: idle without terminal pull may mean coordinator is stuck.
 			wd.dumpCompletionStall(elapsed)
-			wd.Beat()
+			wd.resetTimer()
 		}
 		return
 	}
 
 	// Queue appears stalled - dump state
 	wd.dumpState(elapsed, inProgress, pending)
+	wd.possibleStall.Store(true)
 
-	// Reset beat to avoid spamming (will dump again in another stallTimeout if still stuck)
-	wd.Beat()
+	// Reset timer to avoid spamming (will dump again in another stallTimeout if still stuck)
+	wd.resetTimer()
 }
 
 func (wd *QueueWatchdog) dumpState(stalledFor time.Duration, inProgress, pending int) {

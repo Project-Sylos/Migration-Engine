@@ -46,6 +46,7 @@ func srcStatusEventsTableDDL() string {
 		id VARCHAR NOT NULL,
 		traversal_status VARCHAR,
 		copy_status VARCHAR,
+		delete_status VARCHAR,
 		event_time BIGINT NOT NULL,
 		depth INTEGER NOT NULL,
 		error_log_id VARCHAR
@@ -72,7 +73,7 @@ func statsTableDDL() string {
 }
 
 // srcStatsTableDDL returns CREATE TABLE for src_stats (traversal + copy status counts per depth).
-// Keys: traversal/pending, traversal/successful, traversal/failed; copy/pending, copy/successful, copy/failed (src only).
+// Keys: traversal/pending, traversal/successful, traversal/failed; copy/pending, copy/successful, copy/failed; delete/pending, delete/deleted, delete/failed (src only).
 func srcStatsTableDDL() string {
 	return `CREATE TABLE IF NOT EXISTS src_stats (
 		depth INTEGER NOT NULL,
@@ -108,11 +109,13 @@ func logsTableDDL() string {
 	)`
 }
 
-// queueStatsTableDDL returns CREATE TABLE for queue_stats (queue metrics JSON).
+// queueStatsTableDDL returns CREATE TABLE for queue_stats (append-only queue metrics JSON).
 func queueStatsTableDDL() string {
 	return `CREATE TABLE IF NOT EXISTS queue_stats (
-		queue_key VARCHAR PRIMARY KEY,
-		metrics_json VARCHAR
+		queue_key VARCHAR NOT NULL,
+		phase VARCHAR NOT NULL,
+		event_time TIMESTAMP NOT NULL DEFAULT current_timestamp,
+		metrics_json VARCHAR NOT NULL
 	)`
 }
 

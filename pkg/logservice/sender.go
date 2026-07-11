@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"github.com/google/uuid"
 )
 
 const defaultBatchSize = 50_000
@@ -115,7 +116,7 @@ func (s *Sender) Log(level, message, entity, entityID string, queues ...string) 
 
 	// --- DB write (when log DB is set, buffered) ---
 	if s.logBuffer != nil {
-		id := db.GenerateLogID()
+		id := uuid.New().String()
 		s.logBuffer.Add(db.LogEntry{
 			ID:        id,
 			Timestamp: timestamp.Format(time.RFC3339Nano),

@@ -27,7 +27,9 @@ type workerPool struct {
 	traversalAdapter types.FSAdapter
 	copySrcAdapter   types.FSAdapter
 	copyDstAdapter   types.FSAdapter
+	deleteSrcAdapter types.FSAdapter
 	isCopy            bool
+	isDelete          bool
 	listPageSize      atomic.Int64
 	interOpDelay      atomic.Int64 // nanoseconds; autoscaler pacing fallback at worker floor
 	rateLimitSources  []RateLimitTelemetry
@@ -37,6 +39,7 @@ func (q *Queue) initWorkerPool(traversalAdapter types.FSAdapter) {
 	q.pool.mu.Lock()
 	q.pool.traversalAdapter = traversalAdapter
 	q.pool.isCopy = false
+	q.pool.isDelete = false
 	if q.pool.listPageSize.Load() == 0 {
 		q.pool.listPageSize.Store(100)
 	}
@@ -44,11 +47,23 @@ func (q *Queue) initWorkerPool(traversalAdapter types.FSAdapter) {
 	q.syncAdapterWorkerHint()
 }
 
+func (q *Queue) initDeleteWorkerPool(src types.FSAdapter) {
+	q.pool.mu.Lock()
+	q.pool.deleteSrcAdapter = src
+	q.pool.isCopy = false
+	q.pool.isDelete = true
+	if q.pool.listPageSize.Load() == 0 {
+		q.pool.listPageSize.Store(100)
+	}
+	q.pool.mu.Unlock()
+}
+
 func (q *Queue) initCopyWorkerPool(src, dst types.FSAdapter) {
 	q.pool.mu.Lock()
 	q.pool.copySrcAdapter = src
 	q.pool.copyDstAdapter = dst
 	q.pool.isCopy = true
+	q.pool.isDelete = false
 	q.pool.mu.Unlock()
 	q.syncCopyAdapterWorkerHints()
 }
@@ -159,6 +174,10 @@ func (q *Queue) SetTargetWorkerCount(target int) error {
 				w := NewCopyWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.copySrcAdapter, q.pool.copyDstAdapter, shutdownCtx, workerCtx, &h.idle, &h.retire)
 				q.workers = append(q.workers, w)
 				go w.Run()
+			} else if q.pool.isDelete {
+				w := NewDeleteWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.deleteSrcAdapter, shutdownCtx, workerCtx, &h.idle, &h.retire)
+				q.workers = append(q.workers, w)
+				go w.Run()
 			} else {
 				w := NewTraversalWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.traversalAdapter, q.name, shutdownCtx, workerCtx, &h.idle, &h.retire)
 				q.workers = append(q.workers, w)
@@ -191,6 +210,12 @@ func (q *Queue) applyWorkerHintLocked() {
 			h.SetActiveWorkers(n)
 		}
 		if h, ok := q.pool.copyDstAdapter.(types.FSConcurrencyHint); ok {
+			h.SetActiveWorkers(n)
+		}
+		return
+	}
+	if q.pool.isDelete {
+		if h, ok := q.pool.deleteSrcAdapter.(types.FSConcurrencyHint); ok {
 			h.SetActiveWorkers(n)
 		}
 		return

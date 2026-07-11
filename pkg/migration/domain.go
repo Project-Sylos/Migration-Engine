@@ -127,6 +127,8 @@ type Migration struct {
 	runCancel            context.CancelFunc
 	running              bool
 	softSuspendRequested atomic.Bool
+	stopGraceMu          sync.Mutex
+	stopGraceTimer       *time.Timer
 	// persistRecord holds the last known migrations row (refreshed on DB sync); used to avoid DuckDB reads on hot API paths while Live.
 	persistRecord atomic.Value // migrationRecord
 	// activeQueueObs is set for the duration of traversal/copy/retry runs so queue metrics APIs can read memory instead of queue_stats.
@@ -153,10 +155,6 @@ func (m *Migration) syncRecord(record migrationRecord) {
 	m.phase = record.Phase
 	m.mu.Unlock()
 	m.persistRecord.Store(record)
-}
-
-func (m *Migration) setActiveQueueObserver(o *queue.QueueObserver) {
-	m.activeQueueObs.Store(o)
 }
 
 // cachedMigrationDetailsForLiveAPI returns details from the last persisted migration row without querying DuckDB.
@@ -250,6 +248,27 @@ func (m *Migration) Phase() string {
 	return m.phase
 }
 
+// GetName returns the migration's current display name.
+func (m *Migration) GetName() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.Name
+}
+
+// SetName persists a new display name and updates the in-memory value.
+func (m *Migration) SetName(name string) error {
+	if m.DB == nil {
+		return fmt.Errorf("migration has no database")
+	}
+	if err := m.store.updateName(m.ID, name); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.Name = name
+	m.mu.Unlock()
+	return nil
+}
+
 // IsLive returns true when a run is active (traversal, copy, or retry). Distinct from lifecycle phase; use for "in progress / paused" indicator.
 func (m *Migration) IsLive() bool {
 	m.mu.RLock()
@@ -285,6 +304,7 @@ func (m *Migration) transitionTo(next string) error {
 // beginRun returns the per-run context and its cancel function. Call cancelRun when the run is finished
 // (success, error, or soft suspend) so queue Run loops and workers exit; otherwise they keep polling while paused.
 func (m *Migration) beginRun(shutdownCtx context.Context) (runCtx context.Context, cancelRun context.CancelFunc) {
+	m.disarmStopGraceTimer()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.softSuspendRequested.Store(false)
@@ -313,6 +333,7 @@ func (m *Migration) endRun() {
 	m.runCancel = nil
 	m.running = false
 	m.mu.Unlock()
+	m.disarmStopGraceTimer()
 }
 
 // AddRoots seeds source and destination root tasks into the migration DB.
@@ -409,7 +430,7 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 		ShutdownContext:      runCtx,
 		ResumeTraversal:      resume,
 		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
-		OnQueueObserver:      func(o *queue.QueueObserver) { m.setActiveQueueObserver(o) },
+		OnQueueObserver:      func(o *queue.QueueObserver) { m.activeQueueObs.Store(o) },
 		Autoscaler:           cfg.Autoscaler,
 		SrcService:           cfg.Source,
 		DstService:           cfg.Destination,
@@ -418,7 +439,7 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 		if errors.Is(err, ErrTraversalSoftSuspended) {
 			rstats, sus, ok := AsTraversalSuspended(err)
 			if ok {
-				if patch, e2 := traversalSuspendRuntimeMergePatch(sus); e2 == nil {
+				if patch, e2 := suspendRuntimeMergePatch(sus); e2 == nil {
 					_ = m.store.updateRuntimeState(m.ID, patch)
 				}
 				if e3 := m.transitionTo(PhaseTraversalSuspended); e3 != nil {
@@ -490,7 +511,7 @@ func (m *Migration) StartCopy(cfg Config) (queue.QueueStats, error) {
 		ShutdownContext:      runCtx,
 		ResumeCopy:           resumeCopy,
 		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
-		OnQueueObserver:      func(o *queue.QueueObserver) { m.setActiveQueueObserver(o) },
+		OnQueueObserver:      func(o *queue.QueueObserver) { m.activeQueueObs.Store(o) },
 		Autoscaler:           cfg.Autoscaler,
 		SrcService:           cfg.Source,
 		DstService:           cfg.Destination,
@@ -499,7 +520,7 @@ func (m *Migration) StartCopy(cfg Config) (queue.QueueStats, error) {
 		if errors.Is(err, ErrCopySoftSuspended) {
 			cstats, sus, ok := AsCopySuspended(err)
 			if ok {
-				if patch, e2 := traversalSuspendRuntimeMergePatch(sus); e2 == nil {
+				if patch, e2 := suspendRuntimeMergePatch(sus); e2 == nil {
 					_ = m.store.updateRuntimeState(m.ID, patch)
 				}
 				if e3 := m.transitionTo(PhaseCopySuspended); e3 != nil {
@@ -517,6 +538,151 @@ func (m *Migration) StartCopy(cfg Config) (queue.QueueStats, error) {
 	}
 	if err := m.DB.ResyncReviewStats(); err != nil {
 		fmt.Println("warning: resync review stats after StartCopy:", err)
+	}
+	m.refreshRuntimeState()
+	return stats, nil
+}
+
+// DeleteSummary holds counts and source info for the delete confirmation modal.
+type DeleteSummary struct {
+	SourceRootPath string
+	Pending        int64
+	Failed         int64
+	Deleted        int64
+}
+
+// GetDeleteSummary returns delete status counts for confirmation UI.
+func (m *Migration) GetDeleteSummary(sourceRootPath string) (DeleteSummary, error) {
+	if m.DB == nil {
+		return DeleteSummary{}, fmt.Errorf("database not available")
+	}
+	counts, err := m.DB.GetDeleteStatusCountsFromEvents()
+	if err != nil {
+		return DeleteSummary{}, err
+	}
+	return DeleteSummary{
+		SourceRootPath: sourceRootPath,
+		Pending:        counts.Pending,
+		Failed:         counts.Failed,
+		Deleted:        counts.Deleted,
+	}, nil
+}
+
+// StartDelete transitions copy-review->deleting and runs delete phase. Requires awaiting-copy-review or delete-suspended.
+func (m *Migration) StartDelete(cfg Config) (queue.QueueStats, error) {
+	prevPhase := m.Phase()
+	validDeleteStartPhases := []string{PhaseCopyReview, PhaseDeleteSuspended}
+	if !slices.Contains(validDeleteStartPhases, prevPhase) {
+		return queue.QueueStats{}, fmt.Errorf("start delete requires awaiting-copy-review or delete-suspended phase, got %s", prevPhase)
+	}
+	if err := m.transitionTo(PhaseDeleting); err != nil {
+		return queue.QueueStats{}, err
+	}
+	if cfg.Source.Adapter == nil {
+		return queue.QueueStats{}, fmt.Errorf("delete requires source adapter in config")
+	}
+	if err := m.UpdateConfig(cfg); err != nil {
+		return queue.QueueStats{}, fmt.Errorf("persist migration config: %w", err)
+	}
+	m.setLastRunConfig(cfg)
+
+	runCtx, cancelRun := m.beginRun(cfg.ShutdownContext)
+	defer func() {
+		cancelRun()
+		m.endRun()
+		_ = m.store.updateUpdatedAt(m.ID)
+	}()
+	stats, err := RunDeletePhase(DeletePhaseConfig{
+		DuckDB:               m.DB,
+		SrcAdapter:           cfg.Source.Adapter,
+		WorkerCount:          cfg.WorkerCount,
+		MaxRetries:           cfg.MaxRetries,
+		LogAddress:           cfg.LogAddress,
+		LogLevel:             cfg.LogLevel,
+		SkipListener:         cfg.SkipListener,
+		StartupDelay:         cfg.StartupDelay,
+		ProgressTick:         cfg.ProgressTick,
+		ShutdownContext:      runCtx,
+		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
+		OnQueueObserver:      func(o *queue.QueueObserver) { m.activeQueueObs.Store(o) },
+		Autoscaler:           cfg.Autoscaler,
+		SrcService:           cfg.Source,
+	})
+	if err != nil {
+		return queue.QueueStats{}, err
+	}
+	if err := m.transitionTo(PhaseDeleteReview); err != nil {
+		return queue.QueueStats{}, err
+	}
+	if err := m.DB.ResyncReviewStats(); err != nil {
+		fmt.Println("warning: resync review stats after StartDelete:", err)
+	}
+	m.refreshRuntimeState()
+	return stats, nil
+}
+
+// PrepareDeleteRetry transitions to delete-in-progress before async retry.
+func (m *Migration) PrepareDeleteRetry() error {
+	phase := m.Phase()
+	if phase != PhaseDeleteReview && phase != PhaseDeleteSuspended {
+		return fmt.Errorf("prepare delete retry requires awaiting-delete-review or delete-suspended phase")
+	}
+	return m.transitionTo(PhaseDeleting)
+}
+
+// RunDeleteRetry runs delete retry for failed items only.
+func (m *Migration) RunDeleteRetry(cfg Config, opts CopyPhaseOptions) (queue.QueueStats, error) {
+	phase := m.Phase()
+	if phase != PhaseDeleteReview && phase != PhaseDeleting && phase != PhaseDeleteSuspended {
+		return queue.QueueStats{}, fmt.Errorf("delete retry requires awaiting-delete-review, delete-suspended, or prepared delete-in-progress")
+	}
+	if cfg.Source.Adapter == nil {
+		return queue.QueueStats{}, fmt.Errorf("delete retry requires source adapter in config")
+	}
+	if err := m.UpdateConfig(cfg); err != nil {
+		return queue.QueueStats{}, fmt.Errorf("persist migration config: %w", err)
+	}
+	m.setLastRunConfig(cfg)
+	if phase == PhaseDeleteReview || phase == PhaseDeleteSuspended {
+		if err := m.transitionTo(PhaseDeleting); err != nil {
+			return queue.QueueStats{}, err
+		}
+	}
+	runCtx, cancelRun := m.beginRun(cfg.ShutdownContext)
+	defer func() {
+		cancelRun()
+		m.endRun()
+		_ = m.store.updateUpdatedAt(m.ID)
+	}()
+	workerCount := opts.WorkerCount
+	if workerCount <= 0 {
+		workerCount = cfg.WorkerCount
+	}
+	maxRetries := opts.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = cfg.MaxRetries
+	}
+	stats, err := RunDeleteRetryPhase(DeletePhaseConfig{
+		DuckDB:          m.DB,
+		SrcAdapter:      cfg.Source.Adapter,
+		WorkerCount:     workerCount,
+		MaxRetries:      maxRetries,
+		LogAddress:      cfg.LogAddress,
+		LogLevel:        cfg.LogLevel,
+		SkipListener:    opts.SkipListener || cfg.SkipListener,
+		StartupDelay:    cfg.StartupDelay,
+		ShutdownContext: runCtx,
+		OnQueueObserver: func(o *queue.QueueObserver) { m.activeQueueObs.Store(o) },
+		SrcService:      cfg.Source,
+	})
+	if err != nil {
+		return queue.QueueStats{}, err
+	}
+	if err := m.transitionTo(PhaseDeleteReview); err != nil {
+		return queue.QueueStats{}, err
+	}
+	if err := m.DB.ResyncReviewStats(); err != nil {
+		fmt.Println("warning: resync review stats after delete retry:", err)
 	}
 	m.refreshRuntimeState()
 	return stats, nil
@@ -597,7 +763,7 @@ func (m *Migration) RunRetrySweep(cfg Config, opts RetrySweepOptions) (RuntimeSt
 		}(),
 		ShutdownContext:      runCtx,
 		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
-		OnQueueObserver:      func(o *queue.QueueObserver) { m.setActiveQueueObserver(o) },
+		OnQueueObserver:      func(o *queue.QueueObserver) { m.activeQueueObs.Store(o) },
 		Autoscaler:           cfg.Autoscaler,
 		SrcService:           cfg.Source,
 		DstService:           cfg.Destination,
@@ -606,7 +772,7 @@ func (m *Migration) RunRetrySweep(cfg Config, opts RetrySweepOptions) (RuntimeSt
 		if errors.Is(err, ErrTraversalSoftSuspended) {
 			rstats, sus, ok := AsTraversalSuspended(err)
 			if ok {
-				if patch, e2 := traversalSuspendRuntimeMergePatch(sus); e2 == nil {
+				if patch, e2 := suspendRuntimeMergePatch(sus); e2 == nil {
 					_ = m.store.updateRuntimeState(m.ID, patch)
 				}
 				if e3 := m.transitionTo(PhaseTraversalSuspended); e3 != nil {
@@ -695,7 +861,7 @@ func (m *Migration) RunCopyRetry(cfg Config, opts CopyPhaseOptions) (queue.Queue
 		ProgressTick:         cfg.ProgressTick,
 		ShutdownContext:      runCtx,
 		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
-		OnQueueObserver:      func(o *queue.QueueObserver) { m.setActiveQueueObserver(o) },
+		OnQueueObserver:      func(o *queue.QueueObserver) { m.activeQueueObs.Store(o) },
 		Autoscaler:           cfg.Autoscaler,
 		SrcService:           cfg.Source,
 		DstService:           cfg.Destination,
@@ -704,7 +870,7 @@ func (m *Migration) RunCopyRetry(cfg Config, opts CopyPhaseOptions) (queue.Queue
 		if errors.Is(err, ErrCopySoftSuspended) {
 			cstats, sus, ok := AsCopySuspended(err)
 			if ok {
-				if patch, e2 := traversalSuspendRuntimeMergePatch(sus); e2 == nil {
+				if patch, e2 := suspendRuntimeMergePatch(sus); e2 == nil {
 					_ = m.store.updateRuntimeState(m.ID, patch)
 				}
 				if e3 := m.transitionTo(PhaseCopySuspended); e3 != nil {
@@ -749,6 +915,7 @@ func (m *Migration) Stop() (StopResult, error) {
 	case PhaseTraversing, PhaseCopying:
 		m.softSuspendRequested.Store(true)
 		result.SoftSuspendRequested = true
+		m.armStopGraceTimer(DefaultStopGracePeriod)
 		return result, nil
 	default:
 		if cancel != nil {
@@ -778,6 +945,7 @@ func (m *Migration) ForceStop() (StopResult, error) {
 		return result, nil
 	}
 
+	m.disarmStopGraceTimer()
 	m.softSuspendRequested.Store(false)
 	if cancel != nil {
 		cancel()
@@ -967,6 +1135,157 @@ func (m *Migration) UnmarkNodeForRetryCopy(nodeID string) (PathReviewActionResul
 	return pathReviewResult(n, deltas), nil
 }
 
+func (m *Migration) MarkNodeForRetryDelete(nodeID string) (PathReviewActionResult, error) {
+	phase := m.Phase()
+	if phase != PhaseCopyReview && phase != PhaseDeleting && phase != PhaseDeleteReview {
+		return PathReviewActionResult{}, fmt.Errorf("retry delete mutation requires delete review or deleting phase")
+	}
+	n, deltas, err := m.store.setNodeDeleteStatus(nodeID, db.DeleteStatusPending)
+	if err != nil {
+		return PathReviewActionResult{}, err
+	}
+	m.refreshRuntimeState()
+	return pathReviewResult(n, deltas), nil
+}
+
+func (m *Migration) UnmarkNodeForRetryDelete(nodeID string) (PathReviewActionResult, error) {
+	phase := m.Phase()
+	if phase != PhaseCopyReview && phase != PhaseDeleting && phase != PhaseDeleteReview {
+		return PathReviewActionResult{}, fmt.Errorf("retry delete mutation requires delete review or deleting phase")
+	}
+	n, deltas, err := m.store.setNodeDeleteStatus(nodeID, db.DeleteStatusFailed)
+	if err != nil {
+		return PathReviewActionResult{}, err
+	}
+	m.refreshRuntimeState()
+	return pathReviewResult(n, deltas), nil
+}
+
+// SkipNodeDelete opts a successfully copied SRC node out of source removal during cleanup planning.
+func (m *Migration) SkipNodeDelete(nodeID string) (PathReviewActionResult, error) {
+	if m.Phase() != PhaseCopyReview {
+		return PathReviewActionResult{}, fmt.Errorf("skip delete requires awaiting-copy-review phase")
+	}
+	node, err := db.GetNodeByID(m.DB, "SRC", nodeID)
+	if err != nil {
+		return PathReviewActionResult{}, err
+	}
+	if node == nil {
+		return PathReviewActionResult{}, fmt.Errorf("node %s not found in SRC", nodeID)
+	}
+	if node.CopyStatus != db.CopyStatusSuccessful {
+		return PathReviewActionResult{}, fmt.Errorf("skip delete requires copy_status successful")
+	}
+	n, deltas, err := m.store.setNodeDeleteStatusWithPropagation(nodeID, db.DeleteStatusSkipped)
+	if err != nil {
+		return PathReviewActionResult{}, err
+	}
+	m.refreshRuntimeState()
+	return pathReviewResult(n, deltas), nil
+}
+
+// UnskipNodeDelete re-includes a SRC node in source removal during cleanup planning.
+func (m *Migration) UnskipNodeDelete(nodeID string) (PathReviewActionResult, error) {
+	if m.Phase() != PhaseCopyReview {
+		return PathReviewActionResult{}, fmt.Errorf("unskip delete requires awaiting-copy-review phase")
+	}
+	node, err := db.GetNodeByID(m.DB, "SRC", nodeID)
+	if err != nil {
+		return PathReviewActionResult{}, err
+	}
+	if node == nil {
+		return PathReviewActionResult{}, fmt.Errorf("node %s not found in SRC", nodeID)
+	}
+	if node.CopyStatus != db.CopyStatusSuccessful {
+		return PathReviewActionResult{}, fmt.Errorf("unskip delete requires copy_status successful")
+	}
+	if node.DeleteStatus == db.DeleteStatusDeleted {
+		return PathReviewActionResult{}, fmt.Errorf("cannot unskip already deleted node")
+	}
+	n, deltas, err := m.store.setNodeDeleteStatusWithPropagation(nodeID, db.DeleteStatusPending)
+	if err != nil {
+		return PathReviewActionResult{}, err
+	}
+	m.refreshRuntimeState()
+	return pathReviewResult(n, deltas), nil
+}
+
+// PrepareSourceCleanup aligns delete_status with the user's selected SRC nodes for source removal.
+// When keepNodeIDs is non-empty, only those nodes are pending and others are skipped.
+// When deselectedNodeIDs is non-empty (and keepNodeIDs is empty), those nodes are skipped and others pending.
+// When both are empty, all successful copies are pending.
+func (m *Migration) PrepareSourceCleanup(keepNodeIDs, deselectedNodeIDs []string) (PathReviewActionResult, error) {
+	if m.Phase() != PhaseCopyReview {
+		return PathReviewActionResult{}, fmt.Errorf("prepare source cleanup requires awaiting-copy-review phase")
+	}
+	useKeepList := len(keepNodeIDs) > 0
+	keep := make(map[string]bool, len(keepNodeIDs))
+	for _, id := range keepNodeIDs {
+		if id != "" {
+			keep[id] = true
+		}
+	}
+	deselected := make(map[string]bool, len(deselectedNodeIDs))
+	for _, id := range deselectedNodeIDs {
+		if id != "" {
+			deselected[id] = true
+		}
+	}
+	var total int64
+	merged := make(map[string]int64)
+	offset := 0
+	const pageSize = 1000
+	for {
+		nodes, err := db.ListSrcNodesByCopyStatus(m.DB, db.CopyStatusSuccessful, pageSize, offset)
+		if err != nil {
+			return PathReviewActionResult{}, err
+		}
+		if len(nodes) == 0 {
+			break
+		}
+		for _, node := range nodes {
+			var selected bool
+			switch {
+			case useKeepList:
+				selected = keep[node.ID]
+			case len(deselected) > 0:
+				selected = !deselected[node.ID]
+			default:
+				selected = true
+			}
+			var target string
+			if selected {
+				if node.DeleteStatus == db.DeleteStatusDeleted || node.DeleteStatus == db.DeleteStatusFailed {
+					continue
+				}
+				target = db.DeleteStatusPending
+			} else {
+				if node.DeleteStatus == db.DeleteStatusDeleted {
+					continue
+				}
+				target = db.DeleteStatusSkipped
+			}
+			if node.DeleteStatus == target {
+				continue
+			}
+			n, deltas, err := m.store.setNodeDeleteStatus(node.ID, target)
+			if err != nil {
+				return pathReviewResult(total, merged), err
+			}
+			total += n
+			for k, v := range deltas {
+				merged[k] += v
+			}
+		}
+		if len(nodes) < pageSize {
+			break
+		}
+		offset += pageSize
+	}
+	m.refreshRuntimeState()
+	return pathReviewResult(total, merged), nil
+}
+
 func (m *Migration) RetryAllFailed() (PathReviewActionResult, error) {
 	if m.Phase() != PhaseTraversalReview {
 		return PathReviewActionResult{}, fmt.Errorf("retry all failed requires awaiting-traversal-review phase")
@@ -1070,6 +1389,14 @@ func (m *Migration) GetQueueMetrics() (QueueMetricsSnapshot, error) {
 		}
 	}
 	return m.store.getQueueMetrics()
+}
+
+// PossibleStall reports whether any active queue watchdog recently detected a stall.
+func (m *Migration) PossibleStall() bool {
+	if o := m.activeQueueObs.Load(); o != nil {
+		return o.AnyPossibleStall()
+	}
+	return false
 }
 
 func queueMetricsSnapshotFromRawJSON(raw map[string][]byte) QueueMetricsSnapshot {

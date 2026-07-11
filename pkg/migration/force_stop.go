@@ -49,11 +49,21 @@ func performTraversalForceStop(
 	dstQueue.ClearPendingBufferForSuspend()
 	srcQueue.AbandonInProgressTasks()
 	dstQueue.AbandonInProgressTasks()
-	_ = srcQueue.WaitInProgressZero(context.Background(), 50*time.Millisecond)
-	_ = dstQueue.WaitInProgressZero(context.Background(), 50*time.Millisecond)
-	flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = database.FlushSealBuffer()
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer drainCancel()
+	_ = srcQueue.WaitInProgressZero(drainCtx, 50*time.Millisecond)
+	_ = dstQueue.WaitInProgressZero(drainCtx, 50*time.Millisecond)
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer flushCancel()
+	flushDone := make(chan struct{})
+	go func() {
+		_ = database.FlushSealBuffer()
+		close(flushDone)
+	}()
+	select {
+	case <-flushDone:
+	case <-flushCtx.Done():
+	}
 	_ = database.CheckpointWithRetry(flushCtx, 1)
 }
 
@@ -69,10 +79,20 @@ func performCopyForceStop(
 	copyQueue.StopWatchdog()
 	copyQueue.ClearPendingBufferForSuspend()
 	copyQueue.AbandonInProgressTasks()
-	_ = copyQueue.WaitInProgressZero(context.Background(), 50*time.Millisecond)
-	flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = database.FlushSealBuffer()
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer drainCancel()
+	_ = copyQueue.WaitInProgressZero(drainCtx, 50*time.Millisecond)
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer flushCancel()
+	flushDone := make(chan struct{})
+	go func() {
+		_ = database.FlushSealBuffer()
+		close(flushDone)
+	}()
+	select {
+	case <-flushDone:
+	case <-flushCtx.Done():
+	}
 	_ = database.CheckpointWithRetry(flushCtx, 1)
 }
 

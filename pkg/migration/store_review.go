@@ -32,6 +32,12 @@ func deltaKeyToReviewKey(k string) string {
 		return db.ReviewKeyCopyFailed
 	case DeltaCopySuccessful:
 		return db.ReviewKeyCopySuccessful
+	case DeltaDeletePending:
+		return db.ReviewKeyDeletePending
+	case DeltaDeleteFailed:
+		return db.ReviewKeyDeleteFailed
+	case DeltaDeleteDeleted:
+		return db.ReviewKeyDeleteDeleted
 	case DeltaExcluded:
 		return db.ReviewKeyExcluded
 	case DeltaFolders:
@@ -70,16 +76,17 @@ func (s *migrationStore) persistReviewDeltas(deltas map[string]int64) error {
 
 func mergedRowToDiffItem(r db.MergedReviewRow) DiffItem {
 	item := DiffItem{
-			Path:               r.Path,
-			Name:               r.Name,
-			Depth:              r.Depth,
-			Type:               r.Type,
-			SrcNodeID:          r.SrcNodeID,
-			DstNodeID:          r.DstNodeID,
-			SrcTraversalStatus: r.SrcTraversalStatus,
-			DstTraversalStatus: r.DstTraversalStatus,
-			CopyStatus:         db.CopyStatusForDisplay(r.CopyStatus),
-			Excluded:           r.Excluded,
+		Path:               r.Path,
+		Name:               r.Name,
+		Depth:              r.Depth,
+		Type:               r.Type,
+		SrcNodeID:          r.SrcNodeID,
+		DstNodeID:          r.DstNodeID,
+		SrcTraversalStatus: r.SrcTraversalStatus,
+		DstTraversalStatus: r.DstTraversalStatus,
+		CopyStatus:         db.CopyStatusForDisplay(r.CopyStatus),
+		DeleteStatus:       r.DeleteStatus,
+		Excluded:           r.Excluded,
 		Size:               r.Size,
 		MissingOnSource:    r.SrcNodeID == "",
 		MissingOnDest:      r.DstNodeID == "",
@@ -326,6 +333,83 @@ func (s *migrationStore) setNodeCopyStatus(nodeID, status string) (int64, map[st
 		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
 	}
 	return 1, deltas, nil
+}
+
+func (s *migrationStore) setNodeDeleteStatus(nodeID, status string) (int64, map[string]int64, error) {
+	node, err := db.GetNodeByID(s.db, "SRC", nodeID)
+	if err != nil {
+		return 0, nil, err
+	}
+	if node == nil {
+		return 0, nil, fmt.Errorf("node %s not found in SRC", nodeID)
+	}
+	oldDelete := node.DeleteStatus
+	if oldDelete == status {
+		return 0, nil, nil
+	}
+	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+		return sess.WithTx(func(w *db.Writer) error {
+			return w.SetNodeDeleteStatus("SRC", nodeID, status)
+		})
+	})
+	if err != nil {
+		return 0, nil, err
+	}
+	deltas := make(map[string]int64)
+	addReviewDeltaForDeleteStatusTransition(deltas, oldDelete, status)
+	if err := s.persistReviewDeltas(deltas); err != nil {
+		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+	}
+	return 1, deltas, nil
+}
+
+func (s *migrationStore) setNodeDeleteStatusWithPropagation(nodeID, targetStatus string) (int64, map[string]int64, error) {
+	node, err := db.GetNodeByID(s.db, "SRC", nodeID)
+	if err != nil {
+		return 0, nil, err
+	}
+	if node == nil {
+		return 0, nil, fmt.Errorf("node %s not found in SRC", nodeID)
+	}
+	if node.Type != db.NodeTypeFolder {
+		return s.setNodeDeleteStatus(nodeID, targetStatus)
+	}
+	rootPath := node.Path
+	var affected int64
+	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
+		return sess.WithTx(func(w *db.Writer) error {
+			var err error
+			switch targetStatus {
+			case db.DeleteStatusSkipped:
+				affected, err = w.CountSuccessfulDeletePendingInSubtree(rootPath)
+				if err != nil {
+					return err
+				}
+				return w.InsertSkipDeleteEventsForSubtree(rootPath)
+			case db.DeleteStatusPending:
+				affected, err = w.CountSuccessfulDeleteSkippedInSubtree(rootPath)
+				if err != nil {
+					return err
+				}
+				return w.InsertUnskipDeleteEventsForSubtree(rootPath)
+			default:
+				return fmt.Errorf("delete status propagation only supports skip or unskip")
+			}
+		})
+	})
+	if err != nil {
+		return 0, nil, fmt.Errorf("set delete status with propagation: %w", err)
+	}
+	deltas := make(map[string]int64)
+	pendingDelta := affected
+	if targetStatus == db.DeleteStatusSkipped {
+		pendingDelta = -affected
+	}
+	addReviewDeltaForDeleteStatus(deltas, db.DeleteStatusPending, pendingDelta)
+	if err := s.persistReviewDeltas(deltas); err != nil {
+		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+	}
+	return affected, deltas, nil
 }
 
 // markNodeForRetryDiscovery looks up the node by ID in SRC then DST (nodeID is either a SRC or DST node ID).
@@ -587,6 +671,7 @@ func searchRequestToReviewFilter(req SearchRequest) db.ReviewFilter {
 		StatusSearchType: strings.TrimSpace(req.StatusSearchType),
 		TraversalStatus:  strings.TrimSpace(req.TraversalStatus),
 		CopyStatus:       strings.TrimSpace(req.CopyStatus),
+		DeleteStatus:     strings.TrimSpace(req.DeleteStatus),
 	}
 	for _, c := range req.Conditions {
 		field := strings.ToLower(strings.TrimSpace(c.Field))
@@ -612,6 +697,10 @@ func searchRequestToReviewFilter(req SearchRequest) db.ReviewFilter {
 		case "copystatus":
 			if s, ok := conditionStringValue(c.Value); ok {
 				f.CopyStatus = strings.TrimSpace(s)
+			}
+		case "deletestatus":
+			if s, ok := conditionStringValue(c.Value); ok {
+				f.DeleteStatus = strings.TrimSpace(s)
 			}
 		case "depth":
 			f.DepthOperator = normalizeDepthSizeOp(c.Operator)

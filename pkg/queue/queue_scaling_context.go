@@ -34,7 +34,7 @@ func (q *Queue) ScalingContext() ScalingContext {
 	return ScalingContext{
 		QueueName:   q.name,
 		Mode:        mode,
-		CopyPass:    q.copyPass,
+		CopyPass:    q.passNumber,
 		SrcProvider: q.scalingSrcProvider,
 		DstProvider: q.scalingDstProvider,
 		SrcGroupID:  q.scalingSrcGroupID,

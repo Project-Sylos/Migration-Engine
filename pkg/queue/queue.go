@@ -52,10 +52,12 @@ const (
 type QueueMode string
 
 const (
-	QueueModeTraversal QueueMode = "traversal"  // Normal BFS traversal
-	QueueModeRetry     QueueMode = "retry"      // Retry failed tasks sweep
-	QueueModeCopy      QueueMode = "copy"       // Copy phase (folders then files)
-	QueueModeCopyRetry QueueMode = "copy-retry" // Copy retry: only copy_status = failed, max-depth guarded completion
+	QueueModeTraversal   QueueMode = "traversal"    // Normal BFS traversal
+	QueueModeRetry       QueueMode = "retry"        // Retry failed tasks sweep
+	QueueModeCopy        QueueMode = "copy"         // Copy phase (folders then files)
+	QueueModeCopyRetry   QueueMode = "copy-retry"   // Copy retry: only copy_status = failed, max-depth guarded completion
+	QueueModeDelete      QueueMode = "delete"       // Delete phase (files then folders, reverse BFS)
+	QueueModeDeleteRetry QueueMode = "delete-retry" // Delete retry: only delete_status = failed
 )
 
 const (
@@ -86,6 +88,8 @@ func getQueueType(queueName string) string {
 	case "dst":
 		return "DST"
 	case "copy":
+		return "SRC"
+	case "delete":
 		return "SRC"
 	default:
 		return ""
@@ -206,7 +210,7 @@ type Queue struct {
 	// Retry sweep specific fields
 	maxKnownDepth int // Maximum known depth from previous traversal (for retry sweep)
 	// Copy phase specific fields
-	copyPass int // Current copy pass (1 for folders, 2 for files)
+	passNumber int // Current pass number like for copy and delete phases (1 for folders, 2 for files)
 	// Resume-only: dst ListChildren precheck (see SetCopyResumeDstExistenceWindow, AdvanceCopyRound).
 	copyResumeDstExistenceActive      bool
 	copyResumeDstExistenceAnchorPass  int
@@ -342,9 +346,40 @@ func (q *Queue) InitializeCopyWithContext(database *db.DB, srcAdapter, dstAdapte
 	}
 }
 
+// InitializeDeleteWithContext sets up a delete queue with the source adapter only.
+func (q *Queue) InitializeDeleteWithContext(database *db.DB, srcAdapter types.FSAdapter, shutdownCtx context.Context) {
+	q.setDatabase(database)
+	q.SetShutdownContext(shutdownCtx)
+	q.initDeleteWorkerPool(srcAdapter)
+
+	q.mu.RLock()
+	workerCount := cap(q.workers)
+	q.mu.RUnlock()
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+	_ = q.SetTargetWorkerCount(workerCount)
+
+	go q.Run()
+	q.watchdog = NewQueueWatchdog(q, defaultQueueStallTimeout)
+	q.watchdog.Start()
+
+	if logservice.LS != nil {
+		_ = logservice.LS.Log("info", fmt.Sprintf("%s delete queue initialized", strings.ToUpper(q.name)), "queue", q.name, q.name)
+	}
+}
+
 // Name returns the queue's name.
 func (q *Queue) Name() string {
 	return q.name
+}
+
+// PossibleStall reports whether the queue watchdog recently detected a stall.
+func (q *Queue) PossibleStall() bool {
+	if q == nil || q.watchdog == nil {
+		return false
+	}
+	return q.watchdog.PossibleStall()
 }
 
 // IsExhausted returns true if the queue has finished all traversal or has been stopped.
@@ -442,6 +477,8 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			return q.CheckTraversalCompletion(currentRound)
 		case QueueModeCopy, QueueModeCopyRetry:
 			return q.CheckCopyCompletion(currentRound)
+		case QueueModeDelete, QueueModeDeleteRetry:
+			return q.CheckDeleteCompletion(currentRound)
 		}
 		return false
 	}
@@ -490,6 +527,26 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 		}
 
 		if mode == QueueModeCopy || mode == QueueModeCopyRetry {
+			if inProgressCount > 0 || pendingBuffCount > 0 {
+				return false
+			}
+			if !lastPullWasPartial {
+				return false
+			}
+			if q.getPulling() {
+				return false
+			}
+			info := q.getRoundInfoReadOnly(currentRound)
+			if info == nil || info.PullCount == 0 {
+				return false
+			}
+			if opts.AdvanceRoundIfComplete {
+				q.advanceToNextRound()
+			}
+			return true
+		}
+
+		if mode == QueueModeDelete || mode == QueueModeDeleteRetry {
 			if inProgressCount > 0 || pendingBuffCount > 0 {
 				return false
 			}
@@ -597,9 +654,9 @@ func (q *Queue) markComplete(format string, args ...any) bool {
 type TaskExecutionResult string
 
 const (
-	TaskExecutionResultSuccessful   TaskExecutionResult = "successful"
-	TaskExecutionResultFailed       TaskExecutionResult = "failed"
-	TaskExecutionResultRateLimited  TaskExecutionResult = "rate_limited"
+	TaskExecutionResultSuccessful  TaskExecutionResult = "successful"
+	TaskExecutionResultFailed      TaskExecutionResult = "failed"
+	TaskExecutionResultRateLimited TaskExecutionResult = "rate_limited"
 )
 
 // ReportTaskResult reports the result of a task execution and handles post-processing.
@@ -660,6 +717,10 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 	// Delegate to mode-specific implementation
 	if mode == QueueModeCopy || mode == QueueModeCopyRetry {
 		q.CompleteCopyTask(task, executionDelta)
+		return
+	}
+	if mode == QueueModeDelete || mode == QueueModeDeleteRetry {
+		q.CompleteDeleteTask(task, executionDelta)
 		return
 	}
 
@@ -793,6 +854,10 @@ func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
 		q.FailCopyTask(task, executionDelta)
 		return
 	}
+	if mode == QueueModeDelete || mode == QueueModeDeleteRetry {
+		q.FailDeleteTask(task, executionDelta)
+		return
+	}
 
 	// Traversal and retry modes use the same failure logic
 	q.FailTraversalTask(task, executionDelta)
@@ -811,7 +876,7 @@ func (q *Queue) Clear() {
 
 	// Clear in-progress tracking
 	q.inProgress = make(map[string]*TaskBase)
-	q.pendingBuff = make([]*TaskBase, 0, q.effectiveLeaseBatch())
+	q.pendingBuff = make([]*TaskBase, 0, q.EffectiveLeaseBatchSize())
 	q.pulling = false
 
 	// DuckDB clearing would require deleting all buckets - typically not needed
@@ -1183,6 +1248,10 @@ func (q *Queue) advanceToNextRound() {
 
 	if mode == QueueModeCopy || mode == QueueModeCopyRetry {
 		q.AdvanceCopyRound()
+		return
+	}
+	if mode == QueueModeDelete || mode == QueueModeDeleteRetry {
+		q.AdvanceDeleteRound()
 		return
 	}
 

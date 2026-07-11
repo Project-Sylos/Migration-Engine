@@ -163,6 +163,16 @@ func EnsureStatusEventTableIndexesIfMissing(db *DB, table string) error {
 	return nil
 }
 
+// EnsureQueueStatsIndexes creates an index on queue_stats for latest-per-(queue_key, phase) queries.
+func EnsureQueueStatsIndexes(db *DB) error {
+	conn, err := db.GetDB()
+	if err != nil {
+		return err
+	}
+	_, err = conn.Exec(`CREATE INDEX IF NOT EXISTS queue_stats_key_phase_time_idx ON queue_stats (queue_key, phase, event_time)`)
+	return err
+}
+
 // DropStatusEventTableIndexes drops indexes on the given status event table. Call before a bulk phase.
 func DropStatusEventTableIndexes(db *DB, table string) error {
 	conn, err := db.GetDB()

@@ -70,7 +70,7 @@ func (w *Writer) UpsertNodes(table string, nodes []*NodeState) error {
 
 // SrcStatusEventAppendRowArgs returns column values for one row in src_status_events for appender.
 func SrcStatusEventAppendRowArgs(e *StatusEvent) []any {
-	return []any{e.ID, e.TraversalStatus, e.CopyStatus, e.EventTime, int32(e.Depth), e.ErrorLogID}
+	return []any{e.ID, e.TraversalStatus, e.CopyStatus, e.DeleteStatus, e.EventTime, int32(e.Depth), e.ErrorLogID}
 }
 
 // DstStatusEventAppendRowArgs returns column values for one row in dst_status_events for appender.
@@ -86,8 +86,8 @@ func (w *Writer) BatchInsertSrcStatusEvents(events []StatusEvent) error {
 	ctx := context.Background()
 	for _, e := range events {
 		_, err := w.tx.ExecContext(ctx,
-			`INSERT INTO `+tableSrcStatusEvents+` (id, traversal_status, copy_status, event_time, depth, error_log_id) VALUES ($1, $2, $3, $4, $5, $6)`,
-			e.ID, e.TraversalStatus, e.CopyStatus, e.EventTime, e.Depth, nullIfEmpty(e.ErrorLogID),
+			`INSERT INTO `+tableSrcStatusEvents+` (id, traversal_status, copy_status, delete_status, event_time, depth, error_log_id) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			e.ID, e.TraversalStatus, e.CopyStatus, nullIfEmpty(e.DeleteStatus), e.EventTime, e.Depth, nullIfEmpty(e.ErrorLogID),
 		)
 		if err != nil {
 			return fmt.Errorf("insert src_status_event %s: %w", e.ID, err)
@@ -195,7 +195,7 @@ func (w *Writer) RecomputeStatsForDepth(table string, depth int) error {
 		if err := rows.Scan(&status, &count); err != nil {
 			return err
 		}
-		if err := w.SetStatsCountForDepth(table, depth, StatsKeyTraversalStatus(status), count); err != nil {
+		if err := w.SetStatsCountForDepth(table, depth, StatsKey(StatsKindTraversal,status), count); err != nil {
 			return err
 		}
 	}
@@ -220,7 +220,7 @@ func (w *Writer) RecomputeStatsForDepth(table string, depth int) error {
 			if err := rows.Scan(&status, &count); err != nil {
 				return err
 			}
-			if err := w.SetStatsCountForDepth(table, depth, StatsKeyCopyStatus(status), count); err != nil {
+			if err := w.SetStatsCountForDepth(table, depth, StatsKey(StatsKindCopy,status), count); err != nil {
 				return err
 			}
 		}
@@ -311,6 +311,90 @@ SELECT n.id, COALESCE((SELECT arg_max(e.traversal_status, e.event_time) FROM src
 	return w.recomputeStatsForSubtreeDepths(ctx, tableSrcNodes, rootPath)
 }
 
+func subtreePathPredicate(alias string, pathEqParam, pathLikeParam int) string {
+	return fmt.Sprintf(`(%s.path = $%d OR %s.path LIKE $%d)`, alias, pathEqParam, alias, pathLikeParam)
+}
+
+const successfulCopyEligibleForDelete = `COALESCE(cur.copy_status,'') = 'successful'`
+
+// CountSuccessfulDeletePendingInSubtree counts SRC nodes in the subtree (inclusive) eligible to skip from deletion.
+func (w *Writer) CountSuccessfulDeletePendingInSubtree(rootPath string) (int64, error) {
+	ctx := context.Background()
+	base := `SELECT COUNT(*)::BIGINT FROM ` + tableSrcNodes + ` n LEFT JOIN ` + cteSrcCurrentStatus + ` cur ON n.id = cur.id WHERE `
+	eligible := successfulCopyEligibleForDelete + ` AND COALESCE(cur.delete_status,'') IN ('pending', '')`
+	var n int64
+	var err error
+	if rootPath == "/" {
+		err = w.tx.QueryRowContext(ctx, base+`n.path LIKE '/%' AND `+eligible).Scan(&n)
+	} else {
+		err = w.tx.QueryRowContext(ctx, base+subtreePathPredicate("n", 1, 2)+` AND `+eligible, rootPath, rootPath+"/%").Scan(&n)
+	}
+	return n, err
+}
+
+// CountSuccessfulDeleteSkippedInSubtree counts SRC nodes in the subtree (inclusive) eligible to unskip from deletion.
+func (w *Writer) CountSuccessfulDeleteSkippedInSubtree(rootPath string) (int64, error) {
+	ctx := context.Background()
+	base := `SELECT COUNT(*)::BIGINT FROM ` + tableSrcNodes + ` n LEFT JOIN ` + cteSrcCurrentStatus + ` cur ON n.id = cur.id WHERE `
+	eligible := successfulCopyEligibleForDelete + ` AND COALESCE(cur.delete_status,'') = 'skipped'`
+	var n int64
+	var err error
+	if rootPath == "/" {
+		err = w.tx.QueryRowContext(ctx, base+`n.path LIKE '/%' AND `+eligible).Scan(&n)
+	} else {
+		err = w.tx.QueryRowContext(ctx, base+subtreePathPredicate("n", 1, 2)+` AND `+eligible, rootPath, rootPath+"/%").Scan(&n)
+	}
+	return n, err
+}
+
+// InsertSkipDeleteEventsForSubtree marks all successfully copied SRC nodes in the subtree as delete_status=skipped.
+func (w *Writer) InsertSkipDeleteEventsForSubtree(rootPath string) error {
+	ctx := context.Background()
+	eventTime := time.Now().UnixNano()
+	insert := `INSERT INTO ` + tableSrcStatusEvents + ` (id, traversal_status, copy_status, delete_status, event_time, depth)
+SELECT n.id, COALESCE(cur.traversal_status,''), COALESCE(cur.copy_status,''), 'skipped', $1, n.depth
+FROM ` + tableSrcNodes + ` n
+LEFT JOIN ` + cteSrcCurrentStatus + ` cur ON n.id = cur.id
+WHERE `
+	eligible := successfulCopyEligibleForDelete + ` AND COALESCE(cur.delete_status,'') IN ('pending', '')`
+	if rootPath == "/" {
+		_, err := w.tx.ExecContext(ctx, insert+`n.path LIKE '/%' AND `+eligible, eventTime)
+		if err != nil {
+			return err
+		}
+		return w.recomputeStatsForSubtreeDepths(ctx, tableSrcNodes, "/")
+	}
+	_, err := w.tx.ExecContext(ctx, insert+subtreePathPredicate("n", 2, 3)+` AND `+eligible, eventTime, rootPath, rootPath+"/%")
+	if err != nil {
+		return err
+	}
+	return w.recomputeStatsForSubtreeDepths(ctx, tableSrcNodes, rootPath)
+}
+
+// InsertUnskipDeleteEventsForSubtree marks all successfully copied SRC nodes in the subtree as delete_status=pending.
+func (w *Writer) InsertUnskipDeleteEventsForSubtree(rootPath string) error {
+	ctx := context.Background()
+	eventTime := time.Now().UnixNano()
+	insert := `INSERT INTO ` + tableSrcStatusEvents + ` (id, traversal_status, copy_status, delete_status, event_time, depth)
+SELECT n.id, COALESCE(cur.traversal_status,''), COALESCE(cur.copy_status,''), 'pending', $1, n.depth
+FROM ` + tableSrcNodes + ` n
+LEFT JOIN ` + cteSrcCurrentStatus + ` cur ON n.id = cur.id
+WHERE `
+	eligible := successfulCopyEligibleForDelete + ` AND COALESCE(cur.delete_status,'') = 'skipped'`
+	if rootPath == "/" {
+		_, err := w.tx.ExecContext(ctx, insert+`n.path LIKE '/%' AND `+eligible, eventTime)
+		if err != nil {
+			return err
+		}
+		return w.recomputeStatsForSubtreeDepths(ctx, tableSrcNodes, "/")
+	}
+	_, err := w.tx.ExecContext(ctx, insert+subtreePathPredicate("n", 2, 3)+` AND `+eligible, eventTime, rootPath, rootPath+"/%")
+	if err != nil {
+		return err
+	}
+	return w.recomputeStatsForSubtreeDepths(ctx, tableSrcNodes, rootPath)
+}
+
 // PropagateSubtreeFailure inserts copy_status='failed' events for all SRC descendants of parentPath
 // whose current copy_status is 'pending'. Returns the number of affected nodes. Call inside a transaction.
 func (w *Writer) PropagateSubtreeFailure(parentPath string) (int64, error) {
@@ -393,8 +477,8 @@ func (w *Writer) InsertStatusEvent(table string, e *StatusEvent) error {
 		return err
 	}
 	_, err := w.tx.ExecContext(ctx,
-		`INSERT INTO `+tableSrcStatusEvents+` (id, traversal_status, copy_status, event_time, depth, error_log_id) VALUES ($1, $2, $3, $4, $5, $6)`,
-		e.ID, e.TraversalStatus, e.CopyStatus, e.EventTime, e.Depth, nullIfEmpty(e.ErrorLogID),
+		`INSERT INTO `+tableSrcStatusEvents+` (id, traversal_status, copy_status, delete_status, event_time, depth, error_log_id) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		e.ID, e.TraversalStatus, e.CopyStatus, nullIfEmpty(e.DeleteStatus), e.EventTime, e.Depth, nullIfEmpty(e.ErrorLogID),
 	)
 	return err
 }
@@ -543,12 +627,12 @@ func (w *Writer) SetNodeTraversalStatus(table, nodeID, status string) error {
 		return err
 	}
 	if oldStatus != "" {
-		if err := w.UpdateStatsCountByDelta(table, depth, StatsKeyTraversalStatus(oldStatus), -1); err != nil {
+		if err := w.UpdateStatsCountByDelta(table, depth, StatsKey(StatsKindTraversal,oldStatus), -1); err != nil {
 			return err
 		}
 	}
 	if status != "" {
-		if err := w.UpdateStatsCountByDelta(table, depth, StatsKeyTraversalStatus(status), 1); err != nil {
+		if err := w.UpdateStatsCountByDelta(table, depth, StatsKey(StatsKindTraversal,status), 1); err != nil {
 			return err
 		}
 	}
@@ -576,12 +660,45 @@ func (w *Writer) SetNodeCopyStatus(table, nodeID, status string) error {
 		return err
 	}
 	if oldCopy != "" && oldCopy != CopyStatusInProgress {
-		if err := w.UpdateStatsCountByDelta("SRC", depth, StatsKeyCopyStatus(oldCopy), -1); err != nil {
+		if err := w.UpdateStatsCountByDelta("SRC", depth, StatsKey(StatsKindCopy,oldCopy), -1); err != nil {
 			return err
 		}
 	}
 	if status != "" && status != CopyStatusInProgress {
-		if err := w.UpdateStatsCountByDelta("SRC", depth, StatsKeyCopyStatus(status), 1); err != nil {
+		if err := w.UpdateStatsCountByDelta("SRC", depth, StatsKey(StatsKindCopy,status), 1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SetNodeDeleteStatus emits a delete_status event and applies stat deltas for SRC.
+func (w *Writer) SetNodeDeleteStatus(table, nodeID, status string) error {
+	if table != "SRC" {
+		return nil
+	}
+	ctx := context.Background()
+	t := tableName(table)
+	var depth int
+	err := w.tx.QueryRowContext(ctx, `SELECT depth FROM `+t+` WHERE id = $1`, nodeID).Scan(&depth)
+	if err != nil {
+		return err
+	}
+	var oldDelete, copySt, trav string
+	_ = w.tx.QueryRowContext(ctx, `SELECT COALESCE(arg_max(delete_status, event_time), '') FROM src_status_events WHERE id = $1 AND COALESCE(delete_status, '') <> ''`, nodeID).Scan(&oldDelete)
+	_ = w.tx.QueryRowContext(ctx, `SELECT COALESCE(arg_max(copy_status, event_time), '') FROM src_status_events WHERE id = $1 AND COALESCE(copy_status, '') <> ''`, nodeID).Scan(&copySt)
+	_ = w.tx.QueryRowContext(ctx, `SELECT COALESCE(arg_max(traversal_status, event_time), '') FROM src_status_events WHERE id = $1`, nodeID).Scan(&trav)
+	ev := &StatusEvent{ID: nodeID, TraversalStatus: trav, CopyStatus: copySt, DeleteStatus: status, EventTime: time.Now().UnixNano(), Depth: depth}
+	if err := w.InsertStatusEvent("SRC", ev); err != nil {
+		return err
+	}
+	if oldDelete != "" {
+		if err := w.UpdateStatsCountByDelta("SRC", depth, StatsKey(StatsKindDelete, oldDelete), -1); err != nil {
+			return err
+		}
+	}
+	if status != "" {
+		if err := w.UpdateStatsCountByDelta("SRC", depth, StatsKey(StatsKindDelete, status), 1); err != nil {
 			return err
 		}
 	}
@@ -609,12 +726,12 @@ func (w *Writer) SetNodeExcluded(table, nodeID string, excluded bool) error {
 		return err
 	}
 	if oldCopyStatus != "" && oldCopyStatus != CopyStatusInProgress {
-		if err := w.UpdateStatsCountByDelta("SRC", depth, StatsKeyCopyStatus(oldCopyStatus), -1); err != nil {
+		if err := w.UpdateStatsCountByDelta("SRC", depth, StatsKey(StatsKindCopy,oldCopyStatus), -1); err != nil {
 			return err
 		}
 	}
 	if newCopyStatus != "" {
-		if err := w.UpdateStatsCountByDelta("SRC", depth, StatsKeyCopyStatus(newCopyStatus), 1); err != nil {
+		if err := w.UpdateStatsCountByDelta("SRC", depth, StatsKey(StatsKindCopy,newCopyStatus), 1); err != nil {
 			return err
 		}
 	}
@@ -811,12 +928,25 @@ func (w *Writer) RecordTaskError(queueType, phase, nodeID, message string, attem
 	return err
 }
 
-// WriteQueueStats upserts queue metrics JSON into queue_stats.
-func (w *Writer) WriteQueueStats(queueKey, metricsJSON string) error {
+// AppendQueueStats appends queue metrics JSON into queue_stats for the given phase family.
+func (w *Writer) AppendQueueStats(queueKey, phase, metricsJSON string) error {
 	_, err := w.tx.ExecContext(context.Background(),
-		`INSERT INTO queue_stats (queue_key, metrics_json) VALUES ($1, $2)
-		 ON CONFLICT (queue_key) DO UPDATE SET metrics_json = excluded.metrics_json`,
-		queueKey, metricsJSON,
+		`INSERT INTO queue_stats (queue_key, phase, metrics_json) VALUES ($1, $2, $3)`,
+		queueKey, phase, metricsJSON,
+	)
+	return err
+}
+
+// PruneQueueStats deletes older rows, keeping only the latest event per (queue_key, phase).
+func (w *Writer) PruneQueueStats() error {
+	_, err := w.tx.ExecContext(context.Background(),
+		`DELETE FROM queue_stats AS qs
+		 WHERE EXISTS (
+		   SELECT 1 FROM queue_stats AS newer
+		   WHERE newer.queue_key = qs.queue_key
+		     AND newer.phase = qs.phase
+		     AND newer.event_time > qs.event_time
+		 )`,
 	)
 	return err
 }
@@ -835,6 +965,9 @@ func (w *Writer) WriteReviewStatsSnapshot(s ReviewStatsSnapshot) error {
 		{ReviewKeyCopyPending, s.CopyPending},
 		{ReviewKeyCopySuccessful, s.CopySuccessful},
 		{ReviewKeyCopyFailed, s.CopyFailed},
+		{ReviewKeyDeletePending, s.DeletePending},
+		{ReviewKeyDeleteDeleted, s.DeleteDeleted},
+		{ReviewKeyDeleteFailed, s.DeleteFailed},
 		{ReviewKeyExcluded, s.Excluded},
 		{ReviewKeyFolders, s.Folders},
 		{ReviewKeyFiles, s.Files},

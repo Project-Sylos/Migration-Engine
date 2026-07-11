@@ -185,7 +185,7 @@ func CountPendingNodes(database *db.DB, queueType string) (int, error) {
 
 	totalPending := 0
 	for _, level := range levels {
-		c, err := database.GetStatsCountAtDepth(queueType, level, db.StatsKeyTraversalStatus(db.StatusPending))
+		c, err := database.GetStatsCountAtDepth(queueType, level, db.StatsKey(db.StatsKindTraversal,db.StatusPending))
 		if err != nil {
 			continue
 		}

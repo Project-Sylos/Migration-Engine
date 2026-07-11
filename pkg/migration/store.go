@@ -150,6 +150,23 @@ func (s *migrationStore) updatePhase(id string, phase string) error {
 	})
 }
 
+// updateName replaces the migration's display name.
+func (s *migrationStore) updateName(id string, name string) error {
+	return s.withConn("updateName", func(conn *sql.DB) error {
+		_, err := conn.ExecContext(
+			context.Background(),
+			`UPDATE `+db.TableMigrations+` SET name = $1, updated_at = $2 WHERE migration_id = $3`,
+			name,
+			time.Now().UTC(),
+			id,
+		)
+		if err != nil {
+			return fmt.Errorf("update migration %s name: %w", id, err)
+		}
+		return nil
+	})
+}
+
 // updateUpdatedAt sets updated_at to now for the migration (e.g. after roots inserted or run ended).
 func (s *migrationStore) updateUpdatedAt(id string) error {
 	return s.withConn("updateUpdatedAt", func(conn *sql.DB) error {

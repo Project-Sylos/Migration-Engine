@@ -109,7 +109,7 @@ func performTraversalSoftSuspend(
 	if err := database.FlushSealBuffer(); err != nil {
 		return RuntimeStats{}, RuntimeSuspendV1{}, fmt.Errorf("flush seal buffer: %w", err)
 	}
-	if err := database.CheckpointWithRetry(waitCtx, 5); err != nil {
+	if err := database.CheckpointWithRetry(mergedCtx, 5); err != nil {
 		return RuntimeStats{}, RuntimeSuspendV1{}, fmt.Errorf("checkpoint: %w", err)
 	}
 
@@ -176,7 +176,7 @@ func performCopySoftSuspend(
 	if err := database.FlushSealBuffer(); err != nil {
 		return queue.QueueStats{}, RuntimeSuspendV1{}, fmt.Errorf("flush seal buffer: %w", err)
 	}
-	if err := database.CheckpointWithRetry(waitCtx, 5); err != nil {
+	if err := database.CheckpointWithRetry(mergedCtx, 5); err != nil {
 		return queue.QueueStats{}, RuntimeSuspendV1{}, fmt.Errorf("checkpoint: %w", err)
 	}
 

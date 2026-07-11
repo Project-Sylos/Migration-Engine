@@ -4,6 +4,7 @@
 package db
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestEncryptedOpenRoundTrip(t *testing.T) {
@@ -106,5 +108,45 @@ func TestEncryptedConcurrentQueriesUseAttachedCatalog(t *testing.T) {
 	close(errCh)
 	for err := range errCh {
 		t.Fatal(err)
+	}
+}
+
+func TestEncryptedRunWriteWhileConnHeld(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "enc.db")
+	key := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err := Open(Options{Path: dbPath, EncryptionKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	ctx := context.Background()
+	held, err := database.conn.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- database.RunWrite(ctx, func(s *WriteSession) error {
+			return s.WithTx(func(w *Writer) error {
+				return w.AppendQueueStats("held-write-test", QueueStatsPhaseTraversal, "{}")
+			})
+		})
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunWrite blocked while another pooled conn is held")
 	}
 }

@@ -9,8 +9,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // LogEntry is a single log line for persistence.
@@ -22,11 +20,6 @@ type LogEntry struct {
 	EntityID  string
 	Message   string
 	Queue     string
-}
-
-// GenerateLogID returns a unique log id (UUID).
-func GenerateLogID() string {
-	return uuid.New().String()
 }
 
 // LogBuffer buffers log entries and flushes them to the DB logs table.

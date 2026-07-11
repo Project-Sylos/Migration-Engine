@@ -56,7 +56,7 @@ func (q *Queue) getMaxKnownDepth() int {
 func (q *Queue) GetCopyPass() int {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
-	return q.copyPass
+	return q.passNumber
 }
 
 // incrementTasksCompletedTotal increments the queue's completed-task counter.
@@ -78,7 +78,7 @@ func (q *Queue) GetTasksCompletedTotal() int64 {
 func (q *Queue) SetCopyPass(pass int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.copyPass = pass
+	q.passNumber = pass
 }
 
 // SetCopyResumeDstExistenceWindow enables the copy worker dst ListChildren precheck until the anchor
@@ -101,7 +101,7 @@ func (q *Queue) shouldApplyCopyDstResumeExistenceCheck() bool {
 	if q.mode != QueueModeCopy || !q.copyResumeDstExistenceActive {
 		return false
 	}
-	return q.copyPass == q.copyResumeDstExistenceAnchorPass && q.round == q.copyResumeDstExistenceAnchorRound
+	return q.passNumber == q.copyResumeDstExistenceAnchorPass && q.round == q.copyResumeDstExistenceAnchorRound
 }
 
 // noteCopyResumeDstExistenceLeavingAnchorRound clears resume dst precheck after the anchor round finishes
@@ -112,7 +112,7 @@ func (q *Queue) noteCopyResumeDstExistenceLeavingAnchorRound() {
 	if !q.copyResumeDstExistenceActive {
 		return
 	}
-	if q.copyPass == q.copyResumeDstExistenceAnchorPass && q.round == q.copyResumeDstExistenceAnchorRound {
+	if q.passNumber == q.copyResumeDstExistenceAnchorPass && q.round == q.copyResumeDstExistenceAnchorRound {
 		q.copyResumeDstExistenceActive = false
 	}
 }
@@ -186,7 +186,7 @@ func (q *Queue) getMaxRetries() int {
 	return q.maxRetries
 }
 
-func (q *Queue) effectiveLeaseBatch() int {
+func (q *Queue) EffectiveLeaseBatchSize() int {
 	q.mu.RLock()
 	n := q.leaseBatchSize
 	q.mu.RUnlock()
@@ -199,7 +199,7 @@ func (q *Queue) effectiveLeaseBatch() int {
 	return n
 }
 
-func (q *Queue) effectiveRefillBatch() int {
+func (q *Queue) EffectiveRefillBatchSize() int {
 	q.mu.RLock()
 	n := q.refillBatchSize
 	q.mu.RUnlock()
@@ -209,19 +209,9 @@ func (q *Queue) effectiveRefillBatch() int {
 	return n
 }
 
-// EffectiveLeaseBatchSize returns the capped lease batch size used for pulls and pending buffer sizing.
-func (q *Queue) EffectiveLeaseBatchSize() int {
-	return q.effectiveLeaseBatch()
-}
-
-// EffectiveRefillBatchSize returns the batch size used for traversal DB refills (keyset pagination).
-func (q *Queue) EffectiveRefillBatchSize() int {
-	return q.effectiveRefillBatch()
-}
-
 // getPullLowWM returns the low watermark for pulling more work: 25% of lease batch size, minimum 1.
 func (q *Queue) getPullLowWM() int {
-	bs := q.effectiveLeaseBatch()
+	bs := q.EffectiveLeaseBatchSize()
 	wm := bs / 4
 	if wm < 1 {
 		wm = 1
@@ -277,7 +267,7 @@ func (q *Queue) resetThisQueueKeysetCursor() {
 		q.srcKeysetCursor = ""
 	case "dst":
 		q.dstKeysetCursor = ""
-	case "copy":
+	case "copy", "delete":
 		q.copyKeysetCursor = ""
 	}
 }
@@ -286,6 +276,23 @@ func (q *Queue) GetFilesDiscoveredTotal() int64 {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.filesDiscoveredTotal
+}
+
+// SeedDiscoveryCounters restores traversal discovery totals from persisted queue metrics.
+func (q *Queue) SeedDiscoveryCounters(files, folders int64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.filesDiscoveredTotal = files
+	q.foldersDiscoveredTotal = folders
+}
+
+// SeedCopyCounters restores copy-phase totals from persisted queue metrics.
+func (q *Queue) SeedCopyCounters(folders, files, bytes int64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.foldersCreatedTotal = folders
+	q.filesCreatedTotal = files
+	q.bytesTransferredTotal = bytes
 }
 
 func (q *Queue) GetFoldersDiscoveredTotal() int64 {
@@ -407,7 +414,7 @@ func (q *Queue) SetRound(round int) {
 		q.srcKeysetCursor = ""
 	case "dst":
 		q.dstKeysetCursor = ""
-	case "copy":
+	case "copy", "delete":
 		q.copyKeysetCursor = ""
 	}
 }
@@ -423,7 +430,7 @@ func (q *Queue) SetMode(mode QueueMode) {
 		q.srcKeysetCursor = ""
 	case "dst":
 		q.dstKeysetCursor = ""
-	case "copy":
+	case "copy", "delete":
 		q.copyKeysetCursor = ""
 	}
 }
@@ -688,6 +695,28 @@ func (q *Queue) setExpectedFromStatsBucket(round int) {
 		expected, err = database.GetCopyCountAtDepth(round, nodeType, db.CopyStatusFailed, false)
 		if err != nil {
 			fmt.Println("error getting copy count at depth", err)
+			return
+		}
+	case QueueModeDelete:
+		deletePass := q.GetCopyPass()
+		nodeType := db.NodeTypeFile
+		if deletePass == 2 {
+			nodeType = db.NodeTypeFolder
+		}
+		expected, err = database.GetDeleteCountAtDepth(round, nodeType, db.DeleteStatusPending, false)
+		if err != nil {
+			fmt.Println("error getting delete count at depth", err)
+			return
+		}
+	case QueueModeDeleteRetry:
+		deletePass := q.GetCopyPass()
+		nodeType := db.NodeTypeFile
+		if deletePass == 2 {
+			nodeType = db.NodeTypeFolder
+		}
+		expected, err = database.GetDeleteCountAtDepth(round, nodeType, db.DeleteStatusFailed, false)
+		if err != nil {
+			fmt.Println("error getting delete count at depth", err)
 			return
 		}
 	default:

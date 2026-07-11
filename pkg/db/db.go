@@ -48,13 +48,8 @@ func Open(opts Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Encrypted DBs ATTACH into an in-memory catalog; additional pooled connections
-	// would not repeat ATTACH/USE, so unqualified table names break (e.g. users vs sylos_main.users).
-	if len(opts.EncryptionKey) > 0 && path != ":memory:" {
-		conn.SetMaxOpenConns(1)
-	} else {
-		conn.SetMaxOpenConns(2)
-	}
+	// Two conns so the phase can hold one (persistent appenders) while SealLevelDepth0 or other RunWrite callers can use the other.
+	conn.SetMaxOpenConns(2)
 	// Limit DuckDB memory and threads to avoid OOM during stress testing
 	if _, err := conn.Exec("PRAGMA memory_limit='4GB'"); err != nil {
 		err := conn.Close()
@@ -95,6 +90,10 @@ func Open(opts Options) (*DB, error) {
 		return nil, err
 	}
 	if err := migrateOAuthCredentialsTable(conn); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := migrateQueueStatsAppendOnly(conn); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
@@ -219,6 +218,37 @@ func migrateOAuthCredentialsTable(conn *sql.DB) error {
 		return fmt.Errorf("oauth_credentials migration create table: %w", err)
 	}
 	return nil
+}
+
+// migrateQueueStatsAppendOnly replaces the legacy single-row queue_stats table with the append-only schema.
+func migrateQueueStatsAppendOnly(conn *sql.DB) error {
+	ctx := context.Background()
+	var tableExists int64
+	if err := conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'queue_stats'",
+	).Scan(&tableExists); err != nil {
+		return fmt.Errorf("queue_stats table migration check: %w", err)
+	}
+	if tableExists == 0 {
+		_, err := conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS queue_stats_key_phase_time_idx ON queue_stats (queue_key, phase, event_time)`)
+		return err
+	}
+	var phaseExists int64
+	if err := conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'queue_stats' AND column_name = 'phase'",
+	).Scan(&phaseExists); err != nil {
+		return fmt.Errorf("queue_stats phase migration check: %w", err)
+	}
+	if phaseExists == 0 {
+		if _, err := conn.ExecContext(ctx, "DROP TABLE queue_stats"); err != nil {
+			return fmt.Errorf("queue_stats drop legacy table: %w", err)
+		}
+		if _, err := conn.ExecContext(ctx, queueStatsTableDDL()); err != nil {
+			return fmt.Errorf("queue_stats recreate append-only table: %w", err)
+		}
+	}
+	_, err := conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS queue_stats_key_phase_time_idx ON queue_stats (queue_key, phase, event_time)`)
+	return err
 }
 
 // migratePathHashColumns adds path_hash and parent_path_hash to existing node tables, backfills them, and swaps indexes.

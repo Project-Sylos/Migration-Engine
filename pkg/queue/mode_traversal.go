@@ -52,7 +52,7 @@ func (q *Queue) PullTraversalTasks(force bool) PullResult {
 		}
 	}
 
-	batchSize := q.effectiveRefillBatch()
+	batchSize := q.EffectiveRefillBatchSize()
 	requestLimit := batchSize + 1
 	var count int
 	if q.name == "dst" {
@@ -344,7 +344,7 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 				EventTime:           eventTime,
 				Depth:               nextRound,
 				PrevTraversalStatus: prevTrav,
-				PrevCopyStatus:      meta.CopyStatus, // old copy status before this comparison update
+				PrevCopyStatus:      meta.CopyStatus,
 			}, false)
 		}
 	}

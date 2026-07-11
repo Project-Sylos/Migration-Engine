@@ -47,6 +47,7 @@ type DiffItem struct {
 	SrcTraversalStatus string
 	DstTraversalStatus string
 	CopyStatus         string
+	DeleteStatus       string
 	Excluded           bool
 	MissingOnSource    bool
 	MissingOnDest      bool
@@ -96,6 +97,7 @@ type SearchRequest struct {
 	StatusSearchType string                      `json:"statusSearchType,omitempty"` // traversal, copy, both
 	TraversalStatus  string                      `json:"traversalStatus,omitempty"`
 	CopyStatus       string                      `json:"copyStatus,omitempty"`
+	DeleteStatus     string                      `json:"deleteStatus,omitempty"`
 }
 
 type SearchResult struct {
@@ -122,6 +124,9 @@ const (
 	DeltaCopyPending          = "copyPending"
 	DeltaCopyFailed           = "copyFailed"
 	DeltaCopySuccessful       = "copySuccessful"
+	DeltaDeletePending        = "deletePending"
+	DeltaDeleteFailed         = "deleteFailed"
+	DeltaDeleteDeleted        = "deleteDeleted"
 	DeltaExcluded             = "excluded"
 	DeltaFolders              = "folders"
 	DeltaFiles                = "files"
@@ -136,6 +141,34 @@ func addReviewDelta(deltas map[string]int64, key string, delta int64) {
 	}
 }
 
+// deleteStatusReviewDeltaKey maps delete_status to the migration-layer review delta key.
+// Statuses without a tracked review counter (e.g. skipped) return "".
+func deleteStatusReviewDeltaKey(status string) string {
+	switch status {
+	case db.DeleteStatusPending:
+		return DeltaDeletePending
+	case db.DeleteStatusFailed:
+		return DeltaDeleteFailed
+	case db.DeleteStatusDeleted:
+		return DeltaDeleteDeleted
+	default:
+		return ""
+	}
+}
+
+// addReviewDeltaForDeleteStatus applies a signed delta for one delete_status bucket.
+func addReviewDeltaForDeleteStatus(deltas map[string]int64, status string, delta int64) {
+	if key := deleteStatusReviewDeltaKey(status); key != "" {
+		addReviewDelta(deltas, key, delta)
+	}
+}
+
+// addReviewDeltaForDeleteStatusTransition updates review counters when delete_status changes.
+func addReviewDeltaForDeleteStatusTransition(deltas map[string]int64, from, to string) {
+	addReviewDeltaForDeleteStatus(deltas, from, -1)
+	addReviewDeltaForDeleteStatus(deltas, to, 1)
+}
+
 // PathReviewActionResult is the result of a path review mutation. Deltas holds per-status/category changes (only non-zero keys). UI applies them to the matching counter; phase determines which counters are shown.
 type PathReviewActionResult struct {
 	AffectedCount int64
@@ -148,6 +181,7 @@ type PathReviewStats struct {
 	FailedCount        int
 	ExcludedCount      int
 	PendingRetriesCount int
+	SuccessfulCount    int
 	FoldersCount       int
 	FilesCount         int
 	FoldersRatio       float64
@@ -166,6 +200,9 @@ func ReviewStatsRawFromSnapshot(s db.ReviewStatsSnapshot) ReviewStatsRaw {
 		TraversalFailed:      s.TraversalFailed,
 		CopyPending:          s.CopyPending,
 		CopyFailed:           s.CopyFailed,
+		CopySuccessful:       s.CopySuccessful,
+		DeletePending:        s.DeletePending,
+		DeleteFailed:         s.DeleteFailed,
 		Excluded:             s.Excluded,
 		Folders:              s.Folders,
 		Files:                s.Files,
@@ -182,6 +219,9 @@ type ReviewStatsRaw struct {
 	TraversalFailed      int64
 	CopyPending          int64
 	CopyFailed           int64
+	CopySuccessful       int64
+	DeletePending        int64
+	DeleteFailed         int64
 	Excluded             int64
 	Folders              int64
 	Files                int64
@@ -202,6 +242,10 @@ func (r ReviewStatsRaw) ToPathReviewStats(phase string) PathReviewStats {
 		pendingCount = 0
 		failedCount = r.CopyFailed
 		pendingRetriesCount = r.CopyPending // copy phase: no separate retry counter
+	case PhaseDeleting, PhaseDeleteSuspended, PhaseDeleteReview:
+		pendingCount = r.DeletePending
+		failedCount = r.DeleteFailed
+		pendingRetriesCount = r.DeleteFailed
 	default:
 		pendingCount = r.CopyPending
 		failedCount = r.TraversalFailed
@@ -218,6 +262,7 @@ func (r ReviewStatsRaw) ToPathReviewStats(phase string) PathReviewStats {
 		FailedCount:         int(failedCount),
 		ExcludedCount:       int(r.Excluded),
 		PendingRetriesCount: int(pendingRetriesCount),
+		SuccessfulCount:     int(r.CopySuccessful),
 		FoldersCount:        int(r.Folders),
 		FilesCount:          int(r.Files),
 		FoldersRatio:        foldersRatio,

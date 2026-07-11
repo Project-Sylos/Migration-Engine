@@ -15,7 +15,7 @@
 //   // Stats are published to /STATS/queue-stats bucket with keys like "src-traversal", "dst-traversal"
 //
 // Stats can be retrieved from DuckDB using:
-//   statsJSON, err := database.GetQueueStats("src-traversal")
+//   statsJSON, err := database.GetLatestQueueStats("src-traversal", db.QueueStatsPhaseTraversal)
 //   allStats, err := database.GetAllQueueStats()
 //
 // For low-latency APIs while a run is active, use LastQueueMetricsForAPI(): same JSON as written to
@@ -60,7 +60,8 @@ type ExternalQueueMetrics struct {
 
 	// Current state (for API)
 	QueueStats
-	Round int `json:"round"`
+	Round         int  `json:"round"`
+	PossibleStall bool `json:"possible_stall"`
 }
 
 // InternalQueueMetrics contains control system metrics stored in memory for autoscaling decisions.
@@ -118,12 +119,29 @@ type QueueObserver struct {
 	// lastAPIMetrics: marshaled ExternalQueueMetrics per queue_stats key (e.g. src-traversal), for O(1) API reads.
 	lastAPIMetricsMu sync.RWMutex
 	lastAPIMetrics   map[string][]byte
+	// lastDBPersist tracks when metrics were last appended to DuckDB.
+	lastDBPersistMu sync.Mutex
+	lastDBPersist   time.Time
 }
 
 const (
 	// emaAlpha is the smoothing factor for exponential moving average (0.2 = ~5 second window)
 	emaAlpha = 0.2
+	// dbPersistInterval is how often metrics are appended to DuckDB (in-memory cache updates every tick).
+	dbPersistInterval = 1 * time.Second
 )
+
+// PhaseFamilyForMode maps internal queue modes to persisted queue_stats phase families.
+func PhaseFamilyForMode(mode QueueMode) string {
+	switch mode {
+	case QueueModeCopy, QueueModeCopyRetry:
+		return db.QueueStatsPhaseCopy
+	case QueueModeDelete, QueueModeDeleteRetry:
+		return db.QueueStatsPhaseDelete
+	default:
+		return db.QueueStatsPhaseTraversal
+	}
+}
 
 // NewQueueObserver creates a new observer that will publish stats to DuckDB.
 // updateInterval is how often stats are written to DuckDB (default: 200ms).
@@ -206,10 +224,38 @@ func (o *QueueObserver) Start() {
 // This should only be called once. Calling it multiple times is safe but has no effect.
 func (o *QueueObserver) Stop() {
 	o.mu.Lock()
+	if !o.running {
+		o.mu.Unlock()
+		return
+	}
+
+	// Flush final metrics before tearing down queue references.
+	queues := make(map[string]*Queue, len(o.queues))
+	for name, queue := range o.queues {
+		queues[name] = queue
+	}
+	o.mu.Unlock()
+
+	if len(queues) > 0 {
+		metrics := make(map[string]ExternalQueueMetrics, len(queues))
+		for queueName, queue := range queues {
+			if metric := o.pollQueue(queueName, queue); metric != nil {
+				metrics[queueName] = *metric
+			}
+		}
+		if len(metrics) > 0 {
+			o.storeLastAPIMetrics(metrics)
+			if o.database != nil {
+				o.publishMetricsToDuckDB(metrics, queues)
+			}
+		}
+	}
+
+	o.mu.Lock()
 	defer o.mu.Unlock()
 
 	if !o.running {
-		return // Already stopped
+		return // Already stopped by concurrent Stop
 	}
 
 	o.running = false
@@ -297,8 +343,8 @@ func (o *QueueObserver) observeLoop() {
 
 			if len(metrics) > 0 {
 				o.storeLastAPIMetrics(metrics)
-				if o.database != nil {
-					o.publishMetricsToDuckDB(metrics)
+				if o.database != nil && o.shouldPersistToDB() {
+					o.publishMetricsToDuckDB(metrics, queues)
 				}
 			}
 		}
@@ -306,10 +352,12 @@ func (o *QueueObserver) observeLoop() {
 }
 
 func queueStatsKeyForAPI(queueName string) string {
-	if queueName == "copy" {
+	switch queueName {
+	case "copy", "delete":
 		return queueName
+	default:
+		return queueName + "-traversal"
 	}
-	return queueName + "-traversal"
 }
 
 func (o *QueueObserver) storeLastAPIMetrics(metrics map[string]ExternalQueueMetrics) {
@@ -372,9 +420,13 @@ func (o *QueueObserver) pollQueue(queueName string, queue *Queue) *ExternalQueue
 	filesCreatedTotal := queue.GetFilesCreatedTotal()
 
 	// Get total pending and failed counts from stats bucket (O(1) lookup)
-	// The stats bucket is maintained by the output buffer during flush operations
-	totalPending := o.getTotalPendingCount(queueName)
-	totalFailed := o.getTotalFailedCount(queueName)
+	var totalPending, totalFailed int
+	if queueName == "delete" {
+		totalPending, totalFailed = o.getDeleteStatusTotals()
+	} else {
+		totalPending = o.getTotalStatusCount(queueName, db.StatusPending, db.CopyStatusPending)
+		totalFailed = o.getTotalStatusCount(queueName, db.StatusFailed, db.CopyStatusFailed)
+	}
 
 	// Update internal metrics (state tracking)
 	o.updateInternalMetrics(queueName, queue, currentState, now)
@@ -407,9 +459,25 @@ func (o *QueueObserver) pollQueue(queueName string, queue *Queue) *ExternalQueue
 		BytesPerSecond:           bytesPerSecond,
 		QueueStats:               stats,
 		Round:                    stats.Round,
+		PossibleStall:            queue.PossibleStall(),
 	}
 
 	return &metric
+}
+
+// AnyPossibleStall reports whether any registered queue recently triggered the watchdog.
+func (o *QueueObserver) AnyPossibleStall() bool {
+	if o == nil {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, queue := range o.queues {
+		if queue != nil && queue.PossibleStall() {
+			return true
+		}
+	}
+	return false
 }
 
 // calculateDiscoveryRate calculates EMA-smoothed discovery rate (items/sec).
@@ -722,118 +790,78 @@ func (o *QueueObserver) updateRateLimitMetrics(queueName string, now time.Time) 
 	}
 }
 
-// getTotalPendingCount reads total pending count from stats bucket (O(1) lookup).
-// The stats bucket is maintained by the output buffer during flush operations.
-func (o *QueueObserver) getTotalPendingCount(queueName string) int {
+// getDeleteStatusTotals returns pending and failed delete counts across all depths.
+func (o *QueueObserver) getDeleteStatusTotals() (pending, failed int) {
+	if o.database == nil {
+		return 0, 0
+	}
+	levels, err := db.GetAllLevels(o.database, "SRC")
+	if err != nil {
+		return 0, 0
+	}
+	for _, level := range levels {
+		for _, nt := range []string{db.NodeTypeFolder, db.NodeTypeFile} {
+			if c, err := o.database.GetDeleteCountAtDepth(level, nt, db.DeleteStatusPending, false); err == nil {
+				pending += int(c)
+			}
+			if c, err := o.database.GetDeleteCountAtDepth(level, nt, db.DeleteStatusFailed, false); err == nil {
+				failed += int(c)
+			}
+		}
+	}
+	return pending, failed
+}
+
+// getTotalStatusCount reads total traversal or copy status count from stats buckets.
+func (o *QueueObserver) getTotalStatusCount(queueName, traversalStatus, copyStatus string) int {
 	if o.database == nil {
 		return 0
 	}
 
-	// Handle copy phase separately
 	if queueName == "copy" {
-		// For copy phase, sum pending counts across all levels and both node types
 		levels, err := db.GetAllLevels(o.database, "SRC")
 		if err != nil {
 			return 0
 		}
 
-		totalPending := 0
+		total := 0
 		for _, level := range levels {
-			count, err := o.database.GetCopyCountAtDepth(level, db.NodeTypeFolder, db.CopyStatusPending, false)
+			count, err := o.database.GetCopyCountAtDepth(level, db.NodeTypeFolder, copyStatus, false)
 			if err == nil {
-				totalPending += int(count)
+				total += int(count)
 			}
-			count, err = o.database.GetCopyCountAtDepth(level, db.NodeTypeFile, db.CopyStatusPending, false)
+			count, err = o.database.GetCopyCountAtDepth(level, db.NodeTypeFile, copyStatus, false)
 			if err == nil {
-				totalPending += int(count)
+				total += int(count)
 			}
 		}
 
-		return totalPending
+		return total
 	}
 
-	// Traversal phase: use traversal status buckets
 	queueType := getQueueType(queueName)
 	if queueType == "" {
 		return 0
 	}
 
-	// Get all levels for this queue type
 	levels, err := db.GetAllLevels(o.database, queueType)
 	if err != nil {
 		return 0
 	}
 
-	// Sum pending counts across all levels using stats table
-	totalPending := 0
+	total := 0
 	for _, level := range levels {
-		count, err := o.database.GetStatsCountAtDepth(queueType, level, db.StatsKeyTraversalStatus(db.StatusPending))
+		count, err := o.database.GetStatsCountAtDepth(queueType, level, db.StatsKey(db.StatsKindTraversal, traversalStatus))
 		if err == nil {
-			totalPending += int(count)
+			total += int(count)
 		}
 	}
 
-	return totalPending
+	return total
 }
 
-// getTotalFailedCount reads total failed count from stats bucket (O(1) lookup).
-// The stats bucket is maintained by the output buffer during flush operations.
-func (o *QueueObserver) getTotalFailedCount(queueName string) int {
-	if o.database == nil {
-		return 0
-	}
-
-	// Handle copy phase separately
-	if queueName == "copy" {
-		// For copy phase, sum failed counts across all levels and both node types
-		levels, err := db.GetAllLevels(o.database, "SRC")
-		if err != nil {
-			return 0
-		}
-
-		totalFailed := 0
-		for _, level := range levels {
-			count, err := o.database.GetCopyCountAtDepth(level, db.NodeTypeFolder, db.CopyStatusFailed, false)
-			if err == nil {
-				totalFailed += int(count)
-			}
-			count, err = o.database.GetCopyCountAtDepth(level, db.NodeTypeFile, db.CopyStatusFailed, false)
-			if err == nil {
-				totalFailed += int(count)
-			}
-		}
-
-		return totalFailed
-	}
-
-	// Traversal phase: use traversal status buckets
-	queueType := getQueueType(queueName)
-	if queueType == "" {
-		return 0
-	}
-
-	// Get all levels for this queue type
-	levels, err := db.GetAllLevels(o.database, queueType)
-	if err != nil {
-		return 0
-	}
-
-	// Sum failed counts across all levels using stats table
-	totalFailed := 0
-	for _, level := range levels {
-		count, err := o.database.GetStatsCountAtDepth(queueType, level, db.StatsKeyTraversalStatus(db.StatusFailed))
-		if err == nil {
-			totalFailed += int(count)
-		}
-	}
-
-	return totalFailed
-}
-
-// publishMetricsToDuckDB writes external queue metrics to DuckDB in the queue-stats bucket.
-// Only external metrics are published - internal metrics remain in memory for autoscaling decisions.
-// Each queue's metrics are stored under a key like "src-traversal", "dst-traversal", etc.
-func (o *QueueObserver) publishMetricsToDuckDB(metricsMap map[string]ExternalQueueMetrics) {
+// publishMetricsToDuckDB appends external queue metrics to DuckDB and prunes older rows.
+func (o *QueueObserver) publishMetricsToDuckDB(metricsMap map[string]ExternalQueueMetrics, queues map[string]*Queue) {
 	if o.database == nil {
 		return
 	}
@@ -842,6 +870,10 @@ func (o *QueueObserver) publishMetricsToDuckDB(metricsMap map[string]ExternalQue
 		return s.WithTx(func(w *db.Writer) error {
 			for queueName, metrics := range metricsMap {
 				key := queueStatsKeyForAPI(queueName)
+				phase := db.QueueStatsPhaseTraversal
+				if q := queues[queueName]; q != nil {
+					phase = PhaseFamilyForMode(q.GetMode())
+				}
 				metricsJSON, err := json.Marshal(metrics)
 				if err != nil {
 					if logservice.LS != nil {
@@ -854,13 +886,20 @@ func (o *QueueObserver) publishMetricsToDuckDB(metricsMap map[string]ExternalQue
 					}
 					continue
 				}
-				if err := w.WriteQueueStats(key, string(metricsJSON)); err != nil {
-					return fmt.Errorf("failed to write metrics for %s: %w", key, err)
+				if err := w.AppendQueueStats(key, phase, string(metricsJSON)); err != nil {
+					return fmt.Errorf("failed to append metrics for %s: %w", key, err)
 				}
+			}
+			if err := w.PruneQueueStats(); err != nil {
+				return fmt.Errorf("failed to prune queue_stats: %w", err)
 			}
 			return nil
 		})
 	})
+
+	o.lastDBPersistMu.Lock()
+	o.lastDBPersist = time.Now()
+	o.lastDBPersistMu.Unlock()
 
 	if err != nil {
 		if logservice.LS != nil {
@@ -872,4 +911,13 @@ func (o *QueueObserver) publishMetricsToDuckDB(metricsMap map[string]ExternalQue
 			}
 		}
 	}
+}
+
+func (o *QueueObserver) shouldPersistToDB() bool {
+	o.lastDBPersistMu.Lock()
+	defer o.lastDBPersistMu.Unlock()
+	if o.lastDBPersist.IsZero() {
+		return true
+	}
+	return time.Since(o.lastDBPersist) >= dbPersistInterval
 }

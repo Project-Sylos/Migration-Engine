@@ -125,13 +125,16 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, srcWC, coordinator, qsz)
 	srcQueue.SetMode(queue.QueueModeRetry)
 	srcQueue.SetMaxKnownDepth(maxKnownDepth)
-	srcQueue.InitializeWithContext(duckDB, cfg.SrcAdapter, cfg.ShutdownContext)
+	seedQueueCountersFromDB(duckDB, srcQueue, "src-traversal", db.QueueStatsPhaseTraversal)
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, dstWC, coordinator, qsz)
 	dstQueue.SetMode(queue.QueueModeRetry)
 	if cfg.MaxKnownDepth >= 0 {
 		dstQueue.SetMaxKnownDepth(cfg.MaxKnownDepth)
 	}
+	seedQueueCountersFromDB(duckDB, dstQueue, "dst-traversal", db.QueueStatsPhaseTraversal)
+
+	srcQueue.InitializeWithContext(duckDB, cfg.SrcAdapter, cfg.ShutdownContext)
 	dstQueue.InitializeWithContext(duckDB, cfg.DstAdapter, cfg.ShutdownContext)
 
 	srcListProfile := scaling.ResolveEffectiveProfile(
@@ -292,11 +295,12 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 			mcfg := MigrationConfig{
 				ProgressTick:         cfg.ProgressTick,
 				ObserverPollInterval: cfg.ObserverPollInterval,
+				ShutdownContext:      cfg.ShutdownContext,
 			}
 			if mcfg.ObserverPollInterval <= 0 {
 				mcfg.ObserverPollInterval = obsPoll
 			}
-			waitCtx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+			waitCtx, cancel := softSuspendWaitContext(cfg.ShutdownContext)
 			stats, suspend, err := performTraversalSoftSuspend(waitCtx, duckDB, srcQueue, dstQueue, observer, coordinator, mcfg, start, srcWC, mr)
 			cancel()
 			if err != nil {

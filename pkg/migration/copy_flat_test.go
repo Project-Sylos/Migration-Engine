@@ -125,6 +125,10 @@ func (m *memCopyAdapter) RegisterCredentials(credsData []byte, masterKey []byte,
 }
 func (m *memCopyAdapter) HasValidCredentials() bool { return true }
 
+func (m *memCopyAdapter) DeleteNode(ctx context.Context, nodeID string, nodeType string) error {
+	return nil
+}
+
 type memWriteCloser struct {
 	m    *memCopyAdapter
 	id   string

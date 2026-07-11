@@ -87,7 +87,7 @@ func InspectMigrationStatus(database *db.DB) (MigrationStatus, error) {
 	breakdown, err := database.GetStatsBreakdown("SRC")
 	if err == nil {
 		for _, row := range breakdown {
-			if row.Key == db.StatsKeyTraversalStatus(db.StatusPending) && row.Count > 0 {
+			if row.Key == db.StatsKey(db.StatsKindTraversal,db.StatusPending) && row.Count > 0 {
 				if status.MinPendingDepthSrc == nil || row.Depth < *status.MinPendingDepthSrc {
 					d := row.Depth
 					status.MinPendingDepthSrc = &d
@@ -98,7 +98,7 @@ func InspectMigrationStatus(database *db.DB) (MigrationStatus, error) {
 	breakdown, err = database.GetStatsBreakdown("DST")
 	if err == nil {
 		for _, row := range breakdown {
-			if row.Key == db.StatsKeyTraversalStatus(db.StatusPending) && row.Count > 0 {
+			if row.Key == db.StatsKey(db.StatsKindTraversal,db.StatusPending) && row.Count > 0 {
 				if status.MinPendingDepthDst == nil || row.Depth < *status.MinPendingDepthDst {
 					d := row.Depth
 					status.MinPendingDepthDst = &d

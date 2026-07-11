@@ -147,7 +147,7 @@ func (q *Queue) PullCopyTasks(force bool) PullResult {
 		nodeType = db.NodeTypeFile
 	}
 
-	batchSize := q.effectiveLeaseBatch()
+	batchSize := q.EffectiveLeaseBatchSize()
 	copyStatusFilter := db.CopyStatusPending
 	if q.GetMode() == QueueModeCopyRetry {
 		copyStatusFilter = db.CopyStatusFailed
@@ -272,6 +272,7 @@ func nodeStateToCopyTask(state *db.NodeState, taskType string, copyPass int) *Ta
 		LeaseTime:          time.Now(),
 		DstParentID:        "",
 		CopyStatus:         state.CopyStatus,
+		DeleteStatus:       state.DeleteStatus,
 		SrcTraversalStatus: state.TraversalStatus,
 	}
 

@@ -44,6 +44,8 @@ func (q *Queue) pullTasksOnce(force bool) PullResult {
 		return q.PullRetryTasks(force)
 	case QueueModeCopy, QueueModeCopyRetry:
 		return q.PullCopyTasks(force)
+	case QueueModeDelete, QueueModeDeleteRetry:
+		return q.PullDeleteTasks(force)
 	default:
 		return q.PullTraversalTasks(force)
 	}

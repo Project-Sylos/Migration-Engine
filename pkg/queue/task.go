@@ -17,6 +17,8 @@ const (
 	TaskTypeCopy         = "copy"
 	TaskTypeCopyFolder   = "copy-folder" // Copy phase: create folder
 	TaskTypeCopyFile     = "copy-file"   // Copy phase: copy file with streaming
+	TaskTypeDeleteFolder = "delete-folder"
+	TaskTypeDeleteFile   = "delete-file"
 )
 
 // SrcNodeMeta holds Depth and CopyStatus for an SRC node; used by DST tasks at completion to avoid per-child DB lookups.
@@ -24,6 +26,7 @@ type SrcNodeMeta struct {
 	Depth      int
 	TraversalStatus string
 	CopyStatus string
+	DeleteStatus string
 }
 
 // RetryDstChild holds DST child node meta for retry DST cleanup; populated at pull to avoid per-child DB lookups.
@@ -63,6 +66,7 @@ type TaskBase struct {
 	Round               int                // The round this task belongs to (for buffer coordination)
 	LeaseTime           time.Time          // Time when task was leased (for execution time tracking)
 	CopyStatus          string             // Current SRC copy status from DB (used to preserve copy_status on traversal completion events)
+	DeleteStatus        string             // Current SRC delete status from DB (delete phase)
 	// Copy phase specific fields
 	CopyPass           int    // Copy pass number (1 for folders, 2 for files)
 	SrcTraversalStatus string // SRC node traversal_status at pull time (preserved when writing copy_status events)
@@ -101,9 +105,9 @@ func (t *TaskBase) LocationPath() string {
 // traversal/retry still use Folder.ServiceID when Type is not copy-folder/copy-file.
 func (t *TaskBase) IsFolder() bool {
 	switch t.Type {
-	case TaskTypeCopyFolder:
+	case TaskTypeCopyFolder, TaskTypeDeleteFolder:
 		return true
-	case TaskTypeCopyFile:
+	case TaskTypeCopyFile, TaskTypeDeleteFile:
 		return false
 	}
 	return t.Folder.ServiceID != ""
@@ -112,9 +116,9 @@ func (t *TaskBase) IsFolder() bool {
 // IsFile returns whether this task represents a file operation.
 func (t *TaskBase) IsFile() bool {
 	switch t.Type {
-	case TaskTypeCopyFile:
+	case TaskTypeCopyFile, TaskTypeDeleteFile:
 		return true
-	case TaskTypeCopyFolder:
+	case TaskTypeCopyFolder, TaskTypeDeleteFolder:
 		return false
 	}
 	return t.File.ServiceID != ""

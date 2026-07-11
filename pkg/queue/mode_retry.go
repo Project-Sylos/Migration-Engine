@@ -66,7 +66,7 @@ func (q *Queue) PullRetryTasks(force bool) PullResult {
 	// If current round <= maxKnownDepth, scan all known levels with pending status (keyset + status filter)
 	if maxKnownDepth >= 0 && currentRound <= maxKnownDepth {
 		queueType := getQueueType(q.name)
-		batchSize := q.effectiveLeaseBatch()
+		batchSize := q.EffectiveLeaseBatchSize()
 		requestLimit := batchSize + 1
 		var batch []db.FetchResult
 		var expectedFoldersMap map[string][]types.Folder

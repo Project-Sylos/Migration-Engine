@@ -244,11 +244,11 @@ func (w *CopyWorker) createFolder(task *TaskBase, ctx context.Context, wd *Progr
 	}
 
 	if w.queue.shouldApplyCopyDstResumeExistenceCheck() {
-		done, err := w.applyResumeCopyDstFolderPrecheck(task, ctx, wd)
+		skipCopy, err := w.applyResumeCopyDstFolderPrecheck(task, ctx, wd)
 		if err != nil {
 			return err
 		}
-		if done {
+		if skipCopy {
 			return nil
 		}
 	}
@@ -292,14 +292,12 @@ func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressW
 		return fmt.Errorf("task missing DstParentID (ServiceID) for file %s", file.LocationPath)
 	}
 
-	if w.queue.shouldApplyCopyDstResumeExistenceCheck() {
-		skipCopy, err := w.applyResumeCopyDstFilePrecheck(task, ctx, wd)
-		if err != nil {
-			return err
-		}
-		if skipCopy {
-			return nil
-		}
+	skipCopy, updateTarget, err := w.applyCopyDstFilePrecheck(task, ctx, wd)
+	if err != nil {
+		return err
+	}
+	if skipCopy {
+		return nil
 	}
 
 	srcReader, err := w.srcAdapter.OpenRead(ctx, file.ServiceID)
@@ -317,23 +315,27 @@ func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressW
 		fileName = file.DisplayName
 	}
 	srcLocationPath := file.LocationPath
-	createMeta := map[string]string{"location_path": srcLocationPath}
-	createdFile, err := w.dstAdapter.CreateFile(ctx, dstParentServiceID, fileName, file.Size, createMeta)
-	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("create file cancelled by watchdog for %s: %w", file.LocationPath, err)
+	var destFile types.File
+	if updateTarget != nil {
+		destFile = *updateTarget
+	} else {
+		createMeta := map[string]string{"location_path": srcLocationPath}
+		destFile, err = w.dstAdapter.CreateFile(ctx, dstParentServiceID, fileName, file.Size, createMeta)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return fmt.Errorf("create file cancelled by watchdog for %s: %w", file.LocationPath, err)
+			}
+			return fmt.Errorf("failed to create destination file %s in parent %s: %w", fileName, dstParentServiceID, err)
 		}
-		return fmt.Errorf("failed to create destination file %s in parent %s: %w", fileName, dstParentServiceID, err)
 	}
-	// All of these beats are making me wanna jam. 
 	wd.Beat()
 
-	dstWriter, err := w.dstAdapter.OpenWrite(ctx, createdFile.ServiceID)
+	dstWriter, err := w.dstAdapter.OpenWrite(ctx, destFile.ServiceID)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return fmt.Errorf("open write cancelled by watchdog for %s: %w", file.LocationPath, err)
 		}
-		return fmt.Errorf("failed to open destination file %s for writing: %w", createdFile.ServiceID, err)
+		return fmt.Errorf("failed to open destination file %s for writing: %w", destFile.ServiceID, err)
 	}
 	wd.Beat()
 
@@ -374,13 +376,16 @@ func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressW
 
 	if committed, ok := dstWriter.(interface{ CommittedServiceID() string }); ok {
 		if id := committed.CommittedServiceID(); id != "" {
-			createdFile.ServiceID = id
+			destFile.ServiceID = id
 		}
 	}
 
 	task.BytesTransferred = bytesTransferred
-	createdFile.LocationPath = srcLocationPath
-	task.File = createdFile
+	destFile.LocationPath = srcLocationPath
+	destFile.LastUpdated = file.LastUpdated
+	destFile.Size = file.Size
+	destFile.DisplayName = file.DisplayName
+	task.File = destFile
 	return nil
 }
 
@@ -410,32 +415,34 @@ func (w *CopyWorker) applyResumeCopyDstFolderPrecheck(task *TaskBase, ctx contex
 	return false, nil
 }
 
-// applyResumeCopyDstFilePrecheck lists the dst parent and skips copy when the file exists and is up to date
-// (same mtime rule as traversal dst comparison). Used only when shouldApplyCopyDstResumeExistenceCheck() is true.
-func (w *CopyWorker) applyResumeCopyDstFilePrecheck(task *TaskBase, ctx context.Context, wd *ProgressWatchdog) (skipCopy bool, err error) {
+// applyCopyDstFilePrecheck lists the dst parent and either skips copy when the file is up to date,
+// or returns the existing dst file to update in place when src is newer.
+func (w *CopyWorker) applyCopyDstFilePrecheck(task *TaskBase, ctx context.Context, wd *ProgressWatchdog) (skipCopy bool, updateTarget *types.File, err error) {
 	file := task.File
 	dstParentServiceID := task.DstParentID
 	parentPath, parentDepth, err := copyTaskParentListArgs(task)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	aggregated, err := w.listDstChildrenAggregated(dstParentServiceID, parentPath, parentDepth, ctx, wd)
 	if err != nil {
-		return false, fmt.Errorf("list destination children before file copy for %s: %w", file.LocationPath, err)
+		return false, nil, fmt.Errorf("list destination children before file copy for %s: %w", file.LocationPath, err)
 	}
 	folderMap, fileMap := copyTaskChildMaps(aggregated, task.Round)
 	matchKey := file.Type + ":" + file.DisplayName
 	if _, ok := folderMap[types.NodeTypeFolder+":"+file.DisplayName]; ok {
-		return false, fmt.Errorf("destination has folder %q but task expects file at %s", file.DisplayName, file.LocationPath)
+		return false, nil, fmt.Errorf("destination has folder %q but task expects file at %s", file.DisplayName, file.LocationPath)
 	}
 	if existing, ok := fileMap[matchKey]; ok {
 		if compareTimestamps(file.LastUpdated, existing.LastUpdated) == "Successful" {
 			task.File = existing
 			wd.Beat()
-			return true, nil
+			return true, nil, nil
 		}
+		ex := existing
+		return false, &ex, nil
 	}
-	return false, nil
+	return false, nil, nil
 }
 
 // copyTaskParentListArgs returns parent path and depth for ListChildren on the destination parent,

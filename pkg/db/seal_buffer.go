@@ -195,6 +195,9 @@ func buildCanonicalReviewStatsDeltas(jobs []SealJob) []ReviewStatsDelta {
 						copySt = CopyStatusPending
 					}
 					addCanonicalReviewDelta(deltas, reviewKeyForStatus("copy", copySt), 1)
+					if delSt := e.DeleteStatus; delSt != "" {
+						addCanonicalReviewDelta(deltas, reviewKeyForStatus("delete", delSt), 1)
+					}
 				}
 			}
 			continue
@@ -210,6 +213,10 @@ func buildCanonicalReviewStatsDeltas(jobs []SealJob) []ReviewStatsDelta {
 			if j.Table == "SRC" && e.PrevCopyStatus != e.CopyStatus {
 				addCanonicalReviewDelta(deltas, reviewKeyForStatus("copy", e.PrevCopyStatus), -1)
 				addCanonicalReviewDelta(deltas, reviewKeyForStatus("copy", e.CopyStatus), 1)
+			}
+			if j.Table == "SRC" && e.PrevDeleteStatus != e.DeleteStatus {
+				addCanonicalReviewDelta(deltas, reviewKeyForStatus("delete", e.PrevDeleteStatus), -1)
+				addCanonicalReviewDelta(deltas, reviewKeyForStatus("delete", e.DeleteStatus), 1)
 			}
 			if j.FromRetry && e.PrevTraversalStatus == StatusPending &&
 				(e.TraversalStatus == StatusSuccessful || e.TraversalStatus == StatusFailed) {

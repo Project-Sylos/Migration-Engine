@@ -6,17 +6,22 @@ package db
 import (
 	"context"
 	"database/sql"
-	"fmt"
 )
 
-// StatsKeyTraversalStatus returns the src_stats/dst_stats key for traversal status. Valid statuses: pending, successful, failed, not_on_src (DST only).
-func StatsKeyTraversalStatus(status string) string {
-	return fmt.Sprintf("traversal/%s", status)
-}
+// StatsKind identifies the per-depth stats key family in src_stats/dst_stats.
+type StatsKind string
 
-// StatsKeyCopyStatus returns the src_stats key for copy status (src_nodes only). Valid statuses: pending, successful, failed.
-func StatsKeyCopyStatus(status string) string {
-	return fmt.Sprintf("copy/%s", status)
+const (
+	StatsKindTraversal StatsKind = "traversal"
+	StatsKindCopy      StatsKind = "copy"
+	StatsKindDelete    StatsKind = "delete"
+)
+
+// StatsKey returns the src_stats/dst_stats key for the given kind and status.
+// Traversal valid statuses: pending, successful, failed, not_on_src (DST only).
+// Copy valid statuses: pending, successful, failed (src only).
+func StatsKey(kind StatsKind, status string) string {
+	return string(kind) + "/" + status
 }
 
 // StatsKeyExpected is the stats key for expected count at a depth (set at round start).
@@ -34,6 +39,9 @@ const (
 	ReviewKeyCopyPending           = "copy/pending"
 	ReviewKeyCopySuccessful        = "copy/successful"
 	ReviewKeyCopyFailed            = "copy/failed"
+	ReviewKeyDeletePending         = "delete/pending"
+	ReviewKeyDeleteDeleted         = "delete/deleted"
+	ReviewKeyDeleteFailed          = "delete/failed"
 	ReviewKeyExcluded              = "excluded"
 	ReviewKeyFolders               = "folders"
 	ReviewKeyFiles                 = "files"
@@ -49,6 +57,9 @@ var canonicalReviewKeys = []string{
 	ReviewKeyCopyPending,
 	ReviewKeyCopySuccessful,
 	ReviewKeyCopyFailed,
+	ReviewKeyDeletePending,
+	ReviewKeyDeleteDeleted,
+	ReviewKeyDeleteFailed,
 	ReviewKeyExcluded,
 	ReviewKeyFolders,
 	ReviewKeyFiles,
@@ -57,6 +68,18 @@ var canonicalReviewKeys = []string{
 }
 
 func reviewKeyForStatus(phase, status string) string {
+	if phase == "delete" {
+		switch status {
+		case DeleteStatusPending:
+			return ReviewKeyDeletePending
+		case DeleteStatusDeleted:
+			return ReviewKeyDeleteDeleted
+		case DeleteStatusFailed:
+			return ReviewKeyDeleteFailed
+		default:
+			return ""
+		}
+	}
 	if phase == "copy" {
 		switch status {
 		case CopyStatusPending:
@@ -90,6 +113,9 @@ type ReviewStatsSnapshot struct {
 	CopyPending           int64
 	CopySuccessful        int64
 	CopyFailed            int64
+	DeletePending         int64
+	DeleteDeleted         int64
+	DeleteFailed          int64
 	Excluded              int64
 	Folders               int64
 	Files                 int64
@@ -128,6 +154,12 @@ func (db *DB) GetReviewStatsSnapshot() (ReviewStatsSnapshot, error) {
 				out.CopySuccessful = v
 			case ReviewKeyCopyFailed:
 				out.CopyFailed = v
+			case ReviewKeyDeletePending:
+				out.DeletePending = v
+			case ReviewKeyDeleteDeleted:
+				out.DeleteDeleted = v
+			case ReviewKeyDeleteFailed:
+				out.DeleteFailed = v
 			case ReviewKeyExcluded:
 				out.Excluded = v
 			case ReviewKeyFolders:
@@ -158,6 +190,10 @@ func (db *DB) GetPathReviewStatsFromDB() (ReviewStatsSnapshot, error) {
 	if err != nil {
 		return ReviewStatsSnapshot{}, err
 	}
+	deleteCounts, err := db.GetDeleteStatusCountsFromEvents()
+	if err != nil {
+		return ReviewStatsSnapshot{}, err
+	}
 	merged, err := GetMergedReviewStats(db, ReviewFilter{})
 	if err != nil {
 		return ReviewStatsSnapshot{}, err
@@ -170,6 +206,9 @@ func (db *DB) GetPathReviewStatsFromDB() (ReviewStatsSnapshot, error) {
 		CopyPending:           copyCounts.Pending,
 		CopySuccessful:        copyCounts.Successful,
 		CopyFailed:            copyCounts.Failed,
+		DeletePending:         deleteCounts.Pending,
+		DeleteDeleted:         deleteCounts.Deleted,
+		DeleteFailed:          deleteCounts.Failed,
 		Excluded:              int64(merged.Excluded),
 		Folders:               int64(merged.Folders),
 		Files:                 int64(merged.Files),
@@ -293,6 +332,51 @@ SELECT COALESCE(e.copy_status,'') AS status, count(*)::BIGINT FROM ` + tableSrcN
 			out.Excluded += n
 		default:
 			out.Pending += n
+		}
+	}
+	return out, rows.Err()
+}
+
+// DeleteStatusCounts holds delete status counts for SRC (from src_status_events).
+type DeleteStatusCounts struct {
+	Pending int64
+	Deleted int64
+	Failed  int64
+}
+
+// GetDeleteStatusCountsFromEvents returns counts of SRC nodes by current delete_status from src_status_events.
+func (db *DB) GetDeleteStatusCountsFromEvents() (DeleteStatusCounts, error) {
+	var out DeleteStatusCounts
+	conn, err := db.GetDB()
+	if err != nil {
+		return out, err
+	}
+	ctx := context.Background()
+	q := `WITH latest AS (
+SELECT id, arg_max(delete_status, event_time) AS delete_status
+FROM ` + tableSrcStatusEvents + `
+WHERE COALESCE(delete_status, '') <> ''
+GROUP BY id
+)
+SELECT COALESCE(e.delete_status,'') AS status, count(*)::BIGINT FROM ` + tableSrcNodes + ` n LEFT JOIN latest e ON n.id = e.id GROUP BY 1`
+	rows, err := conn.QueryContext(ctx, q)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var n int64
+		if err := rows.Scan(&status, &n); err != nil {
+			return out, err
+		}
+		switch status {
+		case DeleteStatusPending:
+			out.Pending += n
+		case DeleteStatusDeleted:
+			out.Deleted += n
+		case DeleteStatusFailed:
+			out.Failed += n
 		}
 	}
 	return out, rows.Err()
@@ -427,6 +511,48 @@ func (db *DB) GetCopyCountAtDepth(depth int, nodeType string, copyStatus string,
 	}
 }
 
+// GetDeleteCountAtDepth returns the count of nodes in src_nodes at the given depth with current delete_status (event-derived).
+func (db *DB) GetDeleteCountAtDepth(depth int, nodeType string, deleteStatus string, breakAtFirst bool) (int64, error) {
+	conn, err := db.GetDB()
+	if err != nil {
+		return 0, err
+	}
+	ctx := context.Background()
+	var q string
+	args := []any{depth, deleteStatus}
+	if breakAtFirst {
+		q = `SELECT 1 FROM src_nodes n LEFT JOIN ` + cteSrcCurrentStatus + ` e ON n.id = e.id WHERE n.depth = $1 AND COALESCE(e.delete_status,'') = $2 AND COALESCE(e.copy_status,'') = 'successful' AND COALESCE(e.copy_status,'') NOT IN ('excluded_explicit','excluded_inherited')`
+		if nodeType != "" {
+			q += ` AND n.type = $3`
+			args = append(args, nodeType)
+		}
+		q += ` LIMIT 1`
+		var dummy int
+		err = conn.QueryRowContext(ctx, q, args...).Scan(&dummy)
+		if err == sql.ErrNoRows {
+			return 0, nil
+		}
+		if err != nil {
+			return 0, err
+		}
+		return 1, nil
+	}
+	q = `SELECT COUNT(*)::BIGINT FROM src_nodes n LEFT JOIN ` + cteSrcCurrentStatus + ` e ON n.id = e.id WHERE n.depth = $1 AND COALESCE(e.delete_status,'') = $2 AND COALESCE(e.copy_status,'') = 'successful' AND COALESCE(e.copy_status,'') NOT IN ('excluded_explicit','excluded_inherited')`
+	if nodeType != "" {
+		q += ` AND n.type = $3`
+		args = append(args, nodeType)
+	}
+	var n sql.NullInt64
+	err = conn.QueryRowContext(ctx, q, args...).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	if n.Valid {
+		return n.Int64, nil
+	}
+	return 0, nil
+}
+
 // GetMaxDepth returns the maximum depth present in the nodes table for the given table ("SRC" or "DST"). Used as stop condition for retry sweep.
 func (db *DB) GetMaxDepth(table string) (int, error) {
 	tbl := tableSrcNodes
@@ -486,21 +612,35 @@ func (db *DB) GetStatsBreakdown(table string) ([]StatsRow, error) {
 		if count == 0 {
 			continue
 		}
-		key := StatsKeyTraversalStatus(status)
+		key := StatsKey(StatsKindTraversal, status)
 		out = append(out, StatsRow{Depth: depth, Key: key, Count: count})
 	}
 	return out, rows.Err()
 }
 
-// GetQueueStats returns the metrics JSON for the queue key from queue_stats table.
-func (db *DB) GetQueueStats(queueKey string) ([]byte, error) {
+const (
+	// QueueStatsPhaseTraversal is the phase family for traversal and retry queue modes.
+	QueueStatsPhaseTraversal = "traversal"
+	// QueueStatsPhaseCopy is the phase family for copy and copy-retry queue modes.
+	QueueStatsPhaseCopy = "copy"
+	// QueueStatsPhaseDelete is the phase family for delete and delete-retry queue modes.
+	QueueStatsPhaseDelete = "delete"
+)
+
+// GetLatestQueueStats returns the most recent metrics JSON for queue_key and phase.
+func (db *DB) GetLatestQueueStats(queueKey, phase string) ([]byte, error) {
 	conn, err := db.GetDB()
 	if err != nil {
 		return nil, err
 	}
 	ctx := context.Background()
 	var js sql.NullString
-	err = conn.QueryRowContext(ctx, "SELECT metrics_json FROM queue_stats WHERE queue_key = $1", queueKey).Scan(&js)
+	err = conn.QueryRowContext(ctx,
+		`SELECT arg_max(metrics_json, event_time)
+		 FROM queue_stats
+		 WHERE queue_key = $1 AND phase = $2`,
+		queueKey, phase,
+	).Scan(&js)
 	if err == sql.ErrNoRows || !js.Valid {
 		return nil, nil
 	}
@@ -510,28 +650,53 @@ func (db *DB) GetQueueStats(queueKey string) ([]byte, error) {
 	return []byte(js.String), nil
 }
 
-// GetAllQueueStats returns all queue stats from queue_stats table.
+// GetAllQueueStats returns the latest metrics JSON per API queue key (src-traversal, dst-traversal, copy, delete).
 func (db *DB) GetAllQueueStats() (map[string][]byte, error) {
 	conn, err := db.GetDB()
 	if err != nil {
 		return nil, err
 	}
 	ctx := context.Background()
-	rows, err := conn.QueryContext(ctx, "SELECT queue_key, metrics_json FROM queue_stats")
+	rows, err := conn.QueryContext(ctx,
+		`SELECT queue_key, phase, arg_max(metrics_json, event_time) AS metrics_json
+		 FROM queue_stats
+		 GROUP BY queue_key, phase`,
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	allStats := make(map[string][]byte)
 	for rows.Next() {
-		var key string
+		var key, phase string
 		var js sql.NullString
-		if err := rows.Scan(&key, &js); err != nil {
+		if err := rows.Scan(&key, &phase, &js); err != nil {
 			return nil, err
 		}
-		if js.Valid {
-			allStats[key] = []byte(js.String)
+		if !js.Valid {
+			continue
 		}
+		apiKey := key
+		switch phase {
+		case QueueStatsPhaseTraversal:
+			if key == "copy" || key == "delete" {
+				continue
+			}
+		case QueueStatsPhaseCopy:
+			if key != "copy" {
+				continue
+			}
+			apiKey = "copy"
+		case QueueStatsPhaseDelete:
+			if key == "delete" || key == "delete-traversal" {
+				apiKey = "delete"
+			} else {
+				continue
+			}
+		default:
+			continue
+		}
+		allStats[apiKey] = []byte(js.String)
 	}
 	return allStats, rows.Err()
 }

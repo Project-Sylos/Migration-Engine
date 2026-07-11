@@ -28,12 +28,19 @@ const (
 		FROM src_status_events
 		WHERE COALESCE(copy_status, '') <> ''
 		GROUP BY id
+	), src_delete AS (
+		SELECT id, arg_max(delete_status, event_time) AS delete_status
+		FROM src_status_events
+		WHERE COALESCE(delete_status, '') <> ''
+		GROUP BY id
 	)
-	SELECT COALESCE(t.id, c.id) AS id,
+	SELECT COALESCE(t.id, c.id, d.id) AS id,
 		COALESCE(t.traversal_status, '') AS traversal_status,
-		COALESCE(c.copy_status, '') AS copy_status
+		COALESCE(c.copy_status, '') AS copy_status,
+		COALESCE(d.delete_status, '') AS delete_status
 	FROM src_traversal t
-	FULL OUTER JOIN src_copy c ON t.id = c.id)`
+	FULL OUTER JOIN src_copy c ON t.id = c.id
+	FULL OUTER JOIN src_delete d ON COALESCE(t.id, c.id) = d.id)`
 	cteDstCurrentStatus = `(SELECT id, arg_max(traversal_status, event_time) AS traversal_status FROM dst_status_events GROUP BY id)`
 )
 
@@ -49,18 +56,18 @@ func selectNodeColsWithStatus(table string) string {
 	t := tableName(table)
 	n, e, cte := statusJoinExpr(table)
 	if table == "DST" {
-		return `SELECT ` + n + `.id, ` + n + `.service_id, ` + n + `.parent_id, ` + n + `.parent_service_id, ` + n + `.path, ` + n + `.parent_path, ` + n + `.type, ` + n + `.size, ` + n + `.mtime, ` + n + `.depth, COALESCE(` + e + `.traversal_status,'') AS traversal_status, '' AS copy_status, 0 AS excluded, '' AS errors FROM ` + t + ` ` + n + ` LEFT JOIN ` + cte + ` ` + e + ` ON ` + n + `.id = ` + e + `.id`
+		return `SELECT ` + n + `.id, ` + n + `.service_id, ` + n + `.parent_id, ` + n + `.parent_service_id, ` + n + `.path, ` + n + `.parent_path, ` + n + `.type, ` + n + `.size, ` + n + `.mtime, ` + n + `.depth, COALESCE(` + e + `.traversal_status,'') AS traversal_status, '' AS copy_status, '' AS delete_status, 0 AS excluded, '' AS errors FROM ` + t + ` ` + n + ` LEFT JOIN ` + cte + ` ` + e + ` ON ` + n + `.id = ` + e + `.id`
 	}
-	return `SELECT ` + n + `.id, ` + n + `.service_id, ` + n + `.parent_id, ` + n + `.parent_service_id, ` + n + `.path, ` + n + `.parent_path, ` + n + `.type, ` + n + `.size, ` + n + `.mtime, ` + n + `.depth, COALESCE(` + e + `.traversal_status,'') AS traversal_status, COALESCE(` + e + `.copy_status,'') AS copy_status, (COALESCE(` + e + `.copy_status,'') IN ('excluded_explicit','excluded_inherited')) AS excluded, '' AS errors FROM ` + t + ` ` + n + ` LEFT JOIN ` + cte + ` ` + e + ` ON ` + n + `.id = ` + e + `.id`
+	return `SELECT ` + n + `.id, ` + n + `.service_id, ` + n + `.parent_id, ` + n + `.parent_service_id, ` + n + `.path, ` + n + `.parent_path, ` + n + `.type, ` + n + `.size, ` + n + `.mtime, ` + n + `.depth, COALESCE(` + e + `.traversal_status,'') AS traversal_status, COALESCE(` + e + `.copy_status,'') AS copy_status, COALESCE(` + e + `.delete_status,'') AS delete_status, (COALESCE(` + e + `.copy_status,'') IN ('excluded_explicit','excluded_inherited')) AS excluded, '' AS errors FROM ` + t + ` ` + n + ` LEFT JOIN ` + cte + ` ` + e + ` ON ` + n + `.id = ` + e + `.id`
 }
 
 // selectNodeColsRaw returns node columns without joining status events (traversal/copy columns are empty defaults).
 func selectNodeColsRaw(table string) string {
 	t := tableName(table)
 	if table == "DST" {
-		return `SELECT n.id, n.service_id, n.parent_id, n.parent_service_id, n.path, n.parent_path, n.type, n.size, n.mtime, n.depth, '' AS traversal_status, '' AS copy_status, 0 AS excluded, '' AS errors FROM ` + t + ` n`
+		return `SELECT n.id, n.service_id, n.parent_id, n.parent_service_id, n.path, n.parent_path, n.type, n.size, n.mtime, n.depth, '' AS traversal_status, '' AS copy_status, '' AS delete_status, 0 AS excluded, '' AS errors FROM ` + t + ` n`
 	}
-	return `SELECT n.id, n.service_id, n.parent_id, n.parent_service_id, n.path, n.parent_path, n.type, n.size, n.mtime, n.depth, '' AS traversal_status, '' AS copy_status, 0 AS excluded, '' AS errors FROM ` + t + ` n`
+	return `SELECT n.id, n.service_id, n.parent_id, n.parent_service_id, n.path, n.parent_path, n.type, n.size, n.mtime, n.depth, '' AS traversal_status, '' AS copy_status, '' AS delete_status, 0 AS excluded, '' AS errors FROM ` + t + ` n`
 }
 
 // pullKeysetWindowSize is how many node rows we scan per round-trip when filtering pulls by event-derived status.
@@ -119,7 +126,7 @@ func QueryNodesForReview(d *DB, table string, depth *int, status string, exclude
 	var size sql.NullInt64
 	for rows.Next() {
 		var n NodeState
-		if err := rows.Scan(&n.ID, &n.ServiceID, &n.ParentID, &n.ParentServiceID, &n.Path, &n.ParentPath, &n.Type, &size, &n.MTime, &n.Depth, &n.TraversalStatus, &n.CopyStatus, &n.Excluded, &n.Errors); err != nil {
+		if err := rows.Scan(&n.ID, &n.ServiceID, &n.ParentID, &n.ParentServiceID, &n.Path, &n.ParentPath, &n.Type, &size, &n.MTime, &n.Depth, &n.TraversalStatus, &n.CopyStatus, &n.DeleteStatus, &n.Excluded, &n.Errors); err != nil {
 			return nil, err
 		}
 		if size.Valid {
@@ -147,6 +154,7 @@ SELECT
 	COALESCE(se.traversal_status, '') AS src_traversal_status,
 	COALESCE(de.traversal_status, '') AS dst_traversal_status,
 	COALESCE(se.copy_status, '') AS copy_status,
+	COALESCE(se.delete_status, '') AS delete_status,
 	(COALESCE(se.copy_status,'') IN ('excluded_explicit','excluded_inherited')) AS excluded,
 	COALESCE(s.size, d.size, 0) AS size,
 	COALESCE(s.size, 0) AS src_size,
@@ -181,9 +189,10 @@ all_hashes AS (
 	SELECT path_hash FROM folder_dst_children
 ),
 src_cur AS (
-	SELECT COALESCE(t.id, c.id) AS id,
+	SELECT COALESCE(t.id, c.id, d.id) AS id,
 		COALESCE(t.traversal_status, '') AS traversal_status,
-		COALESCE(c.copy_status, '') AS copy_status
+		COALESCE(c.copy_status, '') AS copy_status,
+		COALESCE(d.delete_status, '') AS delete_status
 	FROM (
 		SELECT se.id, arg_max(se.traversal_status, se.event_time) AS traversal_status
 		FROM src_status_events se
@@ -197,6 +206,13 @@ src_cur AS (
 		WHERE COALESCE(se.copy_status, '') <> ''
 		GROUP BY se.id
 	) c ON t.id = c.id
+	FULL OUTER JOIN (
+		SELECT se.id, arg_max(se.delete_status, se.event_time) AS delete_status
+		FROM src_status_events se
+		INNER JOIN folder_src fs ON se.id = fs.id
+		WHERE COALESCE(se.delete_status, '') <> ''
+		GROUP BY se.id
+	) d ON COALESCE(t.id, c.id) = d.id
 ),
 dst_cur AS (
 	SELECT se.id, arg_max(se.traversal_status, se.event_time) AS traversal_status
@@ -219,6 +235,7 @@ SELECT
 	COALESCE(se.traversal_status, '') AS src_traversal_status,
 	COALESCE(de.traversal_status, '') AS dst_traversal_status,
 	COALESCE(se.copy_status, '') AS copy_status,
+	COALESCE(se.delete_status, '') AS delete_status,
 	(COALESCE(se.copy_status,'') IN ('excluded_explicit','excluded_inherited')) AS excluded,
 	COALESCE(s.size, d.size, 0) AS size,
 	COALESCE(s.size, 0) AS src_size,
@@ -256,6 +273,7 @@ type MergedReviewRow struct {
 	SrcTraversalStatus string
 	DstTraversalStatus string
 	CopyStatus         string
+	DeleteStatus       string
 	Excluded           bool
 	Size               int64
 }
@@ -276,6 +294,7 @@ type ReviewFilter struct {
 	StatusSearchType string
 	TraversalStatus  string
 	CopyStatus       string
+	DeleteStatus     string
 
 	TypeFilter string
 
@@ -290,6 +309,9 @@ func reviewFilterUsesStructuredStatus(f ReviewFilter) bool {
 		return true
 	}
 	if strings.TrimSpace(f.TraversalStatus) != "" || strings.TrimSpace(f.CopyStatus) != "" {
+		return true
+	}
+	if strings.TrimSpace(f.DeleteStatus) != "" {
 		return true
 	}
 	return false
@@ -327,6 +349,21 @@ func appendCopyStatusClause(parts []string, args []any, param int, value string)
 	return parts, args, param
 }
 
+func appendDeleteStatusClause(parts []string, args []any, param int, value string) ([]string, []any, int) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return parts, args, param
+	}
+	if strings.EqualFold(v, "excluded") || strings.EqualFold(v, "skipped") {
+		parts = append(parts, `LOWER(delete_status) = 'skipped'`)
+		return parts, args, param
+	}
+	parts = append(parts, `LOWER(delete_status) = LOWER($`+strconv.Itoa(param)+`)`)
+	args = append(args, v)
+	param++
+	return parts, args, param
+}
+
 // buildMergedReviewWhere returns a WHERE clause and args for the merged CTE. Param placeholders are $1, $2, ...
 func buildMergedReviewWhere(f ReviewFilter) (clause string, args []any) {
 	var parts []string
@@ -359,9 +396,11 @@ func buildMergedReviewWhere(f ReviewFilter) (clause string, args []any) {
 		st := strings.ToLower(strings.TrimSpace(f.StatusSearchType))
 		trav := strings.TrimSpace(f.TraversalStatus)
 		copySt := strings.TrimSpace(f.CopyStatus)
+		delSt := strings.TrimSpace(f.DeleteStatus)
 
 		needTrav := trav != "" && (st == "traversal" || st == "both")
 		needCopy := copySt != "" && (st == "copy" || st == "both")
+		needDelete := delSt != "" && (st == "delete" || st == "both")
 
 		if st == "" {
 			if trav != "" {
@@ -370,12 +409,18 @@ func buildMergedReviewWhere(f ReviewFilter) (clause string, args []any) {
 			if copySt != "" {
 				parts, args, param = appendCopyStatusClause(parts, args, param, copySt)
 			}
+			if delSt != "" {
+				parts, args, param = appendDeleteStatusClause(parts, args, param, delSt)
+			}
 		} else {
 			if needTrav {
 				parts, args, param = appendTraversalStatusClause(parts, args, param, trav)
 			}
 			if needCopy {
 				parts, args, param = appendCopyStatusClause(parts, args, param, copySt)
+			}
+			if needDelete {
+				parts, args, param = appendDeleteStatusClause(parts, args, param, delSt)
 			}
 		}
 	}
@@ -455,7 +500,7 @@ func ListMergedReviewDiffs(d *DB, f ReviewFilter, orderBy string, limit, offset 
 	if err := conn.QueryRowContext(ctx, countQ, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	sel := base + ` SELECT path, name, depth, type, src_node_id, dst_node_id, src_traversal_status, dst_traversal_status, copy_status, excluded, size FROM merged` + where +
+	sel := base + ` SELECT path, name, depth, type, src_node_id, dst_node_id, src_traversal_status, dst_traversal_status, copy_status, delete_status, excluded, size FROM merged` + where +
 		` ORDER BY ` + orderBy + ` LIMIT $` + strconv.Itoa(len(args)+1) + ` OFFSET $` + strconv.Itoa(len(args)+2)
 	listArgs := append(append([]any{}, args...), limit, offset)
 	rows, err := conn.QueryContext(ctx, sel, listArgs...)
@@ -466,7 +511,7 @@ func ListMergedReviewDiffs(d *DB, f ReviewFilter, orderBy string, limit, offset 
 	var out []MergedReviewRow
 	for rows.Next() {
 		var r MergedReviewRow
-		if err := rows.Scan(&r.Path, &r.Name, &r.Depth, &r.Type, &r.SrcNodeID, &r.DstNodeID, &r.SrcTraversalStatus, &r.DstTraversalStatus, &r.CopyStatus, &r.Excluded, &r.Size); err != nil {
+		if err := rows.Scan(&r.Path, &r.Name, &r.Depth, &r.Type, &r.SrcNodeID, &r.DstNodeID, &r.SrcTraversalStatus, &r.DstTraversalStatus, &r.CopyStatus, &r.DeleteStatus, &r.Excluded, &r.Size); err != nil {
 			return nil, 0, err
 		}
 		out = append(out, r)
@@ -553,7 +598,7 @@ func GetNodeByID(d *DB, table, id string) (*NodeState, error) {
 	var n NodeState
 	var size sql.NullInt64
 	q := selectNodeColsWithStatus(table) + ` WHERE n.id = $1`
-	err = conn.QueryRowContext(ctx, q, id).Scan(&n.ID, &n.ServiceID, &n.ParentID, &n.ParentServiceID, &n.Path, &n.ParentPath, &n.Type, &size, &n.MTime, &n.Depth, &n.TraversalStatus, &n.CopyStatus, &n.Excluded, &n.Errors)
+	err = conn.QueryRowContext(ctx, q, id).Scan(&n.ID, &n.ServiceID, &n.ParentID, &n.ParentServiceID, &n.Path, &n.ParentPath, &n.Type, &size, &n.MTime, &n.Depth, &n.TraversalStatus, &n.CopyStatus, &n.DeleteStatus, &n.Excluded, &n.Errors)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -581,7 +626,7 @@ func GetNodeByPath(d *DB, table, path string) (*NodeState, error) {
 	var n NodeState
 	var size sql.NullInt64
 	q := selectNodeColsWithStatus(table) + ` WHERE n.path_hash = $1`
-	err = conn.QueryRowContext(ctx, q, PathHash(path)).Scan(&n.ID, &n.ServiceID, &n.ParentID, &n.ParentServiceID, &n.Path, &n.ParentPath, &n.Type, &size, &n.MTime, &n.Depth, &n.TraversalStatus, &n.CopyStatus, &n.Excluded, &n.Errors)
+	err = conn.QueryRowContext(ctx, q, PathHash(path)).Scan(&n.ID, &n.ServiceID, &n.ParentID, &n.ParentServiceID, &n.Path, &n.ParentPath, &n.Type, &size, &n.MTime, &n.Depth, &n.TraversalStatus, &n.CopyStatus, &n.DeleteStatus, &n.Excluded, &n.Errors)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -625,7 +670,7 @@ func GetChildrenByParentPath(d *DB, table, parentPath string, limit int) ([]*Nod
 	for rows.Next() {
 		var n NodeState
 		var size sql.NullInt64
-		if err := rows.Scan(&n.ID, &n.ServiceID, &n.ParentID, &n.ParentServiceID, &n.Path, &n.ParentPath, &n.Type, &size, &n.MTime, &n.Depth, &n.TraversalStatus, &n.CopyStatus, &n.Excluded, &n.Errors); err != nil {
+		if err := rows.Scan(&n.ID, &n.ServiceID, &n.ParentID, &n.ParentServiceID, &n.Path, &n.ParentPath, &n.Type, &size, &n.MTime, &n.Depth, &n.TraversalStatus, &n.CopyStatus, &n.DeleteStatus, &n.Excluded, &n.Errors); err != nil {
 			return nil, err
 		}
 		if size.Valid {
@@ -655,7 +700,7 @@ func GetChildrenByParentID(d *DB, table, parentID string, limit int) ([]*NodeSta
 	for rows.Next() {
 		var n NodeState
 		var size sql.NullInt64
-		if err := rows.Scan(&n.ID, &n.ServiceID, &n.ParentID, &n.ParentServiceID, &n.Path, &n.ParentPath, &n.Type, &size, &n.MTime, &n.Depth, &n.TraversalStatus, &n.CopyStatus, &n.Excluded, &n.Errors); err != nil {
+		if err := rows.Scan(&n.ID, &n.ServiceID, &n.ParentID, &n.ParentServiceID, &n.Path, &n.ParentPath, &n.Type, &size, &n.MTime, &n.Depth, &n.TraversalStatus, &n.CopyStatus, &n.DeleteStatus, &n.Excluded, &n.Errors); err != nil {
 			return nil, err
 		}
 		if size.Valid {
@@ -732,6 +777,7 @@ trav AS (
 SELECT c.id, c.service_id, c.parent_id, c.parent_service_id, c.path, c.parent_path, c.type, c.size, c.mtime, c.depth,
 	COALESCE(trav.traversal_status,'') AS traversal_status,
 	'' AS copy_status,
+	'' AS delete_status,
 	0 AS excluded,
 	'' AS errors
 FROM cand c
@@ -757,15 +803,24 @@ cpy AS (
 	INNER JOIN cand c ON c.id = se.id
 	WHERE COALESCE(se.copy_status, '') <> ''
 	GROUP BY se.id
+),
+del AS (
+	SELECT se.id, arg_max(se.delete_status, se.event_time) AS delete_status
+	FROM src_status_events se
+	INNER JOIN cand c ON c.id = se.id
+	WHERE COALESCE(se.delete_status, '') <> ''
+	GROUP BY se.id
 )
 SELECT c.id, c.service_id, c.parent_id, c.parent_service_id, c.path, c.parent_path, c.type, c.size, c.mtime, c.depth,
 	COALESCE(trav.traversal_status,'') AS traversal_status,
 	COALESCE(cpy.copy_status,'') AS copy_status,
+	COALESCE(del.delete_status,'') AS delete_status,
 	(COALESCE(cpy.copy_status,'') IN ('excluded_explicit','excluded_inherited')) AS excluded,
 	'' AS errors
 FROM cand c
 LEFT JOIN trav ON trav.id = c.id
 LEFT JOIN cpy ON cpy.id = c.id
+LEFT JOIN del ON del.id = c.id
 ORDER BY c.id`
 	}
 	rows, err := conn.QueryContext(ctx, q, args...)
@@ -781,7 +836,7 @@ func scanFetchResults(rows *sql.Rows) ([]FetchResult, error) {
 	for rows.Next() {
 		var node NodeState
 		var size sql.NullInt64
-		if err := rows.Scan(&node.ID, &node.ServiceID, &node.ParentID, &node.ParentServiceID, &node.Path, &node.ParentPath, &node.Type, &size, &node.MTime, &node.Depth, &node.TraversalStatus, &node.CopyStatus, &node.Excluded, &node.Errors); err != nil {
+		if err := rows.Scan(&node.ID, &node.ServiceID, &node.ParentID, &node.ParentServiceID, &node.Path, &node.ParentPath, &node.Type, &size, &node.MTime, &node.Depth, &node.TraversalStatus, &node.CopyStatus, &node.DeleteStatus, &node.Excluded, &node.Errors); err != nil {
 			return nil, err
 		}
 		if size.Valid {
@@ -874,16 +929,25 @@ cpy AS (
 	INNER JOIN cand c ON c.id = se.id
 	WHERE COALESCE(se.copy_status, '') <> ''
 	GROUP BY se.id
+),
+del AS (
+	SELECT se.id, arg_max(se.delete_status, se.event_time) AS delete_status
+	FROM src_status_events se
+	INNER JOIN cand c ON c.id = se.id
+	WHERE COALESCE(se.delete_status, '') <> ''
+	GROUP BY se.id
 )
 SELECT c.id, c.service_id, c.parent_id, c.parent_service_id, c.path, c.parent_path, c.type, c.size, c.mtime, c.depth,
 	COALESCE(trav.traversal_status,'') AS traversal_status,
 	COALESCE(cpy.copy_status,'') AS copy_status,
+	COALESCE(del.delete_status,'') AS delete_status,
 	(COALESCE(cpy.copy_status,'') IN ('excluded_explicit','excluded_inherited')) AS excluded,
 	'' AS errors,
 	COALESCE(dst_parent.service_id,'') AS dst_parent_service_id
 FROM cand c
 LEFT JOIN trav ON trav.id = c.id
 LEFT JOIN cpy ON cpy.id = c.id
+LEFT JOIN del ON del.id = c.id
 LEFT JOIN ` + tableDstNodes + ` dst_parent ON dst_parent.path_hash = c.parent_path_hash
 ORDER BY c.id`
 	rows, err := conn.QueryContext(ctx, q, args...)
@@ -896,7 +960,7 @@ ORDER BY c.id`
 		var node NodeState
 		var size sql.NullInt64
 		var dstParentServiceID string
-		if err := rows.Scan(&node.ID, &node.ServiceID, &node.ParentID, &node.ParentServiceID, &node.Path, &node.ParentPath, &node.Type, &size, &node.MTime, &node.Depth, &node.TraversalStatus, &node.CopyStatus, &node.Excluded, &node.Errors, &dstParentServiceID); err != nil {
+		if err := rows.Scan(&node.ID, &node.ServiceID, &node.ParentID, &node.ParentServiceID, &node.Path, &node.ParentPath, &node.Type, &size, &node.MTime, &node.Depth, &node.TraversalStatus, &node.CopyStatus, &node.DeleteStatus, &node.Excluded, &node.Errors, &dstParentServiceID); err != nil {
 			return nil, err
 		}
 		if size.Valid {
@@ -941,6 +1005,157 @@ func ListNodesCopyKeyset(d *DB, depth int, nodeType, afterID string, limit int, 
 		}
 	}
 	return out, nil
+}
+
+// queryDeleteKeysetWindow is like queryCopyKeysetWindow but without dst parent join.
+func queryDeleteKeysetWindow(ctx context.Context, conn *sql.DB, depth int, nodeType, afterID string, window int) ([]FetchResult, error) {
+	candWhere := `WHERE n.depth = $1`
+	args := []any{depth}
+	param := 2
+	if nodeType != "" {
+		candWhere += ` AND n.type = $` + strconv.Itoa(param)
+		args = append(args, nodeType)
+		param++
+	}
+	if afterID != "" {
+		candWhere += ` AND n.id > $` + strconv.Itoa(param)
+		args = append(args, afterID)
+		param++
+	}
+	limitParam := `$` + strconv.Itoa(param)
+	args = append(args, window)
+
+	q := `WITH cand AS (
+	SELECT id, service_id, parent_id, parent_service_id, path, parent_path, parent_path_hash, type, size, mtime, depth
+	FROM ` + tableSrcNodes + ` n
+	` + candWhere + `
+	ORDER BY n.id
+	LIMIT ` + limitParam + `
+),
+trav AS (
+	SELECT se.id, arg_max(se.traversal_status, se.event_time) AS traversal_status
+	FROM src_status_events se
+	INNER JOIN cand c ON c.id = se.id
+	GROUP BY se.id
+),
+cpy AS (
+	SELECT se.id, arg_max(se.copy_status, se.event_time) AS copy_status
+	FROM src_status_events se
+	INNER JOIN cand c ON c.id = se.id
+	WHERE COALESCE(se.copy_status, '') <> ''
+	GROUP BY se.id
+),
+del AS (
+	SELECT se.id, arg_max(se.delete_status, se.event_time) AS delete_status
+	FROM src_status_events se
+	INNER JOIN cand c ON c.id = se.id
+	WHERE COALESCE(se.delete_status, '') <> ''
+	GROUP BY se.id
+)
+SELECT c.id, c.service_id, c.parent_id, c.parent_service_id, c.path, c.parent_path, c.type, c.size, c.mtime, c.depth,
+	COALESCE(trav.traversal_status,'') AS traversal_status,
+	COALESCE(cpy.copy_status,'') AS copy_status,
+	COALESCE(del.delete_status,'') AS delete_status,
+	(COALESCE(cpy.copy_status,'') IN ('excluded_explicit','excluded_inherited')) AS excluded,
+	'' AS errors
+FROM cand c
+LEFT JOIN trav ON trav.id = c.id
+LEFT JOIN cpy ON cpy.id = c.id
+LEFT JOIN del ON del.id = c.id
+ORDER BY c.id`
+	rows, err := conn.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanFetchResults(rows)
+}
+
+// ListNodesDeleteKeyset returns src_nodes at depth with current delete_status = statusFilter (event-derived), ordered by id.
+func ListNodesDeleteKeyset(d *DB, depth int, nodeType, afterID string, limit int, statusFilter string) ([]FetchResult, error) {
+	conn, err := d.GetDB()
+	if err != nil {
+		return nil, err
+	}
+	ctx := context.Background()
+	out := make([]FetchResult, 0, limit)
+	cursor := afterID
+	for len(out) < limit {
+		window, err := queryDeleteKeysetWindow(ctx, conn, depth, nodeType, cursor, pullKeysetWindowSize)
+		if err != nil {
+			return nil, err
+		}
+		if len(window) == 0 {
+			break
+		}
+		for i := range window {
+			st := window[i].State
+			if st != nil && !st.Excluded && st.CopyStatus == CopyStatusSuccessful && st.DeleteStatus == statusFilter {
+				out = append(out, window[i])
+				if len(out) == limit {
+					return out, nil
+				}
+			}
+		}
+		cursor = window[len(window)-1].Key
+		if len(window) < pullKeysetWindowSize {
+			break
+		}
+	}
+	return out, nil
+}
+
+// FolderDeleteBlockedIDs returns folder node IDs (subset of parentIDs) that have a direct non-excluded child whose delete_status is not 'deleted'.
+func FolderDeleteBlockedIDs(d *DB, parentIDs []string) (map[string]bool, error) {
+	blocked := make(map[string]bool)
+	if len(parentIDs) == 0 {
+		return blocked, nil
+	}
+	conn, err := d.GetDB()
+	if err != nil {
+		return nil, err
+	}
+	ctx := context.Background()
+	const chunk = 500
+	for start := 0; start < len(parentIDs); start += chunk {
+		end := start + chunk
+		if end > len(parentIDs) {
+			end = len(parentIDs)
+		}
+		part := parentIDs[start:end]
+		ph := make([]string, len(part))
+		args := make([]any, len(part))
+		for i := range part {
+			ph[i] = "$" + strconv.Itoa(i+1)
+			args[i] = part[i]
+		}
+		q := `SELECT DISTINCT p.id
+FROM ` + tableSrcNodes + ` p
+INNER JOIN ` + tableSrcNodes + ` ch ON ch.parent_id = p.id
+LEFT JOIN ` + cteSrcCurrentStatus + ` ce ON ch.id = ce.id
+WHERE p.id IN (` + strings.Join(ph, ",") + `)
+  AND p.type = 'folder'
+  AND COALESCE(ce.copy_status,'') NOT IN ('excluded_explicit','excluded_inherited')
+  AND COALESCE(ce.delete_status,'') <> 'deleted'`
+		rows, err := conn.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			blocked[id] = true
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return blocked, nil
 }
 
 // SubtreeStats holds aggregate counts for a subtree (path = rootPath OR path LIKE rootPath || '/%').
@@ -1223,16 +1438,25 @@ cpy AS (
 	INNER JOIN ch ON ch.id = se.id
 	WHERE COALESCE(se.copy_status, '') <> ''
 	GROUP BY se.id
+),
+del AS (
+	SELECT se.id, arg_max(se.delete_status, se.event_time) AS delete_status
+	FROM src_status_events se
+	INNER JOIN ch ON ch.id = se.id
+	WHERE COALESCE(se.delete_status, '') <> ''
+	GROUP BY se.id
 )
 SELECT ch.id, ch.service_id, ch.parent_id, ch.parent_service_id, ch.path, ch.parent_path, ch.type, ch.size, ch.mtime, ch.depth,
 	COALESCE(trav.traversal_status,'') AS traversal_status,
 	COALESCE(cpy.copy_status,'') AS copy_status,
+	COALESCE(del.delete_status,'') AS delete_status,
 	(COALESCE(cpy.copy_status,'') IN ('excluded_explicit','excluded_inherited')) AS excluded,
 	'' AS errors,
 	ch.parent_path_hash
 FROM ch
 LEFT JOIN trav ON trav.id = ch.id
 LEFT JOIN cpy ON cpy.id = ch.id
+LEFT JOIN del ON del.id = ch.id
 ORDER BY ch.parent_path_hash, ch.id`
 		rows, err := conn.QueryContext(ctx, q, args...)
 		if err != nil {
@@ -1242,7 +1466,7 @@ ORDER BY ch.parent_path_hash, ch.id`
 			var node NodeState
 			var size sql.NullInt64
 			var parentHash string
-			if err := rows.Scan(&node.ID, &node.ServiceID, &node.ParentID, &node.ParentServiceID, &node.Path, &node.ParentPath, &node.Type, &size, &node.MTime, &node.Depth, &node.TraversalStatus, &node.CopyStatus, &node.Excluded, &node.Errors, &parentHash); err != nil {
+			if err := rows.Scan(&node.ID, &node.ServiceID, &node.ParentID, &node.ParentServiceID, &node.Path, &node.ParentPath, &node.Type, &size, &node.MTime, &node.Depth, &node.TraversalStatus, &node.CopyStatus, &node.DeleteStatus, &node.Excluded, &node.Errors, &parentHash); err != nil {
 				rows.Close()
 				return nil, err
 			}
@@ -1384,7 +1608,7 @@ func GetSrcChildrenGroupedByParentPath(d *DB, parentPaths []string) (map[string]
 		parentPathHashes[i] = PathHash(p)
 	}
 	nodeAlias, e, cte := statusJoinExpr("SRC")
-	sel := `SELECT ` + nodeAlias + `.parent_path, ` + nodeAlias + `.id, ` + nodeAlias + `.service_id, ` + nodeAlias + `.parent_id, ` + nodeAlias + `.parent_service_id, ` + nodeAlias + `.path, ` + nodeAlias + `.type, ` + nodeAlias + `.size, ` + nodeAlias + `.mtime, ` + nodeAlias + `.depth, COALESCE(` + e + `.traversal_status,'') AS traversal_status, COALESCE(` + e + `.copy_status,'') AS copy_status, (COALESCE(` + e + `.copy_status,'') IN ('excluded_explicit','excluded_inherited')) AS excluded, '' AS errors FROM ` + tableSrcNodes + ` ` + nodeAlias + ` LEFT JOIN ` + cte + ` ` + e + ` ON ` + nodeAlias + `.id = ` + e + `.id WHERE ` + nodeAlias + `.parent_path_hash IN (`
+	sel := `SELECT ` + nodeAlias + `.parent_path, ` + nodeAlias + `.id, ` + nodeAlias + `.service_id, ` + nodeAlias + `.parent_id, ` + nodeAlias + `.parent_service_id, ` + nodeAlias + `.path, ` + nodeAlias + `.type, ` + nodeAlias + `.size, ` + nodeAlias + `.mtime, ` + nodeAlias + `.depth, COALESCE(` + e + `.traversal_status,'') AS traversal_status, COALESCE(` + e + `.copy_status,'') AS copy_status, COALESCE(` + e + `.delete_status,'') AS delete_status, (COALESCE(` + e + `.copy_status,'') IN ('excluded_explicit','excluded_inherited')) AS excluded, '' AS errors FROM ` + tableSrcNodes + ` ` + nodeAlias + ` LEFT JOIN ` + cte + ` ` + e + ` ON ` + nodeAlias + `.id = ` + e + `.id WHERE ` + nodeAlias + `.parent_path_hash IN (`
 	for i := 0; i < len(parentPathHashes); i += chunk {
 		end := i + chunk
 		if end > len(parentPathHashes) {
@@ -1411,7 +1635,7 @@ func GetSrcChildrenGroupedByParentPath(d *DB, parentPaths []string) (map[string]
 			var node NodeState
 			var parentPath string
 			var size sql.NullInt64
-			if err := rows.Scan(&parentPath, &node.ID, &node.ServiceID, &node.ParentID, &node.ParentServiceID, &node.Path, &node.Type, &size, &node.MTime, &node.Depth, &node.TraversalStatus, &node.CopyStatus, &node.Excluded, &node.Errors); err != nil {
+			if err := rows.Scan(&parentPath, &node.ID, &node.ServiceID, &node.ParentID, &node.ParentServiceID, &node.Path, &node.Type, &size, &node.MTime, &node.Depth, &node.TraversalStatus, &node.CopyStatus, &node.DeleteStatus, &node.Excluded, &node.Errors); err != nil {
 				rows.Close()
 				return nil, err
 			}
@@ -1584,7 +1808,7 @@ func BatchGetNodesByID(d *DB, table string, ids []string) (map[string]*NodeState
 	var size sql.NullInt64
 	for rows.Next() {
 		var n NodeState
-		if err := rows.Scan(&n.ID, &n.ServiceID, &n.ParentID, &n.ParentServiceID, &n.Path, &n.ParentPath, &n.Type, &size, &n.MTime, &n.Depth, &n.TraversalStatus, &n.CopyStatus, &n.Excluded, &n.Errors); err != nil {
+		if err := rows.Scan(&n.ID, &n.ServiceID, &n.ParentID, &n.ParentServiceID, &n.Path, &n.ParentPath, &n.Type, &size, &n.MTime, &n.Depth, &n.TraversalStatus, &n.CopyStatus, &n.DeleteStatus, &n.Excluded, &n.Errors); err != nil {
 			return nil, err
 		}
 		if size.Valid {
@@ -1634,6 +1858,44 @@ func BatchGetChildrenIDsByParentIDs(d *DB, table string, parentIDs []string) (ma
 			return nil, err
 		}
 		out[parentID] = append(out[parentID], childID)
+	}
+	return out, rows.Err()
+}
+
+// ListSrcNodesByCopyStatus returns SRC nodes whose current copy_status matches, paginated.
+func ListSrcNodesByCopyStatus(d *DB, copyStatus string, limit, offset int) ([]NodeState, error) {
+	conn, err := d.GetDB()
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 1000
+	}
+	if limit > 5000 {
+		limit = 5000
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	ctx := context.Background()
+	q := selectNodeColsWithStatus("SRC") + ` WHERE COALESCE(e.copy_status,'') = $1 ORDER BY n.path LIMIT $2 OFFSET $3`
+	rows, err := conn.QueryContext(ctx, q, copyStatus, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []NodeState
+	var size sql.NullInt64
+	for rows.Next() {
+		var n NodeState
+		if err := rows.Scan(&n.ID, &n.ServiceID, &n.ParentID, &n.ParentServiceID, &n.Path, &n.ParentPath, &n.Type, &size, &n.MTime, &n.Depth, &n.TraversalStatus, &n.CopyStatus, &n.DeleteStatus, &n.Excluded, &n.Errors); err != nil {
+			return nil, err
+		}
+		if size.Valid {
+			n.Size = size.Int64
+		}
+		n.Status = n.TraversalStatus
+		out = append(out, n)
 	}
 	return out, rows.Err()
 }

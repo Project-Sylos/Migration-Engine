@@ -3,7 +3,11 @@
 
 package db
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/google/uuid"
+)
 
 // AttachTaskFailureLog prepares a logs-table row to be written at seal flush alongside a failed status event.
 func AttachTaskFailureLog(e *StatusEvent, phase, queueName, nodeID, path string, attempts int, lastError string) {
@@ -13,7 +17,7 @@ func AttachTaskFailureLog(e *StatusEvent, phase, queueName, nodeID, path string,
 	if lastError == "" {
 		lastError = "unknown error"
 	}
-	e.ErrorLogID = GenerateLogID()
+	e.ErrorLogID = uuid.New().String()
 	e.ErrorLogDetail = lastError
 	e.ErrorLogMessage = fmt.Sprintf(
 		"%s task failed after %d attempt(s): path=%s node_id=%s error=%s",

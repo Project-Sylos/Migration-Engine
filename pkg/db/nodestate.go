@@ -51,6 +51,7 @@ type NodeState struct {
 	Depth            int
 	TraversalStatus  string // pending, successful, failed, not_on_src (dst)
 	CopyStatus       string // pending, in_progress, successful, failed (src)
+	DeleteStatus     string // pending, deleted, failed (src)
 	Excluded         bool
 	Errors           string // JSON placeholder for log refs
 	Status           string // Alias for TraversalStatus (used by queue taskToNodeState)
@@ -64,6 +65,7 @@ type NodeMeta struct {
 	Type            string
 	TraversalStatus string
 	CopyStatus      string
+	DeleteStatus    string
 }
 
 // InsertOperation represents a single node insert in a batch.
@@ -92,6 +94,7 @@ type StatusEvent struct {
 	ID               string
 	TraversalStatus  string // nullable in DB
 	CopyStatus       string // src only; empty for dst
+	DeleteStatus     string // src only; empty for dst
 	EventTime        int64
 	Depth            int
 	ErrorLogID       string // links to logs.id when this event records a task failure
@@ -103,6 +106,7 @@ type StatusEvent struct {
 	// per-depth level-stat deltas without re-querying the events table.
 	PrevTraversalStatus string
 	PrevCopyStatus      string
+	PrevDeleteStatus    string
 }
 
 // TaskErrorRecord is one buffered row for task_errors (queue_type, phase, node_id, message, attempts, path).
