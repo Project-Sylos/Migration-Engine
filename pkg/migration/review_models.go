@@ -245,7 +245,7 @@ func (r ReviewStatsRaw) ToPathReviewStats(phase string) PathReviewStats {
 	case PhaseDeleting, PhaseDeleteSuspended, PhaseDeleteReview:
 		pendingCount = r.DeletePending
 		failedCount = r.DeleteFailed
-		pendingRetriesCount = r.DeleteFailed
+		pendingRetriesCount = r.DeletePending // items marked pending for delete retry (mirrors copy review)
 	default:
 		pendingCount = r.CopyPending
 		failedCount = r.TraversalFailed

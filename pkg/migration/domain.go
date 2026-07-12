@@ -154,9 +154,19 @@ func newMigration(manager *MigrationManager, record migrationRecord, database *d
 
 func (m *Migration) syncRecord(record migrationRecord) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Concurrent GetMigration can SELECT a row, then lose a race to transitionTo's UPDATE,
+	// and finally apply that stale snapshot here — rolling phase backward (e.g. filters-set
+	// over traversal-in-progress). Reject records older than the last applied snapshot.
+	if v := m.persistRecord.Load(); v != nil {
+		if cur, ok := v.(migrationRecord); ok {
+			if !record.UpdatedAt.IsZero() && !cur.UpdatedAt.IsZero() && record.UpdatedAt.Before(cur.UpdatedAt) {
+				return
+			}
+		}
+	}
 	m.Name = record.Name
 	m.phase = record.Phase
-	m.mu.Unlock()
 	m.persistRecord.Store(record)
 }
 
@@ -388,6 +398,17 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 		return RuntimeStats{}, err
 	}
 
+	// Mark live immediately so concurrent GetMigration skips syncRecord and cannot race
+	// a stale filters-set snapshot over this phase before RunMigration starts.
+	runCtx, cancelRun := m.beginRun(cfg.ShutdownContext)
+	defer func() {
+		cancelRun()
+		m.endRun()
+		if updErr := m.store.updateUpdatedAt(m.ID); updErr != nil {
+			fmt.Println("error updating updated at", updErr)
+		}
+	}()
+
 	var resume *RuntimeSuspendV1
 	if prevPhase == PhaseTraversalSuspended {
 		if s, ok := parseRuntimeSuspendV1(m.runtimeStateJSON()); ok && s.Kind == "traversal" {
@@ -412,15 +433,6 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 	}
 	m.setLastRunConfig(cfgForRun)
 
-	runCtx, cancelRun := m.beginRun(cfg.ShutdownContext)
-	defer func() {
-		cancelRun()
-		m.endRun()
-		err = m.store.updateUpdatedAt(m.ID)
-		if err != nil {
-			fmt.Println("error updating updated at", err)
-		}
-	}()
 	stats, err := RunMigration(MigrationConfig{
 		DB:                   m.DB,
 		DBPath:               cfg.Database.Path,
@@ -967,7 +979,8 @@ func (m *Migration) ForceStop() (StopResult, error) {
 func (m *Migration) QueryNodes(filter NodeQueryFilter) ([]db.NodeState, error) {
 	phase := m.Phase()
 	if phase != PhaseTraversalReview && phase != PhaseTraversalSuspended &&
-		phase != PhaseCopying && phase != PhaseCopySuspended && phase != PhaseCopyReview {
+		phase != PhaseCopying && phase != PhaseCopySuspended && phase != PhaseCopyReview &&
+		phase != PhaseDeleting && phase != PhaseDeleteSuspended && phase != PhaseDeleteReview {
 		return nil, fmt.Errorf("query nodes is only available after traversal reaches review phase")
 	}
 	return m.store.queryNodes(filter)
@@ -1364,7 +1377,8 @@ func (m *Migration) BulkExcludeWithPropagation(filter NodeQueryFilter, excluded 
 
 func (m *Migration) ListChildrenDiffs(req ListChildrenDiffsRequest) (ListChildrenDiffsResult, error) {
 	phase := m.Phase()
-	if phase != PhaseTraversalReview && phase != PhaseCopying && phase != PhaseCopyReview {
+	if phase != PhaseTraversalReview && phase != PhaseCopying && phase != PhaseCopyReview &&
+		phase != PhaseDeleting && phase != PhaseDeleteSuspended && phase != PhaseDeleteReview {
 		return ListChildrenDiffsResult{}, fmt.Errorf("diff listing requires review or later phase")
 	}
 	return m.store.listChildrenDiffs(req)
@@ -1372,7 +1386,8 @@ func (m *Migration) ListChildrenDiffs(req ListChildrenDiffsRequest) (ListChildre
 
 func (m *Migration) SearchPathReviewItems(req SearchRequest) (SearchResult, error) {
 	phase := m.Phase()
-	if phase != PhaseTraversalReview && phase != PhaseCopying && phase != PhaseCopyReview {
+	if phase != PhaseTraversalReview && phase != PhaseCopying && phase != PhaseCopyReview &&
+		phase != PhaseDeleting && phase != PhaseDeleteSuspended && phase != PhaseDeleteReview {
 		return SearchResult{}, fmt.Errorf("search requires review or later phase")
 	}
 	return m.store.searchPathReviewItems(req)
@@ -1380,7 +1395,8 @@ func (m *Migration) SearchPathReviewItems(req SearchRequest) (SearchResult, erro
 
 func (m *Migration) GetChildrenDiffsStats(path string, foldersOnly bool) (DiffsStats, error) {
 	phase := m.Phase()
-	if phase != PhaseTraversalReview && phase != PhaseCopying && phase != PhaseCopyReview {
+	if phase != PhaseTraversalReview && phase != PhaseCopying && phase != PhaseCopyReview &&
+		phase != PhaseDeleting && phase != PhaseDeleteSuspended && phase != PhaseDeleteReview {
 		return DiffsStats{}, fmt.Errorf("diff stats requires review or later phase")
 	}
 	return m.store.getChildrenDiffsStats(path, foldersOnly)
@@ -1389,7 +1405,8 @@ func (m *Migration) GetChildrenDiffsStats(path string, foldersOnly bool) (DiffsS
 // GetSearchStats returns aggregate counts for the same filter as SearchPathReviewItems (query, path, status, foldersOnly).
 func (m *Migration) GetSearchStats(req SearchRequest) (DiffsStats, error) {
 	phase := m.Phase()
-	if phase != PhaseTraversalReview && phase != PhaseCopying && phase != PhaseCopyReview {
+	if phase != PhaseTraversalReview && phase != PhaseCopying && phase != PhaseCopyReview &&
+		phase != PhaseDeleting && phase != PhaseDeleteSuspended && phase != PhaseDeleteReview {
 		return DiffsStats{}, fmt.Errorf("search stats requires review or later phase")
 	}
 	return m.store.getSearchStats(req)
