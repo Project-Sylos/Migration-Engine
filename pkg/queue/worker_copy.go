@@ -261,12 +261,12 @@ func (w *CopyWorker) createFolder(task *TaskBase, ctx context.Context, wd *Progr
 	wd.Beat()
 	done := make(chan error, 1)
 	go func() {
-		created, err := w.dstAdapter.CreateFolder(ctx, dstParentServiceID, folderName)
+		created, err := w.dstAdapter.CreateFolder(ctx, dstParentServiceID, folderName, copyTaskCreateMetadata(task))
 		if err != nil {
 			done <- fmt.Errorf("failed to create folder %s in parent %s: %w", folder.DisplayName, dstParentServiceID, err)
 			return
 		}
-		task.Folder = created
+		applyCopyDstFolderFromAdapter(task, created)
 		done <- nil
 	}()
 
@@ -314,12 +314,11 @@ func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressW
 	if fileName == "" || fileName == "." {
 		fileName = file.DisplayName
 	}
-	srcLocationPath := file.LocationPath
 	var destFile types.File
 	if updateTarget != nil {
 		destFile = *updateTarget
 	} else {
-		createMeta := map[string]string{"location_path": srcLocationPath}
+		createMeta := copyTaskCreateMetadata(task)
 		destFile, err = w.dstAdapter.CreateFile(ctx, dstParentServiceID, fileName, file.Size, createMeta)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -381,11 +380,7 @@ func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressW
 	}
 
 	task.BytesTransferred = bytesTransferred
-	destFile.LocationPath = srcLocationPath
-	destFile.LastUpdated = file.LastUpdated
-	destFile.Size = file.Size
-	destFile.DisplayName = file.DisplayName
-	task.File = destFile
+	applyCopyDstFileFromAdapter(task, destFile)
 	return nil
 }
 
@@ -405,7 +400,7 @@ func (w *CopyWorker) applyResumeCopyDstFolderPrecheck(task *TaskBase, ctx contex
 	folderMap, fileMap := copyTaskChildMaps(aggregated, task.Round)
 	matchKey := folder.Type + ":" + folder.DisplayName
 	if existing, ok := folderMap[matchKey]; ok {
-		task.Folder = existing
+		applyCopyDstFolderFromAdapter(task, existing)
 		wd.Beat()
 		return true, nil
 	}
@@ -435,7 +430,7 @@ func (w *CopyWorker) applyCopyDstFilePrecheck(task *TaskBase, ctx context.Contex
 	}
 	if existing, ok := fileMap[matchKey]; ok {
 		if compareTimestamps(file.LastUpdated, existing.LastUpdated) == "Successful" {
-			task.File = existing
+			applyCopyDstFileFromAdapter(task, existing)
 			wd.Beat()
 			return true, nil, nil
 		}

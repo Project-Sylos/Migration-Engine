@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -63,23 +64,27 @@ func (m *memCopyAdapter) OpenRead(ctx context.Context, fileID string) (io.ReadCl
 	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
-func (m *memCopyAdapter) CreateFolder(ctx context.Context, parentId, name string) (types.Folder, error) {
+func (m *memCopyAdapter) CreateFolder(ctx context.Context, parentId, name string, metadata map[string]string) (types.Folder, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.folders[parentId] == nil {
 		m.folders[parentId] = make(map[string]types.Folder)
 	}
 	id := m.nextServiceID()
-	parentPath := "/"
-	if parentId != m.rootID {
-		parentPath = types.NormalizeLocationPath("/" + parentId)
+	parentPath := types.LogicalParentFromCreateMetadata(metadata, "/")
+	if metadata == nil || (strings.TrimSpace(metadata["location_path"]) == "" && strings.TrimSpace(metadata["parent_path"]) == "") {
+		parentPath = "/"
+		if parentId != m.rootID {
+			parentPath = types.NormalizeLocationPath("/" + parentId)
+		}
 	}
+	loc := types.ChildLocationFromCreateMetadata(metadata, parentPath, name)
 	f := types.Folder{
 		ServiceID:    id,
 		ParentId:     parentId,
 		ParentPath:   parentPath,
 		DisplayName:  name,
-		LocationPath: types.NormalizeLocationPath(parentPath + "/" + name),
+		LocationPath: loc,
 		LastUpdated:  time.Now().UTC().Format(time.RFC3339),
 		Type:         types.NodeTypeFolder,
 	}

@@ -13,52 +13,42 @@ import (
 )
 
 // CheckDeleteCompletion checks if the delete phase should switch passes or complete.
-// Delete uses reverse BFS (max depth → 1) with pass 1 = files, pass 2 = folders.
+// Only called when pass 1 has swept all depths down to depth 1 (reverse BFS), mirroring copy at maxKnownDepth.
+// Pass 1 = files, pass 2 = folders. Trust per-round exhaustion; no global DB pending re-check.
 func (q *Queue) CheckDeleteCompletion(currentRound int) bool {
+	maxKnownDepth := q.getMaxKnownDepth()
+
 	if currentRound > 1 {
 		return false
 	}
 	if q.InProgressCount() > 0 || q.GetPendingCount() > 0 {
 		return false
 	}
+
 	deletePass := q.GetCopyPass()
 	if deletePass == 1 {
 		q.SetCopyPass(2)
 		q.resetRoundStatsCompleted()
-		q.setExpectedFromStatsBucket(currentRound)
+		q.SetRound(maxKnownDepth)
+		q.setExpectedFromStatsBucket(maxKnownDepth)
 		q.setLastPullWasPartial(false)
 		return false
 	}
-	database := q.getDatabase()
-	if database != nil {
-		if counts, err := database.GetDeleteStatusCountsFromEvents(); err == nil && counts.Pending > 0 {
-			return false
-		}
-	}
+
 	return q.markComplete("Delete phase complete - both passes finished")
 }
 
 // AdvanceDeleteRound handles delete-specific round advancement (reverse BFS).
+// Round completion is determined by lastPullWasPartial (memory/keyset only); we never query the DB for in-round advancement.
+// When called, the current depth has just completed — decrement depth within the same pass until depth 1, then check pass switch or phase complete.
 func (q *Queue) AdvanceDeleteRound() {
 	currentRound := q.GetRound()
 	deletePass := q.GetCopyPass()
 
-	if deletePass == 1 {
-		q.SetCopyPass(2)
-		q.resetRoundStatsCompleted()
-		q.setExpectedFromStatsBucket(currentRound)
-		q.setLastPullWasPartial(false)
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("info", fmt.Sprintf("Delete pass 1 (files) done at depth %d, starting pass 2 (folders)", currentRound), "queue", q.name, q.name)
-		}
-		q.pullWithRetryIfNeeded(true)
-		return
-	}
-
 	newRound := currentRound - 1
 	if newRound < 1 {
 		if logservice.LS != nil {
-			_ = logservice.LS.Log("info", "Delete rounds exhausted at depth 1, checking completion", "queue", q.name, q.name)
+			_ = logservice.LS.Log("info", fmt.Sprintf("Pass %d exhausted depths (reached depth 1), checking for completion", deletePass), "queue", q.name, q.name)
 		}
 		completed := q.checkCompletion(currentRound, CompletionCheckOptions{CheckFinalCompletion: true})
 		if completed {
@@ -68,12 +58,16 @@ func (q *Queue) AdvanceDeleteRound() {
 		return
 	}
 
-	q.SetCopyPass(1)
 	q.SetRound(newRound)
 	q.setExpectedFromStatsBucket(newRound)
 	q.setLastPullWasPartial(false)
+
+	passName := "files"
+	if deletePass == 2 {
+		passName = "folders"
+	}
 	if logservice.LS != nil {
-		_ = logservice.LS.Log("info", fmt.Sprintf("Advanced delete to depth %d (pass 1: files)", newRound), "queue", q.name, q.name)
+		_ = logservice.LS.Log("info", fmt.Sprintf("Advanced delete to depth %d (pass %d: %s)", newRound, deletePass, passName), "queue", q.name, q.name)
 	}
 	q.pullWithRetryIfNeeded(true)
 }

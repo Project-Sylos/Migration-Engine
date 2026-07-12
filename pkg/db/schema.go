@@ -18,7 +18,8 @@ const (
 	TableDstStatusEvents = "dst_status_events"
 	// TableFSCredentialBinding holds per-side connection id, optional creds file path, and serialized root folder for API rehydration.
 	TableFSCredentialBinding = "fs_credential_binding"
-	// TableOAuthCredentials stores plaintext OAuth refresh token JSON keyed by connection id (file encryption protects at rest).
+	// TableOAuthCredentials stores OAuth refresh token JSON keyed by connection id.
+	// Values may be plaintext (tests) or AES-GCM blobs prefixed with enc:v1: (production).
 	TableOAuthCredentials = "oauth_credentials"
 )
 

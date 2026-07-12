@@ -25,11 +25,16 @@ type migrationRecord struct {
 }
 
 type migrationStore struct {
-	db *db.DB // set on Migration-bound stores only
+	db       *db.DB // set on Migration-bound stores only
+	tokenKey []byte // nil = plaintext oauth_credentials rows (tests)
 }
 
-func newMigrationStore(database *db.DB) *migrationStore {
-	return &migrationStore{db: database}
+func newMigrationStore(database *db.DB, tokenKey []byte) *migrationStore {
+	return &migrationStore{db: database, tokenKey: tokenKey}
+}
+
+func (s *migrationStore) setTokenKey(tokenKey []byte) {
+	s.tokenKey = tokenKey
 }
 
 func (s *migrationStore) createMigration(database *db.DB, record migrationRecord) error {

@@ -119,6 +119,8 @@ type Migration struct {
 	store   *migrationStore // store bound to this migration's DB
 	manager *MigrationManager
 
+	tokenEncryptionKey []byte // nil = plaintext oauth_credentials rows (tests)
+
 	mu                   sync.RWMutex
 	phase                string
 	runtimeState         RuntimeState
@@ -135,15 +137,16 @@ type Migration struct {
 	activeQueueObs atomic.Pointer[queue.QueueObserver]
 }
 
-func newMigration(manager *MigrationManager, record migrationRecord, database *db.DB) *Migration {
+func newMigration(manager *MigrationManager, record migrationRecord, database *db.DB, tokenKey []byte) *Migration {
 	m := &Migration{
-		ID:      record.ID,
-		Name:    record.Name,
-		DB:      database,
-		store:   newMigrationStore(database),
-		manager: manager,
-		phase:   record.Phase,
-		logRing: newLogRing(256),
+		ID:                 record.ID,
+		Name:               record.Name,
+		DB:                 database,
+		store:              newMigrationStore(database, tokenKey),
+		manager:            manager,
+		tokenEncryptionKey: tokenKey,
+		phase:              record.Phase,
+		logRing:            newLogRing(256),
 	}
 	m.persistRecord.Store(record)
 	return m
@@ -191,7 +194,14 @@ func (m *Migration) setLastRunConfig(cfg Config) {
 // bindDB attaches the database to a migration that was created without one (pending). Called by the manager when the API passes the migration folder path.
 func (m *Migration) bindDB(database *db.DB) {
 	m.DB = database
-	m.store = newMigrationStore(database)
+	m.store = newMigrationStore(database, m.tokenEncryptionKey)
+}
+
+func (m *Migration) setTokenEncryptionKey(tokenKey []byte) {
+	m.tokenEncryptionKey = tokenKey
+	if m.store != nil {
+		m.store.setTokenKey(tokenKey)
+	}
 }
 
 // UpsertFSCredentialBinding persists one side's FS credential binding (connection id, optional creds path, service id, serialized root folder).
@@ -218,7 +228,7 @@ func (m *Migration) ListFSCredentialBindings() ([]FSCredentialBinding, error) {
 	return m.store.listFSCredentialBindings()
 }
 
-// UpsertOAuthCredentials stores plaintext OAuth refresh credentials JSON for a connection.
+// UpsertOAuthCredentials stores OAuth refresh credentials JSON for a connection, encrypted when a token key is configured.
 func (m *Migration) UpsertOAuthCredentials(connectionID string, credsJSON []byte) error {
 	if m.DB == nil {
 		return fmt.Errorf("migration has no database")
@@ -226,7 +236,7 @@ func (m *Migration) UpsertOAuthCredentials(connectionID string, credsJSON []byte
 	return m.store.upsertOAuthCredentials(connectionID, credsJSON)
 }
 
-// GetOAuthCredentials returns stored OAuth credentials JSON for a connection.
+// GetOAuthCredentials returns stored OAuth credentials JSON for a connection, decrypting when encrypted at rest.
 func (m *Migration) GetOAuthCredentials(connectionID string) ([]byte, error) {
 	if m.DB == nil {
 		return nil, fmt.Errorf("migration has no database")
@@ -1244,6 +1254,9 @@ func (m *Migration) PrepareSourceCleanup(keepNodeIDs, deselectedNodeIDs []string
 			break
 		}
 		for _, node := range nodes {
+			if node.Depth == 0 {
+				continue // root is metadata-only; no delete_status event (null)
+			}
 			var selected bool
 			switch {
 			case useKeepList:

@@ -5,6 +5,7 @@ package queue
 
 import (
 	"fmt"
+	"path"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
@@ -261,19 +262,26 @@ func nodeStateToCopyTask(state *db.NodeState, taskType string, copyPass int) *Ta
 		return nil
 	}
 
+	logicalPath := db.NormalizeRootRelativePath(state.Path)
+	logicalParent := state.ParentPath
+	if state.Depth > 0 {
+		logicalParent = db.NormalizeRootRelativePath(state.ParentPath)
+	}
 	task := &TaskBase{
-		ID:                 state.ID,
-		Type:               taskType,
-		Round:              state.Depth,
-		CopyPass:           copyPass,
-		Attempts:           0,
-		Status:             "",
-		Locked:             false,
-		LeaseTime:          time.Now(),
-		DstParentID:        "",
-		CopyStatus:         state.CopyStatus,
-		DeleteStatus:       state.DeleteStatus,
-		SrcTraversalStatus: state.TraversalStatus,
+		ID:                   state.ID,
+		Type:                 taskType,
+		Round:                state.Depth,
+		CopyPass:             copyPass,
+		Attempts:             0,
+		Status:               "",
+		Locked:               false,
+		LeaseTime:            time.Now(),
+		DstParentID:          "",
+		CopyStatus:           state.CopyStatus,
+		DeleteStatus:         state.DeleteStatus,
+		SrcLogicalPath:       logicalPath,
+		SrcLogicalParentPath: logicalParent,
+		SrcTraversalStatus:   state.TraversalStatus,
 	}
 
 	// Populate folder or file based on node type
@@ -327,7 +335,8 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 	q.recordTaskCompletion(currentRound, true)
 
 	taskType := types.NodeTypeFile
-	taskPath := db.NormalizeRootRelativePath(task.LocationPath())
+	taskPath := copyTaskLogicalPath(task)
+	parentPath := copyTaskLogicalParentPath(task)
 	taskName := task.File.DisplayName
 	taskSize := task.File.Size
 	taskMTime := task.File.LastUpdated
@@ -336,12 +345,9 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 		taskName = task.Folder.DisplayName
 		taskMTime = task.Folder.LastUpdated
 	}
-
-	parentPath := task.File.ParentPath
-	if task.IsFolder() {
-		parentPath = task.Folder.ParentPath
+	if taskName == "" {
+		taskName = path.Base(taskPath)
 	}
-	parentPath = db.NormalizeRootRelativePath(parentPath)
 
 	database.AppendStatusEvent("SRC", db.StatusEvent{
 		ID:              nodeID,

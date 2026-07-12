@@ -38,6 +38,7 @@ func findDeleteStartRound(duckDB *db.DB, retry bool) int {
 	if err != nil || maxDepth < 1 {
 		return 1
 	}
+	// Delete sweeps maxDepth down to 1; depth 0 (root) is metadata-only and never processed.
 	if !retry {
 		return maxDepth
 	}
@@ -66,7 +67,7 @@ func findDeleteStartRound(duckDB *db.DB, retry bool) int {
 	return minLevel
 }
 
-// RunDeletePhase runs the delete phase (reverse BFS, files then folders per depth).
+// RunDeletePhase runs the delete phase (reverse BFS, global passes: files then folders, depths max→1; depth 0 root excluded).
 func RunDeletePhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 	duckDB := cfg.DuckDB
 	if duckDB == nil {

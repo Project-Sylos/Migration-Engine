@@ -68,8 +68,10 @@ type TaskBase struct {
 	CopyStatus          string             // Current SRC copy status from DB (used to preserve copy_status on traversal completion events)
 	DeleteStatus        string             // Current SRC delete status from DB (delete phase)
 	// Copy phase specific fields
-	CopyPass           int    // Copy pass number (1 for folders, 2 for files)
-	SrcTraversalStatus string // SRC node traversal_status at pull time (preserved when writing copy_status events)
+	CopyPass             int    // Copy pass number (1 for folders, 2 for files)
+	SrcLogicalPath       string // SRC root-relative path at pull time (immune to dst adapter path metadata)
+	SrcLogicalParentPath string // SRC parent path at pull time
+	SrcTraversalStatus   string // SRC node traversal_status at pull time (preserved when writing copy_status events)
 	BytesTransferred   int64  // Bytes transferred for file copy tasks
 	DstParentID        string // Destination parent folder ID for creation
 }

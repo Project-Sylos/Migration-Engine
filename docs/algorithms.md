@@ -164,3 +164,68 @@ Copy Retry Mode mirrors traversal retry mechanics:
 
 No additional structural differences exist beyond scope restriction.
 
+---
+
+## Delete Phase
+
+The delete phase removes successfully copied source (SRC) content after copy review. It mirrors the copy phase structurally but runs in **reverse BFS** (deepest depth first) and uses the **opposite pass order** (files before folders) so children are removed before parents.
+
+### Scope
+
+* **SRC only** — one delete queue; destination nodes are not deleted.
+* **Operational depths:** `maxKnownDepth` down to **1** (from `GetMaxDepth("SRC")`).
+* **Depth 0 (root) is never processed** — the root row is metadata-only (same as copy: seeded `copy_status = successful`, no delete work). `PrepareSourceCleanup` does not assign `delete_status` to depth-0 nodes.
+* **Eligible nodes:** `copy_status = successful`, not excluded, and `delete_status = pending` (set during copy-review cleanup planning via `PrepareSourceCleanup`).
+
+### Two global passes (copy-shaped)
+
+Like copy, delete exhausts **all depths in pass 1** before switching to pass 2. Unlike copy, depth decreases each round (reverse BFS).
+
+| Pass | Node type | Depth sweep |
+|------|-----------|-------------|
+| 1 | Files | `maxKnownDepth` → … → 1 |
+| 2 | Folders | `maxKnownDepth` → … → 1 |
+
+**Pass switch** occurs only after pass 1 has fully exhausted depth 1 (the bottom of the reverse sweep), with the same in-memory gates as round completion: pending buffer empty, in-progress zero, `lastPullWasPartial = true`, and at least one counted pull for the round. The queue then resets to `maxKnownDepth` for pass 2.
+
+**Phase complete** when pass 2 has exhausted depth 1 under the same round-completion gates. Completion trusts per-round exhaustion (like copy); it does not re-query global `delete_status = pending` across the tree.
+
+### Per-depth round advancement
+
+Within a pass, when a depth’s keyspace is exhausted:
+
+1. `advanceToNextRound` flushes the seal buffer.
+2. `AdvanceDeleteRound` decrements depth (`currentRound - 1`) and **keeps the same pass**.
+3. When depth 1 completes, `CheckDeleteCompletion` runs (pass switch or phase complete).
+
+Round completion gates (shared with traversal/copy) require:
+
+* In-memory pending buffer empty
+* In-progress count zero
+* `lastPullWasPartial = true` (terminal keyset pull for this depth/pass)
+* `PullCount > 0` for the round
+* Not currently pulling
+
+### Pull and folder gate
+
+`PullDeleteTasks` loads SRC nodes at the current depth with the current pass filter (`pending` for normal delete, `failed` for delete-retry). Depth 0 pulls are skipped (`currentRound == 0` → no pull).
+
+Before enqueueing folder tasks (pass 2), the engine calls `FolderDeleteBlockedIDs`: a folder is not deletable until **every direct non-excluded child** has `delete_status = deleted`. Blocked folders are marked failed with a `copy_blocked` error rather than wedging the queue.
+
+Workers call `DeleteNode` on the source adapter; success emits `delete_status = deleted` via the seal buffer.
+
+### Delete retry mode
+
+Delete retry reuses the same reverse-BFS and two-pass structure. It only pulls nodes whose current `delete_status = failed`. `findDeleteStartRound` scans depths from high to low (skipping depth 0) to find the highest depth with failed work.
+
+### Comparison to copy
+
+| | Copy (forward BFS) | Delete (reverse BFS) |
+|---|-------------------|----------------------|
+| Pass order | Folders → files | Files → folders |
+| Depth direction | 1 → maxKnownDepth | maxKnownDepth → 1 |
+| Pass switch after | All depths in pass 1 | All depths in pass 1 (ends at depth 1) |
+| Restart depth on pass 2 | 1 | maxKnownDepth |
+| Root (depth 0) | Never copied (pre-successful) | Never deleted (null delete_status) |
+
+---

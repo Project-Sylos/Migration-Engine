@@ -26,8 +26,8 @@ type CreateMigrationConfig struct {
 	MigrationDir string
 	// MigrationID is optional; when set with MigrationDir, this ID is used (API pre-generated ID and created the folder).
 	MigrationID string
-	// EncryptionKey enables DuckDB native encryption for the migration DB; nil keeps plaintext (tests).
-	EncryptionKey []byte
+	// TokenEncryptionKey encrypts oauth_credentials rows in the migration DB; nil keeps plaintext (tests).
+	TokenEncryptionKey []byte
 }
 
 // MigrationSummary is a compact projection returned by ListMigrations.
@@ -117,8 +117,8 @@ func (m *MigrationManager) ResetState() error {
 	return nil
 }
 
-// openDB opens (or returns cached) the DB for the given migration folder path and ID.
-func (m *MigrationManager) openDB(migrationDir, id string, encryptionKey []byte) (*db.DB, error) {
+// openDB opens (or returns cached) the plaintext DB for the given migration folder path and ID.
+func (m *MigrationManager) openDB(migrationDir, id string) (*db.DB, error) {
 	absDir, err := filepath.Abs(migrationDir)
 	if err != nil {
 		return nil, fmt.Errorf("migration dir: %w", err)
@@ -133,13 +133,20 @@ func (m *MigrationManager) openDB(migrationDir, id string, encryptionKey []byte)
 	if err := os.MkdirAll(absDir, 0755); err != nil {
 		return nil, fmt.Errorf("create migration dir: %w", err)
 	}
-	cfg := DatabaseConfig{Path: dbPath, EncryptionKey: encryptionKey}
+	cfg := DatabaseConfig{Path: dbPath}
 	database, _, err := SetupDatabase(cfg)
 	if err != nil {
 		return nil, err
 	}
 	m.openDBs[cacheKey] = database
 	return database, nil
+}
+
+func (m *MigrationManager) applyTokenKey(mig *Migration, tokenKey []byte) {
+	if mig == nil || len(tokenKey) == 0 {
+		return
+	}
+	mig.setTokenEncryptionKey(tokenKey)
 }
 
 // CreateMigration registers a migration and returns a domain object. The API can either:
@@ -169,7 +176,7 @@ func (m *MigrationManager) CreateMigration(cfg CreateMigrationConfig) (*Migratio
 	}
 
 	if cfg.MigrationDir != "" {
-		database, err := m.openDB(cfg.MigrationDir, id, cfg.EncryptionKey)
+		database, err := m.openDB(cfg.MigrationDir, id)
 		if err != nil {
 			return nil, err
 		}
@@ -188,7 +195,7 @@ func (m *MigrationManager) CreateMigration(cfg CreateMigrationConfig) (*Migratio
 		if persisted != nil {
 			record = *persisted
 		}
-		instance := newMigration(m, record, database)
+		instance := newMigration(m, record, database, cfg.TokenEncryptionKey)
 		m.migrations[id] = instance
 		return instance, nil
 	}
@@ -198,7 +205,7 @@ func (m *MigrationManager) CreateMigration(cfg CreateMigrationConfig) (*Migratio
 		m.pendingRecords = make(map[string]migrationRecord)
 	}
 	m.pendingRecords[id] = record
-	instance := newMigration(m, record, nil)
+	instance := newMigration(m, record, nil, cfg.TokenEncryptionKey)
 	m.migrations[id] = instance
 	return instance, nil
 }
@@ -216,10 +223,13 @@ func isDuplicateKey(err error) bool {
 		strings.Contains(msg, "constraint violation")
 }
 
-// GetMigration loads or returns a cached migration. encryptionKey is required for API opens; pass nil for plaintext test DBs.
-func (m *MigrationManager) GetMigration(id string, migrationDir string, encryptionKey []byte) (*Migration, error) {
+// GetMigration loads or returns a cached migration.
+// tokenEncryptionKey encrypts oauth_credentials rows; pass nil for plaintext test DBs.
+// Migration DuckDB files are always opened plaintext.
+func (m *MigrationManager) GetMigration(id string, migrationDir string, tokenEncryptionKey []byte) (*Migration, error) {
 	snap := m.snapshotMigrationEntry(id)
 	if snap.Migration != nil {
+		m.applyTokenKey(snap.Migration, tokenEncryptionKey)
 		if snap.HasDB {
 			if snap.Migration.IsLive() {
 				if _, ok := snap.Migration.cachedMigrationDetailsForLiveAPI(); ok {
@@ -248,6 +258,7 @@ func (m *MigrationManager) GetMigration(id string, migrationDir string, encrypti
 
 		after := m.snapshotMigrationEntry(id)
 		if after.Migration != nil && after.HasDB {
+			m.applyTokenKey(after.Migration, tokenEncryptionKey)
 			if after.Migration.IsLive() {
 				if _, ok := after.Migration.cachedMigrationDetailsForLiveAPI(); ok {
 					return after.Migration, nil
@@ -262,8 +273,9 @@ func (m *MigrationManager) GetMigration(id string, migrationDir string, encrypti
 			return nil, nil
 		}
 		existing := after.Migration
+		m.applyTokenKey(existing, tokenEncryptionKey)
 
-		database, err := m.openDB(migrationDir, id, encryptionKey)
+		database, err := m.openDB(migrationDir, id)
 		if err != nil {
 			return nil, err
 		}
@@ -301,7 +313,7 @@ func (m *MigrationManager) GetMigration(id string, migrationDir string, encrypti
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		return nil, nil
 	}
-	database, err := m.openDB(migrationDir, id, encryptionKey)
+	database, err := m.openDB(migrationDir, id)
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +324,7 @@ func (m *MigrationManager) GetMigration(id string, migrationDir string, encrypti
 	if record == nil {
 		return nil, nil
 	}
-	instance := newMigration(m, *record, database)
+	instance := newMigration(m, *record, database, tokenEncryptionKey)
 	m.putMigration(id, instance)
 	return instance, nil
 }
@@ -339,7 +351,7 @@ func (m *MigrationManager) ListMigrations(dataDir string) ([]MigrationSummary, e
 			if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 				continue
 			}
-			database, err := m.openDB(migrationDir, id, nil)
+			database, err := m.openDB(migrationDir, id)
 			if err != nil {
 				continue
 			}
@@ -367,7 +379,7 @@ func (m *MigrationManager) ListMigrations(dataDir string) ([]MigrationSummary, e
 }
 
 // GetMigrationDetails returns the full migration record. Pass migrationDir (path to that migration's folder) if the migration is not already loaded in memory.
-func (m *MigrationManager) GetMigrationDetails(id string, migrationDir string, encryptionKey []byte) (*MigrationDetails, error) {
+func (m *MigrationManager) GetMigrationDetails(id string, migrationDir string, tokenEncryptionKey []byte) (*MigrationDetails, error) {
 	m.mu.Lock()
 	pending, hasPending := m.pendingRecords[id]
 	existing := m.migrations[id]
@@ -376,6 +388,7 @@ func (m *MigrationManager) GetMigrationDetails(id string, migrationDir string, e
 		return &MigrationDetails{ID: pending.ID, Name: pending.Name, Phase: pending.Phase, CreatedAt: pending.CreatedAt, UpdatedAt: pending.UpdatedAt, ServiceMetadataJSON: pending.ServiceMetadataJSON, RootConfigJSON: pending.RootConfigJSON, Live: false}, nil
 	}
 	if existing != nil && existing.DB != nil {
+		m.applyTokenKey(existing, tokenEncryptionKey)
 		if existing.IsLive() {
 			if d, ok := existing.cachedMigrationDetailsForLiveAPI(); ok {
 				m.overlayRuntimeFromCache(id, &d.Live, &d.Phase)
@@ -391,7 +404,7 @@ func (m *MigrationManager) GetMigrationDetails(id string, migrationDir string, e
 		return d, nil
 	}
 	if migrationDir != "" {
-		database, err := m.openDB(migrationDir, id, encryptionKey)
+		database, err := m.openDB(migrationDir, id)
 		if err != nil {
 			return nil, err
 		}
@@ -439,7 +452,7 @@ func (m *MigrationManager) overlayRuntimeFromCache(id string, live *bool, phase 
 }
 
 // DeleteMigration removes the migration from memory and, when a DB exists, deletes its record. Pass migrationDir so the engine can open the DB, delete the row, and close it; otherwise only in-memory state is removed.
-func (m *MigrationManager) DeleteMigration(id string, migrationDir string, encryptionKey []byte) error {
+func (m *MigrationManager) DeleteMigration(id string, migrationDir string, _ []byte) error {
 	m.mu.Lock()
 	delete(m.migrations, id)
 	delete(m.pendingRecords, id)
@@ -449,7 +462,7 @@ func (m *MigrationManager) DeleteMigration(id string, migrationDir string, encry
 	}
 	absDir, _ := filepath.Abs(migrationDir)
 	dbPath := MigrationDBPath(absDir, id)
-	database, err := m.openDB(migrationDir, id, encryptionKey)
+	database, err := m.openDB(migrationDir, id)
 	if err != nil {
 		return err
 	}

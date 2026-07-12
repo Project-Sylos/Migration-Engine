@@ -2,7 +2,7 @@
 
 Heavy **scenario** tests (Spectra, real queues, DuckDB on disk). They are **`package main`** runners under **`pkg/tests/traversal/`** and **`pkg/tests/copy/`**, not `go test` packages—run them with **`go run`** or the shell/PowerShell scripts next to each scenario.
 
-Scenario databases use **plaintext** DuckDB files (`EncryptionKey == nil` in `db.Open`). Production encryption is applied only when the Sylos API supplies keys.
+Scenario databases use **plaintext** DuckDB files (`EncryptionKey == nil` in `db.Open`) and plaintext `oauth_credentials` rows (`tokenEncryptionKey == nil` in `GetMigration`). Production API opens pass a per-migration token key to encrypt OAuth credentials at rest inside each migration DB.
 
 Do **not** rely on `go test ./...` for these; use the scripts when you want full validation.
 
