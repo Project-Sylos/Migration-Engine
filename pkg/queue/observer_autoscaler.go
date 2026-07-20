@@ -44,6 +44,11 @@ func (o *QueueObserver) SnapshotThroughputRate(queueName string) float64 {
 	}
 	o.mu.RLock()
 	defer o.mu.RUnlock()
+	// Prefer task completions for traversal (matches Comp / FS list ops); children-discovered
+	// EMA goes to 0 on leaf folders even while work continues.
+	if rate, ok := o.prevEMARates[queueName+"-tasks"]; ok && rate > 0 {
+		return rate
+	}
 	if rate, ok := o.prevEMARates[queueName]; ok && rate > 0 {
 		return rate
 	}

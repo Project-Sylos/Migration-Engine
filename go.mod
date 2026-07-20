@@ -5,10 +5,10 @@ go 1.26.0
 require (
 	codeberg.org/Sylos/Spectra v0.2.6
 	codeberg.org/Sylos/Sylos-FS v0.1.6
+	codeberg.org/Sylos/go-path-linter v0.0.0
+	github.com/google/uuid v1.6.0
 	github.com/marcboeker/go-duckdb v1.7.0
 )
-
-require github.com/google/uuid v1.6.0
 
 require (
 	github.com/apache/arrow/go/v14 v14.0.2 // indirect
@@ -45,4 +45,5 @@ require (
 replace (
 	codeberg.org/Sylos/Spectra => ../Spectra
 	codeberg.org/Sylos/Sylos-FS => ../Sylos-FS
+	codeberg.org/Sylos/go-path-linter => ../go-path-linter
 )

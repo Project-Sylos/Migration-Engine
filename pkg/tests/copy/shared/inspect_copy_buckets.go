@@ -41,6 +41,7 @@ func InspectCopyBuckets(dbPath string) error {
 		db.CopyStatusPending,
 		db.CopyStatusInProgress,
 		db.CopyStatusSuccessful,
+		db.CopyStatusAlreadyExisted,
 		db.CopyStatusSkipped,
 		db.CopyStatusFailed,
 	}

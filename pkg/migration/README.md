@@ -65,7 +65,7 @@ Examples: **`roots-set`**, **`filters-set`**, **`traversal-in-progress`**, **`tr
 
 **Soft suspend:** While phase is **`traversal-in-progress`** or **`copy-in-progress`**, **`Stop()`** requests a **coordinated suspend** (pause queues, drop non-leased pending work, drain in-flight tasks, flush seal/appender buffers, checkpoint, persist **`runtime_state_json.suspend_v1`**). The phase becomes **`traversal-suspended`** or **`copy-suspended`**. **Hard cancel** still uses **`ShutdownContext`** cancellation (abbreviated shutdown, not the full soft path).
 
-**Resume:** **`StartTraversal(cfg)`** from **`traversal-suspended`** reloads **`suspend_v1`** and restarts with **retry-style** queues (round 0, persisted max depth and batch sizing) so the frontier is rebuilt from DuckDB—not from restored in-memory buffers. **`StartCopy(cfg)`** from **`copy-suspended`** restores tuning from **`suspend_v1`**; pending depths and copy passes still come from **DB scans** in **`RunCopyPhase`**.
+**Resume:** **`StartTraversal(cfg)`** from **`traversal-suspended`** reloads **`suspend_v1`** and restarts with **retry-style** queues (round 0, persisted max depth and batch sizing) so the frontier is rebuilt from DuckDB—not from restored in-memory buffers. **`StartCopy(cfg)`** from **`copy-suspended`** restores tuning from **`suspend_v1`**; pending depths and copy passes still come from **DB scans** in **`RunCopyPhase`**. If phase is still **`*-in-progress`** but the run is not live, **`NormalizeDeadInProgressToSuspended()`** moves to the matching suspended phase so API resume can restart. Duplicate resume while **`IsLive()`** is a no-op at the API.
 
 ### Common methods
 

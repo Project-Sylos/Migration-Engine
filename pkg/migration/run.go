@@ -46,6 +46,9 @@ type MigrationConfig struct {
 
 	SrcService Service
 	DstService Service
+
+	// PathCheckTarget selects destination-name rules ("none", "auto", or provider id).
+	PathCheckTarget string
 }
 
 // RuntimeStats captures execution statistics at the end of a migration run.
@@ -199,7 +202,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	if runCtx == nil {
 		runCtx = context.Background()
 	}
-	asCtx := startAutoscaler(runCtx, cfg.Autoscaler, observer, database, srcQueue, dstQueue, cfg.SrcService, cfg.DstService)
+	asCtx := startAutoscaler(runCtx, cfg.Autoscaler, observer, database, srcQueue, dstQueue, cfg.SrcService, cfg.DstService, cfg.PathCheckTarget)
 	defer asCtx.stop()
 
 	// Set up stats channels for UDP logging (after queues are running)

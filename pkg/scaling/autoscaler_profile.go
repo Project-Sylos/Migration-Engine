@@ -14,6 +14,8 @@ func MapFSOperation(operation string) FSOperation {
 		return OpListChildren
 	case "CreateFolder":
 		return OpCreateFolder
+	case "DeleteNode", "DeleteBatch", "DeleteFile", "DeleteFolder":
+		return OpDelete
 	case "OpenRead":
 		return OpDownload
 	case "CreateFileUpload", "UploadFile", "OpenWrite":
@@ -34,6 +36,8 @@ func ClassifyFSOperation(operation string) FSOperation {
 		return OpCreateFolder
 	case "ListChildren":
 		return OpListChildren
+	case "DeleteNode", "DeleteBatch", "DeleteFile", "DeleteFolder":
+		return OpDelete
 	default:
 		return MapFSOperation(operation)
 	}

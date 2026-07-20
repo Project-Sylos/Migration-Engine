@@ -88,6 +88,37 @@ func TestActiveOperations(t *testing.T) {
 	if ops := ActiveOperations(queue.ScalingContext{Mode: queue.ScalingModeTraversal}); len(ops) != 1 || ops[0] != OpListChildren {
 		t.Fatalf("traversal ops=%v", ops)
 	}
+	if ops := ActiveOperations(queue.ScalingContext{Mode: queue.ScalingModeDelete}); len(ops) != 1 || ops[0] != OpDelete {
+		t.Fatalf("delete ops=%v", ops)
+	}
+	if ops := ActiveOperations(queue.ScalingContext{Mode: queue.ScalingModeDeleteRetry}); len(ops) != 1 || ops[0] != OpDelete {
+		t.Fatalf("delete-retry ops=%v", ops)
+	}
+}
+
+func TestResolveOperationProfileDeleteDropbox(t *testing.T) {
+	ctx := queue.ScalingContext{
+		QueueName:   "dst",
+		Mode:        queue.ScalingModeDelete,
+		SrcProvider: "local",
+		DstProvider: "dropbox",
+	}
+	op := ResolveOperationProfile(ctx)
+	if op.DefaultWorkers != 4 || op.MaxWorkers != 8 {
+		t.Fatalf("delete profile: %+v want DefaultWorkers=4 MaxWorkers=8", op)
+	}
+}
+
+func TestResolveOperationProfileDropboxListCap(t *testing.T) {
+	ctx := queue.ScalingContext{
+		QueueName:   "dst",
+		Mode:        queue.ScalingModeTraversal,
+		DstProvider: "dropbox",
+	}
+	op := ResolveOperationProfile(ctx)
+	if op.MaxWorkers != 5 || op.DefaultWorkers != 4 {
+		t.Fatalf("dropbox list: %+v want DefaultWorkers=4 MaxWorkers=5", op)
+	}
 }
 
 func TestResolveInitialWorkersCopyPass1(t *testing.T) {

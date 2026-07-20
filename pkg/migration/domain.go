@@ -4,11 +4,11 @@
 package migration
 
 import (
-	"slices"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -126,6 +126,9 @@ type Migration struct {
 	runtimeState         RuntimeState
 	logRing              *logRing
 	lastRunConfig        *Config
+	pathCheckSrcProvider string
+	pathCheckDstProvider string
+	pathCheckProfile     string
 	runCancel            context.CancelFunc
 	running              bool
 	softSuspendRequested atomic.Bool
@@ -199,6 +202,24 @@ func (m *Migration) setLastRunConfig(cfg Config) {
 	c := cfg
 	c.ShutdownContext = nil
 	m.lastRunConfig = &c
+	m.pathCheckSrcProvider = c.Source.ProviderID
+	m.pathCheckDstProvider = c.Destination.ProviderID
+	m.pathCheckProfile = c.PathCheckTarget
+}
+
+// SetPathCheckProviders records source/destination provider IDs and optional path-check profile
+// used to decide whether destination-name checks apply.
+func (m *Migration) SetPathCheckProviders(srcProvider, dstProvider, profile string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pathCheckSrcProvider = srcProvider
+	m.pathCheckDstProvider = dstProvider
+	if profile != "" {
+		m.pathCheckProfile = profile
+	}
 }
 
 // bindDB attaches the database to a migration that was created without one (pending). Called by the manager when the API passes the migration folder path.
@@ -294,6 +315,29 @@ func (m *Migration) IsLive() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.running
+}
+
+// NormalizeDeadInProgressToSuspended moves a non-live *-in-progress phase to the matching
+// *-suspended phase so resume can restart. No-op when live or when not in an in-progress phase.
+func (m *Migration) NormalizeDeadInProgressToSuspended() (bool, error) {
+	if m.IsLive() {
+		return false, nil
+	}
+	var target string
+	switch m.Phase() {
+	case PhaseTraversing:
+		target = PhaseTraversalSuspended
+	case PhaseCopying:
+		target = PhaseCopySuspended
+	case PhaseDeleting:
+		target = PhaseDeleteSuspended
+	default:
+		return false, nil
+	}
+	if err := m.transitionTo(target); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (m *Migration) transitionTo(next string) error {
@@ -456,6 +500,7 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 		Autoscaler:           cfg.Autoscaler,
 		SrcService:           cfg.Source,
 		DstService:           cfg.Destination,
+		PathCheckTarget:      cfg.PathCheckTarget,
 	})
 	if err != nil {
 		if errors.Is(err, ErrTraversalSoftSuspended) {
@@ -537,6 +582,7 @@ func (m *Migration) StartCopy(cfg Config) (queue.QueueStats, error) {
 		Autoscaler:           cfg.Autoscaler,
 		SrcService:           cfg.Source,
 		DstService:           cfg.Destination,
+		PathCheckTarget:      cfg.PathCheckTarget,
 	})
 	if err != nil {
 		if errors.Is(err, ErrCopySoftSuspended) {
@@ -646,6 +692,10 @@ func (m *Migration) StartDelete(cfg Config) (queue.QueueStats, error) {
 // PrepareDeleteRetry transitions to delete-in-progress before async retry.
 func (m *Migration) PrepareDeleteRetry() error {
 	phase := m.Phase()
+	if phase == PhaseDeleting {
+		// Already prepared (or left mid-run); allow idempotent re-prepare.
+		return nil
+	}
 	if phase != PhaseDeleteReview && phase != PhaseDeleteSuspended {
 		return fmt.Errorf("prepare delete retry requires awaiting-delete-review or delete-suspended phase")
 	}
@@ -716,6 +766,10 @@ func (m *Migration) RunDeleteRetry(cfg Config, opts CopyPhaseOptions) (queue.Que
 // Allowed from awaiting-traversal-review or traversal-suspended (resume after soft suspend).
 func (m *Migration) PrepareRetrySweep() error {
 	phase := m.Phase()
+	if phase == PhaseTraversing {
+		// Already prepared (or left mid-run); allow idempotent re-prepare.
+		return nil
+	}
 	if phase != PhaseTraversalReview && phase != PhaseTraversalSuspended {
 		return fmt.Errorf("prepare retry sweep requires awaiting-traversal-review or traversal-suspended phase")
 	}
@@ -789,6 +843,7 @@ func (m *Migration) RunRetrySweep(cfg Config, opts RetrySweepOptions) (RuntimeSt
 		Autoscaler:           cfg.Autoscaler,
 		SrcService:           cfg.Source,
 		DstService:           cfg.Destination,
+		PathCheckTarget:      cfg.PathCheckTarget,
 	})
 	if err != nil {
 		if errors.Is(err, ErrTraversalSoftSuspended) {
@@ -822,6 +877,10 @@ func (m *Migration) RunRetrySweep(cfg Config, opts RetrySweepOptions) (RuntimeSt
 // Allowed from awaiting-copy-review or copy-suspended.
 func (m *Migration) PrepareCopyRetry() error {
 	phase := m.Phase()
+	if phase == PhaseCopying {
+		// Already prepared (or left mid-run); allow idempotent re-prepare.
+		return nil
+	}
 	if phase != PhaseCopyReview && phase != PhaseCopySuspended {
 		return fmt.Errorf("prepare copy retry requires awaiting-copy-review or copy-suspended phase")
 	}
@@ -887,6 +946,7 @@ func (m *Migration) RunCopyRetry(cfg Config, opts CopyPhaseOptions) (queue.Queue
 		Autoscaler:           cfg.Autoscaler,
 		SrcService:           cfg.Source,
 		DstService:           cfg.Destination,
+		PathCheckTarget:      cfg.PathCheckTarget,
 	})
 	if err != nil {
 		if errors.Is(err, ErrCopySoftSuspended) {
@@ -1031,8 +1091,15 @@ func (m *Migration) BulkExclude(filter NodeQueryFilter, excluded bool) (PathRevi
 	return pathReviewResult(total, merged), nil
 }
 
-// GetPathReviewStats returns phase-aware review stats for API passthrough. Reads the canonical stats table; falls back to live recomputation only when the table is empty.
+// GetPathReviewStats returns phase-aware review stats for API passthrough.
 func (m *Migration) GetPathReviewStats() PathReviewStats {
+	return m.GetPathReviewStatsForView("")
+}
+
+// GetPathReviewStatsForView projects stats for a specific review UI. The
+// source-cleanup view uses eligible delete statuses even while the migration is
+// technically still in copy review.
+func (m *Migration) GetPathReviewStatsForView(view string) PathReviewStats {
 	if m.DB == nil {
 		return PathReviewStats{}
 	}
@@ -1041,7 +1108,26 @@ func (m *Migration) GetPathReviewStats() PathReviewStats {
 		return PathReviewStats{}
 	}
 	raw := ReviewStatsRawFromSnapshot(snap)
-	return raw.ToPathReviewStats(m.Phase())
+	phase := m.Phase()
+	if phase == PhaseDeleteReview {
+		if remainingSize, sizeErr := m.DB.GetRemainingSourceSizeAfterDelete(); sizeErr == nil {
+			raw.SizeSrc = remainingSize
+		}
+	}
+	stats := raw.ToPathReviewStats(phase)
+	if view == "source-cleanup" {
+		if counts, countsErr := m.DB.GetEligibleDeleteStatusCounts(); countsErr == nil {
+			stats.PendingCount = int(counts.Pending)
+			stats.FailedCount = int(counts.Failed)
+			stats.ExcludedCount = int(counts.Skipped)
+			stats.SuccessfulCount = int(counts.Deleted)
+			stats.PendingRetriesCount = 0
+			if phase == PhaseDeleteReview {
+				stats.PendingRetriesCount = int(counts.Pending)
+			}
+		}
+	}
+	return stats
 }
 
 func (m *Migration) GetTraversalSummary() (TraversalSummary, error) {
@@ -1082,7 +1168,7 @@ func (m *Migration) GetTraversalSummary() (TraversalSummary, error) {
 		DstExcluded: dstExcluded,
 		CopyStatusCounts: CopyStatusCounts{
 			Pending:    int(copyCounts.Pending),
-			Successful: int(copyCounts.Successful),
+			Successful: int(copyCounts.Complete()),
 			Failed:     int(copyCounts.Failed),
 			Skipped:    int(copyCounts.Skipped),
 		},
@@ -1196,8 +1282,8 @@ func (m *Migration) SkipNodeDelete(nodeID string) (PathReviewActionResult, error
 	if node == nil {
 		return PathReviewActionResult{}, fmt.Errorf("node %s not found in SRC", nodeID)
 	}
-	if node.CopyStatus != db.CopyStatusSuccessful {
-		return PathReviewActionResult{}, fmt.Errorf("skip delete requires copy_status successful")
+	if !db.CopyStatusIsComplete(node.CopyStatus) {
+		return PathReviewActionResult{}, fmt.Errorf("skip delete requires copy complete (successful or already_existed)")
 	}
 	n, deltas, err := m.store.setNodeDeleteStatusWithPropagation(nodeID, db.DeleteStatusSkipped)
 	if err != nil {
@@ -1219,8 +1305,8 @@ func (m *Migration) UnskipNodeDelete(nodeID string) (PathReviewActionResult, err
 	if node == nil {
 		return PathReviewActionResult{}, fmt.Errorf("node %s not found in SRC", nodeID)
 	}
-	if node.CopyStatus != db.CopyStatusSuccessful {
-		return PathReviewActionResult{}, fmt.Errorf("unskip delete requires copy_status successful")
+	if !db.CopyStatusIsComplete(node.CopyStatus) {
+		return PathReviewActionResult{}, fmt.Errorf("unskip delete requires copy complete (successful or already_existed)")
 	}
 	if node.DeleteStatus == db.DeleteStatusDeleted {
 		return PathReviewActionResult{}, fmt.Errorf("cannot unskip already deleted node")
@@ -1393,13 +1479,13 @@ func (m *Migration) SearchPathReviewItems(req SearchRequest) (SearchResult, erro
 	return m.store.searchPathReviewItems(req)
 }
 
-func (m *Migration) GetChildrenDiffsStats(path string, foldersOnly bool) (DiffsStats, error) {
+func (m *Migration) GetChildrenDiffsStats(path string, foldersOnly bool, includeDestinationOnly *bool) (DiffsStats, error) {
 	phase := m.Phase()
 	if phase != PhaseTraversalReview && phase != PhaseCopying && phase != PhaseCopyReview &&
 		phase != PhaseDeleting && phase != PhaseDeleteSuspended && phase != PhaseDeleteReview {
 		return DiffsStats{}, fmt.Errorf("diff stats requires review or later phase")
 	}
-	return m.store.getChildrenDiffsStats(path, foldersOnly)
+	return m.store.getChildrenDiffsStats(path, foldersOnly, includeDestinationOnly)
 }
 
 // GetSearchStats returns aggregate counts for the same filter as SearchPathReviewItems (query, path, status, foldersOnly).

@@ -11,6 +11,7 @@ type FSOperation string
 const (
 	OpListChildren FSOperation = "list_children"
 	OpCreateFolder FSOperation = "create_folder"
+	OpDelete       FSOperation = "delete"
 	OpDownload     FSOperation = "download"
 	OpUpload       FSOperation = "upload"
 )
@@ -36,8 +37,10 @@ type OperationProfile struct {
 }
 
 // ProviderOperationProfiles maps operations to profiles for one provider.
+// Default is used for any operation not present in Ops (single worker count for everything).
 type ProviderOperationProfiles struct {
 	ProviderID string
+	Default    OperationProfile
 	Ops        map[FSOperation]OperationProfile
 }
 
@@ -47,6 +50,9 @@ var operationProfiles = map[string]ProviderOperationProfiles{
 	"local":        buildLocalOperationProfiles(),
 	"google_drive": buildGoogleDriveOperationProfiles(),
 	"dropbox":      buildDropboxOperationProfiles(),
+	"onedrive":     buildOneDriveOperationProfiles(),
+	"sharepoint":   buildSharePointOperationProfiles(),
+	"box":          buildBoxOperationProfiles(),
 }
 
 func genericListProfile() OperationProfile {
@@ -85,32 +91,37 @@ func localListProfile() OperationProfile {
 	}
 }
 
+// buildOps returns op overrides for a provider. Lookup falls back to Default for missing keys.
+func buildOps(overrides map[FSOperation]OperationProfile) map[FSOperation]OperationProfile {
+	if len(overrides) == 0 {
+		return nil
+	}
+	out := make(map[FSOperation]OperationProfile, len(overrides))
+	for op, prof := range overrides {
+		out[op] = prof
+	}
+	return out
+}
+
 func buildGenericOperationProfiles() ProviderOperationProfiles {
-	transfer := OperationProfile{
+	def := OperationProfile{
 		MinWorkers: 1, DefaultWorkers: 8, MaxWorkers: 32,
 		MaxInterOpDelay: 5 * time.Second,
 	}
 	return ProviderOperationProfiles{
 		ProviderID: "generic",
-		Ops: map[FSOperation]OperationProfile{
+		Default:    def,
+		Ops: buildOps(map[FSOperation]OperationProfile{
 			OpListChildren: genericListProfile(),
-			OpCreateFolder: transfer,
-			OpDownload:     transfer,
-			OpUpload:       transfer,
-		},
+		}),
 	}
 }
 
 func buildSpectraOperationProfiles() ProviderOperationProfiles {
-	uncapped := spectraUncappedOp()
 	return ProviderOperationProfiles{
 		ProviderID: "spectra",
-		Ops: map[FSOperation]OperationProfile{
-			OpListChildren: uncapped,
-			OpCreateFolder: uncapped,
-			OpDownload:     uncapped,
-			OpUpload:       uncapped,
-		},
+		Default:    spectraUncappedOp(),
+		Ops:        nil,
 	}
 }
 
@@ -126,22 +137,24 @@ func spectraUncappedOp() OperationProfile {
 }
 
 func buildLocalOperationProfiles() ProviderOperationProfiles {
-	transfer := OperationProfile{
+	def := OperationProfile{
 		MinWorkers: 1, DefaultWorkers: 8, MaxWorkers: 64,
 		MaxInterOpDelay: 2 * time.Second,
 	}
 	return ProviderOperationProfiles{
 		ProviderID: "local",
-		Ops: map[FSOperation]OperationProfile{
+		Default:    def,
+		Ops: buildOps(map[FSOperation]OperationProfile{
 			OpListChildren: localListProfile(),
-			OpCreateFolder: transfer,
-			OpDownload:     transfer,
-			OpUpload:       transfer,
-		},
+		}),
 	}
 }
 
 func buildGoogleDriveOperationProfiles() ProviderOperationProfiles {
+	def := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 8, MaxWorkers: 16,
+		MaxInterOpDelay: 5 * time.Second,
+	}
 	list := OperationProfile{
 		MinWorkers: 1, DefaultWorkers: 6, MaxWorkers: 16,
 		MaxInterOpDelay:     5 * time.Second,
@@ -161,24 +174,29 @@ func buildGoogleDriveOperationProfiles() ProviderOperationProfiles {
 		MinWorkers: 1, DefaultWorkers: 4, MaxWorkers: 12,
 		MaxInterOpDelay: 5 * time.Second,
 	}
-	transfer := OperationProfile{
-		MinWorkers: 1, DefaultWorkers: 8, MaxWorkers: 16,
+	del := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 4, MaxWorkers: 8,
 		MaxInterOpDelay: 5 * time.Second,
 	}
 	return ProviderOperationProfiles{
 		ProviderID: "google_drive",
-		Ops: map[FSOperation]OperationProfile{
+		Default:    def,
+		Ops: buildOps(map[FSOperation]OperationProfile{
 			OpListChildren: list,
 			OpCreateFolder: createFolder,
-			OpDownload:     transfer,
-			OpUpload:       transfer,
-		},
+			OpDelete:       del,
+		}),
 	}
 }
 
 func buildDropboxOperationProfiles() ProviderOperationProfiles {
+	def := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 8, MaxWorkers: 16,
+		MaxInterOpDelay: 5 * time.Second,
+	}
+	// Dropbox list quotas are harsh; keep list below create/delete (4/8).
 	list := OperationProfile{
-		MinWorkers: 1, DefaultWorkers: 6, MaxWorkers: 16,
+		MinWorkers: 1, DefaultWorkers: 4, MaxWorkers: 5,
 		MaxInterOpDelay:     5 * time.Second,
 		MinListPageSize:     20,
 		DefaultListPageSize: 100,
@@ -192,22 +210,135 @@ func buildDropboxOperationProfiles() ProviderOperationProfiles {
 		MaxRefillBatch:      1000,
 		MinRefillBatch:      100,
 	}
-	createFolder := OperationProfile{
-		MinWorkers: 1, DefaultWorkers: 4, MaxWorkers: 12,
-		MaxInterOpDelay: 5 * time.Second,
-	}
-	transfer := OperationProfile{
-		MinWorkers: 1, DefaultWorkers: 8, MaxWorkers: 16,
+	mutate := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 4, MaxWorkers: 8,
 		MaxInterOpDelay: 5 * time.Second,
 	}
 	return ProviderOperationProfiles{
 		ProviderID: "dropbox",
-		Ops: map[FSOperation]OperationProfile{
+		Default:    def,
+		Ops: buildOps(map[FSOperation]OperationProfile{
+			OpListChildren: list,
+			OpCreateFolder: mutate,
+			OpDelete:       mutate,
+		}),
+	}
+}
+
+func buildOneDriveOperationProfiles() ProviderOperationProfiles {
+	def := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 8, MaxWorkers: 16,
+		MaxInterOpDelay: 5 * time.Second,
+	}
+	list := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 6, MaxWorkers: 12,
+		MaxInterOpDelay:     5 * time.Second,
+		MinListPageSize:     20,
+		DefaultListPageSize: 200,
+		MaxListPageSize:     200,
+		ListPageStep:        20,
+		PreferLargePages:    false,
+		DefaultLeaseBatch:   100,
+		MaxLeaseBatch:       500,
+		MinLeaseBatch:       25,
+		DefaultRefillBatch:  500,
+		MaxRefillBatch:      1000,
+		MinRefillBatch:      100,
+	}
+	createFolder := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 4, MaxWorkers: 12,
+		MaxInterOpDelay: 5 * time.Second,
+	}
+	del := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 4, MaxWorkers: 8,
+		MaxInterOpDelay: 5 * time.Second,
+	}
+	return ProviderOperationProfiles{
+		ProviderID: "onedrive",
+		Default:    def,
+		Ops: buildOps(map[FSOperation]OperationProfile{
 			OpListChildren: list,
 			OpCreateFolder: createFolder,
-			OpDownload:     transfer,
-			OpUpload:       transfer,
-		},
+			OpDelete:       del,
+		}),
+	}
+}
+
+func buildSharePointOperationProfiles() ProviderOperationProfiles {
+	def := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 6, MaxWorkers: 12,
+		MaxInterOpDelay: 5 * time.Second,
+	}
+	// SharePoint Online RU is shared tenant-wide; stay more conservative than OneDrive.
+	list := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 4, MaxWorkers: 8,
+		MaxInterOpDelay:     5 * time.Second,
+		MinListPageSize:     20,
+		DefaultListPageSize: 200,
+		MaxListPageSize:     200,
+		ListPageStep:        20,
+		PreferLargePages:    false,
+		DefaultLeaseBatch:   100,
+		MaxLeaseBatch:       500,
+		MinLeaseBatch:       25,
+		DefaultRefillBatch:  500,
+		MaxRefillBatch:      1000,
+		MinRefillBatch:      100,
+	}
+	mutate := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 4, MaxWorkers: 6,
+		MaxInterOpDelay: 5 * time.Second,
+	}
+	return ProviderOperationProfiles{
+		ProviderID: "sharepoint",
+		Default:    def,
+		Ops: buildOps(map[FSOperation]OperationProfile{
+			OpListChildren: list,
+			OpCreateFolder: mutate,
+			OpDelete:       mutate,
+		}),
+	}
+}
+
+func buildBoxOperationProfiles() ProviderOperationProfiles {
+	// Box: ~1000 req/min/user general, ~240 upload/min/user — keep upload concurrency modest.
+	def := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 6, MaxWorkers: 12,
+		MaxInterOpDelay: 5 * time.Second,
+	}
+	list := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 6, MaxWorkers: 12,
+		MaxInterOpDelay:     5 * time.Second,
+		MinListPageSize:     100,
+		DefaultListPageSize: 1000,
+		MaxListPageSize:     1000,
+		ListPageStep:        100,
+		PreferLargePages:    true,
+		DefaultLeaseBatch:   100,
+		MaxLeaseBatch:       500,
+		MinLeaseBatch:       25,
+		DefaultRefillBatch:  500,
+		MaxRefillBatch:      1000,
+		MinRefillBatch:      100,
+	}
+	upload := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 3, MaxWorkers: 4,
+		MaxInterOpDelay: 5 * time.Second,
+	}
+	mutate := OperationProfile{
+		MinWorkers: 1, DefaultWorkers: 4, MaxWorkers: 8,
+		MaxInterOpDelay: 5 * time.Second,
+	}
+	return ProviderOperationProfiles{
+		ProviderID: "box",
+		Default:    def,
+		Ops: buildOps(map[FSOperation]OperationProfile{
+			OpListChildren: list,
+			OpUpload:       upload,
+			OpDownload:     upload,
+			OpCreateFolder: mutate,
+			OpDelete:       mutate,
+		}),
 	}
 }
 
@@ -227,12 +358,25 @@ func LookupProviderOperations(providerID, serviceName string) ProviderOperationP
 }
 
 // LookupOperationProfile returns the profile for one operation.
+// Order: provider Ops override → provider Default → generic Ops override → generic Default.
 func LookupOperationProfile(providerID, serviceName string, op FSOperation) OperationProfile {
 	pop := LookupProviderOperations(providerID, serviceName)
 	if prof, ok := pop.Ops[op]; ok {
 		return prof
 	}
-	return operationProfiles["generic"].Ops[op]
+	if profileHasWorkerBounds(pop.Default) {
+		return pop.Default
+	}
+	generic := operationProfiles["generic"]
+	if prof, ok := generic.Ops[op]; ok {
+		return prof
+	}
+	return generic.Default
+}
+
+func profileHasWorkerBounds(p OperationProfile) bool {
+	return p.MinWorkers != 0 || p.DefaultWorkers != 0 || p.MaxWorkers != 0 || p.MaxInterOpDelay != 0 ||
+		p.MinListPageSize != 0 || p.DefaultListPageSize != 0 || p.DefaultLeaseBatch != 0
 }
 
 // ComposePipelineMin merges src and dst legs of a copy pipeline; 0 caps are uncapped (minPositive).

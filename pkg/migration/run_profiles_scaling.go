@@ -58,7 +58,7 @@ func queueSizingForScalingContext(ctx queue.ScalingContext, suspend *RuntimeSusp
 	return nil
 }
 
-func wireQueueScalingContext(srcQ, dstQ, copyQ *queue.Queue, srcService, dstService Service, sameBackend bool) {
+func wireQueueScalingContext(srcQ, dstQ, copyQ *queue.Queue, srcService, dstService Service, sameBackend bool, pathCheckProfile string) {
 	srcGroup := scaling.ResolveGroupID(srcService.BackendGroupID, "", "src")
 	dstGroup := scaling.ResolveGroupID(dstService.BackendGroupID, "", "dst")
 	if sameBackend {
@@ -68,11 +68,14 @@ func wireQueueScalingContext(srcQ, dstQ, copyQ *queue.Queue, srcService, dstServ
 	dstProv := dstService.ProviderID
 	if srcQ != nil {
 		srcQ.SetScalingMigrationContext(srcProv, dstProv, srcGroup, dstGroup)
+		srcQ.SetPathCheckProfile(pathCheckProfile)
 	}
 	if dstQ != nil {
 		dstQ.SetScalingMigrationContext(srcProv, dstProv, srcGroup, dstGroup)
+		dstQ.SetPathCheckProfile(pathCheckProfile)
 	}
 	if copyQ != nil {
 		copyQ.SetScalingMigrationContext(srcProv, dstProv, "queue:copy", "queue:copy")
+		copyQ.SetPathCheckProfile(pathCheckProfile)
 	}
 }

@@ -23,10 +23,11 @@ const (
 
 // SrcNodeMeta holds Depth and CopyStatus for an SRC node; used by DST tasks at completion to avoid per-child DB lookups.
 type SrcNodeMeta struct {
-	Depth      int
+	Depth           int
 	TraversalStatus string
-	CopyStatus string
-	DeleteStatus string
+	CopyStatus      string
+	DeleteStatus    string
+	GPLState        string
 }
 
 // RetryDstChild holds DST child node meta for retry DST cleanup; populated at pull to avoid per-child DB lookups.
@@ -73,7 +74,16 @@ type TaskBase struct {
 	SrcLogicalParentPath string // SRC parent path at pull time
 	SrcTraversalStatus   string // SRC node traversal_status at pull time (preserved when writing copy_status events)
 	BytesTransferred   int64  // Bytes transferred for file copy tasks
-	DstParentID        string // Destination parent folder ID for creation
+	DstParentID        string // Destination parent folder ServiceID for FS create
+	DstParentNodeID    string // Destination parent folder internal UUID (id_map)
+	ResolvedDstName    string // Basename/segment from accepted path_events (empty = use original name)
+	ParentGPLState     string // Parent gpl_state JSON (GPL cascade)
+	GPLState           string // This node's gpl_state JSON (GPL cascade)
+	// Transfer checkpoint (file copy); copy_status stays pending while Offset > 0.
+	XferOffset   int64
+	XferSrcSize  int64
+	XferSrcMTime string
+	XferDstRef   string
 }
 
 // ChildResult represents a discovered child node with its traversal status.
@@ -83,7 +93,7 @@ type ChildResult struct {
 	Status        string       // "pending", "successful", "missing", "not_on_src"
 	IsFile        bool         // true if this is a file, false if folder
 	SrcID         string       // ULID of corresponding SRC node (for DST nodes only, set during matching)
-	SrcCopyStatus string       // Copy status to update on SRC node (if SrcID is set and match found): "pending" or "successful", empty if no update needed
+		SrcCopyStatus string       // Copy status to update on SRC node (if SrcID is set and match found): "pending", "already_existed", empty if no update needed
 }
 
 // Identifier returns the unique identifier for this task (absolute path).

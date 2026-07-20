@@ -4,6 +4,8 @@ The **db** package is the persistence layer for the Migration Engine. It owns th
 
 Traversal and copy **current status** for each node are derived from append-only **`src_status_events`** / **`dst_status_events`** (latest event per `id` via `arg_max`), not from columns on `src_nodes` / `dst_nodes` (those tables store path, depth, type, size, etc.).
 
+Node **`id`** is a UUID v5 minted from `(side, parent_id, type, basename)` ([`MintNodeID`](node_id.go)). SRC↔DST pairing uses append-only **`id_map`**. Path cleaning / remaps use append-only **`path_events`**; compact GPL findings ride on **`src_nodes.gpl_state`**. Joins use `parent_id` / `id_map` — not path hashes.
+
 Seal: **`SealLevel`** bulk-appends node rows and writes per-depth stats; when **`Options.SealBuffer`** is set, seal payloads are flushed asynchronously (**`seal_buffer.go`**).
 
 ---

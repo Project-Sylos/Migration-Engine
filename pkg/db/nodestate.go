@@ -4,14 +4,13 @@
 package db
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"strings"
 	"time"
 )
 
-// NormalizeRootRelativePath returns a root-relative path with no "//" so SRC/DST path_hash joins match.
+// NormalizeRootRelativePath returns a root-relative path with no "//".
 // Root is "/"; children are "/name", "/name/child". Collapses any "//" to "/".
+// Used for display/open paths only — not as a join key.
 func NormalizeRootRelativePath(path string) string {
 	if path == "" {
 		return "/"
@@ -25,6 +24,15 @@ func NormalizeRootRelativePath(path string) string {
 	return path
 }
 
+// NormalizeQueueNodeType coerces a node type to the structural values stored in queue tables.
+// Cloud browse tags (team_folder, shared_folder, …) must not be persisted on src_nodes/dst_nodes.
+func NormalizeQueueNodeType(typ string) string {
+	if typ == NodeTypeFile {
+		return NodeTypeFile
+	}
+	return NodeTypeFolder
+}
+
 // NormalizeSubtreeRootPathForPropagation normalizes a failed folder path so subtree updates match src_nodes.path
 // (root-relative slashes, trim trailing slash except "/").
 func NormalizeSubtreeRootPathForPropagation(path string) string {
@@ -36,14 +44,15 @@ func NormalizeSubtreeRootPathForPropagation(path string) string {
 }
 
 // NodeState is the in-memory representation of a row in src_nodes or dst_nodes.
-// Path and parent_path are the join keys between SRC and DST.
+// ID is a UUID v5 (MintNodeID). SRC↔DST pairing uses id_map; parent/child uses parent_id.
+// Path/parent_path are display and open-path fields only.
 type NodeState struct {
-	ID               string // Internal ULID-like id (deterministic from queueType, nodeType, path)
-	ServiceID        string // FS id
+	ID               string // UUID v5 internal id (MintNodeID)
+	ServiceID        string // FS handle (cloud native id, or local path)
 	ParentID         string // Parent's internal id
 	ParentServiceID  string
-	Path             string // Join key with other table
-	ParentPath       string // Join key for children
+	Path             string // Display / open path (immutable after insert)
+	ParentPath       string // Display parent path
 	Name             string // Display name (for task/UI)
 	Type             string // "folder" or "file"
 	Size             int64
@@ -52,10 +61,12 @@ type NodeState struct {
 	TraversalStatus  string // pending, successful, failed, not_on_src (dst)
 	CopyStatus       string // pending, in_progress, successful, failed (src)
 	DeleteStatus     string // pending, deleted, failed (src)
+	GPLStatus        string // pending, successful, failed (path-scoped cascade)
 	Excluded         bool
 	Errors           string // JSON placeholder for log refs
 	Status           string // Alias for TraversalStatus (used by queue taskToNodeState)
-	SrcID            string // Optional: corresponding SRC node id (join is by path; used during seeding for DST root)
+	SrcID            string // Optional: corresponding SRC node id (DST seeding / compare)
+	GPLState         string // Compact JSON (SRC only); empty for DST
 }
 
 // NodeMeta is a subset of NodeState for batch lookups.
@@ -77,11 +88,15 @@ type InsertOperation struct {
 }
 
 // FetchResult is one row from a keyset list (id + full state).
-// DstParentServiceID is populated by ListNodesCopyKeyset when joining dst_nodes on parent path_hash.
+// DstParentServiceID is populated by ListNodesCopyKeyset via id_map → dst_nodes.
 type FetchResult struct {
 	Key                string
 	State              *NodeState
-	DstParentServiceID string // DST parent's ServiceID from path_hash join (copy pull only)
+	DstParentServiceID string // DST parent's ServiceID from id_map join (copy pull only)
+	DstParentNodeID    string // DST parent's internal id from id_map
+	ResolvedDstPath    string // Effective destination path/segment from path_events (copy pull)
+	DstMappedID        string // Current dst_internal_id from id_map for this src id (copy pull)
+	ParentGPLState     string // Parent src_nodes.gpl_state (GPL cascade pull)
 }
 
 // WriteOperation is an operation that can be buffered and flushed via the writer.
@@ -95,6 +110,7 @@ type StatusEvent struct {
 	TraversalStatus  string // nullable in DB
 	CopyStatus       string // src only; empty for dst
 	DeleteStatus     string // src only; empty for dst
+	GPLStatus        string // path-scoped cascade; empty means "unchanged" for arg_max filters
 	EventTime        int64
 	Depth            int
 	ErrorLogID       string // links to logs.id when this event records a task failure
@@ -107,6 +123,7 @@ type StatusEvent struct {
 	PrevTraversalStatus string
 	PrevCopyStatus      string
 	PrevDeleteStatus    string
+	PrevGPLStatus       string
 }
 
 // TaskErrorRecord is one buffered row for task_errors (queue_type, phase, node_id, message, attempts, path).
@@ -168,7 +185,7 @@ func (o *BatchInsertOperation) flush(w *Writer) error {
 			return err
 		}
 		for _, s := range srcNodes {
-			ev := &StatusEvent{ID: s.ID, TraversalStatus: s.TraversalStatus, CopyStatus: s.CopyStatus, EventTime: eventTime, Depth: s.Depth}
+			ev := &StatusEvent{ID: s.ID, TraversalStatus: s.TraversalStatus, CopyStatus: s.CopyStatus, DeleteStatus: s.DeleteStatus, EventTime: eventTime, Depth: s.Depth}
 			if err := w.InsertStatusEvent("SRC", ev); err != nil {
 				return err
 			}
@@ -188,35 +205,14 @@ func (o *BatchInsertOperation) flush(w *Writer) error {
 	return nil
 }
 
-// PathHash returns a deterministic 32-char hex hash of path for use as an index key.
-func PathHash(path string) string {
-	sum := sha256.Sum256([]byte(path))
-	return hex.EncodeToString(sum[:16])
-}
-
-// NodeInsertPathFields returns normalized path columns and hashes for node table inserts.
-// Depth-0 rows keep parent_path as stored (typically "" for roots). Deeper rows normalize
-// parent_path so "" and "/" both resolve to the root join key PathHash("/").
-func NodeInsertPathFields(path, parentPath string, depth int) (normPath, normParentPath, pathHash, parentPathHash string) {
+// NodeInsertPathFields returns normalized path columns for node table inserts.
+// Depth-0 rows keep parent_path as stored (typically "" for roots). Deeper rows normalize parent_path.
+func NodeInsertPathFields(path, parentPath string, depth int) (normPath, normParentPath string) {
 	normPath = NormalizeRootRelativePath(path)
 	if depth == 0 {
 		normParentPath = parentPath
 	} else {
 		normParentPath = NormalizeRootRelativePath(parentPath)
 	}
-	pathHash = PathHash(normPath)
-	parentPathHash = PathHash(normParentPath)
-	return normPath, normParentPath, pathHash, parentPathHash
-}
-
-// DeterministicNodeID returns a stable id from (queueType, nodeType, path) for race-safe deduplication.
-func DeterministicNodeID(queueType, nodeType, path string) string {
-	h := sha256.New()
-	h.Write([]byte(queueType))
-	h.Write([]byte("\x00"))
-	h.Write([]byte(nodeType))
-	h.Write([]byte("\x00"))
-	h.Write([]byte(path))
-	sum := h.Sum(nil)
-	return hex.EncodeToString(sum[:16]) // 32 hex chars
+	return normPath, normParentPath
 }

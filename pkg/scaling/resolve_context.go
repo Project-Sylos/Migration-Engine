@@ -19,6 +19,8 @@ func ActiveOperations(ctx queue.ScalingContext) []FSOperation {
 		return []FSOperation{OpDownload, OpUpload}
 	case queue.ScalingModeTraversal, queue.ScalingModeRetry:
 		return []FSOperation{OpListChildren}
+	case queue.ScalingModeDelete, queue.ScalingModeDeleteRetry:
+		return []FSOperation{OpDelete}
 	default:
 		return nil
 	}
@@ -46,6 +48,8 @@ func ResolveOperationProfile(ctx queue.ScalingContext) OperationProfile {
 		srcDL := LookupOperationProfile(ctx.SrcProvider, "", OpDownload)
 		dstUL := LookupOperationProfile(ctx.DstProvider, "", OpUpload)
 		return ComposePipelineMin(srcDL, dstUL)
+	case queue.ScalingModeDelete, queue.ScalingModeDeleteRetry:
+		return LookupOperationProfile(ctx.DstProvider, "", OpDelete)
 	default:
 		return LookupOperationProfile("generic", "", OpListChildren)
 	}

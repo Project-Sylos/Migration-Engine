@@ -35,6 +35,7 @@ func (m *memActuator) ScalingContext() queue.ScalingContext {
 }
 func (m *memActuator) ScalingSrcAdapter() fstypes.FSAdapter { return nil }
 func (m *memActuator) ScalingDstAdapter() fstypes.FSAdapter { return nil }
+func (m *memActuator) ReleaseInFlightOnThrottle()           {}
 
 func TestStepDownMemoryKnobs(t *testing.T) {
 	act := &memActuator{lease: 1000, refill: 8000}

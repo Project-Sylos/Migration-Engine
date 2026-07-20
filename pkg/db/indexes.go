@@ -10,7 +10,7 @@ import (
 )
 
 // EnsureNodeTableIndexes creates stable lookup indexes on the given node table
-// (e.g. "src_nodes", "dst_nodes") for path_hash, parent_path_hash, and depth.
+// (e.g. "src_nodes", "dst_nodes") for parent_id and depth.
 //
 // Idempotent for create/drop operations.
 func EnsureNodeTableIndexes(db *DB, table string) error {
@@ -23,9 +23,9 @@ func EnsureNodeTableIndexes(db *DB, table string) error {
 		name   string
 		column string
 	}{
-		{table + "_path_hash_idx", "path_hash"},
-		{table + "_parent_path_hash_idx", "parent_path_hash"},
+		{table + "_parent_id_idx", "parent_id"},
 		{table + "_depth_idx", "depth"},
+		{table + "_path_idx", "path"},
 	}
 	for _, idx := range indexes {
 		_, err := conn.Exec("CREATE INDEX IF NOT EXISTS " + idx.name + " ON " + table + " (" + idx.column + ")")
@@ -65,7 +65,7 @@ func hasIndexLower(present map[string]struct{}, indexName string) bool {
 }
 
 // EnsureNodeTableIndexesIfMissing creates only secondary node indexes that are absent from the catalog.
-// Same three indexes as EnsureNodeTableIndexes (join keys + depth). Falls back to EnsureNodeTableIndexes if duckdb_indexes is unavailable.
+// Same indexes as EnsureNodeTableIndexes (parent_id + depth). Falls back to EnsureNodeTableIndexes if duckdb_indexes is unavailable.
 func EnsureNodeTableIndexesIfMissing(db *DB, table string) error {
 	conn, err := db.GetDB()
 	if err != nil {
@@ -79,9 +79,9 @@ func EnsureNodeTableIndexesIfMissing(db *DB, table string) error {
 		name   string
 		column string
 	}{
-		{table + "_path_hash_idx", "path_hash"},
-		{table + "_parent_path_hash_idx", "parent_path_hash"},
+		{table + "_parent_id_idx", "parent_id"},
 		{table + "_depth_idx", "depth"},
+		{table + "_path_idx", "path"},
 	}
 	for _, idx := range indexes {
 		if hasIndexLower(present, idx.name) {
@@ -102,9 +102,9 @@ func DropNodeTableIndexes(db *DB, table string) error {
 		return err
 	}
 	for _, name := range []string{
-		table + "_path_hash_idx",
-		table + "_parent_path_hash_idx",
+		table + "_parent_id_idx",
 		table + "_depth_idx",
+		table + "_path_idx",
 	} {
 		if _, err := conn.Exec("DROP INDEX IF EXISTS " + name); err != nil {
 			return err

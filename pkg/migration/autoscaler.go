@@ -75,9 +75,10 @@ func startAutoscaler(
 	database *db.DB,
 	srcQueue, dstQueue *queue.Queue,
 	srcService, dstService Service,
+	pathCheckProfile string,
 ) *autoscalerRunContext {
 	same := sameBackend(srcService.Adapter, dstService.Adapter)
-	wireQueueScalingContext(srcQueue, dstQueue, nil, srcService, dstService, same)
+	wireQueueScalingContext(srcQueue, dstQueue, nil, srcService, dstService, same, pathCheckProfile)
 	return startAutoscalerActuators(ctx, cfg, observer, database, map[string]scaling.QueueActuator{
 		"src": srcQueue,
 		"dst": dstQueue,
@@ -94,8 +95,9 @@ func startCopyAutoscaler(
 	database *db.DB,
 	copyQueue *queue.Queue,
 	srcService, dstService Service,
+	pathCheckProfile string,
 ) *autoscalerRunContext {
-	wireQueueScalingContext(nil, nil, copyQueue, srcService, dstService, false)
+	wireQueueScalingContext(nil, nil, copyQueue, srcService, dstService, false, pathCheckProfile)
 	return startAutoscalerActuators(ctx, cfg, observer, database, map[string]scaling.QueueActuator{
 		"copy": copyQueue,
 	}, []autoscalerQueueSpec{

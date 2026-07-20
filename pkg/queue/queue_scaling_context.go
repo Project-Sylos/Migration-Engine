@@ -20,6 +20,16 @@ func (q *Queue) SetScalingMigrationContext(srcProvider, dstProvider, srcGroupID,
 	q.scalingDstGroupID = dstGroupID
 }
 
+// SetPathCheckProfile sets the destination-name check profile ("none", "auto", or a provider id).
+func (q *Queue) SetPathCheckProfile(profile string) {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.pathCheckProfile = profile
+}
+
 // ScalingContext returns the current scaling context for autoscaler profile resolution.
 func (q *Queue) ScalingContext() ScalingContext {
 	if q == nil {

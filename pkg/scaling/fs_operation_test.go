@@ -9,6 +9,10 @@ func TestMapFSOperation(t *testing.T) {
 	cases := map[string]FSOperation{
 		"ListChildren":     OpListChildren,
 		"CreateFolder":     OpCreateFolder,
+		"DeleteNode":       OpDelete,
+		"DeleteBatch":      OpDelete,
+		"DeleteFile":       OpDelete,
+		"DeleteFolder":     OpDelete,
 		"OpenRead":         OpDownload,
 		"CreateFileUpload": OpUpload,
 		"UploadFile":       OpUpload,

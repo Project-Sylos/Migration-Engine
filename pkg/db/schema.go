@@ -8,6 +8,8 @@ const (
 	tableDstNodes         = "dst_nodes"
 	tableSrcStatusEvents  = "src_status_events"
 	tableDstStatusEvents  = "dst_status_events"
+	tablePathEvents       = "path_events"
+	tableIDMap            = "id_map"
 	tableSrcStats         = "src_stats"
 	tableDstStats         = "dst_stats"
 	tableStats            = "stats" // universal key/count table for canonical review stats
@@ -16,6 +18,8 @@ const (
 	// TableSrcStatusEvents / TableDstStatusEvents are status event table names.
 	TableSrcStatusEvents = "src_status_events"
 	TableDstStatusEvents = "dst_status_events"
+	TablePathEvents      = "path_events"
+	TableIDMap           = "id_map"
 	// TableFSCredentialBinding holds per-side connection id, optional creds file path, and serialized root folder for API rehydration.
 	TableFSCredentialBinding = "fs_credential_binding"
 	// TableOAuthCredentials stores OAuth refresh token JSON keyed by connection id.
@@ -24,21 +28,47 @@ const (
 )
 
 // nodeTableDDL returns CREATE TABLE for src_nodes or dst_nodes (metadata only; no status columns).
+// src_nodes includes nullable transfer checkpoint columns (xfer_*) and gpl_state; dst_nodes does not.
 func nodeTableDDL(table string) string {
-	return `CREATE TABLE IF NOT EXISTS ` + table + ` (
+	base := `CREATE TABLE IF NOT EXISTS ` + table + ` (
 		id VARCHAR PRIMARY KEY,
 		service_id VARCHAR,
 		parent_id VARCHAR,
 		parent_service_id VARCHAR,
 		path VARCHAR,
 		parent_path VARCHAR,
-		path_hash VARCHAR,
-		parent_path_hash VARCHAR,
 		type VARCHAR,
 		size BIGINT,
 		mtime VARCHAR,
-		depth INTEGER NOT NULL
+		depth INTEGER NOT NULL`
+	if table == tableSrcNodes {
+		base += `,
+		` + colXferOffset + ` BIGINT,
+		` + colXferSrcSize + ` BIGINT,
+		` + colXferSrcMTime + ` VARCHAR,
+		` + colXferDstRef + ` VARCHAR,
+		gpl_state VARCHAR`
+	}
+	return base + `
 	)`
+}
+
+// Transfer checkpoint columns are nullable; copy_status stays pending while a checkpoint exists.
+// ensureSrcTransferCheckpointColumns ALTERs older DBs that were created before these columns existed.
+const (
+	colXferOffset   = "xfer_offset"
+	colXferSrcSize  = "xfer_src_size"
+	colXferSrcMTime = "xfer_src_mtime"
+	colXferDstRef   = "xfer_dst_ref"
+)
+
+func srcNodesTransferCheckpointAlters() []string {
+	return []string{
+		`ALTER TABLE ` + tableSrcNodes + ` ADD COLUMN IF NOT EXISTS ` + colXferOffset + ` BIGINT`,
+		`ALTER TABLE ` + tableSrcNodes + ` ADD COLUMN IF NOT EXISTS ` + colXferSrcSize + ` BIGINT`,
+		`ALTER TABLE ` + tableSrcNodes + ` ADD COLUMN IF NOT EXISTS ` + colXferSrcMTime + ` VARCHAR`,
+		`ALTER TABLE ` + tableSrcNodes + ` ADD COLUMN IF NOT EXISTS ` + colXferDstRef + ` VARCHAR`,
+	}
 }
 
 // srcStatusEventsTableDDL returns CREATE TABLE for append-only source status events.
@@ -48,6 +78,7 @@ func srcStatusEventsTableDDL() string {
 		traversal_status VARCHAR,
 		copy_status VARCHAR,
 		delete_status VARCHAR,
+		gpl_status VARCHAR,
 		event_time BIGINT NOT NULL,
 		depth INTEGER NOT NULL,
 		error_log_id VARCHAR
@@ -59,6 +90,7 @@ func dstStatusEventsTableDDL() string {
 	return `CREATE TABLE IF NOT EXISTS ` + tableDstStatusEvents + ` (
 		id VARCHAR NOT NULL,
 		traversal_status VARCHAR,
+		gpl_status VARCHAR,
 		event_time BIGINT NOT NULL,
 		depth INTEGER NOT NULL,
 		error_log_id VARCHAR
@@ -163,5 +195,39 @@ func oauthCredentialsTableDDL() string {
 		creds_json VARCHAR NOT NULL,
 		updated_at TIMESTAMP NOT NULL
 	)`
+}
+
+// pathEventsTableDDL returns CREATE TABLE for append-only path resolution events (GPL / remaps).
+func pathEventsTableDDL() string {
+	return `CREATE TABLE IF NOT EXISTS ` + tablePathEvents + ` (
+		id VARCHAR NOT NULL,
+		event_time BIGINT NOT NULL,
+		category VARCHAR NOT NULL,
+		proposed_path VARCHAR,
+		status VARCHAR NOT NULL,
+		gpl_issues VARCHAR
+	)`
+}
+
+// idMapTableDDL returns CREATE TABLE for append-only SRC↔DST identity mappings.
+func idMapTableDDL() string {
+	return `CREATE TABLE IF NOT EXISTS ` + tableIDMap + ` (
+		src_internal_id VARCHAR NOT NULL,
+		dst_internal_id VARCHAR NOT NULL,
+		event_time BIGINT NOT NULL,
+		source VARCHAR NOT NULL,
+		status VARCHAR NOT NULL
+	)`
+}
+
+func srcNodesGPLStateAlter() string {
+	return `ALTER TABLE ` + tableSrcNodes + ` ADD COLUMN IF NOT EXISTS gpl_state VARCHAR`
+}
+
+func statusEventsGPLStatusAlters() []string {
+	return []string{
+		`ALTER TABLE ` + tableSrcStatusEvents + ` ADD COLUMN IF NOT EXISTS gpl_status VARCHAR`,
+		`ALTER TABLE ` + tableDstStatusEvents + ` ADD COLUMN IF NOT EXISTS gpl_status VARCHAR`,
+	}
 }
 

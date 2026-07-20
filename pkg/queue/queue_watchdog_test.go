@@ -62,3 +62,28 @@ func TestQueueWatchdogFlagsStallWithPendingWork(t *testing.T) {
 		t.Fatal("expected possible stall when pending work exists but no progress")
 	}
 }
+
+func TestQueueWatchdogBeatClearsInFlightLeaseStall(t *testing.T) {
+	// Batch/copy leases hold tasks in-progress until ReportTaskResult; mid-flight
+	// QueueWatchdog.Beat (e.g. beatQueueWatchdogWhile / chunk progress) must prevent false stall.
+	q := NewQueue("copy", 3, 1, nil, nil)
+	q.SetMode(QueueModeCopy)
+	q.mu.Lock()
+	q.inProgress["leased-batch"] = &TaskBase{ID: "leased-batch", Round: 1, Type: TaskTypeCopyFile}
+	q.mu.Unlock()
+
+	wd := NewQueueWatchdog(q, 30*time.Second)
+	wd.lastProgress.Store(time.Now().Add(-31 * time.Second).UnixNano())
+
+	wd.Beat()
+	wd.checkForStall()
+	if wd.PossibleStall() {
+		t.Fatal("expected no stall when QueueWatchdog was Beaten while tasks are in-progress")
+	}
+
+	wd.lastProgress.Store(time.Now().Add(-31 * time.Second).UnixNano())
+	wd.checkForStall()
+	if !wd.PossibleStall() {
+		t.Fatal("expected stall when in-progress work has had no Beat past stallTimeout")
+	}
+}

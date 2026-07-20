@@ -16,28 +16,51 @@ type Writer struct {
 	tx *sql.Tx
 }
 
-// NodeStateAppendRowArgs returns the column values for one NodeState (metadata only) in table order for use with duckdb.Appender.AppendRow.
+// NodeStateAppendRowArgs returns the column values for one NodeState in table order for duckdb.Appender.AppendRow.
+// For src_nodes, appends four NULL transfer-checkpoint columns plus gpl_state (15 columns total).
+// For dst_nodes, returns the 10 metadata columns only.
 func NodeStateAppendRowArgs(n *NodeState) []any {
-	path, parentPath, pathHash, parentPathHash := NodeInsertPathFields(n.Path, n.ParentPath, n.Depth)
-	return []any{
+	return NodeStateAppendRowArgsForTable(tableDstNodes, n)
+}
+
+// NodeStateAppendRowArgsForTable returns appender values matching the physical column layout of table.
+func NodeStateAppendRowArgsForTable(table string, n *NodeState) []any {
+	path, parentPath := NodeInsertPathFields(n.Path, n.ParentPath, n.Depth)
+	args := []any{
 		n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, path, parentPath,
-		pathHash, parentPathHash,
-		n.Type, n.Size, n.MTime, int32(n.Depth),
+		NormalizeQueueNodeType(n.Type), n.Size, n.MTime, int32(n.Depth),
 	}
+	if table == tableSrcNodes {
+		// xfer_offset, xfer_src_size, xfer_src_mtime, xfer_dst_ref — null on insert; ME updates later.
+		args = append(args, nil, nil, nil, nil, n.GPLState)
+	}
+	return args
 }
 
 // AppenderInsert inserts node metadata into src_nodes or dst_nodes (batch INSERT). No status columns.
+// Explicit column lists omit xfer_* so INSERT stays valid for both tables.
 func (w *Writer) AppenderInsert(table string, nodes []*NodeState) error {
 	if len(nodes) == 0 {
 		return nil
 	}
 	ctx := context.Background()
 	for _, n := range nodes {
-		path, parentPath, pathHash, parentPathHash := NodeInsertPathFields(n.Path, n.ParentPath, n.Depth)
+		path, parentPath := NodeInsertPathFields(n.Path, n.ParentPath, n.Depth)
+		if table == tableSrcNodes {
+			_, err := w.tx.ExecContext(ctx,
+				`INSERT INTO `+table+` (id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth, gpl_state)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+				n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, path, parentPath, NormalizeQueueNodeType(n.Type), n.Size, n.MTime, n.Depth, n.GPLState,
+			)
+			if err != nil {
+				return err
+			}
+			continue
+		}
 		_, err := w.tx.ExecContext(ctx,
-			`INSERT INTO `+table+` (id, service_id, parent_id, parent_service_id, path, parent_path, path_hash, parent_path_hash, type, size, mtime, depth)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, path, parentPath, pathHash, parentPathHash, n.Type, n.Size, n.MTime, n.Depth,
+			`INSERT INTO `+table+` (id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, path, parentPath, NormalizeQueueNodeType(n.Type), n.Size, n.MTime, n.Depth,
 		)
 		if err != nil {
 			return err
@@ -54,13 +77,23 @@ func (w *Writer) UpsertNodes(table string, nodes []*NodeState) error {
 	}
 	ctx := context.Background()
 	for _, n := range nodes {
-		path, parentPath, pathHash, parentPathHash := NodeInsertPathFields(n.Path, n.ParentPath, n.Depth)
-		_, err := w.tx.ExecContext(ctx,
-			`INSERT INTO `+table+` (id, service_id, parent_id, parent_service_id, path, parent_path, path_hash, parent_path_hash, type, size, mtime, depth)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-			 ON CONFLICT (id) DO NOTHING`,
-			n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, path, parentPath, pathHash, parentPathHash, n.Type, n.Size, n.MTime, n.Depth,
-		)
+		path, parentPath := NodeInsertPathFields(n.Path, n.ParentPath, n.Depth)
+		var err error
+		if table == tableSrcNodes {
+			_, err = w.tx.ExecContext(ctx,
+				`INSERT INTO `+table+` (id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth, gpl_state)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				 ON CONFLICT (id) DO NOTHING`,
+				n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, path, parentPath, NormalizeQueueNodeType(n.Type), n.Size, n.MTime, n.Depth, n.GPLState,
+			)
+		} else {
+			_, err = w.tx.ExecContext(ctx,
+				`INSERT INTO `+table+` (id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				 ON CONFLICT (id) DO NOTHING`,
+				n.ID, n.ServiceID, n.ParentID, n.ParentServiceID, path, parentPath, NormalizeQueueNodeType(n.Type), n.Size, n.MTime, n.Depth,
+			)
+		}
 		if err != nil {
 			return fmt.Errorf("insert node %s into %s: %w", n.ID, table, err)
 		}
@@ -70,12 +103,12 @@ func (w *Writer) UpsertNodes(table string, nodes []*NodeState) error {
 
 // SrcStatusEventAppendRowArgs returns column values for one row in src_status_events for appender.
 func SrcStatusEventAppendRowArgs(e *StatusEvent) []any {
-	return []any{e.ID, e.TraversalStatus, e.CopyStatus, e.DeleteStatus, e.EventTime, int32(e.Depth), e.ErrorLogID}
+	return []any{e.ID, e.TraversalStatus, e.CopyStatus, e.DeleteStatus, e.GPLStatus, e.EventTime, int32(e.Depth), e.ErrorLogID}
 }
 
 // DstStatusEventAppendRowArgs returns column values for one row in dst_status_events for appender.
 func DstStatusEventAppendRowArgs(e *StatusEvent) []any {
-	return []any{e.ID, e.TraversalStatus, e.EventTime, int32(e.Depth), e.ErrorLogID}
+	return []any{e.ID, e.TraversalStatus, e.GPLStatus, e.EventTime, int32(e.Depth), e.ErrorLogID}
 }
 
 // BatchInsertSrcStatusEvents inserts status events into src_status_events inside the current transaction. Used by seal flush so events are atomic with nodes/stats.
@@ -86,8 +119,8 @@ func (w *Writer) BatchInsertSrcStatusEvents(events []StatusEvent) error {
 	ctx := context.Background()
 	for _, e := range events {
 		_, err := w.tx.ExecContext(ctx,
-			`INSERT INTO `+tableSrcStatusEvents+` (id, traversal_status, copy_status, delete_status, event_time, depth, error_log_id) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			e.ID, e.TraversalStatus, e.CopyStatus, nullIfEmpty(e.DeleteStatus), e.EventTime, e.Depth, nullIfEmpty(e.ErrorLogID),
+			`INSERT INTO `+tableSrcStatusEvents+` (id, traversal_status, copy_status, delete_status, gpl_status, event_time, depth, error_log_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			e.ID, e.TraversalStatus, e.CopyStatus, nullIfEmpty(e.DeleteStatus), nullIfEmpty(e.GPLStatus), e.EventTime, e.Depth, nullIfEmpty(e.ErrorLogID),
 		)
 		if err != nil {
 			return fmt.Errorf("insert src_status_event %s: %w", e.ID, err)
@@ -104,8 +137,8 @@ func (w *Writer) BatchInsertDstStatusEvents(events []StatusEvent) error {
 	ctx := context.Background()
 	for _, e := range events {
 		_, err := w.tx.ExecContext(ctx,
-			`INSERT INTO `+tableDstStatusEvents+` (id, traversal_status, event_time, depth, error_log_id) VALUES ($1, $2, $3, $4, $5)`,
-			e.ID, e.TraversalStatus, e.EventTime, e.Depth, nullIfEmpty(e.ErrorLogID),
+			`INSERT INTO `+tableDstStatusEvents+` (id, traversal_status, gpl_status, event_time, depth, error_log_id) VALUES ($1, $2, $3, $4, $5, $6)`,
+			e.ID, e.TraversalStatus, nullIfEmpty(e.GPLStatus), e.EventTime, e.Depth, nullIfEmpty(e.ErrorLogID),
 		)
 		if err != nil {
 			return fmt.Errorf("insert dst_status_event %s: %w", e.ID, err)
@@ -290,21 +323,52 @@ func (w *Writer) recomputeStatsForSubtreeDepths(ctx context.Context, table, root
 	return nil
 }
 
-// InsertUnexcludeEventsForSubtree appends one status event per node in the SRC subtree: copy_status = 'pending', traversal_status preserved. Call inside RunWrite.
+// InsertUnexcludeEventsForSubtree appends one status event per node in the SRC subtree,
+// restoring each node's latest non-exclusion copy_status (not hardcoding pending).
+// Traversal_status is taken from the latest event of any kind. Call inside RunWrite.
 func (w *Writer) InsertUnexcludeEventsForSubtree(table, rootPath string) error {
 	ctx := context.Background()
 	eventTime := time.Now().UnixNano()
+	// Set-based restore: aggregate prior copy_status once for the subtree, then insert.
+	// Avoids N correlated arg_max lookups at large scale.
+	const insertSQL = `INSERT INTO src_status_events (id, traversal_status, copy_status, event_time, depth)
+WITH subtree AS (
+  SELECT n.id, n.depth FROM src_nodes n WHERE ` + "%s" + `
+),
+trav AS (
+  SELECT e.id, arg_max(e.traversal_status, e.event_time) AS traversal_status
+  FROM src_status_events e
+  JOIN subtree s ON s.id = e.id
+  GROUP BY e.id
+),
+prev_copy AS (
+  SELECT e.id, arg_max(e.copy_status, e.event_time) AS copy_status
+  FROM src_status_events e
+  JOIN subtree s ON s.id = e.id
+  WHERE COALESCE(e.copy_status, '') <> ''
+    AND e.copy_status NOT IN ` + SQLCopyStatusExcludedIN + `
+  GROUP BY e.id
+)
+SELECT
+  s.id,
+  COALESCE(t.traversal_status, ''),
+  COALESCE(NULLIF(p.copy_status, ''), 'pending'),
+  $1,
+  s.depth
+FROM subtree s
+LEFT JOIN trav t ON t.id = s.id
+LEFT JOIN prev_copy p ON p.id = s.id`
+
+	var err error
 	if rootPath == "/" {
-		_, err := w.tx.ExecContext(ctx, `INSERT INTO src_status_events (id, traversal_status, copy_status, event_time, depth)
-SELECT n.id, COALESCE((SELECT arg_max(e.traversal_status, e.event_time) FROM src_status_events e WHERE e.id = n.id), ''), 'pending', $1, n.depth FROM src_nodes n WHERE n.path LIKE '/%'`, eventTime)
+		_, err = w.tx.ExecContext(ctx, fmt.Sprintf(insertSQL, `n.path LIKE '/%'`), eventTime)
 		if err != nil {
 			return err
 		}
 		return w.recomputeStatsForSubtreeDepths(ctx, tableSrcNodes, "/")
 	}
 	prefix := rootPath + "/%"
-	_, err := w.tx.ExecContext(ctx, `INSERT INTO src_status_events (id, traversal_status, copy_status, event_time, depth)
-SELECT n.id, COALESCE((SELECT arg_max(e.traversal_status, e.event_time) FROM src_status_events e WHERE e.id = n.id), ''), 'pending', $1, n.depth FROM src_nodes n WHERE n.path = $2 OR n.path LIKE $3`, eventTime, rootPath, prefix)
+	_, err = w.tx.ExecContext(ctx, fmt.Sprintf(insertSQL, `n.path = $2 OR n.path LIKE $3`), eventTime, rootPath, prefix)
 	if err != nil {
 		return err
 	}
@@ -315,7 +379,7 @@ func subtreePathPredicate(alias string, pathEqParam, pathLikeParam int) string {
 	return fmt.Sprintf(`(%s.path = $%d OR %s.path LIKE $%d)`, alias, pathEqParam, alias, pathLikeParam)
 }
 
-const successfulCopyEligibleForDelete = `COALESCE(cur.copy_status,'') = 'successful'`
+const successfulCopyEligibleForDelete = `COALESCE(cur.copy_status,'') IN ` + SQLCopyStatusCompleteIN
 
 // CountSuccessfulDeletePendingInSubtree counts SRC nodes in the subtree (inclusive) eligible to skip from deletion.
 func (w *Writer) CountSuccessfulDeletePendingInSubtree(rootPath string) (int64, error) {
@@ -436,13 +500,13 @@ WHERE starts_with(n.path, $2)
 func (w *Writer) InsertDstChildrenTraversalStatusEvents(parentPath, status string) error {
 	ctx := context.Background()
 	eventTime := time.Now().UnixNano()
-	parentHash := PathHash(parentPath)
-	_, err := w.tx.ExecContext(ctx, `INSERT INTO dst_status_events (id, traversal_status, event_time, depth) SELECT n.id, $1, $2, n.depth FROM dst_nodes n WHERE n.parent_path_hash = $3`, status, eventTime, parentHash)
+	normParentPath := NormalizeRootRelativePath(parentPath)
+	_, err := w.tx.ExecContext(ctx, `INSERT INTO dst_status_events (id, traversal_status, event_time, depth) SELECT n.id, $1, $2, n.depth FROM dst_nodes n WHERE n.parent_path = $3`, status, eventTime, normParentPath)
 	if err != nil {
 		return err
 	}
 	var depths []int
-	rows, err := w.tx.QueryContext(ctx, `SELECT DISTINCT depth FROM dst_nodes WHERE parent_path_hash = $1`, parentHash)
+	rows, err := w.tx.QueryContext(ctx, `SELECT DISTINCT depth FROM dst_nodes WHERE parent_path = $1`, normParentPath)
 	if err != nil {
 		return err
 	}
@@ -471,16 +535,128 @@ func (w *Writer) InsertStatusEvent(table string, e *StatusEvent) error {
 	ctx := context.Background()
 	if table == "DST" {
 		_, err := w.tx.ExecContext(ctx,
-			`INSERT INTO `+tableDstStatusEvents+` (id, traversal_status, event_time, depth, error_log_id) VALUES ($1, $2, $3, $4, $5)`,
-			e.ID, e.TraversalStatus, e.EventTime, e.Depth, nullIfEmpty(e.ErrorLogID),
+			`INSERT INTO `+tableDstStatusEvents+` (id, traversal_status, gpl_status, event_time, depth, error_log_id) VALUES ($1, $2, $3, $4, $5, $6)`,
+			e.ID, e.TraversalStatus, nullIfEmpty(e.GPLStatus), e.EventTime, e.Depth, nullIfEmpty(e.ErrorLogID),
 		)
 		return err
 	}
 	_, err := w.tx.ExecContext(ctx,
-		`INSERT INTO `+tableSrcStatusEvents+` (id, traversal_status, copy_status, delete_status, event_time, depth, error_log_id) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		e.ID, e.TraversalStatus, e.CopyStatus, nullIfEmpty(e.DeleteStatus), e.EventTime, e.Depth, nullIfEmpty(e.ErrorLogID),
+		`INSERT INTO `+tableSrcStatusEvents+` (id, traversal_status, copy_status, delete_status, gpl_status, event_time, depth, error_log_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		e.ID, e.TraversalStatus, e.CopyStatus, nullIfEmpty(e.DeleteStatus), nullIfEmpty(e.GPLStatus), e.EventTime, e.Depth, nullIfEmpty(e.ErrorLogID),
 	)
 	return err
+}
+
+// UpdateNodeGPLState updates src_nodes.gpl_state for a single node.
+func (w *Writer) UpdateNodeGPLState(nodeID, gplState string) error {
+	_, err := w.tx.ExecContext(context.Background(),
+		`UPDATE `+tableSrcNodes+` SET gpl_state = $1 WHERE id = $2`, gplState, nodeID)
+	return err
+}
+
+// InsertGPLPendingEventsForSubtree appends gpl_status=pending for every node under rootPath
+// except the root itself (the accepted remap node). Preserves other status dimensions via
+// empty columns (arg_max filters ignore empty gpl_status on other event types). Call inside RunWrite.
+func (w *Writer) InsertGPLPendingEventsForSubtree(side, rootPath string) error {
+	return w.insertGPLStatusEventsForSubtree(side, rootPath, GPLStatusPending, false)
+}
+
+// InsertGPLIgnoredEventsForSubtree appends gpl_status=ignored for rootPath and all descendants.
+func (w *Writer) InsertGPLIgnoredEventsForSubtree(side, rootPath string) error {
+	return w.insertGPLStatusEventsForSubtree(side, rootPath, GPLStatusIgnored, true)
+}
+
+func (w *Writer) insertGPLStatusEventsForSubtree(side, rootPath, gplStatus string, includeRoot bool) error {
+	ctx := context.Background()
+	eventTime := time.Now().UnixNano()
+	rootPath = NormalizeSubtreeRootPathForPropagation(rootPath)
+
+	if side == "DST" {
+		return w.insertDSTGPLStatusSubtree(ctx, rootPath, eventTime, gplStatus, includeRoot)
+	}
+	return w.insertSRCGPLStatusSubtree(ctx, rootPath, eventTime, gplStatus, includeRoot)
+}
+
+func (w *Writer) insertSRCGPLStatusSubtree(ctx context.Context, rootPath string, eventTime int64, gplStatus string, includeRoot bool) error {
+	insert := `INSERT INTO ` + tableSrcStatusEvents + ` (id, traversal_status, copy_status, delete_status, gpl_status, event_time, depth)
+SELECT n.id,
+  COALESCE((SELECT arg_max(e.traversal_status, e.event_time) FROM ` + tableSrcStatusEvents + ` e WHERE e.id = n.id), ''),
+  COALESCE((SELECT arg_max(e.copy_status, e.event_time) FROM ` + tableSrcStatusEvents + ` e WHERE e.id = n.id AND COALESCE(e.copy_status,'') <> ''), ''),
+  COALESCE((SELECT arg_max(e.delete_status, e.event_time) FROM ` + tableSrcStatusEvents + ` e WHERE e.id = n.id AND COALESCE(e.delete_status,'') <> ''), ''),
+  $1, $2, n.depth
+FROM ` + tableSrcNodes + ` n WHERE `
+	if rootPath == "/" {
+		cond := `n.path LIKE '/%'`
+		if !includeRoot {
+			cond += ` AND n.path <> '/'`
+		}
+		_, err := w.tx.ExecContext(ctx, insert+cond, gplStatus, eventTime)
+		return err
+	}
+	if includeRoot {
+		_, err := w.tx.ExecContext(ctx, insert+`(n.path = $3 OR n.path LIKE $4)`, gplStatus, eventTime, rootPath, rootPath+"/%")
+		return err
+	}
+	_, err := w.tx.ExecContext(ctx, insert+`n.path LIKE $3`, gplStatus, eventTime, rootPath+"/%")
+	return err
+}
+
+func (w *Writer) insertDSTGPLStatusSubtree(ctx context.Context, rootPath string, eventTime int64, gplStatus string, includeRoot bool) error {
+	insert := `INSERT INTO ` + tableDstStatusEvents + ` (id, traversal_status, gpl_status, event_time, depth)
+SELECT n.id,
+  COALESCE((SELECT arg_max(e.traversal_status, e.event_time) FROM ` + tableDstStatusEvents + ` e WHERE e.id = n.id), ''),
+  $1, $2, n.depth
+FROM ` + tableDstNodes + ` n WHERE `
+	if rootPath == "/" {
+		cond := `n.path LIKE '/%'`
+		if !includeRoot {
+			cond += ` AND n.path <> '/'`
+		}
+		_, err := w.tx.ExecContext(ctx, insert+cond, gplStatus, eventTime)
+		return err
+	}
+	if includeRoot {
+		_, err := w.tx.ExecContext(ctx, insert+`(n.path = $3 OR n.path LIKE $4)`, gplStatus, eventTime, rootPath, rootPath+"/%")
+		return err
+	}
+	_, err := w.tx.ExecContext(ctx, insert+`n.path LIKE $3`, gplStatus, eventTime, rootPath+"/%")
+	return err
+}
+
+// BatchInsertPathEvents inserts rows into path_events.
+func (w *Writer) BatchInsertPathEvents(events []PathEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	ctx := context.Background()
+	for _, e := range events {
+		_, err := w.tx.ExecContext(ctx,
+			`INSERT INTO `+tablePathEvents+` (id, event_time, category, proposed_path, status, gpl_issues) VALUES ($1, $2, $3, $4, $5, $6)`,
+			e.ID, e.EventTime, e.Category, e.ProposedPath, e.Status, nullIfEmpty(e.GPLIssues),
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// BatchInsertIDMapEvents inserts rows into id_map.
+func (w *Writer) BatchInsertIDMapEvents(events []IDMapEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	ctx := context.Background()
+	for _, e := range events {
+		_, err := w.tx.ExecContext(ctx,
+			`INSERT INTO `+tableIDMap+` (src_internal_id, dst_internal_id, event_time, source, status) VALUES ($1, $2, $3, $4, $5)`,
+			e.SrcInternalID, e.DstInternalID, e.EventTime, e.Source, e.Status,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func nullIfEmpty(s string) any {
@@ -528,12 +704,12 @@ type CopyStatusBucketsSubtreeNotExcluded struct {
 func (w *Writer) CountCopyStatusBucketsSubtreeNotExcluded(rootPath string) (CopyStatusBucketsSubtreeNotExcluded, error) {
 	ctx := context.Background()
 	var out CopyStatusBucketsSubtreeNotExcluded
-	notExcl := `(COALESCE(e.copy_status,'') NOT IN ('excluded_explicit','excluded_inherited'))`
+	notExcl := `(COALESCE(e.copy_status,'') NOT IN ` + SQLCopyStatusExcludedIN + `)`
 	base := `WITH latest AS (SELECT id, arg_max(copy_status, event_time) AS copy_status FROM ` + tableSrcStatusEvents + ` WHERE COALESCE(copy_status,'') <> '' GROUP BY id)
 SELECT
   COUNT(*) FILTER (WHERE ` + notExcl + ` AND COALESCE(e.copy_status,'') IN ('pending',''))::BIGINT,
   COUNT(*) FILTER (WHERE ` + notExcl + ` AND COALESCE(e.copy_status,'') = 'failed')::BIGINT,
-  COUNT(*) FILTER (WHERE ` + notExcl + ` AND COALESCE(e.copy_status,'') = 'successful')::BIGINT,
+  COUNT(*) FILTER (WHERE ` + notExcl + ` AND COALESCE(e.copy_status,'') IN ` + SQLCopyStatusCompleteIN + `)::BIGINT,
   COUNT(*) FILTER (WHERE ` + notExcl + ` AND COALESCE(e.copy_status,'') = 'skipped')::BIGINT,
   COUNT(*) FILTER (WHERE ` + notExcl + ` AND COALESCE(e.copy_status,'') = 'in_progress')::BIGINT
 FROM ` + tableSrcNodes + ` n LEFT JOIN latest e ON n.id = e.id WHERE `
@@ -548,23 +724,81 @@ FROM ` + tableSrcNodes + ` n LEFT JOIN latest e ON n.id = e.id WHERE `
 	return out, err
 }
 
+// CountCopyStatusBucketsSubtreeExcludedPrior counts currently-excluded SRC nodes under rootPath
+// by the latest non-exclusion copy_status each will restore to on unexclude. Call inside a transaction
+// before InsertUnexcludeEventsForSubtree so review deltas mirror restored buckets.
+func (w *Writer) CountCopyStatusBucketsSubtreeExcludedPrior(rootPath string) (CopyStatusBucketsSubtreeNotExcluded, error) {
+	ctx := context.Background()
+	var out CopyStatusBucketsSubtreeNotExcluded
+	base := `WITH latest AS (
+  SELECT id, arg_max(copy_status, event_time) AS copy_status
+  FROM ` + tableSrcStatusEvents + `
+  WHERE COALESCE(copy_status,'') <> ''
+  GROUP BY id
+),
+subtree AS (
+  SELECT n.id FROM ` + tableSrcNodes + ` n
+  JOIN latest e ON e.id = n.id
+  WHERE COALESCE(e.copy_status,'') IN ` + SQLCopyStatusExcludedIN + ` AND `
+	prev := `),
+prev_copy AS (
+  SELECT e.id, arg_max(e.copy_status, e.event_time) AS copy_status
+  FROM ` + tableSrcStatusEvents + ` e
+  JOIN subtree s ON s.id = e.id
+  WHERE COALESCE(e.copy_status,'') <> ''
+    AND e.copy_status NOT IN ` + SQLCopyStatusExcludedIN + `
+  GROUP BY e.id
+)
+SELECT
+  COUNT(*) FILTER (WHERE COALESCE(NULLIF(p.copy_status,''), 'pending') IN ('pending',''))::BIGINT,
+  COUNT(*) FILTER (WHERE COALESCE(p.copy_status,'') = 'failed')::BIGINT,
+  COUNT(*) FILTER (WHERE COALESCE(p.copy_status,'') IN ` + SQLCopyStatusCompleteIN + `)::BIGINT,
+  COUNT(*) FILTER (WHERE COALESCE(p.copy_status,'') = 'skipped')::BIGINT,
+  COUNT(*) FILTER (WHERE COALESCE(p.copy_status,'') = 'in_progress')::BIGINT
+FROM subtree s
+LEFT JOIN prev_copy p ON p.id = s.id`
+	if rootPath == "/" {
+		err := w.tx.QueryRowContext(ctx, base+`n.path LIKE '/%'`+prev).Scan(
+			&out.Pending, &out.Failed, &out.Successful, &out.Skipped, &out.InProgress)
+		return out, err
+	}
+	prefix := rootPath + "/%"
+	err := w.tx.QueryRowContext(ctx, base+`(n.path = $1 OR n.path LIKE $2)`+prev, rootPath, prefix).Scan(
+		&out.Pending, &out.Failed, &out.Successful, &out.Skipped, &out.InProgress)
+	return out, err
+}
+
+// LatestNonExclusionCopyStatus returns the latest copy_status for nodeID that is not an exclusion
+// status. Empty string means none found (caller should treat as pending). Call inside a transaction.
+func (w *Writer) LatestNonExclusionCopyStatus(nodeID string) (string, error) {
+	ctx := context.Background()
+	var s string
+	err := w.tx.QueryRowContext(ctx, `
+SELECT COALESCE(arg_max(copy_status, event_time), '')
+FROM src_status_events
+WHERE id = $1
+  AND COALESCE(copy_status, '') <> ''
+  AND copy_status NOT IN `+SQLCopyStatusExcludedIN, nodeID).Scan(&s)
+	return s, err
+}
+
 // CountDstNodesUnderPath returns the number of DST nodes whose parent_path equals parentPath (direct children only). Call inside a transaction.
 func (w *Writer) CountDstNodesUnderPath(parentPath string) (int64, error) {
 	ctx := context.Background()
-	parentHash := PathHash(parentPath)
+	normParentPath := NormalizeRootRelativePath(parentPath)
 	var n int64
-	err := w.tx.QueryRowContext(ctx, `SELECT COUNT(*)::BIGINT FROM dst_nodes WHERE parent_path_hash = $1`, parentHash).Scan(&n)
+	err := w.tx.QueryRowContext(ctx, `SELECT COUNT(*)::BIGINT FROM dst_nodes WHERE parent_path = $1`, normParentPath).Scan(&n)
 	return n, err
 }
 
 // CountDstNodesUnderPathWithTraversalStatus returns the number of DST nodes under parentPath (parent_path = parentPath) whose current traversal_status equals status. Call inside a transaction.
 func (w *Writer) CountDstNodesUnderPathWithTraversalStatus(parentPath, status string) (int64, error) {
 	ctx := context.Background()
-	parentHash := PathHash(parentPath)
+	normParentPath := NormalizeRootRelativePath(parentPath)
 	q := `WITH latest AS (SELECT id, arg_max(traversal_status, event_time) AS traversal_status FROM dst_status_events GROUP BY id)
-SELECT COUNT(*)::BIGINT FROM dst_nodes n JOIN latest e ON n.id = e.id WHERE n.parent_path_hash = $1 AND COALESCE(e.traversal_status,'') = $2`
+SELECT COUNT(*)::BIGINT FROM dst_nodes n JOIN latest e ON n.id = e.id WHERE n.parent_path = $1 AND COALESCE(e.traversal_status,'') = $2`
 	var n int64
-	err := w.tx.QueryRowContext(ctx, q, parentHash, status).Scan(&n)
+	err := w.tx.QueryRowContext(ctx, q, normParentPath, status).Scan(&n)
 	return n, err
 }
 
@@ -705,7 +939,9 @@ func (w *Writer) SetNodeDeleteStatus(table, nodeID, status string) error {
 	return nil
 }
 
-// SetNodeExcluded emits a copy_status-only event for SRC: excluding sets copy_status to excluded_explicit (traversal_status unchanged); unexcluding sets copy_status to pending. Applies copy-status stat deltas only.
+// SetNodeExcluded emits a copy_status-only event for SRC: excluding sets copy_status to excluded_explicit
+// (traversal_status unchanged); unexcluding restores the latest non-exclusion copy_status (pending if none).
+// Applies copy-status stat deltas only.
 func (w *Writer) SetNodeExcluded(table, nodeID string, excluded bool) error {
 	ctx := context.Background()
 	t := tableName(table)
@@ -719,19 +955,26 @@ func (w *Writer) SetNodeExcluded(table, nodeID string, excluded bool) error {
 	_ = w.tx.QueryRowContext(ctx, `SELECT COALESCE(arg_max(traversal_status, event_time), '') FROM src_status_events WHERE id = $1`, nodeID).Scan(&curTraversal)
 	newCopyStatus := CopyStatusExcludedExplicit
 	if !excluded {
-		newCopyStatus = CopyStatusPending
+		restore, err := w.LatestNonExclusionCopyStatus(nodeID)
+		if err != nil {
+			return err
+		}
+		if restore == "" {
+			restore = CopyStatusPending
+		}
+		newCopyStatus = restore
 	}
 	ev := &StatusEvent{ID: nodeID, TraversalStatus: curTraversal, CopyStatus: newCopyStatus, EventTime: time.Now().UnixNano(), Depth: depth}
 	if err := w.InsertStatusEvent("SRC", ev); err != nil {
 		return err
 	}
 	if oldCopyStatus != "" && oldCopyStatus != CopyStatusInProgress {
-		if err := w.UpdateStatsCountByDelta("SRC", depth, StatsKey(StatsKindCopy,oldCopyStatus), -1); err != nil {
+		if err := w.UpdateStatsCountByDelta("SRC", depth, StatsKey(StatsKindCopy, oldCopyStatus), -1); err != nil {
 			return err
 		}
 	}
 	if newCopyStatus != "" {
-		if err := w.UpdateStatsCountByDelta("SRC", depth, StatsKey(StatsKindCopy,newCopyStatus), 1); err != nil {
+		if err := w.UpdateStatsCountByDelta("SRC", depth, StatsKey(StatsKindCopy, newCopyStatus), 1); err != nil {
 			return err
 		}
 	}

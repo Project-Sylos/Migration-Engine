@@ -162,16 +162,24 @@ func performCopySoftSuspend(
 	copyQueue.Pause()
 	copyQueue.StopWatchdog()
 	copyQueue.ClearPendingBufferForSuspend()
+	copyQueue.EnterStopAbandonWindow(queue.DefaultSpinDownGrace)
 
 	mergedCtx, cancelMerged := mergeWaitContexts(waitCtx, cfg.ShutdownContext)
 	defer cancelMerged()
 
-	if err := copyQueue.WaitInProgressZero(mergedCtx, 50*time.Millisecond); err != nil {
-		if cfg.ShutdownContext != nil && cfg.ShutdownContext.Err() != nil {
+	graceCtx, graceCancel := context.WithTimeout(mergedCtx, queue.DefaultSpinDownGrace)
+	defer graceCancel()
+	if err := copyQueue.WaitInProgressZero(graceCtx, 50*time.Millisecond); err != nil {
+		// After grace: force-checkout smallest file workers (freeze callback also does this).
+		copyQueue.RequestForceCheckoutAllWorkersForStop()
+		drainCtx, drainCancel := context.WithTimeout(mergedCtx, 5*time.Second)
+		defer drainCancel()
+		if err2 := copyQueue.WaitInProgressZero(drainCtx, 50*time.Millisecond); err2 != nil {
 			copyQueue.AbandonInProgressTasks()
 		}
-		return queue.QueueStats{}, RuntimeSuspendV1{}, fmt.Errorf("copy queue drain in-flight: %w", err)
 	}
+	copyQueue.ClearStopAbandonWindow()
+
 
 	if err := database.FlushSealBuffer(); err != nil {
 		return queue.QueueStats{}, RuntimeSuspendV1{}, fmt.Errorf("flush seal buffer: %w", err)

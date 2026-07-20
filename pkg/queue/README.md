@@ -8,10 +8,18 @@ The queue layer drives **source** and **destination** traversal and **copy** usi
 
 ## High-level flow
 
-1. **Pull** – `PullTraversalTasks` / `PullRetryTasks` / `PullCopyTasks` refill `pendingBuff` from SQL (`ListNodesByDepthKeyset`, `ListDstBatchWithSrcChildren`, copy keysets, etc.). Only one pull runs at a time (`getPulling` / `setPulling`).
-2. **Lease** – Workers take tasks from `pendingBuff` into `inProgress`.
+1. **Pull** – `PullTraversalTasks` / `PullRetryTasks` / `PullCopyTasks` refill `pendingBuff` from SQL (`ListNodesByDepthKeyset`, `ListDstBatchWithSrcChildren`, copy keysets, etc.). Only one pull runs at a time (`getPulling` / `setPulling`). Pull watermarks use **pendingBuff length only** (in-progress leases are not treated as available depth). When workers are idle and pending is below the live pool size, a **starve nudge** raises the effective WM so underfed pools refill sooner.
+2. **Lease** – Workers take tasks from `pendingBuff` into `inProgress`. Multi-task batch turns (folder create, file upload, delete) use **`LeaseGroupBudget`**: live AIMD pool size (`len(pool.handles)`) drives a fair **count ceiling** (`ceil(pending/workers)`) and, for files, a soft **byte budget** (`sum(pending sizes)/workers` with one-item overflow). This prevents one worker from hoovering the whole adapter max batch.
 3. **Complete** – `ReportTaskResult` updates state and enqueues **seal** work (nodes + per-depth stats) through the DB layer.
 4. **Coordinator** – DST may start round *N* only when SRC has completed rounds *N* and *N+1* (or SRC traversal is done). SRC is not round-gated against DST; work is pulled and sealed to DuckDB in batches, so SRC can advance as fast as workers allow.
+
+### Transfer checkpoint / stop-resume (file copy)
+
+Mid-transfer progress is stored on **`src_nodes`** (`xfer_offset`, `xfer_src_size`, `xfer_src_mtime`, `xfer_dst_ref`); **`copy_status` stays `pending`**. Sessions are never handed off: the retiring worker closes its live FS session, persists offset + fingerprint, then either **requeues** to `pendingBuff` (autoscaler scale-down) or leaves **DB-only** (stop / soft-suspend). The next worker opens a **fresh** session and seeks SRC when the destination adapter’s **`FSTransferRestartPolicy`** supports resumable transfer; otherwise ME applies delete-if-required and full restart.
+
+### Spin-down grace (15s)
+
+On scale-down with busy workers, the queue enters a **provisional freeze**: `SetTargetWorkerCount` no-ops (scale up and down) while AIMD rate-limit counters keep accumulating. After **15s**, all tracked busy **FS leases** are force-checked out (files smallest-first by byte size; non-file work at size 0). File transfers cooperatively checkpoint + requeue; other ops abort via canceled `workerCtx` (batches/list/delete prefer that parent). Soft-suspend uses the same grace, then cancels busy worker contexts and uses DB-only abandon.
 
 ---
 
@@ -42,6 +50,9 @@ The queue layer drives **source** and **destination** traversal and **copy** usi
 - **`QueueModeTraversal`** – Normal BFS; pull pending traversal tasks by depth.
 - **`QueueModeRetry`** – Pending/failed across depths; SRC folder success triggers DST child cleanup (see `mode_retry.go`).
 - **`QueueModeCopy`** / **`QueueModeCopyRetry`** – Copy phase and failed-only retry; pulls by copy status and node type.
+- **`QueueModeDelete`** / **`QueueModeDeleteRetry`** – Reverse-BFS delete; autoscaler uses the **dst** provider’s `delete` operation profile (falls back to that provider’s Default worker count when unset).
+
+Autoscaler worker Min/Default/Max are resolved **per FS operation** from `pkg/scaling/operation_profile.go` (list vs create vs delete vs transfer). Providers that do not override an op use a single Default for everything; Dropbox/Drive set tighter list/create/delete caps.
 
 ---
 

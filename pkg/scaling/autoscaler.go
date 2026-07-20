@@ -44,6 +44,8 @@ type QueueActuator interface {
 	ScalingContext() queue.ScalingContext
 	ScalingSrcAdapter() fstypes.FSAdapter
 	ScalingDstAdapter() fstypes.FSAdapter
+	// ReleaseInFlightOnThrottle requeues in-progress work after an FS_THROTTLE step-down.
+	ReleaseInFlightOnThrottle()
 }
 
 // Autoscaler runs the control loop during a migration.
@@ -78,7 +80,9 @@ type Config struct {
 	OnEvent  func(ScalingEvent)
 	// AIMD tunes TCP-style worker scaling; zero values use defaults derived from Interval.
 	AIMD AIMDPolicy
-	// EfficiencyProbe enables throughput-aware scale-up probing (second-order AIMD).
+	// EfficiencyProbe optionally enables throughput-aware scale-up probing (second-order AIMD).
+	// Off by default (EfficiencyProbeConfig.Enabled); set Enabled=true to turn probes back on.
+	// MaxProbeCooldown still caps the universal FS_THROTTLE bounce timer when probes are off.
 	EfficiencyProbe EfficiencyProbeConfig
 	// DebugAIMD prints probe cooldown and scale-up attempt diagnostics to stdout.
 	// Also enabled when ME_AUTOSCALER_DEBUG_AIMD=1.
@@ -254,6 +258,7 @@ func (a *Autoscaler) stepDownInterOpDelay(name string, q QueueActuator, profile 
 		return
 	}
 	if a.lastClass == PressureFSThrottle {
+		a.noteThrottleBounce(st, now, rateLimitedUntil)
 		st.noteFSBackoff(now, rateLimitedUntil, a.aimd.ProbeCooldown)
 	}
 	q.SetInterOpDelay(target)
@@ -452,6 +457,9 @@ func (a *Autoscaler) groupProbeThroughputRate(queues []string, internal map[stri
 }
 
 func (a *Autoscaler) applyGroupEfficiencyProbeBeforeScaleUp(groupID string, queues []string, internal map[string]queue.InternalMetricsSnapshot, st *queueAIMDState, minPer int, now time.Time) bool {
+	if !a.efficiency.Enabled {
+		return true
+	}
 	totalNow := a.groupWorkersTotal(queues)
 	if st.probePending && a.efficiency.MinProbeWindow > 0 && now.Sub(st.probeStarted) < a.efficiency.MinProbeWindow {
 		remaining := a.efficiency.MinProbeWindow - now.Sub(st.probeStarted)
@@ -461,7 +469,9 @@ func (a *Autoscaler) applyGroupEfficiencyProbeBeforeScaleUp(groupID string, queu
 	}
 	wasPending := st.probePending
 	rateNow := a.groupProbeThroughputRate(queues, internal)
-	if rollback, ok := st.evaluateEfficiencyProbe(totalNow, rateNow, a.aimd.ProbeCooldown, a.efficiency); ok {
+	if rollback, ok := st.evaluateEfficiencyProbe(totalNow, rateNow, a.aimd.ProbeCooldown, a.efficiency, now); ok {
+		fmt.Printf("  SCALE_DOWN cause=EFFICIENCY_PROBE scope=group:%s workers %d->%d (rate_now=%.2f rate_before=%.2f failed_probes=%d)\n",
+			groupID, totalNow, rollback, rateNow, st.probeRateBefore, st.failedProbes)
 		a.debugEfficiencyProbeResult("group:"+groupID, st, totalNow, rateNow, rollback, true)
 		split := SplitWorkersTotal(rollback, queues, minPer)
 		for name, target := range split {
@@ -487,11 +497,11 @@ func (a *Autoscaler) applyGroupEfficiencyProbeBeforeScaleUp(groupID string, queu
 	return true
 }
 
-func (a *Autoscaler) abortGroupEfficiencyProbeOnPressure(st *queueAIMDState, workersAfter int) {
-	if st == nil || !st.probePending {
+func (a *Autoscaler) abortGroupEfficiencyProbeOnPressure(st *queueAIMDState, workersAfter int, now time.Time) {
+	if !a.efficiency.Enabled || st == nil || !st.probePending {
 		return
 	}
-	st.abortEfficiencyProbeThrottled(workersAfter, a.aimd.ProbeCooldown, a.efficiency.MaxProbeCooldown)
+	st.abortEfficiencyProbeThrottled(workersAfter, a.aimd.ProbeCooldown, a.efficiency.MaxProbeCooldown, now)
 	if a.debugAIMD {
 		a.debugWorkerScaleUpResult("group", st.probeWorkersBefore, workersAfter,
 			fmt.Sprintf("efficiency probe ABORTED by pressure (failed_probes=%d cooldown=%s)",
@@ -500,6 +510,9 @@ func (a *Autoscaler) abortGroupEfficiencyProbeOnPressure(st *queueAIMDState, wor
 }
 
 func (a *Autoscaler) applyEfficiencyProbeBeforeScaleUp(name string, q QueueActuator, st *queueAIMDState, now time.Time) bool {
+	if !a.efficiency.Enabled {
+		return true
+	}
 	if st.probePending && a.efficiency.MinProbeWindow > 0 && now.Sub(st.probeStarted) < a.efficiency.MinProbeWindow {
 		remaining := a.efficiency.MinProbeWindow - now.Sub(st.probeStarted)
 		a.debugScaleUpBlocked(name, fmt.Sprintf("efficiency_probe_window remaining=%s (workers_before=%d rate_before=%.2f)",
@@ -508,8 +521,10 @@ func (a *Autoscaler) applyEfficiencyProbeBeforeScaleUp(name string, q QueueActua
 	}
 	wasPending := st.probePending
 	rateNow := a.throughputRate(name)
-	if rollback, ok := st.evaluateEfficiencyProbe(q.GetWorkerCount(), rateNow, a.aimd.ProbeCooldown, a.efficiency); ok {
+	if rollback, ok := st.evaluateEfficiencyProbe(q.GetWorkerCount(), rateNow, a.aimd.ProbeCooldown, a.efficiency, now); ok {
 		cur := q.GetWorkerCount()
+		fmt.Printf("  SCALE_DOWN cause=EFFICIENCY_PROBE scope=%s workers %d->%d (rate_now=%.2f rate_before=%.2f failed_probes=%d)\n",
+			name, cur, rollback, rateNow, st.probeRateBefore, st.failedProbes)
 		a.debugEfficiencyProbeResult(name, st, cur, rateNow, rollback, true)
 		if rollback > 0 && rollback < cur {
 			if err := q.SetTargetWorkerCount(rollback); err == nil {
@@ -526,6 +541,9 @@ func (a *Autoscaler) applyEfficiencyProbeBeforeScaleUp(name string, q QueueActua
 }
 
 func (a *Autoscaler) recordEfficiencyProbe(st *queueAIMDState, workersBefore int, rateBefore float64, now time.Time) {
+	if !a.efficiency.Enabled || st == nil {
+		return
+	}
 	st.startEfficiencyProbe(workersBefore, rateBefore, now)
 }
 

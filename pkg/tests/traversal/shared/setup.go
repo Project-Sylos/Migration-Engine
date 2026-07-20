@@ -104,8 +104,27 @@ func SetupSpectraFS(configPath string, cleanDB bool) (*sdk.SpectraFS, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize Spectra: %w", err)
 	}
+	if err := EnsureSpectraAuth(fs); err != nil {
+		_ = fs.Close()
+		return nil, err
+	}
 
 	return fs, nil
+}
+
+// EnsureSpectraAuth issues and binds per-world access tokens when auth is enabled.
+func EnsureSpectraAuth(fs *sdk.SpectraFS) error {
+	if fs == nil || !fs.AuthEnabled() {
+		return nil
+	}
+	worlds := []string{"primary"}
+	worlds = append(worlds, fs.GetSecondaryTables()...)
+	for _, world := range worlds {
+		if _, err := fs.EnsureWorldAuth(world); err != nil {
+			return fmt.Errorf("ensure auth for world %s: %w", world, err)
+		}
+	}
+	return nil
 }
 
 // SetupTest assembles the Spectra-backed migration configuration.
@@ -189,6 +208,10 @@ func SetupEphemeralTest(removeMigrationDB bool) (migration.Config, error) {
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("failed to initialize Spectra in ephemeral mode: %w", err)
 	}
+	if err := EnsureSpectraAuth(spectraFS); err != nil {
+		_ = spectraFS.Close()
+		return migration.Config{}, err
+	}
 
 	srcRoot, dstRoot, err := LoadSpectraRoots(spectraFS)
 	if err != nil {
@@ -263,6 +286,10 @@ func SetupEphemeralThrottleTest(removeMigrationDB bool, workerCount int, autosca
 	if err != nil {
 		return migration.Config{}, fmt.Errorf("spectra throttle config: %w", err)
 	}
+	if err := EnsureSpectraAuth(spectraFS); err != nil {
+		_ = spectraFS.Close()
+		return migration.Config{}, err
+	}
 	srcRoot, dstRoot, err := LoadSpectraRoots(spectraFS)
 	if err != nil {
 		return migration.Config{}, err
@@ -317,14 +344,16 @@ func SetupEphemeralThrottleTest(removeMigrationDB bool, workerCount int, autosca
 func LoadSpectraRoots(spectraFS *sdk.SpectraFS) (types.Folder, types.Folder, error) {
 	// Get root nodes from Spectra using request structs
 	srcRoot, err := spectraFS.GetNode(&sdk.GetNodeRequest{
-		ID: "root",
+		ID:        "root",
+		TableName: "primary",
 	})
 	if err != nil {
 		return types.Folder{}, types.Folder{}, fmt.Errorf("failed to get src root from Spectra: %w", err)
 	}
 
 	dstRoot, err := spectraFS.GetNode(&sdk.GetNodeRequest{
-		ID: "root",
+		ID:        "root",
+		TableName: "s1",
 	})
 	if err != nil {
 		return types.Folder{}, types.Folder{}, fmt.Errorf("failed to get dst root from Spectra: %w", err)

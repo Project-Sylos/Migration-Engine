@@ -66,7 +66,7 @@ func anyToDriverValues(a []any) []driver.Value {
 
 func appendNodesWithAppender(app *duckdb.Appender, table string, nodes []*NodeState) error {
 	for _, n := range nodes {
-		if err := app.AppendRow(anyToDriverValues(NodeStateAppendRowArgs(n))...); err != nil {
+		if err := app.AppendRow(anyToDriverValues(NodeStateAppendRowArgsForTable(table, n))...); err != nil {
 			return fmt.Errorf("append %s node %s: %w", table, n.ID, err)
 		}
 	}
@@ -258,6 +258,8 @@ type SealBuffer struct {
 	queue               []SealJob
 	discoveryQueue      []SealJob         // nodes + events only (no stats); flushed with queue, stats skipped when Pending < 0
 	taskErrorsQueue     []TaskErrorRecord // buffered task errors; flushed with jobs
+	pathEventsQueue     []PathEvent       // append-only path_events
+	idMapQueue          []IDMapEvent      // append-only id_map
 	failedSubtreePaths  []string          // SRC folder paths whose pending descendants should be marked failed; flushed with jobs
 	rowsSinceFlush   int
 	lastFlushedDepth int // max depth written by completed Flush(); -1 until first flush
@@ -330,6 +332,8 @@ func NewSealBuffer(db *DB, opts SealBufferOptions) *SealBuffer {
 		queue:                 make([]SealJob, 0, 64),
 		discoveryQueue:        make([]SealJob, 0, 64),
 		taskErrorsQueue:       make([]TaskErrorRecord, 0, 64),
+		pathEventsQueue:       make([]PathEvent, 0, 64),
+		idMapQueue:            make([]IDMapEvent, 0, 64),
 		stopCh:                make(chan struct{}),
 	}
 	sb.cond = sync.NewCond(&sb.mu)
@@ -417,6 +421,7 @@ func (sb *SealBuffer) Add(table string, depth int, nodes []*NodeState, pending, 
 		e := StatusEvent{ID: nd.ID, TraversalStatus: trav, EventTime: eventTime, Depth: depth}
 		if table == "SRC" {
 			e.CopyStatus = nd.CopyStatus
+			e.DeleteStatus = nd.DeleteStatus
 		}
 		events = append(events, e)
 	}
@@ -482,6 +487,7 @@ func (sb *SealBuffer) AddDiscoveryNodes(ops []InsertOperation) {
 			e := StatusEvent{ID: n.ID, TraversalStatus: n.TraversalStatus, EventTime: eventTime, Depth: k.depth}
 			if k.table == "SRC" {
 				e.CopyStatus = n.CopyStatus
+				e.DeleteStatus = n.DeleteStatus
 			}
 			events = append(events, e)
 		}
@@ -543,23 +549,63 @@ func (sb *SealBuffer) AddTaskError(rec TaskErrorRecord) {
 	sb.mu.Unlock()
 }
 
-func (sb *SealBuffer) drain() ([]SealJob, []TaskErrorRecord, []string) {
+// AddPathEvent enqueues one path_events row for async flush.
+func (sb *SealBuffer) AddPathEvent(e PathEvent) {
+	if e.ID == "" {
+		return
+	}
+	if e.EventTime == 0 {
+		e.EventTime = time.Now().UnixNano()
+	}
+	sb.mu.Lock()
+	sb.waitBelowHardCapLocked()
+	sb.pathEventsQueue = append(sb.pathEventsQueue, e)
+	sb.rowsSinceFlush++
+	sb.cond.Broadcast()
+	sb.mu.Unlock()
+}
+
+// AddIDMapEvent enqueues one id_map row for async flush.
+func (sb *SealBuffer) AddIDMapEvent(e IDMapEvent) {
+	if e.SrcInternalID == "" || e.DstInternalID == "" {
+		return
+	}
+	if e.EventTime == 0 {
+		e.EventTime = time.Now().UnixNano()
+	}
+	if e.Status == "" {
+		e.Status = IDMapStatusActive
+	}
+	sb.mu.Lock()
+	sb.waitBelowHardCapLocked()
+	sb.idMapQueue = append(sb.idMapQueue, e)
+	sb.rowsSinceFlush++
+	sb.cond.Broadcast()
+	sb.mu.Unlock()
+}
+
+func (sb *SealBuffer) drain() ([]SealJob, []TaskErrorRecord, []string, []PathEvent, []IDMapEvent) {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
-	if len(sb.queue) == 0 && len(sb.discoveryQueue) == 0 && len(sb.taskErrorsQueue) == 0 && len(sb.failedSubtreePaths) == 0 {
-		return nil, nil, nil
+	if len(sb.queue) == 0 && len(sb.discoveryQueue) == 0 && len(sb.taskErrorsQueue) == 0 &&
+		len(sb.failedSubtreePaths) == 0 && len(sb.pathEventsQueue) == 0 && len(sb.idMapQueue) == 0 {
+		return nil, nil, nil, nil, nil
 	}
 	out := append(sb.queue, sb.discoveryQueue...)
 	taskErrors := append([]TaskErrorRecord(nil), sb.taskErrorsQueue...)
 	subtreePaths := append([]string(nil), sb.failedSubtreePaths...)
+	pathEvents := append([]PathEvent(nil), sb.pathEventsQueue...)
+	idMaps := append([]IDMapEvent(nil), sb.idMapQueue...)
 	sb.queue = make([]SealJob, 0, cap(sb.queue))
 	sb.discoveryQueue = make([]SealJob, 0, cap(sb.discoveryQueue))
 	sb.taskErrorsQueue = make([]TaskErrorRecord, 0, cap(sb.taskErrorsQueue))
+	sb.pathEventsQueue = make([]PathEvent, 0, cap(sb.pathEventsQueue))
+	sb.idMapQueue = make([]IDMapEvent, 0, cap(sb.idMapQueue))
 	sb.failedSubtreePaths = sb.failedSubtreePaths[:0]
 	sb.rowsSinceFlush = 0
 	sb.noteFlushComplete()
 	sb.cond.Broadcast()
-	return out, taskErrors, subtreePaths
+	return out, taskErrors, subtreePaths, pathEvents, idMaps
 }
 
 // StartPhase starts a phase (traversal or copy): conn is held for the phase; 4 appenders are created and reused until StopPhase.
@@ -631,8 +677,8 @@ func (sb *SealBuffer) StopPhase() error {
 }
 
 // phaseFlush runs one transaction per flush when phase is active: drain, BEGIN, append missing nodes/events via persistent appenders, task errors, subtree failure propagation, stats, COMMIT.
-func (sb *SealBuffer) phaseFlush(jobs []SealJob, taskErrors []TaskErrorRecord, subtreePaths []string) error {
-	if len(jobs) == 0 && len(taskErrors) == 0 {
+func (sb *SealBuffer) phaseFlush(jobs []SealJob, taskErrors []TaskErrorRecord, subtreePaths []string, pathEvents []PathEvent, idMaps []IDMapEvent) error {
+	if len(jobs) == 0 && len(taskErrors) == 0 && len(pathEvents) == 0 && len(idMaps) == 0 {
 		return nil
 	}
 	var totalRows int64
@@ -710,6 +756,14 @@ func (sb *SealBuffer) phaseFlush(jobs []SealJob, taskErrors []TaskErrorRecord, s
 				return fmt.Errorf("record task error: %w", err)
 			}
 		}
+		if err := w.BatchInsertPathEvents(pathEvents); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("insert path_events: %w", err)
+		}
+		if err := w.BatchInsertIDMapEvents(idMaps); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("insert id_map: %w", err)
+		}
 		reviewDeltas := buildCanonicalReviewStatsDeltas(jobs)
 		if len(reviewDeltas) > 0 {
 			if err := w.ApplyReviewStatsDeltas(reviewDeltas); err != nil {
@@ -744,8 +798,8 @@ func (sb *SealBuffer) phaseFlush(jobs []SealJob, taskErrors []TaskErrorRecord, s
 }
 
 // ephemeralAppenderFlush runs when no migration phase is active: one tx with temporary appenders for nodes/events, task errors, stats, and subtree failure propagation.
-func (sb *SealBuffer) ephemeralAppenderFlush(jobs []SealJob, taskErrors []TaskErrorRecord, subtreePaths []string) error {
-	if len(jobs) == 0 && len(taskErrors) == 0 && len(subtreePaths) == 0 {
+func (sb *SealBuffer) ephemeralAppenderFlush(jobs []SealJob, taskErrors []TaskErrorRecord, subtreePaths []string, pathEvents []PathEvent, idMaps []IDMapEvent) error {
+	if len(jobs) == 0 && len(taskErrors) == 0 && len(subtreePaths) == 0 && len(pathEvents) == 0 && len(idMaps) == 0 {
 		return nil
 	}
 	maxDepth := -1
@@ -877,6 +931,14 @@ func (sb *SealBuffer) ephemeralAppenderFlush(jobs []SealJob, taskErrors []TaskEr
 				return err
 			}
 		}
+		if err := w.BatchInsertPathEvents(pathEvents); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("insert path_events: %w", err)
+		}
+		if err := w.BatchInsertIDMapEvents(idMaps); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("insert id_map: %w", err)
+		}
 		if len(reviewDeltas) > 0 {
 			if err := w.ApplyReviewStatsDeltas(reviewDeltas); err != nil {
 				_ = tx.Rollback()
@@ -912,8 +974,8 @@ func (sb *SealBuffer) Flush() error {
 	atomic.StoreInt32(&sb.flushActive, 1)
 	defer atomic.StoreInt32(&sb.flushActive, 0)
 
-	jobs, taskErrors, subtreePaths := sb.drain()
-	if len(jobs) == 0 && len(taskErrors) == 0 && len(subtreePaths) == 0 {
+	jobs, taskErrors, subtreePaths, pathEvents, idMaps := sb.drain()
+	if len(jobs) == 0 && len(taskErrors) == 0 && len(subtreePaths) == 0 && len(pathEvents) == 0 && len(idMaps) == 0 {
 		sb.db.writeMu.Lock()
 		sb.runDeferredCheckpointWithRetry()
 		sb.db.writeMu.Unlock()
@@ -924,19 +986,19 @@ func (sb *SealBuffer) Flush() error {
 	sb.mu.Unlock()
 	var err error
 	if pa != nil {
-		err = sb.phaseFlush(jobs, taskErrors, subtreePaths)
+		err = sb.phaseFlush(jobs, taskErrors, subtreePaths, pathEvents, idMaps)
 	} else {
-		err = sb.ephemeralAppenderFlush(jobs, taskErrors, subtreePaths)
+		err = sb.ephemeralAppenderFlush(jobs, taskErrors, subtreePaths, pathEvents, idMaps)
 	}
 	if err != nil {
-		sb.requeue(jobs, taskErrors, subtreePaths)
+		sb.requeue(jobs, taskErrors, subtreePaths, pathEvents, idMaps)
 		return err
 	}
 	return nil
 }
 
 // requeue puts jobs, task errors, and subtree paths back on the queue and restores rowsSinceFlush. Call when a flush fails so data is not lost.
-func (sb *SealBuffer) requeue(jobs []SealJob, taskErrors []TaskErrorRecord, subtreePaths []string) {
+func (sb *SealBuffer) requeue(jobs []SealJob, taskErrors []TaskErrorRecord, subtreePaths []string, pathEvents []PathEvent, idMaps []IDMapEvent) {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
 	rows := int64(0)
@@ -946,7 +1008,9 @@ func (sb *SealBuffer) requeue(jobs []SealJob, taskErrors []TaskErrorRecord, subt
 	sb.queue = append(sb.queue, jobs...)
 	sb.taskErrorsQueue = append(sb.taskErrorsQueue, taskErrors...)
 	sb.failedSubtreePaths = append(sb.failedSubtreePaths, subtreePaths...)
-	sb.rowsSinceFlush += int(rows) + len(taskErrors) + len(subtreePaths)
+	sb.pathEventsQueue = append(sb.pathEventsQueue, pathEvents...)
+	sb.idMapQueue = append(sb.idMapQueue, idMaps...)
+	sb.rowsSinceFlush += int(rows) + len(taskErrors) + len(subtreePaths) + len(pathEvents) + len(idMaps)
 	sb.cond.Broadcast()
 }
 

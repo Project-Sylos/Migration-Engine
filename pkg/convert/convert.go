@@ -49,3 +49,9 @@ func ToBool(v any) bool {
 	b, _ := v.(bool)
 	return b
 }
+
+// ToString coerces an arbitrary value into a string, returning "" for non-string values.
+func ToString(v any) string {
+	s, _ := v.(string)
+	return s
+}

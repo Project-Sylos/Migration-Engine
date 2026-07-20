@@ -37,8 +37,12 @@ func Classify(in ClassifierInput) PressureClass {
 	if in.MemoryLevel == MemoryRed {
 		return PressureMemory
 	}
+	now := time.Now()
 	for _, snap := range in.Internal {
 		if snap.RateLimitHitsSinceLastPoll > 0 {
+			return PressureFSThrottle
+		}
+		if !snap.RateLimitedUntil.IsZero() && snap.RateLimitedUntil.After(now) {
 			return PressureFSThrottle
 		}
 	}

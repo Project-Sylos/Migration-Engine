@@ -15,8 +15,6 @@ import (
 	_ "github.com/marcboeker/go-duckdb"
 )
 
-const pathHashMigrationBatchSize = 5000
-
 // Options configures DB open behavior.
 type Options struct {
 	Path          string // Path to DuckDB file (e.g. "migration.duckdb")
@@ -93,6 +91,8 @@ func schemaDDLs() []string {
 		nodeTableDDL(tableDstNodes),
 		srcStatusEventsTableDDL(),
 		dstStatusEventsTableDDL(),
+		pathEventsTableDDL(),
+		idMapTableDDL(),
 		statsTableDDL(),
 		srcStatsTableDDL(),
 		dstStatsTableDDL(),
@@ -111,47 +111,24 @@ func initSchemaConn(conn *sql.DB) error {
 			return err
 		}
 	}
-	return nil
-}
-
-func backfillPathHash(conn *sql.DB, table string) error {
-	ctx := context.Background()
-	rows, err := conn.QueryContext(ctx, "SELECT id, path, parent_path FROM "+table)
-	if err != nil {
-		return fmt.Errorf("path_hash backfill select %s: %w", table, err)
+	if err := ensureSrcTransferCheckpointColumns(conn); err != nil {
+		return err
 	}
-	defer rows.Close()
-	var id, path, parentPath string
-	var batch []struct{ id, pathHash, parentPathHash string }
-	for rows.Next() {
-		if err := rows.Scan(&id, &path, &parentPath); err != nil {
-			return fmt.Errorf("path_hash backfill scan %s: %w", table, err)
-		}
-		batch = append(batch, struct{ id, pathHash, parentPathHash string }{id, PathHash(path), PathHash(parentPath)})
-		if len(batch) >= pathHashMigrationBatchSize {
-			if err := execPathHashBatch(conn, table, batch); err != nil {
-				return err
-			}
-			batch = batch[:0]
-		}
+	if _, err := conn.Exec(srcNodesGPLStateAlter()); err != nil {
+		return fmt.Errorf("ensure gpl_state column: %w", err)
 	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("path_hash backfill rows %s: %w", table, err)
-	}
-	if len(batch) > 0 {
-		if err := execPathHashBatch(conn, table, batch); err != nil {
-			return err
+	for _, ddl := range statusEventsGPLStatusAlters() {
+		if _, err := conn.Exec(ddl); err != nil {
+			return fmt.Errorf("ensure gpl_status column: %w", err)
 		}
 	}
 	return nil
 }
 
-func execPathHashBatch(conn *sql.DB, table string, batch []struct{ id, pathHash, parentPathHash string }) error {
-	ctx := context.Background()
-	for _, r := range batch {
-		_, err := conn.ExecContext(ctx, "UPDATE "+table+" SET path_hash = $1, parent_path_hash = $2 WHERE id = $3", r.pathHash, r.parentPathHash, r.id)
-		if err != nil {
-			return fmt.Errorf("path_hash backfill update %s: %w", table, err)
+func ensureSrcTransferCheckpointColumns(conn *sql.DB) error {
+	for _, ddl := range srcNodesTransferCheckpointAlters() {
+		if _, err := conn.Exec(ddl); err != nil {
+			return fmt.Errorf("ensure transfer checkpoint columns: %w", err)
 		}
 	}
 	return nil
@@ -368,6 +345,20 @@ func (db *DB) AppendFailedSubtree(parentPath string) {
 	}
 }
 
+// AppendPathEvent enqueues a path_events row for async seal flush.
+func (db *DB) AppendPathEvent(e PathEvent) {
+	if db.sealBuffer != nil {
+		db.sealBuffer.AddPathEvent(e)
+	}
+}
+
+// AppendIDMapEvent enqueues an id_map row for async seal flush.
+func (db *DB) AppendIDMapEvent(e IDMapEvent) {
+	if db.sealBuffer != nil {
+		db.sealBuffer.AddIDMapEvent(e)
+	}
+}
+
 // WriteSession is the handle passed to RunWrite. Caller must not retain conn after the callback returns.
 type WriteSession struct {
 	conn *sql.Conn
@@ -433,8 +424,8 @@ func (db *DB) BeginTraversalPhase(ctx context.Context) error {
 }
 
 // EnsureBulkPhaseSecondaryIndexes recreates secondary indexes after a bulk traversal/copy phase
-// (same set as dropped in BeginTraversalPhase): three per node table (path_hash,
-// parent_path_hash, depth) and two per status-events table (id, id+event_time). Uses conservative
+// (same set as dropped in BeginTraversalPhase): two per node table (parent_id, depth)
+// and two per status-events table (id, id+event_time). Uses conservative
 // PRAGMA settings during creation to reduce OOM risk on large tables.
 //
 // When indexes already exist (e.g. normal EndTraversalPhase), duckdb_indexes is consulted so missing

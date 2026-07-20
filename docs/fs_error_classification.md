@@ -178,27 +178,33 @@ See [autoscaler.md — Remaining work](./autoscaler.md#remaining-work) for imple
 
 ---
 
-## Cloud adapters (Google Drive, Dropbox, and template)
+## Cloud adapters (Google Drive, Dropbox, OneDrive, SharePoint, Box)
 
 OAuth cloud adapters follow the Spectra pattern:
 
-| Signal | Google Drive | Dropbox | Adapter action |
-|--------|--------------|---------|----------------|
-| HTTP 401 | Unauthorized | Unauthorized / `invalid_access_token` | Clear in-memory access token; refresh via stored refresh token; retry |
-| HTTP 429 / quota | Rate limit / quota | `too_many_requests` / `too_many_write_operations` | `FSErrorThrottle`; honor `Retry-After` header **and** JSON `retry_after` |
-| HTTP 404 | Not found | `path/not_found` | `FSErrorFatal` |
-| HTTP 409 | — | `path/conflict` (some) | Retryable or fatal per `.tag` |
-| 5xx / timeout | Transient | Transient | `FSErrorRetryable` |
+| Signal | Google Drive | Dropbox | OneDrive / SharePoint (Graph) | Box | Adapter action |
+|--------|--------------|---------|-------------------------------|-----|----------------|
+| HTTP 401 | Unauthorized | Unauthorized / `invalid_access_token` | Unauthorized | Unauthorized | Clear in-memory access token; refresh via stored refresh token; retry |
+| HTTP 429 / quota | Rate limit / quota | `too_many_requests` / `too_many_write_operations` | 429 / 503 + `Retry-After` (SharePoint Online RU) | 429 + `Retry-After` (~1000/min general, ~240 upload/min) | `FSErrorThrottle`; honor `Retry-After` |
+| HTTP 404 | Not found | `path/not_found` | Not found | Not found | `FSErrorFatal` |
+| HTTP 409 | — | `path/conflict` (some) | Conflict | Conflict / name collision | Fatal for Graph/Box creates |
+| 5xx / timeout | Transient | Transient | Transient | Transient | `FSErrorRetryable` |
 
-**Scaling:** `google_drive` and `dropbox` profiles in `pkg/scaling/operation_profile.go` — conservative defaults (list workers 6/16, transfer 8/16; list pages 100 default / 500 max; `PreferLargePages: false`). Adapter reports API max page size only; profile values are operational defaults.
+**Scaling:** `google_drive`, `dropbox`, `onedrive`, `sharepoint`, and `box` profiles in `pkg/scaling/operation_profile.go`. OneDrive mirrors Drive-ish defaults; SharePoint is slightly more conservative because tenant RU is shared across SPO. Box keeps upload workers low for the 240 upload/min cap. Graph `$batch` and Box `/batch` (max 20, no uploads) are not used for FS batch capability interfaces in v1.
+
+**OneDrive roots:** My files (`/me/drive`) and Shared (`sharedWithMe`, browse-only).
+
+**SharePoint roots:** Sites are browse-only (`MigrationRootForbidden`); document libraries (drives) and folders under them are selectable migration roots. Personal OneDrive sites are filtered out of the SharePoint site list.
+
+**Box roots:** All Files (`folder id 0`). Refresh tokens are single-use — Sylos-FS persists the rotated refresh token into the migration DB on each refresh.
 
 **Dropbox roots:** Business accounts expose multiple browse roots (My Dropbox, team space, team folders, shared folders). Non-home roots require the `Dropbox-API-Path-Root` namespace header on `files/*` calls. See Sylos-FS `pkg/fs/dropbox/session.go` `ListRoots`.
 
 **Backend groups:** When source and destination share one cloud account, Sylos-API sets `BackendGroupID = "conn:" + connectionID` so autoscaler rate-limit signals aggregate per account.
 
-**Token refresh:** Separate from UI OAuth; adapter/session calls the provider token endpoint on 401. Refresh tokens are encrypted on disk; access tokens never persist.
+**Token refresh:** Separate from UI OAuth; adapter/session calls the provider token endpoint on 401. Refresh tokens are encrypted on disk; access tokens never persist. Box refresh tokens must be rewritten on every refresh (single-use).
 
-Add provider-specific rows to this table as each adapter lands (OneDrive, etc.). See Sylos-FS `docs/cloud_provider_checklist.md`.
+See Sylos-FS `docs/cloud_provider_checklist.md`.
 
 ---
 

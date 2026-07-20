@@ -23,11 +23,14 @@ DST nodes have traversal status only; copy and delete statuses apply to SRC.
 ### Possible Copy Status Values
 (Again as a reminder these are only for src items not dst items)
 
-- successful -- the item was successfully copied over to the destination
+- successful -- this migration's copy phase actually created/updated the item on the destination (or an in-run resume precheck confirmed a copy this run already performed)
+- already_existed -- exists on both sides without a copy task for this migration (SRC root seed, or DST traversal name/mtime match)
 - failed -- the item was not successfully copied over to the destination
 - pending -- the item either does not exist on the destination, or the src copy is newer. 
 - excluded_explicit -- the item has been explicitly marked to be excluded from copying over by the user
 - excluded_inherited -- a child of an item that was excluded explicitly by the user. (see point just above this)
+
+Progress, delete eligibility, and UI "exists on both" treat `successful` and `already_existed` as **copy-complete**. Resume detection (dst existence window) keys only on true `successful` counts so fresh post-traversal runs are not mistaken for copy resume.
 
 ### Why copy status only exists on src items
 Mainly because it doesn't make sense to double store it, we only care about items that are ONLY on the src that haven't been copied over yet. So we only need to store it there.
@@ -41,11 +44,11 @@ Mainly because it doesn't make sense to double store it, we only care about item
 * **skipped** — user opted this node out of source removal during cleanup planning (deselected in review UI).
 * **(null / absent)** — no delete event for this node. Normal for depth-0 root (metadata anchor, never deleted) and for nodes not yet involved in cleanup planning.
 
-Delete status is independent of copy status but delete work only applies to nodes with `copy_status = successful` that are not excluded.
+Delete status is independent of copy status but delete work only applies to nodes with copy-complete status (`successful` or `already_existed`) that are not excluded.
 
 ### Root node (depth 0) delete behavior
 
-The SRC root (`path = "/"`, `depth = 0`) is seeded at traversal start with `copy_status = successful` and **no** `delete_status` event — it is never a copy or delete task.
+The SRC root (`path = "/"`, `depth = 0`) is seeded at traversal start with `copy_status = already_existed` and **no** `delete_status` event — it is never a copy or delete task.
 
 During `PrepareSourceCleanup`, depth-0 nodes are skipped entirely (no `pending` or `skipped` event). This mirrors copy and prevents the delete phase from waiting on a node that is intentionally never removed from the source filesystem.
 
@@ -53,7 +56,7 @@ During `PrepareSourceCleanup`, depth-0 nodes are skipped entirely (no `pending` 
 
 Before delete runs, copy review can align delete status with user selection:
 
-* **Default (all selected):** every successfully copied SRC node at depth ≥ 1 gets `delete_status = pending`.
+* **Default (all selected):** every copy-complete SRC node (`successful` or `already_existed`) at depth ≥ 1 gets `delete_status = pending`.
 * **Keep list / deselect list:** selected nodes → `pending`; deselected → `skipped`.
 * Nodes already `deleted` or `failed` are left unchanged when re-marking pending.
 

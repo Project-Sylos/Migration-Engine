@@ -6,25 +6,33 @@ package db
 import "testing"
 
 func TestNodeInsertPathFields_depth1EmptyParentMatchesRoot(t *testing.T) {
-	_, normParent, _, parentHash := NodeInsertPathFields("/alpha", "", 1)
+	_, normParent := NodeInsertPathFields("/alpha", "", 1)
 	if normParent != "/" {
 		t.Fatalf("normParent=%q want /", normParent)
-	}
-	rootHash := PathHash("/")
-	if parentHash != rootHash {
-		t.Fatalf("parentPathHash=%q want %q (root join key)", parentHash, rootHash)
 	}
 }
 
 func TestNodeInsertPathFields_rootKeepsEmptyParent(t *testing.T) {
-	_, normParent, pathHash, parentHash := NodeInsertPathFields("/", "", 0)
+	normPath, normParent := NodeInsertPathFields("/", "", 0)
 	if normParent != "" {
 		t.Fatalf("root normParent=%q want empty", normParent)
 	}
-	if pathHash != PathHash("/") {
-		t.Fatalf("root pathHash mismatch")
+	if normPath != "/" {
+		t.Fatalf("root normPath=%q want /", normPath)
 	}
-	if parentHash != PathHash("") {
-		t.Fatalf("root parentPathHash=%q want PathHash(\"\")", parentHash)
+}
+
+func TestNormalizeQueueNodeType(t *testing.T) {
+	if got := NormalizeQueueNodeType(NodeTypeFile); got != NodeTypeFile {
+		t.Fatalf("file: got %q", got)
+	}
+	if got := NormalizeQueueNodeType(NodeTypeFolder); got != NodeTypeFolder {
+		t.Fatalf("folder: got %q", got)
+	}
+	if got := NormalizeQueueNodeType("team_folder"); got != NodeTypeFolder {
+		t.Fatalf("team_folder: got %q want folder", got)
+	}
+	if got := NormalizeQueueNodeType("shared_folder"); got != NodeTypeFolder {
+		t.Fatalf("shared_folder: got %q want folder", got)
 	}
 }

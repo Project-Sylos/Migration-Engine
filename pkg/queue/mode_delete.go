@@ -277,6 +277,9 @@ func (q *Queue) CompleteDeleteTask(task *TaskBase, executionDelta time.Duration)
 		q.foldersCreatedTotal++
 	} else if task.IsFile() {
 		q.filesCreatedTotal++
+		if task.File.Size > 0 {
+			q.bytesTransferredTotal += task.File.Size
+		}
 	}
 	q.mu.Unlock()
 

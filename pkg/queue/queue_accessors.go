@@ -81,9 +81,12 @@ func (q *Queue) SetCopyPass(pass int) {
 	q.passNumber = pass
 }
 
-// SetCopyResumeDstExistenceWindow enables the copy worker dst ListChildren precheck until the anchor
-// pass+round is left (see AdvanceCopyRound). Only for normal copy mode (not copy-retry); call from
-// RunCopyPhase when resuming a partially completed copy (Successful>0 and Pending>0 in status events).
+// SetCopyResumeDstExistenceWindow enables resume existence handling until the anchor
+// pass+round is left (see AdvanceCopyRound). Folder create still uses CreateFolderBatch:
+// already-present folders are filtered via per-parent ListChildren before the batch RPC.
+// File transfer keeps the single-task path while the window is active (byte-checkpoint resume).
+// Only for normal copy mode (not copy-retry); call from RunCopyPhase when resuming a partially
+// completed copy (Successful>0 and Pending>0 in status events).
 func (q *Queue) SetCopyResumeDstExistenceWindow(anchorPass, anchorRound int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -209,14 +212,40 @@ func (q *Queue) EffectiveRefillBatchSize() int {
 	return n
 }
 
-// getPullLowWM returns the low watermark for pulling more work: 25% of lease batch size, minimum 1.
+// getPullLowWM returns the low watermark for pulling more work from DuckDB into pendingBuff.
+// Base WM is 25% of lease batch size (minimum 1). Pull decisions use pendingBuff length only —
+// in-progress leases are not treated as available queue depth.
+// Starve nudge: when any worker is idle and pendingCount < live activeWorkers, raise the
+// effective WM to pending so underfed pools refill (pending <= WM) without waiting for the
+// normal watermark. Especially matters when pending > base WM is false but still below worker count.
 func (q *Queue) getPullLowWM() int {
 	bs := q.EffectiveLeaseBatchSize()
 	wm := bs / 4
 	if wm < 1 {
 		wm = 1
 	}
+	pending := q.GetPendingCount()
+	active := q.liveActiveWorkers()
+	idle := q.IdleWorkerCount()
+	if idle > 0 && pending < active {
+		if pending > wm {
+			return pending
+		}
+	}
 	return wm
+}
+
+// IdleWorkerCount returns how many pool handles are currently marked idle.
+func (q *Queue) IdleWorkerCount() int {
+	q.pool.mu.Lock()
+	defer q.pool.mu.Unlock()
+	n := 0
+	for _, h := range q.pool.handles {
+		if h != nil && h.idle.Load() {
+			n++
+		}
+	}
+	return n
 }
 
 // Keyset cursors are strictly round-scoped per queue. Each queue (src, dst, copy) has its own cursor and runtime;
@@ -306,11 +335,37 @@ func (q *Queue) GetTotalDiscovered() int64 {
 	return q.GetFilesDiscoveredTotal() + q.GetFoldersDiscoveredTotal()
 }
 
-// GetBytesTransferredTotal returns the total bytes transferred during copy phase.
+// GetBytesTransferredTotal returns the total bytes transferred during copy phase
+// for completed tasks only (excludes in-flight leased progress).
 func (q *Queue) GetBytesTransferredTotal() int64 {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.bytesTransferredTotal
+}
+
+// ReportTaskBytesTransferred records absolute mid-flight bytes on a leased task.
+// Does not bump bytesTransferredTotal; observer uses GetLiveBytesTransferredTotal.
+func (q *Queue) ReportTaskBytesTransferred(task *TaskBase, absoluteBytes int64) {
+	if q == nil || task == nil || absoluteBytes < 0 {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	task.BytesTransferred = absoluteBytes
+}
+
+// GetLiveBytesTransferredTotal returns completed bytes plus in-flight task progress
+// so the observer can show live throughput during long batch/single-file transfers.
+func (q *Queue) GetLiveBytesTransferredTotal() int64 {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	var inFlight int64
+	for _, task := range q.inProgress {
+		if task != nil && task.BytesTransferred > 0 {
+			inFlight += task.BytesTransferred
+		}
+	}
+	return q.bytesTransferredTotal + inFlight
 }
 
 // GetFoldersCreatedTotal returns the total folders created during copy phase.
@@ -609,6 +664,13 @@ func (q *Queue) removeInProgress(nodeID string) {
 	delete(q.inProgress, nodeID)
 }
 
+func (q *Queue) hasInProgress(nodeID string) bool {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	_, ok := q.inProgress[nodeID]
+	return ok
+}
+
 func (q *Queue) incrementRoundStatsCompleted(round int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -673,6 +735,12 @@ func (q *Queue) setExpectedFromStatsBucket(round int) {
 		expected, err = database.GetTraversalCountAtDepthFromLive(queueType, round, db.StatusPending)
 		if err != nil {
 			fmt.Println("error getting pending traversal count at depth from live", err)
+			return
+		}
+	case QueueModeGPL:
+		expected, err = database.GetGPLCountAtDepthFromLive(queueType, round, db.GPLStatusPending)
+		if err != nil {
+			fmt.Println("error getting pending gpl count at depth from live", err)
 			return
 		}
 	case QueueModeCopy:

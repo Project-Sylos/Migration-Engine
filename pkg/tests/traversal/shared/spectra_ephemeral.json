@@ -10,7 +10,6 @@
     "file_depth_decay_factor": 0.9,
     "seed": 0,
     "file_binary_seed": 0,
-    "enable_cache": false,
     "diverging_tree_mode": true
   },
   "api": {

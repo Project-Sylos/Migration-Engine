@@ -54,6 +54,7 @@ type QueueMode string
 const (
 	QueueModeTraversal   QueueMode = "traversal"    // Normal BFS traversal
 	QueueModeRetry       QueueMode = "retry"        // Retry failed tasks sweep
+	QueueModeGPL         QueueMode = "gpl"          // Path-scoped GPL cascade revalidation
 	QueueModeCopy        QueueMode = "copy"         // Copy phase (folders then files)
 	QueueModeCopyRetry   QueueMode = "copy-retry"   // Copy retry: only copy_status = failed, max-depth guarded completion
 	QueueModeDelete      QueueMode = "delete"       // Delete phase (files then folders, reverse BFS)
@@ -62,7 +63,7 @@ const (
 
 const (
 	defaultLeaseBatchSize = 1000
-	maxLeaseBatchSize     = 10_000 // Upper bound for pull (lease) batch size
+	maxLeaseBatchSize     = 20_000 // Upper bound for pull (lease) batch size (batch FS pull)
 	refillFromDBBatchSize = 10_000 // Batch size when refilling queue from DuckDB (ID-offset pagination)
 )
 
@@ -242,6 +243,8 @@ type Queue struct {
 	scalingDstProvider string
 	scalingSrcGroupID  string
 	scalingDstGroupID  string
+	pathCheckProfile   string // "none" | "auto" | provider id (windows, dropbox, …)
+	spin               spinDownState
 }
 
 func pendingBuffCapFromLeaseSizing(leaseConfigured int) int {
@@ -406,30 +409,43 @@ func (q *Queue) Resume() {
 // Lease attempts to lease a task for execution atomically.
 // Returns nil if no tasks are available, queue is paused, or completed.
 func (q *Queue) Lease() *TaskBase {
-	// Check if queue is completed before attempting to pull tasks
+	group := q.LeaseGroup(1)
+	if len(group) == 0 {
+		return nil
+	}
+	return group[0]
+}
+
+// LeaseGroup leases up to maxN pending tasks (all marked in-progress).
+// Returns nil/empty when no work is available. maxN <= 0 is treated as 1.
+func (q *Queue) LeaseGroup(maxN int) []*TaskBase {
+	if maxN <= 0 {
+		maxN = 1
+	}
 	if q.State() == QueueStateCompleted {
 		return nil
 	}
 
 	q.PullTasksIfNeeded(false)
 
-	for attempt := 0; attempt < 2; attempt++ {
-		// Block if paused, completed, or no DB (waiting doesn't block - rounds continue once started)
+	out := make([]*TaskBase, 0, maxN)
+	for attempt := 0; attempt < 2 && len(out) < maxN; attempt++ {
 		state := q.State()
 		database := q.getDatabase()
 		if state == QueueStatePaused || state == QueueStateCompleted || database == nil {
-			return nil
+			break
 		}
 
-		task := q.dequeuePending()
-		if task != nil {
+		for len(out) < maxN {
+			task := q.dequeuePending()
+			if task == nil {
+				break
+			}
 			nodeID := task.ID
 			if nodeID == "" {
-				// With deterministic IDs, task.ID should always be pre-computed
-				// This is a programming error if we reach here
 				if logservice.LS != nil {
 					err := logservice.LS.Log("error",
-						"Lease found task with empty ID - this indicates a bug in ID generation",
+						"LeaseGroup found task with empty ID - this indicates a bug in ID generation",
 						"queue", q.name, q.name)
 					if err != nil {
 						fmt.Println("error logging", err)
@@ -438,16 +454,156 @@ func (q *Queue) Lease() *TaskBase {
 				continue
 			}
 			task.Locked = true
-			task.LeaseTime = time.Now() // Record lease time for execution tracking
+			task.LeaseTime = time.Now()
 			q.addInProgress(nodeID, task)
-			return task
+			out = append(out, task)
 		}
 
-		// Check if we need to pull more tasks (only if buffer is low and last pull wasn't partial)
+		if len(out) >= maxN {
+			break
+		}
 		q.PullTasksIfNeeded(false)
 	}
 
-	return nil
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// LeaseBudgetOpts configures fair multi-task leasing for LeaseGroupBudget.
+// UseByteBudget enables soft byte budgeting from live pending file sizes / activeWorkers.
+// MaxCount is the adapter hard cap, further limited by live countCeiling.
+type LeaseBudgetOpts struct {
+	MaxCount      int
+	UseByteBudget bool
+}
+
+// liveActiveWorkers returns the current AIMD pool size (len of pool handles),
+// falling back to registered workers. Always at least 1.
+func (q *Queue) liveActiveWorkers() int {
+	q.pool.mu.Lock()
+	n := len(q.pool.handles)
+	q.pool.mu.Unlock()
+	if n <= 0 {
+		n = q.GetWorkerCount()
+	}
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+// LeaseGroupBudget leases a fair slice of pending work using live pool size.
+// Files (UseByteBudget): soft byte budget B = sum(pending file sizes)/activeWorkers with
+// one-item overflow, plus countCeiling = ceil(pendingCount/activeWorkers).
+// Folders/deletes: countCeiling only.
+// Budget is computed under the same lock as dequeue so pool size and pendingBuff cannot race mid-walk.
+func (q *Queue) LeaseGroupBudget(opts LeaseBudgetOpts) []*TaskBase {
+	maxCount := opts.MaxCount
+	if maxCount <= 0 {
+		maxCount = 1
+	}
+	if q.State() == QueueStateCompleted {
+		return nil
+	}
+
+	q.PullTasksIfNeeded(false)
+
+	out := make([]*TaskBase, 0, maxCount)
+	for attempt := 0; attempt < 2 && len(out) < maxCount; attempt++ {
+		state := q.State()
+		database := q.getDatabase()
+		if state == QueueStatePaused || state == QueueStateCompleted || database == nil {
+			break
+		}
+
+		batch := q.leaseBudgetOnce(opts, maxCount-len(out))
+		out = append(out, batch...)
+		if len(out) >= maxCount || len(batch) == 0 {
+			break
+		}
+		q.PullTasksIfNeeded(false)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (q *Queue) leaseBudgetOnce(opts LeaseBudgetOpts, remainingCap int) []*TaskBase {
+	if remainingCap <= 0 {
+		return nil
+	}
+	activeWorkers := q.liveActiveWorkers()
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	pendingCount := len(q.pendingBuff)
+	if pendingCount == 0 {
+		return nil
+	}
+
+	countCeiling := (pendingCount + activeWorkers - 1) / activeWorkers
+	if countCeiling < 1 {
+		countCeiling = 1
+	}
+	maxN := opts.MaxCount
+	if maxN <= 0 {
+		maxN = 1
+	}
+	if countCeiling < maxN {
+		maxN = countCeiling
+	}
+	if remainingCap < maxN {
+		maxN = remainingCap
+	}
+
+	var byteBudget int64
+	useBytes := opts.UseByteBudget
+	if useBytes {
+		var totalBytes int64
+		for _, t := range q.pendingBuff {
+			if t != nil && t.IsFile() {
+				totalBytes += t.File.Size
+			}
+		}
+		byteBudget = totalBytes / int64(activeWorkers)
+		if byteBudget < 1 {
+			byteBudget = 1
+		}
+	}
+
+	out := make([]*TaskBase, 0, maxN)
+	var cumBytes int64
+	for len(out) < maxN && len(q.pendingBuff) > 0 {
+		task := q.pendingBuff[0]
+		q.pendingBuff = q.pendingBuff[1:]
+		if task == nil || task.ID == "" {
+			continue
+		}
+		if _, exists := q.inProgress[task.ID]; exists {
+			continue
+		}
+
+		taskSize := int64(0)
+		if useBytes && task.IsFile() {
+			taskSize = task.File.Size
+		}
+
+		task.Locked = true
+		task.LeaseTime = time.Now()
+		q.inProgress[task.ID] = task
+		out = append(out, task)
+		cumBytes += taskSize
+
+		// Soft ceiling: after each take, if cumulative size > B, stop (allows one overflow).
+		if useBytes && cumBytes > byteBudget {
+			break
+		}
+	}
+	return out
 }
 
 // CompletionCheckOptions configures what actions to take during completion checks.
@@ -473,7 +629,7 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 
 		mode := q.GetMode()
 		switch mode {
-		case QueueModeTraversal, QueueModeRetry:
+		case QueueModeTraversal, QueueModeRetry, QueueModeGPL:
 			return q.CheckTraversalCompletion(currentRound)
 		case QueueModeCopy, QueueModeCopyRetry:
 			return q.CheckCopyCompletion(currentRound)
@@ -506,7 +662,7 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 
 		// Round completion: memory state only. DB is a stale snapshot during the round.
 		// Complete when: pending empty, in-progress 0, and last pull was partial (keyspace exhausted).
-		if mode == QueueModeTraversal || mode == QueueModeRetry {
+		if mode == QueueModeTraversal || mode == QueueModeRetry || mode == QueueModeGPL {
 			if inProgressCount > 0 || pendingBuffCount > 0 {
 				return false
 			}
@@ -723,17 +879,21 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 		q.CompleteDeleteTask(task, executionDelta)
 		return
 	}
+	if mode == QueueModeGPL {
+		q.CompleteGPLTask(task, executionDelta)
+		return
+	}
 
 	// Traversal and retry modes use the same completion logic
 	q.CompleteTraversalTask(task, executionDelta)
 
 }
 
-// childResultToNodeState converts a ChildResult to NodeState using deterministic ID generation.
+// childResultToNodeState converts a ChildResult to NodeState using UUID v5 minting.
 // parentPath is the root-relative path of the parent (e.g., "/items").
 // The child's path is computed from parentPath + child name to ensure it's always root-relative,
 // regardless of what the filesystem adapter returns in LocationPath.
-// Node ID is deterministically computed from (queueType, nodeType, path) for race-safe deduplication.
+// Node ID is MintNodeID(queueType, parentID, type, basename) for race-safe deduplication.
 func childResultToNodeState(child ChildResult, parentPath string, depth int, queueType string, parentID string) *db.NodeState {
 	// Compute root-relative path from parent path and child name first
 	// (needed for deterministic ID generation)
@@ -757,9 +917,8 @@ func childResultToNodeState(child ChildResult, parentPath string, depth int, que
 		rootRelativePath = types.NormalizeLocationPath(parentPath + "/" + childName)
 	}
 
-	// Generate deterministic ID from logical identity (queueType, nodeType, path)
-	// This eliminates duplicate logical nodes and makes traversal race-safe
-	nodeID := db.DeterministicNodeID(queueType, nodeType, rootRelativePath)
+	// Generate UUID v5 from (queueType, parentID, nodeType, basename)
+	nodeID := db.MintNodeID(queueType, parentID, nodeType, childName)
 
 	// Store SrcID temporarily in NodeState for BatchInsertNodes to create lookup mappings
 	// (BatchInsertNodes will handle storing in lookup tables, then SrcID can be removed from NodeState)
@@ -768,14 +927,16 @@ func childResultToNodeState(child ChildResult, parentPath string, depth int, que
 		srcID = child.SrcID
 	}
 
-	// Set CopyStatus to "pending" for all SRC children (will be updated during DST comparison)
-	// This ensures ALL SRC items start as pending, and DST comparison will update them to successful
-	// if they exist on both sides (and DST is newer for files)
-	var copyStatus string
+	// All discovered SRC children start pending for copy and source cleanup.
+	// DST-only children are represented exclusively by DST nodes, so they never
+	// receive a delete status. DST comparison only updates copy status for a
+	// matching SRC node.
+	var copyStatus, deleteStatus string
 	if queueType == "SRC" {
 		copyStatus = db.CopyStatusPending
+		deleteStatus = db.DeleteStatusPending
 	} else {
-		copyStatus = "" // DST nodes don't have copy status
+		copyStatus = "" // DST nodes don't have copy or delete status
 	}
 
 	if child.IsFile {
@@ -792,7 +953,8 @@ func childResultToNodeState(child ChildResult, parentPath string, depth int, que
 			Size:            file.Size,
 			MTime:           file.LastUpdated,
 			Depth:           depth,
-			CopyStatus:      copyStatus, // Set to "pending" for SRC, empty for DST
+			CopyStatus:      copyStatus,   // Set to "pending" for SRC, empty for DST
+			DeleteStatus:    deleteStatus, // Set to "pending" for SRC, empty for DST
 			Status:          child.Status,
 			SrcID:           srcID, // Temporarily stored for BatchInsertNodes to create lookup mappings
 		}
@@ -811,7 +973,8 @@ func childResultToNodeState(child ChildResult, parentPath string, depth int, que
 		Size:            0,
 		MTime:           folder.LastUpdated,
 		Depth:           depth,
-		CopyStatus:      copyStatus, // Set to "pending" for SRC, empty for DST
+		CopyStatus:      copyStatus,   // Set to "pending" for SRC, empty for DST
+		DeleteStatus:    deleteStatus, // Set to "pending" for SRC, empty for DST
 		Status:          child.Status,
 		SrcID:           srcID, // Temporarily stored for BatchInsertNodes to create lookup mappings
 	}
@@ -856,6 +1019,10 @@ func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
 	}
 	if mode == QueueModeDelete || mode == QueueModeDeleteRetry {
 		q.FailDeleteTask(task, executionDelta)
+		return
+	}
+	if mode == QueueModeGPL {
+		q.FailGPLTask(task, executionDelta)
 		return
 	}
 
@@ -966,12 +1133,12 @@ type RoundStats struct {
 
 // Stats returns current queue statistics.
 type QueueStats struct {
-	Name         string
-	Round        int
-	Pending      int
-	InProgress   int
-	TotalTracked int
-	Workers      int
+	Name         string `json:"name,omitempty"`
+	Round        int    `json:"round"`
+	Pending      int    `json:"pending"`
+	InProgress   int    `json:"in_progress"`
+	TotalTracked int    `json:"total_tracked,omitempty"`
+	Workers      int    `json:"workers"`
 }
 
 // Stats returns a snapshot of the queue's current state.
@@ -1080,7 +1247,7 @@ func (q *Queue) GetTotalCompleted() int {
 func (q *Queue) Run() {
 	// DST queue runs traversal or retry; copy is the only mode DST skips
 	mode := q.GetMode()
-	if q.name == "dst" && !(mode == QueueModeTraversal || mode == QueueModeRetry) {
+	if q.name == "dst" && !(mode == QueueModeTraversal || mode == QueueModeRetry || mode == QueueModeGPL) {
 		q.SetState(QueueStateCompleted)
 		if logservice.LS != nil {
 			err := logservice.LS.Log("info",

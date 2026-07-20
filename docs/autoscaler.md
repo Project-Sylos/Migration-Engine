@@ -197,22 +197,49 @@ Traversal/copy workers call `Queue.WaitInterOp(ctx)` before FS work. Delay clear
 
 Tunables via `scaling.Config.AIMD`: `DecreaseFactor` (0.5), `AdditiveStep` (1), `ProbeCooldown`, `InitialInterOpDelay` (1ms fallback when throughput unknown), `MinInterOpDelayStep` (100µs).
 
-### Efficiency-aware scale-up probing (second-order AIMD)
+### Throttle bounce timer (universal)
 
-Scale-up is not blind AIMD: before each worker increase (and after a probe window), the autoscaler compares **throughput EMA** from the observer against the worker count delta.
+Classic AIMD only remembers the last congestion event via `ssthresh` — it has no memory of **how often** the FS has punished climbs. Cloud APIs (Dropbox write-ops, etc.) often compound: repeated overshoots grow Retry-After / lockout windows. The **bounce timer** is a second axis:
+
+| Axis | Answers |
+|------|---------|
+| `ssthresh` | How high may workers go (slow-start vs additive) |
+| Bounce wait (`effectiveProbeCooldown`) | How soon may AIMD try climbing again after throttle |
+
+**Always on** (independent of efficiency probing):
 
 | Event | Response |
 |-------|----------|
-| **Failed efficiency probe** — workers increased but discovery/copy/bytes EMA did not improve enough (`rate_gain / worker_gain < MinEfficiencyRatio`, default 0.08) | Roll back toward pre-probe count; lower `ssthresh`; ratchet probe cooldown (2×, capped at 10m) |
-| **FS throttle during probe** | Abort in-flight probe; ratchet cooldown |
-| **Successful probe** | Snap probe cooldown back to normal |
-| **Long stability** (no throttle, no failed probes) | Slowly raise `ssthresh` toward `MaxWorkers` (default 5m interval) |
+| **`FS_THROTTLE` worker or inter-op step-down** | Ratchet bounce: first wait **max(ProbeCooldown, 30s)**, then **double** (60s, 120s, … capped at `EfficiencyProbe.MaxProbeCooldown`, default 10m); stamp `lastDecrease`. `IncreaseTarget` gates climbs on this wait |
+| **Calm worker scale-up** (efficiency probes **off**) | **Halve** bounce wait; clear elevation when ≤ base `ProbeCooldown` |
+| **Calm at MaxWorkers** (probes off, wait elapsed) | Same halve decay so the timer does not stick forever at the ceiling |
+| **Efficiency probe miss / success** (when `Enabled=true`) | Same ratchet / halve helpers — probes share the timer, they do not own a second clock |
+
+Example: `throttle → wait 30s → climb → throttle → wait 60s → climb → calm climb → wait 30s → … → clear`.
+
+`fsBackoffUntil` still blocks **stacked decreases** inside one Retry-After window; bounce only paces **climbs**.
+
+### Efficiency-aware scale-up probing (second-order AIMD)
+
+**Currently disabled by default** (`EfficiencyProbeConfig.Enabled=false`). AIMD still scales within each operation profile’s `MaxWorkers` hard ceiling, still halves on `FS_THROTTLE`, and still runs the **universal bounce timer** above. Set `Enabled=true` to restore throughput probes.
+
+When enabled, scale-up is not blind AIMD: before each worker increase (and after a probe window), the autoscaler compares **throughput EMA** from the observer against the worker count delta. Efficiency misses reuse the **same bounce timer** (soft bounce for the probe loop), not a separate TCP congestion signal:
+
+| Event | Response |
+|-------|----------|
+| **Failed efficiency probe** — workers increased but discovery/copy/bytes EMA did not improve enough (`rate_gain / worker_gain < MinEfficiencyRatio`, default 0.08) | Step workers back to pre-probe count; ratchet shared bounce wait; stamp wait clock. **Does not** lower `ssthresh` |
+| **Successful probe** | Keep workers; **halve** bounce wait; stamp wait clock. Clears elevation when halved wait ≤ base `ProbeCooldown` |
+| **FS throttle during probe** | Abort in-flight probe (clear pending); bounce already ratcheted by the FS_THROTTLE path; may cap `ssthresh` to post-halve workers |
+| **`RateLimitedUntil` still active** | No new scale-up / efficiency re-probe until retry-after elapses (even if hit counter is 0 this tick) |
+| **Long stability** (no throttle) | Slowly raise `ssthresh` toward `MaxWorkers` (default 5m interval) — only after real FS/memory pressure had set it |
+
+Example bounce wait: `try → miss → wait 30s → try → miss → wait 60s → try → miss → wait 120s → try → hit → wait 60s → …`
 
 **Signals:** `QueueObserver` EMA — discovery items/sec, copy items/sec, bytes/sec (copy pass 2 prefers bytes/sec), task completions/sec (inter-op delay seeding). Shared groups evaluate **total worker count** and the **active queue's throughput** (idle peers skipped).
 
-**Probe window:** `MinProbeWindow` defaults to one autoscaler tick. Tunables via `scaling.Config.EfficiencyProbe`.
+**Probe window:** `MinProbeWindow` defaults to **15s** (wall clock after scale-up before judging). Shared bounce waits start at **max(ProbeCooldown, 30s)** on first miss/throttle, then double up to `MaxProbeCooldown` (10m). Tunables via `scaling.Config.EfficiencyProbe` / `AIMD.ProbeCooldown`.
 
-Design rationale: reduce probe aggressiveness when scale-up does not pay off — without permanently freezing concurrency (TCP-style cautious probing, not a one-way latch).
+Design rationale: pace re-probes when scale-up does not pay off, without treating a flat EMA as hard congestion. Real `FS_THROTTLE` / 429 still drives AIMD worker halving, `ssthresh`, and the universal bounce timer.
 
 ### List page size (secondary lever)
 
@@ -272,13 +299,13 @@ Resolved profiles map to the actuator shape `FSPerformanceProfile` via `ToActuat
 
 **Built-in providers:** `generic`, `local`, `google_drive`, `dropbox`, `spectra`.
 
-| Provider | list_children | create_folder | download | upload |
-|----------|---------------|---------------|----------|--------|
-| `generic` | workers 10/32, pages 100/10k | workers 8/32 | workers 8/32 | workers 8/32 |
-| `local` | workers 8/64, pages 100/1k | workers 8/64 | workers 8/64 | workers 8/64 |
-| `google_drive` | pages 100/500, workers 6/16 | workers 4/12 | workers 8/16 | workers 8/16 |
-| `dropbox` | pages 100/500, workers 6/16 | workers 4/12 | workers 8/16 | workers 8/16 |
-| `spectra` | **all max caps = 0** | **0** | **0** | **0** |
+| Provider | list_children | create_folder | delete | download | upload |
+|----------|---------------|---------------|--------|----------|--------|
+| `generic` | workers 10/32, pages 100/10k | Default 8/32 | Default 8/32 | Default 8/32 | Default 8/32 |
+| `local` | workers 8/64, pages 100/1k | Default 8/64 | Default 8/64 | Default 8/64 | Default 8/64 |
+| `google_drive` | pages 100/500, workers 6/16 | workers 4/12 | workers 4/8 | Default 8/16 | Default 8/16 |
+| `dropbox` | pages 100/500, workers 4/8 | workers 4/8 | workers 4/8 | Default 8/16 | Default 8/16 |
+| `spectra` | **all max caps = 0** | **0** | **0** | **0** | **0** |
 
 **Zero-cap semantics (`MaxWorkers == 0`, etc.):** Spectra chaos limits vary per test config, so Spectra operation profiles do not encode fixed throughput caps. **`0` = no provider-imposed ceiling** — AIMD + throttle/memory gating only:
 
@@ -453,13 +480,22 @@ Each knob should have **Min**, **Default**, **Max**, and **Current** (runtime). 
 
 ## FS performance profiles
 
-Profiles live in `pkg/scaling/operation_profile.go`. `pkg/scaling/profile.go` defines the actuator shape (`FSPerformanceProfile`); use `ToActuatorProfile(LookupOperationProfile(...))` for the provider's `list_children` profile. **List pagination min/max/default** are defined on each Sylos-FS adapter (`pkg/types/listpagination.go`, implemented on `SpectraFS`, `LocalFS`, and future cloud adapters). ME merges adapter limits when `list_children` is the active operation via `scaling.ApplyAdapterListPagination`.
+Profiles live in `pkg/scaling/operation_profile.go`. `pkg/scaling/profile.go` defines the actuator shape (`FSPerformanceProfile`); use `ToActuatorProfile(LookupOperationProfile(...))` for the active operation. **Worker ceilings are per FS operation** (`list_children`, `create_folder`, `delete`, `download`, `upload`). Each provider has a **Default** profile used for every op that is not overridden in `Ops` (one worker count for everything unless cloud providers set granular limits). **List pagination min/max/default** are defined on each Sylos-FS adapter (`pkg/types/listpagination.go`, implemented on `SpectraFS`, `LocalFS`, and future cloud adapters). ME merges adapter limits when `list_children` is the active operation via `scaling.ApplyAdapterListPagination`.
 
-Lookup order:
+Lookup order for an operation:
+
+1. Provider `Ops[op]` override
+2. Provider `Default`
+3. `generic` `Ops[op]` override
+4. `generic` `Default`
+
+Provider identity for which profile map to load:
 
 1. `Service.ProviderID` on the migration service
 2. `Service.Name`
 3. `generic` fallback
+
+Active operation is chosen from queue mode (traversal → list; copy pass 1 → create_folder; copy pass 2 → download∩upload; delete → delete on dst).
 
 ### Profile shapes
 

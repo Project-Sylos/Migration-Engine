@@ -18,13 +18,15 @@ const (
 // A user-facing stall is detected when no tasks complete for the configured
 // timeout while tasks remain in-progress or pending. Idle queues that have
 // drained the current round (partial pull, empty buffers) are not flagged.
+// Active FS rate-limit windows and completion growth reset the timer (not stalls).
 type QueueWatchdog struct {
-	queue        *Queue
-	stallTimeout time.Duration
-	lastProgress atomic.Int64 // UnixNano of last progress
+	queue         *Queue
+	stallTimeout  time.Duration
+	lastProgress  atomic.Int64 // UnixNano of last progress
+	lastCompleted atomic.Int64 // last observed round Completed count
 	possibleStall atomic.Bool
-	stopCh       chan struct{}
-	stopped      atomic.Bool
+	stopCh        chan struct{}
+	stopped       atomic.Bool
 }
 
 // NewQueueWatchdog creates a watchdog for the given queue.
@@ -94,6 +96,28 @@ func (wd *QueueWatchdog) checkForStall() {
 		wd.resetTimer()
 		return
 	}
+	// Rate-limit windows are expected idle time — not a deadlock.
+	if wd.queue.IsRateLimitActive() {
+		wd.resetTimer()
+		wd.possibleStall.Store(false)
+		return
+	}
+
+	// Progress = task completions (ReportTaskResult Beat) or explicit Beats during rate-limit waits.
+	// Also treat round Completed growth as progress so mid-flight FS work that hasn't reported
+	// yet doesn't false-positive if other workers are completing.
+	round := wd.queue.GetRound()
+	var completed int64
+	if stats := wd.queue.GetRoundStats(round); stats != nil {
+		completed = int64(stats.Completed)
+	}
+	prev := wd.lastCompleted.Load()
+	if completed > prev {
+		wd.lastCompleted.Store(completed)
+		wd.resetTimer()
+		wd.possibleStall.Store(false)
+		return
+	}
 
 	lastBeat := time.Unix(0, wd.lastProgress.Load())
 	elapsed := time.Since(lastBeat)
@@ -109,7 +133,6 @@ func (wd *QueueWatchdog) checkForStall() {
 	if inProgress == 0 && pending == 0 {
 		st := wd.queue.State()
 		if st == QueueStateRunning && elapsed >= wd.stallTimeout {
-			round := wd.queue.GetRound()
 			if wd.queue.confirmRoundAdvanceGate(round) {
 				// Round keyspace exhausted; coordinator advances round or checks completion.
 				wd.resetTimer()

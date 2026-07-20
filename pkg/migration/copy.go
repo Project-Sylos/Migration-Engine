@@ -34,10 +34,11 @@ type CopyPhaseConfig struct {
 	Autoscaler           AutoscalerConfig
 	SrcService           Service
 	DstService           Service
+	PathCheckTarget      string
 }
 
 // applyCopyResumeDstExistenceWindow enables the copy queue's one-shot dst ListChildren precheck when
-// restarting after partial copy progress (see queue.SetCopyResumeDstExistenceWindow).
+// restarting after real copy progress (Successful = actual copy-phase completes, not DST matches).
 // Uses GetCopyStatusCountsFromEvents: requires both successful and pending SRC copy rows.
 // If any folder copy is still pending, anchors pass 1 at startRound; if only file copies are pending,
 // anchors pass 2 at the minimum depth that still has pending files (so empty shallow file rounds
@@ -155,7 +156,7 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	if runCtx == nil {
 		runCtx = context.Background()
 	}
-	asCtx := startCopyAutoscaler(runCtx, cfg.Autoscaler, observer, duckDB, copyQueue, cfg.SrcService, cfg.DstService)
+	asCtx := startCopyAutoscaler(runCtx, cfg.Autoscaler, observer, duckDB, copyQueue, cfg.SrcService, cfg.DstService, cfg.PathCheckTarget)
 	defer asCtx.stop()
 
 	statsChan := make(chan queue.QueueStats, 10)
@@ -403,7 +404,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	if runCtx == nil {
 		runCtx = context.Background()
 	}
-	asCtx := startCopyAutoscaler(runCtx, cfg.Autoscaler, observer, duckDB, copyQueue, cfg.SrcService, cfg.DstService)
+	asCtx := startCopyAutoscaler(runCtx, cfg.Autoscaler, observer, duckDB, copyQueue, cfg.SrcService, cfg.DstService, cfg.PathCheckTarget)
 	defer asCtx.stop()
 
 	// Set up stats channel for progress updates

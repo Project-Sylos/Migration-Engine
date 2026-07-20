@@ -156,20 +156,19 @@ func (w *memWriteCloser) Close() error {
 	return nil
 }
 
-// seedFlatCopyLayout inserts a flat SRC tree: two folders and one file at depth 1.
-// When wrongParentPathHash is true, rows are inserted with an incorrect parent_path_hash
-// to exercise copy pull join logic against malformed path metadata.
-func seedFlatCopyLayout(t *testing.T, database *db.DB, wrongParentPathHash bool) {
+// seedFlatCopyLayout inserts a flat SRC tree: two folders and one file at depth 1 under the SRC root,
+// plus DST root and root id_map so copy parent resolution works.
+func seedFlatCopyLayout(t *testing.T, database *db.DB) {
 	t.Helper()
 	const srcRootService = "src-root"
 	const dstRootService = "dst-root"
 
-	srcRootID := db.DeterministicNodeID("SRC", db.NodeTypeFolder, "/")
-	dstRootID := db.DeterministicNodeID("DST", db.NodeTypeFolder, "/")
+	srcRootID := db.RootNodeID("SRC")
+	dstRootID := db.RootNodeID("DST")
 
 	if err := db.InsertRootNode(database, "SRC", &db.NodeState{
 		ID: srcRootID, ServiceID: srcRootService, Path: "/", ParentPath: "", Type: db.NodeTypeFolder,
-		TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusSuccessful, Depth: 0,
+		TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusAlreadyExisted, Depth: 0,
 	}); err != nil {
 		t.Fatalf("insert src root: %v", err)
 	}
@@ -178,6 +177,15 @@ func seedFlatCopyLayout(t *testing.T, database *db.DB, wrongParentPathHash bool)
 		TraversalStatus: db.StatusSuccessful, Depth: 0,
 	}); err != nil {
 		t.Fatalf("insert dst root: %v", err)
+	}
+	database.AppendIDMapEvent(db.IDMapEvent{
+		SrcInternalID: srcRootID,
+		DstInternalID: dstRootID,
+		Source:        db.IDMapSourceRootSeed,
+		Status:        db.IDMapStatusActive,
+	})
+	if err := database.FlushSealBuffer(); err != nil {
+		t.Fatalf("flush id_map: %v", err)
 	}
 
 	type child struct {
@@ -196,14 +204,15 @@ func seedFlatCopyLayout(t *testing.T, database *db.DB, wrongParentPathHash bool)
 			now := time.Now().UTC().Format(time.RFC3339)
 			for _, ch := range children {
 				path := "/" + ch.name
-				nodeID := db.DeterministicNodeID("SRC", ch.typ, path)
+				nodeID := db.MintNodeID("SRC", srcRootID, ch.typ, ch.name)
 				node := &db.NodeState{
 					ID:              nodeID,
 					ServiceID:       "src-" + ch.name,
 					ParentID:        srcRootID,
 					ParentServiceID: srcRootService,
 					Path:            path,
-					ParentPath:      "",
+					ParentPath:      "/",
+					Name:            ch.name,
 					Type:            ch.typ,
 					Size:            ch.size,
 					MTime:           now,
@@ -211,22 +220,7 @@ func seedFlatCopyLayout(t *testing.T, database *db.DB, wrongParentPathHash bool)
 					TraversalStatus: db.StatusSuccessful,
 					CopyStatus:      db.CopyStatusPending,
 				}
-				if wrongParentPathHash {
-					conn, err := database.GetDB()
-					if err != nil {
-						return err
-					}
-					_, err = conn.ExecContext(context.Background(),
-						`INSERT INTO src_nodes (id, service_id, parent_id, parent_service_id, path, parent_path, path_hash, parent_path_hash, type, size, mtime, depth)
-						 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-						node.ID, node.ServiceID, node.ParentID, node.ParentServiceID, node.Path, node.ParentPath,
-						db.PathHash(node.Path), db.PathHash(""),
-						node.Type, node.Size, node.MTime, node.Depth,
-					)
-					if err != nil {
-						return err
-					}
-				} else if err := w.AppenderInsert("src_nodes", []*db.NodeState{node}); err != nil {
+				if err := w.AppenderInsert("src_nodes", []*db.NodeState{node}); err != nil {
 					return err
 				}
 				if err := w.InsertStatusEvent("SRC", &db.StatusEvent{
@@ -254,7 +248,7 @@ func TestRunCopyPhase_flatLayoutPass1FoldersBeforePass2(t *testing.T) {
 	}
 	defer database.Close()
 
-	seedFlatCopyLayout(t, database, false)
+	seedFlatCopyLayout(t, database)
 
 	src := newMemCopyAdapter("src-root", "src")
 	dst := newMemCopyAdapter("dst-root", "dst")
@@ -312,39 +306,5 @@ func TestRunCopyPhase_flatLayoutPass1FoldersBeforePass2(t *testing.T) {
 	}
 	if firstFile < 2 {
 		t.Fatalf("expected both folders before file, ops=%v", dst.ops)
-	}
-}
-
-func TestRunCopyPhase_flatLayoutWrongParentPathHash(t *testing.T) {
-	database, err := db.Open(db.Options{Path: t.TempDir() + "/flat_copy_wrong_hash.db"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
-
-	seedFlatCopyLayout(t, database, true)
-
-	src := newMemCopyAdapter("src-root", "src")
-	dst := newMemCopyAdapter("dst-root", "dst")
-	src.fileData["src-"+flatCopyFile] = []byte("hello sample")
-
-	_, err = RunCopyPhase(CopyPhaseConfig{
-		DuckDB:       database,
-		SrcAdapter:   src,
-		DstAdapter:   dst,
-		WorkerCount:  2,
-		MaxRetries:   1,
-		SkipListener: true,
-	})
-	if err != nil {
-		t.Fatalf("RunCopyPhase: %v", err)
-	}
-
-	c, err := database.GetCopyCountAtDepth(1, db.NodeTypeFolder, db.CopyStatusPending, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c > 0 {
-		t.Fatalf("wrong parent_path_hash rows: %d folders still pending", c)
 	}
 }

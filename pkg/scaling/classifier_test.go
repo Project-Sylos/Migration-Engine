@@ -22,6 +22,17 @@ func TestClassifyFSThrottle(t *testing.T) {
 	}
 }
 
+func TestClassifyFSThrottleFromRetryAfterWindow(t *testing.T) {
+	p := Classify(ClassifierInput{
+		Internal: map[string]queue.InternalMetricsSnapshot{
+			"dst": {RateLimitedUntil: time.Now().Add(2 * time.Second)},
+		},
+	})
+	if p != PressureFSThrottle {
+		t.Fatalf("got %s want FS_THROTTLE from RateLimitedUntil", p)
+	}
+}
+
 func TestClassifyUnderfeed(t *testing.T) {
 	p := Classify(ClassifierInput{
 		Internal: map[string]queue.InternalMetricsSnapshot{

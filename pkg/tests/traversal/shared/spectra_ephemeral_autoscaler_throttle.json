@@ -65,5 +65,9 @@
       "probability": 0.0,
       "retry_after_ms": 500
     }
+  },
+  "auth": {
+    "enabled": true,
+    "access_token_ttl_seconds": 3600
   }
 }

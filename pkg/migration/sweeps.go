@@ -41,6 +41,7 @@ type SweepConfig struct {
 	Autoscaler             AutoscalerConfig
 	SrcService             Service
 	DstService             Service
+	PathCheckTarget        string
 }
 
 // RunRetrySweep runs a retry sweep to re-process failed or pending tasks from a previous traversal.
@@ -185,7 +186,7 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	if runCtx == nil {
 		runCtx = context.Background()
 	}
-	asCtx := startAutoscaler(runCtx, cfg.Autoscaler, observer, duckDB, srcQueue, dstQueue, cfg.SrcService, cfg.DstService)
+	asCtx := startAutoscaler(runCtx, cfg.Autoscaler, observer, duckDB, srcQueue, dstQueue, cfg.SrcService, cfg.DstService, cfg.PathCheckTarget)
 	defer asCtx.stop()
 
 	// Set up stats channels for progress updates

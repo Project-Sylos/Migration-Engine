@@ -44,18 +44,42 @@ type errString string
 
 func (e errString) Error() string { return string(e) }
 
-func TestRateLimitedWaitDuration(t *testing.T) {
-	q := NewQueue("src", 3, 1, nil, nil)
-	until := time.Now().Add(500 * time.Millisecond)
-	q.SetRateLimitTelemetry(stubRateLimitTelemetry{until: until})
-	if d := q.RateLimitedWaitDuration(); d <= 0 {
-		t.Fatalf("expected positive wait, got %v", d)
+func TestRateLimitedUntilSides(t *testing.T) {
+	srcUntil := time.Now().Add(10 * time.Second)
+	dstUntil := time.Now().Add(20 * time.Second)
+
+	srcQ := NewQueue("src", 3, 1, nil, nil)
+	srcQ.SetRateLimitTelemetry(stubRateLimitTelemetry{until: srcUntil})
+	gotSrc, gotDst := srcQ.RateLimitedUntilSides()
+	if !gotSrc.Equal(srcUntil) || !gotDst.IsZero() {
+		t.Fatalf("src queue: src=%v dst=%v", gotSrc, gotDst)
 	}
-	q.SetRateLimitTelemetry(stubRateLimitTelemetry{until: time.Now().Add(-time.Second)})
-	if d := q.RateLimitedWaitDuration(); d != 0 {
-		t.Fatalf("expected zero wait after window, got %v", d)
+
+	dstQ := NewQueue("dst", 3, 1, nil, nil)
+	dstQ.SetRateLimitTelemetry(stubRateLimitTelemetry{until: dstUntil})
+	gotSrc, gotDst = dstQ.RateLimitedUntilSides()
+	if !gotSrc.IsZero() || !gotDst.Equal(dstUntil) {
+		t.Fatalf("dst queue: src=%v dst=%v", gotSrc, gotDst)
+	}
+
+	copyQ := NewQueue("copy", 3, 1, nil, nil)
+	copyQ.SetRateLimitTelemetry(
+		stubRateLimitTelemetry{until: srcUntil},
+		stubRateLimitTelemetry{until: dstUntil},
+	)
+	gotSrc, gotDst = copyQ.RateLimitedUntilSides()
+	if !gotSrc.Equal(srcUntil) || !gotDst.Equal(dstUntil) {
+		t.Fatalf("copy queue: src=%v dst=%v", gotSrc, gotDst)
+	}
+
+	delQ := NewQueue("delete", 3, 1, nil, nil)
+	delQ.SetRateLimitTelemetry(stubRateLimitTelemetry{until: srcUntil})
+	gotSrc, gotDst = delQ.RateLimitedUntilSides()
+	if !gotSrc.Equal(srcUntil) || !gotDst.IsZero() {
+		t.Fatalf("delete queue: src=%v dst=%v", gotSrc, gotDst)
 	}
 }
+
 
 func TestYieldTaskOnRateLimitDoesNotIncrementAttempts(t *testing.T) {
 	q := NewQueue("src", 3, 1, nil, nil)
@@ -75,5 +99,19 @@ func TestYieldTaskOnRateLimitDoesNotIncrementAttempts(t *testing.T) {
 	}
 	if q.GetPendingCount() != 1 {
 		t.Fatalf("pending=%d want 1", q.GetPendingCount())
+	}
+}
+
+func TestRateLimitReleaseJitter(t *testing.T) {
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 40; i++ {
+		j := rateLimitReleaseJitter(4 * time.Second)
+		if j < 0 || j > rateLimitReleaseJitterCap {
+			t.Fatalf("jitter=%v out of range", j)
+		}
+		seen[j] = true
+	}
+	if len(seen) < 2 {
+		t.Fatal("expected varied jitter samples")
 	}
 }

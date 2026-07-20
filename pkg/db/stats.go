@@ -84,7 +84,7 @@ func reviewKeyForStatus(phase, status string) string {
 		switch status {
 		case CopyStatusPending:
 			return ReviewKeyCopyPending
-		case CopyStatusSuccessful:
+		case CopyStatusSuccessful, CopyStatusAlreadyExisted:
 			return ReviewKeyCopySuccessful
 		case CopyStatusFailed:
 			return ReviewKeyCopyFailed
@@ -121,6 +121,141 @@ type ReviewStatsSnapshot struct {
 	Files                 int64
 	SizeSrc               int64
 	SizeDst               int64
+}
+
+// PhaseProgressCounts holds durable pending/successful/failed counts for copy or delete progress.
+// Successful is copy_status=successful for copy, or delete_status=deleted for delete.
+type PhaseProgressCounts struct {
+	Pending    int64
+	Successful int64
+	Failed     int64
+}
+
+// Completed returns successful + failed (terminal outcomes count as processed work).
+func (c PhaseProgressCounts) Completed() int64 {
+	return c.Successful + c.Failed
+}
+
+// Eligible returns pending + completed (excludes skipped/excluded by construction of the counts).
+func (c PhaseProgressCounts) Eligible() int64 {
+	return c.Pending + c.Completed()
+}
+
+// ProgressPercent returns 0–100 progress where completed work includes terminal failures.
+func (c PhaseProgressCounts) ProgressPercent() float64 {
+	return DeterministicProgressPercent(c.Pending, c.Successful, c.Failed, false)
+}
+
+// ProgressPercentRetry returns 0–100 progress for copy/delete retry runs.
+// Already-successful work is the baseline; pending and failed count as remaining retry work.
+func (c PhaseProgressCounts) ProgressPercentRetry() float64 {
+	return DeterministicProgressPercent(c.Pending, c.Successful, c.Failed, true)
+}
+
+// DeterministicProgressPercent computes percent complete from durable status counts.
+//
+// Normal mode: completed = successful + failed (terminal outcomes), so a finished run with
+// permanent failures still reaches 100%.
+//
+// Retry mode: completed = successful only. Failed items are the retry workload, so the bar
+// starts at the already-processed baseline and the remaining % is pending + failed.
+func DeterministicProgressPercent(pending, successful, failed int64, retryMode bool) float64 {
+	var completed, eligible int64
+	if retryMode {
+		completed = successful
+		eligible = pending + successful + failed
+	} else {
+		completed = successful + failed
+		eligible = pending + completed
+	}
+	if eligible <= 0 {
+		return 0
+	}
+	pct := 100.0 * float64(completed) / float64(eligible)
+	if pct < 0 {
+		return 0
+	}
+	if pct > 100 {
+		return 100
+	}
+	return pct
+}
+
+func (db *DB) readStatsKeyCount(key string) (int64, error) {
+	conn, err := db.GetDB()
+	if err != nil {
+		return 0, err
+	}
+	ctx := context.Background()
+	var n sql.NullInt64
+	err = conn.QueryRowContext(ctx, "SELECT count FROM "+tableStats+" WHERE key = $1", key).Scan(&n)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if n.Valid {
+		return n.Int64, nil
+	}
+	return 0, nil
+}
+
+// GetCopyProgressCounts reads O(1) canonical copy review-stat counters (excludes skipped/excluded).
+func (db *DB) GetCopyProgressCounts() (PhaseProgressCounts, error) {
+	var out PhaseProgressCounts
+	var err error
+	if out.Pending, err = db.readStatsKeyCount(ReviewKeyCopyPending); err != nil {
+		return out, err
+	}
+	if out.Successful, err = db.readStatsKeyCount(ReviewKeyCopySuccessful); err != nil {
+		return out, err
+	}
+	if out.Failed, err = db.readStatsKeyCount(ReviewKeyCopyFailed); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// GetDeleteProgressCounts aggregates delete statuses only for copy-successful SRC nodes
+// (same eligibility as GetDeleteCountAtDepth), excluding delete_status=skipped.
+func (db *DB) GetDeleteProgressCounts() (PhaseProgressCounts, error) {
+	counts, err := db.GetEligibleDeleteStatusCounts()
+	if err != nil {
+		return PhaseProgressCounts{}, err
+	}
+	return PhaseProgressCounts{
+		Pending:    counts.Pending,
+		Successful: counts.Deleted,
+		Failed:     counts.Failed,
+	}, nil
+}
+
+// GetEligibleDeleteStatusCounts returns current delete-status counts only for
+// copy-successful SRC nodes. This is the population shown in source-cleanup
+// planning/results; skipped nodes are excluded from deletion but still counted
+// for the review footer.
+func (db *DB) GetEligibleDeleteStatusCounts() (DeleteStatusCounts, error) {
+	var out DeleteStatusCounts
+	conn, err := db.GetDB()
+	if err != nil {
+		return out, err
+	}
+	ctx := context.Background()
+	rows, err := conn.QueryContext(ctx, `SELECT COALESCE(cur.delete_status,''), COUNT(*)::BIGINT
+FROM `+tableSrcNodes+` n
+LEFT JOIN `+cteSrcCurrentStatus+` cur ON n.id = cur.id
+WHERE COALESCE(cur.copy_status,'') IN ` + SQLCopyStatusCompleteIN + `
+  AND COALESCE(cur.delete_status,'') IN ('pending','deleted','failed','skipped')
+GROUP BY 1`)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	if err := scanDeleteStatusCounts(rows, &out); err != nil {
+		return out, err
+	}
+	return out, rows.Err()
 }
 
 // GetReviewStatsSnapshot reads the full canonical review stats from the universal stats table.
@@ -204,7 +339,7 @@ func (db *DB) GetPathReviewStatsFromDB() (ReviewStatsSnapshot, error) {
 		TraversalSuccessful:   srcT.Successful + dstT.Successful,
 		TraversalFailed:       srcT.Failed + dstT.Failed,
 		CopyPending:           copyCounts.Pending,
-		CopySuccessful:        copyCounts.Successful,
+		CopySuccessful:        copyCounts.Complete(),
 		CopyFailed:            copyCounts.Failed,
 		DeletePending:         deleteCounts.Pending,
 		DeleteDeleted:         deleteCounts.Deleted,
@@ -285,12 +420,20 @@ SELECT COALESCE(e.traversal_status,'') AS status, count(*)::BIGINT FROM ` + node
 }
 
 // CopyStatusCounts holds copy status counts for SRC (from src_status_events).
+// Successful is actual copy-phase completes only; AlreadyExisted is root/DST matches.
+// Complete() folds both for progress / API successfulCount.
 type CopyStatusCounts struct {
-	Pending    int64
-	Successful int64
-	Failed     int64
-	Skipped    int64
-	Excluded   int64 // excluded_explicit + excluded_inherited
+	Pending        int64
+	Successful     int64
+	AlreadyExisted int64
+	Failed         int64
+	Skipped        int64
+	Excluded       int64 // excluded_explicit + excluded_inherited
+}
+
+// Complete returns copy-satisfied count (actual copies + already on DST).
+func (c CopyStatusCounts) Complete() int64 {
+	return c.Successful + c.AlreadyExisted
 }
 
 // GetCopyStatusCountsFromEvents returns counts of SRC nodes by current copy_status from src_status_events (arg_max per id). Use for review/API counts.
@@ -324,6 +467,8 @@ SELECT COALESCE(e.copy_status,'') AS status, count(*)::BIGINT FROM ` + tableSrcN
 			out.Pending += n
 		case CopyStatusSuccessful:
 			out.Successful += n
+		case CopyStatusAlreadyExisted:
+			out.AlreadyExisted += n
 		case CopyStatusFailed:
 			out.Failed += n
 		case CopyStatusSkipped:
@@ -331,7 +476,7 @@ SELECT COALESCE(e.copy_status,'') AS status, count(*)::BIGINT FROM ` + tableSrcN
 		case CopyStatusExcludedExplicit, CopyStatusExcludedInherited:
 			out.Excluded += n
 		default:
-			out.Pending += n
+			// Unknown statuses must not inflate pending work.
 		}
 	}
 	return out, rows.Err()
@@ -342,6 +487,28 @@ type DeleteStatusCounts struct {
 	Pending int64
 	Deleted int64
 	Failed  int64
+	Skipped int64
+}
+
+func scanDeleteStatusCounts(rows *sql.Rows, out *DeleteStatusCounts) error {
+	for rows.Next() {
+		var status string
+		var n int64
+		if err := rows.Scan(&status, &n); err != nil {
+			return err
+		}
+		switch status {
+		case DeleteStatusPending:
+			out.Pending += n
+		case DeleteStatusDeleted:
+			out.Deleted += n
+		case DeleteStatusFailed:
+			out.Failed += n
+		case DeleteStatusSkipped:
+			out.Skipped += n
+		}
+	}
+	return rows.Err()
 }
 
 // GetDeleteStatusCountsFromEvents returns counts of SRC nodes by current delete_status from src_status_events.
@@ -364,22 +531,33 @@ SELECT COALESCE(e.delete_status,'') AS status, count(*)::BIGINT FROM ` + tableSr
 		return out, err
 	}
 	defer rows.Close()
-	for rows.Next() {
-		var status string
-		var n int64
-		if err := rows.Scan(&status, &n); err != nil {
-			return out, err
-		}
-		switch status {
-		case DeleteStatusPending:
-			out.Pending += n
-		case DeleteStatusDeleted:
-			out.Deleted += n
-		case DeleteStatusFailed:
-			out.Failed += n
-		}
+	if err := scanDeleteStatusCounts(rows, &out); err != nil {
+		return out, err
 	}
 	return out, rows.Err()
+}
+
+// GetRemainingSourceSizeAfterDelete returns the size of SRC nodes whose latest
+// delete status is not deleted. Nodes with pending, failed, skipped, or no
+// delete status remain part of the post-delete source-size result.
+func (db *DB) GetRemainingSourceSizeAfterDelete() (int64, error) {
+	conn, err := db.GetDB()
+	if err != nil {
+		return 0, err
+	}
+	ctx := context.Background()
+	var size sql.NullInt64
+	err = conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(n.size), 0)::BIGINT
+FROM `+tableSrcNodes+` n
+LEFT JOIN `+cteSrcCurrentStatus+` cur ON n.id = cur.id
+WHERE COALESCE(cur.delete_status, '') <> $1`, DeleteStatusDeleted).Scan(&size)
+	if err != nil {
+		return 0, err
+	}
+	if size.Valid {
+		return size.Int64, nil
+	}
+	return 0, nil
 }
 
 // GetStatsCount returns the total count for the given key from live nodes+events (table = "SRC" or "DST"). Supports traversal status keys only.
@@ -464,6 +642,40 @@ func (db *DB) GetTraversalCountAtDepthFromLive(table string, depth int, status s
 	return 0, nil
 }
 
+// GetGPLCountAtDepthFromLive returns the count of nodes at depth with the given gpl_status (event-derived).
+func (db *DB) GetGPLCountAtDepthFromLive(table string, depth int, status string) (int64, error) {
+	t := tableSrcNodes
+	evTable := tableSrcStatusEvents
+	if table == "DST" {
+		t = tableDstNodes
+		evTable = tableDstStatusEvents
+	}
+	conn, err := db.GetDB()
+	if err != nil {
+		return 0, err
+	}
+	ctx := context.Background()
+	q := `WITH gpl AS (
+	SELECT se.id, arg_max(se.gpl_status, se.event_time) AS gpl_status
+	FROM ` + evTable + ` se
+	INNER JOIN ` + t + ` n ON n.id = se.id AND n.depth = $1
+	WHERE COALESCE(se.gpl_status,'') <> ''
+	GROUP BY se.id
+)
+SELECT COUNT(*)::BIGINT FROM ` + t + ` n
+INNER JOIN gpl g ON g.id = n.id
+WHERE n.depth = $1 AND COALESCE(g.gpl_status,'') = $2`
+	var n sql.NullInt64
+	err = conn.QueryRowContext(ctx, q, depth, status).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	if n.Valid {
+		return n.Int64, nil
+	}
+	return 0, nil
+}
+
 // GetCopyCountAtDepth returns the count of nodes in src_nodes at the given depth with current copy_status (event-derived).
 // Optional nodeType filter. If breakAtFirst is true, returns 1 if any matching node exists or 0 otherwise.
 func (db *DB) GetCopyCountAtDepth(depth int, nodeType string, copyStatus string, breakAtFirst bool) (int64, error) {
@@ -521,7 +733,7 @@ func (db *DB) GetDeleteCountAtDepth(depth int, nodeType string, deleteStatus str
 	var q string
 	args := []any{depth, deleteStatus}
 	if breakAtFirst {
-		q = `SELECT 1 FROM src_nodes n LEFT JOIN ` + cteSrcCurrentStatus + ` e ON n.id = e.id WHERE n.depth = $1 AND COALESCE(e.delete_status,'') = $2 AND COALESCE(e.copy_status,'') = 'successful' AND COALESCE(e.copy_status,'') NOT IN ('excluded_explicit','excluded_inherited')`
+		q = `SELECT 1 FROM src_nodes n LEFT JOIN ` + cteSrcCurrentStatus + ` e ON n.id = e.id WHERE n.depth = $1 AND COALESCE(e.delete_status,'') = $2 AND COALESCE(e.copy_status,'') IN ` + SQLCopyStatusCompleteIN + ` AND COALESCE(e.copy_status,'') NOT IN ('excluded_explicit','excluded_inherited')`
 		if nodeType != "" {
 			q += ` AND n.type = $3`
 			args = append(args, nodeType)
@@ -537,7 +749,7 @@ func (db *DB) GetDeleteCountAtDepth(depth int, nodeType string, deleteStatus str
 		}
 		return 1, nil
 	}
-	q = `SELECT COUNT(*)::BIGINT FROM src_nodes n LEFT JOIN ` + cteSrcCurrentStatus + ` e ON n.id = e.id WHERE n.depth = $1 AND COALESCE(e.delete_status,'') = $2 AND COALESCE(e.copy_status,'') = 'successful' AND COALESCE(e.copy_status,'') NOT IN ('excluded_explicit','excluded_inherited')`
+	q = `SELECT COUNT(*)::BIGINT FROM src_nodes n LEFT JOIN ` + cteSrcCurrentStatus + ` e ON n.id = e.id WHERE n.depth = $1 AND COALESCE(e.delete_status,'') = $2 AND COALESCE(e.copy_status,'') IN ` + SQLCopyStatusCompleteIN + ` AND COALESCE(e.copy_status,'') NOT IN ('excluded_explicit','excluded_inherited')`
 	if nodeType != "" {
 		q += ` AND n.type = $3`
 		args = append(args, nodeType)

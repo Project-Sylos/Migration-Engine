@@ -88,22 +88,43 @@ func SetupSpectraFS(configPath string, cleanDB bool) (*sdk.SpectraFS, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize Spectra: %w", err)
 	}
+	if err := EnsureSpectraAuth(fs); err != nil {
+		_ = fs.Close()
+		return nil, err
+	}
 
 	return fs, nil
+}
+
+// EnsureSpectraAuth issues and binds per-world access tokens when auth is enabled.
+func EnsureSpectraAuth(fs *sdk.SpectraFS) error {
+	if fs == nil || !fs.AuthEnabled() {
+		return nil
+	}
+	worlds := []string{"primary"}
+	worlds = append(worlds, fs.GetSecondaryTables()...)
+	for _, world := range worlds {
+		if _, err := fs.EnsureWorldAuth(world); err != nil {
+			return fmt.Errorf("ensure auth for world %s: %w", world, err)
+		}
+	}
+	return nil
 }
 
 // LoadSpectraRoots fetches the Spectra root nodes and maps them to types.Folder structures.
 func LoadSpectraRoots(spectraFS *sdk.SpectraFS) (types.Folder, types.Folder, error) {
 	// Get root nodes from Spectra using request structs
 	srcRoot, err := spectraFS.GetNode(&sdk.GetNodeRequest{
-		ID: "root",
+		ID:        "root",
+		TableName: "primary",
 	})
 	if err != nil {
 		return types.Folder{}, types.Folder{}, fmt.Errorf("failed to get src root from Spectra: %w", err)
 	}
 
 	dstRoot, err := spectraFS.GetNode(&sdk.GetNodeRequest{
-		ID: "root",
+		ID:        "root",
+		TableName: "s1",
 	})
 	if err != nil {
 		return types.Folder{}, types.Folder{}, fmt.Errorf("failed to get dst root from Spectra: %w", err)

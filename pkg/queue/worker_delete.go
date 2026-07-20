@@ -5,6 +5,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -69,6 +70,14 @@ func (w *DeleteWorker) Run() {
 		if w.shouldRetire() {
 			return
 		}
+		if w.useDeleteBatchLease() {
+			w.runDeleteBatchTurn()
+			if w.shouldRetire() {
+				return
+			}
+			continue
+		}
+
 		task := w.queue.Lease()
 		if task == nil {
 			time.Sleep(50 * time.Millisecond)
@@ -77,6 +86,19 @@ func (w *DeleteWorker) Run() {
 		w.setBusy()
 		err := w.execute(task)
 		w.setIdle()
+		if errors.Is(err, errTransferAbandoned) {
+			if w.queue.hasInProgress(task.ID) {
+				task.Locked = false
+				w.queue.removeInProgress(task.ID)
+				if !w.queue.abandonModeForStop() {
+					_ = w.queue.Add(task)
+				}
+			}
+			if w.shouldRetire() {
+				return
+			}
+			continue
+		}
 		if err != nil {
 			task.LastError = err.Error()
 			task.WorkerResult = "error"
@@ -92,7 +114,9 @@ func (w *DeleteWorker) Run() {
 }
 
 func (w *DeleteWorker) execute(task *TaskBase) error {
-	ctx := w.workerCtx
+	ctx := fsOpContext(w.workerCtx, w.shutdownCtx)
+	w.queue.SetActiveLeaseSize(w.id, 0)
+	defer w.queue.ClearActiveLeaseSize(w.id)
 	serviceID := task.Identifier()
 	nodeType := types.NodeTypeFile
 	if task.IsFolder() {
@@ -101,5 +125,9 @@ func (w *DeleteWorker) execute(task *TaskBase) error {
 	if serviceID == "" {
 		return fmt.Errorf("empty service id for delete task %s", task.LocationPath())
 	}
-	return w.srcAdapter.DeleteNode(ctx, serviceID, nodeType)
+	err := w.srcAdapter.DeleteNode(ctx, serviceID, nodeType)
+	if isForceCheckoutAbort(err, w.shouldRetire(), w.queue.forceCheckoutWorker(w.id)) {
+		return errTransferAbandoned
+	}
+	return err
 }

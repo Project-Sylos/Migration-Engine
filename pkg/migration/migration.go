@@ -25,6 +25,9 @@ type persistedRunConfig struct {
 	SourceRoot        types.Folder   `json:"sourceRoot"`
 	DestinationName   string         `json:"destinationName"`
 	DestinationRoot   types.Folder   `json:"destinationRoot"`
+	SourceProviderID  string         `json:"sourceProviderId,omitempty"`
+	DestProviderID    string         `json:"destinationProviderId,omitempty"`
+	PathCheckTarget   string         `json:"pathCheckTarget,omitempty"`
 	SeedRoots         bool           `json:"seedRoots"`
 	WorkerCount       int            `json:"workerCount"`
 	MaxRetries        int            `json:"maxRetries"`
@@ -49,6 +52,9 @@ func persistedRunConfigFrom(cfg Config) persistedRunConfig {
 		SourceRoot:        cfg.Source.Root,
 		DestinationName:   cfg.Destination.Name,
 		DestinationRoot:   cfg.Destination.Root,
+		SourceProviderID:  cfg.Source.ProviderID,
+		DestProviderID:    cfg.Destination.ProviderID,
+		PathCheckTarget:   cfg.PathCheckTarget,
 		SeedRoots:         cfg.SeedRoots,
 		WorkerCount:       cfg.WorkerCount,
 		MaxRetries:        cfg.MaxRetries,
@@ -95,6 +101,10 @@ type Config struct {
 	ProgressTick time.Duration
 
 	Verification VerifyOptions
+
+	// PathCheckTarget selects destination-name rules: "none", "auto", or a provider id
+	// (e.g. "windows"). Empty is treated as "auto".
+	PathCheckTarget string
 
 	// ShutdownContext is an optional context for force shutdown control.
 	ShutdownContext context.Context

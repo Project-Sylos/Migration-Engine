@@ -30,7 +30,7 @@ type AIMDPolicy struct {
 // DefaultAIMDPolicy returns TCP-like defaults for worker scaling.
 func DefaultAIMDPolicy(probeCooldown time.Duration) AIMDPolicy {
 	if probeCooldown <= 0 {
-		probeCooldown = 20 * time.Second
+		probeCooldown = 30 * time.Second
 	}
 	return AIMDPolicy{
 		DecreaseFactor:      0.5,

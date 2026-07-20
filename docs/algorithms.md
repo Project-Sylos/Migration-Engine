@@ -60,14 +60,16 @@ For each item under a destination parent:
 
 2. **Exists on both source and destination**
 
-   * If folder → `copy_status = successful`
+   * If folder → `copy_status = already_existed`
    * If file:
 
      * If source timestamp > destination timestamp → `copy_status = pending`
-     * Otherwise → `copy_status = successful`
+     * Otherwise → `copy_status = already_existed`
 
 3. **Exists only on destination**
    → No `copy_status` assigned (ignored in one-way sync model)
+
+The SRC root is seeded with `copy_status = already_existed` (never a copy task). Only the copy phase writes `copy_status = successful` when it actually creates/updates an item.
 
 The engine intentionally ignores destination-only subtrees to avoid traversing potentially large, irrelevant structures. The tradeoff is reduced visibility during review for items that exist exclusively on the destination.
 
@@ -174,8 +176,8 @@ The delete phase removes successfully copied source (SRC) content after copy rev
 
 * **SRC only** — one delete queue; destination nodes are not deleted.
 * **Operational depths:** `maxKnownDepth` down to **1** (from `GetMaxDepth("SRC")`).
-* **Depth 0 (root) is never processed** — the root row is metadata-only (same as copy: seeded `copy_status = successful`, no delete work). `PrepareSourceCleanup` does not assign `delete_status` to depth-0 nodes.
-* **Eligible nodes:** `copy_status = successful`, not excluded, and `delete_status = pending` (set during copy-review cleanup planning via `PrepareSourceCleanup`).
+* **Depth 0 (root) is never processed** — the root row is metadata-only (same as copy: seeded `copy_status = already_existed`, no delete work). `PrepareSourceCleanup` does not assign `delete_status` to depth-0 nodes.
+* **Eligible nodes:** copy-complete (`successful` or `already_existed`), not excluded, and `delete_status = pending` (set during copy-review cleanup planning via `PrepareSourceCleanup`).
 
 ### Two global passes (copy-shaped)
 
@@ -226,6 +228,6 @@ Delete retry reuses the same reverse-BFS and two-pass structure. It only pulls n
 | Depth direction | 1 → maxKnownDepth | maxKnownDepth → 1 |
 | Pass switch after | All depths in pass 1 | All depths in pass 1 (ends at depth 1) |
 | Restart depth on pass 2 | 1 | maxKnownDepth |
-| Root (depth 0) | Never copied (pre-successful) | Never deleted (null delete_status) |
+| Root (depth 0) | Never copied (`already_existed`) | Never deleted (null delete_status) |
 
 ---

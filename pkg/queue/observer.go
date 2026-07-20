@@ -40,7 +40,8 @@ type ExternalQueueMetrics struct {
 	FilesDiscoveredTotal   int64 `json:"files_discovered_total"`
 	FoldersDiscoveredTotal int64 `json:"folders_discovered_total"`
 
-	// EMA-smoothed rates (2-5 second window) - traversal phase
+	// EMA-smoothed rates (2-5 second window) - traversal phase.
+	// Published as list-task completions/sec (not newly discovered children).
 	DiscoveryRateItemsPerSec float64 `json:"discovery_rate_items_per_sec"`
 
 	// Verification counts (for O(1) stats bucket lookups)
@@ -57,6 +58,26 @@ type ExternalQueueMetrics struct {
 	// Copy phase rates (EMA-smoothed)
 	ItemsPerSecond float64 `json:"items_per_second"` // Items/sec (folders + files)
 	BytesPerSecond float64 `json:"bytes_per_second"` // Bytes/sec
+
+	// Deterministic copy/delete progress (0–100). Omitted for traversal.
+	ProgressPercent float64 `json:"progress_percent,omitempty"`
+
+	// Current round Expected/Completed (same counters as console progress lines).
+	RoundExpected  int `json:"round_expected,omitempty"`
+	RoundCompleted int `json:"round_completed,omitempty"`
+	// Copy pass (1=folders, 2=files); omit for non-copy queues.
+	CopyPass int `json:"copy_pass,omitempty"`
+
+	// Rate-limit windows from attached FS telemetry (RFC3339 UTC when active).
+	// Traversal src → until_src; traversal dst → until_dst; copy → both; delete → until_src.
+	RateLimitedUntilSrc string `json:"rate_limited_until_src,omitempty"`
+	RateLimitedUntilDst string `json:"rate_limited_until_dst,omitempty"`
+	// Remaining ms at poll time (0 omitted). UI may subtract ~1s for poll staleness.
+	RateLimitedRemainingMsSrc int64 `json:"rate_limited_remaining_ms_src,omitempty"`
+	RateLimitedRemainingMsDst int64 `json:"rate_limited_remaining_ms_dst,omitempty"`
+
+	// AIMD inter-op pacing delay (ns→ms for API). Non-zero means workers are artificially slowed.
+	InterOpDelayMs int64 `json:"inter_op_delay_ms,omitempty"`
 
 	// Current state (for API)
 	QueueStats
@@ -95,7 +116,7 @@ type QueueObserver struct {
 	updateInterval time.Duration
 	running        bool // Whether the observe loop is running
 	// Internal metrics (in-memory only, for autoscaling)
-	internalMetrics map[string]*InternalQueueMetrics // Per-queue internal metrics
+	internalMetrics  map[string]*InternalQueueMetrics // Per-queue internal metrics
 	rateLimitSources map[string]RateLimitTelemetry
 	// EMA rate tracking
 	prevEMARates map[string]float64 // Previous EMA values for rate smoothing (key: queueName)
@@ -105,17 +126,9 @@ type QueueObserver struct {
 		folders int64
 		time    time.Time
 	} // Previous discovery totals and time for each queue
-	// Copy metrics tracking for delta calculation
-	prevCopyTotals map[string]struct {
-		bytes   int64
-		folders int64
-		files   int64
-		time    time.Time
-	} // Previous copy totals and time for each queue
-	prevTaskCompletionTotals map[string]struct {
-		tasks int64
-		time  time.Time
-	}
+	// Copy metrics tracking for sliding-window rates (Dropbox/Graph batch completions are bursty).
+	copyRateHistory map[string][]rateSample
+	taskRateHistory map[string][]rateSample
 	// lastAPIMetrics: marshaled ExternalQueueMetrics per queue_stats key (e.g. src-traversal), for O(1) API reads.
 	lastAPIMetricsMu sync.RWMutex
 	lastAPIMetrics   map[string][]byte
@@ -124,9 +137,19 @@ type QueueObserver struct {
 	lastDBPersist   time.Time
 }
 
+// rateSample is one monotonic counter observation for sliding-window rate math.
+type rateSample struct {
+	at    time.Time
+	value int64
+}
+
 const (
-	// emaAlpha is the smoothing factor for exponential moving average (0.2 = ~5 second window)
+	// emaAlpha is the smoothing factor for exponential moving average (0.2 ≈ several seconds).
 	emaAlpha = 0.2
+	// rateWindow is the lookback used for copy/delete throughput. EMA-per-tick decays to ~0
+	// within ~2s after a Dropbox batch completes; a wall-clock window keeps burst completions
+	// visible for the full window.
+	rateWindow = 5 * time.Second
 	// dbPersistInterval is how often metrics are appended to DuckDB (in-memory cache updates every tick).
 	dbPersistInterval = 1 * time.Second
 )
@@ -163,16 +186,8 @@ func NewQueueObserver(database *db.DB, updateInterval time.Duration) *QueueObser
 			folders int64
 			time    time.Time
 		}),
-		prevCopyTotals: make(map[string]struct {
-			bytes   int64
-			folders int64
-			files   int64
-			time    time.Time
-		}),
-		prevTaskCompletionTotals: make(map[string]struct {
-			tasks int64
-			time  time.Time
-		}),
+		copyRateHistory: make(map[string][]rateSample),
+		taskRateHistory: make(map[string][]rateSample),
 	}
 }
 
@@ -200,9 +215,12 @@ func (o *QueueObserver) UnregisterQueue(queueName string) {
 	delete(o.internalMetrics, queueName)
 	delete(o.prevEMARates, queueName)
 	delete(o.prevEMARates, queueName+"-tasks")
+	delete(o.prevEMARates, queueName+"-items")
+	delete(o.prevEMARates, queueName+"-bytes")
 	delete(o.prevDiscoveryTotals, queueName)
-	delete(o.prevCopyTotals, queueName)
-	delete(o.prevTaskCompletionTotals, queueName)
+	delete(o.copyRateHistory, queueName)
+	delete(o.copyRateHistory, queueName+"-bytes")
+	delete(o.taskRateHistory, queueName)
 }
 
 // Start begins the observer loop that publishes stats to DuckDB.
@@ -287,12 +305,8 @@ func (o *QueueObserver) Stop() {
 		folders int64
 		time    time.Time
 	})
-	o.prevCopyTotals = make(map[string]struct {
-		bytes   int64
-		folders int64
-		files   int64
-		time    time.Time
-	})
+	o.copyRateHistory = make(map[string][]rateSample)
+	o.taskRateHistory = make(map[string][]rateSample)
 	o.lastAPIMetricsMu.Lock()
 	o.lastAPIMetrics = nil
 	o.lastAPIMetricsMu.Unlock()
@@ -414,8 +428,8 @@ func (o *QueueObserver) pollQueue(queueName string, queue *Queue) *ExternalQueue
 	foldersTotal := queue.GetFoldersDiscoveredTotal()
 	totalDiscovered := queue.GetTotalDiscovered()
 
-	// Get copy phase totals
-	bytesTransferredTotal := queue.GetBytesTransferredTotal()
+	// Get copy phase totals (live bytes include in-flight leased progress).
+	bytesTransferredTotal := queue.GetLiveBytesTransferredTotal()
 	foldersCreatedTotal := queue.GetFoldersCreatedTotal()
 	filesCreatedTotal := queue.GetFilesCreatedTotal()
 
@@ -432,13 +446,26 @@ func (o *QueueObserver) pollQueue(queueName string, queue *Queue) *ExternalQueue
 	o.updateInternalMetrics(queueName, queue, currentState, now)
 	o.updateRateLimitMetrics(queueName, now)
 
-	// Calculate EMA-smoothed discovery rate (traversal phase)
-	discoveryRate := o.calculateDiscoveryRate(queueName, filesTotal, foldersTotal, now)
-	o.calculateTaskCompletionRate(queueName, queue.GetTasksCompletedTotal(), now)
+	// Calculate EMA-smoothed rates.
+	// Discovery rate for the UI tracks list-task completions (matches Comp growth), not
+	// newly discovered children — leaf/empty folders complete work without adding children.
+	_ = o.calculateDiscoveryRate(queueName, filesTotal, foldersTotal, now)
+	taskCompletionRate := o.calculateTaskCompletionRate(queueName, queue.GetTasksCompletedTotal(), now)
 
-	// Calculate copy phase rates (EMA-smoothed)
-	itemsPerSecond := o.calculateItemsPerSecond(queueName, foldersCreatedTotal, filesCreatedTotal, now)
-	bytesPerSecond := o.calculateBytesPerSecond(queueName, bytesTransferredTotal, now)
+	// Copy/delete phase rates over a sliding window (shared create+bytes snapshot).
+	itemsPerSecond, bytesPerSecond := o.calculateCopyPhaseRates(
+		queueName, foldersCreatedTotal, filesCreatedTotal, bytesTransferredTotal, now,
+	)
+	// Prefer task-completion rate for items/sec on copy/delete so Dropbox batch finishes
+	// and permanent failures still show activity matching the Comp ticker. Create-counter
+	// rate alone stays 0 between rare batch commits and undercounts failed work.
+	if queueName == "copy" || queueName == "delete" {
+		if taskCompletionRate > itemsPerSecond {
+			itemsPerSecond = taskCompletionRate
+		}
+	}
+
+	discoveryRate := taskCompletionRate
 
 	// Calculate total items (folders + files)
 	totalItems := foldersCreatedTotal + filesCreatedTotal
@@ -462,7 +489,62 @@ func (o *QueueObserver) pollQueue(queueName string, queue *Queue) *ExternalQueue
 		PossibleStall:            queue.PossibleStall(),
 	}
 
+	if queueName == "copy" || queueName == "delete" {
+		metric.ProgressPercent = o.computePhaseProgressPercent(queueName, queue.GetMode())
+	}
+	if roundStats := queue.GetRoundStats(stats.Round); roundStats != nil {
+		metric.RoundExpected = roundStats.Expected
+		metric.RoundCompleted = roundStats.Completed
+	}
+	if queueName == "copy" {
+		metric.CopyPass = queue.GetCopyPass()
+	}
+
+	srcUntil, dstUntil := queue.RateLimitedUntilSides()
+	metric.RateLimitedUntilSrc, metric.RateLimitedRemainingMsSrc = formatActiveRateLimit(srcUntil, now)
+	metric.RateLimitedUntilDst, metric.RateLimitedRemainingMsDst = formatActiveRateLimit(dstUntil, now)
+	if d := queue.GetInterOpDelay(); d > 0 {
+		metric.InterOpDelayMs = d.Milliseconds()
+		if metric.InterOpDelayMs < 1 {
+			metric.InterOpDelayMs = 1
+		}
+	}
+
 	return &metric
+}
+
+// formatActiveRateLimit returns RFC3339 until + remaining ms when the window is still open.
+func formatActiveRateLimit(until time.Time, now time.Time) (untilStr string, remainingMs int64) {
+	if until.IsZero() || !until.After(now) {
+		return "", 0
+	}
+	return until.UTC().Format(time.RFC3339Nano), until.Sub(now).Milliseconds()
+}
+
+// computePhaseProgressPercent returns durable copy/delete progress from review-stat / eligible counts.
+// Copy-retry and delete-retry treat already-successful work as the baseline and failed/pending as remaining.
+func (o *QueueObserver) computePhaseProgressPercent(queueName string, mode QueueMode) float64 {
+	if o.database == nil {
+		return 0
+	}
+	var counts db.PhaseProgressCounts
+	var err error
+	switch queueName {
+	case "copy":
+		counts, err = o.database.GetCopyProgressCounts()
+	case "delete":
+		counts, err = o.database.GetDeleteProgressCounts()
+	default:
+		return 0
+	}
+	if err != nil {
+		return 0
+	}
+	retryMode := mode == QueueModeCopyRetry || mode == QueueModeDeleteRetry
+	if retryMode {
+		return counts.ProgressPercentRetry()
+	}
+	return counts.ProgressPercent()
 }
 
 // AnyPossibleStall reports whether any registered queue recently triggered the watchdog.
@@ -534,160 +616,80 @@ func (o *QueueObserver) calculateDiscoveryRate(queueName string, filesTotal, fol
 	return newEMA
 }
 
-// calculateTaskCompletionRate calculates EMA-smoothed traversal/copy task completion rate (≈ FS ops/sec).
+// calculateTaskCompletionRate returns completions/sec over rateWindow (matches Comp growth).
 func (o *QueueObserver) calculateTaskCompletionRate(queueName string, tasksTotal int64, now time.Time) float64 {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	prev, hasPrev := o.prevTaskCompletionTotals[queueName]
-	if !hasPrev {
-		o.prevTaskCompletionTotals[queueName] = struct {
-			tasks int64
-			time  time.Time
-		}{tasks: tasksTotal, time: now}
-		o.prevEMARates[queueName+"-tasks"] = 0
+	if o.database != nil && o.database.SealIOWaitActive() {
+		return slidingWindowRate(o.taskRateHistory[queueName], now, tasksTotal)
+	}
+	rate, hist := appendSlidingRate(o.taskRateHistory[queueName], now, tasksTotal)
+	o.taskRateHistory[queueName] = hist
+	return rate
+}
+
+// calculateCopyPhaseRates returns items/sec and bytes/sec over a shared rateWindow.
+// Items use successful create counters (folders+files). Bursty Dropbox batch completions
+// stay visible for the full window instead of EMA-decaying to 0 within ~2s.
+func (o *QueueObserver) calculateCopyPhaseRates(
+	queueName string,
+	foldersTotal, filesTotal, bytesTotal int64,
+	now time.Time,
+) (itemsPerSec, bytesPerSec float64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	itemsTotal := foldersTotal + filesTotal
+	if o.database != nil && o.database.SealIOWaitActive() {
+		return slidingWindowRate(o.copyRateHistory[queueName], now, itemsTotal),
+			slidingWindowRate(o.copyRateHistory[queueName+"-bytes"], now, bytesTotal)
+	}
+	itemsPerSec, itemsHist := appendSlidingRate(o.copyRateHistory[queueName], now, itemsTotal)
+	bytesPerSec, bytesHist := appendSlidingRate(o.copyRateHistory[queueName+"-bytes"], now, bytesTotal)
+	o.copyRateHistory[queueName] = itemsHist
+	o.copyRateHistory[queueName+"-bytes"] = bytesHist
+	return itemsPerSec, bytesPerSec
+}
+
+// appendSlidingRate records value at now and returns (value-oldest)/dt over rateWindow.
+func appendSlidingRate(hist []rateSample, now time.Time, value int64) (float64, []rateSample) {
+	hist = append(hist, rateSample{at: now, value: value})
+	cutoff := now.Add(-rateWindow)
+	// Keep one sample at/before cutoff as the baseline, drop older.
+	firstKeep := 0
+	for i := 0; i < len(hist)-1; i++ {
+		if hist[i].at.Before(cutoff) {
+			firstKeep = i
+			continue
+		}
+		break
+	}
+	if firstKeep > 0 {
+		hist = hist[firstKeep:]
+	}
+	// Cap history length to avoid unbounded growth if clock stalls.
+	const maxSamples = 256
+	if len(hist) > maxSamples {
+		hist = hist[len(hist)-maxSamples:]
+	}
+	return slidingWindowRate(hist, now, value), hist
+}
+
+func slidingWindowRate(hist []rateSample, now time.Time, value int64) float64 {
+	if len(hist) == 0 {
 		return 0
 	}
-
-	if o.database != nil && o.database.SealIOWaitActive() {
-		return o.prevEMARates[queueName+"-tasks"]
+	oldest := hist[0]
+	dt := now.Sub(oldest.at).Seconds()
+	if dt <= 0 {
+		return 0
 	}
-
-	timeDelta := now.Sub(prev.time).Seconds()
-	if timeDelta <= 0 {
-		return o.prevEMARates[queueName+"-tasks"]
+	delta := value - oldest.value
+	if delta < 0 {
+		delta = 0
 	}
-
-	taskDelta := tasksTotal - prev.tasks
-	if taskDelta < 0 {
-		taskDelta = 0
-	}
-	currentRate := float64(taskDelta) / timeDelta
-
-	prevEMA := o.prevEMARates[queueName+"-tasks"]
-	newEMA := emaAlpha*currentRate + (1-emaAlpha)*prevEMA
-	o.prevEMARates[queueName+"-tasks"] = newEMA
-	o.prevTaskCompletionTotals[queueName] = struct {
-		tasks int64
-		time  time.Time
-	}{tasks: tasksTotal, time: now}
-	return newEMA
-}
-
-// calculateBytesPerSecond calculates EMA-smoothed bytes/sec rate for copy phase.
-func (o *QueueObserver) calculateBytesPerSecond(queueName string, bytesTotal int64, now time.Time) float64 {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	prev, hasPrev := o.prevCopyTotals[queueName]
-
-	if !hasPrev {
-		// First poll - initialize tracking
-		o.prevCopyTotals[queueName] = struct {
-			bytes   int64
-			folders int64
-			files   int64
-			time    time.Time
-		}{
-			bytes:   bytesTotal,
-			folders: 0,
-			files:   0,
-			time:    now,
-		}
-		return 0.0
-	}
-
-	if o.database != nil && o.database.SealIOWaitActive() {
-		return o.prevEMARates[queueName+"-bytes"]
-	}
-
-	// Calculate current instantaneous rate
-	timeDelta := now.Sub(prev.time).Seconds()
-	if timeDelta <= 0 {
-		return 0.0
-	}
-
-	bytesDelta := bytesTotal - prev.bytes
-	currentRate := float64(bytesDelta) / timeDelta
-
-	// Update EMA: newEMA = alpha * currentRate + (1-alpha) * previousEMA
-	prevEMA := o.prevEMARates[queueName+"-bytes"]
-	newEMA := emaAlpha*currentRate + (1-emaAlpha)*prevEMA
-
-	// Store for next calculation
-	o.prevEMARates[queueName+"-bytes"] = newEMA
-	o.prevCopyTotals[queueName] = struct {
-		bytes   int64
-		folders int64
-		files   int64
-		time    time.Time
-	}{
-		bytes:   bytesTotal,
-		folders: prev.folders,
-		files:   prev.files,
-		time:    now,
-	}
-
-	return newEMA
-}
-
-// calculateItemsPerSecond calculates EMA-smoothed items/sec rate for copy phase (folders + files).
-func (o *QueueObserver) calculateItemsPerSecond(queueName string, foldersTotal, filesTotal int64, now time.Time) float64 {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	prev, hasPrev := o.prevCopyTotals[queueName]
-
-	if !hasPrev {
-		// First poll - initialize tracking
-		o.prevCopyTotals[queueName] = struct {
-			bytes   int64
-			folders int64
-			files   int64
-			time    time.Time
-		}{
-			bytes:   0,
-			folders: foldersTotal,
-			files:   filesTotal,
-			time:    now,
-		}
-		o.prevEMARates[queueName+"-items"] = 0.0
-		return 0.0
-	}
-
-	if o.database != nil && o.database.SealIOWaitActive() {
-		return o.prevEMARates[queueName+"-items"]
-	}
-
-	// Calculate current instantaneous rate
-	timeDelta := now.Sub(prev.time).Seconds()
-	if timeDelta <= 0 {
-		return o.prevEMARates[queueName+"-items"]
-	}
-
-	// Calculate total items delta (folders + files)
-	itemsDelta := (foldersTotal - prev.folders) + (filesTotal - prev.files)
-	currentRate := float64(itemsDelta) / timeDelta
-
-	// Update EMA: newEMA = alpha * currentRate + (1-alpha) * previousEMA
-	prevEMA := o.prevEMARates[queueName+"-items"]
-	newEMA := emaAlpha*currentRate + (1-emaAlpha)*prevEMA
-
-	// Store for next calculation
-	o.prevEMARates[queueName+"-items"] = newEMA
-	o.prevCopyTotals[queueName] = struct {
-		bytes   int64
-		folders int64
-		files   int64
-		time    time.Time
-	}{
-		bytes:   prev.bytes,
-		folders: foldersTotal,
-		files:   filesTotal,
-		time:    now,
-	}
-
-	return newEMA
+	return float64(delta) / dt
 }
 
 // updateInternalMetrics updates internal metrics by attributing time deltas to state buckets.
@@ -768,14 +770,8 @@ func (o *QueueObserver) updateRateLimitMetrics(queueName string, now time.Time) 
 	if !ok || src == nil || internal == nil {
 		return
 	}
-	hits := src.TakeRecentHits()
-	if hits > 0 {
-		o.mu.Lock()
-		if m := o.internalMetrics[queueName]; m != nil {
-			m.TimeRateLimited += time.Duration(hits) * 50 * time.Millisecond
-		}
-		o.mu.Unlock()
-	}
+	// Do NOT TakeRecentHits here — that is reserved for SnapshotInternalMetrics
+	// (autoscaler tick). Draining on every observer poll hid FS_THROTTLE from AIMD.
 	until := src.RateLimitedUntil()
 	if until.After(now) {
 		o.mu.Lock()

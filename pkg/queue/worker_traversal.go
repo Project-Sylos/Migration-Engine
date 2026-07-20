@@ -5,6 +5,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -160,6 +161,19 @@ func (w *TraversalWorker) Run() {
 		// Execute the task (check for shutdown during execution if needed)
 		err := w.execute(task)
 		w.setIdle()
+		if errors.Is(err, errTransferAbandoned) {
+			// Scale-down / throttle abort already (or will be) requeued via ReleaseInFlightOnThrottle;
+			// if still in-progress, yield without failure.
+			if w.queue.hasInProgress(task.ID) {
+				task.Locked = false
+				w.queue.removeInProgress(task.ID)
+				_ = w.queue.Add(task)
+			}
+			if w.shouldRetire() {
+				return
+			}
+			continue
+		}
 		if err != nil {
 			task.LastError = err.Error()
 			if IsThrottleError(err) {
@@ -188,16 +202,22 @@ func (w *TraversalWorker) Run() {
 // execute performs the actual traversal work.
 // It populates task.DiscoveredChildren instead of writing directly to DB.
 func (w *TraversalWorker) execute(task *TaskBase) error {
+	if w.queue.GetMode() == QueueModeGPL {
+		return w.executeGPL(task)
+	}
 	if !task.IsFolder() {
 		return fmt.Errorf("traversal worker received non-folder task")
 	}
 
-	parent := w.shutdownCtx
-	if parent == nil {
-		parent = context.Background()
-	}
-	wd, ctx := NewProgressWatchdog(parent, traversalStallTimeout, w.queue.sealIOWaitActive)
+	// Prefer workerCtx so scale-down / stop force-checkout aborts mid-ListChildren; fall back to shutdown.
+	parent := fsOpContext(w.workerCtx, w.shutdownCtx)
+	wd, ctx := NewProgressWatchdog(parent, traversalStallTimeout, func() bool {
+		return w.queue.sealIOWaitActive() || w.queue.IsRateLimitActive()
+	})
 	defer wd.Stop()
+
+	w.queue.SetActiveLeaseSize(w.id, 0)
+	defer w.queue.ClearActiveLeaseSize(w.id)
 
 	w.queue.WaitInterOp(w.workerCtx)
 
@@ -213,10 +233,22 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 		listDone <- listChildrenResult{result: r, err: err}
 	}(folder.ServiceID, depth, folder.LocationPath)
 
+	// Heartbeat while waiting so long list RPCs / throttle waits are not silent stalls.
+	stopBeat := beatWatchdogWhile(ctx, wd, 5*time.Second)
+	defer stopBeat()
+	if w.queue.watchdog != nil {
+		stopQ := beatQueueWatchdogWhile(ctx, w.queue.watchdog, 5*time.Second)
+		defer stopQ()
+	}
+
 	var (
 		result types.ListResult
 		err    error
 	)
+	var shutdownCh <-chan struct{}
+	if w.shutdownCtx != nil {
+		shutdownCh = w.shutdownCtx.Done()
+	}
 	select {
 	case out := <-listDone:
 		result = out.result
@@ -226,10 +258,14 @@ func (w *TraversalWorker) execute(task *TaskBase) error {
 		}
 	case <-ctx.Done():
 		err = ctx.Err()
-	case <-w.shutdownCtx.Done():
+	case <-shutdownCh:
 		err = fmt.Errorf("list children cancelled by shutdown")
 	}
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			// Scale-down / throttle abort: yield without failure accounting.
+			return errTransferAbandoned
+		}
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("error",
 				fmt.Sprintf("Failed to list children: path=%s folderId=%s error=%v",
@@ -345,13 +381,13 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 			// Get SRC node ID from map
 			srcID := srcIDMap[matchKey]
 
-			// Folder exists on both: SRC copy status should be "successful"
+			// Folder exists on both: never a copy task for this migration.
 			task.DiscoveredChildren = append(task.DiscoveredChildren, ChildResult{
 				Folder:        actualFolder,
 				Status:        db.StatusPending,
 				IsFile:        false,
 				SrcID:         srcID,
-				SrcCopyStatus: db.CopyStatusSuccessful, // Folder exists on both, no copy needed
+				SrcCopyStatus: db.CopyStatusAlreadyExisted,
 			})
 		}
 	}
@@ -378,16 +414,16 @@ func (w *TraversalWorker) executeDstComparison(task *TaskBase, actualResult type
 			srcID := srcIDMap[matchKey]
 
 			// Compare timestamps to determine copy status for SRC node.
-			// If DST is newer or equal: no copy needed (successful).
+			// If DST is newer or equal: already on DST (already_existed).
 			// If SRC is newer: copy needed (pending).
 			srcCopyStatus := db.CopyStatusPending
 			switch compareTimestamps(expectedFile.LastUpdated, actualFile.LastUpdated) {
 			case "Successful":
-				srcCopyStatus = db.CopyStatusSuccessful
+				srcCopyStatus = db.CopyStatusAlreadyExisted
 			case "Unparseable":
 				// Provider mtimes missing or non-RFC3339: same-size match on both sides is treated as in sync.
 				if expectedFile.Size > 0 && expectedFile.Size == actualFile.Size {
-					srcCopyStatus = db.CopyStatusSuccessful
+					srcCopyStatus = db.CopyStatusAlreadyExisted
 				}
 			}
 
@@ -465,4 +501,19 @@ func (w *TraversalWorker) logError(task *TaskBase, paramErr error, willRetry boo
 	if err != nil {
 		fmt.Println("error logging", err)
 	}
+}
+
+// executeGPL revalidates path-scoped GPL rules for cascade after ancestor remaps.
+func (w *TraversalWorker) executeGPL(task *TaskBase) error {
+	if w.isDst {
+		// DST pending is acknowledgment only; path composition lives on SRC.
+		return nil
+	}
+	if !PathChecksRequired(w.queue.scalingSrcProvider, w.queue.scalingDstProvider, w.queue.pathCheckProfile) {
+		return nil
+	}
+	database := w.queue.getDatabase()
+	checkTarget := ResolvePathCheckTarget(w.queue.scalingSrcProvider, w.queue.scalingDstProvider, w.queue.pathCheckProfile)
+	target := gplTargetFromProvider(checkTarget)
+	return ProcessGPLTaskSRC(database, target, task)
 }

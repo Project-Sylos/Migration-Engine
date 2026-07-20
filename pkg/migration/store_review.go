@@ -198,7 +198,7 @@ func addReviewDeltaLeaveCopyBucketForExclude(deltas map[string]int64, copyStatus
 		addReviewDelta(deltas, DeltaCopyPending, -1)
 	case db.CopyStatusFailed:
 		addReviewDelta(deltas, DeltaCopyFailed, -1)
-	case db.CopyStatusSuccessful:
+	case db.CopyStatusSuccessful, db.CopyStatusAlreadyExisted:
 		addReviewDelta(deltas, DeltaCopySuccessful, -1)
 	case db.CopyStatusInProgress:
 		// Writer does not decrement in_progress in per-depth stats when switching to excluded.
@@ -208,6 +208,22 @@ func addReviewDeltaLeaveCopyBucketForExclude(deltas map[string]int64, copyStatus
 		// Exclude path should not run when already excluded.
 	default:
 		addReviewDelta(deltas, DeltaCopyPending, -1)
+	}
+}
+
+// addReviewDeltaEnterCopyBucketForUnexclude applies +1 to the copy-status bucket restored on unexclude.
+func addReviewDeltaEnterCopyBucketForUnexclude(deltas map[string]int64, copyStatus string) {
+	switch copyStatus {
+	case db.CopyStatusPending, "":
+		addReviewDelta(deltas, DeltaCopyPending, 1)
+	case db.CopyStatusFailed:
+		addReviewDelta(deltas, DeltaCopyFailed, 1)
+	case db.CopyStatusSuccessful, db.CopyStatusAlreadyExisted:
+		addReviewDelta(deltas, DeltaCopySuccessful, 1)
+	case db.CopyStatusInProgress, db.CopyStatusSkipped:
+		// No separate review-table copy bucket (mirrors exclude leave path).
+	default:
+		addReviewDelta(deltas, DeltaCopyPending, 1)
 	}
 }
 
@@ -224,8 +240,19 @@ func (s *migrationStore) setNodeExcluded(nodeID string, excluded bool) (int64, m
 	if node.Excluded == excluded {
 		return 0, nil, nil
 	}
+	var restoredCopy string
 	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
 		return sess.WithTx(func(w *db.Writer) error {
+			if !excluded {
+				prior, err2 := w.LatestNonExclusionCopyStatus(nodeID)
+				if err2 != nil {
+					return err2
+				}
+				if prior == "" {
+					prior = db.CopyStatusPending
+				}
+				restoredCopy = prior
+			}
 			return w.SetNodeExcluded(q, nodeID, excluded)
 		})
 	})
@@ -238,7 +265,7 @@ func (s *migrationStore) setNodeExcluded(nodeID string, excluded bool) (int64, m
 		addReviewDeltaLeaveCopyBucketForExclude(deltas, node.CopyStatus)
 	} else {
 		addReviewDelta(deltas, DeltaExcluded, -1)
-		addReviewDelta(deltas, DeltaCopyPending, 1)
+		addReviewDeltaEnterCopyBucketForUnexclude(deltas, restoredCopy)
 	}
 	if err := s.persistReviewDeltas(deltas); err != nil {
 		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
@@ -406,6 +433,7 @@ func (s *migrationStore) setNodeDeleteStatusWithPropagation(nodeID, targetStatus
 		pendingDelta = -affected
 	}
 	addReviewDeltaForDeleteStatus(deltas, db.DeleteStatusPending, pendingDelta)
+	addReviewDeltaForDeleteStatus(deltas, db.DeleteStatusSkipped, -pendingDelta)
 	if err := s.persistReviewDeltas(deltas); err != nil {
 		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
 	}
@@ -572,6 +600,11 @@ func (s *migrationStore) setNodeExcludedWithPropagation(nodeID string, excluded 
 				}
 				return w.InsertExclusionEventsForSubtree(q, rootPath)
 			}
+			var err2 error
+			buckets, err2 = w.CountCopyStatusBucketsSubtreeExcludedPrior(rootPath)
+			if err2 != nil {
+				return err2
+			}
 			return w.InsertUnexcludeEventsForSubtree(q, rootPath)
 		})
 	})
@@ -586,7 +619,9 @@ func (s *migrationStore) setNodeExcludedWithPropagation(nodeID string, excluded 
 		addReviewDelta(deltas, DeltaCopySuccessful, -buckets.Successful)
 	} else {
 		addReviewDelta(deltas, DeltaExcluded, -affected)
-		addReviewDelta(deltas, DeltaCopyPending, affected)
+		addReviewDelta(deltas, DeltaCopyPending, buckets.Pending)
+		addReviewDelta(deltas, DeltaCopyFailed, buckets.Failed)
+		addReviewDelta(deltas, DeltaCopySuccessful, buckets.Successful)
 	}
 	if err := s.persistReviewDeltas(deltas); err != nil {
 		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
@@ -664,14 +699,15 @@ func normalizeDepthSizeOp(op string) string {
 // searchRequestToReviewFilter maps API/UI SearchRequest onto db.ReviewFilter (merged view, status from events).
 func searchRequestToReviewFilter(req SearchRequest) db.ReviewFilter {
 	f := db.ReviewFilter{
-		ParentPath:       strings.TrimSpace(req.Path),
-		Query:            strings.TrimSpace(req.Query),
-		FoldersOnly:      req.FoldersOnly,
-		ExcludeRoot:      req.Path == "",
-		StatusSearchType: strings.TrimSpace(req.StatusSearchType),
-		TraversalStatus:  strings.TrimSpace(req.TraversalStatus),
-		CopyStatus:       strings.TrimSpace(req.CopyStatus),
-		DeleteStatus:     strings.TrimSpace(req.DeleteStatus),
+		ParentPath:             strings.TrimSpace(req.Path),
+		Query:                  strings.TrimSpace(req.Query),
+		FoldersOnly:            req.FoldersOnly,
+		ExcludeRoot:            req.Path == "",
+		StatusSearchType:       strings.TrimSpace(req.StatusSearchType),
+		TraversalStatus:        strings.TrimSpace(req.TraversalStatus),
+		CopyStatus:             strings.TrimSpace(req.CopyStatus),
+		DeleteStatus:           strings.TrimSpace(req.DeleteStatus),
+		ExcludeDestinationOnly: excludeDestinationOnly(req.IncludeDestinationOnly),
 	}
 	for _, c := range req.Conditions {
 		field := strings.ToLower(strings.TrimSpace(c.Field))
@@ -717,6 +753,11 @@ func searchRequestToReviewFilter(req SearchRequest) db.ReviewFilter {
 	return f
 }
 
+// excludeDestinationOnly maps includeDestinationOnly pointer: nil/true → keep dst-only; false → hide.
+func excludeDestinationOnly(include *bool) bool {
+	return include != nil && !*include
+}
+
 func sanitizeSort(sortBy, sortDirection string) string {
 	column := "path"
 	switch strings.ToLower(strings.TrimSpace(sortBy)) {
@@ -758,10 +799,11 @@ func (s *migrationStore) listChildrenDiffs(req ListChildrenDiffsRequest) (ListCh
 	}
 	orderBy := sanitizeSort(req.SortBy, req.SortDirection)
 	f := db.ReviewFilter{
-		ParentPath:      req.Path,
-		FoldersOnly:     req.FoldersOnly,
-		TraversalStatus: strings.TrimSpace(req.TraversalStatus),
-		CopyStatus:      strings.TrimSpace(req.CopyStatus),
+		ParentPath:             req.Path,
+		FoldersOnly:            req.FoldersOnly,
+		TraversalStatus:        strings.TrimSpace(req.TraversalStatus),
+		CopyStatus:             strings.TrimSpace(req.CopyStatus),
+		ExcludeDestinationOnly: excludeDestinationOnly(req.IncludeDestinationOnly),
 	}
 	rows, total, err := db.ListMergedReviewDiffs(s.db, f, orderBy, limit, offset)
 	if err != nil {
@@ -812,8 +854,12 @@ func (s *migrationStore) searchPathReviewItems(req SearchRequest) (SearchResult,
 	}, nil
 }
 
-func (s *migrationStore) getChildrenDiffsStats(path string, foldersOnly bool) (DiffsStats, error) {
-	f := db.ReviewFilter{ParentPath: path, FoldersOnly: foldersOnly}
+func (s *migrationStore) getChildrenDiffsStats(path string, foldersOnly bool, includeDestinationOnly *bool) (DiffsStats, error) {
+	f := db.ReviewFilter{
+		ParentPath:             path,
+		FoldersOnly:            foldersOnly,
+		ExcludeDestinationOnly: excludeDestinationOnly(includeDestinationOnly),
+	}
 	stats, err := db.GetMergedReviewStats(s.db, f)
 	if err != nil {
 		return DiffsStats{}, err

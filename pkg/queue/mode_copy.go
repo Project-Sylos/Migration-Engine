@@ -4,6 +4,7 @@
 package queue
 
 import (
+	"context"
 	"fmt"
 	"path"
 	"time"
@@ -213,7 +214,7 @@ func (q *Queue) PullCopyTasks(force bool) PullResult {
 			task.ID = item.State.ID
 		}
 
-		// DstParentServiceID from path_hash join in ListNodesCopyKeyset
+		// DstParentServiceID from id_map → dst_nodes join in ListNodesCopyKeyset
 		if item.State.ParentID == "" {
 			if logservice.LS != nil {
 				err := logservice.LS.Log("error", fmt.Sprintf("Item at round %d has empty ParentID (path=%s) - this should not happen", item.State.Depth, item.State.Path), "queue", q.name, q.name)
@@ -242,6 +243,11 @@ func (q *Queue) PullCopyTasks(force bool) PullResult {
 			continue
 		}
 		task.DstParentID = dstParentServiceID
+		task.DstParentNodeID = item.DstParentNodeID
+		if item.DstParentNodeID == "" && (item.State.ParentPath == "" || item.State.ParentPath == "/") {
+			task.DstParentNodeID = db.RootNodeID("DST")
+		}
+		task.ResolvedDstName = item.ResolvedDstPath
 
 		if q.Add(task) {
 			enqueueSuccessCount++
@@ -332,6 +338,8 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 
 	q.incrementRoundStatsCompleted(currentRound)
 	q.incrementTasksCompletedTotal()
+
+	_ = q.ClearTransferCheckpoint(context.Background(), task)
 	q.recordTaskCompletion(currentRound, true)
 
 	taskType := types.NodeTypeFile
@@ -357,16 +365,20 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 		EventTime:       time.Now().UnixNano(),
 		Depth:           currentRound,
 	}, false)
-	dstNodeID := db.DeterministicNodeID("DST", taskType, taskPath)
+	dstParentID := db.RootNodeID("DST")
+	if task.DstParentNodeID != "" {
+		dstParentID = task.DstParentNodeID
+	}
+	createName := taskName
+	if task.ResolvedDstName != "" {
+		createName = db.NormalizeNodeBasename(task.ResolvedDstName)
+	}
+	dstNodeID := db.MintNodeID("DST", dstParentID, taskType, createName)
 	var dstServiceID string
 	if task.IsFolder() {
 		dstServiceID = task.Folder.ServiceID
 	} else {
 		dstServiceID = task.File.ServiceID
-	}
-	dstParentID := ""
-	if parentPath != "" && parentPath != "/" {
-		dstParentID = db.DeterministicNodeID("DST", db.NodeTypeFolder, parentPath)
 	}
 	dstNode := &db.NodeState{
 		ID:              dstNodeID,
@@ -374,8 +386,8 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 		ParentID:        dstParentID,
 		ParentServiceID: task.DstParentID,
 		ParentPath:      parentPath,
-		Name:            taskName,
-		Path:            taskPath,
+		Name:            createName,
+		Path:            taskPath, // display path stays SRC-original; create uses ResolvedDstName
 		Type:            taskType,
 		Size:            taskSize,
 		MTime:           taskMTime,
@@ -386,6 +398,12 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 	database.AppendDiscoveredNodes([]db.InsertOperation{
 		{QueueType: "DST", Level: currentRound, Status: db.StatusSuccessful, State: dstNode},
 	})
+	database.AppendIDMapEvent(db.IDMapEvent{
+		SrcInternalID: nodeID,
+		DstInternalID: dstNodeID,
+		Source:        db.IDMapSourceDSTCompare,
+		Status:        db.IDMapStatusActive,
+	})
 
 	q.mu.Lock()
 	if task.IsFolder() {
@@ -394,9 +412,9 @@ func (q *Queue) CompleteCopyTask(task *TaskBase, executionDelta time.Duration) {
 		q.filesCreatedTotal++
 		q.bytesTransferredTotal += task.BytesTransferred
 	}
+	// Remove under the same lock so live overlay does not double-count briefly.
+	delete(q.inProgress, nodeID)
 	q.mu.Unlock()
-
-	q.removeInProgress(nodeID)
 }
 
 // FailCopyTask handles failure of copy tasks.

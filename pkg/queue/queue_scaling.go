@@ -148,9 +148,14 @@ func (q *Queue) WaitInterOp(ctx context.Context) {
 }
 
 // SetTargetWorkerCount scales worker goroutines up or down safely.
+// While provisional freeze is active (spin-down grace), this is a no-op so AIMD
+// classifiers keep accumulating but pool size does not change.
 func (q *Queue) SetTargetWorkerCount(target int) error {
 	if target < 1 {
 		return fmt.Errorf("worker count must be at least 1")
+	}
+	if q.PoolSizeFrozen() {
+		return nil
 	}
 	q.pool.mu.Lock()
 	defer q.pool.mu.Unlock()
@@ -187,18 +192,25 @@ func (q *Queue) SetTargetWorkerCount(target int) error {
 		q.applyWorkerHintLocked()
 		return nil
 	}
-	// Scale down: cancel idle workers immediately; busy workers finish their task then exit via retire flag.
+	// Scale down: cancel retiring workers immediately (including busy) so mid-flight
+	// ListChildren/transfers abort; mark retire for cooperative exit. FS_THROTTLE also
+	// calls ReleaseInFlightOnThrottle to requeue abandoned leases.
+	busyRetiring := false
 	for i := cur - 1; i >= target; i-- {
 		h := q.pool.handles[i]
-		if h.idle.Load() {
-			h.cancel()
-		} else {
-			h.retire.Store(true)
+		if !h.idle.Load() {
+			busyRetiring = true
 		}
+		h.retire.Store(true)
+		h.cancel()
 	}
 	q.pool.handles = q.pool.handles[:target]
 	q.workers = q.workers[:target]
 	q.applyWorkerHintLocked()
+	if busyRetiring {
+		// Freeze further actuation for grace; after grace, smallest file workers force-checkout.
+		q.EnterProvisionalFreeze(DefaultSpinDownGrace)
+	}
 	return nil
 }
 

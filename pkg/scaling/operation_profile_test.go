@@ -43,6 +43,10 @@ func TestLookupOperationProfileGoogleDrive(t *testing.T) {
 	if cf.MaxWorkers != 12 {
 		t.Fatalf("create_folder MaxWorkers=%d want 12", cf.MaxWorkers)
 	}
+	del := LookupOperationProfile("google_drive", "", OpDelete)
+	if del.DefaultWorkers != 4 || del.MaxWorkers != 8 {
+		t.Fatalf("delete profile: %+v", del)
+	}
 }
 
 func TestLookupOperationProfileDropbox(t *testing.T) {
@@ -51,19 +55,63 @@ func TestLookupOperationProfileDropbox(t *testing.T) {
 		t.Fatalf("download profile: %+v", dl)
 	}
 	list := LookupOperationProfile("dropbox", "", OpListChildren)
-	if list.MaxListPageSize != 500 || list.DefaultWorkers != 6 {
+	if list.MaxListPageSize != 500 || list.DefaultWorkers != 4 || list.MaxWorkers != 5 {
 		t.Fatalf("list_children profile: %+v", list)
 	}
 	cf := LookupOperationProfile("dropbox", "", OpCreateFolder)
-	if cf.MaxWorkers != 12 {
-		t.Fatalf("create_folder MaxWorkers=%d want 12", cf.MaxWorkers)
+	if cf.DefaultWorkers != 4 || cf.MaxWorkers != 8 {
+		t.Fatalf("create_folder profile: %+v", cf)
+	}
+	del := LookupOperationProfile("dropbox", "", OpDelete)
+	if del.DefaultWorkers != 4 || del.MaxWorkers != 8 {
+		t.Fatalf("delete profile: %+v", del)
+	}
+}
+
+func TestLookupOperationProfileOneDrive(t *testing.T) {
+	dl := LookupOperationProfile("onedrive", "", OpDownload)
+	if dl.MaxWorkers != 16 || dl.DefaultWorkers != 8 {
+		t.Fatalf("download profile: %+v", dl)
+	}
+	list := LookupOperationProfile("onedrive", "", OpListChildren)
+	if list.DefaultWorkers != 6 || list.MaxWorkers != 12 {
+		t.Fatalf("list_children profile: %+v", list)
+	}
+}
+
+func TestLookupOperationProfileSharePoint(t *testing.T) {
+	list := LookupOperationProfile("sharepoint", "", OpListChildren)
+	if list.DefaultWorkers != 4 || list.MaxWorkers != 8 {
+		t.Fatalf("list_children profile: %+v", list)
+	}
+	del := LookupOperationProfile("sharepoint", "", OpDelete)
+	if del.DefaultWorkers != 4 || del.MaxWorkers != 6 {
+		t.Fatalf("delete profile: %+v", del)
+	}
+}
+
+func TestLookupOperationProfileBox(t *testing.T) {
+	up := LookupOperationProfile("box", "", OpUpload)
+	if up.DefaultWorkers != 3 || up.MaxWorkers != 4 {
+		t.Fatalf("upload profile: %+v", up)
+	}
+	list := LookupOperationProfile("box", "", OpListChildren)
+	if list.DefaultListPageSize != 1000 || list.MaxListPageSize != 1000 {
+		t.Fatalf("list_children profile: %+v", list)
+	}
+}
+
+func TestLookupFallsBackToProviderDefault(t *testing.T) {
+	// local has no OpDelete override — should use provider Default (8/64).
+	del := LookupOperationProfile("local", "", OpDelete)
+	if del.DefaultWorkers != 8 || del.MaxWorkers != 64 {
+		t.Fatalf("local delete via Default: %+v", del)
 	}
 }
 
 func TestSpectraAllOpsUncapped(t *testing.T) {
-	pop := LookupProviderOperations("spectra", "")
-	for _, op := range []FSOperation{OpListChildren, OpCreateFolder, OpDownload, OpUpload} {
-		p := pop.Ops[op]
+	for _, op := range []FSOperation{OpListChildren, OpCreateFolder, OpDelete, OpDownload, OpUpload} {
+		p := LookupOperationProfile("spectra", "", op)
 		if p.MaxWorkers != 0 {
 			t.Fatalf("%s MaxWorkers=%d want 0", op, p.MaxWorkers)
 		}

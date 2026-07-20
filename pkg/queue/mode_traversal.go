@@ -275,7 +275,7 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 
 			// Generate deterministic ID from logical identity (queueType, nodeType, path)
 			// This eliminates duplicate logical nodes and makes traversal race-safe
-			deterministicID := db.DeterministicNodeID(queueType, types.NodeTypeFolder, rootRelativePath)
+			deterministicID := db.MintNodeID(queueType, nodeID, types.NodeTypeFolder, child.folder.DisplayName)
 
 			// Create task state for DST child folder
 			taskState := &db.NodeState{
@@ -308,7 +308,29 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 
 	// Push discovered children and completed-node status to appender buffer (async flush until round advance).
 	if len(childNodesToInsert) > 0 {
+		if queueType == "SRC" {
+			states := make([]*db.NodeState, 0, len(childNodesToInsert))
+			for _, op := range childNodesToInsert {
+				if op.State != nil {
+					states = append(states, op.State)
+				}
+			}
+			parentParts := loadParentGPLParts(database, nodeID, "")
+			checkTarget := ResolvePathCheckTarget(q.scalingSrcProvider, q.scalingDstProvider, q.pathCheckProfile)
+			skipChecks := checkTarget == ""
+			applyGPLToSRCChildren(database, gplTargetFromProvider(checkTarget), parentParts, states, skipChecks)
+		}
 		database.AppendDiscoveredNodes(childNodesToInsert)
+		for _, op := range childNodesToInsert {
+			if op.State != nil && op.State.SrcID != "" {
+				database.AppendIDMapEvent(db.IDMapEvent{
+					SrcInternalID: op.State.SrcID,
+					DstInternalID: op.State.ID,
+					Source:        db.IDMapSourceDSTCompare,
+					Status:        db.IDMapStatusActive,
+				})
+			}
+		}
 	}
 	fromRetry := q.GetMode() == QueueModeRetry
 	// Preserve task's copy_status on completion; DST traversal does comparison and emits copy_status updates for matches.
@@ -325,27 +347,58 @@ func (q *Queue) CompleteTraversalTask(task *TaskBase, executionDelta time.Durati
 	// DST comparison: persist SRC copy status for each matched child so path review shows correct copy_status.
 	if q.name == "dst" {
 		eventTime := time.Now().UnixNano()
+		dstSiblingNames := make(map[string]struct{})
 		for _, child := range task.DiscoveredChildren {
-			if child.SrcID == "" || child.SrcCopyStatus == "" {
+			name := ""
+			if child.IsFile {
+				name = db.NormalizeNodeBasename(dstChildMatchName(child.File.DisplayName, child.File.LocationPath))
+			} else {
+				name = db.NormalizeNodeBasename(dstChildMatchName(child.Folder.DisplayName, child.Folder.LocationPath))
+			}
+			if name != "" {
+				dstSiblingNames[name] = struct{}{}
+			}
+		}
+		for _, child := range task.DiscoveredChildren {
+			if child.SrcID == "" {
 				continue
 			}
 			meta := task.ExpectedSrcNodeMeta[child.SrcID]
-			if child.SrcCopyStatus == meta.CopyStatus {
-				continue // No SRC copy-status change, so no event is needed.
+			if child.SrcCopyStatus != "" && child.SrcCopyStatus != meta.CopyStatus {
+				prevTrav := meta.TraversalStatus
+				if prevTrav == "" {
+					prevTrav = db.StatusSuccessful
+				}
+				database.AppendStatusEvent("SRC", db.StatusEvent{
+					ID:                  child.SrcID,
+					TraversalStatus:     prevTrav,
+					CopyStatus:          child.SrcCopyStatus,
+					EventTime:           eventTime,
+					Depth:               nextRound,
+					PrevTraversalStatus: prevTrav,
+					PrevCopyStatus:      meta.CopyStatus,
+				}, false)
 			}
-			prevTrav := meta.TraversalStatus
-			if prevTrav == "" {
-				prevTrav = db.StatusSuccessful
+			// DST sibling collision: proposed clean name already exists on destination.
+			proposed := parseGPLProposedClean(meta.GPLState)
+			if proposed == "" {
+				continue
 			}
-			database.AppendStatusEvent("SRC", db.StatusEvent{
-				ID:                  child.SrcID,
-				TraversalStatus:     prevTrav,
-				CopyStatus:          child.SrcCopyStatus,
-				EventTime:           eventTime,
-				Depth:               nextRound,
-				PrevTraversalStatus: prevTrav,
-				PrevCopyStatus:      meta.CopyStatus,
-			}, false)
+			origName := ""
+			if child.IsFile {
+				origName = db.NormalizeNodeBasename(dstChildMatchName(child.File.DisplayName, child.File.LocationPath))
+			} else {
+				origName = db.NormalizeNodeBasename(dstChildMatchName(child.Folder.DisplayName, child.Folder.LocationPath))
+			}
+			if _, exists := dstSiblingNames[proposed]; exists && proposed != origName {
+				database.AppendPathEvent(db.PathEvent{
+					ID:           child.SrcID,
+					Category:     db.PathEventCategoryGPLClean,
+					ProposedPath: proposed,
+					Status:       db.PathEventStatusCollision,
+					GPLIssues:    meta.GPLState,
+				})
+			}
 		}
 	}
 

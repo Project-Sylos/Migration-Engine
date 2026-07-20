@@ -42,6 +42,8 @@ func (q *Queue) pullTasksOnce(force bool) PullResult {
 	switch q.GetMode() {
 	case QueueModeRetry:
 		return q.PullRetryTasks(force)
+	case QueueModeGPL:
+		return q.PullGPLTasks(force)
 	case QueueModeCopy, QueueModeCopyRetry:
 		return q.PullCopyTasks(force)
 	case QueueModeDelete, QueueModeDeleteRetry:

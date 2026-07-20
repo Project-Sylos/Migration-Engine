@@ -48,7 +48,7 @@ func VerifyCopyCompletion(database *db.DB) error {
 
 		// Count both folder and file buckets for each status
 		nodeTypes := []string{db.NodeTypeFolder, db.NodeTypeFile}
-		copyStatuses := []string{db.CopyStatusPending, db.CopyStatusSuccessful, db.CopyStatusFailed, db.CopyStatusSkipped, db.CopyStatusInProgress}
+		copyStatuses := []string{db.CopyStatusPending, db.CopyStatusSuccessful, db.CopyStatusAlreadyExisted, db.CopyStatusFailed, db.CopyStatusSkipped, db.CopyStatusInProgress}
 
 		for _, nodeType := range nodeTypes {
 			for _, status := range copyStatuses {
@@ -57,7 +57,7 @@ func VerifyCopyCompletion(database *db.DB) error {
 					switch status {
 					case db.CopyStatusPending:
 						totalPending += c
-					case db.CopyStatusSuccessful:
+					case db.CopyStatusSuccessful, db.CopyStatusAlreadyExisted:
 						totalSuccessful += c
 					case db.CopyStatusFailed:
 						totalFailed += c

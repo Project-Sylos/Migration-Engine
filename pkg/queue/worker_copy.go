@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
@@ -157,6 +158,27 @@ func (w *CopyWorker) Run() {
 		}
 
 		// Try to lease a task from the queue
+		if w.useFolderBatchLease() {
+			w.runFolderBatchTurn()
+			if w.shouldRetire() {
+				if logservice.LS != nil {
+					_ = logservice.LS.Log("info", "Copy worker exiting - scale down retire", "worker", w.id, w.queueName)
+				}
+				return
+			}
+			continue
+		}
+		if w.useFileBatchLease() {
+			w.runFileBatchTurn()
+			if w.shouldRetire() {
+				if logservice.LS != nil {
+					_ = logservice.LS.Log("info", "Copy worker exiting - scale down retire", "worker", w.id, w.queueName)
+				}
+				return
+			}
+			continue
+		}
+
 		task := w.queue.Lease()
 		if task == nil {
 			// No work available, sleep briefly before checking again
@@ -168,6 +190,23 @@ func (w *CopyWorker) Run() {
 		// Execute the task (check for shutdown during execution if needed)
 		err := w.execute(task)
 		w.setIdle()
+		if errors.Is(err, errTransferAbandoned) {
+			// File path may already have checkpointed/removed; folder/list abandons still need yield.
+			if w.queue.hasInProgress(task.ID) {
+				task.Locked = false
+				w.queue.removeInProgress(task.ID)
+				if !w.queue.abandonModeForStop() {
+					_ = w.queue.Add(task)
+				}
+			}
+			if w.shouldRetire() {
+				if logservice.LS != nil {
+					_ = logservice.LS.Log("info", "Copy worker exiting - scale down retire after abandon", "worker", w.id, w.queueName)
+				}
+				return
+			}
+			continue
+		}
 		if err != nil {
 			// Mark worker result BEFORE calling ReportTaskResult (for stall diagnostics)
 			task.LastError = err.Error()
@@ -208,10 +247,7 @@ func (w *CopyWorker) Run() {
 // For folders: creates the folder on the destination.
 // For files: streams the file from source to destination.
 func (w *CopyWorker) execute(task *TaskBase) error {
-	parent := w.shutdownCtx
-	if parent == nil {
-		parent = context.Background()
-	}
+	parent := fsOpContext(w.workerCtx, w.shutdownCtx)
 	wd, ctx := NewProgressWatchdog(parent, copyStallTimeout, w.queue.sealIOWaitActive)
 	defer wd.Stop()
 
@@ -243,6 +279,9 @@ func (w *CopyWorker) createFolder(task *TaskBase, ctx context.Context, wd *Progr
 		return fmt.Errorf("task missing DstParentID (ServiceID) for %s", folder.LocationPath)
 	}
 
+	w.queue.SetActiveLeaseSize(w.id, 0)
+	defer w.queue.ClearActiveLeaseSize(w.id)
+
 	if w.queue.shouldApplyCopyDstResumeExistenceCheck() {
 		skipCopy, err := w.applyResumeCopyDstFolderPrecheck(task, ctx, wd)
 		if err != nil {
@@ -256,6 +295,9 @@ func (w *CopyWorker) createFolder(task *TaskBase, ctx context.Context, wd *Progr
 	folderName := filepath.Base(folder.LocationPath)
 	if folderName == "" || folderName == "." {
 		folderName = folder.DisplayName
+	}
+	if task.ResolvedDstName != "" {
+		folderName = db.NormalizeNodeBasename(task.ResolvedDstName)
 	}
 
 	wd.Beat()
@@ -273,17 +315,21 @@ func (w *CopyWorker) createFolder(task *TaskBase, ctx context.Context, wd *Progr
 	select {
 	case err := <-done:
 		if err != nil {
+			if isForceCheckoutAbort(err, w.shouldRetire(), w.queue.forceCheckoutWorker(w.id)) {
+				return errTransferAbandoned
+			}
 			return err
 		}
 		wd.Beat()
 		return nil
 	case <-ctx.Done():
-		return fmt.Errorf("create folder cancelled by watchdog for %s: %w", folder.LocationPath, ctx.Err())
+		return errTransferAbandoned
 	}
 }
 
 // copyFile streams a file from source to destination.
 // Uses a read/write loop with Beat() so the progress watchdog resets while data is flowing.
+// Honors transfer checkpoints and FSTransferRestartPolicy for stop/scale-down resume.
 func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressWatchdog) error {
 	file := task.File
 
@@ -300,8 +346,23 @@ func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressW
 		return nil
 	}
 
+	resumeOffset, err := prepareFileTransferResume(ctx, w.queue, w.dstAdapter, task)
+	if err != nil {
+		return fmt.Errorf("prepare transfer resume for %s: %w", file.LocationPath, err)
+	}
+	w.queue.SetActiveLeaseSize(w.id, file.Size)
+	defer w.queue.ClearActiveLeaseSize(w.id)
+
 	srcReader, err := w.srcAdapter.OpenRead(ctx, file.ServiceID)
 	if err != nil {
+		if isForceCheckoutAbort(err, w.shouldRetire(), w.queue.forceCheckoutWorker(w.id)) {
+			mode := TransferAbandonRequeue
+			if w.queue.abandonModeForStop() {
+				mode = TransferAbandonDBOnly
+			}
+			_ = w.queue.AbandonTransferCheckpoint(ctx, task, resumeOffset, task.XferDstRef, mode)
+			return errTransferAbandoned
+		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return fmt.Errorf("open source cancelled by watchdog for %s: %w", file.LocationPath, err)
 		}
@@ -310,13 +371,25 @@ func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressW
 	defer srcReader.Close()
 	wd.Beat()
 
+	if resumeOffset > 0 {
+		if err := seekReaderTo(srcReader, resumeOffset); err != nil {
+			_ = w.queue.ClearTransferCheckpoint(ctx, task)
+			return fmt.Errorf("seek source to checkpoint offset %d for %s: %w", resumeOffset, file.LocationPath, err)
+		}
+	}
+
 	fileName := filepath.Base(file.LocationPath)
 	if fileName == "" || fileName == "." {
 		fileName = file.DisplayName
 	}
+	if task.ResolvedDstName != "" {
+		fileName = db.NormalizeNodeBasename(task.ResolvedDstName)
+	}
 	var destFile types.File
 	if updateTarget != nil {
 		destFile = *updateTarget
+	} else if resumeOffset > 0 && task.XferDstRef != "" {
+		destFile = types.File{ServiceID: task.XferDstRef, DisplayName: fileName, Type: types.NodeTypeFile}
 	} else {
 		createMeta := copyTaskCreateMetadata(task)
 		destFile, err = w.dstAdapter.CreateFile(ctx, dstParentServiceID, fileName, file.Size, createMeta)
@@ -329,7 +402,16 @@ func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressW
 	}
 	wd.Beat()
 
-	dstWriter, err := w.dstAdapter.OpenWrite(ctx, destFile.ServiceID)
+	var dstWriter io.WriteCloser
+	if resumeOffset > 0 {
+		if rw, ok := types.OpenWriteFromOffsetFrom(w.dstAdapter); ok {
+			dstWriter, err = rw.OpenWriteFromOffset(ctx, destFile.ServiceID, resumeOffset)
+		} else {
+			dstWriter, err = w.dstAdapter.OpenWrite(ctx, destFile.ServiceID)
+		}
+	} else {
+		dstWriter, err = w.dstAdapter.OpenWrite(ctx, destFile.ServiceID)
+	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return fmt.Errorf("open write cancelled by watchdog for %s: %w", file.LocationPath, err)
@@ -338,12 +420,31 @@ func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressW
 	}
 	wd.Beat()
 
-	var bytesTransferred int64
+	bytesTransferred := resumeOffset
+	lastCheckpoint := resumeOffset
+	const checkpointEvery = int64(16 << 20) // ~Dropbox chunk size
 	buf := w.copyBuffer
 	for {
+		if w.shouldRetire() || w.queue.forceCheckoutWorker(w.id) {
+			_ = dstWriter.Close()
+			mode := TransferAbandonRequeue
+			if w.queue.abandonModeForStop() {
+				mode = TransferAbandonDBOnly
+			}
+			_ = w.queue.AbandonTransferCheckpoint(ctx, task, bytesTransferred, destFile.ServiceID, mode)
+			return errTransferAbandoned
+		}
 		n, readErr := srcReader.Read(buf)
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
 			_ = dstWriter.Close()
+			if isForceCheckoutAbort(readErr, w.shouldRetire(), w.queue.forceCheckoutWorker(w.id)) {
+				mode := TransferAbandonRequeue
+				if w.queue.abandonModeForStop() {
+					mode = TransferAbandonDBOnly
+				}
+				_ = w.queue.AbandonTransferCheckpoint(ctx, task, bytesTransferred, destFile.ServiceID, mode)
+				return errTransferAbandoned
+			}
 			if errors.Is(readErr, context.Canceled) || errors.Is(readErr, context.DeadlineExceeded) {
 				return fmt.Errorf("copy cancelled by watchdog for %s: %w", file.LocationPath, readErr)
 			}
@@ -353,13 +454,30 @@ func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressW
 			_, writeErr := dstWriter.Write(buf[:n])
 			if writeErr != nil {
 				_ = dstWriter.Close()
+				if isForceCheckoutAbort(writeErr, w.shouldRetire(), w.queue.forceCheckoutWorker(w.id)) {
+					mode := TransferAbandonRequeue
+					if w.queue.abandonModeForStop() {
+						mode = TransferAbandonDBOnly
+					}
+					_ = w.queue.AbandonTransferCheckpoint(ctx, task, bytesTransferred, destFile.ServiceID, mode)
+					return errTransferAbandoned
+				}
 				if errors.Is(writeErr, context.Canceled) || errors.Is(writeErr, context.DeadlineExceeded) {
 					return fmt.Errorf("copy cancelled by watchdog for %s: %w", file.LocationPath, writeErr)
 				}
 				return fmt.Errorf("failed to copy file data for %s: %w", file.LocationPath, writeErr)
 			}
 			bytesTransferred += int64(n)
+			w.queue.ReportTaskBytesTransferred(task, bytesTransferred)
 			wd.Beat()
+			// File is still leased until ReportTaskResult; chunk progress clears queue stall.
+			if w.queue.watchdog != nil {
+				w.queue.watchdog.Beat()
+			}
+			if bytesTransferred-lastCheckpoint >= checkpointEvery {
+				_ = w.queue.PersistTransferCheckpoint(ctx, task, bytesTransferred, destFile.ServiceID)
+				lastCheckpoint = bytesTransferred
+			}
 		}
 		if readErr == io.EOF {
 			break
@@ -380,9 +498,15 @@ func (w *CopyWorker) copyFile(task *TaskBase, ctx context.Context, wd *ProgressW
 	}
 
 	task.BytesTransferred = bytesTransferred
+	w.queue.ReportTaskBytesTransferred(task, bytesTransferred)
+	_ = w.queue.ClearTransferCheckpoint(ctx, task)
 	applyCopyDstFileFromAdapter(task, destFile)
 	return nil
 }
+
+// errTransferAbandoned is returned when a file copy cooperatively checkpoints and exits.
+var errTransferAbandoned = errors.New("transfer abandoned for scale-down or stop")
+
 
 // applyResumeCopyDstFolderPrecheck lists the dst parent and short-circuits if the folder already exists
 // or errors on name/type clash. Used only when shouldApplyCopyDstResumeExistenceCheck() is true.
@@ -408,6 +532,136 @@ func (w *CopyWorker) applyResumeCopyDstFolderPrecheck(task *TaskBase, ctx contex
 		return false, fmt.Errorf("destination has file %q but task expects folder at %s", folder.DisplayName, folder.LocationPath)
 	}
 	return false, nil
+}
+
+// partitionFolderGroupForResumeExistence lists each unique destination parent once and completes
+// folders that already exist, returning only tasks that still need CreateFolderBatch.
+func (w *CopyWorker) partitionFolderGroupForResumeExistence(ctx context.Context, wd *ProgressWatchdog, group []*TaskBase) []*TaskBase {
+	type parentKey struct {
+		id    string
+		path  string
+		depth int
+	}
+	byParent := make(map[parentKey][]*TaskBase)
+	for _, task := range group {
+		if task == nil {
+			continue
+		}
+		if task.CopyPass != 1 || !task.IsFolder() {
+			reportTaskOutcome(w.queue, task, fmt.Errorf("folder batch leased non-folder or wrong pass task %s", task.LocationPath()))
+			continue
+		}
+		if task.DstParentID == "" {
+			reportTaskOutcome(w.queue, task, fmt.Errorf("task missing DstParentID for %s", task.LocationPath()))
+			continue
+		}
+		parentPath, parentDepth, err := copyTaskParentListArgs(task)
+		if err != nil {
+			reportTaskOutcome(w.queue, task, err)
+			continue
+		}
+		key := parentKey{id: task.DstParentID, path: parentPath, depth: parentDepth}
+		byParent[key] = append(byParent[key], task)
+	}
+
+	needCreate := make([]*TaskBase, 0, len(group))
+	for key, tasks := range byParent {
+		aggregated, err := w.listDstChildrenAggregated(key.id, key.path, key.depth, ctx, wd)
+		if err != nil {
+			for _, task := range tasks {
+				reportTaskOutcome(w.queue, task, fmt.Errorf("list destination children before folder batch for %s: %w", task.LocationPath(), err))
+			}
+			continue
+		}
+		childRound := tasks[0].Round
+		folderMap, fileMap := copyTaskChildMaps(aggregated, childRound)
+		for _, task := range tasks {
+			name := task.Folder.DisplayName
+			if name == "" {
+				name = filepath.Base(task.LocationPath())
+			}
+			matchKey := task.Folder.Type + ":" + name
+			if existing, ok := folderMap[matchKey]; ok {
+				applyCopyDstFolderFromAdapter(task, existing)
+				wd.Beat()
+				reportTaskOutcome(w.queue, task, nil)
+				continue
+			}
+			if _, ok := fileMap[types.NodeTypeFile+":"+name]; ok {
+				reportTaskOutcome(w.queue, task, fmt.Errorf("destination has file %q but task expects folder at %s", name, task.LocationPath()))
+				continue
+			}
+			needCreate = append(needCreate, task)
+		}
+	}
+	return needCreate
+}
+
+// partitionFileGroupForResumeExistence lists each unique destination parent once, completes
+// files that are already up to date, and returns tasks that still need UploadFilesBatch
+// (missing or src-newer; adapters overwrite on commit).
+func (w *CopyWorker) partitionFileGroupForResumeExistence(ctx context.Context, wd *ProgressWatchdog, group []*TaskBase) []*TaskBase {
+	type parentKey struct {
+		id    string
+		path  string
+		depth int
+	}
+	byParent := make(map[parentKey][]*TaskBase)
+	for _, task := range group {
+		if task == nil {
+			continue
+		}
+		if task.CopyPass != 2 || !task.IsFile() {
+			reportTaskOutcome(w.queue, task, fmt.Errorf("file batch leased non-file or wrong pass task %s", task.LocationPath()))
+			continue
+		}
+		if task.DstParentID == "" {
+			reportTaskOutcome(w.queue, task, fmt.Errorf("task missing DstParentID for %s", task.LocationPath()))
+			continue
+		}
+		parentPath, parentDepth, err := copyTaskParentListArgs(task)
+		if err != nil {
+			reportTaskOutcome(w.queue, task, err)
+			continue
+		}
+		key := parentKey{id: task.DstParentID, path: parentPath, depth: parentDepth}
+		byParent[key] = append(byParent[key], task)
+	}
+
+	needUpload := make([]*TaskBase, 0, len(group))
+	for key, tasks := range byParent {
+		aggregated, err := w.listDstChildrenAggregated(key.id, key.path, key.depth, ctx, wd)
+		if err != nil {
+			for _, task := range tasks {
+				reportTaskOutcome(w.queue, task, fmt.Errorf("list destination children before file batch for %s: %w", task.LocationPath(), err))
+			}
+			continue
+		}
+		childRound := tasks[0].Round
+		folderMap, fileMap := copyTaskChildMaps(aggregated, childRound)
+		for _, task := range tasks {
+			name := task.File.DisplayName
+			if name == "" {
+				name = filepath.Base(task.LocationPath())
+			}
+			if _, ok := folderMap[types.NodeTypeFolder+":"+name]; ok {
+				reportTaskOutcome(w.queue, task, fmt.Errorf("destination has folder %q but task expects file at %s", name, task.LocationPath()))
+				continue
+			}
+			matchKey := task.File.Type + ":" + name
+			if existing, ok := fileMap[matchKey]; ok {
+				if compareTimestamps(task.File.LastUpdated, existing.LastUpdated) == "Successful" {
+					applyCopyDstFileFromAdapter(task, existing)
+					wd.Beat()
+					reportTaskOutcome(w.queue, task, nil)
+					continue
+				}
+				// Src newer or unparseable timestamps — keep for batch overwrite.
+			}
+			needUpload = append(needUpload, task)
+		}
+	}
+	return needUpload
 }
 
 // applyCopyDstFilePrecheck lists the dst parent and either skips copy when the file is up to date,

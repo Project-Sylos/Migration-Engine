@@ -6,6 +6,7 @@ package queue
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -13,7 +14,17 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/credentials"
 )
 
+// rateLimitReleaseJitterFrac is the max extra wait fraction added per worker so
+// concurrent WaitRateLimited calls do not wake in lockstep (thundering herd).
+const rateLimitReleaseJitterFrac = 0.25
+
+// rateLimitReleaseJitterCap bounds absolute jitter so huge Retry-After windows
+// do not add multi-minute random skew.
+const rateLimitReleaseJitterCap = 2 * time.Second
+
+
 // SetRateLimitTelemetry attaches FS degradation telemetry used by workers to idle during throttle windows.
+// Convention: first source is SRC, second (if present) is DST. Traversal/delete attach one side only.
 func (q *Queue) SetRateLimitTelemetry(sources ...RateLimitTelemetry) {
 	if q == nil {
 		return
@@ -21,6 +32,36 @@ func (q *Queue) SetRateLimitTelemetry(sources ...RateLimitTelemetry) {
 	q.pool.mu.Lock()
 	q.pool.rateLimitSources = sources
 	q.pool.mu.Unlock()
+}
+
+// RateLimitedUntilSides returns active rate-limit deadlines for SRC and/or DST.
+// Mapping: src/delete queues → sources[0] as SRC; dst → sources[0] as DST; copy → sources[0]=SRC, sources[1]=DST.
+func (q *Queue) RateLimitedUntilSides() (srcUntil, dstUntil time.Time) {
+	if q == nil {
+		return time.Time{}, time.Time{}
+	}
+	q.pool.mu.Lock()
+	sources := q.pool.rateLimitSources
+	name := q.name
+	q.pool.mu.Unlock()
+	switch name {
+	case "dst":
+		if len(sources) > 0 && sources[0] != nil {
+			dstUntil = sources[0].RateLimitedUntil()
+		}
+	case "copy":
+		if len(sources) > 0 && sources[0] != nil {
+			srcUntil = sources[0].RateLimitedUntil()
+		}
+		if len(sources) > 1 && sources[1] != nil {
+			dstUntil = sources[1].RateLimitedUntil()
+		}
+	default: // "src", "delete", and unknown: treat first as SRC
+		if len(sources) > 0 && sources[0] != nil {
+			srcUntil = sources[0].RateLimitedUntil()
+		}
+	}
+	return srcUntil, dstUntil
 }
 
 // RateLimitedWaitDuration returns remaining time workers should wait before leasing (0 if clear).
@@ -48,22 +89,61 @@ func (q *Queue) RateLimitedWaitDuration() time.Duration {
 }
 
 // WaitRateLimited blocks until d elapses or ctx is canceled.
+// Adds per-call jitter (0–25% of d, capped) so workers released from the same
+// RateLimitedUntil do not all retry at once.
+// Beats the queue watchdog periodically so rate-limit idle time is not treated as a stall.
 func (q *Queue) WaitRateLimited(ctx context.Context, d time.Duration) error {
 	if d <= 0 {
 		return nil
 	}
-	if ctx == nil {
-		time.Sleep(d)
-		return nil
+	d = d + rateLimitReleaseJitter(d)
+	if q != nil && q.watchdog != nil {
+		q.watchdog.Beat()
 	}
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
+	deadline := time.Now().Add(d)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil
+		}
+		chunk := remaining
+		if chunk > time.Second {
+			chunk = time.Second
+		}
+		if ctx == nil {
+			time.Sleep(chunk)
+		} else {
+			timer := time.NewTimer(chunk)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+		if q != nil && q.watchdog != nil {
+			q.watchdog.Beat()
+		}
 	}
+}
+
+func rateLimitReleaseJitter(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	maxJitter := time.Duration(float64(base) * rateLimitReleaseJitterFrac)
+	if maxJitter > rateLimitReleaseJitterCap {
+		maxJitter = rateLimitReleaseJitterCap
+	}
+	if maxJitter <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int63n(int64(maxJitter) + 1))
+}
+
+// IsRateLimitActive reports whether any attached FS telemetry has an open retry-after window.
+func (q *Queue) IsRateLimitActive() bool {
+	return q.RateLimitedWaitDuration() > 0
 }
 
 // IsThrottleError reports whether err is an explicit FS rate limit (worker should yield the task).

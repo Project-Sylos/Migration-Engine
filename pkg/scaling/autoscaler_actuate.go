@@ -75,6 +75,9 @@ func (a *Autoscaler) stepUpWorkers(internal map[string]queue.InternalMetricsSnap
 func (a *Autoscaler) groupCanCalmProbe(groupID string, queues []string, internal map[string]queue.InternalMetricsSnapshot, now time.Time) bool {
 	st := a.queueState(groupAIMDKey(groupID))
 	rateLimitedUntil := maxRateLimitedUntilForQueues(internal, queues)
+	if scaleUpBlockedByRateLimit(now, rateLimitedUntil) {
+		return false
+	}
 	if fsThrottleActuationBlocked(st, now, rateLimitedUntil) {
 		return false
 	}
@@ -111,6 +114,9 @@ func (a *Autoscaler) groupCanCalmProbe(groupID string, queues []string, internal
 func (a *Autoscaler) queueCanCalmProbe(name string, q QueueActuator, internal map[string]queue.InternalMetricsSnapshot, now time.Time) bool {
 	st := a.queueState(name)
 	rateLimitedUntil := maxRateLimitedUntil(internal, name)
+	if scaleUpBlockedByRateLimit(now, rateLimitedUntil) {
+		return false
+	}
 	if fsThrottleActuationBlocked(st, now, rateLimitedUntil) {
 		return false
 	}
@@ -183,10 +189,18 @@ func (a *Autoscaler) stepDownSharedGroup(groupID string, queues []string, intern
 	}
 	targetTotal := a.aimd.DecreaseTarget(totalCur, minTotal, maxTotal, st, now)
 	if targetTotal < totalCur {
-		if a.lastClass == PressureFSThrottle {
-			a.abortGroupEfficiencyProbeOnPressure(st, targetTotal)
+		cause := "PRESSURE"
+		switch a.lastClass {
+		case PressureFSThrottle:
+			cause = "FS_THROTTLE"
+			a.noteThrottleBounce(st, now, rateLimitedUntil)
+			a.abortGroupEfficiencyProbeOnPressure(st, targetTotal, now)
 			st.noteFSBackoff(now, rateLimitedUntil, a.aimd.ProbeCooldown)
+		case PressureMemory:
+			cause = "MEMORY_PRESSURE"
 		}
+		fmt.Printf("  SCALE_DOWN cause=%s scope=group:%s workers %d->%d (pressure=%s)\n",
+			cause, groupID, totalCur, targetTotal, a.lastClass)
 		a.debugAIMDPrint(fmt.Sprintf("  aimd decrease [group:%s]: total workers %d->%d", groupID, totalCur, targetTotal))
 		if a.debugAIMD {
 			a.debugAIMDPrint(formatProbeCooldownLine("group:"+groupID, st, a.aimd.ProbeCooldown, now))
@@ -203,6 +217,9 @@ func (a *Autoscaler) stepDownSharedGroup(groupID string, queues []string, intern
 			}
 			if err := q.SetTargetWorkerCount(target); err != nil {
 				continue
+			}
+			if a.lastClass == PressureFSThrottle {
+				q.ReleaseInFlightOnThrottle()
 			}
 			if a.debugAIMD {
 				a.debugAIMDPrint(fmt.Sprintf("  aimd decrease [%s]: workers %d->%d (group split)", name, cur, target))
@@ -254,6 +271,7 @@ func (a *Autoscaler) stepDownSharedInterOpDelay(groupID string, queues []string,
 		return
 	}
 	if a.lastClass == PressureFSThrottle {
+		a.noteThrottleBounce(st, now, rateLimitedUntil)
 		st.noteFSBackoff(now, rateLimitedUntil, a.aimd.ProbeCooldown)
 	}
 	for _, name := range queues {
@@ -288,10 +306,24 @@ func (a *Autoscaler) stepDownIndependentQueue(name string, q QueueActuator, inte
 		if err := q.SetTargetWorkerCount(target); err != nil {
 			return
 		}
-		a.debugAfterWorkerDecrease(name, st, cur, target, now)
 		if a.lastClass == PressureFSThrottle {
-			st.noteFSBackoff(now, rateLimitedUntil, a.aimd.ProbeCooldown)
+			q.ReleaseInFlightOnThrottle()
 		}
+		cause := "PRESSURE"
+		switch a.lastClass {
+		case PressureFSThrottle:
+			cause = "FS_THROTTLE"
+			a.noteThrottleBounce(st, now, rateLimitedUntil)
+			if a.efficiency.Enabled && st.probePending {
+				st.abortEfficiencyProbeThrottled(target, a.aimd.ProbeCooldown, a.efficiency.MaxProbeCooldown, now)
+			}
+			st.noteFSBackoff(now, rateLimitedUntil, a.aimd.ProbeCooldown)
+		case PressureMemory:
+			cause = "MEMORY_PRESSURE"
+		}
+		fmt.Printf("  SCALE_DOWN cause=%s scope=%s workers %d->%d (pressure=%s)\n",
+			cause, name, cur, target, a.lastClass)
+		a.debugAfterWorkerDecrease(name, st, cur, target, now)
 		a.emit(ScalingEvent{Queue: name, Knob: "WorkerCount", OldValue: cur, NewValue: target, Pressure: a.lastClass, At: now})
 		if target > profile.MinWorkers {
 			a.clearInterOpDelay(name, q, st, now)
@@ -309,6 +341,13 @@ func (a *Autoscaler) stepDownIndependentQueue(name string, q QueueActuator, inte
 func (a *Autoscaler) stepUpSharedGroup(groupID string, queues []string, internal map[string]queue.InternalMetricsSnapshot, reason string, now time.Time) {
 	if reason != "" {
 		a.debugWorkerScaleUpAttempt("group:"+groupID, reason)
+	}
+	rateLimitedUntil := maxRateLimitedUntilForQueues(internal, queues)
+	if scaleUpBlockedByRateLimit(now, rateLimitedUntil) {
+		if a.debugAIMD {
+			a.debugScaleUpBlocked("group:"+groupID, fmt.Sprintf("fs_retry_after remaining=%s", rateLimitedUntil.Sub(now).Round(time.Millisecond)))
+		}
+		return
 	}
 	minPer := 1
 	if p, ok := a.profiles[queues[0]]; ok && p.MinWorkers > 0 {
@@ -339,6 +378,7 @@ func (a *Autoscaler) stepUpSharedGroup(groupID string, queues []string, internal
 			blockReason := increaseTargetBlockReason(totalCur, maxTotal, st, a.aimd, now)
 			a.debugScaleUpBlocked("group:"+groupID, blockReason)
 		}
+		a.maybeDecayBounceAtCeiling(st, totalCur, maxTotal, now)
 		return
 	}
 	a.debugScaleUpProbe("group:"+groupID, st, totalCur, targetTotal, rateBefore)
@@ -360,6 +400,7 @@ func (a *Autoscaler) stepUpSharedGroup(groupID string, queues []string, internal
 		a.maybeDecreaseListPage(name, q, a.profiles[name], now)
 		a.emit(ScalingEvent{Queue: name, Knob: "WorkerCount", OldValue: cur, NewValue: target, Pressure: a.lastClass, At: now})
 	}
+	a.maybeHalveBounceAfterCalmClimb(st, now)
 }
 
 func (a *Autoscaler) tryRecoverSharedInterOpDelay(groupID string, queues []string, internal map[string]queue.InternalMetricsSnapshot, st *queueAIMDState, now time.Time) (cleared bool) {
@@ -421,6 +462,13 @@ func (a *Autoscaler) stepUpIndependentQueue(name string, q QueueActuator, intern
 	if reason != "" {
 		a.debugWorkerScaleUpAttempt(name, reason)
 	}
+	rateLimitedUntil := maxRateLimitedUntil(internal, name)
+	if scaleUpBlockedByRateLimit(now, rateLimitedUntil) {
+		if a.debugAIMD {
+			a.debugScaleUpBlocked(name, fmt.Sprintf("fs_retry_after remaining=%s", rateLimitedUntil.Sub(now).Round(time.Millisecond)))
+		}
+		return
+	}
 	profile := a.profiles[name]
 	st := a.queueState(name)
 	a.prepareScaleUpState(st, profile.MaxWorkers, now)
@@ -439,6 +487,7 @@ func (a *Autoscaler) stepUpIndependentQueue(name string, q QueueActuator, intern
 		if a.debugAIMD {
 			a.debugScaleUpBlocked(name, increaseTargetBlockReason(cur, profile.MaxWorkers, st, a.aimd, now))
 		}
+		a.maybeDecayBounceAtCeiling(st, cur, profile.MaxWorkers, now)
 		return
 	}
 	if err := q.SetTargetWorkerCount(target); err != nil {
@@ -449,6 +498,7 @@ func (a *Autoscaler) stepUpIndependentQueue(name string, q QueueActuator, intern
 	a.clearInterOpDelay(name, q, st, now)
 	a.maybeDecreaseListPage(name, q, profile, now)
 	a.emit(ScalingEvent{Queue: name, Knob: "WorkerCount", OldValue: cur, NewValue: target, Pressure: a.lastClass, At: now})
+	a.maybeHalveBounceAfterCalmClimb(st, now)
 }
 
 func (a *Autoscaler) maybeIncreaseListPage(name string, q QueueActuator, profile FSPerformanceProfile, now time.Time) {

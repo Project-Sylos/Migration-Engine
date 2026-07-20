@@ -59,14 +59,16 @@ type DiffItem struct {
 }
 
 type ListChildrenDiffsRequest struct {
-	Path          string
-	Limit         int
-	Offset        int
-	SortBy        string
-	SortDirection string
-	FoldersOnly   bool
+	Path            string
+	Limit           int
+	Offset          int
+	SortBy          string
+	SortDirection   string
+	FoldersOnly     bool
 	TraversalStatus string
 	CopyStatus      string
+	// IncludeDestinationOnly when false hides destination-only rows. Nil means include (legacy default).
+	IncludeDestinationOnly *bool
 }
 
 type ListChildrenDiffsResult struct {
@@ -98,6 +100,8 @@ type SearchRequest struct {
 	TraversalStatus  string                      `json:"traversalStatus,omitempty"`
 	CopyStatus       string                      `json:"copyStatus,omitempty"`
 	DeleteStatus     string                      `json:"deleteStatus,omitempty"`
+	// IncludeDestinationOnly when false hides destination-only rows. Nil means include (legacy default).
+	IncludeDestinationOnly *bool `json:"includeDestinationOnly,omitempty"`
 }
 
 type SearchResult struct {
@@ -118,20 +122,21 @@ type DiffsStats struct {
 
 // Canonical delta keys for PathReviewActionResult.Deltas. Only keys that changed (non-zero) are included.
 const (
-	DeltaTraversalPending     = "traversalPending"
+	DeltaTraversalPending      = "traversalPending"
 	DeltaTraversalPendingRetry = "traversalPendingRetry"
-	DeltaTraversalFailed      = "traversalFailed"
-	DeltaCopyPending          = "copyPending"
-	DeltaCopyFailed           = "copyFailed"
-	DeltaCopySuccessful       = "copySuccessful"
-	DeltaDeletePending        = "deletePending"
-	DeltaDeleteFailed         = "deleteFailed"
-	DeltaDeleteDeleted        = "deleteDeleted"
-	DeltaExcluded             = "excluded"
-	DeltaFolders              = "folders"
-	DeltaFiles                = "files"
-	DeltaSizeSrc              = "sizeSrc"
-	DeltaSizeDst              = "sizeDst"
+	DeltaTraversalFailed       = "traversalFailed"
+	DeltaCopyPending           = "copyPending"
+	DeltaCopyFailed            = "copyFailed"
+	DeltaCopySuccessful        = "copySuccessful"
+	DeltaDeletePending         = "deletePending"
+	DeltaDeleteFailed          = "deleteFailed"
+	DeltaDeleteDeleted         = "deleteDeleted"
+	DeltaDeleteSkipped         = "deleteSkipped"
+	DeltaExcluded              = "excluded"
+	DeltaFolders               = "folders"
+	DeltaFiles                 = "files"
+	DeltaSizeSrc               = "sizeSrc"
+	DeltaSizeDst               = "sizeDst"
 )
 
 // addReviewDelta sets deltas[key] = delta only when delta != 0, so the API omits unchanged counters.
@@ -151,6 +156,8 @@ func deleteStatusReviewDeltaKey(status string) string {
 		return DeltaDeleteFailed
 	case db.DeleteStatusDeleted:
 		return DeltaDeleteDeleted
+	case db.DeleteStatusSkipped:
+		return DeltaDeleteSkipped
 	default:
 		return ""
 	}
@@ -177,16 +184,16 @@ type PathReviewActionResult struct {
 
 // PathReviewStats is the UI/API-facing review stats shape. pendingCount, failedCount, and pendingRetriesCount are phase-aware.
 type PathReviewStats struct {
-	PendingCount       int
-	FailedCount        int
-	ExcludedCount      int
+	PendingCount        int
+	FailedCount         int
+	ExcludedCount       int
 	PendingRetriesCount int
-	SuccessfulCount    int
-	FoldersCount       int
-	FilesCount         int
-	FoldersRatio       float64
-	FilesRatio         float64
-	TotalFileSize      struct {
+	SuccessfulCount     int
+	FoldersCount        int
+	FilesCount          int
+	FoldersRatio        float64
+	FilesRatio          float64
+	TotalFileSize       struct {
 		Src int64
 		Dst int64
 	}
@@ -195,38 +202,38 @@ type PathReviewStats struct {
 // ReviewStatsRawFromSnapshot converts the DB snapshot to the migration-layer raw stats (e.g. for seeding the in-memory cache).
 func ReviewStatsRawFromSnapshot(s db.ReviewStatsSnapshot) ReviewStatsRaw {
 	return ReviewStatsRaw{
-		TraversalPending:     s.TraversalPending,
+		TraversalPending:      s.TraversalPending,
 		TraversalPendingRetry: s.TraversalPendingRetry,
-		TraversalFailed:      s.TraversalFailed,
-		CopyPending:          s.CopyPending,
-		CopyFailed:           s.CopyFailed,
-		CopySuccessful:       s.CopySuccessful,
-		DeletePending:        s.DeletePending,
-		DeleteFailed:         s.DeleteFailed,
-		Excluded:             s.Excluded,
-		Folders:              s.Folders,
-		Files:                s.Files,
-		SizeSrc:              s.SizeSrc,
-		SizeDst:              s.SizeDst,
+		TraversalFailed:       s.TraversalFailed,
+		CopyPending:           s.CopyPending,
+		CopyFailed:            s.CopyFailed,
+		CopySuccessful:        s.CopySuccessful,
+		DeletePending:         s.DeletePending,
+		DeleteFailed:          s.DeleteFailed,
+		Excluded:              s.Excluded,
+		Folders:               s.Folders,
+		Files:                 s.Files,
+		SizeSrc:               s.SizeSrc,
+		SizeDst:               s.SizeDst,
 	}
 }
 
 // ReviewStatsRaw is the canonical persisted counters in the universal stats table (key -> count).
 // Used for cache and delta updates; PathReviewStats is derived from this plus phase.
 type ReviewStatsRaw struct {
-	TraversalPending     int64
+	TraversalPending      int64
 	TraversalPendingRetry int64
-	TraversalFailed      int64
-	CopyPending          int64
-	CopyFailed           int64
-	CopySuccessful       int64
-	DeletePending        int64
-	DeleteFailed         int64
-	Excluded             int64
-	Folders              int64
-	Files                int64
-	SizeSrc              int64
-	SizeDst              int64
+	TraversalFailed       int64
+	CopyPending           int64
+	CopyFailed            int64
+	CopySuccessful        int64
+	DeletePending         int64
+	DeleteFailed          int64
+	Excluded              int64
+	Folders               int64
+	Files                 int64
+	SizeSrc               int64
+	SizeDst               int64
 }
 
 // ToPathReviewStats projects raw stats into the API shape using phase.

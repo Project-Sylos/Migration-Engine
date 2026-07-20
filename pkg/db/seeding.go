@@ -16,14 +16,29 @@ func InsertRootNode(d *DB, table string, state *NodeState) error {
 	t := tableName(table)
 	return d.RunWrite(context.Background(), func(s *WriteSession) error {
 		return s.WithTx(func(w *Writer) error {
-			path, parentPath, pathHash, parentPathHash := NodeInsertPathFields(state.Path, state.ParentPath, state.Depth)
-			_, err := w.tx.ExecContext(context.Background(),
-				`INSERT INTO `+t+` (id, service_id, parent_id, parent_service_id, path, parent_path, path_hash, parent_path_hash, type, size, mtime, depth)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-				state.ID, state.ServiceID, state.ParentID, state.ParentServiceID, path, parentPath, pathHash, parentPathHash, state.Type, state.Size, state.MTime, state.Depth,
-			)
-			if err != nil {
-				return err
+			path, parentPath := NodeInsertPathFields(state.Path, state.ParentPath, state.Depth)
+			if table == "SRC" {
+				gplState := state.GPLState
+				if gplState == "" {
+					gplState = `{"valid":true,"part":{"valid":true},"path":{"valid":true},"parts":[]}`
+				}
+				_, err := w.tx.ExecContext(context.Background(),
+					`INSERT INTO `+t+` (id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth, gpl_state)
+					 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+					state.ID, state.ServiceID, state.ParentID, state.ParentServiceID, path, parentPath, NormalizeQueueNodeType(state.Type), state.Size, state.MTime, state.Depth, gplState,
+				)
+				if err != nil {
+					return err
+				}
+			} else {
+				_, err := w.tx.ExecContext(context.Background(),
+					`INSERT INTO `+t+` (id, service_id, parent_id, parent_service_id, path, parent_path, type, size, mtime, depth)
+					 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+					state.ID, state.ServiceID, state.ParentID, state.ParentServiceID, path, parentPath, NormalizeQueueNodeType(state.Type), state.Size, state.MTime, state.Depth,
+				)
+				if err != nil {
+					return err
+				}
 			}
 			trav := state.TraversalStatus
 			if trav == "" {
@@ -31,7 +46,7 @@ func InsertRootNode(d *DB, table string, state *NodeState) error {
 			}
 			copyStatus := state.CopyStatus
 			if table == "SRC" && copyStatus == "" {
-				copyStatus = CopyStatusSuccessful
+				copyStatus = CopyStatusAlreadyExisted
 			}
 			ev := &StatusEvent{
 				ID:              state.ID,
