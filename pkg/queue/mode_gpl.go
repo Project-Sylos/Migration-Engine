@@ -218,8 +218,8 @@ func ProcessGPLTaskSRC(database *db.DB, target gpl.Target, task *TaskBase) error
 				ID:           task.ID,
 				EventTime:    time.Now().UnixNano(),
 				Category:     db.PathEventCategoryGPLClean,
-				ProposedPath: base,
-				Status:       db.PathEventStatusPending,
+				ProposedPath: "",
+				Status:       db.PathEventStatusManualReview,
 				GPLIssues:    string(issuesJSON),
 			}})
 		})

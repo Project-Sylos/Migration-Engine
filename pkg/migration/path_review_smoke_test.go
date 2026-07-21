@@ -135,7 +135,7 @@ func TestPathNameReview_smokeFlows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(issues) != 0 {
-		t.Fatalf("copy gate should see empty queue, got %+v", issues)
+	if len(ActivePathIssues(issues)) != 0 {
+		t.Fatalf("copy gate should see empty active queue, got %+v", issues)
 	}
 }

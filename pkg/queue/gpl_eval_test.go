@@ -130,3 +130,35 @@ func TestApplyGPLToSRCChildren_windowsTrailingSpace(t *testing.T) {
 		t.Fatalf("proposed clean=%q want %q", clean, "Extra Space")
 	}
 }
+
+
+func TestEvaluateGPLAddPart_parentEmptyDoesNotFlagChild(t *testing.T) {
+	// Parent "*" cleans to empty under Windows and needs manual rename.
+	parentPayload, parentEv := evaluateGPLAddPart(gpl.Windows, nil, "*", nil, false)
+	if parentEv == nil || parentEv.Status != db.PathEventStatusManualReview {
+		t.Fatalf("parent * want manual_review event, got %#v payload=%#v", parentEv, parentPayload)
+	}
+
+	// Child under emptied parent parts should still evaluate, but must not inherit
+	// a path_event / manual_review from the ancestor EmptyPart finding.
+	childPayload, childEv := evaluateGPLAddPart(gpl.Windows, parentPayload.Parts, "example_folder", nil, false)
+	if childEv != nil {
+		t.Fatalf("child under bad parent should not get path_event, got %#v payload=%#v", childEv, childPayload)
+	}
+	if !childPayload.Part.Valid {
+		t.Fatalf("child part should be valid, got %#v", childPayload.Part)
+	}
+	if len(childPayload.Parts) < 2 {
+		t.Fatalf("child should keep composed parts including parent, got %#v", childPayload.Parts)
+	}
+}
+
+func TestEvaluateGPLAddPart_starOnlyStillManualReview(t *testing.T) {
+	_, ev := evaluateGPLAddPart(gpl.Windows, nil, "***", nil, true)
+	if ev == nil || ev.Status != db.PathEventStatusManualReview {
+		t.Fatalf("*** file want manual_review, got %#v", ev)
+	}
+	if ev.ProposedPath != "" {
+		t.Fatalf("manual review must have empty proposed path, got %q", ev.ProposedPath)
+	}
+}

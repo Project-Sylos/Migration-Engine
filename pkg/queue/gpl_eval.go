@@ -176,6 +176,8 @@ func evaluateGPLAddPart(target gpl.Target, parentParts []string, basename string
 		gpl.WithRaiseErrors(false),
 		gpl.WithSiblings(siblings),
 		gpl.WithAutoValidate(false),
+		// Never collapse hierarchy by deleting a path part (empty-after-strip, etc.).
+		gpl.WithDisallowPartRemoval(true),
 	}
 	if isFile {
 		opts = append(opts, gpl.WithFileAdded(true))
@@ -195,6 +197,11 @@ func evaluateGPLAddPart(target gpl.Target, parentParts []string, basename string
 		partOpts = append(partOpts, gpl.AsFile())
 	}
 	_ = l.AddPart(basename, partOpts...)
+	originalPartCount := len(l.Parts())
+	leafIdx := originalPartCount - 1
+	if leafIdx < 0 {
+		leafIdx = 0
+	}
 	cleaned, _ := l.Clean()
 	cleanedParts := l.Parts()
 	cleanedBase := basename
@@ -210,31 +217,54 @@ func evaluateGPLAddPart(target gpl.Target, parentParts []string, basename string
 	partCats := make([]string, 0)
 	pathCats := make([]string, 0)
 	collision := false
-	// Clean() re-validates the *cleaned* parts, so TrailingSpace/etc. often appear only as
-	// Actions (original → cleaned), not as Issues. Treat those Actions as part-local findings.
+	manualReview := false
+	// Clean() re-validates the full composed path, so ancestor EmptyPart/etc. can appear
+	// on earlier PartIndexes. Queue decisions and path_events only apply to the *leaf*
+	// basename being evaluated (the node itself), not inherited parent findings.
 	for _, act := range l.Log.Actions {
-		if act.Category == "" {
+		if act.Category == "" || act.PartIndex != leafIdx {
 			continue
 		}
 		partCats = append(partCats, string(act.Category))
+		if act.Category == issue.CategoryEmptyPart || act.Kind == issue.KindRemove {
+			manualReview = true
+		}
 	}
 	for _, iss := range l.Log.Issues {
 		if iss.Scope == issue.ScopePath {
 			pathCats = append(pathCats, string(iss.Category))
 			continue
 		}
+		if iss.PartIndex != leafIdx {
+			continue
+		}
 		partCats = append(partCats, string(iss.Category))
 		if iss.Category == issue.CategorySiblingCollision {
 			collision = true
 		}
+		if iss.Category == issue.CategoryEmptyPart {
+			manualReview = true
+		}
 	}
+	// Leaf emptied or removed → cannot auto-suggest a safe rename for this node.
+	if len(cleanedParts) < originalPartCount && strings.TrimSpace(basename) != "" {
+		// Only treat as leaf manual-review when the leaf segment itself disappeared.
+		if len(cleanedParts) <= leafIdx {
+			manualReview = true
+		}
+	}
+	if strings.TrimSpace(cleanedBase) == "" && strings.TrimSpace(basename) != "" {
+		manualReview = true
+		cleanedBase = ""
+	}
+
 	out.Part.Categories = partCats
 	out.Part.Collision = collision
 	out.Path.Categories = pathCats
-	if cleanedBase != "" && cleanedBase != basename {
+	if !manualReview && cleanedBase != "" && cleanedBase != basename {
 		out.Part.ProposedClean = cleanedBase
 	}
-	out.Part.Valid = !collision && len(partCats) == 0
+	out.Part.Valid = !collision && !manualReview && len(partCats) == 0
 	out.Path.Valid = len(pathCats) == 0
 	out.Parts = append([]string(nil), cleanedParts...)
 	out.Valid = out.Part.Valid && out.Path.Valid
@@ -243,12 +273,21 @@ func evaluateGPLAddPart(target gpl.Target, parentParts []string, basename string
 	out.Categories = append(append([]string(nil), partCats...), pathCats...)
 	out.ProposedClean = out.Part.ProposedClean
 
-	issuesJSON, _ := json.Marshal(mergeIssuesFromActions(l.Log.Issues, l.Log.Actions))
+	leafIssues := filterIssuesForPartIndex(mergeIssuesFromActions(l.Log.Issues, l.Log.Actions), leafIdx)
+	issuesJSON, _ := json.Marshal(leafIssues)
 	if collision {
 		return out, &db.PathEvent{
 			Category:     db.PathEventCategoryGPLClean,
 			ProposedPath: firstNonEmpty(out.Part.ProposedClean, cleanedBase, basename),
 			Status:       db.PathEventStatusCollision,
+			GPLIssues:    string(issuesJSON),
+		}
+	}
+	if manualReview {
+		return out, &db.PathEvent{
+			Category:     db.PathEventCategoryGPLClean,
+			ProposedPath: "",
+			Status:       db.PathEventStatusManualReview,
 			GPLIssues:    string(issuesJSON),
 		}
 	}
@@ -262,6 +301,21 @@ func evaluateGPLAddPart(target gpl.Target, parentParts []string, basename string
 	}
 	return out, nil
 }
+
+// filterIssuesForPartIndex keeps path-scoped issues and part-local issues at partIndex.
+func filterIssuesForPartIndex(issues []issue.Issue, partIndex int) []issue.Issue {
+	if len(issues) == 0 {
+		return nil
+	}
+	out := make([]issue.Issue, 0, len(issues))
+	for _, iss := range issues {
+		if iss.Scope == issue.ScopePath || iss.PartIndex == partIndex {
+			out = append(out, iss)
+		}
+	}
+	return out
+}
+
 
 // mergeIssuesFromActions ensures Clean Actions (e.g. TrailingSpace) are persisted as Issues
 // for the review queue when Validate-after-clean left Log.Issues empty.
@@ -286,6 +340,7 @@ func mergeIssuesFromActions(issues []issue.Issue, actions []issue.Action) []issu
 			PartIndex:   act.PartIndex,
 			Part:        act.Original,
 			Message:     act.Reason,
+			Detail:      act.Detail,
 			UserMessage: act.UserMessage,
 			DocsURL:     act.DocsURL,
 		})

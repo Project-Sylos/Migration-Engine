@@ -8,11 +8,12 @@ const (
 	PathEventCategoryGPLClean    = "gpl_clean"
 	PathEventCategoryManualRemap = "manual_remap"
 
-	PathEventStatusPending   = "pending"
-	PathEventStatusCollision = "collision"
-	PathEventStatusAccepted  = "accepted"
-	PathEventStatusCommitted = "committed"
-	PathEventStatusReverted  = "reverted"
+	PathEventStatusPending      = "pending"
+	PathEventStatusCollision    = "collision"
+	PathEventStatusManualReview = "manual_review" // no safe auto-suggestion; user must rename
+	PathEventStatusAccepted     = "accepted"
+	PathEventStatusCommitted    = "committed"
+	PathEventStatusReverted     = "reverted"
 )
 
 // ID map sources and statuses (append-only id_map table).

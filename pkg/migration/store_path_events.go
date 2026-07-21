@@ -11,6 +11,7 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
+	"codeberg.org/Sylos/go-path-linter/pkg/check"
 	"codeberg.org/Sylos/go-path-linter/pkg/gpl"
 	"codeberg.org/Sylos/go-path-linter/pkg/issue"
 )
@@ -19,7 +20,9 @@ import (
 type PathIssueMessage struct {
 	Category string
 	Message  string
-	DocsURL  string
+	// Detail is a GPL structured attribute (e.g. InvalidChar: the forbidden runes found).
+	Detail  string
+	DocsURL string
 }
 
 // PathIssueRow is one current path_events finding for review.
@@ -32,6 +35,8 @@ type PathIssueRow struct {
 	GPLIssues    string
 	EventTime    int64
 	Messages     []PathIssueMessage
+	// Ignored is true when the node's current gpl_status is ignored (warning dismissed).
+	Ignored bool
 }
 
 // ValidatePathProposalResult is a dry-run GPL check for a proposed basename.
@@ -64,9 +69,9 @@ func (e *PathValidationError) Error() string {
 	return "path validation failed"
 }
 
-// ListPathIssues returns SRC nodes whose latest path_events status is pending or collision,
-// excluding nodes whose current gpl_status is ignored.
-// Returns an empty list when path checks are disabled (same source/destination service type).
+// ListPathIssues returns SRC nodes whose latest path_events status is pending,
+// collision, or manual_review. Rows with gpl_status=ignored are included with Ignored=true
+// so the UI can offer unignore. Returns an empty list when path checks are disabled.
 func (m *Migration) ListPathIssues(limit int) ([]PathIssueRow, error) {
 	if m == nil || m.DB == nil {
 		return nil, fmt.Errorf("migration db not open")
@@ -98,15 +103,15 @@ gpl AS (
   GROUP BY id
 )
 SELECT c.id, COALESCE(n.path,''), COALESCE(c.proposed_path,''), COALESCE(c.status,''),
-       COALESCE(c.category,''), COALESCE(c.gpl_issues,''), c.event_time
+       COALESCE(c.category,''), COALESCE(c.gpl_issues,''), c.event_time,
+       COALESCE(g.gpl_status,'')
 FROM cur c
 LEFT JOIN src_nodes n ON n.id = c.id
 LEFT JOIN gpl g ON g.id = c.id
-WHERE c.status IN ('pending', 'collision')
-  AND COALESCE(g.gpl_status,'') <> $2
+WHERE c.status IN ('pending', 'collision', 'manual_review')
 ORDER BY c.event_time
 LIMIT $1`
-	rows, err := conn.QueryContext(context.Background(), q, limit, db.GPLStatusIgnored)
+	rows, err := conn.QueryContext(context.Background(), q, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -114,13 +119,26 @@ LIMIT $1`
 	var out []PathIssueRow
 	for rows.Next() {
 		var r PathIssueRow
-		if err := rows.Scan(&r.NodeID, &r.Path, &r.ProposedPath, &r.Status, &r.Category, &r.GPLIssues, &r.EventTime); err != nil {
+		var gplStatus string
+		if err := rows.Scan(&r.NodeID, &r.Path, &r.ProposedPath, &r.Status, &r.Category, &r.GPLIssues, &r.EventTime, &gplStatus); err != nil {
 			return nil, err
 		}
+		r.Ignored = gplStatus == db.GPLStatusIgnored
 		r.Messages = PathIssueMessagesFromGPLJSON(r.GPLIssues)
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// ActivePathIssues returns the subset of ListPathIssues that are not ignored.
+func ActivePathIssues(rows []PathIssueRow) []PathIssueRow {
+	out := make([]PathIssueRow, 0, len(rows))
+	for _, r := range rows {
+		if !r.Ignored {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // ValidatePathProposal dry-runs parent+AddPart(proposed) without writing.
@@ -182,7 +200,7 @@ func (m *Migration) AcceptAllPathProposals() (int, error) {
 		return 0, err
 	}
 	accepted := 0
-	for _, row := range issues {
+	for _, row := range ActivePathIssues(issues) {
 		if row.Status != db.PathEventStatusPending || row.ProposedPath == "" {
 			continue
 		}
@@ -222,7 +240,36 @@ func (m *Migration) IgnoreGPLSubtree(nodeID string) error {
 	})
 }
 
-// IgnoreAllPathIssues marks every active path-issue node's subtree as ignored.
+// UnignoreGPLSubtree restores the prior non-ignored gpl_status for nodeID and descendants
+// (append-only rollback of IgnoreGPLSubtree).
+func (m *Migration) UnignoreGPLSubtree(nodeID string) error {
+	if m == nil || m.DB == nil {
+		return fmt.Errorf("migration db not open")
+	}
+	if !m.PathChecksEnabled() {
+		return nil
+	}
+	conn, err := m.DB.GetDB()
+	if err != nil {
+		return err
+	}
+	var nodePath string
+	if err := conn.QueryRowContext(context.Background(),
+		`SELECT COALESCE(path,'') FROM src_nodes WHERE id = $1`, nodeID,
+	).Scan(&nodePath); err != nil {
+		return fmt.Errorf("load node: %w", err)
+	}
+	return m.DB.RunWrite(context.Background(), func(s *db.WriteSession) error {
+		return s.WithTx(func(w *db.Writer) error {
+			if err := w.InsertGPLRestoredEventsForSubtree("SRC", nodePath); err != nil {
+				return err
+			}
+			return w.InsertGPLRestoredEventsForSubtree("DST", nodePath)
+		})
+	})
+}
+
+// IgnoreAllPathIssues marks every active (non-ignored) path-issue node's subtree as ignored.
 func (m *Migration) IgnoreAllPathIssues() (int, error) {
 	if !m.PathChecksEnabled() {
 		return 0, nil
@@ -233,7 +280,7 @@ func (m *Migration) IgnoreAllPathIssues() (int, error) {
 	}
 	seen := make(map[string]struct{}, len(issues))
 	n := 0
-	for _, row := range issues {
+	for _, row := range ActivePathIssues(issues) {
 		if _, ok := seen[row.NodeID]; ok {
 			continue
 		}
@@ -552,7 +599,13 @@ func FriendlyPathIssueMessage(iss issue.Issue) string {
 		return iss.UserMessage
 	}
 	switch iss.Category {
-	case issue.CategoryInvalidChar, issue.CategoryControlChar:
+	case issue.CategoryInvalidChar:
+		chars := check.FormatInvalidChars(iss.Detail)
+		if chars != "" {
+			return "Contains characters the destination doesn’t allow: " + chars
+		}
+		return "Contains characters the destination doesn’t allow."
+	case issue.CategoryControlChar:
 		return "Contains characters the destination doesn’t allow."
 	case issue.CategoryReservedName:
 		return "This name is reserved on the destination."
@@ -566,7 +619,7 @@ func FriendlyPathIssueMessage(iss issue.Issue) string {
 	case issue.CategoryTrailingSpace:
 		return "Names can’t end with a space on the destination."
 	case issue.CategoryEmptyPart:
-		return "The destination name can’t be empty."
+		return "This name needs a manual rename; it can’t be left empty or removed."
 	case issue.CategoryAbsolute:
 		return "Enter a name, not a full path."
 	case issue.CategorySiblingCollision:
@@ -595,7 +648,7 @@ func PathIssueMessagesFromGPLJSON(raw string) []PathIssueMessage {
 		if msg == "" {
 			continue
 		}
-		key := msg + "\x00" + iss.DocsURL
+		key := msg + "\x00" + iss.DocsURL + "\x00" + iss.Detail
 		if _, ok := seen[key]; ok {
 			continue
 		}
@@ -603,6 +656,7 @@ func PathIssueMessagesFromGPLJSON(raw string) []PathIssueMessage {
 		out = append(out, PathIssueMessage{
 			Category: string(iss.Category),
 			Message:  msg,
+			Detail:   iss.Detail,
 			DocsURL:  iss.DocsURL,
 		})
 	}

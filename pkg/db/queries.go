@@ -143,11 +143,18 @@ const cteActiveIDMap = `(SELECT src_internal_id, arg_max(dst_internal_id, event_
 	WHERE status = 'active'
 	GROUP BY src_internal_id)`
 
+// cteAcceptedPathRemap is the latest accepted/committed destination basename per SRC node.
+const cteAcceptedPathRemap = `(SELECT id, arg_max(proposed_path, event_time) AS proposed_path
+	FROM ` + tablePathEvents + `
+	WHERE status IN ('accepted', 'committed')
+	GROUP BY id)`
+
 // MergedReviewQueryBase returns the WITH clause for the merged src+dst review view (status from events). Use with " SELECT ... FROM merged" + where.
 // SRC↔DST pairing uses id_map with path fallback when no active map row exists.
 func MergedReviewQueryBase() string {
 	return `WITH src_cur AS ` + cteSrcCurrentStatus + `, dst_cur AS ` + cteDstCurrentStatus + `,
 idmap AS ` + cteActiveIDMap + `,
+path_remap AS ` + cteAcceptedPathRemap + `,
 merged AS (
 SELECT
 	COALESCE(s.path, d.path) AS path,
@@ -170,7 +177,8 @@ SELECT
 		WHEN COALESCE(s.path, d.path) = '' THEN ''
 		WHEN strpos(reverse(COALESCE(s.path, d.path)), '/') = 0 THEN COALESCE(s.path, d.path)
 		ELSE right(COALESCE(s.path, d.path), strpos(reverse(COALESCE(s.path, d.path)), '/') - 1)
-	END AS name
+	END AS name,
+	COALESCE(pr.proposed_path, '') AS resolved_dst_name
 FROM src_nodes s
 LEFT JOIN src_cur se ON s.id = se.id
 LEFT JOIN idmap im ON im.src_internal_id = s.id
@@ -179,6 +187,7 @@ LEFT JOIN dst_nodes d ON (
 	OR (im.dst_internal_id IS NULL AND d.path = s.path)
 )
 LEFT JOIN dst_cur de ON d.id = de.id
+LEFT JOIN path_remap pr ON pr.id = s.id
 
 UNION ALL
 
@@ -203,7 +212,8 @@ SELECT
 		WHEN d.path = '' THEN ''
 		WHEN strpos(reverse(d.path), '/') = 0 THEN d.path
 		ELSE right(d.path, strpos(reverse(d.path), '/') - 1)
-	END AS name
+	END AS name,
+	'' AS resolved_dst_name
 FROM dst_nodes d
 LEFT JOIN dst_cur de ON d.id = de.id
 WHERE NOT EXISTS (
@@ -225,6 +235,13 @@ folder_dst_children AS (
 	SELECT * FROM dst_nodes WHERE parent_path = $1
 ),
 idmap AS ` + cteActiveIDMap + `,
+path_remap AS (
+	SELECT pe.id, arg_max(pe.proposed_path, pe.event_time) AS proposed_path
+	FROM ` + tablePathEvents + ` pe
+	INNER JOIN folder_src fs ON pe.id = fs.id
+	WHERE pe.status IN ('accepted', 'committed')
+	GROUP BY pe.id
+),
 src_cur AS (
 	SELECT COALESCE(t.id, c.id, d.id) AS id,
 		COALESCE(t.traversal_status, '') AS traversal_status,
@@ -285,7 +302,8 @@ SELECT
 		WHEN COALESCE(s.path, d.path) = '' THEN ''
 		WHEN strpos(reverse(COALESCE(s.path, d.path)), '/') = 0 THEN COALESCE(s.path, d.path)
 		ELSE right(COALESCE(s.path, d.path), strpos(reverse(COALESCE(s.path, d.path)), '/') - 1)
-	END AS name
+	END AS name,
+	COALESCE(pr.proposed_path, '') AS resolved_dst_name
 FROM folder_src s
 LEFT JOIN src_cur se ON s.id = se.id
 LEFT JOIN idmap im ON im.src_internal_id = s.id
@@ -294,6 +312,7 @@ LEFT JOIN dst_nodes d ON (
 	OR (im.dst_internal_id IS NULL AND d.path = s.path)
 )
 LEFT JOIN dst_cur de ON d.id = de.id
+LEFT JOIN path_remap pr ON pr.id = s.id
 
 UNION ALL
 
@@ -318,7 +337,8 @@ SELECT
 		WHEN d.path = '' THEN ''
 		WHEN strpos(reverse(d.path), '/') = 0 THEN d.path
 		ELSE right(d.path, strpos(reverse(d.path), '/') - 1)
-	END AS name
+	END AS name,
+	'' AS resolved_dst_name
 FROM folder_dst_children d
 LEFT JOIN dst_cur de ON d.id = de.id
 WHERE NOT EXISTS (
@@ -351,6 +371,8 @@ type MergedReviewRow struct {
 	DeleteStatus       string
 	Excluded           bool
 	Size               int64
+	// ResolvedDstName is the accepted/committed destination basename from path_events (empty if none).
+	ResolvedDstName string
 }
 
 // ReviewFilter narrows merged review rows for listing, search, and counts.
@@ -380,6 +402,17 @@ type ReviewFilter struct {
 	SizeValue     *int64
 
 	ExcludeDestinationOnly bool
+
+	// PathIssueFilter narrows by destination naming / compatibility review state:
+	//   "issues"   — pending/collision suggestions only (excludes manual_review)
+	//   "manual"   — needs manual rename (manual_review)
+	//   "accepted" — latest path_events accepted/committed (and not ignored)
+	//   "rejected" — gpl_status ignored (warnings dismissed)
+	//   "none"     — no active/accepted/rejected compat footprint
+	PathIssueFilter string
+	// PathIssueCategory narrows suggestion path_events (pending/collision) whose gpl_issues
+	// JSON mentions this category (e.g. InvalidChar). Empty means no category filter.
+	PathIssueCategory string
 }
 
 func reviewFilterUsesStructuredStatus(f ReviewFilter) bool {
@@ -443,6 +476,157 @@ func appendDeleteStatusClause(parts []string, args []any, param int, value strin
 	}
 	parts = append(parts, `LOWER(delete_status) = LOWER($`+strconv.Itoa(param)+`)`)
 	args = append(args, v)
+	param++
+	return parts, args, param
+}
+
+// pathIssueAnyActiveSQL matches any open compatibility queue row (suggestions + manual rename).
+const pathIssueAnyActiveSQL = `src_node_id <> '' AND EXISTS (
+	SELECT 1
+	FROM (
+		SELECT id, arg_max(status, event_time) AS status
+		FROM path_events
+		GROUP BY id
+	) pe
+	LEFT JOIN (
+		SELECT id, arg_max(gpl_status, event_time) AS gpl_status
+		FROM src_status_events
+		WHERE COALESCE(gpl_status, '') <> ''
+		GROUP BY id
+	) g ON g.id = pe.id
+	WHERE pe.id = src_node_id
+	  AND pe.status IN ('pending', 'collision', 'manual_review')
+	  AND COALESCE(g.gpl_status, '') <> 'ignored'
+)`
+
+// pathIssueSuggestionsSQL matches auto-fixable / collision suggestions only (not manual_review).
+const pathIssueSuggestionsSQL = `src_node_id <> '' AND EXISTS (
+	SELECT 1
+	FROM (
+		SELECT id, arg_max(status, event_time) AS status
+		FROM path_events
+		GROUP BY id
+	) pe
+	LEFT JOIN (
+		SELECT id, arg_max(gpl_status, event_time) AS gpl_status
+		FROM src_status_events
+		WHERE COALESCE(gpl_status, '') <> ''
+		GROUP BY id
+	) g ON g.id = pe.id
+	WHERE pe.id = src_node_id
+	  AND pe.status IN ('pending', 'collision')
+	  AND COALESCE(g.gpl_status, '') <> 'ignored'
+)`
+
+const pathIssueAcceptedSQL = `src_node_id <> '' AND EXISTS (
+	SELECT 1
+	FROM (
+		SELECT id, arg_max(status, event_time) AS status
+		FROM path_events
+		GROUP BY id
+	) pe
+	LEFT JOIN (
+		SELECT id, arg_max(gpl_status, event_time) AS gpl_status
+		FROM src_status_events
+		WHERE COALESCE(gpl_status, '') <> ''
+		GROUP BY id
+	) g ON g.id = pe.id
+	WHERE pe.id = src_node_id
+	  AND pe.status IN ('accepted', 'committed')
+	  AND COALESCE(g.gpl_status, '') <> 'ignored'
+)`
+
+const pathIssueRejectedSQL = `src_node_id <> '' AND EXISTS (
+	SELECT 1
+	FROM (
+		SELECT id, arg_max(gpl_status, event_time) AS gpl_status
+		FROM src_status_events
+		WHERE COALESCE(gpl_status, '') <> ''
+		GROUP BY id
+	) g
+	WHERE g.id = src_node_id
+	  AND COALESCE(g.gpl_status, '') = 'ignored'
+)`
+
+const pathIssueManualSQL = `src_node_id <> '' AND EXISTS (
+	SELECT 1
+	FROM (
+		SELECT id, arg_max(status, event_time) AS status
+		FROM path_events
+		GROUP BY id
+	) pe
+	LEFT JOIN (
+		SELECT id, arg_max(gpl_status, event_time) AS gpl_status
+		FROM src_status_events
+		WHERE COALESCE(gpl_status, '') <> ''
+		GROUP BY id
+	) g ON g.id = pe.id
+	WHERE pe.id = src_node_id
+	  AND pe.status = 'manual_review'
+	  AND COALESCE(g.gpl_status, '') <> 'ignored'
+)`
+
+func appendPathIssueFilterClause(parts []string, value string) []string {
+	v := strings.ToLower(strings.TrimSpace(value))
+	switch v {
+	case "issues", "active", "pending", "suggestions":
+		return append(parts, pathIssueSuggestionsSQL)
+	case "accepted":
+		return append(parts, pathIssueAcceptedSQL)
+	case "rejected", "ignored":
+		return append(parts, pathIssueRejectedSQL)
+	case "manual", "manual_review":
+		return append(parts, pathIssueManualSQL)
+	case "none", "clean":
+		return append(parts, `NOT (`+pathIssueAnyActiveSQL+`) AND NOT (`+pathIssueAcceptedSQL+`) AND NOT (`+pathIssueRejectedSQL+`)`)
+	default:
+		return parts
+	}
+}
+
+// sanitizePathIssueCategory allows only simple category tokens used in gpl_issues JSON.
+func sanitizePathIssueCategory(category string) string {
+	cat := strings.TrimSpace(category)
+	if cat == "" {
+		return ""
+	}
+	for _, r := range cat {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			continue
+		}
+		return ""
+	}
+	return cat
+}
+
+func appendPathIssueCategoryClause(parts []string, args []any, param int, category string) ([]string, []any, int) {
+	cat := sanitizePathIssueCategory(category)
+	if cat == "" {
+		return parts, args, param
+	}
+	// Match `"category":"InvalidChar"` (and similar) inside latest path_events.gpl_issues.
+	needle := `"category":"` + cat + `"`
+	parts = append(parts, `src_node_id <> '' AND EXISTS (
+	SELECT 1
+	FROM (
+		SELECT id,
+			arg_max(status, event_time) AS status,
+			arg_max(gpl_issues, event_time) AS gpl_issues
+		FROM path_events
+		GROUP BY id
+	) pe
+	LEFT JOIN (
+		SELECT id, arg_max(gpl_status, event_time) AS gpl_status
+		FROM src_status_events
+		WHERE COALESCE(gpl_status, '') <> ''
+		GROUP BY id
+	) g ON g.id = pe.id
+	WHERE pe.id = src_node_id
+	  AND pe.status IN ('pending', 'collision')
+	  AND COALESCE(g.gpl_status, '') <> 'ignored'
+	  AND strpos(COALESCE(pe.gpl_issues, ''), $`+strconv.Itoa(param)+`) > 0
+)`)
+	args = append(args, needle)
 	param++
 	return parts, args, param
 }
@@ -520,6 +704,13 @@ func buildMergedReviewWhere(f ReviewFilter) (clause string, args []any) {
 		parts = append(parts, `src_node_id <> ''`)
 	}
 
+	if strings.TrimSpace(f.PathIssueFilter) != "" {
+		parts = appendPathIssueFilterClause(parts, f.PathIssueFilter)
+	}
+	if strings.TrimSpace(f.PathIssueCategory) != "" {
+		parts, args, param = appendPathIssueCategoryClause(parts, args, param, f.PathIssueCategory)
+	}
+
 	if f.DepthValue != nil && f.DepthOperator != "" {
 		col := "depth"
 		op := "="
@@ -586,7 +777,7 @@ func ListMergedReviewDiffs(d *DB, f ReviewFilter, orderBy string, limit, offset 
 	if err := conn.QueryRowContext(ctx, countQ, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	sel := base + ` SELECT path, name, depth, type, src_node_id, dst_node_id, src_traversal_status, dst_traversal_status, copy_status, delete_status, excluded, size FROM merged` + where +
+	sel := base + ` SELECT path, name, depth, type, src_node_id, dst_node_id, src_traversal_status, dst_traversal_status, copy_status, delete_status, excluded, size, resolved_dst_name FROM merged` + where +
 		` ORDER BY ` + orderBy + ` LIMIT $` + strconv.Itoa(len(args)+1) + ` OFFSET $` + strconv.Itoa(len(args)+2)
 	listArgs := append(append([]any{}, args...), limit, offset)
 	rows, err := conn.QueryContext(ctx, sel, listArgs...)
@@ -597,7 +788,7 @@ func ListMergedReviewDiffs(d *DB, f ReviewFilter, orderBy string, limit, offset 
 	var out []MergedReviewRow
 	for rows.Next() {
 		var r MergedReviewRow
-		if err := rows.Scan(&r.Path, &r.Name, &r.Depth, &r.Type, &r.SrcNodeID, &r.DstNodeID, &r.SrcTraversalStatus, &r.DstTraversalStatus, &r.CopyStatus, &r.DeleteStatus, &r.Excluded, &r.Size); err != nil {
+		if err := rows.Scan(&r.Path, &r.Name, &r.Depth, &r.Type, &r.SrcNodeID, &r.DstNodeID, &r.SrcTraversalStatus, &r.DstTraversalStatus, &r.CopyStatus, &r.DeleteStatus, &r.Excluded, &r.Size, &r.ResolvedDstName); err != nil {
 			return nil, 0, err
 		}
 		out = append(out, r)

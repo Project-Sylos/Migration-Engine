@@ -90,6 +90,7 @@ func mergedRowToDiffItem(r db.MergedReviewRow) DiffItem {
 		Size:               r.Size,
 		MissingOnSource:    r.SrcNodeID == "",
 		MissingOnDest:      r.DstNodeID == "",
+		ResolvedDstName:    strings.TrimSpace(r.ResolvedDstName),
 	}
 	if item.MissingOnSource {
 		item.CopyStatus = ""
@@ -598,14 +599,28 @@ func (s *migrationStore) setNodeExcludedWithPropagation(nodeID string, excluded 
 				if err2 != nil {
 					return err2
 				}
-				return w.InsertExclusionEventsForSubtree(q, rootPath)
+				if err := w.InsertExclusionEventsForSubtree(q, rootPath); err != nil {
+					return err
+				}
+				// Hide destination naming warnings while excluded (append-only ignore).
+				if err := w.InsertGPLIgnoredEventsForSubtree("SRC", rootPath); err != nil {
+					return err
+				}
+				return w.InsertGPLIgnoredEventsForSubtree("DST", rootPath)
 			}
 			var err2 error
 			buckets, err2 = w.CountCopyStatusBucketsSubtreeExcludedPrior(rootPath)
 			if err2 != nil {
 				return err2
 			}
-			return w.InsertUnexcludeEventsForSubtree(q, rootPath)
+			if err := w.InsertUnexcludeEventsForSubtree(q, rootPath); err != nil {
+				return err
+			}
+			// Restore prior non-ignored gpl_status so warnings reappear after unexclude.
+			if err := w.InsertGPLRestoredEventsForSubtree("SRC", rootPath); err != nil {
+				return err
+			}
+			return w.InsertGPLRestoredEventsForSubtree("DST", rootPath)
 		})
 	})
 	if err != nil {
@@ -737,6 +752,14 @@ func searchRequestToReviewFilter(req SearchRequest) db.ReviewFilter {
 		case "deletestatus":
 			if s, ok := conditionStringValue(c.Value); ok {
 				f.DeleteStatus = strings.TrimSpace(s)
+			}
+		case "pathissuestatus", "pathissuefilter", "compatibilitystatus":
+			if s, ok := conditionStringValue(c.Value); ok {
+				f.PathIssueFilter = strings.TrimSpace(s)
+			}
+		case "pathissuecategory", "compatibilitycategory":
+			if s, ok := conditionStringValue(c.Value); ok {
+				f.PathIssueCategory = strings.TrimSpace(s)
 			}
 		case "depth":
 			f.DepthOperator = normalizeDepthSizeOp(c.Operator)

@@ -566,6 +566,62 @@ func (w *Writer) InsertGPLIgnoredEventsForSubtree(side, rootPath string) error {
 	return w.insertGPLStatusEventsForSubtree(side, rootPath, GPLStatusIgnored, true)
 }
 
+// InsertGPLRestoredEventsForSubtree appends the latest non-ignored gpl_status for rootPath and
+// descendants (rollback after exclude-coupled ignore). Defaults to successful when none.
+func (w *Writer) InsertGPLRestoredEventsForSubtree(side, rootPath string) error {
+	ctx := context.Background()
+	eventTime := time.Now().UnixNano()
+	rootPath = NormalizeSubtreeRootPathForPropagation(rootPath)
+	if side == "DST" {
+		return w.insertDSTGPLRestoredSubtree(ctx, rootPath, eventTime)
+	}
+	return w.insertSRCGPLRestoredSubtree(ctx, rootPath, eventTime)
+}
+
+func (w *Writer) insertSRCGPLRestoredSubtree(ctx context.Context, rootPath string, eventTime int64) error {
+	insert := `INSERT INTO ` + tableSrcStatusEvents + ` (id, traversal_status, copy_status, delete_status, gpl_status, event_time, depth)
+SELECT n.id,
+  COALESCE((SELECT arg_max(e.traversal_status, e.event_time) FROM ` + tableSrcStatusEvents + ` e WHERE e.id = n.id), ''),
+  COALESCE((SELECT arg_max(e.copy_status, e.event_time) FROM ` + tableSrcStatusEvents + ` e WHERE e.id = n.id AND COALESCE(e.copy_status,'') <> ''), ''),
+  COALESCE((SELECT arg_max(e.delete_status, e.event_time) FROM ` + tableSrcStatusEvents + ` e WHERE e.id = n.id AND COALESCE(e.delete_status,'') <> ''), ''),
+  COALESCE((
+    SELECT arg_max(e.gpl_status, e.event_time)
+    FROM ` + tableSrcStatusEvents + ` e
+    WHERE e.id = n.id
+      AND COALESCE(e.gpl_status, '') <> ''
+      AND e.gpl_status <> '` + GPLStatusIgnored + `'
+  ), '` + GPLStatusSuccessful + `'),
+  $1, n.depth
+FROM ` + tableSrcNodes + ` n WHERE `
+	if rootPath == "/" {
+		_, err := w.tx.ExecContext(ctx, insert+`n.path LIKE '/%'`, eventTime)
+		return err
+	}
+	_, err := w.tx.ExecContext(ctx, insert+`(n.path = $2 OR n.path LIKE $3)`, eventTime, rootPath, rootPath+"/%")
+	return err
+}
+
+func (w *Writer) insertDSTGPLRestoredSubtree(ctx context.Context, rootPath string, eventTime int64) error {
+	insert := `INSERT INTO ` + tableDstStatusEvents + ` (id, traversal_status, gpl_status, event_time, depth)
+SELECT n.id,
+  COALESCE((SELECT arg_max(e.traversal_status, e.event_time) FROM ` + tableDstStatusEvents + ` e WHERE e.id = n.id), ''),
+  COALESCE((
+    SELECT arg_max(e.gpl_status, e.event_time)
+    FROM ` + tableDstStatusEvents + ` e
+    WHERE e.id = n.id
+      AND COALESCE(e.gpl_status, '') <> ''
+      AND e.gpl_status <> '` + GPLStatusIgnored + `'
+  ), '` + GPLStatusSuccessful + `'),
+  $1, n.depth
+FROM ` + tableDstNodes + ` n WHERE `
+	if rootPath == "/" {
+		_, err := w.tx.ExecContext(ctx, insert+`n.path LIKE '/%'`, eventTime)
+		return err
+	}
+	_, err := w.tx.ExecContext(ctx, insert+`(n.path = $2 OR n.path LIKE $3)`, eventTime, rootPath, rootPath+"/%")
+	return err
+}
+
 func (w *Writer) insertGPLStatusEventsForSubtree(side, rootPath, gplStatus string, includeRoot bool) error {
 	ctx := context.Background()
 	eventTime := time.Now().UnixNano()
@@ -768,6 +824,20 @@ LEFT JOIN prev_copy p ON p.id = s.id`
 	return out, err
 }
 
+// LatestNonIgnoredGPLStatus returns the latest gpl_status for nodeID that is not ignored.
+// Empty string means none found. Call inside a transaction.
+func (w *Writer) LatestNonIgnoredGPLStatus(nodeID string) (string, error) {
+	ctx := context.Background()
+	var s string
+	err := w.tx.QueryRowContext(ctx, `
+SELECT COALESCE(arg_max(gpl_status, event_time), '')
+FROM src_status_events
+WHERE id = $1
+  AND COALESCE(gpl_status, '') <> ''
+  AND gpl_status <> $2`, nodeID, GPLStatusIgnored).Scan(&s)
+	return s, err
+}
+
 // LatestNonExclusionCopyStatus returns the latest copy_status for nodeID that is not an exclusion
 // status. Empty string means none found (caller should treat as pending). Call inside a transaction.
 func (w *Writer) LatestNonExclusionCopyStatus(nodeID string) (string, error) {
@@ -941,6 +1011,8 @@ func (w *Writer) SetNodeDeleteStatus(table, nodeID, status string) error {
 
 // SetNodeExcluded emits a copy_status-only event for SRC: excluding sets copy_status to excluded_explicit
 // (traversal_status unchanged); unexcluding restores the latest non-exclusion copy_status (pending if none).
+// Also appends gpl_status=ignored on exclude and restores the prior non-ignored gpl_status on unexclude
+// so destination naming warnings stay hidden while excluded.
 // Applies copy-status stat deltas only.
 func (w *Writer) SetNodeExcluded(table, nodeID string, excluded bool) error {
 	ctx := context.Background()
@@ -954,6 +1026,7 @@ func (w *Writer) SetNodeExcluded(table, nodeID string, excluded bool) error {
 	var curTraversal string
 	_ = w.tx.QueryRowContext(ctx, `SELECT COALESCE(arg_max(traversal_status, event_time), '') FROM src_status_events WHERE id = $1`, nodeID).Scan(&curTraversal)
 	newCopyStatus := CopyStatusExcludedExplicit
+	gplStatus := GPLStatusIgnored
 	if !excluded {
 		restore, err := w.LatestNonExclusionCopyStatus(nodeID)
 		if err != nil {
@@ -963,8 +1036,23 @@ func (w *Writer) SetNodeExcluded(table, nodeID string, excluded bool) error {
 			restore = CopyStatusPending
 		}
 		newCopyStatus = restore
+		priorGPL, err := w.LatestNonIgnoredGPLStatus(nodeID)
+		if err != nil {
+			return err
+		}
+		if priorGPL == "" {
+			priorGPL = GPLStatusSuccessful
+		}
+		gplStatus = priorGPL
 	}
-	ev := &StatusEvent{ID: nodeID, TraversalStatus: curTraversal, CopyStatus: newCopyStatus, EventTime: time.Now().UnixNano(), Depth: depth}
+	ev := &StatusEvent{
+		ID:              nodeID,
+		TraversalStatus: curTraversal,
+		CopyStatus:      newCopyStatus,
+		GPLStatus:       gplStatus,
+		EventTime:       time.Now().UnixNano(),
+		Depth:           depth,
+	}
 	if err := w.InsertStatusEvent("SRC", ev); err != nil {
 		return err
 	}

@@ -56,6 +56,9 @@ type DiffItem struct {
 	SrcFailureMessage  string
 	DstFailureLogID    string
 	DstFailureMessage  string
+	// ResolvedDstName is the accepted/committed destination basename from path_events.
+	// Empty when no remap was applied. Review identity (Path/Name) stays SRC-original.
+	ResolvedDstName string
 }
 
 type ListChildrenDiffsRequest struct {

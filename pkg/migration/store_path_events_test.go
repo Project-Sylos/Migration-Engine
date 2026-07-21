@@ -214,7 +214,20 @@ func TestIgnoreAllAndAcceptAllPathProposals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(issues) != 0 {
-		t.Fatalf("expected empty queue after ignore-all, got %+v", issues)
+	if len(ActivePathIssues(issues)) != 0 {
+		t.Fatalf("expected no active issues after ignore-all, got %+v", issues)
+	}
+	if len(issues) != 1 || !issues[0].Ignored {
+		t.Fatalf("expected ignored issue still listed, got %+v", issues)
+	}
+	if err := m.UnignoreGPLSubtree(cID); err != nil {
+		t.Fatal(err)
+	}
+	issues, err = m.ListPathIssues(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ActivePathIssues(issues)) != 1 || issues[0].Ignored {
+		t.Fatalf("expected active issue after unignore, got %+v", issues)
 	}
 }
