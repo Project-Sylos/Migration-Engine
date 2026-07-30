@@ -7,7 +7,8 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/memory"
 )
 
 // PressureClass identifies autoscaler pressure bucket.
@@ -23,9 +24,9 @@ const (
 
 // ClassifierInput is one autoscaler tick snapshot.
 type ClassifierInput struct {
-	Internal      map[string]queue.InternalMetricsSnapshot
+	Internal      map[string]observe.InternalMetricsSnapshot
 	SealTelemetry db.SealBufferTelemetry
-	MemoryLevel   MemoryLevel
+	MemoryLevel   memory.MemoryLevel
 	InProgress    map[string]int
 	Pending       map[string]int
 }
@@ -34,7 +35,7 @@ type ClassifierInput struct {
 // Host memory red (≥90% system use) is MEMORY_PRESSURE. Seal backpressure is handled
 // separately in the autoscaler tick (batch/seal step-down only, not mislabeled as host OOM).
 func Classify(in ClassifierInput) PressureClass {
-	if in.MemoryLevel == MemoryRed {
+	if in.MemoryLevel == memory.MemoryRed {
 		return PressureMemory
 	}
 	now := time.Now()

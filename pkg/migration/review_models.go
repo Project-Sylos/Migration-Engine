@@ -3,7 +3,11 @@
 
 package migration
 
-import "codeberg.org/Sylos/Migration-Engine/pkg/db"
+import (
+	"errors"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+)
 
 // RetrySweepOptions are manager-level knobs for retry sweep runs.
 type RetrySweepOptions struct {
@@ -108,11 +112,16 @@ type SearchRequest struct {
 }
 
 type SearchResult struct {
-	Items  []DiffItem
-	Total  int
-	Limit  int
-	Offset int
+	Items []DiffItem
+	// Total is nil when unknown (search hot path does not COUNT). Exact totals come from GetSearchStats.
+	Total   *int `json:"total,omitempty"`
+	HasMore bool `json:"hasMore"`
+	Limit   int  `json:"limit"`
+	Offset  int  `json:"offset"`
 }
+
+// ErrSearchRequiresFilter is returned when SearchPathReviewItems is called with no narrowing predicates.
+var ErrSearchRequiresFilter = errors.New("search requires at least one filter")
 
 type DiffsStats struct {
 	Total           int
@@ -140,6 +149,8 @@ const (
 	DeltaFiles                 = "files"
 	DeltaSizeSrc               = "sizeSrc"
 	DeltaSizeDst               = "sizeDst"
+	DeltaSizeSelected          = "sizeSelected"
+	DeltaSizeDeleteSelected    = "sizeDeleteSelected"
 )
 
 // addReviewDelta sets deltas[key] = delta only when delta != 0, so the API omits unchanged counters.
@@ -197,8 +208,9 @@ type PathReviewStats struct {
 	FoldersRatio        float64
 	FilesRatio          float64
 	TotalFileSize       struct {
-		Src int64
-		Dst int64
+		Src      int64
+		Dst      int64
+		Selected int64
 	}
 }
 
@@ -218,6 +230,7 @@ func ReviewStatsRawFromSnapshot(s db.ReviewStatsSnapshot) ReviewStatsRaw {
 		Files:                 s.Files,
 		SizeSrc:               s.SizeSrc,
 		SizeDst:               s.SizeDst,
+		SizeSelected:          s.SizeSelected,
 	}
 }
 
@@ -237,6 +250,7 @@ type ReviewStatsRaw struct {
 	Files                 int64
 	SizeSrc               int64
 	SizeDst               int64
+	SizeSelected          int64
 }
 
 // ToPathReviewStats projects raw stats into the API shape using phase.
@@ -277,8 +291,19 @@ func (r ReviewStatsRaw) ToPathReviewStats(phase string) PathReviewStats {
 		FilesCount:          int(r.Files),
 		FoldersRatio:        foldersRatio,
 		FilesRatio:          filesRatio,
-		TotalFileSize:       struct{ Src, Dst int64 }{r.SizeSrc, r.SizeDst},
+		TotalFileSize: struct{ Src, Dst, Selected int64 }{
+			Src:      maxInt64(0, r.SizeSrc),
+			Dst:      maxInt64(0, r.SizeDst),
+			Selected: maxInt64(0, r.SizeSelected),
+		},
 	}
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 type QueueMetricsSnapshot struct {

@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -163,16 +165,16 @@ func seedFlatCopyLayout(t *testing.T, database *db.DB) {
 	const srcRootService = "src-root"
 	const dstRootService = "dst-root"
 
-	srcRootID := db.RootNodeID("SRC")
-	dstRootID := db.RootNodeID("DST")
+	srcRootID := db.MintNodeID("SRC", "", db.NodeTypeFolder, "/")
+	dstRootID := db.MintNodeID("DST", "", db.NodeTypeFolder, "/")
 
-	if err := db.InsertRootNode(database, "SRC", &db.NodeState{
+	if err := pull.InsertRootNode(database, "SRC", &db.NodeState{
 		ID: srcRootID, ServiceID: srcRootService, Path: "/", ParentPath: "", Type: db.NodeTypeFolder,
 		TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusAlreadyExisted, Depth: 0,
 	}); err != nil {
 		t.Fatalf("insert src root: %v", err)
 	}
-	if err := db.InsertRootNode(database, "DST", &db.NodeState{
+	if err := pull.InsertRootNode(database, "DST", &db.NodeState{
 		ID: dstRootID, ServiceID: dstRootService, Path: "/", ParentPath: "", Type: db.NodeTypeFolder,
 		TraversalStatus: db.StatusSuccessful, Depth: 0,
 	}); err != nil {
@@ -184,7 +186,7 @@ func seedFlatCopyLayout(t *testing.T, database *db.DB) {
 		Source:        db.IDMapSourceRootSeed,
 		Status:        db.IDMapStatusActive,
 	})
-	if err := database.FlushSealBuffer(); err != nil {
+	if err := database.Flush(); err != nil {
 		t.Fatalf("flush id_map: %v", err)
 	}
 
@@ -267,20 +269,20 @@ func TestRunCopyPhase_flatLayoutPass1FoldersBeforePass2(t *testing.T) {
 	}
 
 	for _, folder := range []string{flatCopyFolderA, flatCopyFolderB} {
-		c, err := database.GetCopyCountAtDepth(1, db.NodeTypeFolder, db.CopyStatusPending, true)
+		c, err := stats.GetCopyCountAtDepth(database, 1, db.NodeTypeFolder, db.CopyStatusPending, true)
 		if err != nil {
 			t.Fatalf("pending folder count: %v", err)
 		}
 		if c > 0 {
 			t.Fatalf("folder %q still pending (pending folder count=%d)", folder, c)
 		}
-		state, err := db.GetNodeByPath(database, "DST", "/"+folder)
+		state, err := pull.GetNodeByPath(database, "DST", "/"+folder)
 		if err != nil || state == nil {
 			t.Fatalf("dst folder /%s missing: %v", folder, err)
 		}
 	}
 
-	filePending, err := database.GetCopyCountAtDepth(1, db.NodeTypeFile, db.CopyStatusPending, true)
+	filePending, err := stats.GetCopyCountAtDepth(database, 1, db.NodeTypeFile, db.CopyStatusPending, true)
 	if err != nil {
 		t.Fatal(err)
 	}

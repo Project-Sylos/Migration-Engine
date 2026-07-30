@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/subtree"
 	"codeberg.org/Sylos/go-path-linter/pkg/check"
 	"codeberg.org/Sylos/go-path-linter/pkg/gpl"
 )
@@ -22,7 +23,7 @@ func TestAcceptPathProposal_fansOutGPLPendingDescendants(t *testing.T) {
 	}
 	defer database.Close()
 
-	srcRoot := db.RootNodeID("SRC")
+	srcRoot := db.MintNodeID("SRC", "", db.NodeTypeFolder, "/")
 	folderID := db.MintNodeID("SRC", srcRoot, db.NodeTypeFolder, "folder")
 	childID := db.MintNodeID("SRC", folderID, db.NodeTypeFile, "child.txt")
 
@@ -51,7 +52,7 @@ func TestAcceptPathProposal_fansOutGPLPendingDescendants(t *testing.T) {
 	}
 
 	m := &Migration{DB: database}
-	if err := m.AcceptPathProposal(folderID, "renamed"); err != nil {
+	if err := m.AcceptPathChange(folderID, "renamed", false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -90,7 +91,7 @@ func TestGPLSweep_clearsPathLengthAfterAncestorShorten(t *testing.T) {
 	}
 	long := "abcdefghij" // 10 chars
 	// parent "abcdefghij" + "/" + "xy" = 13 > 12
-	srcRoot := db.RootNodeID("SRC")
+	srcRoot := db.MintNodeID("SRC", "", db.NodeTypeFolder, "/")
 	folderID := db.MintNodeID("SRC", srcRoot, db.NodeTypeFolder, long)
 	childID := db.MintNodeID("SRC", folderID, db.NodeTypeFile, "xy")
 
@@ -122,7 +123,7 @@ func TestGPLSweep_clearsPathLengthAfterAncestorShorten(t *testing.T) {
 			}); err != nil {
 				return err
 			}
-			return w.InsertGPLPendingEventsForSubtree("SRC", "/"+long)
+			return subtree.InsertGPLStatusEventsForSubtree(w, "SRC", "/"+long, db.GPLStatusPending, false)
 		})
 	}); err != nil {
 		t.Fatal(err)

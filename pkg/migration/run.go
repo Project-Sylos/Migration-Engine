@@ -9,9 +9,12 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
-	"codeberg.org/Sylos/Migration-Engine/pkg/scaling"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/loop"
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/profile"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -34,13 +37,17 @@ type MigrationConfig struct {
 	ProgressTick    time.Duration
 	ResumeStatus    *MigrationStatus
 	ShutdownContext context.Context
+	// RootPreparation selects start rounds after UI-injected depth-1 children at AddRoots.
+	RootPreparation RootPreparation
 	// ResumeTraversal: non-nil after traversal-suspended; retry-style frontier rebuild (round 0, persisted max depth / sizing).
 	ResumeTraversal *RuntimeSuspendV1
 	// SoftSuspendRequested is polled in the run loop; when true, queues drain and state is flushed (see ErrTraversalSoftSuspended).
 	SoftSuspendRequested func() bool
 	ObserverPollInterval time.Duration
 	// OnQueueObserver is called with the live observer after queues register, and with nil when the run exits (before observer.Stop).
-	OnQueueObserver func(*queue.QueueObserver)
+	OnQueueObserver func(*observe.QueueObserver)
+	// OnAutoscaler is called with the live autoscaler after start, and with nil when the run exits.
+	OnAutoscaler func(*loop.Autoscaler)
 
 	Autoscaler AutoscalerConfig
 
@@ -49,6 +56,8 @@ type MigrationConfig struct {
 
 	// PathCheckTarget selects destination-name rules ("none", "auto", or provider id).
 	PathCheckTarget string
+	// WindowsCompat enables Windows desktop-sync overlays on soft cloud destinations.
+	WindowsCompat bool
 }
 
 // RuntimeStats captures execution statistics at the end of a migration run.
@@ -104,7 +113,11 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	dstSizing := queueSizingForScalingContext(dstCtx, cfg.ResumeTraversal)
 	srcWC := resolveWorkersForScalingContext(srcCtx, cfg.WorkerCount, cfg.ResumeTraversal)
 	dstWC := resolveWorkersForScalingContext(dstCtx, cfg.WorkerCount, cfg.ResumeTraversal)
-	mr := effectiveMaxRetries(cfg.MaxRetries, cfg.ResumeTraversal)
+	suspendRetries := 0
+	if cfg.ResumeTraversal != nil {
+		suspendRetries = cfg.ResumeTraversal.MaxRetries
+	}
+	mr := effectiveInt(suspendRetries, cfg.MaxRetries)
 
 	// DB-backed frontier: no LevelCache for traversal. Queues pull from DuckDB in batches.
 	srcQueue := queue.NewQueue("src", mr, srcWC, coordinator, srcSizing)
@@ -115,7 +128,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		dstQueue.SetMode(queue.QueueModeRetry)
 		maxKD := cfg.ResumeTraversal.MaxKnownDepth
 		if maxKD <= 0 {
-			if d, err := database.GetMaxDepth("SRC"); err == nil {
+			if d, err := stats.GetMaxDepth(database, "SRC"); err == nil {
 				maxKD = d
 			}
 		}
@@ -130,17 +143,17 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	srcQueue.SetRateLimitTelemetry(rateLimitBridgeForAdapter(cfg.SrcAdapter))
 	dstQueue.SetRateLimitTelemetry(rateLimitBridgeForAdapter(cfg.DstAdapter))
 
-	srcListProfile := scaling.ResolveEffectiveProfile(
+	srcListProfile := profile.ResolveEffectiveProfile(
 		scalingContextForTraversal("src", cfg.SrcService, cfg.DstService, queue.QueueModeTraversal),
 		cfg.SrcAdapter, cfg.DstAdapter,
 	)
-	dstListProfile := scaling.ResolveEffectiveProfile(
+	dstListProfile := profile.ResolveEffectiveProfile(
 		scalingContextForTraversal("dst", cfg.SrcService, cfg.DstService, queue.QueueModeTraversal),
 		cfg.SrcAdapter, cfg.DstAdapter,
 	)
 	// Per-queue list pagination uses each side's operation profile at init.
-	scaling.ApplyQueueListPagination(srcQueue, srcListProfile)
-	scaling.ApplyQueueListPagination(dstQueue, dstListProfile)
+	profile.ApplyQueueListPagination(srcQueue, srcListProfile)
+	profile.ApplyQueueListPagination(dstQueue, dstListProfile)
 
 	if cfg.ResumeTraversal != nil {
 		srcQueue.SetRound(0)
@@ -149,8 +162,8 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			coordinator.UpdateRound("src", 0)
 			coordinator.UpdateRound("dst", 0)
 		}
-		srcQueue.EnsureRoundExpectedFromStats()
-		dstQueue.EnsureRoundExpectedFromStats()
+		srcQueue.SetExpectedFromStatsBucket(srcQueue.GetRound())
+		dstQueue.SetExpectedFromStatsBucket(dstQueue.GetRound())
 		srcQueue.SetTraversalCacheLoaded(true)
 		dstQueue.SetTraversalCacheLoaded(true)
 		logTraversalResumePositionCheck(cfg.ResumeTraversal, srcQueue, dstQueue)
@@ -184,7 +197,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	}()
 
 	obsPoll := observerPollFromConfigAndSuspend(cfg.ObserverPollInterval, cfg.ResumeTraversal)
-	observer := queue.NewQueueObserver(database, obsPoll)
+	observer := observe.NewQueueObserver(database, obsPoll)
 	observer.Start()      // Start observer loop immediately
 	defer observer.Stop() // Ensure observer is stopped on exit
 	if cfg.OnQueueObserver != nil {
@@ -202,7 +215,11 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	if runCtx == nil {
 		runCtx = context.Background()
 	}
-	asCtx := startAutoscaler(runCtx, cfg.Autoscaler, observer, database, srcQueue, dstQueue, cfg.SrcService, cfg.DstService, cfg.PathCheckTarget)
+	asCtx := startAutoscaler(runCtx, cfg.Autoscaler, observer, database, srcQueue, dstQueue, cfg.SrcService, cfg.DstService, cfg.PathCheckTarget, cfg.WindowsCompat)
+	if cfg.OnAutoscaler != nil {
+		cfg.OnAutoscaler(asCtx.Autoscaler())
+		defer cfg.OnAutoscaler(nil)
+	}
 	defer asCtx.stop()
 
 	// Set up stats channels for UDP logging (after queues are running)
@@ -248,13 +265,13 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		if cfg.ShutdownContext != nil {
 			select {
 			case <-cfg.ShutdownContext.Done():
-				performTraversalForceStop(database, srcQueue, dstQueue, observer)
+				performTraversalForceStop(database, srcQueue, dstQueue, observer, coordinator)
 				srcStats, dstStats := snapshotTraversalQueueStats(database, coordinator)
 				return RuntimeStats{
 					Duration: time.Since(start),
 					Src:      srcStats,
 					Dst:      dstStats,
-				}, forceStopErr("traversal")
+				}, fmt.Errorf("migration force stopped during %s", "traversal")
 			default:
 			}
 		}
@@ -335,13 +352,13 @@ func snapshotTraversalQueueStats(database *db.DB, coordinator *queue.QueueCoordi
 	dstRound := coordinator.GetRound("dst")
 	srcPending := 0
 	dstPending := 0
-	c, err := database.GetStatsCountAtDepth("SRC", srcRound, db.StatsKey(db.StatsKindTraversal,db.StatusPending))
+	c, err := stats.GetStatsCountAtDepth(database, "SRC", srcRound, db.StatsKey(db.StatsKindTraversal, db.StatusPending))
 	if err != nil {
 		fmt.Println("error getting stats count at depth", err)
 		return queue.QueueStats{}, queue.QueueStats{}
 	}
 	srcPending = int(c)
-	c, err = database.GetStatsCountAtDepth("DST", dstRound, db.StatsKey(db.StatsKindTraversal,db.StatusPending))
+	c, err = stats.GetStatsCountAtDepth(database, "DST", dstRound, db.StatsKey(db.StatsKindTraversal, db.StatusPending))
 	if err != nil {
 		fmt.Println("error getting stats count at depth", err)
 		return queue.QueueStats{}, queue.QueueStats{}
@@ -353,6 +370,10 @@ func snapshotTraversalQueueStats(database *db.DB, coordinator *queue.QueueCoordi
 }
 
 func completeTraversalRun(database *db.DB, coordinator *queue.QueueCoordinator, progressTicker *time.Ticker, start time.Time) RuntimeStats {
+	if database != nil {
+		_ = database.Flush()
+		_ = queue.FinalizeCopyWorkOnStop(database, coordinator)
+	}
 	srcStats, dstStats := snapshotTraversalQueueStats(database, coordinator)
 	fmt.Println("\nTraversal complete!")
 	progressTicker.Stop()
@@ -386,8 +407,8 @@ func closeGlobalLoggerWithTimeout(timeout time.Duration) {
 
 // initializeQueues sets up src/dst queues from runtime DB resume state.
 func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queue.Queue, coordinator *queue.QueueCoordinator) error {
-	srcRound := 0
-	dstRound := 0
+	srcRound := cfg.RootPreparation.SourceStartRound()
+	dstRound := cfg.RootPreparation.DestStartRound()
 	if cfg.ResumeStatus != nil {
 		if cfg.ResumeStatus.MinPendingDepthSrc != nil {
 			srcRound = *cfg.ResumeStatus.MinPendingDepthSrc
@@ -397,15 +418,13 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 		}
 	}
 
-	// DuckDB is the primary database - no SQLite seeding needed
-
 	// Set queue rounds
 	srcQueue.SetRound(srcRound)
 	dstQueue.SetRound(dstRound)
 
 	// Set Expected from stats bucket (O(1) per queue; round 0 = 1 for traversal)
-	srcQueue.EnsureRoundExpectedFromStats()
-	dstQueue.EnsureRoundExpectedFromStats()
+	srcQueue.SetExpectedFromStatsBucket(srcQueue.GetRound())
+	dstQueue.SetExpectedFromStatsBucket(dstQueue.GetRound())
 
 	if coordinator != nil {
 		coordinator.UpdateRound("src", srcRound)
@@ -415,9 +434,6 @@ func initializeQueues(cfg MigrationConfig, srcQueue *queue.Queue, dstQueue *queu
 			coordinator.MarkCompleted("dst")
 		}
 	}
-
-	// Don't pull tasks here - let Run() handle the initial pull
-	// DST will check coordinator when it needs to advance
 
 	if logservice.LS != nil {
 		err := logservice.LS.Log("info",

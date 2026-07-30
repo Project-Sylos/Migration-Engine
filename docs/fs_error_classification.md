@@ -87,6 +87,28 @@ This is a **structural translation gap** at the boundary between remote API sema
 
 **Implication for Sylos:** empirical testing under load against real sync-client / mounted-folder setups is the practical way to collect errno distributions for ambiguous-bucket rules. Design the telemetry hooks first; tune buckets from measured behavior per `(operation, errno)` and backend group.
 
+### Implemented local allowlist
+
+`ClassifyLocalError` (Sylos-FS `pkg/types/local_classify_unix.go`) uses an explicit allowlist, because Ambiguous is the only bucket behavioral promotion can turn into `FS_THROTTLE` — and therefore the only one that can scale workers down.
+
+| Bucket | Local errnos |
+|--------|--------------|
+| **Ambiguous** (promotable) | `EAGAIN`, `EBUSY`, `EIO`, `EMFILE`, `ENFILE`, `ENOMEM` — the errnos whose rate scales with concurrency |
+| **Fatal** | `EACCES`, `EPERM`, `ENOENT`, `ENOTDIR`, `EISDIR`, `ENAMETOOLONG`, `ELOOP`, `ENOSPC`, `EDQUOT`, `EFBIG`, `EROFS`, `EXDEV`, `EINVAL`, `ENOTSUP`, and `ErrPathBlocked` (hard-denied paths such as `/proc`, `/sys`, `/dev`, `/run`) |
+| **Retryable** (neutral) | `ETIMEDOUT`, `EINTR`, **and everything unrecognized** |
+
+Unrecognized errors are Retryable rather than Ambiguous: a default of Ambiguous made any opaque `PathError` burst on a healthy local disk look like a rate limit. Unknown errors also collapse to a single `unclassified` error code, since per-message keys would fragment the tracker's burst and sample counters.
+
+The non-Unix stub is Fatal for not-exist / permission / invalid and Retryable otherwise; Windows and WinFsp sharing- and lock-violation codes still need a platform classifier before they can drive the autoscaler.
+
+### LocalFS hard-deny paths
+
+LocalFS refuses to list or open paths under `/proc`, `/sys`, `/dev`, `/run` (and Windows device namespaces). Children whose absolute path matches are skipped during `ListChildren` rather than enqueued. The adapter returns `ErrPathBlocked` (fatal) when the list/open target itself is blocked.
+
+### Traversal stall (Migration-Engine)
+
+`ListChildren` no longer gets fake ProgressWatchdog heartbeats. If a list call makes no real progress for ~15s (except while seal flush or a rate-limit wait is active), the watchdog cancels the context and the task fails as non-retryable (`traversal stalled`) so the round can advance instead of wedging forever on hung kernel ops (classic: `Lstat` on `/proc/.../fd/N`). Delete uses the same seal-or-rate-limit suppress with a 60s kill timeout on `DeleteNode` / `DeleteBatch`.
+
 ---
 
 ## Backoff strategy patterns (planned)
@@ -159,7 +181,7 @@ Local-path adapters cannot see HTTP 429 underneath a mount. Validate empirically
 
 1. Point ME local migration at a sync-client folder or FUSE mount (not plain ext4 when testing opaque errors).
 2. Run with autoscaler enabled and elevated worker count; collect `(operation, errno)` histograms from adapter logs or injected test hooks.
-3. Tune `ClassifyLocalError` ambiguous bucket from measured data — start with `EIO`, `EAGAIN`, `EBUSY`.
+3. Tune the `ClassifyLocalError` ambiguous allowlist from measured data (see Implemented local allowlist above); widen it only for errnos observed to correlate with mount-level load shedding.
 4. Unit tests with `LocalFS.InjectBeforeOp` cover the engine path; mount behavior remains empirical.
 
 ---

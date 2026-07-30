@@ -5,6 +5,7 @@ package queue
 
 import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -29,11 +30,11 @@ func BuildExpectedMapsFromDstWithChildren(dstBatch []db.FetchResult, childrenByD
 		var files []types.File
 		idMap := make(map[string]string)
 		for _, n := range nodes {
-			displayName := dstChildMatchName(n.Name, n.Path)
+			displayName := DstChildMatchName(n.Name, n.Path)
 			if displayName == "" && n.Name != "" {
 				displayName = n.Name
 			}
-			matchKey := dstChildMatchKey(n.Type, displayName, n.Path)
+			matchKey := DstChildMatchKey(n.Type, displayName, n.Path)
 			idMap[matchKey] = n.ID
 			srcIDToMeta[n.ID] = SrcNodeMeta{Depth: n.Depth, TraversalStatus: n.TraversalStatus, CopyStatus: n.CopyStatus, DeleteStatus: n.DeleteStatus, GPLState: n.GPLState}
 			if n.Type == types.NodeTypeFolder {
@@ -98,7 +99,7 @@ func BatchLoadExpectedChildrenByDSTIDs(database *db.DB, dstParentIDs []string, d
 	if len(paths) == 0 {
 		return expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta, nil
 	}
-	byPath, err := db.GetSrcChildrenGroupedByParentPath(database, paths)
+	byPath, err := pull.GetSrcChildrenGroupedByParentPath(database, paths)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -111,11 +112,11 @@ func BatchLoadExpectedChildrenByDSTIDs(database *db.DB, dstParentIDs []string, d
 		var files []types.File
 		idMap := make(map[string]string)
 		for _, n := range nodes {
-			displayName := dstChildMatchName(n.Name, n.Path)
+			displayName := DstChildMatchName(n.Name, n.Path)
 			if displayName == "" && n.Name != "" {
 				displayName = n.Name
 			}
-			matchKey := dstChildMatchKey(n.Type, displayName, n.Path)
+			matchKey := DstChildMatchKey(n.Type, displayName, n.Path)
 			idMap[matchKey] = n.ID
 			srcIDToMeta[n.ID] = SrcNodeMeta{Depth: n.Depth, TraversalStatus: n.TraversalStatus, CopyStatus: n.CopyStatus, DeleteStatus: n.DeleteStatus, GPLState: n.GPLState}
 			if n.Type == types.NodeTypeFolder {
@@ -156,7 +157,7 @@ func BatchLoadRetryDstCleanup(database *db.DB, srcFolderIDs []string) (map[strin
 	if len(srcFolderIDs) == 0 {
 		return out, nil
 	}
-	srcToDst, err := db.BatchGetDstIDsFromSrcIDs(database, srcFolderIDs)
+	srcToDst, err := pull.BatchGetDstIDsFromSrcIDs(database, srcFolderIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -164,11 +165,11 @@ func BatchLoadRetryDstCleanup(database *db.DB, srcFolderIDs []string) (map[strin
 	for _, dstID := range srcToDst {
 		dstIDs = append(dstIDs, dstID)
 	}
-	dstMeta, err := db.BatchGetNodeMeta(database, "DST", dstIDs)
+	dstMeta, err := pull.BatchGetNodeMeta(database, "DST", dstIDs)
 	if err != nil {
 		return nil, err
 	}
-	parentToChildren, err := db.BatchGetChildrenIDsByParentIDs(database, "DST", dstIDs)
+	parentToChildren, err := pull.BatchGetChildrenIDsByParentIDs(database, "DST", dstIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +179,7 @@ func BatchLoadRetryDstCleanup(database *db.DB, srcFolderIDs []string) (map[strin
 	}
 	var childMeta map[string]db.NodeMeta
 	if len(allChildIDs) > 0 {
-		childMeta, err = db.BatchGetNodeMeta(database, "DST", allChildIDs)
+		childMeta, err = pull.BatchGetNodeMeta(database, "DST", allChildIDs)
 		if err != nil {
 			return nil, err
 		}

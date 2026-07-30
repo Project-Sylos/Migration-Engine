@@ -17,7 +17,7 @@ func TestPathEventsReviewAccept(t *testing.T) {
 	}
 	defer database.Close()
 
-	srcRoot := db.RootNodeID("SRC")
+	srcRoot := db.MintNodeID("SRC", "", db.NodeTypeFolder, "/")
 	nodeID := db.MintNodeID("SRC", srcRoot, db.NodeTypeFile, "bad*name.txt")
 	if err := database.RunWrite(t.Context(), func(s *db.WriteSession) error {
 		return s.WithTx(func(w *db.Writer) error {
@@ -44,7 +44,7 @@ func TestPathEventsReviewAccept(t *testing.T) {
 	if len(issues) != 1 || issues[0].ProposedPath != "bad_name.txt" {
 		t.Fatalf("issues=%+v", issues)
 	}
-	if err := m.AcceptPathProposal(nodeID, "bad_name.txt"); err != nil {
+	if err := m.AcceptPathChange(nodeID, "bad_name.txt", false); err != nil {
 		t.Fatal(err)
 	}
 	issues, err = m.ListPathIssues(10)
@@ -63,7 +63,7 @@ func TestValidatePathProposal_andForceIgnore(t *testing.T) {
 	}
 	defer database.Close()
 
-	srcRoot := db.RootNodeID("SRC")
+	srcRoot := db.MintNodeID("SRC", "", db.NodeTypeFolder, "/")
 	nodeID := db.MintNodeID("SRC", srcRoot, db.NodeTypeFile, "bad*name.txt")
 	childID := db.MintNodeID("SRC", nodeID, db.NodeTypeFile, "nested.txt")
 	if err := database.RunWrite(t.Context(), func(s *db.WriteSession) error {
@@ -106,7 +106,7 @@ func TestValidatePathProposal_andForceIgnore(t *testing.T) {
 		t.Fatalf("expected invalid proposal with issues, got %+v", invalid)
 	}
 
-	if err := m.RemapPathManual(nodeID, "still*bad.txt", true); err != nil {
+	if err := m.AcceptPathChange(nodeID, "still*bad.txt", true); err != nil {
 		t.Fatal(err)
 	}
 	issues, err := m.ListPathIssues(10)
@@ -143,7 +143,7 @@ func TestIgnoreAllAndAcceptAllPathProposals(t *testing.T) {
 	}
 	defer database.Close()
 
-	srcRoot := db.RootNodeID("SRC")
+	srcRoot := db.MintNodeID("SRC", "", db.NodeTypeFolder, "/")
 	aID := db.MintNodeID("SRC", srcRoot, db.NodeTypeFile, "a*1.txt")
 	bID := db.MintNodeID("SRC", srcRoot, db.NodeTypeFile, "b*2.txt")
 	if err := database.RunWrite(t.Context(), func(s *db.WriteSession) error {
@@ -220,7 +220,7 @@ func TestIgnoreAllAndAcceptAllPathProposals(t *testing.T) {
 	if len(issues) != 1 || !issues[0].Ignored {
 		t.Fatalf("expected ignored issue still listed, got %+v", issues)
 	}
-	if err := m.UnignoreGPLSubtree(cID); err != nil {
+	if err := m.SetGPLSubtreeIgnored(cID, false); err != nil {
 		t.Fatal(err)
 	}
 	issues, err = m.ListPathIssues(10)

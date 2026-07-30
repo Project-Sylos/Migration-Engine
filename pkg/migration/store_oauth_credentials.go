@@ -8,12 +8,12 @@ import (
 	"fmt"
 	"time"
 
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/oauth"
 )
 
-func (s *migrationStore) upsertOAuthCredentials(connectionID string, credsJSON []byte) error {
+func (s *migrationStore) UpsertOAuthCredentials(connectionID string, credsJSON []byte) error {
 	if s.db == nil {
-		return fmt.Errorf("upsertOAuthCredentials requires store db")
+		return fmt.Errorf("UpsertOAuthCredentials requires store db")
 	}
 	if connectionID == "" {
 		return fmt.Errorf("connectionID required")
@@ -21,7 +21,7 @@ func (s *migrationStore) upsertOAuthCredentials(connectionID string, credsJSON [
 	if len(credsJSON) == 0 {
 		return fmt.Errorf("credsJSON required")
 	}
-	stored, err := db.SealOAuthCredentials(credsJSON, s.tokenKey)
+	stored, err := oauth.SealOAuthCredentials(credsJSON, s.tokenKey)
 	if err != nil {
 		return fmt.Errorf("seal oauth credentials: %w", err)
 	}
@@ -60,16 +60,16 @@ func (s *migrationStore) getOAuthCredentials(connectionID string) ([]byte, error
 	if err != nil {
 		return nil, err
 	}
-	plain, err := db.OpenOAuthCredentials(credsJSON, s.tokenKey)
+	plain, err := oauth.OpenOAuthCredentials(credsJSON, s.tokenKey)
 	if err != nil {
 		return nil, fmt.Errorf("open oauth credentials: %w", err)
 	}
 	return plain, nil
 }
 
-func (s *migrationStore) deleteOAuthCredentials(connectionID string) error {
+func (s *migrationStore) DeleteOAuthCredentials(connectionID string) error {
 	if s.db == nil {
-		return fmt.Errorf("deleteOAuthCredentials requires store db")
+		return fmt.Errorf("DeleteOAuthCredentials requires store db")
 	}
 	conn, err := s.db.GetDB()
 	if err != nil {

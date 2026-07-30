@@ -17,8 +17,8 @@ import (
 
 // Options configures DB open behavior.
 type Options struct {
-	Path          string // Path to DuckDB file (e.g. "migration.duckdb")
-	EncryptionKey []byte // nil = plaintext open; non-nil = DuckDB native encryption via ATTACH
+	Path          string             // Path to DuckDB file (e.g. "migration.duckdb")
+	EncryptionKey []byte             // nil = plaintext open; non-nil = DuckDB native encryption via ATTACH
 	SealBuffer    *SealBufferOptions // Optional overrides for seal buffer; nil uses defaults. Seal buffer is always created.
 }
 
@@ -29,11 +29,11 @@ func DefaultOptions() Options {
 
 // DB is the DuckDB-backed database handle. Single physical connection for all DB operations (schema, bulk append at seal, pulls, checkpoint).
 type DB struct {
-	path       string
-	conn       *sql.DB    // single connection for all operations
-	writeMu    sync.Mutex // one global mutex for all DB writes
-	checkpointMu sync.Mutex // serializes CHECKPOINT; only one connection runs it since it's a global DB op
-	sealBuffer *SealBuffer // always set; seal jobs + discovery (nodes/events), flushes async and on demand
+	path         string
+	conn         *sql.DB        // single connection for all operations
+	writeMu      sync.Mutex     // one global mutex for all DB writes
+	checkpointMu sync.Mutex     // serializes CHECKPOINT; only one connection runs it since it's a global DB op
+	sealBuffer   SealController // always set by Open; seal jobs + discovery (nodes/events), flushes async and on demand
 }
 
 // Open opens a DuckDB database at the given path and creates schema if missing.
@@ -77,25 +77,33 @@ func Open(opts Options) (*DB, error) {
 			return nil, err
 		}
 	}
+	if sealAttach == nil {
+		_ = conn.Close()
+		return nil, ErrNoSealController
+	}
 	sbOpts := SealBufferOptions{}
 	if opts.SealBuffer != nil {
 		sbOpts = *opts.SealBuffer
 	}
-	db.sealBuffer = NewSealBuffer(db, sbOpts)
+	db.AttachSeal(sealAttach(db, sbOpts))
 	return db, nil
 }
 
 func schemaDDLs() []string {
 	return []string{
-		nodeTableDDL(tableSrcNodes),
-		nodeTableDDL(tableDstNodes),
+		nodeTableDDL(TableSrcNodes),
+		nodeTableDDL(TableDstNodes),
 		srcStatusEventsTableDDL(),
 		dstStatusEventsTableDDL(),
-		pathEventsTableDDL(),
+		gplIssuesTableDDL(),
 		idMapTableDDL(),
+		srcCurrentTableDDL(),
+		dstCurrentTableDDL(),
 		statsTableDDL(),
 		srcStatsTableDDL(),
 		dstStatsTableDDL(),
+		copyWorkRoundStatsTableDDL(),
+		deleteWorkRoundStatsTableDDL(),
 		logsTableDDL(),
 		queueStatsTableDDL(),
 		taskErrorsTableDDL(),
@@ -117,9 +125,17 @@ func initSchemaConn(conn *sql.DB) error {
 	if _, err := conn.Exec(srcNodesGPLStateAlter()); err != nil {
 		return fmt.Errorf("ensure gpl_state column: %w", err)
 	}
+	if _, err := conn.Exec(gplIssuesDstActionAlter()); err != nil {
+		return fmt.Errorf("ensure gpl_issues.dst_action column: %w", err)
+	}
 	for _, ddl := range statusEventsGPLStatusAlters() {
 		if _, err := conn.Exec(ddl); err != nil {
 			return fmt.Errorf("ensure gpl_status column: %w", err)
+		}
+	}
+	for _, ddl := range nodeTableNameAlters() {
+		if _, err := conn.Exec(ddl); err != nil {
+			return fmt.Errorf("ensure name column: %w", err)
 		}
 	}
 	return nil
@@ -170,7 +186,7 @@ func (db *DB) Checkpoint() error {
 		return err
 	}
 	if db.sealBuffer != nil {
-		db.sealBuffer.onCheckpointOK()
+		db.sealBuffer.OnCheckpointOK()
 	}
 	return nil
 }
@@ -266,26 +282,26 @@ func (db *DB) AddSealNodes(table string, depth int, nodes []*NodeState) error {
 	return db.sealBuffer.Add(table, depth, nodes, 0, 0, 0, 0, 0, 0, 0)
 }
 
-// SealLevelDepth0 updates existing root row(s) at depth 0 and writes stats.
+// SealLevelDepth0 updates existing root row(s) at depth 0 and emits status events.
 // Root rows are seeded up-front, so depth 0 uses update semantics instead of appender insert.
-func (db *DB) SealLevelDepth0(table string, nodes []*NodeState, pending, successful, failed, completed int64, copyP, copyS, copyF int64) error {
+func (db *DB) SealLevelDepth0(table string, nodes []*NodeState) error {
 	if table != "SRC" && table != "DST" {
 		return nil
 	}
 	return db.RunWrite(context.Background(), func(s *WriteSession) error {
 		return s.WithTx(func(w *Writer) error {
-			return w.SealDepth0(table, nodes, pending, successful, failed, completed, copyP, copyS, copyF)
+			return w.SealDepth0(table, nodes)
 		})
 	})
 }
 
-// FlushSealBuffer drains pending seal jobs to the DB. Call before backpressure wait so we don't block on the flush interval.
-func (db *DB) FlushSealBuffer() error {
+// Flush drains pending seal jobs to the DB. Call before backpressure wait so we don't block on the flush interval.
+func (db *DB) Flush() error {
 	return db.sealBuffer.Flush()
 }
 
-// WaitUntilSealFlushedThrough blocks until the seal buffer has written at least the given depth (for backpressure: don't run more than one round ahead of flushed state).
-func (db *DB) WaitUntilSealFlushedThrough(depth int) {
+// WaitUntilFlushedThrough blocks until the seal buffer has written at least the given depth (for backpressure: don't run more than one round ahead of flushed state).
+func (db *DB) WaitUntilFlushedThrough(depth int) {
 	db.sealBuffer.WaitUntilFlushedThrough(depth)
 }
 
@@ -309,7 +325,7 @@ func (db *DB) UpdateSealBufferOptions(opts SealBufferOptions) {
 	}
 }
 
-// AppendDiscoveredNodes adds discovered nodes (and their initial status events) to the seal buffer discovery queue. Call from traversal completion; flush is async until FlushSealBuffer.
+// AppendDiscoveredNodes adds discovered nodes (and their initial status events) to the seal buffer discovery queue. Call from traversal completion; flush is async until Flush.
 func (db *DB) AppendDiscoveredNodes(ops []InsertOperation) {
 	if db.sealBuffer != nil && len(ops) > 0 {
 		db.sealBuffer.AddDiscoveryNodes(ops)
@@ -337,26 +353,32 @@ func (db *DB) AppendTaskError(queueType, phase, nodeID, message string, attempts
 	}
 }
 
-// AppendFailedSubtree enqueues an SRC folder path for subtree failure propagation.
-// At the next flush, all pending descendants will be marked as copy_status='failed'.
-func (db *DB) AppendFailedSubtree(parentPath string) {
+func (db *DB) withSealBuffer(fn func(SealController)) {
 	if db.sealBuffer != nil {
-		db.sealBuffer.AddFailedSubtreePath(parentPath)
+		fn(db.sealBuffer)
 	}
 }
 
-// AppendPathEvent enqueues a path_events row for async seal flush.
-func (db *DB) AppendPathEvent(e PathEvent) {
-	if db.sealBuffer != nil {
-		db.sealBuffer.AddPathEvent(e)
-	}
+// AppendFailedSubtree enqueues an SRC folder path for subtree failure propagation.
+// At the next flush, all pending descendants will be marked as copy_status='failed'.
+func (db *DB) AppendFailedSubtree(parentPath string) {
+	db.withSealBuffer(func(sb SealController) {
+		sb.AddFailedSubtreePath(parentPath)
+	})
+}
+
+// AppendGPLIssue enqueues a sparse GPL review row for async seal flush.
+func (db *DB) AppendGPLIssue(e GPLIssue) {
+	db.withSealBuffer(func(sb SealController) {
+		sb.AddGPLIssue(e)
+	})
 }
 
 // AppendIDMapEvent enqueues an id_map row for async seal flush.
 func (db *DB) AppendIDMapEvent(e IDMapEvent) {
-	if db.sealBuffer != nil {
-		db.sealBuffer.AddIDMapEvent(e)
-	}
+	db.withSealBuffer(func(sb SealController) {
+		sb.AddIDMapEvent(e)
+	})
 }
 
 // WriteSession is the handle passed to RunWrite. Caller must not retain conn after the callback returns.
@@ -400,16 +422,10 @@ func (db *DB) RunWrite(ctx context.Context, fn func(s *WriteSession) error) erro
 func (db *DB) BeginTraversalPhase(ctx context.Context) error {
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
-	if err := DropNodeTableIndexes(db, tableSrcNodes); err != nil {
+	if err := DropBulkPhaseNodeIndexes(db); err != nil {
 		return err
 	}
-	if err := DropNodeTableIndexes(db, tableDstNodes); err != nil {
-		return err
-	}
-	if err := DropStatusEventTableIndexes(db, tableSrcStatusEvents); err != nil {
-		return err
-	}
-	if err := DropStatusEventTableIndexes(db, tableDstStatusEvents); err != nil {
+	if err := DropBulkPhaseStatusEventIndexes(db); err != nil {
 		return err
 	}
 	conn, err := db.conn.Conn(ctx)
@@ -423,14 +439,15 @@ func (db *DB) BeginTraversalPhase(ctx context.Context) error {
 	return nil
 }
 
-// EnsureBulkPhaseSecondaryIndexes recreates secondary indexes after a bulk traversal/copy phase
-// (same set as dropped in BeginTraversalPhase): two per node table (parent_id, depth)
-// and two per status-events table (id, id+event_time). Uses conservative
-// PRAGMA settings during creation to reduce OOM risk on large tables.
+// EnsureBulkPhaseSecondaryIndexes recreates the minimal secondary indexes after a bulk
+// traversal/copy phase (same set dropped in BeginTraversalPhase):
+//   - nodes: parent_id, depth (SRC + DST) — 4 indexes
+//   - status events: (id, event_time) only (SRC + DST) — 2 indexes
 //
-// When indexes already exist (e.g. normal EndTraversalPhase), duckdb_indexes is consulted so missing
-// names are skipped—avoiding redundant full-table index builds. Call after retry sweep if the DB may
-// have been left without indexes after an interrupted traversal run.
+// Uses conservative PRAGMA settings during creation to reduce OOM risk on large tables.
+//
+// When indexes already exist, duckdb_indexes is consulted so present names are skipped.
+// Call after retry sweep if the DB may have been left without indexes after an interrupted run.
 func (db *DB) EnsureBulkPhaseSecondaryIndexes() error {
 	runtime.GC()
 	if _, err := db.conn.Exec("PRAGMA threads=1"); err != nil {
@@ -443,17 +460,10 @@ func (db *DB) EnsureBulkPhaseSecondaryIndexes() error {
 		_, _ = db.conn.Exec("PRAGMA threads=4")
 		_, _ = db.conn.Exec("PRAGMA memory_limit='4GB'")
 	}()
-	for _, table := range []string{tableSrcNodes, tableDstNodes} {
-		if err := EnsureNodeTableIndexesIfMissing(db, table); err != nil {
-			return err
-		}
+	if err := EnsureBulkPhaseNodeIndexesIfMissing(db); err != nil {
+		return err
 	}
-	for _, table := range []string{tableSrcStatusEvents, tableDstStatusEvents} {
-		if err := EnsureStatusEventTableIndexesIfMissing(db, table); err != nil {
-			return err
-		}
-	}
-	return nil
+	return EnsureBulkPhaseStatusEventIndexesIfMissing(db)
 }
 
 // EndTraversalPhase flushes remaining seal jobs, closes phase appenders, then rebuilds indexes.
@@ -464,4 +474,3 @@ func (db *DB) EndTraversalPhase() error {
 	}
 	return db.EnsureBulkPhaseSecondaryIndexes()
 }
-

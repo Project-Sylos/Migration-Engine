@@ -102,7 +102,7 @@ if err != nil {
     return err
 }
 
-srcAdapter := fsservices.NewSpectraFS(spectraInstance, cfg.SrcRootID, "primary")
+srcAdapter, err := spectra.NewSpectraFS(spectraInstance, cfg.SrcRootID, "primary", false)
 ```
 
 **Configuration file:** `spectra.json`

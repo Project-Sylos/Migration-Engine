@@ -19,7 +19,7 @@ func TestPathNameReview_smokeFlows(t *testing.T) {
 	}
 	defer database.Close()
 
-	srcRoot := db.RootNodeID("SRC")
+	srcRoot := db.MintNodeID("SRC", "", db.NodeTypeFolder, "/")
 	aID := db.MintNodeID("SRC", srcRoot, db.NodeTypeFile, "a*1.txt")
 	bID := db.MintNodeID("SRC", srcRoot, db.NodeTypeFile, "b*2.txt")
 	cID := db.MintNodeID("SRC", srcRoot, db.NodeTypeFile, "c*3.txt")
@@ -98,7 +98,7 @@ func TestPathNameReview_smokeFlows(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.RemapPathManual(dID, "still*bad.txt", true); err != nil {
+	if err := m.AcceptPathChange(dID, "still*bad.txt", true); err != nil {
 		t.Fatal(err)
 	}
 	issues, err = m.ListPathIssues(10)

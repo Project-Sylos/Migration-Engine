@@ -6,7 +6,7 @@ package db
 import "testing"
 
 func TestMintNodeID_stableAndParentScoped(t *testing.T) {
-	root := RootNodeID("SRC")
+	root := MintNodeID("SRC", "", NodeTypeFolder, "/")
 	a1 := MintNodeID("SRC", root, NodeTypeFolder, "alpha")
 	a2 := MintNodeID("SRC", root, NodeTypeFolder, "alpha")
 	if a1 != a2 {
@@ -23,7 +23,7 @@ func TestMintNodeID_stableAndParentScoped(t *testing.T) {
 		t.Fatal("same basename under different parents must differ")
 	}
 	// SRC vs DST roots differ
-	if RootNodeID("SRC") == RootNodeID("DST") {
+	if MintNodeID("SRC", "", NodeTypeFolder, "/") == MintNodeID("DST", "", NodeTypeFolder, "/") {
 		t.Fatal("SRC and DST roots must differ")
 	}
 }

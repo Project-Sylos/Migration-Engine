@@ -9,9 +9,9 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
-// dstChildMatchName returns the bare child name used when matching DST listed children to SRC expected children.
+// DstChildMatchName returns the bare child name used when matching DST listed children to SRC expected children.
 // Adapters may set DisplayName to a root-relative path (e.g. "/file_1.txt"); DB rows use path with basename names.
-func dstChildMatchName(displayName, locationPath string) string {
+func DstChildMatchName(displayName, locationPath string) string {
 	if locationPath != "" {
 		return rootRelativeBaseName(locationPath)
 	}
@@ -30,7 +30,7 @@ func rootRelativeBaseName(p string) string {
 	return p
 }
 
-// dstChildMatchKey returns the Type:Name lookup key for DST traversal child comparison.
-func dstChildMatchKey(typ, displayName, locationPath string) string {
-	return typ + ":" + dstChildMatchName(displayName, locationPath)
+// DstChildMatchKey returns the Type:Name lookup key for DST traversal child comparison.
+func DstChildMatchKey(typ, displayName, locationPath string) string {
+	return typ + ":" + DstChildMatchName(displayName, locationPath)
 }

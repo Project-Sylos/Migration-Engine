@@ -18,6 +18,7 @@ DST nodes have traversal status only; copy and delete statuses apply to SRC.
 - failed -- the attempt to traverse the item has failed
 - pending -- the item has not yet been attempted to traverse (or maybe it was at one point but set to retry traversal since the last review phase)
 - not_on_src -- This is exclusive to destination items, if the item only exists on the destination but 'not on the src FS tree' then we don't care because it's a 1 way sync and these are treated as successful but a different kind of successful. 
+- excluded -- SRC only: the user excluded this item at root-pick (folders). The engine does not traverse its subtree. It counts as **one** discovered item in excluded totals (not the unknown subtree under it), similar in effect to `not_on_src` on DST. Excluded **files** keep `traversal_status = successful` and use `copy_status = excluded_explicit` instead, so they remain listed and can be unexcluded in copy review. 
 
 
 ### Possible Copy Status Values
@@ -56,7 +57,7 @@ During `PrepareSourceCleanup`, depth-0 nodes are skipped entirely (no `pending` 
 
 Before delete runs, copy review can align delete status with user selection:
 
-* **Default (all selected):** every copy-complete SRC node (`successful` or `already_existed`) at depth ≥ 1 gets `delete_status = pending`.
+* **Default (empty body):** idempotent init only. Copy-complete SRC nodes at depth ≥ 1 with **unset** `delete_status` become `pending`. Existing `pending` / `skipped` / `failed` / `deleted` are left alone so remounting the source-cleanup page does not wipe the user's skip plan.
 * **Keep list / deselect list:** selected nodes → `pending`; deselected → `skipped`.
 * Nodes already `deleted` or `failed` are left unchanged when re-marking pending.
 

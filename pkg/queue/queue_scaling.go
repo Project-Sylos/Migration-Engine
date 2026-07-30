@@ -13,6 +13,36 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
+// Scaling mode strings for operation-based autoscaler profile resolution.
+const (
+	ScalingModeTraversal   = "traversal"
+	ScalingModeRetry       = "retry"
+	ScalingModeCopy        = "copy"
+	ScalingModeCopyRetry   = "copy-retry"
+	ScalingModeDelete      = "delete"
+	ScalingModeDeleteRetry = "delete-retry"
+)
+
+// ScalingContext describes queue state used to resolve operation-based profiles.
+type ScalingContext struct {
+	QueueName   string
+	Mode        string
+	CopyPass    int
+	SrcProvider string
+	DstProvider string
+	SrcGroupID  string
+	DstGroupID  string
+}
+
+func (q *Queue) applyQueueLocked(fn func()) {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	fn()
+}
+
 type managedWorker struct {
 	cancel context.CancelFunc
 	idle   atomic.Bool
@@ -154,7 +184,7 @@ func (q *Queue) SetTargetWorkerCount(target int) error {
 	if target < 1 {
 		return fmt.Errorf("worker count must be at least 1")
 	}
-	if q.PoolSizeFrozen() {
+	if q.Spin.Freeze.Load() {
 		return nil
 	}
 	q.pool.mu.Lock()
@@ -163,7 +193,7 @@ func (q *Queue) SetTargetWorkerCount(target int) error {
 	if target == cur {
 		return nil
 	}
-	shutdownCtx := q.getShutdownCtx()
+	shutdownCtx := q.ShutdownCtx()
 	if shutdownCtx == nil {
 		shutdownCtx = context.Background()
 	}
@@ -176,15 +206,24 @@ func (q *Queue) SetTargetWorkerCount(target int) error {
 			id := q.pool.nextID
 			q.pool.nextID++
 			if q.pool.isCopy {
-				w := NewCopyWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.copySrcAdapter, q.pool.copyDstAdapter, shutdownCtx, workerCtx, &h.idle, &h.retire)
+				if workerHooks.NewCopyWorker == nil {
+					return fmt.Errorf("copy worker factory not registered: import codeberg.org/Sylos/Migration-Engine/pkg/queue/worker")
+				}
+				w := workerHooks.NewCopyWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.copySrcAdapter, q.pool.copyDstAdapter, shutdownCtx, workerCtx, &h.idle, &h.retire)
 				q.workers = append(q.workers, w)
 				go w.Run()
 			} else if q.pool.isDelete {
-				w := NewDeleteWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.deleteSrcAdapter, shutdownCtx, workerCtx, &h.idle, &h.retire)
+				if workerHooks.NewDeleteWorker == nil {
+					return fmt.Errorf("delete worker factory not registered: import codeberg.org/Sylos/Migration-Engine/pkg/queue/worker")
+				}
+				w := workerHooks.NewDeleteWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.deleteSrcAdapter, shutdownCtx, workerCtx, &h.idle, &h.retire)
 				q.workers = append(q.workers, w)
 				go w.Run()
 			} else {
-				w := NewTraversalWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.traversalAdapter, q.name, shutdownCtx, workerCtx, &h.idle, &h.retire)
+				if workerHooks.NewTraversalWorker == nil {
+					return fmt.Errorf("traversal worker factory not registered: import codeberg.org/Sylos/Migration-Engine/pkg/queue/worker")
+				}
+				w := workerHooks.NewTraversalWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.traversalAdapter, q.name, shutdownCtx, workerCtx, &h.idle, &h.retire)
 				q.workers = append(q.workers, w)
 				go w.Run()
 			}
@@ -293,4 +332,58 @@ func (q *Queue) AvgExecutionTime() time.Duration {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.avgExecutionTime
+}
+
+func (q *Queue) ConfigureScalingContext(srcProvider, dstProvider, srcGroupID, dstGroupID, pathCheckProfile string, windowsCompat bool) {
+	q.applyQueueLocked(func() {
+		q.scalingSrcProvider = srcProvider
+		q.scalingDstProvider = dstProvider
+		q.scalingSrcGroupID = srcGroupID
+		q.scalingDstGroupID = dstGroupID
+		q.pathCheckProfile = pathCheckProfile
+		q.windowsCompat = windowsCompat
+	})
+}
+
+// ScalingContext returns the current scaling context for autoscaler profile resolution.
+func (q *Queue) ScalingContext() ScalingContext {
+	if q == nil {
+		return ScalingContext{}
+	}
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	mode := string(q.mode)
+	if mode == "" {
+		mode = ScalingModeTraversal
+	}
+	return ScalingContext{
+		QueueName:   q.name,
+		Mode:        mode,
+		CopyPass:    q.passNumber,
+		SrcProvider: q.scalingSrcProvider,
+		DstProvider: q.scalingDstProvider,
+		SrcGroupID:  q.scalingSrcGroupID,
+		DstGroupID:  q.scalingDstGroupID,
+	}
+}
+
+func (q *Queue) ScalingAdapter(srcSide bool) types.FSAdapter {
+	if q == nil {
+		return nil
+	}
+	q.pool.mu.Lock()
+	defer q.pool.mu.Unlock()
+	if q.pool.isCopy {
+		if srcSide {
+			return q.pool.copySrcAdapter
+		}
+		return q.pool.copyDstAdapter
+	}
+	if srcSide && q.name == "src" {
+		return q.pool.traversalAdapter
+	}
+	if !srcSide && q.name == "dst" {
+		return q.pool.traversalAdapter
+	}
+	return nil
 }

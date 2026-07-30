@@ -53,7 +53,7 @@ func TestChildResultToNodeStateInitializesDeleteStatusForSrcOnly(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			state := childResultToNodeState(tt.child, "/", 1, tt.queueType, "parent")
+			state := ChildResultToNodeState(tt.child, "/", 1, tt.queueType, "parent")
 			if state == nil {
 				t.Fatal("expected node state")
 			}

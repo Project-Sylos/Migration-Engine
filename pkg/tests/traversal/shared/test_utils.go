@@ -10,11 +10,13 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
 )
 
-// CountSubtree returns aggregate counts for the subtree at rootPath using a single SQL query (path prefix). Uses db.CountSubtree.
-func CountSubtree(database *db.DB, queueType string, rootPath string) (db.SubtreeStats, error) {
-	return db.CountSubtree(database, queueType, rootPath)
+// CountSubtree returns aggregate counts for the subtree at rootPath using a single SQL query (path prefix).
+func CountSubtree(database *db.DB, queueType string, rootPath string) (pull.SubtreeStats, error) {
+	return pull.CountSubtree(database, queueType, rootPath)
 }
 
 // DeleteSubtree deletes all nodes in the subtree at rootPath and recomputes stats for affected depths. Uses Writer.DeleteSubtree.
@@ -28,7 +30,7 @@ func DeleteSubtree(database *db.DB, queueType string, rootPath string) error {
 
 // MarkNodeAsPending marks a node as pending in the database (direct live-table update + stats recompute).
 func MarkNodeAsPending(database *db.DB, queueType string, nodePath string) error {
-	nodeState, err := db.GetNodeByPath(database, queueType, nodePath)
+	nodeState, err := pull.GetNodeByPath(database, queueType, nodePath)
 	if err != nil {
 		return fmt.Errorf("failed to find node: %w", err)
 	}
@@ -44,7 +46,7 @@ func MarkNodeAsPending(database *db.DB, queueType string, nodePath string) error
 
 // MarkNodeAsFailed marks a node as failed in the database (direct live-table update + stats recompute).
 func MarkNodeAsFailed(database *db.DB, queueType string, nodePath string) error {
-	nodeState, err := db.GetNodeByPath(database, queueType, nodePath)
+	nodeState, err := pull.GetNodeByPath(database, queueType, nodePath)
 	if err != nil {
 		return fmt.Errorf("failed to find node: %w", err)
 	}
@@ -60,7 +62,7 @@ func MarkNodeAsFailed(database *db.DB, queueType string, nodePath string) error 
 
 // MarkNodeAsExcluded marks a node as excluded in the database (direct live-table update).
 func MarkNodeAsExcluded(database *db.DB, queueType string, nodePath string) error {
-	nodeState, err := db.GetNodeByPath(database, queueType, nodePath)
+	nodeState, err := pull.GetNodeByPath(database, queueType, nodePath)
 	if err != nil {
 		return fmt.Errorf("failed to find node: %w", err)
 	}
@@ -76,7 +78,7 @@ func MarkNodeAsExcluded(database *db.DB, queueType string, nodePath string) erro
 
 // MarkNodeAsUnexcluded marks a node as not excluded in the database (direct live-table update).
 func MarkNodeAsUnexcluded(database *db.DB, queueType string, nodePath string) error {
-	nodeState, err := db.GetNodeByPath(database, queueType, nodePath)
+	nodeState, err := pull.GetNodeByPath(database, queueType, nodePath)
 	if err != nil {
 		return fmt.Errorf("failed to find node: %w", err)
 	}
@@ -140,14 +142,14 @@ func PickFirstExcludedTopLevelChild(database *db.DB, queueType string, rootPath 
 
 // GetTopLevelChildren returns direct children of the node at rootPath (by parent_path = rootPath).
 func GetTopLevelChildren(database *db.DB, queueType string, rootPath string) ([]*db.NodeState, error) {
-	rootNode, err := db.GetNodeByPath(database, queueType, rootPath)
+	rootNode, err := pull.GetNodeByPath(database, queueType, rootPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find root node: %w", err)
 	}
 	if rootNode == nil {
 		return nil, fmt.Errorf("node not found: %s", rootPath)
 	}
-	return db.GetChildrenByParentPath(database, queueType, rootPath, 10_000)
+	return pull.GetChildrenByParentPath(database, queueType, rootPath, 10_000)
 }
 
 // PickRandomTopLevelChild picks a random top-level child from the root. Only selects folders (not files).
@@ -178,14 +180,14 @@ func PickRandomTopLevelChild(database *db.DB, queueType string, rootPath string)
 
 // CountPendingNodes counts all pending nodes across all levels for a queue type (from stats table).
 func CountPendingNodes(database *db.DB, queueType string) (int, error) {
-	levels, err := db.GetAllLevels(database, queueType)
+	levels, err := pull.GetAllLevels(database, queueType)
 	if err != nil {
 		return 0, err
 	}
 
 	totalPending := 0
 	for _, level := range levels {
-		c, err := database.GetStatsCountAtDepth(queueType, level, db.StatsKey(db.StatsKindTraversal,db.StatusPending))
+		c, err := stats.GetStatsCountAtDepth(database, queueType, level, db.StatsKey(db.StatsKindTraversal, db.StatusPending))
 		if err != nil {
 			continue
 		}
@@ -197,10 +199,10 @@ func CountPendingNodes(database *db.DB, queueType string) (int, error) {
 
 // CountExcludedNodes counts all excluded nodes in the table (excluded = true).
 func CountExcludedNodes(database *db.DB, queueType string) (int, error) {
-	return db.CountExcluded(database, queueType)
+	return pull.CountExcluded(database, queueType)
 }
 
 // CountExcludedInSubtree counts excluded nodes within the subtree at rootPath (single SQL query).
 func CountExcludedInSubtree(database *db.DB, queueType string, rootPath string) (int, error) {
-	return db.CountExcludedInSubtree(database, queueType, rootPath)
+	return pull.CountExcludedInSubtree(database, queueType, rootPath)
 }

@@ -19,6 +19,7 @@ const (
 	TaskTypeCopyFile     = "copy-file"   // Copy phase: copy file with streaming
 	TaskTypeDeleteFolder = "delete-folder"
 	TaskTypeDeleteFile   = "delete-file"
+	TaskTypeGPL          = "gpl-revalidate"
 )
 
 // SrcNodeMeta holds Depth and CopyStatus for an SRC node; used by DST tasks at completion to avoid per-child DB lookups.
@@ -96,44 +97,45 @@ type ChildResult struct {
 		SrcCopyStatus string       // Copy status to update on SRC node (if SrcID is set and match found): "pending", "already_existed", empty if no update needed
 }
 
+func folderFirstString(folderVal, fileVal string) string {
+	if folderVal != "" {
+		return folderVal
+	}
+	return fileVal
+}
+
+func taskNodeKind(taskType string, folder types.Folder, file types.File) (isFolder, isFile bool) {
+	switch taskType {
+	case TaskTypeCopyFolder, TaskTypeDeleteFolder:
+		return true, false
+	case TaskTypeCopyFile, TaskTypeDeleteFile:
+		return false, true
+	}
+	return folder.ServiceID != "", file.ServiceID != ""
+}
+
 // Identifier returns the unique identifier for this task (absolute path).
 func (t *TaskBase) Identifier() string {
-	if t.Folder.ServiceID != "" {
-		return t.Folder.ServiceID
-	}
-	return t.File.ServiceID
+	return folderFirstString(t.Folder.ServiceID, t.File.ServiceID)
 }
 
 // LocationPath returns the logical, root-relative path for this task.
 func (t *TaskBase) LocationPath() string {
-	if t.Folder.LocationPath != "" {
-		return t.Folder.LocationPath
-	}
-	return t.File.LocationPath
+	return folderFirstString(t.Folder.LocationPath, t.File.LocationPath)
 }
 
 // IsFolder returns whether this task represents a folder traversal.
 // Copy phase: use TaskType (copy-folder) so folder tasks are recognized even when ServiceID is empty;
 // traversal/retry still use Folder.ServiceID when Type is not copy-folder/copy-file.
 func (t *TaskBase) IsFolder() bool {
-	switch t.Type {
-	case TaskTypeCopyFolder, TaskTypeDeleteFolder:
-		return true
-	case TaskTypeCopyFile, TaskTypeDeleteFile:
-		return false
-	}
-	return t.Folder.ServiceID != ""
+	isFolder, _ := taskNodeKind(t.Type, t.Folder, t.File)
+	return isFolder
 }
 
 // IsFile returns whether this task represents a file operation.
 func (t *TaskBase) IsFile() bool {
-	switch t.Type {
-	case TaskTypeCopyFile, TaskTypeDeleteFile:
-		return true
-	case TaskTypeCopyFolder, TaskTypeDeleteFolder:
-		return false
-	}
-	return t.File.ServiceID != ""
+	_, isFile := taskNodeKind(t.Type, t.Folder, t.File)
+	return isFile
 }
 
 // UploadTask represents a task to upload a file from source to destination.

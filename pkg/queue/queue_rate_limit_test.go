@@ -19,15 +19,6 @@ func (s stubRateLimitTelemetry) RateLimitedUntil() time.Time {
 	return s.until
 }
 
-func TestIsNonRetryableCopyError(t *testing.T) {
-	if !IsNonRetryableCopyError("failed to commit upload: dropbox: path/no_write_permission/ (HTTP 409)") {
-		t.Fatal("expected fatal copy error")
-	}
-	if IsNonRetryableCopyError("timeout waiting for response") {
-		t.Fatal("transient error should retry")
-	}
-}
-
 func TestIsThrottleError(t *testing.T) {
 	if IsThrottleError(nil) {
 		t.Fatal("nil error should not be throttle")

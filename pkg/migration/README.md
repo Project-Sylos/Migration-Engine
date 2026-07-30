@@ -9,9 +9,24 @@ Higher-level **API / HTTP integration** (routes, background tasks, runtime cache
 ## Documentation in this repository
 
 - **`docs/algorithms.md`**, **`docs/item_statuses.md`** – Supplemental reference.
-- **`pkg/db/README.md`**, **`pkg/queue/README.md`** – Persistence and queue behavior.
+- **`pkg/db/README.md`**, **`pkg/queue/README.md`**, **`pkg/scaling/README.md`** – Persistence, queue, and autoscaler behavior.
 
 > Note: Some older docs referred to `docs/ENGINE_ARCHITECTURE_OVERVIEW.md` and similar files. Those paths are **not** present in this repo; they may live in another Sylos repository or be retired—prefer the package READMEs above.
+
+---
+
+## Autoscaler wiring
+
+Migration starts the control loop and resolves provider knobs; it does not invent scaling policy. Package map details live in **`pkg/scaling/README.md`**.
+
+| Concern | Package | Used from |
+|---------|---------|-----------|
+| Control loop (`NewAutoscaler`, tick/actuate) | **`pkg/scaling/loop`** | `autoscaler.go` |
+| Op profiles, list pagination, initial workers | **`pkg/scaling/profile`** | `run.go`, `sweeps.go`, `run_profiles_scaling.go`, `autoscaler.go` |
+| Backend groups / rate-limit bridge | **`pkg/scaling/backend`** | `autoscaler.go`, `run_profiles_scaling.go` |
+| Events + queue actuator interface | **`pkg/scaling`** (root) | `AutoscalerConfig.OnEvent` (`scaling.ScalingEvent`); actuators are `scaling.QueueActuator` |
+
+Autoscaler runs by default on traversal, copy, delete, and retry unless **`AutoscalerConfig.DisableAutoscaler`** is set. The Sylos API observes lifecycle and metrics; it does not set worker counts.
 
 ---
 
@@ -57,7 +72,7 @@ There is **no** `GetDB()` / `Result()` / `Error()` on the controller in the curr
 
 ---
 
-## Domain `Migration` (`domain.go`, `phase.go`, …)
+## Domain `Migration` (`domain.go`, `domain_store.go`, `domain_phases.go`, `domain_review.go`, `phase.go`, …)
 
 ### Phases (string constants)
 
@@ -70,8 +85,8 @@ Examples: **`roots-set`**, **`filters-set`**, **`traversal-in-progress`**, **`tr
 ### Common methods
 
 - **`AddRoots`**, **`StartTraversal(cfg)`**, **`StartCopy(cfg)`** – require live **FS adapters** in **`cfg`**; **`UpdateConfig`** persists **`root_config_json`**. **`StartTraversal`** accepts **`filters-set`** or **`traversal-suspended`**. **`StartCopy`** accepts **`awaiting-traversal-review`** or **`copy-suspended`** (and may be called again while phase is **`copy-in-progress`**); **`RunCopyPhase`** rescans pending depths and may enable a one-round dst existence precheck when events show both successful and pending copy work (`copy.go`).
-- **`RunRetrySweep(cfg, opts)`**, **`PrepareRetrySweep()`** – For **async** HTTP: call **`PrepareRetrySweep()` synchronously** before returning **202**, then run **`RunRetrySweep`** with the same **`cfg`** shape as traversal (adapters + roots) in a background task. Both accept phase **`awaiting-traversal-review`** or **`traversal-suspended`** (after soft suspend). **`PrepareCopyRetry`** / **`RunCopyRetry`** similarly accept **`awaiting-copy-review`** or **`copy-suspended`**.
-- **`RunCopyRetry(cfg, opts)`**, **`PrepareCopyRetry()`** – Same pattern for copy retry when exposed asynchronously.
+- **`RunRetrySweep(cfg, opts)`**, **`PreparePhase(PreparePhaseRetrySweep)`** – For **async** HTTP: call **`PreparePhase`** synchronously before returning **202**, then run **`RunRetrySweep`** with the same **`cfg`** shape as traversal (adapters + roots) in a background task. Both accept phase **`awaiting-traversal-review`** or **`traversal-suspended`** (after soft suspend). **`PreparePhase(PreparePhaseCopyRetry)`** / **`RunCopyRetry`** similarly accept **`awaiting-copy-review`** or **`copy-suspended`**.
+- **`RunCopyRetry(cfg, opts)`**, **`PreparePhase(PreparePhaseCopyRetry)`** – Same pattern for copy retry when exposed asynchronously. Use **`PreparePhaseDeleteRetry`** before **`RunDeleteRetry`**.
 - **`UpdateConfig(cfg)`** – persists **`root_config_json`** only (serializable fields); callers still pass **`cfg`** with adapters for each run.
 - Review helpers: query nodes, path review, exclude, mark retry, etc.
 - **`Stop()`** – for live traversal/copy, sets **soft suspend** (see above) and returns **`StopResult.SoftSuspendRequested`**. For other live phases, cancels the run context. **`runtime_state_json`** is updated when the suspend drain finishes (asynchronous relative to **`Stop()`** returning).
@@ -83,7 +98,7 @@ Examples: **`roots-set`**, **`filters-set`**, **`traversal-in-progress`**, **`tr
 **`InspectMigrationStatus(database *db.DB)`** (`status.go`):
 
 - Totals from node tables.
-- **Pending / failed** from **status events** (`GetTraversalStatusCountsFromEvents`), not from stats tables alone—so counts stay correct if per-depth stats lag.
+- **Pending / failed** from materialized **`src_current` / `dst_current`** (updated per sealed depth and status-event insert), not from full event-log replay.
 
 ---
 
@@ -91,7 +106,7 @@ Examples: **`roots-set`**, **`filters-set`**, **`traversal-in-progress`**, **`tr
 
 Engine retry sweep re-processes pending/failed traversal work (**`pkg/queue`** retry mode). DST cleanup on SRC folder completion is described in **`pkg/queue/README.md`**.
 
-**Automated scenario:** **`pkg/tests/traversal/retry_sweep/`** (see **`pkg/tests/README.md`**). **Soft suspend** is covered by unit tests on **`suspend_v1`** merge/parse in **`suspend_state_test.go`**; full stack interrupt tests can extend the same runners with **`Stop()`** during traversal/copy.
+**Automated scenario:** **`pkg/tests/traversal/retry_sweep/`** (see **`pkg/tests/README.md`**). Soft suspend parse/merge coverage lives beside **`suspend.go`**; full stack interrupt tests can extend the same runners with **`Stop()`** during traversal/copy.
 
 ---
 

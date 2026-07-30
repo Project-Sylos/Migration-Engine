@@ -47,26 +47,26 @@ func NormalizeSubtreeRootPathForPropagation(path string) string {
 // ID is a UUID v5 (MintNodeID). SRC↔DST pairing uses id_map; parent/child uses parent_id.
 // Path/parent_path are display and open-path fields only.
 type NodeState struct {
-	ID               string // UUID v5 internal id (MintNodeID)
-	ServiceID        string // FS handle (cloud native id, or local path)
-	ParentID         string // Parent's internal id
-	ParentServiceID  string
-	Path             string // Display / open path (immutable after insert)
-	ParentPath       string // Display parent path
-	Name             string // Display name (for task/UI)
-	Type             string // "folder" or "file"
-	Size             int64
-	MTime            string
-	Depth            int
-	TraversalStatus  string // pending, successful, failed, not_on_src (dst)
-	CopyStatus       string // pending, in_progress, successful, failed (src)
-	DeleteStatus     string // pending, deleted, failed (src)
-	GPLStatus        string // pending, successful, failed (path-scoped cascade)
-	Excluded         bool
-	Errors           string // JSON placeholder for log refs
-	Status           string // Alias for TraversalStatus (used by queue taskToNodeState)
-	SrcID            string // Optional: corresponding SRC node id (DST seeding / compare)
-	GPLState         string // Compact JSON (SRC only); empty for DST
+	ID              string // UUID v5 internal id (MintNodeID)
+	ServiceID       string // FS handle (cloud native id, or local path)
+	ParentID        string // Parent's internal id
+	ParentServiceID string
+	Path            string // Display / open path (immutable after insert)
+	ParentPath      string // Display parent path
+	Name            string // Display name (for task/UI)
+	Type            string // "folder" or "file"
+	Size            int64
+	MTime           string
+	Depth           int
+	TraversalStatus string // pending, successful, failed, not_on_src (dst)
+	CopyStatus      string // pending, in_progress, successful, failed (src)
+	DeleteStatus    string // pending, deleted, failed (src)
+	GPLStatus       string // pending, successful, failed (path-scoped cascade)
+	Excluded        bool
+	Errors          string // JSON placeholder for log refs
+	Status          string // Alias for TraversalStatus (used by queue taskToNodeState)
+	SrcID           string // Optional: corresponding SRC node id (DST seeding / compare)
+	GPLState        string // Compact JSON (SRC only); empty for DST
 }
 
 // NodeMeta is a subset of NodeState for batch lookups.
@@ -81,9 +81,9 @@ type NodeMeta struct {
 
 // InsertOperation represents a single node insert in a batch.
 type InsertOperation struct {
-	QueueType string   // "SRC" or "DST"
-	Level     int      // depth
-	Status    string   // initial traversal_status
+	QueueType string // "SRC" or "DST"
+	Level     int    // depth
+	Status    string // initial traversal_status
 	State     *NodeState
 }
 
@@ -106,17 +106,17 @@ type WriteOperation interface {
 
 // StatusEvent is one append-only row for src_status_events or dst_status_events.
 type StatusEvent struct {
-	ID               string
-	TraversalStatus  string // nullable in DB
-	CopyStatus       string // src only; empty for dst
-	DeleteStatus     string // src only; empty for dst
-	GPLStatus        string // path-scoped cascade; empty means "unchanged" for arg_max filters
-	EventTime        int64
-	Depth            int
-	ErrorLogID       string // links to logs.id when this event records a task failure
-	ErrorLogMessage  string // transient: full log line written to logs.message at seal flush
-	ErrorLogDetail   string // transient: bare error written to logs.detail at seal flush
-	ErrorLogQueue    string // transient: logs.queue at seal flush
+	ID              string
+	TraversalStatus string // nullable in DB
+	CopyStatus      string // src only; empty for dst
+	DeleteStatus    string // src only; empty for dst
+	GPLStatus       string // path-scoped cascade; empty means "unchanged" for arg_max filters
+	EventTime       int64
+	Depth           int
+	ErrorLogID      string // links to logs.id when this event records a task failure
+	ErrorLogMessage string // transient: full log line written to logs.message at seal flush
+	ErrorLogDetail  string // transient: bare error written to logs.detail at seal flush
+	ErrorLogQueue   string // transient: logs.queue at seal flush
 	// PrevTraversalStatus and PrevCopyStatus carry the status that was current before this event.
 	// Set at enqueue time (task already has the loaded state); used by the seal buffer to compute
 	// per-depth level-stat deltas without re-querying the events table.
@@ -124,6 +124,11 @@ type StatusEvent struct {
 	PrevCopyStatus      string
 	PrevDeleteStatus    string
 	PrevGPLStatus       string
+	// Size and NodeType are transient (not persisted on status_events). When set on SRC
+	// events, seal flush applies size_selected / size_delete_selected and folders/files
+	// deltas so Path Review Selected stays durable mid-round.
+	Size     int64
+	NodeType string
 }
 
 // TaskErrorRecord is one buffered row for task_errors (queue_type, phase, node_id, message, attempts, path).
@@ -155,7 +160,7 @@ type BatchInsertOperation struct {
 	Operations []InsertOperation
 }
 
-func (o *BatchInsertOperation) flush(w *Writer) error {
+func (o *BatchInsertOperation) Flush(w *Writer) error {
 	if len(o.Operations) == 0 {
 		return nil
 	}
@@ -181,7 +186,7 @@ func (o *BatchInsertOperation) flush(w *Writer) error {
 		}
 	}
 	if len(srcNodes) > 0 {
-		if err := w.AppenderInsert(tableSrcNodes, srcNodes); err != nil {
+		if err := w.AppenderInsert(TableSrcNodes, srcNodes); err != nil {
 			return err
 		}
 		for _, s := range srcNodes {
@@ -192,7 +197,7 @@ func (o *BatchInsertOperation) flush(w *Writer) error {
 		}
 	}
 	if len(dstNodes) > 0 {
-		if err := w.AppenderInsert(tableDstNodes, dstNodes); err != nil {
+		if err := w.AppenderInsert(TableDstNodes, dstNodes); err != nil {
 			return err
 		}
 		for _, s := range dstNodes {
@@ -203,6 +208,19 @@ func (o *BatchInsertOperation) flush(w *Writer) error {
 		}
 	}
 	return nil
+}
+
+// NodeInsertName returns the display basename to store in the name column.
+// Providers sometimes report a full path (or nothing) as the display name, so the
+// stored value is always reduced to the leaf segment, falling back to the node path.
+func NodeInsertName(name, path string) string {
+	if base := NormalizeNodeBasename(name); base != "" && base != "/" {
+		return base
+	}
+	if base := NormalizeNodeBasename(path); base != "" && base != "/" {
+		return base
+	}
+	return ""
 }
 
 // NodeInsertPathFields returns normalized path columns for node table inserts.

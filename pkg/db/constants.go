@@ -3,14 +3,14 @@
 
 package db
 
-// Traversal status values (event-derived). Stats keys use: pending, successful, failed, not_on_src (DST only).
+// Traversal status values (event-derived). Stats keys use: pending, successful, failed, not_on_src (DST only), excluded (SRC).
 const (
 	StatusPending            = "pending"
 	StatusSuccessful         = "successful"
 	StatusFailed             = "failed"
-	StatusNotOnSrc           = "not_on_src"          // DST only
-	StatusExcluded           = "excluded"
-	StatusExclusionInherited = "exclusion_inherited" // bulk subtree exclusion
+	StatusNotOnSrc           = "not_on_src" // DST only: exists only on destination; do not traverse subtree
+	StatusExcluded           = "excluded"   // SRC only: user excluded; do not traverse subtree (counts as 1 item)
+	StatusExclusionInherited = "exclusion_inherited" // bulk subtree exclusion (legacy / inherited mark)
 )
 
 // Copy status values (src_nodes only). Stats keys use: pending, successful, failed (no in_progress in stats).
@@ -32,6 +32,14 @@ const SQLCopyStatusCompleteIN = `('successful','already_existed')`
 // SQLCopyStatusExcludedIN is the SQL IN-list for copy exclusion statuses.
 const SQLCopyStatusExcludedIN = `('excluded_explicit','excluded_inherited')`
 
+// Delete-subtree eligibility (copy-complete SRC nodes under a path).
+const successfulCopyEligibleForDelete = `COALESCE(cur.copy_status,'') IN ` + SQLCopyStatusCompleteIN
+
+const (
+	SQLDeleteSubtreeSkipEligible   = successfulCopyEligibleForDelete + ` AND COALESCE(cur.delete_status,'') IN ('pending', '')`
+	SQLDeleteSubtreeUnskipEligible = successfulCopyEligibleForDelete + ` AND COALESCE(cur.delete_status,'') = 'skipped'`
+)
+
 // CopyStatusIsComplete reports whether copy work is satisfied (actual copy or already on DST).
 func CopyStatusIsComplete(s string) bool {
 	switch s {
@@ -40,11 +48,6 @@ func CopyStatusIsComplete(s string) bool {
 	default:
 		return false
 	}
-}
-
-// CopyStatusEligibleForDelete reports whether the node may enter source cleanup (copy satisfied).
-func CopyStatusEligibleForDelete(s string) bool {
-	return CopyStatusIsComplete(s)
 }
 
 // CopyStatusIsActualCopy reports whether this migration's copy phase wrote the item.

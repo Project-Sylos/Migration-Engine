@@ -103,7 +103,7 @@ func runTest() error {
 		return fmt.Errorf("failed to create migration: %w", err)
 	}
 
-	if _, err := migrationInstance.AddRoots(cfg.Source.Root, cfg.Destination.Root); err != nil {
+	if _, err := migrationInstance.AddRoots(cfg.Source.Root, cfg.Destination.Root, migration.RootPreparation{}); err != nil {
 		return fmt.Errorf("failed to add roots: %w", err)
 	}
 	if err := assertMigrationPhase(manager, migrationInstance.ID, migration.PhaseFiltersSet); err != nil {

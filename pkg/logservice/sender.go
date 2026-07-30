@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/logbuf"
 	"github.com/google/uuid"
 )
 
@@ -43,7 +44,7 @@ func InitGlobalLogger(mainDB *db.DB, addr, level string) error {
 // Sender transmits logs over UDP and optionally writes them to the main DB's logs table.
 type Sender struct {
 	logDB      *db.DB        // main DB for log persistence (not owned; do not close)
-	logBuffer  *db.LogBuffer // buffered log writer (nil if logDB is nil)
+	logBuffer  *logbuf.LogBuffer // buffered log writer (nil if logDB is nil)
 	Addr       string        // e.g. "127.0.0.1:1997"
 	Level      string        // threshold for UDP output
 	conn       net.Conn
@@ -87,9 +88,9 @@ func NewSender(logDB *db.DB, addr, level string) (*Sender, error) {
 	}
 	buf := new(bytes.Buffer)
 
-	var logBuffer *db.LogBuffer
+	var logBuffer *logbuf.LogBuffer
 	if logDB != nil {
-		logBuffer = db.NewLogBuffer(logDB, defaultBatchSize, 3 * time.Second)
+		logBuffer = logbuf.NewLogBuffer(logDB, defaultBatchSize, 3 * time.Second)
 	}
 
 	return &Sender{
@@ -117,7 +118,7 @@ func (s *Sender) Log(level, message, entity, entityID string, queues ...string) 
 	// --- DB write (when log DB is set, buffered) ---
 	if s.logBuffer != nil {
 		id := uuid.New().String()
-		s.logBuffer.Add(db.LogEntry{
+		s.logBuffer.Add(logbuf.LogEntry{
 			ID:        id,
 			Timestamp: timestamp.Format(time.RFC3339Nano),
 			Level:     level,

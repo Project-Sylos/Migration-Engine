@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 )
 
@@ -28,7 +29,7 @@ func VerifyCopyCompletion(database *db.DB) error {
 	fmt.Println("Verifying copy completion...")
 
 	// Get all levels
-	levels, err := db.GetAllLevels(database, "SRC")
+	levels, err := pull.GetAllLevels(database, "SRC")
 	if err != nil {
 		return fmt.Errorf("failed to get levels: %w", err)
 	}

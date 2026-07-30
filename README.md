@@ -87,14 +87,16 @@ Implementation: **`pkg/db`**. Queue and migration share the same **`*db.DB`** fo
 
 ### Tables and roles
 
-- **Node tables** (`src_nodes`, `dst_nodes`) – Metadata (path, depth, type, size, …). **Current traversal/copy status** comes from append-only **`src_status_events`** / **`dst_status_events`** (latest event per node), not from long-lived columns on the node row.
+- **Node tables** (`src_nodes`, `dst_nodes`) – Metadata (path, depth, type, size, `name`, …). **Current traversal/copy status** comes from append-only **`src_status_events`** / **`dst_status_events`** (latest event per node), not from long-lived columns on the node row. SRC also stores `xfer_*` checkpoint columns and `gpl_state`.
 - **Stats** – `src_stats` / `dst_stats` per depth; global **`stats`** table for canonical review counters and similar key/value aggregates.
+- **`gpl_issues`** – Sparse path-review / GPL issue queue (status, proposed name, optional `dst_action`).
+- **`id_map`** – Append-only SRC↔DST identity mappings.
 - **`migrations`** – Lifecycle row (id, name, **phase**, JSON metadata) when using **`MigrationManager`**.
-- **`migration_envelope`** – Single row (`singleton = 1`) with a 32-byte **envelope master key** for Sylos-FS credential encryption (HKDF per connection). Written by the host (e.g. Sylos-API) on first use.
 - **`fs_credential_binding`** – Up to two rows (`source` / `destination`): stable **connection id**, optional **relative path** to a creds/config file under the migration directory (e.g. `spectra-config.json`), **service id**, and **serialized root folder** JSON so adapters can be rebuilt after restart.
+- **`oauth_credentials`** – OAuth refresh material keyed by connection id (plaintext in tests; `enc:v1:` when a token key is set).
 - **Other** – `logs`, `queue_stats`, `task_errors`.
 
-**Security:** The per-migration DuckDB file contains the envelope key in plaintext. Anyone with the file can derive per-connection keys and read encrypted credential material. Restrict filesystem permissions and treat backups as sensitive; a future layer can wrap the envelope key with a server secret without changing the table shape much.
+**Security:** Treat migration DuckDB files and backups as sensitive. Hosts such as Sylos-API typically encrypt the file at rest with a per-migration key; optional field-level sealing of `oauth_credentials` uses a 32-byte token key passed into the manager.
 
 The queue **pulls** pending tasks via SQL (keyset pagination); **seal** (`SealLevel`, optionally via **SealBuffer**) bulk-writes completed levels. **Retry** mode uses DST cleanup paths documented in **`pkg/queue/README.md`** (and `AddNodeDeletions` where applicable).
 
@@ -111,7 +113,7 @@ See **`pkg/db/README.md`** for schema and APIs.
 - **`MigrationController`** (`StartMigration`) only provides **`Shutdown`**, **`Done`**, and **`Wait`**—there is no **`GetDB()`** on the controller in this package.
 - **Checkpointing** is handled inside **`pkg/db`** (serialized with the single connection).
 
-See **`pkg/migration/README.md`** for **`PrepareRetrySweep`** / **`PrepareCopyRetry`** when enqueueing background retry work so phase flips **before** HTTP **202**.
+See **`pkg/migration/README.md`** for **`PreparePhase`** (`PreparePhaseRetrySweep` / `PreparePhaseCopyRetry` / `PreparePhaseDeleteRetry`) when enqueueing background retry work so phase flips **before** HTTP **202**.
 
 ---
 
@@ -121,6 +123,7 @@ See **`pkg/migration/README.md`** for **`PrepareRetrySweep`** / **`PrepareCopyRe
 |---------------|------|
 | **pkg/db**    | Database layer: open/close, schema (node/stats/logs tables), seal (bulk append + stats), read queries. Single DuckDB file and connection. |
 | **pkg/queue** | Queue layer: BFS rounds, **DB-backed pull** into `pendingBuff`, seal via `SealLevel`, coordinator, observer. Uses `*db.DB` for pulls, seal, and resume. |
+| **pkg/scaling** | Autoscaler: AIMD actuation from observer metrics; `QueueActuator` implemented by `*queue.Queue` (queue does not import scaling). |
 | **pkg/migration** | Orchestration: **`MigrationManager`**, domain **`Migration`**, root seeding, traversal/copy/retry APIs, verification. No YAML helpers in-tree. |
 | **pkg/configs**   | JSON config loaders: buffer config, log service (UDP), Spectra. |
 | **pkg/logservice** | Dual-channel logging: UDP (level-filtered) and persistence to the main DB’s `logs` table via `db.LogBuffer`. |
@@ -129,19 +132,24 @@ See **`pkg/migration/README.md`** for **`PrepareRetrySweep`** / **`PrepareCopyRe
 
 ## Documentation
 
-### Docs in this repo
+### Design docs (`docs/`)
 
-- **[docs/algorithms.md](./docs/algorithms.md)** – Algorithm notes.
-- **[docs/autoscaler.md](./docs/autoscaler.md)** – Autoscaler design: pipeline, knobs, profiles, telemetry (living doc).
-- **[docs/item_statuses.md](./docs/item_statuses.md)** – Status semantics.
-- **[pkg/db/README.md](./pkg/db/README.md)** – Schema, seal, Writer, queries.
-- **[pkg/queue/README.md](./pkg/queue/README.md)** – Pull/seal flow, modes, coordinator.
-- **[pkg/migration/README.md](./pkg/migration/README.md)** – Manager, domain lifecycle, **`PrepareRetrySweep`** / async retry.
+- **[docs/algorithms.md](./docs/algorithms.md)** – BFS traversal/copy/delete algorithms, streaming copy contract.
+- **[docs/autoscaler.md](./docs/autoscaler.md)** – Observer → AIMD loop, profiles, knobs, stall vs throttle.
+- **[docs/item_statuses.md](./docs/item_statuses.md)** – Traversal / copy / delete status semantics.
+- **[docs/fs_error_classification.md](./docs/fs_error_classification.md)** – Retry vs throttle axes, ambiguous errors.
+
+### Package READMEs
+
+- **[pkg/migration/README.md](./pkg/migration/README.md)** – Entry points, manager lifecycle, retry sweep.
+- **[pkg/queue/README.md](./pkg/queue/README.md)** – Pull / lease / seal, coordinator, watchdogs, checkpoints.
+- **[pkg/db/README.md](./pkg/db/README.md)** – Schema, SealBuffer, status events, Writer.
+- **[pkg/scaling/README.md](./pkg/scaling/README.md)** – Autoscaler, AIMD, operation profiles, QueueActuator.
 - **[pkg/configs/README.md](./pkg/configs/README.md)** – JSON loaders (buffer, log service, Spectra).
 - **[pkg/logservice/README.md](./pkg/logservice/README.md)** – UDP and DB logging.
 - **[pkg/tests/README.md](./pkg/tests/README.md)** – Integration runners layout.
 
-> **Note:** Filenames like `ENGINE_ARCHITECTURE_OVERVIEW.md` or `EPHEMERAL_MODE_GUIDE.md` are **not** in this repository; they may exist in another Sylos repo (e.g. API or docs site). Use the package READMEs above as the source of truth for this module.
+> **Note:** Filenames like `ENGINE_ARCHITECTURE_OVERVIEW.md` or `EPHEMERAL_MODE_GUIDE.md` are **not** in this repository; they may exist in another Sylos repo (e.g. API or docs site). Use **`docs/`** and the package READMEs above as the source of truth for this module.
 
 ### Testing
 

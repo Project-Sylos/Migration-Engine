@@ -10,6 +10,10 @@ import (
 	"strings"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
+	_ "codeberg.org/Sylos/Migration-Engine/pkg/queue/mode"
+	_ "codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
+	_ "codeberg.org/Sylos/Migration-Engine/pkg/queue/worker"
 )
 
 // DatabaseConfig defines how the migration engine opens a DuckDB file for a run or test.
@@ -70,9 +74,9 @@ func SetupDatabase(cfg DatabaseConfig) (*db.DB, bool, error) {
 		return nil, false, fmt.Errorf("failed to open database %s: %w", cfg.Path, err)
 	}
 
-	// Secondary indexes on node and status-event tables are not created here: BeginTraversalPhase /
-	// BeginTraversalPhase drops them before bulk inserts, and EndTraversalPhase (or
-	// EnsureBulkPhaseSecondaryIndexes after retry) recreate them. Creating them at open would be
-	// redundant for new migrations and wasted work before the first phase.
+	// Secondary indexes on node and status-event tables are not created here: BeginTraversalPhase
+	// drops them before bulk inserts, and EndTraversalPhase (or EnsureBulkPhaseSecondaryIndexes
+	// after retry) recreates a minimal set (nodes: parent_id+depth; events: id+event_time only).
+	// Creating them at open would be redundant for new migrations and wasted work before the first phase.
 	return database, wasFresh, nil
 }

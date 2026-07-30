@@ -37,26 +37,26 @@ const (
 	pullRetryMaxWall     = 100 * time.Millisecond
 )
 
-// pullTasksOnce dispatches a single pull attempt for the queue mode.
-func (q *Queue) pullTasksOnce(force bool) PullResult {
+// PullTasksOnce dispatches a single pull attempt for the queue mode.
+func (q *Queue) PullTasksOnce(force bool) PullResult {
 	switch q.GetMode() {
 	case QueueModeRetry:
-		return q.PullRetryTasks(force)
+		return q.PullTasks(ModeRetry, force)
 	case QueueModeGPL:
-		return q.PullGPLTasks(force)
+		return q.PullTasks(ModeGPL, force)
 	case QueueModeCopy, QueueModeCopyRetry:
-		return q.PullCopyTasks(force)
+		return q.PullTasks(ModeCopy, force)
 	case QueueModeDelete, QueueModeDeleteRetry:
-		return q.PullDeleteTasks(force)
+		return q.PullTasks(ModeDelete, force)
 	default:
-		return q.PullTraversalTasks(force)
+		return q.PullTasks(ModeTraversal, force)
 	}
 }
 
 // shouldDeferForcePull returns true when a force pull would only contend with an in-flight worker pull
 // or when the buffer still has tasks and the keyspace is not exhausted (workers will refill).
 func (q *Queue) shouldDeferForcePull() bool {
-	if q.getPulling() {
+	if q.IsPulling() {
 		return true
 	}
 	if q.GetPendingCount() > 0 && !q.GetLastPullWasPartial() {
@@ -65,22 +65,22 @@ func (q *Queue) shouldDeferForcePull() bool {
 	return false
 }
 
-// pullWithRetryIfNeeded runs pullWithRetry unless a worker pull or active refill makes force pull pointless.
-func (q *Queue) pullWithRetryIfNeeded(force bool) PullResult {
+// PullWithRetryIfNeeded runs PullWithRetry unless a worker pull or active refill makes force pull pointless.
+func (q *Queue) PullWithRetryIfNeeded(force bool) PullResult {
 	if force && q.shouldDeferForcePull() {
 		return PullResult{Round: q.GetRound(), Status: PullSkipped}
 	}
-	return q.pullWithRetry(force)
+	return q.PullWithRetry(force)
 }
 
-// pullWithRetry retries skipped pulls with exponential backoff. Stale-round results retry immediately.
-func (q *Queue) pullWithRetry(force bool) PullResult {
+// PullWithRetry retries skipped pulls with exponential backoff. Stale-round results retry immediately.
+func (q *Queue) PullWithRetry(force bool) PullResult {
 	start := time.Now()
 	backoff := time.Millisecond
 	attempts := 0
 	var last PullResult
 	for {
-		last = q.pullTasksOnce(force)
+		last = q.PullTasksOnce(force)
 		if last.OK() {
 			return last
 		}
@@ -103,14 +103,14 @@ func (q *Queue) pullWithRetry(force bool) PullResult {
 	}
 }
 
-// roundHasCountedPull reports whether RoundInfo has at least one DB-committed pull for the round.
-func (q *Queue) roundHasCountedPull(round int) bool {
-	info := q.getRoundInfoReadOnly(round)
+// RoundHasCountedPull reports whether RoundInfo has at least one DB-committed pull for the round.
+func (q *Queue) RoundHasCountedPull(round int) bool {
+	info := q.RoundInfoReadOnly(round)
 	return info != nil && info.PullCount > 0
 }
 
 // confirmRoundAdvanceGate returns true when in-memory state allows advancing from currentRound.
-func (q *Queue) confirmRoundAdvanceGate(currentRound int) bool {
+func (q *Queue) ConfirmRoundAdvanceGate(currentRound int) bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	if q.round != currentRound {

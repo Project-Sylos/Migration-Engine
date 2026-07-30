@@ -7,6 +7,8 @@ import (
 	"fmt"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
 )
 
 // VerifyOptions define the expectations for post-migration validation.
@@ -52,13 +54,13 @@ func VerifyMigration(database *db.DB, opts VerifyOptions) (VerificationReport, e
 
 	report := VerificationReport{}
 
-	srcTotal, err := db.CountNodes(database, "SRC")
+	srcTotal, err := pull.CountNodes(database, "SRC")
 	if err != nil {
 		return VerificationReport{}, fmt.Errorf("failed to count src nodes: %w", err)
 	}
 	report.SrcTotal = srcTotal
 
-	dstTotal, err := db.CountNodes(database, "DST")
+	dstTotal, err := pull.CountNodes(database, "DST")
 	if err != nil {
 		return VerificationReport{}, fmt.Errorf("failed to count dst nodes: %w", err)
 	}
@@ -69,7 +71,7 @@ func VerifyMigration(database *db.DB, opts VerifyOptions) (VerificationReport, e
 	}
 
 	// Status totals from status_events (COUNT by current traversal_status per node)
-	srcCounts, err := database.GetTraversalStatusCountsFromEvents("SRC")
+	srcCounts, err := stats.GetTraversalStatusCountsFromEvents(database, "SRC")
 	if err != nil {
 		return VerificationReport{}, fmt.Errorf("failed to get SRC status counts from events: %w", err)
 	}
@@ -77,7 +79,7 @@ func VerifyMigration(database *db.DB, opts VerifyOptions) (VerificationReport, e
 	report.SrcSuccessful = int(srcCounts.Successful)
 	report.SrcFailed = int(srcCounts.Failed)
 
-	dstCounts, err := database.GetTraversalStatusCountsFromEvents("DST")
+	dstCounts, err := stats.GetTraversalStatusCountsFromEvents(database, "DST")
 	if err != nil {
 		return VerificationReport{}, fmt.Errorf("failed to get DST status counts from events: %w", err)
 	}

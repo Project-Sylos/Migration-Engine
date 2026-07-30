@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Migration-Engine/pkg/tests/traversal/shared"
 	"codeberg.org/Sylos/Spectra/sdk"
@@ -101,14 +103,14 @@ func runTest() error {
 	fmt.Printf("Spectra DB node count: %d\n", spectraNodeCount)
 
 	// Count nodes in database BEFORE any mutations (baseline check)
-	duckNodeCountInitial, err := db.CountNodes(database, "SRC")
+	duckNodeCountInitial, err := pull.CountNodes(database, "SRC")
 	if err != nil {
 		return fmt.Errorf("failed to count initial SRC nodes: %w", err)
 	}
 	fmt.Printf("Database SRC node count (initial): %d\n", duckNodeCountInitial)
 
 	// Count DST nodes too for comparison
-	duckNodeCountDST, err := db.CountNodes(database, "DST")
+	duckNodeCountDST, err := pull.CountNodes(database, "DST")
 	if err != nil {
 		return fmt.Errorf("failed to count initial DST nodes: %w", err)
 	}
@@ -144,7 +146,7 @@ func runTest() error {
 	}
 
 	// Get DST node state to get its path
-	dstNodeState, err := db.GetNodeByID(database, "DST", dstNodeID)
+	dstNodeState, err := pull.GetNodeByID(database, "DST", dstNodeID)
 	if err != nil {
 		return fmt.Errorf("failed to get DST node state: %w", err)
 	}
@@ -194,13 +196,13 @@ func runTest() error {
 	}
 
 	// Count nodes in database after deletion
-	duckNodeCountSRCBefore, err := db.CountNodes(database, "SRC")
+	duckNodeCountSRCBefore, err := pull.CountNodes(database, "SRC")
 	if err != nil {
 		return fmt.Errorf("failed to count SRC nodes: %w", err)
 	}
 	fmt.Printf("Database SRC node count after deletion: %d\n", duckNodeCountSRCBefore)
 
-	duckNodeCountDSTBefore, err := db.CountNodes(database, "DST")
+	duckNodeCountDSTBefore, err := pull.CountNodes(database, "DST")
 	if err != nil {
 		return fmt.Errorf("failed to count DST nodes: %w", err)
 	}
@@ -240,13 +242,13 @@ func runTest() error {
 	fmt.Println("========================")
 
 	// Count nodes in database after retry sweep
-	duckNodeCountSRCAfter, err := db.CountNodes(database, "SRC")
+	duckNodeCountSRCAfter, err := pull.CountNodes(database, "SRC")
 	if err != nil {
 		return fmt.Errorf("failed to count SRC nodes after sweep: %w", err)
 	}
 	fmt.Printf("Database SRC node count after retry sweep: %d\n", duckNodeCountSRCAfter)
 
-	duckNodeCountDSTAfter, err := db.CountNodes(database, "DST")
+	duckNodeCountDSTAfter, err := pull.CountNodes(database, "DST")
 	if err != nil {
 		return fmt.Errorf("failed to count DST nodes after sweep: %w", err)
 	}

@@ -27,9 +27,9 @@ type FSCredentialBinding struct {
 	RootFolderJSON   string
 }
 
-func (s *migrationStore) upsertFSCredentialBinding(binding FSCredentialBinding) error {
+func (s *migrationStore) UpsertFSCredentialBinding(binding FSCredentialBinding) error {
 	if s.db == nil {
-		return fmt.Errorf("upsertFSCredentialBinding requires store db")
+		return fmt.Errorf("UpsertFSCredentialBinding requires store db")
 	}
 	if binding.Role != FSCredentialRoleSource && binding.Role != FSCredentialRoleDestination {
 		return fmt.Errorf("invalid credential role %q", binding.Role)

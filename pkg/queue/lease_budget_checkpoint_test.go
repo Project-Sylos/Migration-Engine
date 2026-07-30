@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/checkpoint"
+	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -104,14 +106,14 @@ func idsOf(tasks []*TaskBase) []string {
 
 func TestProvisionalFreezeGatesSetTargetWorkerCount(t *testing.T) {
 	q := queueWithWorkers(2)
-	q.spin.freeze.Store(true)
+	q.Spin.Freeze.Store(true)
 	if err := q.SetTargetWorkerCount(4); err != nil {
 		t.Fatal(err)
 	}
 	if n := q.liveActiveWorkers(); n != 2 {
 		t.Fatalf("freeze should no-op scale-up, want 2 workers got %d", n)
 	}
-	q.spin.freeze.Store(false)
+	q.Spin.Freeze.Store(false)
 }
 
 func TestForceCheckoutMarksAllBusyLeases(t *testing.T) {
@@ -120,7 +122,7 @@ func TestForceCheckoutMarksAllBusyLeases(t *testing.T) {
 	q.SetActiveLeaseSize("w-small", 10)
 	q.SetActiveLeaseSize("w-folder-batch", 0)
 	q.forceCheckoutBusyWorkers()
-	if !q.forceCheckoutWorker("w-small") || !q.forceCheckoutWorker("w-big") || !q.forceCheckoutWorker("w-folder-batch") {
+	if !q.ForceCheckoutWorker("w-small") || !q.ForceCheckoutWorker("w-big") || !q.ForceCheckoutWorker("w-folder-batch") {
 		t.Fatal("expected all tracked FS workers marked for force checkout (including non-file size 0)")
 	}
 }
@@ -169,27 +171,27 @@ func TestTransferCheckpointPersistAndResumePolicy(t *testing.T) {
 	})
 
 	q := NewQueue("copy", 3, 1, nil, nil)
-	q.setDatabase(database)
+	q.SetDatabase(database)
 	task := fileTask("n1", 100)
 	task.File.LastUpdated = "t0"
 
 	if err := q.PersistTransferCheckpoint(ctx, task, 40, "dst1"); err != nil {
 		t.Fatal(err)
 	}
-	ckpt, err := database.GetTransferCheckpoint(ctx, "n1")
+	ckpt, err := checkpoint.GetTransferCheckpoint(database, ctx, "n1")
 	if err != nil || ckpt == nil || ckpt.Offset != 40 {
 		t.Fatalf("checkpoint want offset 40, got %+v err=%v", ckpt, err)
 	}
 
 	// Non-resumable policy → clear and restart at 0.
-	off, err := prepareFileTransferResume(ctx, q, types.DefaultTransferRestartPolicy{}, task)
+	off, err := PrepareFileTransferResume(ctx, q, types.DefaultTransferRestartPolicy{}, task)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if off != 0 {
 		t.Fatalf("non-resumable want offset 0, got %d", off)
 	}
-	ckpt, _ = database.GetTransferCheckpoint(ctx, "n1")
+	ckpt, _ = checkpoint.GetTransferCheckpoint(database, ctx, "n1")
 	if ckpt != nil {
 		t.Fatalf("checkpoint should be cleared, got %+v", ckpt)
 	}
@@ -199,7 +201,7 @@ func TestTransferCheckpointPersistAndResumePolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	pol := mockResumablePolicy{}
-	off, err = prepareFileTransferResume(ctx, q, pol, task)
+	off, err = PrepareFileTransferResume(ctx, q, pol, task)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +231,7 @@ func TestAbandonRequeueVsDBOnly(t *testing.T) {
 	})
 
 	q := queueWithWorkers(1)
-	q.setDatabase(database)
+	q.SetDatabase(database)
 	task := fileTask("n2", 50)
 	task.File.LastUpdated = "t0"
 	q.inProgress[task.ID] = task
@@ -240,7 +242,7 @@ func TestAbandonRequeueVsDBOnly(t *testing.T) {
 	if q.GetPendingCount() != 1 {
 		t.Fatalf("scale-down abandon should requeue, pending=%d", q.GetPendingCount())
 	}
-	ckpt, _ := database.GetTransferCheckpoint(ctx, "n2")
+	ckpt, _ := checkpoint.GetTransferCheckpoint(database, ctx, "n2")
 	if ckpt == nil || ckpt.Offset != 25 {
 		t.Fatalf("want checkpoint 25, got %+v", ckpt)
 	}
@@ -261,11 +263,11 @@ func TestAbandonRequeueVsDBOnly(t *testing.T) {
 func TestEnterProvisionalFreezeLifts(t *testing.T) {
 	q := queueWithWorkers(1)
 	q.EnterProvisionalFreeze(20 * time.Millisecond)
-	if !q.PoolSizeFrozen() {
+	if !q.Spin.Freeze.Load() {
 		t.Fatal("expected freeze")
 	}
 	time.Sleep(50 * time.Millisecond)
-	if q.PoolSizeFrozen() {
+	if q.Spin.Freeze.Load() {
 		t.Fatal("expected freeze lifted after grace")
 	}
 }

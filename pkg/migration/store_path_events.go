@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/subtree"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
+	queuegpl "codeberg.org/Sylos/Migration-Engine/pkg/queue/gpl"
 	"codeberg.org/Sylos/go-path-linter/pkg/check"
 	"codeberg.org/Sylos/go-path-linter/pkg/gpl"
 	"codeberg.org/Sylos/go-path-linter/pkg/issue"
@@ -25,10 +27,11 @@ type PathIssueMessage struct {
 	DocsURL string
 }
 
-// PathIssueRow is one current path_events finding for review.
+// PathIssueRow is one current sparse GPL finding for review.
 type PathIssueRow struct {
 	NodeID       string
 	Path         string
+	Name         string
 	ProposedPath string
 	Status       string
 	Category     string
@@ -69,8 +72,8 @@ func (e *PathValidationError) Error() string {
 	return "path validation failed"
 }
 
-// ListPathIssues returns SRC nodes whose latest path_events status is pending,
-// collision, or manual_review. Rows with gpl_status=ignored are included with Ignored=true
+// ListPathIssues returns sparse GPL rows whose status is pending or manual_review.
+// Rows with gpl_status=ignored are included with Ignored=true
 // so the UI can offer unignore. Returns an empty list when path checks are disabled.
 func (m *Migration) ListPathIssues(limit int) ([]PathIssueRow, error) {
 	if m == nil || m.DB == nil {
@@ -87,29 +90,14 @@ func (m *Migration) ListPathIssues(limit int) ([]PathIssueRow, error) {
 		return nil, err
 	}
 	q := `
-WITH cur AS (
-  SELECT id, arg_max(proposed_path, event_time) AS proposed_path,
-         arg_max(status, event_time) AS status,
-         arg_max(category, event_time) AS category,
-         arg_max(gpl_issues, event_time) AS gpl_issues,
-         max(event_time) AS event_time
-  FROM path_events
-  GROUP BY id
-),
-gpl AS (
-  SELECT id, arg_max(gpl_status, event_time) AS gpl_status
-  FROM src_status_events
-  WHERE COALESCE(gpl_status,'') <> ''
-  GROUP BY id
-)
-SELECT c.id, COALESCE(n.path,''), COALESCE(c.proposed_path,''), COALESCE(c.status,''),
-       COALESCE(c.category,''), COALESCE(c.gpl_issues,''), c.event_time,
-       COALESCE(g.gpl_status,'')
-FROM cur c
-LEFT JOIN src_nodes n ON n.id = c.id
-LEFT JOIN gpl g ON g.id = c.id
-WHERE c.status IN ('pending', 'collision', 'manual_review')
-ORDER BY c.event_time
+SELECT gi.src_id, COALESCE(n.path,''), COALESCE(n.name,''), COALESCE(gi.proposed_name,''), COALESCE(gi.status,''),
+       'gpl_clean', COALESCE(gi.issues_json,''), gi.updated_at,
+       COALESCE(cur.gpl_status,'')
+FROM gpl_issues gi
+LEFT JOIN src_nodes n ON n.id = gi.src_id
+LEFT JOIN src_current cur ON cur.id = gi.src_id
+WHERE gi.status IN ('pending', 'manual_review')
+ORDER BY gi.updated_at
 LIMIT $1`
 	rows, err := conn.QueryContext(context.Background(), q, limit)
 	if err != nil {
@@ -120,8 +108,11 @@ LIMIT $1`
 	for rows.Next() {
 		var r PathIssueRow
 		var gplStatus string
-		if err := rows.Scan(&r.NodeID, &r.Path, &r.ProposedPath, &r.Status, &r.Category, &r.GPLIssues, &r.EventTime, &gplStatus); err != nil {
+		if err := rows.Scan(&r.NodeID, &r.Path, &r.Name, &r.ProposedPath, &r.Status, &r.Category, &r.GPLIssues, &r.EventTime, &gplStatus); err != nil {
 			return nil, err
+		}
+		if r.Name == "" {
+			r.Name = db.NormalizeNodeBasename(r.Path)
 		}
 		r.Ignored = gplStatus == db.GPLStatusIgnored
 		r.Messages = PathIssueMessagesFromGPLJSON(r.GPLIssues)
@@ -157,7 +148,7 @@ func (m *Migration) ValidatePathProposal(nodeID, proposedPath string) (ValidateP
 	if err != nil {
 		return out, err
 	}
-	payload, issues, err := validateProposedPart(m.dstGPLTarget(), parentParts, proposedPath, siblings, isFile)
+	payload, issues, err := validateProposedPart(m.dstGPLTarget(), parentParts, proposedPath, siblings, isFile, m.WindowsCompat())
 	if err != nil {
 		return out, err
 	}
@@ -170,23 +161,48 @@ func (m *Migration) ValidatePathProposal(nodeID, proposedPath string) (ValidateP
 	return out, nil
 }
 
-// AcceptPathProposal validates parent+AddPart(proposed), appends an accepted path_events row,
-// updates the node's gpl_state, and fans out gpl_status=pending to SRC/DST descendants.
-func (m *Migration) AcceptPathProposal(nodeID, proposedPath string) error {
+func (m *Migration) AcceptPathChange(nodeID, proposedPath string, forceSkipValidation bool) error {
 	if !m.PathChecksEnabled() {
 		return fmt.Errorf("%s", PathChecksNotApplicableMessage)
 	}
-	return m.acceptPathChange(nodeID, proposedPath, db.PathEventCategoryGPLClean, false)
+	return m.acceptPathChange(nodeID, proposedPath, forceSkipValidation)
 }
 
-// RemapPathManual validates override through GPL then appends a manual_remap accepted event.
-// forceSkipValidation records the override even when GPL still reports issues (issues preserved on the row)
-// and marks the node + descendants gpl_status=ignored (no pending cascade / sweep required).
-func (m *Migration) RemapPathManual(nodeID, proposedPath string, forceSkipValidation bool) error {
-	if !m.PathChecksEnabled() {
-		return fmt.Errorf("%s", PathChecksNotApplicableMessage)
+// ResetPathRemap clears an accepted destination name override, restores gpl_status=pending
+// on the node (and descendants), and re-runs the GPL sweep so warnings can reappear.
+func (m *Migration) ResetPathRemap(nodeID string) error {
+	if m == nil || m.DB == nil {
+		return fmt.Errorf("migration db not open")
 	}
-	return m.acceptPathChange(nodeID, proposedPath, db.PathEventCategoryManualRemap, forceSkipValidation)
+	if !m.PathChecksEnabled() {
+		return nil
+	}
+	node, err := pull.GetNodeByID(m.DB, "SRC", nodeID)
+	if err != nil {
+		return err
+	}
+	if node == nil {
+		return fmt.Errorf("node %s not found", nodeID)
+	}
+	err = m.DB.RunWrite(context.Background(), func(s *db.WriteSession) error {
+		return s.WithTx(func(w *db.Writer) error {
+			now := time.Now().UnixNano()
+			if err := w.SetSrcCurrentResolvedName(nodeID, "", now); err != nil {
+				return err
+			}
+			if err := w.DeleteGPLIssue(nodeID); err != nil {
+				return err
+			}
+			if err := subtree.InsertGPLStatusEventsForSubtree(w, "SRC", node.Path, db.GPLStatusPending, true); err != nil {
+				return err
+			}
+			return subtree.InsertGPLStatusEventsForSubtree(w, "DST", node.Path, db.GPLStatusPending, true)
+		})
+	})
+	if err != nil {
+		return err
+	}
+	return m.RunGPLSweep()
 }
 
 // AcceptAllPathProposals accepts every active pending proposal's proposed_path.
@@ -204,16 +220,21 @@ func (m *Migration) AcceptAllPathProposals() (int, error) {
 		if row.Status != db.PathEventStatusPending || row.ProposedPath == "" {
 			continue
 		}
-		if err := m.AcceptPathProposal(row.NodeID, row.ProposedPath); err != nil {
+		if err := m.AcceptPathChange(row.NodeID, row.ProposedPath, false); err != nil {
+			if _, needsManual := err.(*PathValidationError); needsManual {
+				continue
+			}
 			return accepted, fmt.Errorf("accept %s: %w", row.NodeID, err)
 		}
 		accepted++
 	}
+	if err := m.RunDSTRenameSweep(); err != nil {
+		return accepted, fmt.Errorf("destination renames: %w", err)
+	}
 	return accepted, nil
 }
 
-// IgnoreGPLSubtree marks nodeID and all SRC/DST descendants gpl_status=ignored.
-func (m *Migration) IgnoreGPLSubtree(nodeID string) error {
+func (m *Migration) applyGPLSubtreeEvents(nodeID string, write func(w *db.Writer, side, nodePath string) error) error {
 	if m == nil || m.DB == nil {
 		return fmt.Errorf("migration db not open")
 	}
@@ -232,41 +253,22 @@ func (m *Migration) IgnoreGPLSubtree(nodeID string) error {
 	}
 	return m.DB.RunWrite(context.Background(), func(s *db.WriteSession) error {
 		return s.WithTx(func(w *db.Writer) error {
-			if err := w.InsertGPLIgnoredEventsForSubtree("SRC", nodePath); err != nil {
+			if err := write(w, "SRC", nodePath); err != nil {
 				return err
 			}
-			return w.InsertGPLIgnoredEventsForSubtree("DST", nodePath)
+			return write(w, "DST", nodePath)
 		})
 	})
 }
 
-// UnignoreGPLSubtree restores the prior non-ignored gpl_status for nodeID and descendants
-// (append-only rollback of IgnoreGPLSubtree).
-func (m *Migration) UnignoreGPLSubtree(nodeID string) error {
-	if m == nil || m.DB == nil {
-		return fmt.Errorf("migration db not open")
-	}
-	if !m.PathChecksEnabled() {
-		return nil
-	}
-	conn, err := m.DB.GetDB()
-	if err != nil {
-		return err
-	}
-	var nodePath string
-	if err := conn.QueryRowContext(context.Background(),
-		`SELECT COALESCE(path,'') FROM src_nodes WHERE id = $1`, nodeID,
-	).Scan(&nodePath); err != nil {
-		return fmt.Errorf("load node: %w", err)
-	}
-	return m.DB.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			if err := w.InsertGPLRestoredEventsForSubtree("SRC", nodePath); err != nil {
-				return err
-			}
-			return w.InsertGPLRestoredEventsForSubtree("DST", nodePath)
+// SetGPLSubtreeIgnored marks nodeID and descendants ignored or restores prior gpl_status when ignored is false.
+func (m *Migration) SetGPLSubtreeIgnored(nodeID string, ignored bool) error {
+	if ignored {
+		return m.applyGPLSubtreeEvents(nodeID, func(w *db.Writer, side, nodePath string) error {
+			return subtree.InsertGPLStatusEventsForSubtree(w, side, nodePath, db.GPLStatusIgnored, true)
 		})
-	})
+	}
+	return m.applyGPLSubtreeEvents(nodeID, subtree.InsertGPLRestoredEventsForSubtree)
 }
 
 // IgnoreAllPathIssues marks every active (non-ignored) path-issue node's subtree as ignored.
@@ -285,7 +287,7 @@ func (m *Migration) IgnoreAllPathIssues() (int, error) {
 			continue
 		}
 		seen[row.NodeID] = struct{}{}
-		if err := m.IgnoreGPLSubtree(row.NodeID); err != nil {
+		if err := m.SetGPLSubtreeIgnored(row.NodeID, true); err != nil {
 			return n, err
 		}
 		n++
@@ -318,10 +320,15 @@ func (m *Migration) loadPathChangeContext(nodeID string) (parentParts, siblings 
 	if err != nil {
 		return nil, nil, false, err
 	}
+	dstSiblings, err := m.listDSTSiblingBasenames(parentID)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	siblings = append(siblings, dstSiblings...)
 	return parentParts, siblings, nodeType == db.NodeTypeFile, nil
 }
 
-func (m *Migration) acceptPathChange(nodeID, proposedPath, category string, forceSkipValidation bool) error {
+func (m *Migration) acceptPathChange(nodeID, proposedPath string, forceSkipValidation bool) error {
 	if m == nil || m.DB == nil {
 		return fmt.Errorf("migration db not open")
 	}
@@ -354,58 +361,103 @@ func (m *Migration) acceptPathChange(nodeID, proposedPath, category string, forc
 	if err != nil {
 		return err
 	}
+	dstSiblings, err := m.listDSTSiblingBasenames(parentID)
+	if err != nil {
+		return err
+	}
+	siblings = append(siblings, dstSiblings...)
 
 	target := m.dstGPLTarget()
 	isFile := nodeType == db.NodeTypeFile
-	payload, issues, err := validateProposedPart(target, parentParts, proposedPath, siblings, isFile)
+	payload, issues, err := validateProposedPart(target, parentParts, proposedPath, siblings, isFile, m.WindowsCompat())
 	if err != nil {
 		return err
 	}
 	issuesJSON, _ := json.Marshal(issues)
 	if !forceSkipValidation && len(issues) > 0 {
 		for _, iss := range issues {
-			if iss.Category != issue.CategorySiblingCollision {
-				msgs := FriendlyPathIssueMessages(issues)
-				msg := "This destination name isn’t allowed."
-				if len(msgs) > 0 {
-					msg = msgs[0]
-				} else if iss.Message != "" {
-					msg = iss.Message
-				}
-				return &PathValidationError{Message: msg, Issues: issues, Messages: msgs}
+			if iss.Category == issue.CategorySiblingCollision {
+				_ = m.DB.RunWrite(ctx, func(s *db.WriteSession) error {
+					return s.WithTx(func(w *db.Writer) error {
+						return w.UpdateGPLIssueWithAction(nodeID, db.GPLIssueStatusManualReview, "", string(issuesJSON), "", time.Now().UnixNano())
+					})
+				})
+				break
 			}
 		}
+		msgs := FriendlyPathIssueMessages(issues)
+		msg := "This destination name isn’t allowed."
+		if len(msgs) > 0 {
+			msg = msgs[0]
+		} else if issues[0].Message != "" {
+			msg = issues[0].Message
+		}
+		return &PathValidationError{Message: msg, Issues: issues, Messages: msgs}
 	}
 
 	gplJSON, _ := json.Marshal(payload)
 
-	return m.DB.RunWrite(ctx, func(s *db.WriteSession) error {
+	var copyStatus string
+	_ = conn.QueryRowContext(ctx, `
+SELECT COALESCE(arg_max(copy_status, event_time), '')
+FROM src_status_events
+WHERE id = $1 AND COALESCE(copy_status,'') <> ''`, nodeID).Scan(&copyStatus)
+	if copyStatus == "" {
+		_ = conn.QueryRowContext(ctx,
+			`SELECT COALESCE(copy_status,'') FROM src_current WHERE id = $1`, nodeID,
+		).Scan(&copyStatus)
+	}
+	dstAction := ""
+	if copyStatus == db.CopyStatusAlreadyExisted {
+		var dstMapped int
+		_ = conn.QueryRowContext(ctx, `
+SELECT COUNT(*)::INT FROM id_map
+WHERE src_internal_id = $1 AND status = 'active'`, nodeID).Scan(&dstMapped)
+		if dstMapped > 0 {
+			dstAction = db.DstActionRename
+		}
+	}
+
+	err = m.DB.RunWrite(ctx, func(s *db.WriteSession) error {
 		return s.WithTx(func(w *db.Writer) error {
-			if err := w.BatchInsertPathEvents([]db.PathEvent{{
-				ID:           nodeID,
-				EventTime:    time.Now().UnixNano(),
-				Category:     category,
-				ProposedPath: proposedPath,
-				Status:       db.PathEventStatusAccepted,
-				GPLIssues:    string(issuesJSON),
-			}}); err != nil {
+			now := time.Now().UnixNano()
+			if err := w.UpdateGPLIssueWithAction(nodeID, db.GPLIssueStatusAccepted, proposedPath, string(issuesJSON), dstAction, now); err != nil {
+				return err
+			}
+			if err := w.SetSrcCurrentResolvedName(nodeID, proposedPath, now); err != nil {
 				return err
 			}
 			if err := w.UpdateNodeGPLState(nodeID, string(gplJSON)); err != nil {
 				return err
 			}
-			if forceSkipValidation {
-				if err := w.InsertGPLIgnoredEventsForSubtree("SRC", nodePath); err != nil {
-					return err
-				}
-				return w.InsertGPLIgnoredEventsForSubtree("DST", nodePath)
-			}
-			if err := w.InsertGPLPendingEventsForSubtree("SRC", nodePath); err != nil {
+			if err := w.DeleteGPLIssuesForDescendants(nodePath); err != nil {
 				return err
 			}
-			return w.InsertGPLPendingEventsForSubtree("DST", nodePath)
+			if forceSkipValidation {
+				if err := subtree.InsertGPLStatusEventsForSubtree(w, "SRC", nodePath, db.GPLStatusIgnored, true); err != nil {
+					return err
+				}
+				return subtree.InsertGPLStatusEventsForSubtree(w, "DST", nodePath, db.GPLStatusIgnored, true)
+			}
+			if err := subtree.InsertGPLStatusEventsForSubtree(w, "SRC", nodePath, db.GPLStatusPending, false); err != nil {
+				return err
+			}
+			return subtree.InsertGPLStatusEventsForSubtree(w, "DST", nodePath, db.GPLStatusPending, false)
 		})
 	})
+	if err != nil {
+		return err
+	}
+	if dstAction == db.DstActionRename {
+		// Best-effort immediate rename when the DST adapter is available; otherwise
+		// dst_action stays set for RunDSTRenameSweep (e.g. Accept-all / pre-copy).
+		if m.destinationAdapter() != nil {
+			if renameErr := m.ApplyDSTRename(nodeID); renameErr != nil {
+				return fmt.Errorf("accepted proposal but destination rename failed: %w", renameErr)
+			}
+		}
+	}
+	return nil
 }
 
 // PathChecksEnabled reports whether destination-name checks apply for this migration.
@@ -418,10 +470,10 @@ func (m *Migration) PathChecksEnabled() bool {
 	cfg := m.lastRunConfig
 	m.mu.RUnlock()
 	if src != "" || dst != "" || profile != "" {
-		return queue.PathChecksRequired(src, dst, profile)
+		return queuegpl.PathChecksRequired(src, dst, profile)
 	}
 	if cfg != nil {
-		return queue.PathChecksRequired(cfg.Source.ProviderID, cfg.Destination.ProviderID, cfg.PathCheckTarget)
+		return queuegpl.PathChecksRequired(cfg.Source.ProviderID, cfg.Destination.ProviderID, cfg.PathCheckTarget)
 	}
 	return true
 }
@@ -445,11 +497,6 @@ func (m *Migration) PathCheckProfile() string {
 // PathChecksNotApplicableMessage is the user-facing reason when checks are skipped.
 const PathChecksNotApplicableMessage = "Destination name checks aren’t needed when source and destination are the same type of service."
 
-// gplTargetFromProviderExported mirrors queue mapping without importing internals cyclically via exported helper.
-func gplTargetFromProviderExported(provider string) gpl.Target {
-	return queue.GPLTargetFromProvider(provider)
-}
-
 func (m *Migration) dstGPLTarget() gpl.Target {
 	provider := ""
 	if m != nil {
@@ -458,12 +505,12 @@ func (m *Migration) dstGPLTarget() gpl.Target {
 		cfg := m.lastRunConfig
 		m.mu.RUnlock()
 		if src != "" || dst != "" || profile != "" {
-			provider = queue.ResolvePathCheckTarget(src, dst, profile)
+			provider = queuegpl.ResolvePathCheckTarget(src, dst, profile)
 		} else if cfg != nil {
-			provider = queue.ResolvePathCheckTarget(cfg.Source.ProviderID, cfg.Destination.ProviderID, cfg.PathCheckTarget)
+			provider = queuegpl.ResolvePathCheckTarget(cfg.Source.ProviderID, cfg.Destination.ProviderID, cfg.PathCheckTarget)
 		}
 	}
-	return gplTargetFromProviderExported(provider)
+	return queuegpl.GPLTargetFromProvider(provider)
 }
 
 func (m *Migration) listSRCSiblingBasenames(parentID, excludeID string) ([]string, error) {
@@ -472,7 +519,7 @@ func (m *Migration) listSRCSiblingBasenames(parentID, excludeID string) ([]strin
 		return nil, err
 	}
 	rows, err := conn.QueryContext(context.Background(),
-		`SELECT path FROM src_nodes WHERE parent_id = $1 AND id <> $2`, parentID, excludeID)
+		`SELECT COALESCE(NULLIF(name, ''), path) FROM src_nodes WHERE parent_id = $1 AND id <> $2`, parentID, excludeID)
 	if err != nil {
 		return nil, err
 	}
@@ -488,7 +535,34 @@ func (m *Migration) listSRCSiblingBasenames(parentID, excludeID string) ([]strin
 	return out, rows.Err()
 }
 
-func validateProposedPart(target gpl.Target, parentParts []string, proposed string, siblings []string, isFile bool) (db.GPLStatePayload, []issue.Issue, error) {
+func (m *Migration) listDSTSiblingBasenames(srcParentID string) ([]string, error) {
+	conn, err := m.DB.GetDB()
+	if err != nil {
+		return nil, err
+	}
+	// dst_nodes.path mirrors the SRC display path, so the name column is the only
+	// place the actual destination basename (post-GPL rename) is recorded.
+	rows, err := conn.QueryContext(context.Background(), `
+SELECT COALESCE(NULLIF(d.name, ''), d.path)
+FROM id_map im
+JOIN dst_nodes d ON d.parent_id = im.dst_internal_id
+WHERE im.src_internal_id = $1 AND im.status = 'active'`, srcParentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, db.NormalizeNodeBasename(p))
+	}
+	return out, rows.Err()
+}
+
+func validateProposedPart(target gpl.Target, parentParts []string, proposed string, siblings []string, isFile, windowsCompat bool) (db.GPLStatePayload, []issue.Issue, error) {
 	opts := []gpl.Option{
 		gpl.WithRelative(true),
 		gpl.WithAutoClean(false),
@@ -499,7 +573,7 @@ func validateProposedPart(target gpl.Target, parentParts []string, proposed stri
 	if isFile {
 		opts = append(opts, gpl.WithFileAdded(true))
 	}
-	l, err := gpl.New(target, "", opts...)
+	l, err := gpl.NewWithWindowsCompat(target, "", windowsCompat, opts...)
 	if err != nil {
 		return db.GPLStatePayload{}, nil, err
 	}
@@ -632,7 +706,7 @@ func FriendlyPathIssueMessage(iss issue.Issue) string {
 	}
 }
 
-// PathIssueMessagesFromGPLJSON parses path_events.gpl_issues into user-facing messages.
+// PathIssueMessagesFromGPLJSON parses gpl_issues.issues_json into user-facing messages.
 func PathIssueMessagesFromGPLJSON(raw string) []PathIssueMessage {
 	if raw == "" {
 		return nil

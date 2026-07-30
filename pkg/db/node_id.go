@@ -25,11 +25,6 @@ func MintNodeID(side, parentID, nodeType, basename string) string {
 	return uuid.NewSHA1(nodeIDNamespace, []byte(name)).String()
 }
 
-// RootNodeID returns the fixed UUID v5 for the SRC or DST root folder.
-func RootNodeID(side string) string {
-	return MintNodeID(side, "", NodeTypeFolder, "/")
-}
-
 // NormalizeNodeBasename returns the final path segment used for minting, sibling checks, and GPL.
 // Full paths (e.g. "/a/b.txt" or adapters that put LocationPath in DisplayName) collapse to "b.txt".
 //

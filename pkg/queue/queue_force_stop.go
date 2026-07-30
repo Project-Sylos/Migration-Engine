@@ -17,7 +17,7 @@ func (q *Queue) AbandonInProgressTasks() {
 	if q == nil {
 		return
 	}
-	dbOnly := q.abandonModeForStop()
+	dbOnly := q.Spin.AbandonDBOnly.Load()
 	q.mu.Lock()
 	tasks := make([]*TaskBase, 0, len(q.inProgress))
 	for _, task := range q.inProgress {
@@ -37,7 +37,7 @@ func (q *Queue) AbandonInProgressTasks() {
 		}
 		dstRef := task.XferDstRef
 		task.Locked = false
-		q.removeInProgress(nodeID)
+		q.RemoveInProgress(nodeID)
 		if task.IsFile() && offset > 0 {
 			_ = q.PersistTransferCheckpoint(ctx, task, offset, dstRef)
 		}
@@ -61,10 +61,10 @@ func (q *Queue) ReleaseInFlightOnThrottle() {
 	if q == nil {
 		return
 	}
-	was := q.spin.abandonDBOnly.Load()
-	q.spin.abandonDBOnly.Store(false)
+	was := q.Spin.AbandonDBOnly.Load()
+	q.Spin.AbandonDBOnly.Store(false)
 	q.AbandonInProgressTasks()
-	q.spin.abandonDBOnly.Store(was)
+	q.Spin.AbandonDBOnly.Store(was)
 	if q.watchdog != nil {
 		q.watchdog.Beat()
 	}

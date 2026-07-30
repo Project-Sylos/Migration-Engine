@@ -5,7 +5,8 @@ package migration
 
 import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
-	"codeberg.org/Sylos/Migration-Engine/pkg/scaling"
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/backend"
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/profile"
 )
 
 func scalingContextForTraversal(queueName string, srcService, dstService Service, mode queue.QueueMode) queue.ScalingContext {
@@ -35,19 +36,36 @@ func scalingContextForCopy(srcService, dstService Service, copyPass int, mode qu
 	}
 }
 
+func scalingContextForDelete(srcService, dstService Service, mode queue.QueueMode) queue.ScalingContext {
+	scalingMode := string(mode)
+	if scalingMode == "" {
+		scalingMode = queue.ScalingModeDelete
+	}
+	return queue.ScalingContext{
+		QueueName:   "delete",
+		Mode:        scalingMode,
+		SrcProvider: srcService.ProviderID,
+		DstProvider: dstService.ProviderID,
+	}
+}
+
 func resolveWorkersForScalingContext(ctx queue.ScalingContext, requested int, suspend *RuntimeSuspendV1) int {
-	wc := effectiveWorkerCount(requested, suspend)
-	return scaling.ResolveInitialWorkers(ctx, wc)
+	suspendWorkers := 0
+	if suspend != nil {
+		suspendWorkers = suspend.WorkerCount
+	}
+	wc := effectiveInt(suspendWorkers, requested)
+	return profile.ResolveInitialWorkers(ctx, wc)
 }
 
 func queueSizingForScalingContext(ctx queue.ScalingContext, suspend *RuntimeSuspendV1) *queue.QueueSizing {
 	if s := queueSizingFromSuspend(suspend); s != nil {
 		return s
 	}
-	for _, op := range scaling.ActiveOperations(ctx) {
-		if op == scaling.OpListChildren {
-			prof := scaling.ToActuatorProfile(scaling.ResolveOperationProfile(ctx))
-			if batch := scaling.QueueBatchSizingFromProfile(prof); batch != nil {
+	for _, op := range profile.ActiveOperations(ctx) {
+		if op == profile.OpListChildren {
+			prof := profile.ToActuatorProfile(profile.ResolveOperationProfile(ctx))
+			if batch := profile.QueueBatchSizingFromProfile(prof); batch != nil {
 				return &queue.QueueSizing{
 					LeaseBatchSize:  batch.LeaseBatchSize,
 					RefillBatchSize: batch.RefillBatchSize,
@@ -58,24 +76,28 @@ func queueSizingForScalingContext(ctx queue.ScalingContext, suspend *RuntimeSusp
 	return nil
 }
 
-func wireQueueScalingContext(srcQ, dstQ, copyQ *queue.Queue, srcService, dstService Service, sameBackend bool, pathCheckProfile string) {
-	srcGroup := scaling.ResolveGroupID(srcService.BackendGroupID, "", "src")
-	dstGroup := scaling.ResolveGroupID(dstService.BackendGroupID, "", "dst")
+func wireQueueScalingContext(srcQ, dstQ, copyQ *queue.Queue, srcService, dstService Service, sameBackend bool, pathCheckProfile string, windowsCompat bool) {
+	srcGroup := backend.ResolveGroupID(srcService.BackendGroupID, "", "src")
+	dstGroup := backend.ResolveGroupID(dstService.BackendGroupID, "", "dst")
 	if sameBackend {
 		dstGroup = srcGroup
 	}
 	srcProv := srcService.ProviderID
 	dstProv := dstService.ProviderID
 	if srcQ != nil {
-		srcQ.SetScalingMigrationContext(srcProv, dstProv, srcGroup, dstGroup)
-		srcQ.SetPathCheckProfile(pathCheckProfile)
+		srcQ.ConfigureScalingContext(srcProv, dstProv, srcGroup, dstGroup, pathCheckProfile, windowsCompat)
 	}
 	if dstQ != nil {
-		dstQ.SetScalingMigrationContext(srcProv, dstProv, srcGroup, dstGroup)
-		dstQ.SetPathCheckProfile(pathCheckProfile)
+		dstQ.ConfigureScalingContext(srcProv, dstProv, srcGroup, dstGroup, pathCheckProfile, windowsCompat)
 	}
 	if copyQ != nil {
-		copyQ.SetScalingMigrationContext(srcProv, dstProv, "queue:copy", "queue:copy")
-		copyQ.SetPathCheckProfile(pathCheckProfile)
+		copyQ.ConfigureScalingContext(srcProv, dstProv, "queue:copy", "queue:copy", pathCheckProfile, windowsCompat)
 	}
+}
+
+func wireDeleteQueueScalingContext(deleteQ *queue.Queue, srcService, dstService Service, pathCheckProfile string, windowsCompat bool) {
+	if deleteQ == nil {
+		return
+	}
+	deleteQ.ConfigureScalingContext(srcService.ProviderID, dstService.ProviderID, "queue:delete", "queue:delete", pathCheckProfile, windowsCompat)
 }

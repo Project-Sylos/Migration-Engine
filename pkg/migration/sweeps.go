@@ -9,9 +9,12 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
-	"codeberg.org/Sylos/Migration-Engine/pkg/scaling"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/loop"
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/profile"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -35,13 +38,15 @@ type SweepConfig struct {
 	DuckDBPath             string // Optional: Path to DuckDB file (auto-derived from DuckDB path if empty and ETL is enabled)
 	SoftSuspendRequested   func() bool
 	ObserverPollInterval   time.Duration
-	OnQueueObserver        func(*queue.QueueObserver)
+	OnQueueObserver        func(*observe.QueueObserver)
+	OnAutoscaler           func(*loop.Autoscaler)
 	LeaseBatchSize         int
 	RefillBatchSize        int
 	Autoscaler             AutoscalerConfig
 	SrcService             Service
 	DstService             Service
 	PathCheckTarget        string
+	WindowsCompat          bool
 }
 
 // RunRetrySweep runs a retry sweep to re-process failed or pending tasks from a previous traversal.
@@ -100,7 +105,7 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	// Get max known depth from config or detect from stats table
 	maxKnownDepth := cfg.MaxKnownDepth
 	if maxKnownDepth < 0 {
-		d, err := duckDB.GetMaxDepth("SRC")
+		d, err := stats.GetMaxDepth(duckDB, "SRC")
 		if err == nil {
 			maxKnownDepth = d
 		}
@@ -138,22 +143,22 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	srcQueue.InitializeWithContext(duckDB, cfg.SrcAdapter, cfg.ShutdownContext)
 	dstQueue.InitializeWithContext(duckDB, cfg.DstAdapter, cfg.ShutdownContext)
 
-	srcListProfile := scaling.ResolveEffectiveProfile(
+	srcListProfile := profile.ResolveEffectiveProfile(
 		scalingContextForTraversal("src", cfg.SrcService, cfg.DstService, queue.QueueModeRetry),
 		cfg.SrcAdapter, cfg.DstAdapter,
 	)
-	dstListProfile := scaling.ResolveEffectiveProfile(
+	dstListProfile := profile.ResolveEffectiveProfile(
 		scalingContextForTraversal("dst", cfg.SrcService, cfg.DstService, queue.QueueModeRetry),
 		cfg.SrcAdapter, cfg.DstAdapter,
 	)
-	scaling.ApplyQueueListPagination(srcQueue, srcListProfile)
-	scaling.ApplyQueueListPagination(dstQueue, dstListProfile)
+	profile.ApplyQueueListPagination(srcQueue, srcListProfile)
+	profile.ApplyQueueListPagination(dstQueue, dstListProfile)
 
 	// Set initial rounds to 0 for retry sweep
 	srcQueue.SetRound(0)
 	dstQueue.SetRound(0)
-	srcQueue.EnsureRoundExpectedFromStats()
-	dstQueue.EnsureRoundExpectedFromStats()
+	srcQueue.SetExpectedFromStatsBucket(srcQueue.GetRound())
+	dstQueue.SetExpectedFromStatsBucket(dstQueue.GetRound())
 	srcQueue.SetTraversalCacheLoaded(true)
 	dstQueue.SetTraversalCacheLoaded(true)
 
@@ -169,7 +174,7 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	if obsPoll <= 0 {
 		obsPoll = 500 * time.Millisecond
 	}
-	observer := queue.NewQueueObserver(duckDB, obsPoll)
+	observer := observe.NewQueueObserver(duckDB, obsPoll)
 	observer.Start()
 	defer observer.Stop()
 	if cfg.OnQueueObserver != nil {
@@ -186,7 +191,11 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	if runCtx == nil {
 		runCtx = context.Background()
 	}
-	asCtx := startAutoscaler(runCtx, cfg.Autoscaler, observer, duckDB, srcQueue, dstQueue, cfg.SrcService, cfg.DstService, cfg.PathCheckTarget)
+	asCtx := startAutoscaler(runCtx, cfg.Autoscaler, observer, duckDB, srcQueue, dstQueue, cfg.SrcService, cfg.DstService, cfg.PathCheckTarget, cfg.WindowsCompat)
+	if cfg.OnAutoscaler != nil {
+		cfg.OnAutoscaler(asCtx.Autoscaler())
+		defer cfg.OnAutoscaler(nil)
+	}
 	defer asCtx.stop()
 
 	// Set up stats channels for progress updates
@@ -267,6 +276,7 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	progressTicker := time.NewTicker(progressTick)
 	defer progressTicker.Stop()
 	start := time.Now()
+	sweepStartNanos := start.UnixNano()
 
 	mr := cfg.MaxRetries
 
@@ -275,8 +285,10 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 		if cfg.ShutdownContext != nil {
 			select {
 			case <-cfg.ShutdownContext.Done():
-				srcQueue.Pause()
-				dstQueue.Pause()
+				_ = duckDB.Flush()
+				_ = queue.FinalizeCopyWorkOnStop(duckDB, coordinator)
+				srcQueue.SetState(queue.QueueStatePaused)
+				dstQueue.SetState(queue.QueueStatePaused)
 
 				time.Sleep(200 * time.Millisecond)
 
@@ -350,6 +362,7 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 			if err := duckDB.CheckpointWithRetry(context.Background(), 8); err != nil {
 				fmt.Println("checkpoint after retry sweep:", err)
 			}
+			rebuildCurrentSinceSweep(duckDB, sweepStartNanos)
 
 			return RuntimeStats{
 				Duration: time.Since(start),
@@ -397,6 +410,7 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 				if err := duckDB.CheckpointWithRetry(context.Background(), 8); err != nil {
 					fmt.Println("checkpoint after retry sweep:", err)
 				}
+				rebuildCurrentSinceSweep(duckDB, sweepStartNanos)
 
 				return RuntimeStats{
 					Duration: time.Since(start),
@@ -407,5 +421,14 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 		default:
 			time.Sleep(100 * time.Millisecond)
 		}
+	}
+}
+
+func rebuildCurrentSinceSweep(duckDB *db.DB, sweepStartNanos int64) {
+	if err := duckDB.RebuildCurrentSince("SRC", sweepStartNanos); err != nil {
+		fmt.Println("rebuild src_current after retry sweep:", err)
+	}
+	if err := duckDB.RebuildCurrentSince("DST", sweepStartNanos); err != nil {
+		fmt.Println("rebuild dst_current after retry sweep:", err)
 	}
 }

@@ -1,0 +1,112 @@
+// Copyright 2025 Sylos contributors
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+package review
+
+import (
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
+	"context"
+	"testing"
+	"time"
+)
+
+func TestListMergedReviewDiffsExcludeDestinationOnly(t *testing.T) {
+	database, err := db.Open(db.Options{Path: t.TempDir() + "/dst-only.db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	eventTime := time.Now().UnixNano()
+	srcBoth := &db.NodeState{
+		ID:   db.DeterministicNodeID("SRC", db.NodeTypeFile, "/both.txt"),
+		Path: "/both.txt", ParentPath: "/", Name: "both.txt",
+		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusSuccessful,
+	}
+	srcOnly := &db.NodeState{
+		ID:   db.DeterministicNodeID("SRC", db.NodeTypeFile, "/src-only.txt"),
+		Path: "/src-only.txt", ParentPath: "/", Name: "src-only.txt",
+		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
+	}
+	dstBoth := &db.NodeState{
+		ID:   db.DeterministicNodeID("DST", db.NodeTypeFile, "/both.txt"),
+		Path: "/both.txt", ParentPath: "/", Name: "both.txt",
+		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful,
+	}
+	dstOnly := &db.NodeState{
+		ID:   db.DeterministicNodeID("DST", db.NodeTypeFile, "/dst-only.txt"),
+		Path: "/dst-only.txt", ParentPath: "/", Name: "dst-only.txt",
+		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusNotOnSrc,
+	}
+
+	err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
+		return s.WithTx(func(w *db.Writer) error {
+			if err := w.AppenderInsert(db.TableSrcNodes, []*db.NodeState{srcBoth, srcOnly}); err != nil {
+				return err
+			}
+			if err := w.AppenderInsert(db.TableDstNodes, []*db.NodeState{dstBoth, dstOnly}); err != nil {
+				return err
+			}
+			srcEvents := []db.StatusEvent{
+				{ID: srcBoth.ID, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusSuccessful, EventTime: eventTime, Depth: 1},
+				{ID: srcOnly.ID, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending, EventTime: eventTime, Depth: 1},
+			}
+			dstEvents := []db.StatusEvent{
+				{ID: dstBoth.ID, TraversalStatus: db.StatusSuccessful, EventTime: eventTime, Depth: 1},
+				{ID: dstOnly.ID, TraversalStatus: db.StatusNotOnSrc, EventTime: eventTime, Depth: 1},
+			}
+			if err := w.BatchInsertSrcStatusEvents(srcEvents); err != nil {
+				return err
+			}
+			return w.BatchInsertDstStatusEvents(dstEvents)
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.RebuildAllCurrent(); err != nil {
+		t.Fatal(err)
+	}
+
+	all, totalAll, err := ListMergedReviewDiffs(database, ReviewFilter{ParentPath: "/"}, "path ASC", 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totalAll != 3 {
+		t.Fatalf("include all: total=%d want 3 (got rows=%d)", totalAll, len(all))
+	}
+
+	filtered, totalFiltered, err := ListMergedReviewDiffs(database, ReviewFilter{
+		ParentPath:             "/",
+		ExcludeDestinationOnly: true,
+	}, "path ASC", 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totalFiltered != 2 {
+		t.Fatalf("exclude dst-only: total=%d want 2", totalFiltered)
+	}
+	if len(filtered) != 2 {
+		t.Fatalf("exclude dst-only: rows=%d want 2", len(filtered))
+	}
+	for _, row := range filtered {
+		if row.SrcNodeID == "" {
+			t.Fatalf("unexpected destination-only row in filtered results: %+v", row)
+		}
+		if row.Path == "/dst-only.txt" {
+			t.Fatalf("destination-only path still present: %s", row.Path)
+		}
+	}
+
+	stats, err := GetMergedReviewStats(database, ReviewFilter{
+		ParentPath:             "/",
+		ExcludeDestinationOnly: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Total != 2 {
+		t.Fatalf("stats.Total=%d want 2", stats.Total)
+	}
+}

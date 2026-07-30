@@ -3,7 +3,8 @@
 
 package db
 
-// Path event categories and statuses (append-only path_events table).
+// Legacy path-event names are retained for API/test source compatibility. They
+// map onto the sparse gpl_issues table; no path_events table is created.
 const (
 	PathEventCategoryGPLClean    = "gpl_clean"
 	PathEventCategoryManualRemap = "manual_remap"
@@ -14,6 +15,13 @@ const (
 	PathEventStatusAccepted     = "accepted"
 	PathEventStatusCommitted    = "committed"
 	PathEventStatusReverted     = "reverted"
+
+	GPLIssueStatusPending      = PathEventStatusPending
+	GPLIssueStatusManualReview = PathEventStatusManualReview
+	GPLIssueStatusAccepted     = PathEventStatusAccepted
+
+	// DstActionRename marks Accept on an already_existed SRC node: rename DST in place.
+	DstActionRename = "rename"
 )
 
 // ID map sources and statuses (append-only id_map table).
@@ -25,7 +33,7 @@ const (
 	IDMapStatusActive = "active"
 )
 
-// PathEvent is one append-only row for path_events.
+// PathEvent is the legacy input shape bridged to GPLIssue.
 type PathEvent struct {
 	ID           string
 	EventTime    int64
@@ -33,6 +41,16 @@ type PathEvent struct {
 	ProposedPath string
 	Status       string
 	GPLIssues    string // serialized issue log; preserved across overrides
+}
+
+// GPLIssue is the sparse current naming-issue shape.
+type GPLIssue struct {
+	SrcID        string
+	Status       string
+	ProposedName string
+	IssuesJSON   string
+	UpdatedAt    int64
+	DstAction    string // empty (create-on-copy) or DstActionRename
 }
 
 // IDMapEvent is one append-only row for id_map.

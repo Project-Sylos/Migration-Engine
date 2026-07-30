@@ -23,6 +23,12 @@ const rateLimitReleaseJitterFrac = 0.25
 const rateLimitReleaseJitterCap = 2 * time.Second
 
 
+// RateLimitTelemetry supplies FS throttle signals for workers, observer, and autoscaler.
+type RateLimitTelemetry interface {
+	TakeRecentHits() int64
+	RateLimitedUntil() time.Time
+}
+
 // SetRateLimitTelemetry attaches FS degradation telemetry used by workers to idle during throttle windows.
 // Convention: first source is SRC, second (if present) is DST. Traversal/delete attach one side only.
 func (q *Queue) SetRateLimitTelemetry(sources ...RateLimitTelemetry) {
@@ -187,12 +193,37 @@ func IsNonRetryableCopyError(errMsg string) bool {
 	return false
 }
 
+// IsNonRetryableTraversalError reports permanent list/traverse failures that should not
+// consume traversal retry budget (permission denied, blocked pseudo-paths, stalls).
+func IsNonRetryableTraversalError(errMsg string) bool {
+	msg := strings.ToLower(strings.TrimSpace(errMsg))
+	if msg == "" {
+		return false
+	}
+	for _, frag := range []string{
+		"path blocked from migration",
+		"permission denied",
+		"operation not permitted",
+		"eacces",
+		"eperm",
+		"traversal stalled",
+		"not a directory",
+		"no such file or directory",
+		"enoent",
+	} {
+		if strings.Contains(msg, frag) {
+			return true
+		}
+	}
+	return false
+}
+
 // yieldTaskOnRateLimit returns a leased task to the pending buffer without incrementing attempts.
 func (q *Queue) yieldTaskOnRateLimit(task *TaskBase, executionDelta time.Duration) {
-	q.recordExecutionTime(executionDelta)
+	q.RecordExecutionTime(executionDelta)
 	nodeID := task.ID
 	task.Locked = false
-	q.removeInProgress(nodeID)
+	q.RemoveInProgress(nodeID)
 	if !q.Add(task) {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("error",

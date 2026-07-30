@@ -5,7 +5,6 @@ package migration
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -28,6 +27,7 @@ type persistedRunConfig struct {
 	SourceProviderID  string         `json:"sourceProviderId,omitempty"`
 	DestProviderID    string         `json:"destinationProviderId,omitempty"`
 	PathCheckTarget   string         `json:"pathCheckTarget,omitempty"`
+	WindowsCompat     bool           `json:"windowsCompat,omitempty"`
 	SeedRoots         bool           `json:"seedRoots"`
 	WorkerCount       int            `json:"workerCount"`
 	MaxRetries        int            `json:"maxRetries"`
@@ -55,6 +55,7 @@ func persistedRunConfigFrom(cfg Config) persistedRunConfig {
 		SourceProviderID:  cfg.Source.ProviderID,
 		DestProviderID:    cfg.Destination.ProviderID,
 		PathCheckTarget:   cfg.PathCheckTarget,
+		WindowsCompat:     cfg.WindowsCompat,
 		SeedRoots:         cfg.SeedRoots,
 		WorkerCount:       cfg.WorkerCount,
 		MaxRetries:        cfg.MaxRetries,
@@ -66,10 +67,6 @@ func persistedRunConfigFrom(cfg Config) persistedRunConfig {
 		ProgressTickNanos: cfg.ProgressTick.Nanoseconds(),
 		Verification:      cfg.Verification,
 	}
-}
-
-func marshalPersistedRunConfigJSON(cfg Config) ([]byte, error) {
-	return json.Marshal(persistedRunConfigFrom(cfg))
 }
 
 // Service defines a single filesystem service participating in a migration.
@@ -105,6 +102,9 @@ type Config struct {
 	// PathCheckTarget selects destination-name rules: "none", "auto", or a provider id
 	// (e.g. "windows"). Empty is treated as "auto".
 	PathCheckTarget string
+	// WindowsCompat enables Windows desktop-sync overlays on soft cloud destinations
+	// (Dropbox, Box, Egnyte, ShareFile). Default false.
+	WindowsCompat bool
 
 	// ShutdownContext is an optional context for force shutdown control.
 	ShutdownContext context.Context
@@ -112,6 +112,9 @@ type Config struct {
 	// Autoscaler enables in-engine throughput tuning during traversal/copy.
 	// Enabled by default; see AutoscalerConfig.Resolve and DisableAutoscaler.
 	Autoscaler AutoscalerConfig
+
+	// RootPreparation is set when the UI reviewed root children before Start discovery.
+	RootPreparation RootPreparation
 }
 
 // Result captures the outcome of a migration run.

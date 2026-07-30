@@ -48,7 +48,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if _, err := mig.AddRoots(cfg.Source.Root, cfg.Destination.Root); err != nil {
+	if _, err := mig.AddRoots(cfg.Source.Root, cfg.Destination.Root, migration.RootPreparation{}); err != nil {
 		return err
 	}
 	if _, err := mig.StartTraversal(cfg); err != nil {

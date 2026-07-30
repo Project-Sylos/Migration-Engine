@@ -8,12 +8,15 @@ import (
 	"time"
 
 	spectrafs "codeberg.org/Sylos/Sylos-FS/pkg/fs/spectra"
-	localfs "codeberg.org/Sylos/Sylos-FS/pkg/fs/local"
 	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
 	"codeberg.org/Sylos/Migration-Engine/pkg/scaling"
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/backend"
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/loop"
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/profile"
 )
 
 const defaultAutoscalerInterval = 3 * time.Second
@@ -25,6 +28,8 @@ type AutoscalerConfig struct {
 	Interval          time.Duration
 	OnEvent           func(scaling.ScalingEvent)
 	DebugAIMD         bool // probe cooldown + scale-up diagnostics on stdout
+	// WorkerCapOverrides overlay MaxWorkers after profile resolve (from API/DB or live UI).
+	WorkerCapOverrides profile.WorkerCapOverrides
 }
 
 // DefaultAutoscalerConfig returns enabled autoscaler settings used when none are supplied.
@@ -51,7 +56,7 @@ func (c AutoscalerConfig) Resolve() AutoscalerConfig {
 // autoscalerRunContext holds autoscaler lifecycle for a migration run.
 type autoscalerRunContext struct {
 	cancel context.CancelFunc
-	scaler *scaling.Autoscaler
+	scaler *loop.Autoscaler
 }
 
 func (a *autoscalerRunContext) stop() {
@@ -61,7 +66,7 @@ func (a *autoscalerRunContext) stop() {
 	a.cancel()
 }
 
-func (a *autoscalerRunContext) Autoscaler() *scaling.Autoscaler {
+func (a *autoscalerRunContext) Autoscaler() *loop.Autoscaler {
 	if a == nil {
 		return nil
 	}
@@ -71,14 +76,15 @@ func (a *autoscalerRunContext) Autoscaler() *scaling.Autoscaler {
 func startAutoscaler(
 	ctx context.Context,
 	cfg AutoscalerConfig,
-	observer *queue.QueueObserver,
+	observer *observe.QueueObserver,
 	database *db.DB,
 	srcQueue, dstQueue *queue.Queue,
 	srcService, dstService Service,
 	pathCheckProfile string,
+	windowsCompat bool,
 ) *autoscalerRunContext {
 	same := sameBackend(srcService.Adapter, dstService.Adapter)
-	wireQueueScalingContext(srcQueue, dstQueue, nil, srcService, dstService, same, pathCheckProfile)
+	wireQueueScalingContext(srcQueue, dstQueue, nil, srcService, dstService, same, pathCheckProfile, windowsCompat)
 	return startAutoscalerActuators(ctx, cfg, observer, database, map[string]scaling.QueueActuator{
 		"src": srcQueue,
 		"dst": dstQueue,
@@ -91,17 +97,36 @@ func startAutoscaler(
 func startCopyAutoscaler(
 	ctx context.Context,
 	cfg AutoscalerConfig,
-	observer *queue.QueueObserver,
+	observer *observe.QueueObserver,
 	database *db.DB,
 	copyQueue *queue.Queue,
 	srcService, dstService Service,
 	pathCheckProfile string,
+	windowsCompat bool,
 ) *autoscalerRunContext {
-	wireQueueScalingContext(nil, nil, copyQueue, srcService, dstService, false, pathCheckProfile)
+	wireQueueScalingContext(nil, nil, copyQueue, srcService, dstService, false, pathCheckProfile, windowsCompat)
 	return startAutoscalerActuators(ctx, cfg, observer, database, map[string]scaling.QueueActuator{
 		"copy": copyQueue,
 	}, []autoscalerQueueSpec{
 		{Name: "copy", Service: srcService, InitialWorkers: copyQueue.GetWorkerCount()},
+	}, srcService.Adapter, dstService.Adapter)
+}
+
+func startDeleteAutoscaler(
+	ctx context.Context,
+	cfg AutoscalerConfig,
+	observer *observe.QueueObserver,
+	database *db.DB,
+	deleteQueue *queue.Queue,
+	srcService, dstService Service,
+	pathCheckProfile string,
+	windowsCompat bool,
+) *autoscalerRunContext {
+	wireDeleteQueueScalingContext(deleteQueue, srcService, dstService, pathCheckProfile, windowsCompat)
+	return startAutoscalerActuators(ctx, cfg, observer, database, map[string]scaling.QueueActuator{
+		"delete": deleteQueue,
+	}, []autoscalerQueueSpec{
+		{Name: "delete", Service: srcService, InitialWorkers: deleteQueue.GetWorkerCount()},
 	}, srcService.Adapter, dstService.Adapter)
 }
 
@@ -114,7 +139,7 @@ type autoscalerQueueSpec struct {
 func startAutoscalerActuators(
 	ctx context.Context,
 	cfg AutoscalerConfig,
-	observer *queue.QueueObserver,
+	observer *observe.QueueObserver,
 	database *db.DB,
 	actuators map[string]scaling.QueueActuator,
 	specs []autoscalerQueueSpec,
@@ -140,16 +165,16 @@ func startAutoscalerActuators(
 		dstAdapter = adapters[1]
 	}
 
-	registry := scaling.NewBackendRegistry()
-	profiles := make(map[string]scaling.FSPerformanceProfile, len(specs))
+	registry := backend.NewBackendRegistry()
+	profiles := make(map[string]profile.FSPerformanceProfile, len(specs))
 
 	var srcGroup, dstGroup string
 	for _, spec := range specs {
 		if spec.Name == "src" {
-			srcGroup = scaling.ResolveGroupID(spec.Service.BackendGroupID, "", spec.Name)
+			srcGroup = backend.ResolveGroupID(spec.Service.BackendGroupID, "", spec.Name)
 		}
 		if spec.Name == "dst" {
-			dstGroup = scaling.ResolveGroupID(spec.Service.BackendGroupID, "", spec.Name)
+			dstGroup = backend.ResolveGroupID(spec.Service.BackendGroupID, "", spec.Name)
 		}
 	}
 	if len(adapters) >= 2 && sameBackend(adapters[0], adapters[1]) {
@@ -158,16 +183,16 @@ func startAutoscalerActuators(
 
 	for _, spec := range specs {
 		q := actuators[spec.Name]
-		var profile scaling.FSPerformanceProfile
+		var prof profile.FSPerformanceProfile
 		if q != nil {
 			sctx := q.ScalingContext()
-			profile = scaling.ResolveEffectiveProfile(sctx, srcAdapter, dstAdapter)
+			prof = profile.ResolveEffectiveProfile(sctx, srcAdapter, dstAdapter)
 		} else {
-			profile = scaling.ToActuatorProfile(
-				scaling.LookupOperationProfile(spec.Service.ProviderID, spec.Service.Name, scaling.OpListChildren),
+			prof = profile.ToActuatorProfile(
+				profile.LookupOperationProfile(spec.Service.ProviderID, spec.Service.Name, profile.OpListChildren),
 			)
 		}
-		groupID := scaling.ResolveGroupID(spec.Service.BackendGroupID, "", spec.Name)
+		groupID := backend.ResolveGroupID(spec.Service.BackendGroupID, "", spec.Name)
 		if spec.Name == "dst" && dstGroup != "" {
 			groupID = dstGroup
 		}
@@ -177,27 +202,33 @@ func startAutoscalerActuators(
 		if spec.Name == "copy" {
 			groupID = "queue:copy"
 		}
-		registry.RegisterQueue(spec.Name, groupID, profile, spec.InitialWorkers)
-		profiles[spec.Name] = profile
+		if spec.Name == "delete" {
+			groupID = "queue:delete"
+		}
+		registry.RegisterQueue(spec.Name, groupID, prof, spec.InitialWorkers)
+		profiles[spec.Name] = prof
 	}
 
-	scaler := scaling.NewAutoscaler(database, observer, registry, profiles, actuators, scaling.Config{
+	scaler := loop.NewAutoscaler(database, observer, registry, profiles, actuators, loop.Config{
 		Enabled:   true,
 		Interval:  cfg.Interval,
 		OnEvent:   cfg.OnEvent,
 		DebugAIMD: cfg.DebugAIMD,
-		Adapters: scaling.AdaptersForScaling{
+		Adapters: profile.AdaptersForScaling{
 			Src: srcAdapter,
 			Dst: dstAdapter,
 		},
+		WorkerCapOverrides: cfg.WorkerCapOverrides,
 	})
+	// Apply overlays to the initial registry profiles (NewAutoscaler stores them; refresh on first tick too).
+	scaler.SetWorkerCapOverrides(cfg.WorkerCapOverrides)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	go scaler.Run(runCtx)
 	return &autoscalerRunContext{cancel: cancel, scaler: scaler}
 }
 
-func combinedRateLimitBridge(adapters ...fstypes.FSAdapter) scaling.RateLimitBridge {
+func combinedRateLimitBridge(adapters ...fstypes.FSAdapter) backend.RateLimitBridge {
 	seen := make(map[*fstypes.FSDegradationState]struct{})
 	var states []*fstypes.FSDegradationState
 	for _, adapter := range adapters {
@@ -213,9 +244,9 @@ func combinedRateLimitBridge(adapters ...fstypes.FSAdapter) scaling.RateLimitBri
 		}
 	}
 	if len(states) == 0 {
-		return scaling.RateLimitBridge{}
+		return backend.RateLimitBridge{}
 	}
-	return scaling.RateLimitBridge{
+	return backend.RateLimitBridge{
 		TakeHits: func() int64 {
 			var n int64
 			for _, st := range states {
@@ -237,12 +268,13 @@ func combinedRateLimitBridge(adapters ...fstypes.FSAdapter) scaling.RateLimitBri
 }
 
 func degradationStateFrom(adapter fstypes.FSAdapter) *fstypes.FSDegradationState {
-	if s, ok := adapter.(*spectrafs.SpectraFS); ok {
-		return s.GetDegradationState()
+	if adapter == nil {
+		return nil
 	}
-	if s, ok := adapter.(*localfs.LocalFS); ok {
-		return s.GetDegradationState()
+	if r, ok := adapter.(fstypes.FSDegradationReporter); ok {
+		return r.GetDegradationState()
 	}
+	// Legacy fallback for adapters that expose the bridge method without the full reporter.
 	if r, ok := adapter.(interface{ GetDegradationState() *fstypes.FSDegradationState }); ok {
 		return r.GetDegradationState()
 	}

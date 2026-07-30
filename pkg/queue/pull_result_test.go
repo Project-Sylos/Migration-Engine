@@ -15,29 +15,29 @@ func TestConfirmRoundAdvanceGate(t *testing.T) {
 	q.roundInfoMap[2] = &RoundInfo{Round: 2, PullCount: 1, LastPartialPull: true}
 	q.mu.Unlock()
 
-	if !q.confirmRoundAdvanceGate(2) {
+	if !q.ConfirmRoundAdvanceGate(2) {
 		t.Fatal("expected gate open with empty buffer and terminal pull")
 	}
-	if q.confirmRoundAdvanceGate(1) {
+	if q.ConfirmRoundAdvanceGate(1) {
 		t.Fatal("expected gate closed for stale round arg")
 	}
 
 	q.mu.Lock()
 	q.pendingBuff = append(q.pendingBuff, &TaskBase{ID: "x", Round: 2})
 	q.mu.Unlock()
-	if q.confirmRoundAdvanceGate(2) {
+	if q.ConfirmRoundAdvanceGate(2) {
 		t.Fatal("expected gate closed with pending buffer")
 	}
 }
 
 func TestRoundHasCountedPull(t *testing.T) {
 	q := NewQueue("src", 3, 1, nil, nil)
-	if q.roundHasCountedPull(0) {
+	if q.RoundHasCountedPull(0) {
 		t.Fatal("expected no counted pull before any record")
 	}
-	q.recordPull(0, 0, true)
-	if !q.roundHasCountedPull(0) {
-		t.Fatal("expected counted pull after recordPull")
+	q.RecordPull(0, 0, true)
+	if !q.RoundHasCountedPull(0) {
+		t.Fatal("expected counted pull after RecordPull")
 	}
 }
 

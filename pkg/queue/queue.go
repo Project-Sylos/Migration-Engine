@@ -82,7 +82,7 @@ func effectiveLeaseBatchSize() int {
 }
 
 // getQueueType returns "SRC" for "src", "DST" for "dst", "SRC" for "copy" (copy phase uses SRC table). Returns "" for unknown.
-func getQueueType(queueName string) string {
+func GetQueueType(queueName string) string {
 	switch strings.ToLower(queueName) {
 	case "src":
 		return "SRC"
@@ -98,7 +98,7 @@ func getQueueType(queueName string) string {
 }
 
 // taskToNodeState converts a TaskBase to NodeState for DB writes (e.g. child inserts).
-func taskToNodeState(task *TaskBase) *db.NodeState {
+func TaskToNodeState(task *TaskBase) *db.NodeState {
 	if task == nil {
 		return nil
 	}
@@ -133,7 +133,7 @@ func taskToNodeState(task *TaskBase) *db.NodeState {
 }
 
 // nodeStateToTask converts a NodeState to a traversal TaskBase (src-traversal or dst-traversal).
-func nodeStateToTask(state *db.NodeState, taskType string) *TaskBase {
+func NodeStateToTask(state *db.NodeState, taskType string) *TaskBase {
 	if state == nil {
 		return nil
 	}
@@ -221,10 +221,14 @@ type Queue struct {
 	foldersDiscoveredTotal int64 // Total folders discovered (monotonic counter)
 	// Copy phase metrics tracking
 	bytesTransferredTotal int64 // Total bytes transferred (monotonic counter)
+	bytesFailedTotal      int64 // Eligible file bytes on permanent failure (touched, not transferred)
 	foldersCreatedTotal   int64 // Total folders created (monotonic counter)
 	filesCreatedTotal     int64 // Total files created (monotonic counter)
 	// Tasks completed total: incremented on every success or final failure, pushed to stats on flush
 	tasksCompletedTotal int64
+	// Phase denominators are loaded once before workers start. Observer reads these
+	// in memory; it must never run status/event queries on its polling hot path.
+	workTotals WorkTotals
 	// Keyset cursors for pagination (id > cursor ORDER BY id LIMIT n). Strictly round-scoped per queue; see resetThisQueueKeysetCursor.
 	srcKeysetCursor  string // SRC traversal/retry pull
 	dstKeysetCursor  string // DST traversal/retry pull
@@ -232,7 +236,7 @@ type Queue struct {
 	// traversalCacheLoaded: set on first pull; until true, completion checks are ignored so we don't complete before first pull.
 	traversalCacheLoaded bool
 	// Watchdog for detecting stalled queues
-	watchdog *QueueWatchdog
+	watchdog StallWatchdog
 	// Per-queue sizing (0 = use package defaults via effectiveLeaseBatch / effectiveRefillBatch).
 	leaseBatchSize  int
 	refillBatchSize int
@@ -244,7 +248,8 @@ type Queue struct {
 	scalingSrcGroupID  string
 	scalingDstGroupID  string
 	pathCheckProfile   string // "none" | "auto" | provider id (windows, dropbox, …)
-	spin               spinDownState
+	windowsCompat      bool   // soft-cloud Windows desktop-sync overlays for GPL
+	Spin               SpinDownState
 }
 
 func pendingBuffCapFromLeaseSizing(leaseConfigured int) int {
@@ -289,7 +294,7 @@ func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCo
 // InitializeWithContext sets up the queue with DuckDB, context, and filesystem adapter references.
 // Creates and starts workers immediately - they'll poll for tasks autonomously.
 func (q *Queue) InitializeWithContext(database *db.DB, adapter types.FSAdapter, shutdownCtx context.Context) {
-	q.setDatabase(database)
+	q.SetDatabase(database)
 	q.SetShutdownContext(shutdownCtx)
 	q.initWorkerPool(adapter)
 
@@ -305,9 +310,7 @@ func (q *Queue) InitializeWithContext(database *db.DB, adapter types.FSAdapter, 
 	// Start the queue's Run() method to coordinate pulling tasks and advancing rounds
 	go q.Run()
 
-	// Start queue watchdog to detect stalls
-	q.watchdog = NewQueueWatchdog(q, defaultQueueStallTimeout)
-	q.watchdog.Start()
+	q.attachQueueWatchdog()
 
 	// Queues are initialized - tasks will be seeded externally or propagated through Complete()
 	if logservice.LS != nil {
@@ -321,7 +324,7 @@ func (q *Queue) InitializeWithContext(database *db.DB, adapter types.FSAdapter, 
 // InitializeCopyWithContext sets up a copy queue with both source and destination adapters.
 // This is specifically for copy mode which requires both adapters.
 func (q *Queue) InitializeCopyWithContext(database *db.DB, srcAdapter, dstAdapter types.FSAdapter, shutdownCtx context.Context) {
-	q.setDatabase(database)
+	q.SetDatabase(database)
 	q.SetShutdownContext(shutdownCtx)
 	q.initCopyWorkerPool(srcAdapter, dstAdapter)
 
@@ -336,9 +339,7 @@ func (q *Queue) InitializeCopyWithContext(database *db.DB, srcAdapter, dstAdapte
 	// Start the queue's Run() method to coordinate pulling tasks and advancing rounds
 	go q.Run()
 
-	// Start queue watchdog to detect stalls
-	q.watchdog = NewQueueWatchdog(q, defaultQueueStallTimeout)
-	q.watchdog.Start()
+	q.attachQueueWatchdog()
 
 	// Queues are initialized - tasks will be pulled from copy status buckets
 	if logservice.LS != nil {
@@ -351,7 +352,7 @@ func (q *Queue) InitializeCopyWithContext(database *db.DB, srcAdapter, dstAdapte
 
 // InitializeDeleteWithContext sets up a delete queue with the source adapter only.
 func (q *Queue) InitializeDeleteWithContext(database *db.DB, srcAdapter types.FSAdapter, shutdownCtx context.Context) {
-	q.setDatabase(database)
+	q.SetDatabase(database)
 	q.SetShutdownContext(shutdownCtx)
 	q.initDeleteWorkerPool(srcAdapter)
 
@@ -364,8 +365,7 @@ func (q *Queue) InitializeDeleteWithContext(database *db.DB, srcAdapter types.FS
 	_ = q.SetTargetWorkerCount(workerCount)
 
 	go q.Run()
-	q.watchdog = NewQueueWatchdog(q, defaultQueueStallTimeout)
-	q.watchdog.Start()
+	q.attachQueueWatchdog()
 
 	if logservice.LS != nil {
 		_ = logservice.LS.Log("info", fmt.Sprintf("%s delete queue initialized", strings.ToUpper(q.name)), "queue", q.name, q.name)
@@ -375,6 +375,68 @@ func (q *Queue) InitializeDeleteWithContext(database *db.DB, srcAdapter types.FS
 // Name returns the queue's name.
 func (q *Queue) Name() string {
 	return q.name
+}
+
+// AddDiscoveredTotals increments discovery counters (traversal complete).
+func (q *Queue) AddDiscoveredTotals(files, folders int64) {
+	q.mu.Lock()
+	q.filesDiscoveredTotal += files
+	q.foldersDiscoveredTotal += folders
+	q.mu.Unlock()
+}
+
+// RecordCreatedAndClearInProgress increments created/bytes counters and clears in-progress
+// under one lock (copy success path).
+func (q *Queue) RecordCreatedAndClearInProgress(nodeID string, isFolder, isFile bool, bytes int64) {
+	q.mu.Lock()
+	if isFolder {
+		q.foldersCreatedTotal++
+	} else if isFile {
+		q.filesCreatedTotal++
+		q.bytesTransferredTotal += bytes
+	}
+	delete(q.inProgress, nodeID)
+	q.mu.Unlock()
+}
+
+// RecordCreatedTotals increments created/bytes counters (delete success path).
+func (q *Queue) RecordCreatedTotals(isFolder, isFile bool, bytes int64) {
+	q.mu.Lock()
+	if isFolder {
+		q.foldersCreatedTotal++
+	} else if isFile {
+		q.filesCreatedTotal++
+		q.bytesTransferredTotal += bytes
+	}
+	q.mu.Unlock()
+}
+
+// ScalingSrcProvider returns the configured source provider id for path checks.
+func (q *Queue) ScalingSrcProvider() string {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.scalingSrcProvider
+}
+
+// ScalingDstProvider returns the configured destination provider id for path checks.
+func (q *Queue) ScalingDstProvider() string {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.scalingDstProvider
+}
+
+// PathCheckProfile returns the path-check profile string.
+func (q *Queue) PathCheckProfile() string {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.pathCheckProfile
+}
+
+// WindowsCompat reports whether Windows desktop-sync GPL overlays are enabled.
+func (q *Queue) WindowsCompat() bool {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.windowsCompat
 }
 
 // PossibleStall reports whether the queue watchdog recently detected a stall.
@@ -394,16 +456,6 @@ func (q *Queue) IsExhausted() bool {
 // IsPaused returns true if the queue is paused.
 func (q *Queue) IsPaused() bool {
 	return q.State() == QueueStatePaused
-}
-
-// Pause pauses the queue (workers will not lease new tasks).
-func (q *Queue) Pause() {
-	q.SetState(QueueStatePaused)
-}
-
-// Resume resumes the queue after a pause.
-func (q *Queue) Resume() {
-	q.SetState(QueueStateRunning)
 }
 
 // Lease attempts to lease a task for execution atomically.
@@ -431,7 +483,7 @@ func (q *Queue) LeaseGroup(maxN int) []*TaskBase {
 	out := make([]*TaskBase, 0, maxN)
 	for attempt := 0; attempt < 2 && len(out) < maxN; attempt++ {
 		state := q.State()
-		database := q.getDatabase()
+		database := q.Database()
 		if state == QueueStatePaused || state == QueueStateCompleted || database == nil {
 			break
 		}
@@ -455,7 +507,7 @@ func (q *Queue) LeaseGroup(maxN int) []*TaskBase {
 			}
 			task.Locked = true
 			task.LeaseTime = time.Now()
-			q.addInProgress(nodeID, task)
+			q.AddInProgress(nodeID, task)
 			out = append(out, task)
 		}
 
@@ -513,7 +565,7 @@ func (q *Queue) LeaseGroupBudget(opts LeaseBudgetOpts) []*TaskBase {
 	out := make([]*TaskBase, 0, maxCount)
 	for attempt := 0; attempt < 2 && len(out) < maxCount; attempt++ {
 		state := q.State()
-		database := q.getDatabase()
+		database := q.Database()
 		if state == QueueStatePaused || state == QueueStateCompleted || database == nil {
 			break
 		}
@@ -613,28 +665,28 @@ type CompletionCheckOptions struct {
 	AdvanceRoundIfComplete bool // Advance to next round if current round is complete
 }
 
-// checkCompletion performs completion checks based on the provided options.
+// CheckCompletion performs completion checks based on the provided options.
 // Returns true if queue was marked as completed, false otherwise.
 // please see the docs/algorithms.md file for more information on the completion checking logic.
-func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) bool {
+func (q *Queue) CheckCompletion(currentRound int, opts CompletionCheckOptions) bool {
 	// For traversal/sweep completion check (handles all modes)
 	// Called when first pull returns 0 entries - decides if we're completely done
 	if opts.CheckFinalCompletion {
 		// Soft queue checks: if we have tasks in progress or in buffer, we're not done.
 		// Also wait for any in-flight DB pull: a worker may be past the "empty" snapshot but
 		// not yet enqueued, or may still record stats for a round we are about to leave.
-		if q.InProgressCount() > 0 || q.GetPendingCount() > 0 || q.getPulling() {
+		if q.InProgressCount() > 0 || q.GetPendingCount() > 0 || q.IsPulling() {
 			return false
 		}
 
 		mode := q.GetMode()
 		switch mode {
 		case QueueModeTraversal, QueueModeRetry, QueueModeGPL:
-			return q.CheckTraversalCompletion(currentRound)
+			return q.CheckModeCompletion(ModeTraversal, currentRound)
 		case QueueModeCopy, QueueModeCopyRetry:
-			return q.CheckCopyCompletion(currentRound)
+			return q.CheckModeCompletion(ModeCopy, currentRound)
 		case QueueModeDelete, QueueModeDeleteRetry:
-			return q.CheckDeleteCompletion(currentRound)
+			return q.CheckModeCompletion(ModeDelete, currentRound)
 		}
 		return false
 	}
@@ -669,10 +721,10 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			if !lastPullWasPartial {
 				return false
 			}
-			if q.getPulling() {
+			if q.IsPulling() {
 				return false
 			}
-			info := q.getRoundInfoReadOnly(currentRound)
+			info := q.RoundInfoReadOnly(currentRound)
 			if info == nil || info.PullCount == 0 {
 				return false
 			}
@@ -689,10 +741,10 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			if !lastPullWasPartial {
 				return false
 			}
-			if q.getPulling() {
+			if q.IsPulling() {
 				return false
 			}
-			info := q.getRoundInfoReadOnly(currentRound)
+			info := q.RoundInfoReadOnly(currentRound)
 			if info == nil || info.PullCount == 0 {
 				return false
 			}
@@ -709,10 +761,10 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 			if !lastPullWasPartial {
 				return false
 			}
-			if q.getPulling() {
+			if q.IsPulling() {
 				return false
 			}
-			info := q.getRoundInfoReadOnly(currentRound)
+			info := q.RoundInfoReadOnly(currentRound)
 			if info == nil || info.PullCount == 0 {
 				return false
 			}
@@ -726,10 +778,10 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 		if inProgressCount > 0 || pendingBuffCount > 0 || !lastPullWasPartial {
 			return false
 		}
-		if q.getPulling() {
+		if q.IsPulling() {
 			return false
 		}
-		info := q.getRoundInfoReadOnly(currentRound)
+		info := q.RoundInfoReadOnly(currentRound)
 		if info == nil || info.PullCount == 0 {
 			return false
 		}
@@ -742,9 +794,9 @@ func (q *Queue) checkCompletion(currentRound int, opts CompletionCheckOptions) b
 	return false
 }
 
-// markComplete marks the queue as completed and notifies the coordinator.
+// MarkComplete marks the queue as completed and notifies the coordinator.
 // Returns true if successfully marked complete.
-func (q *Queue) markComplete(format string, args ...any) bool {
+func (q *Queue) MarkComplete(format string, args ...any) bool {
 	state := q.State()
 	if state != QueueStateRunning && state != QueueStateWaiting {
 		return false
@@ -786,15 +838,18 @@ func (q *Queue) markComplete(format string, args ...any) bool {
 	// Durability: flush seal buffer so this queue's work is persisted while the peer queue may still run.
 	// CHECKPOINT is deferred to phase end (traversal/retry/copy complete) so one queue finishing first
 	// does not block the other on a global checkpoint.
-	if database := q.getDatabase(); database != nil {
-		if err := database.FlushSealBuffer(); err != nil {
+	if database := q.Database(); database != nil {
+		finishedDepth := q.GetRound()
+		if err := database.Flush(); err != nil {
 			fmt.Printf("[%s Queue Complete] flush seal buffer: %v\n", q.name, err)
+		} else if err := database.RebuildCurrentByDepth(finishedDepth); err != nil {
+			fmt.Printf("[%s Queue Complete] rebuild current at depth %d: %v\n", q.name, finishedDepth, err)
 		}
 	}
 
 	// Notify coordinator
-	coordinator := q.getCoordinator()
-	queueType := getQueueType(q.name)
+	coordinator := q.Coordinator()
+	queueType := GetQueueType(q.name)
 	if coordinator != nil {
 		switch queueType {
 		case "SRC":
@@ -803,6 +858,8 @@ func (q *Queue) markComplete(format string, args ...any) bool {
 			coordinator.MarkCompleted("dst")
 		}
 	}
+	// Seal any depths now unlocked (especially when DST completes, or SRC completes after DST).
+	q.finalizeCopyWorkOnQueueComplete()
 	return true
 }
 
@@ -827,9 +884,9 @@ func (q *Queue) ReportTaskResult(task *TaskBase, result TaskExecutionResult) {
 
 	switch result {
 	case TaskExecutionResultSuccessful:
-		q.completeTask(task, executionDelta)
+		q.finishTask(task, executionDelta, true)
 	case TaskExecutionResultFailed:
-		q.failTask(task, executionDelta)
+		q.finishTask(task, executionDelta, false)
 	case TaskExecutionResultRateLimited:
 		q.yieldTaskOnRateLimit(task, executionDelta)
 	default:
@@ -860,33 +917,26 @@ func (q *Queue) ReportTaskResult(task *TaskBase, result TaskExecutionResult) {
 	}
 
 	// Check if we need to pull more tasks (if count is below threshold and last pull wasn't partial)
-	pullLowWM := q.getPullLowWM()
+	pullLowWM := q.EffectivePullLowWM()
 	if pendingCount <= pullLowWM && !lastPullWasPartial {
 		q.PullTasksIfNeeded(false)
 	}
 }
 
-// completeTask is the internal implementation for successful task completion.
-func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
+func (q *Queue) finishTask(task *TaskBase, executionDelta time.Duration, success bool) {
 	mode := q.GetMode()
-
-	// Delegate to mode-specific implementation
-	if mode == QueueModeCopy || mode == QueueModeCopyRetry {
-		q.CompleteCopyTask(task, executionDelta)
-		return
+	var kind ModeKind
+	switch mode {
+	case QueueModeCopy, QueueModeCopyRetry:
+		kind = ModeCopy
+	case QueueModeDelete, QueueModeDeleteRetry:
+		kind = ModeDelete
+	case QueueModeGPL:
+		kind = ModeGPL
+	default:
+		kind = ModeTraversal
 	}
-	if mode == QueueModeDelete || mode == QueueModeDeleteRetry {
-		q.CompleteDeleteTask(task, executionDelta)
-		return
-	}
-	if mode == QueueModeGPL {
-		q.CompleteGPLTask(task, executionDelta)
-		return
-	}
-
-	// Traversal and retry modes use the same completion logic
-	q.CompleteTraversalTask(task, executionDelta)
-
+	q.FinishModeTask(kind, task, executionDelta, success)
 }
 
 // childResultToNodeState converts a ChildResult to NodeState using UUID v5 minting.
@@ -894,7 +944,7 @@ func (q *Queue) completeTask(task *TaskBase, executionDelta time.Duration) {
 // The child's path is computed from parentPath + child name to ensure it's always root-relative,
 // regardless of what the filesystem adapter returns in LocationPath.
 // Node ID is MintNodeID(queueType, parentID, type, basename) for race-safe deduplication.
-func childResultToNodeState(child ChildResult, parentPath string, depth int, queueType string, parentID string) *db.NodeState {
+func ChildResultToNodeState(child ChildResult, parentPath string, depth int, queueType string, parentID string) *db.NodeState {
 	// Compute root-relative path from parent path and child name first
 	// (needed for deterministic ID generation)
 	var rootRelativePath string
@@ -981,7 +1031,7 @@ func childResultToNodeState(child ChildResult, parentPath string, depth int, que
 }
 
 func (q *Queue) PullTasksIfNeeded(force bool) PullResult {
-	database := q.getDatabase()
+	database := q.Database()
 	if database == nil {
 		return PullResult{Status: PullAborted}
 	}
@@ -993,41 +1043,19 @@ func (q *Queue) PullTasksIfNeeded(force bool) PullResult {
 	}
 
 	if force {
-		return q.pullTasksOnce(true)
+		return q.PullTasksOnce(true)
 	}
 
 	// Only pull if: queue is running, buffer is low, not already pulling, and last pull wasn't partial
 	lastPullWasPartial := q.GetLastPullWasPartial()
 	pendingCount := q.GetPendingCount()
-	pullLowWM := q.getPullLowWM()
-	pulling := q.getPulling()
+	pullLowWM := q.EffectivePullLowWM()
+	pulling := q.IsPulling()
 	needPull := state == QueueStateRunning && pendingCount <= pullLowWM && !pulling && !lastPullWasPartial
 	if needPull {
-		return q.pullTasksOnce(false)
+		return q.PullTasksOnce(false)
 	}
 	return PullResult{Round: q.GetRound(), Status: PullSkipped}
-}
-
-// failTask is the internal implementation for failed task handling.
-func (q *Queue) failTask(task *TaskBase, executionDelta time.Duration) {
-	mode := q.GetMode()
-
-	// Delegate to mode-specific implementation
-	if mode == QueueModeCopy || mode == QueueModeCopyRetry {
-		q.FailCopyTask(task, executionDelta)
-		return
-	}
-	if mode == QueueModeDelete || mode == QueueModeDeleteRetry {
-		q.FailDeleteTask(task, executionDelta)
-		return
-	}
-	if mode == QueueModeGPL {
-		q.FailGPLTask(task, executionDelta)
-		return
-	}
-
-	// Traversal and retry modes use the same failure logic
-	q.FailTraversalTask(task, executionDelta)
 }
 
 // TotalTracked returns the total number of tasks across all rounds (pending + in-progress).
@@ -1074,7 +1102,7 @@ func (q *Queue) SetStatsChannel(ch chan QueueStats) {
 
 // SetObserver registers this queue with an observer for DuckDB stats publishing.
 // The observer will poll this queue directly for statistics.
-func (q *Queue) SetObserver(observer *QueueObserver) {
+func (q *Queue) SetObserver(observer QueueRegistrar) {
 	if observer != nil {
 		observer.RegisterQueue(q.name, q)
 	}
@@ -1131,6 +1159,16 @@ type RoundStats struct {
 	Failed    int // Tasks failed in this round
 }
 
+// WorkTotals is the immutable denominator snapshot for a copy/delete phase.
+// Migration setup loads it once from sealed stats before the observer starts.
+type WorkTotals struct {
+	Folders int64
+	Files   int64
+	Bytes   int64
+}
+
+func (t WorkTotals) Items() int64 { return t.Folders + t.Files }
+
 // Stats returns current queue statistics.
 type QueueStats struct {
 	Name         string `json:"name,omitempty"`
@@ -1157,12 +1195,6 @@ func (q *Queue) Stats() QueueStats {
 	}
 }
 
-// EnsureRoundExpectedFromStats sets Expected for the current round from the stats bucket (O(1) lookup).
-// Call after SetRound (e.g. on init or resume) so Expected reflects actual pending count and survives restarts.
-func (q *Queue) EnsureRoundExpectedFromStats() {
-	q.setExpectedFromStatsBucket(q.GetRound())
-}
-
 // AddWorker registers a worker with this queue for reference.
 // Workers manage their own lifecycle - this is just for tracking/debugging.
 func (q *Queue) AddWorker(worker Worker) {
@@ -1185,8 +1217,8 @@ func (q *Queue) Close() {
 	}
 }
 
-// recordExecutionTime adds an execution time delta to the buffer and periodically calculates averages.
-func (q *Queue) recordExecutionTime(delta time.Duration) {
+// RecordExecutionTime adds an execution time delta to the buffer and periodically calculates averages.
+func (q *Queue) RecordExecutionTime(delta time.Duration) {
 	if delta <= 0 {
 		return // Skip invalid deltas
 	}
@@ -1220,11 +1252,6 @@ func (q *Queue) calculateAverage() {
 
 	// Clear buffer after calculating average
 	q.clearExecutionTimeDeltas()
-}
-
-// GetExecutionTimeBufferSize returns the current size of the execution time buffer.
-func (q *Queue) GetExecutionTimeBufferSize() int {
-	return len(q.GetExecutionTimeDeltas())
 }
 
 // GetTotalCompleted returns the total number of completed tasks across all rounds.
@@ -1263,7 +1290,7 @@ func (q *Queue) Run() {
 	// OUTER LOOP: Iterate through rounds
 	for {
 		// Check for shutdown
-		shutdownCtx := q.getShutdownCtx()
+		shutdownCtx := q.ShutdownCtx()
 		if shutdownCtx != nil {
 			select {
 			case <-shutdownCtx.Done():
@@ -1273,7 +1300,7 @@ func (q *Queue) Run() {
 		}
 
 		state := q.State()
-		database := q.getDatabase()
+		database := q.Database()
 
 		if database == nil {
 			time.Sleep(100 * time.Millisecond)
@@ -1296,7 +1323,7 @@ func (q *Queue) Run() {
 
 		// Get current round
 		currentRound := q.GetRound()
-		coordinator := q.getCoordinator()
+		coordinator := q.Coordinator()
 
 		// GATE: DST pulls for round N are blocked until SRC is two rounds ahead or done; do not skip the inner loop.
 		if coordinator != nil && q.name == "dst" {
@@ -1352,12 +1379,12 @@ func (q *Queue) Run() {
 			}
 
 			// 1. Check phase completion (pass switch or copy/traversal done)
-			if q.checkCompletion(roundToCheck, CompletionCheckOptions{CheckFinalCompletion: true}) {
+			if q.CheckCompletion(roundToCheck, CompletionCheckOptions{CheckFinalCompletion: true}) {
 				return
 			}
 
 			// Check if the round is complete
-			q.checkCompletion(roundToCheck, CompletionCheckOptions{
+			q.CheckCompletion(roundToCheck, CompletionCheckOptions{
 				CheckRoundComplete:     true,
 				AdvanceRoundIfComplete: true,
 			})
@@ -1380,8 +1407,9 @@ const flushRetryBackoff = 100 * time.Millisecond
 // For copy mode: flush seal buffer then reset cursor and advance.
 // If flush fails after retries, round is not advanced so the observer can retry.
 func (q *Queue) advanceToNextRound() {
-	database := q.getDatabase()
+	database := q.Database()
 	mode := q.GetMode()
+	finishedDepth := q.GetRound()
 
 	if database != nil {
 		var err error
@@ -1389,7 +1417,7 @@ func (q *Queue) advanceToNextRound() {
 			if attempt > 0 {
 				time.Sleep(flushRetryBackoff)
 			}
-			err = database.FlushSealBuffer()
+			err = database.Flush()
 			if err == nil {
 				break
 			}
@@ -1405,6 +1433,15 @@ func (q *Queue) advanceToNextRound() {
 			}
 			return
 		}
+		// Scoped rebuild of review read model for the depth that just finished.
+		if err := database.RebuildCurrentByDepth(finishedDepth); err != nil {
+			if logservice.LS != nil {
+				_ = logservice.LS.Log("error", fmt.Sprintf("aborting round advance: rebuild current at depth %d: %v", finishedDepth, err), "queue", q.name, q.name)
+			} else {
+				fmt.Println("error rebuilding current status before round advance:", err)
+			}
+			return
+		}
 	}
 	q.resetThisQueueKeysetCursor()
 
@@ -1414,13 +1451,13 @@ func (q *Queue) advanceToNextRound() {
 	}
 
 	if mode == QueueModeCopy || mode == QueueModeCopyRetry {
-		q.AdvanceCopyRound()
+		q.AdvanceModeRound(ModeCopy)
 		return
 	}
 	if mode == QueueModeDelete || mode == QueueModeDeleteRetry {
-		q.AdvanceDeleteRound()
+		q.AdvanceModeRound(ModeDelete)
 		return
 	}
 
-	q.AdvanceTraversalRound()
+	q.AdvanceModeRound(ModeTraversal)
 }

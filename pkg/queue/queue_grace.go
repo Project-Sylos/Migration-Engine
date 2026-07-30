@@ -13,19 +13,14 @@ import (
 // of busy FS work (adaptive/p95 grace is a documented follow-up).
 const DefaultSpinDownGrace = 15 * time.Second
 
-// Queue grace / provisional freeze state (embedded conceptually via fields on Queue).
-type spinDownState struct {
-	freeze          atomic.Bool // provisional freeze: SetTargetWorkerCount no-ops
-	abandonDBOnly   atomic.Bool // stop/soft-suspend: checkpoint without requeue
+// Queue grace / provisional freeze state (embedded on Queue as Spin).
+type SpinDownState struct {
+	Freeze          atomic.Bool // provisional freeze: SetTargetWorkerCount no-ops
+	AbandonDBOnly   atomic.Bool // stop/soft-suspend: checkpoint without requeue
 	graceTimer      *time.Timer
 	graceMu         sync.Mutex
 	forceCheckout   sync.Map // worker id string -> struct{}
 	activeLeaseSize sync.Map // worker id string -> int64 (file bytes; 0 for non-file FS work)
-}
-
-// PoolSizeFrozen reports whether SetTargetWorkerCount is gated (provisional freeze).
-func (q *Queue) PoolSizeFrozen() bool {
-	return q.spin.freeze.Load()
 }
 
 // EnterProvisionalFreeze gates scale actuation for d (default 15s). AIMD counters keep accumulating.
@@ -36,34 +31,25 @@ func (q *Queue) EnterProvisionalFreeze(d time.Duration) {
 	if d <= 0 {
 		d = DefaultSpinDownGrace
 	}
-	q.spin.freeze.Store(true)
-	q.spin.graceMu.Lock()
-	if q.spin.graceTimer != nil {
-		q.spin.graceTimer.Stop()
+	q.Spin.Freeze.Store(true)
+	q.Spin.graceMu.Lock()
+	if q.Spin.graceTimer != nil {
+		q.Spin.graceTimer.Stop()
 	}
-	q.spin.graceTimer = time.AfterFunc(d, func() {
+	q.Spin.graceTimer = time.AfterFunc(d, func() {
 		q.forceCheckoutBusyWorkers()
-		if q.spin.abandonDBOnly.Load() {
+		if q.Spin.AbandonDBOnly.Load() {
 			q.CancelBusyWorkerContexts()
 		}
-		q.spin.freeze.Store(false)
+		q.Spin.Freeze.Store(false)
 	})
-	q.spin.graceMu.Unlock()
+	q.Spin.graceMu.Unlock()
 }
 
 // EnterStopAbandonWindow marks abandon-as-DB-only and enters the same provisional freeze.
 func (q *Queue) EnterStopAbandonWindow(d time.Duration) {
-	q.spin.abandonDBOnly.Store(true)
+	q.Spin.AbandonDBOnly.Store(true)
 	q.EnterProvisionalFreeze(d)
-}
-
-// ClearStopAbandonWindow clears DB-only abandon mode after drain completes.
-func (q *Queue) ClearStopAbandonWindow() {
-	q.spin.abandonDBOnly.Store(false)
-}
-
-func (q *Queue) abandonModeForStop() bool {
-	return q.spin.abandonDBOnly.Load()
 }
 
 // SetActiveLeaseSize records the worker's current FS lease for force-checkout tracking.
@@ -75,20 +61,21 @@ func (q *Queue) SetActiveLeaseSize(workerID string, size int64) {
 	if size < 0 {
 		size = 0
 	}
-	q.spin.activeLeaseSize.Store(workerID, size)
+	q.Spin.activeLeaseSize.Store(workerID, size)
 }
 
 // ClearActiveLeaseSize clears lease size tracking when a worker finishes a turn.
 func (q *Queue) ClearActiveLeaseSize(workerID string) {
-	q.spin.activeLeaseSize.Delete(workerID)
-	q.spin.forceCheckout.Delete(workerID)
+	q.Spin.activeLeaseSize.Delete(workerID)
+	q.Spin.forceCheckout.Delete(workerID)
 }
 
-func (q *Queue) forceCheckoutWorker(workerID string) bool {
+// ForceCheckoutWorker reports whether this worker id should abort mid-flight (grace force-checkout).
+func (q *Queue) ForceCheckoutWorker(workerID string) bool {
 	if workerID == "" {
 		return false
 	}
-	_, ok := q.spin.forceCheckout.Load(workerID)
+	_, ok := q.Spin.forceCheckout.Load(workerID)
 	return ok
 }
 
@@ -100,7 +87,7 @@ func (q *Queue) forceCheckoutBusyWorkers() {
 		size int64
 	}
 	var items []item
-	q.spin.activeLeaseSize.Range(func(k, v any) bool {
+	q.Spin.activeLeaseSize.Range(func(k, v any) bool {
 		id, _ := k.(string)
 		size, _ := v.(int64)
 		if id != "" {
@@ -120,7 +107,7 @@ func (q *Queue) forceCheckoutBusyWorkers() {
 		}
 	}
 	for _, it := range items {
-		q.spin.forceCheckout.Store(it.id, struct{}{})
+		q.Spin.forceCheckout.Store(it.id, struct{}{})
 	}
 }
 
@@ -148,14 +135,4 @@ func (q *Queue) CancelBusyWorkerContexts() {
 func (q *Queue) RequestForceCheckoutAllWorkersForStop() {
 	q.forceCheckoutBusyWorkers()
 	q.CancelBusyWorkerContexts()
-}
-
-// RequestForceCheckoutAllFileWorkersForStop is retained for callers; it force-checkouts all FS ops.
-func (q *Queue) RequestForceCheckoutAllFileWorkersForStop() {
-	q.RequestForceCheckoutAllWorkersForStop()
-}
-
-// RequestForceCheckoutForTest marks a worker for cooperative abandon (unit tests).
-func (q *Queue) RequestForceCheckoutForTest(workerID string) {
-	q.spin.forceCheckout.Store(workerID, struct{}{})
 }

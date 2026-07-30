@@ -139,34 +139,17 @@ func (s *migrationStore) withConn(op string, fn func(*sql.DB) error) error {
 	return fn(conn)
 }
 
-func (s *migrationStore) updatePhase(id string, phase string) error {
-	return s.withConn("updatePhase", func(conn *sql.DB) error {
+func (s *migrationStore) updateMigrationField(id, column, value string, op string) error {
+	return s.withConn(op, func(conn *sql.DB) error {
 		_, err := conn.ExecContext(
 			context.Background(),
-			`UPDATE `+db.TableMigrations+` SET phase = $1, updated_at = $2 WHERE migration_id = $3`,
-			phase,
+			`UPDATE `+db.TableMigrations+` SET `+column+` = $1, updated_at = $2 WHERE migration_id = $3`,
+			value,
 			time.Now().UTC(),
 			id,
 		)
 		if err != nil {
-			return fmt.Errorf("update migration %s phase: %w", id, err)
-		}
-		return nil
-	})
-}
-
-// updateName replaces the migration's display name.
-func (s *migrationStore) updateName(id string, name string) error {
-	return s.withConn("updateName", func(conn *sql.DB) error {
-		_, err := conn.ExecContext(
-			context.Background(),
-			`UPDATE `+db.TableMigrations+` SET name = $1, updated_at = $2 WHERE migration_id = $3`,
-			name,
-			time.Now().UTC(),
-			id,
-		)
-		if err != nil {
-			return fmt.Errorf("update migration %s name: %w", id, err)
+			return fmt.Errorf("update migration %s %s: %w", id, column, err)
 		}
 		return nil
 	})
@@ -183,23 +166,6 @@ func (s *migrationStore) updateUpdatedAt(id string) error {
 		)
 		if err != nil {
 			return fmt.Errorf("update migration %s updated_at: %w", id, err)
-		}
-		return nil
-	})
-}
-
-// updateRootConfig replaces root_config_json (serialized run knobs + roots; no FS adapters).
-func (s *migrationStore) updateRootConfig(id string, rootConfigJSON string) error {
-	return s.withConn("updateRootConfig", func(conn *sql.DB) error {
-		_, err := conn.ExecContext(
-			context.Background(),
-			`UPDATE `+db.TableMigrations+` SET root_config_json = $1, updated_at = $2 WHERE migration_id = $3`,
-			rootConfigJSON,
-			time.Now().UTC(),
-			id,
-		)
-		if err != nil {
-			return fmt.Errorf("update migration %s root_config_json: %w", id, err)
 		}
 		return nil
 	})

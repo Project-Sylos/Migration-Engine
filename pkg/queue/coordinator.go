@@ -111,11 +111,11 @@ func (c *QueueCoordinator) WaitSealBackpressure(_ string, round int, database *d
 	if database == nil || round < 0 {
 		return true
 	}
-	if err := database.FlushSealBuffer(); err != nil {
+	if err := database.Flush(); err != nil {
 		fmt.Println("error flushing seal buffer", err)
 		return false
 	}
-	database.WaitUntilSealFlushedThrough(round)
+	database.WaitUntilFlushedThrough(round)
 	return true
 }
 

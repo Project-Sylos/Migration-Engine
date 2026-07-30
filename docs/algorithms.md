@@ -24,6 +24,19 @@ Traversal consists of two distinct but coordinated processes:
 
 Both operate in BFS rounds (levels).
 
+### Root seeding and optional round-0 injection
+
+At **Start discovery** (`AddRoots`), the engine always writes SRC/DST root rows into DuckDB (not earlier). Classic seeding inserts each root as `traversal_status = pending` so workers run **round 0** (`ListChildren` on the root).
+
+When the UI has already reviewed immediate root children (root-pick review), `RootPreparation` is passed into `AddRoots`:
+
+* Prepared side: root is seeded as `traversal_status = successful`, reviewed depth-1 children are inserted (included / excluded / dst-only statuses mirror a finished round 0), and that side's queues **start at round 1**.
+* Unprepared side (for example destination-first with no child review): classic pending root and **round 0**.
+* Source excludes apply only to immediate children of the confirmed root; off-path marks are ignored. Unchecked **folders** get `traversal_status = excluded` (do not walk the subtree; count as one excluded item). Unchecked **files** stay `traversal_status = successful` (listed/injected) with `copy_status = excluded_explicit` so they can be unexcluded later in copy review.
+* Destination never excludes; dst-only children get `traversal_status = not_on_src`.
+
+The `filters-set` phase (between `AddRoots` and `StartTraversal`) is the gate after this seed; root-child preparation fulfills that phase's intent for the first level only. Full-tree excludes remain in awaiting-traversal-review after discovery.
+
 ---
 
 ### Source Traversal (src)
@@ -149,8 +162,14 @@ This guarantees parent directories exist before file writes begin.
 
 All pending files are processed level by level:
 
-* Read/download from source
-* Write/upload to destination
+* Read/download from source (`OpenRead`)
+* Write/upload to destination (`OpenWrite` / optional `OpenWriteWithSize`)
+
+**Byte streaming (required):** ME copies with a small read/write loop (tens of KiB). Destination adapters must accept those writes as a live stream — upload session fragments / parts go out during `Write` (or via a pipe consumer that uploads concurrently). **Do not** stage the whole file in RAM or spill to a temp file and only upload on `Close`. Session start/finish RPCs (e.g. Dropbox upload session) are fine; `Close` should finalize the session, not carry the bulk transfer.
+
+Progress heartbeats: each successful `Write` that moves bytes should allow ME to beat both the per-task progress watchdog and the queue watchdog. Close-only bulk upload looks like a queue stall even when the network is busy.
+
+Optional `FSOpenWriteWithSize` lets adapters that need a declared length up front (e.g. Box chunked sessions) receive `file.Size` on overwrite paths where the pending id has no size.
 
 Because traversal already determined copy eligibility, the copy phase is strictly executional.
 

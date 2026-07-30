@@ -17,38 +17,56 @@ The queue layer drives **source** and **destination** traversal and **copy** usi
 
 Mid-transfer progress is stored on **`src_nodes`** (`xfer_offset`, `xfer_src_size`, `xfer_src_mtime`, `xfer_dst_ref`); **`copy_status` stays `pending`**. Sessions are never handed off: the retiring worker closes its live FS session, persists offset + fingerprint, then either **requeues** to `pendingBuff` (autoscaler scale-down) or leaves **DB-only** (stop / soft-suspend). The next worker opens a **fresh** session and seeks SRC when the destination adapter’s **`FSTransferRestartPolicy`** supports resumable transfer; otherwise ME applies delete-if-required and full restart.
 
+Copy uses a small buffer loop (`OpenRead` → `Write` → … → `Close`). Destination **`OpenWrite` must stream** (fragments/parts during `Write`, or a pipe upload goroutine). ME prefers **`OpenWriteWithSize`** when the adapter implements it so providers that need a declared length (Box sessions) get `file.Size`. Each successful write chunk beats the progress + queue watchdogs so long uploads do not false-stall.
+
 ### Spin-down grace (15s)
 
 On scale-down with busy workers, the queue enters a **provisional freeze**: `SetTargetWorkerCount` no-ops (scale up and down) while AIMD rate-limit counters keep accumulating. After **15s**, all tracked busy **FS leases** are force-checked out (files smallest-first by byte size; non-file work at size 0). File transfers cooperatively checkpoint + requeue; other ops abort via canceled `workerCtx` (batches/list/delete prefer that parent). Soft-suspend uses the same grace, then cancels busy worker contexts and uses DB-only abandon.
 
 ---
 
-## Core components
+## Package map
+
+Same pyramid as `pkg/db`: **children import `queue`; root never imports children**. Migration blank-imports `mode` / `worker` / `observe` so `init()` registers hooks. `gpl` is a leaf helper package (no hooks).
+
+| Package | Role |
+|---------|------|
+| **`pkg/queue`** (root) | `Queue`, coordinator, task types, pull/lease/seal surface, scaling pool, rate-limit / grace / soft-suspend, stall dump, hook registries |
+| **`pkg/queue/mode`** | Mode pull + completion (`PullTraversalTasks`, copy/delete/GPL/retry) |
+| **`pkg/queue/worker`** | Worker loops (traversal / copy / delete / batch) + copy path helpers |
+| **`pkg/queue/observe`** | `QueueObserver`, stall watchdog, `ProgressWatchdog` |
+| **`pkg/queue/gpl`** | Path-linter eval helpers used by mode, worker, and migration sweeps |
+
+Wiring: `RegisterModeHooks` / `RegisterWorkerHooks` / `RegisterObserveHooks`. `pkg/queue` does **not** import `pkg/scaling`; `*Queue` satisfies `scaling.QueueActuator` from migration.
+
+## Core components (root)
 
 | File | Responsibility |
 |------|----------------|
 | `queue.go` | `Queue`, `Run`, round advancement, seal handoff, `Lease`, `ReportTaskResult`, `InitializeWithContext` |
 | `queue_accessors.go` | Thread-safe getters/setters, keyset cursors, traversal “cache loaded” flags |
+| `queue_scaling.go` | **`ScalingContext`**, dynamic worker pool, `SetTargetWorkerCount`, lease/refill/list-page knobs for autoscaler |
 | `queue_batch.go` | `BuildExpectedMapsFromDstWithChildren`, batch expected children for DST |
-| `mode_traversal.go` | `PullTraversalTasks` (DB keyset → tasks) |
-| `mode_retry.go` | `PullRetryTasks`; DST cleanup on SRC folder complete in retry mode |
-| `mode_copy.go` | `PullCopyTasks`, copy completion, `CheckCopyCompletion` |
-| `worker_traversal.go` | List children / compare → `ReportTaskResult` |
-| `worker_copy.go` | Folder/file copy → `ReportTaskResult`; optional dst list precheck when resuming partial copy (one anchor round only) |
-| `worker/interface.go` | `Worker` interface |
+| `queue_lease_batch.go` | Lease batch sizing helpers |
+| `list_fill.go` / `pull_result.go` | List-fill and pull result plumbing |
+| `transfer_checkpoint.go` / `copy_work_finalize.go` | Mid-transfer checkpoint + copy finalize |
+| `dst_match_key.go` | DST child match key / name |
+| `mode_hooks.go` / `worker_hooks.go` / `observe_hooks.go` | Hook registries for child packages |
 | `task.go` | `TaskBase`, task types, `ChildResult` |
 | `seeding.go` | Root seeding helpers used with `pkg/db` |
 | `coordinator.go` | `QueueCoordinator`, `CanDstStartRound`, round tracking for SRC/DST |
-| `observer.go` | Polls stats / queues, writes `queue_stats` |
-| `queue_watchdog.go` / `progress_watchdog.go` | Timeouts / progress |
+| `stall_dump.go` | Stall / completion dump helpers used by observe |
+| `queue_rate_limit.go` | FS throttle tracking surfaced to observer/autoscaler |
+| `queue_grace.go` | Spin-down grace (15s) before force checkout on scale-down |
 | `queue_soft_suspend.go` | Pause-side helpers: stop watchdog, clear pending buffer, wait for in-flight zero |
+| `queue_force_stop.go` | Force-stop / abandon helpers |
 
 ---
 
 ## Modes
 
 - **`QueueModeTraversal`** – Normal BFS; pull pending traversal tasks by depth.
-- **`QueueModeRetry`** – Pending/failed across depths; SRC folder success triggers DST child cleanup (see `mode_retry.go`).
+- **`QueueModeRetry`** – Pending/failed across depths; SRC folder success triggers DST child cleanup (see `mode/mode_retry.go`).
 - **`QueueModeCopy`** / **`QueueModeCopyRetry`** – Copy phase and failed-only retry; pulls by copy status and node type.
 - **`QueueModeDelete`** / **`QueueModeDeleteRetry`** – Reverse-BFS delete; autoscaler uses the **dst** provider’s `delete` operation profile (falls back to that provider’s Default worker count when unset).
 
@@ -81,4 +99,4 @@ The **queue watchdog** treats **`QueueStatePaused`** as non-stall (no dump spam 
 
 - **DB-backed pulls** into `pendingBuff`; **seal** persists levels/stats.
 - **Coordinator** enforces DST lag behind SRC (two-round lead); SRC has no coordinator throttle.
-- **Modes:** traversal, retry, copy, copy-retry.
+- **Modes:** traversal, retry, copy, copy-retry, delete, delete-retry.

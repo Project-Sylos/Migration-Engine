@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"io"
 
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/checkpoint"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -27,17 +27,17 @@ func (q *Queue) PersistTransferCheckpoint(ctx context.Context, task *TaskBase, o
 	if q == nil || task == nil || !task.IsFile() || offset <= 0 {
 		return nil
 	}
-	database := q.getDatabase()
+	database := q.Database()
 	if database == nil {
 		return fmt.Errorf("PersistTransferCheckpoint: no database")
 	}
-	ckpt := db.TransferCheckpoint{
+	ckpt := checkpoint.TransferCheckpoint{
 		Offset:   offset,
 		SrcSize:  task.File.Size,
 		SrcMTime: task.File.LastUpdated,
 		DstRef:   dstRef,
 	}
-	if err := database.UpsertTransferCheckpoint(ctx, task.ID, ckpt); err != nil {
+	if err := checkpoint.UpsertTransferCheckpoint(database, ctx, task.ID, ckpt); err != nil {
 		return err
 	}
 	task.XferOffset = offset
@@ -52,11 +52,11 @@ func (q *Queue) ClearTransferCheckpoint(ctx context.Context, task *TaskBase) err
 	if q == nil || task == nil || task.ID == "" {
 		return nil
 	}
-	database := q.getDatabase()
+	database := q.Database()
 	if database == nil {
 		return nil
 	}
-	if err := database.ClearTransferCheckpoint(ctx, task.ID); err != nil {
+	if err := checkpoint.ClearTransferCheckpoint(database, ctx, task.ID); err != nil {
 		return err
 	}
 	task.XferOffset = 0
@@ -71,11 +71,11 @@ func (q *Queue) LoadTransferCheckpointOntoTask(ctx context.Context, task *TaskBa
 	if q == nil || task == nil || !task.IsFile() {
 		return nil
 	}
-	database := q.getDatabase()
+	database := q.Database()
 	if database == nil {
 		return nil
 	}
-	ckpt, err := database.GetTransferCheckpoint(ctx, task.ID)
+	ckpt, err := checkpoint.GetTransferCheckpoint(database, ctx, task.ID)
 	if err != nil || ckpt == nil {
 		return err
 	}
@@ -94,10 +94,10 @@ func fingerprintMatches(task *TaskBase) bool {
 	return task.XferSrcSize == task.File.Size && task.XferSrcMTime == task.File.LastUpdated
 }
 
-// prepareFileTransferResume applies FS restart policy after lease.
+// PrepareFileTransferResume applies FS restart policy after lease.
 // Returns the byte offset to seek SRC to (0 = full start/restart).
 // dst may be an FSAdapter or any value that implements FSTransferRestartPolicy.
-func prepareFileTransferResume(ctx context.Context, q *Queue, dst any, task *TaskBase) (resumeOffset int64, err error) {
+func PrepareFileTransferResume(ctx context.Context, q *Queue, dst any, task *TaskBase) (resumeOffset int64, err error) {
 	if err := q.LoadTransferCheckpointOntoTask(ctx, task); err != nil {
 		return 0, err
 	}
@@ -121,8 +121,8 @@ func prepareFileTransferResume(ctx context.Context, q *Queue, dst any, task *Tas
 	return 0, nil
 }
 
-// seekReaderTo discards or seeks src to offset. Prefer io.Seeker when available.
-func seekReaderTo(r io.Reader, offset int64) error {
+// SeekReaderTo discards or seeks src to offset. Prefer io.Seeker when available.
+func SeekReaderTo(r io.Reader, offset int64) error {
 	if offset <= 0 {
 		return nil
 	}
@@ -142,13 +142,15 @@ func (q *Queue) AbandonTransferCheckpoint(ctx context.Context, task *TaskBase, o
 		return nil
 	}
 	if offset > 0 && task.IsFile() {
-		if err := q.PersistTransferCheckpoint(ctx, task, offset, dstRef); err != nil {
+		// ProgressWatchdog may have cancelled ctx; persist must still succeed.
+		persistCtx := context.WithoutCancel(ctx)
+		if err := q.PersistTransferCheckpoint(persistCtx, task, offset, dstRef); err != nil {
 			return err
 		}
 	}
 	nodeID := task.ID
 	task.Locked = false
-	q.removeInProgress(nodeID)
+	q.RemoveInProgress(nodeID)
 	if mode == TransferAbandonRequeue {
 		q.Add(task)
 	}

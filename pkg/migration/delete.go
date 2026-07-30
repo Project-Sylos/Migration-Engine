@@ -9,8 +9,12 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/loop"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -28,13 +32,17 @@ type DeletePhaseConfig struct {
 	ShutdownContext      context.Context
 	SoftSuspendRequested func() bool
 	ObserverPollInterval time.Duration
-	OnQueueObserver      func(*queue.QueueObserver)
+	OnQueueObserver      func(*observe.QueueObserver)
+	OnAutoscaler         func(*loop.Autoscaler)
 	Autoscaler           AutoscalerConfig
 	SrcService           Service
+	DstService           Service
+	PathCheckTarget      string
+	WindowsCompat        bool
 }
 
 func findDeleteStartRound(duckDB *db.DB, retry bool) int {
-	maxDepth, err := duckDB.GetMaxDepth("SRC")
+	maxDepth, err := stats.GetMaxDepth(duckDB, "SRC")
 	if err != nil || maxDepth < 1 {
 		return 1
 	}
@@ -44,7 +52,7 @@ func findDeleteStartRound(duckDB *db.DB, retry bool) int {
 	}
 	status := db.DeleteStatusFailed
 	minLevel := -1
-	levels, err := db.GetAllLevels(duckDB, "SRC")
+	levels, err := pull.GetAllLevels(duckDB, "SRC")
 	if err != nil {
 		return maxDepth
 	}
@@ -53,7 +61,7 @@ func findDeleteStartRound(duckDB *db.DB, retry bool) int {
 			continue
 		}
 		for _, nt := range []string{db.NodeTypeFile, db.NodeTypeFolder} {
-			c, err := duckDB.GetDeleteCountAtDepth(level, nt, status, true)
+			c, err := stats.GetDeleteCountAtDepth(duckDB, level, nt, status, true)
 			if err == nil && c > 0 {
 				if minLevel == -1 || level > minLevel {
 					minLevel = level
@@ -94,16 +102,27 @@ func RunDeletePhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 		}
 	}
 
-	deleteQueue := queue.NewQueue("delete", cfg.MaxRetries, cfg.WorkerCount, nil, nil)
+	deleteCtx := scalingContextForDelete(cfg.SrcService, cfg.DstService, queue.QueueModeDelete)
+	sizing := queueSizingForScalingContext(deleteCtx, nil)
+	wc := resolveWorkersForScalingContext(deleteCtx, cfg.WorkerCount, nil)
+	mr := effectiveInt(0, cfg.MaxRetries)
+
+	deleteQueue := queue.NewQueue("delete", mr, wc, nil, sizing)
 	deleteQueue.SetMode(queue.QueueModeDelete)
 	deleteQueue.SetCopyPass(1) // pass 1 = files for delete
 
 	startRound := findDeleteStartRound(duckDB, false)
 	deleteQueue.SetRound(startRound)
-	deleteQueue.EnsureRoundExpectedFromStats()
-	if maxDepth, err := duckDB.GetMaxDepth("SRC"); err == nil {
+	deleteQueue.SetExpectedFromStatsBucket(deleteQueue.GetRound())
+	if maxDepth, err := stats.GetMaxDepth(duckDB, "SRC"); err == nil {
 		deleteQueue.SetMaxKnownDepth(maxDepth)
 	}
+
+	// Freeze delete-work denominators once at phase start (retry must not shrink).
+	if err := stats.SnapshotDeleteWorkAtPhaseStart(duckDB); err != nil {
+		return queue.QueueStats{}, fmt.Errorf("snapshot delete work: %w", err)
+	}
+	seedQueueWorkTotalsFromDB(duckDB, deleteQueue, "delete")
 
 	shutdownCtx := cfg.ShutdownContext
 	if shutdownCtx == nil {
@@ -112,7 +131,7 @@ func RunDeletePhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 	if err := duckDB.BeginTraversalPhase(shutdownCtx); err != nil {
 		return queue.QueueStats{}, fmt.Errorf("begin delete phase: %w", err)
 	}
-	_ = duckDB.FlushSealBuffer()
+	_ = duckDB.Flush()
 	defer func() {
 		_ = duckDB.CheckpointWithRetry(context.Background(), 8)
 	}()
@@ -124,7 +143,7 @@ func RunDeletePhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 	deleteQueue.SetRateLimitTelemetry(rateLimitBridgeForAdapter(cfg.SrcAdapter))
 
 	obsPoll := observerPollFromConfigAndSuspend(cfg.ObserverPollInterval, nil)
-	observer := queue.NewQueueObserver(duckDB, obsPoll)
+	observer := observe.NewQueueObserver(duckDB, obsPoll)
 	observer.Start()
 	defer observer.Stop()
 	if cfg.OnQueueObserver != nil {
@@ -135,6 +154,17 @@ func RunDeletePhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 	if cfg.OnQueueObserver != nil {
 		cfg.OnQueueObserver(observer)
 	}
+
+	runCtx := shutdownCtx
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
+	asCtx := startDeleteAutoscaler(runCtx, cfg.Autoscaler, observer, duckDB, deleteQueue, cfg.SrcService, cfg.DstService, cfg.PathCheckTarget, cfg.WindowsCompat)
+	if cfg.OnAutoscaler != nil {
+		cfg.OnAutoscaler(asCtx.Autoscaler())
+		defer cfg.OnAutoscaler(nil)
+	}
+	defer asCtx.stop()
 
 	seedQueueCountersFromDB(duckDB, deleteQueue, "delete", db.QueueStatsPhaseDelete)
 
@@ -209,7 +239,15 @@ func RunDeleteRetryPhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 	if duckDB == nil {
 		return queue.QueueStats{}, fmt.Errorf("DuckDB must be provided")
 	}
-	deleteQueue := queue.NewQueue("delete", cfg.MaxRetries, cfg.WorkerCount, nil, nil)
+	if cfg.SrcAdapter == nil {
+		return queue.QueueStats{}, fmt.Errorf("source adapter must be provided")
+	}
+	deleteCtx := scalingContextForDelete(cfg.SrcService, cfg.DstService, queue.QueueModeDeleteRetry)
+	sizing := queueSizingForScalingContext(deleteCtx, nil)
+	wc := resolveWorkersForScalingContext(deleteCtx, cfg.WorkerCount, nil)
+	mr := effectiveInt(0, cfg.MaxRetries)
+
+	deleteQueue := queue.NewQueue("delete", mr, wc, nil, sizing)
 	deleteQueue.SetMode(queue.QueueModeDeleteRetry)
 	deleteQueue.SetCopyPass(1)
 	startRound := findDeleteStartRound(duckDB, true)
@@ -217,10 +255,15 @@ func RunDeleteRetryPhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 		return queue.QueueStats{}, nil
 	}
 	deleteQueue.SetRound(startRound)
-	deleteQueue.EnsureRoundExpectedFromStats()
-	if maxDepth, err := duckDB.GetMaxDepth("SRC"); err == nil {
+	deleteQueue.SetExpectedFromStatsBucket(deleteQueue.GetRound())
+	if maxDepth, err := stats.GetMaxDepth(duckDB, "SRC"); err == nil {
 		deleteQueue.SetMaxKnownDepth(maxDepth)
 	}
+	// Idempotent: keeps grand delete totals if already sealed; fills them if missing.
+	if err := stats.SnapshotDeleteWorkAtPhaseStart(duckDB); err != nil {
+		return queue.QueueStats{}, fmt.Errorf("snapshot delete work: %w", err)
+	}
+	seedQueueWorkTotalsFromDB(duckDB, deleteQueue, "delete")
 	shutdownCtx := cfg.ShutdownContext
 	if shutdownCtx == nil {
 		shutdownCtx = context.Background()
@@ -230,12 +273,31 @@ func RunDeleteRetryPhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 	}
 	defer func() { _ = duckDB.EndTraversalPhase() }()
 	deleteQueue.InitializeDeleteWithContext(duckDB, cfg.SrcAdapter, shutdownCtx)
+	deleteQueue.SetRateLimitTelemetry(rateLimitBridgeForAdapter(cfg.SrcAdapter))
 	obsPoll := observerPollFromConfigAndSuspend(cfg.ObserverPollInterval, nil)
-	observer := queue.NewQueueObserver(duckDB, obsPoll)
+	observer := observe.NewQueueObserver(duckDB, obsPoll)
 	observer.Start()
 	defer observer.Stop()
+	if cfg.OnQueueObserver != nil {
+		defer cfg.OnQueueObserver(nil)
+	}
 	observer.RegisterQueue("delete", deleteQueue)
 	deleteQueue.SetObserver(observer)
+	if cfg.OnQueueObserver != nil {
+		cfg.OnQueueObserver(observer)
+	}
+
+	runCtx := shutdownCtx
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
+	asCtx := startDeleteAutoscaler(runCtx, cfg.Autoscaler, observer, duckDB, deleteQueue, cfg.SrcService, cfg.DstService, cfg.PathCheckTarget, cfg.WindowsCompat)
+	if cfg.OnAutoscaler != nil {
+		cfg.OnAutoscaler(asCtx.Autoscaler())
+		defer cfg.OnAutoscaler(nil)
+	}
+	defer asCtx.stop()
+
 	seedQueueCountersFromDB(duckDB, deleteQueue, "delete", db.QueueStatsPhaseDelete)
 	deleteQueue.PullTasksIfNeeded(true)
 	start := time.Now()
