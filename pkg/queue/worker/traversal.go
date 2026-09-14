@@ -4,10 +4,8 @@
 package worker
 
 import (
-	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
-	"codeberg.org/Sylos/Migration-Engine/pkg/queue/gpl"
-	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -16,6 +14,9 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue/gpl"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -68,6 +69,7 @@ func (w *TraversalWorker) shouldRetire() bool {
 // When no work is available or queue is paused, it briefly sleeps before polling again.
 // When queue is exhausted, the worker exits.
 func (w *TraversalWorker) Run() {
+	defer w.queue.NotifyWorkerExit(w.id)
 	if logservice.LS != nil {
 		err := logservice.LS.Log("info", "queue.Worker started", "worker", w.id, w.queueName)
 		if err != nil {
@@ -147,13 +149,14 @@ func (w *TraversalWorker) Run() {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
+		w.queue.BindLeaseOwner(task, w.id)
 
 		setWorkerBusy(w.idle)
 		// Execute the task (check for shutdown during execution if needed)
 		err := w.execute(task)
-		setWorkerIdle(w.idle)
+		markWorkerIdle(w.queue, w.id, w.idle)
 		if errors.Is(err, errTransferAbandoned) {
-			// Scale-down / throttle abort already (or will be) requeued via ReleaseInFlightOnThrottle;
+			// Scale-down abandon requeues via AbandonTransferCheckpoint / cooperative force-checkout;
 			// if still in-progress, yield without failure.
 			if w.queue.HasInProgress(task.ID) {
 				task.Locked = false
@@ -364,10 +367,16 @@ func (w *TraversalWorker) executeDstComparison(task *queue.TaskBase, actualResul
 		} 
 	}
 
+	// Rematch: cleaned/proposed SRC basename → unmatched DST sibling (already_existed + id_map).
+	rematchDSTChildren(task, expectedFolders, actualFolderMap, expectedFolderMap, srcIDMap)
+
 	// Check for extra folders on dst (not on src)
 	for _, actualFolder := range actualResult.Folders {
 		matchKey := queue.DstChildMatchKey(actualFolder.Type, actualFolder.DisplayName, actualFolder.LocationPath)
 		if _, exists := expectedFolderMap[matchKey]; !exists {
+			if rematchedDSTKey(task, matchKey) {
+				continue
+			}
 			// Folder exists on dst but not src: mark as "NotOnSrc"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, queue.ChildResult{
 				Folder: actualFolder,
@@ -409,10 +418,16 @@ func (w *TraversalWorker) executeDstComparison(task *queue.TaskBase, actualResul
 		} 
 	}
 
+	// Rematch cleaned SRC file basenames onto unmatched DST siblings.
+	rematchDSTChildrenFiles(task, expectedFiles, actualFileMap, expectedFileMap, srcIDMap)
+
 	// Check for extra files on dst (not on src)
 	for _, actualFile := range actualResult.Files {
 		matchKey := queue.DstChildMatchKey(actualFile.Type, actualFile.DisplayName, actualFile.LocationPath)
 		if _, exists := expectedFileMap[matchKey]; !exists {
+			if rematchedDSTKey(task, matchKey) {
+				continue
+			}
 			// File exists on dst but not src: mark as "not_on_src"
 			task.DiscoveredChildren = append(task.DiscoveredChildren, queue.ChildResult{
 				File:   actualFile,
@@ -424,6 +439,161 @@ func (w *TraversalWorker) executeDstComparison(task *queue.TaskBase, actualResul
 	}
 
 	return nil
+}
+
+func rematchedDSTKey(task *queue.TaskBase, matchKey string) bool {
+	if task == nil {
+		return false
+	}
+	for _, c := range task.DiscoveredChildren {
+		if c.SrcID == "" {
+			continue
+		}
+		if c.IsFile {
+			if queue.DstChildMatchKey(c.File.Type, c.File.DisplayName, c.File.LocationPath) == matchKey {
+				return true
+			}
+			continue
+		}
+		if queue.DstChildMatchKey(c.Folder.Type, c.Folder.DisplayName, c.Folder.LocationPath) == matchKey {
+			return true
+		}
+	}
+	return false
+}
+
+func rematchDSTChildren(task *queue.TaskBase, expectedFolders []types.Folder, actualFolderMap map[string]types.Folder, expectedFolderMap map[string]types.Folder, srcIDMap map[string]string) {
+	if task == nil || len(expectedFolders) == 0 || len(actualFolderMap) == 0 {
+		return
+	}
+	matchedSrc := make(map[string]struct{})
+	usedDST := make(map[string]struct{})
+	for _, c := range task.DiscoveredChildren {
+		if c.SrcID != "" {
+			matchedSrc[c.SrcID] = struct{}{}
+		}
+		if !c.IsFile {
+			usedDST[queue.DstChildMatchKey(c.Folder.Type, c.Folder.DisplayName, c.Folder.LocationPath)] = struct{}{}
+		}
+	}
+	for _, expectedFolder := range expectedFolders {
+		exactKey := queue.DstChildMatchKey(expectedFolder.Type, expectedFolder.DisplayName, expectedFolder.LocationPath)
+		srcID := srcIDMap[exactKey]
+		if srcID == "" {
+			continue
+		}
+		if _, ok := matchedSrc[srcID]; ok {
+			continue
+		}
+		if _, exists := actualFolderMap[exactKey]; exists {
+			continue
+		}
+		clean := proposedCleanForSRC(task, srcID, queue.DstChildMatchName(expectedFolder.DisplayName, expectedFolder.LocationPath))
+		if clean == "" || clean == queue.DstChildMatchName(expectedFolder.DisplayName, expectedFolder.LocationPath) {
+			continue
+		}
+		rematchKey := queue.DstChildMatchKey(expectedFolder.Type, clean, "")
+		if _, taken := expectedFolderMap[rematchKey]; taken {
+			continue
+		}
+		if _, used := usedDST[rematchKey]; used {
+			continue
+		}
+		actual, ok := actualFolderMap[rematchKey]
+		if !ok {
+			continue
+		}
+		task.DiscoveredChildren = append(task.DiscoveredChildren, queue.ChildResult{
+			Folder:        actual,
+			Status:        db.StatusPending,
+			IsFile:        false,
+			SrcID:         srcID,
+			SrcCopyStatus: db.CopyStatusAlreadyExisted,
+		})
+		matchedSrc[srcID] = struct{}{}
+		usedDST[rematchKey] = struct{}{}
+	}
+}
+
+func rematchDSTChildrenFiles(task *queue.TaskBase, expectedFiles []types.File, actualFileMap map[string]types.File, expectedFileMap map[string]types.File, srcIDMap map[string]string) {
+	if task == nil || len(expectedFiles) == 0 || len(actualFileMap) == 0 {
+		return
+	}
+	matchedSrc := make(map[string]struct{})
+	usedDST := make(map[string]struct{})
+	for _, c := range task.DiscoveredChildren {
+		if c.SrcID != "" {
+			matchedSrc[c.SrcID] = struct{}{}
+		}
+		if c.IsFile {
+			usedDST[queue.DstChildMatchKey(c.File.Type, c.File.DisplayName, c.File.LocationPath)] = struct{}{}
+		}
+	}
+	for _, expectedFile := range expectedFiles {
+		exactKey := queue.DstChildMatchKey(expectedFile.Type, expectedFile.DisplayName, expectedFile.LocationPath)
+		srcID := srcIDMap[exactKey]
+		if srcID == "" {
+			continue
+		}
+		if _, ok := matchedSrc[srcID]; ok {
+			continue
+		}
+		if _, exists := actualFileMap[exactKey]; exists {
+			continue
+		}
+		clean := proposedCleanForSRC(task, srcID, queue.DstChildMatchName(expectedFile.DisplayName, expectedFile.LocationPath))
+		if clean == "" || clean == queue.DstChildMatchName(expectedFile.DisplayName, expectedFile.LocationPath) {
+			continue
+		}
+		rematchKey := queue.DstChildMatchKey(expectedFile.Type, clean, "")
+		if _, taken := expectedFileMap[rematchKey]; taken {
+			continue
+		}
+		if _, used := usedDST[rematchKey]; used {
+			continue
+		}
+		actual, ok := actualFileMap[rematchKey]
+		if !ok {
+			continue
+		}
+		srcCopyStatus := db.CopyStatusPending
+		switch compareTimestamps(expectedFile.LastUpdated, actual.LastUpdated) {
+		case "Successful":
+			srcCopyStatus = db.CopyStatusAlreadyExisted
+		case "Unparseable":
+			if expectedFile.Size > 0 && expectedFile.Size == actual.Size {
+				srcCopyStatus = db.CopyStatusAlreadyExisted
+			}
+		}
+		task.DiscoveredChildren = append(task.DiscoveredChildren, queue.ChildResult{
+			File:          actual,
+			Status:        db.StatusSuccessful,
+			IsFile:        true,
+			SrcID:         srcID,
+			SrcCopyStatus: srcCopyStatus,
+		})
+		matchedSrc[srcID] = struct{}{}
+		usedDST[rematchKey] = struct{}{}
+	}
+}
+
+func proposedCleanForSRC(task *queue.TaskBase, srcID, basename string) string {
+	if task == nil || srcID == "" {
+		return ""
+	}
+	meta, ok := task.ExpectedSrcNodeMeta[srcID]
+	if !ok || meta.GPLState == "" {
+		return ""
+	}
+	var payload db.GPLStatePayload
+	if err := json.Unmarshal([]byte(meta.GPLState), &payload); err != nil {
+		return ""
+	}
+	if clean := payload.Part.ProposedClean; clean != "" {
+		return clean
+	}
+	_ = basename
+	return ""
 }
 
 // compareTimestamps compares src and dst timestamps for copy skip decisions.

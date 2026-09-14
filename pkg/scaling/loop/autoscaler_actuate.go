@@ -227,9 +227,6 @@ func (a *Autoscaler) stepDownSharedGroup(groupID string, queues []string, intern
 			if err := q.SetTargetWorkerCount(target); err != nil {
 				continue
 			}
-			if a.lastClass == scaling.PressureFSThrottle {
-				q.ReleaseInFlightOnThrottle()
-			}
 			if a.debugAIMD {
 				a.debugAIMDPrint(fmt.Sprintf("  aimd decrease [%s]: workers %d->%d (group split)", name, cur, target))
 			}
@@ -319,9 +316,6 @@ func (a *Autoscaler) stepDownIndependentQueue(name string, q scaling.QueueActuat
 	if target < cur {
 		if err := q.SetTargetWorkerCount(target); err != nil {
 			return
-		}
-		if a.lastClass == scaling.PressureFSThrottle {
-			q.ReleaseInFlightOnThrottle()
 		}
 		cause := "PRESSURE"
 		switch a.lastClass {

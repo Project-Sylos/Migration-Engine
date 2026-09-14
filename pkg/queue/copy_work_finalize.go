@@ -11,7 +11,8 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 )
 
-// FinalizeCopyWorkAfterTraversalRoundAdvance seals copy-work for the round that just finished.
+// FinalizeCopyWorkAfterTraversalRoundAdvance catches up copy-work progress stats for the round
+// that just finished. This is not catalog indexing; Badger secondary indexes ride node insert.
 //
 // SRC and DST are decoupled:
 //   - SRC: append discovery totals for child depth (= newRound) — potential copy work.

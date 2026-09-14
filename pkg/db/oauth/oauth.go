@@ -14,7 +14,7 @@ import (
 const oauthCredsEncryptedPrefix = "enc:v1:"
 
 // SealOAuthCredentials stores OAuth credential JSON. When tokenKey is nil, plaintext JSON is returned for tests.
-// Production API opens pass the per-migration 32-byte key from sylos.duckdb.
+// Production passes the per-migration 32-byte key from sylos.duckdb.
 func SealOAuthCredentials(plaintextJSON []byte, tokenKey []byte) (string, error) {
 	if len(tokenKey) == 0 {
 		return string(plaintextJSON), nil
@@ -30,9 +30,13 @@ func SealOAuthCredentials(plaintextJSON []byte, tokenKey []byte) (string, error)
 }
 
 // OpenOAuthCredentials returns OAuth credential JSON from a stored row value.
-// Plaintext legacy rows (no enc:v1: prefix) are returned as-is when tokenKey is nil or for backward compatibility.
+// A row must be encrypted whenever a token key is configured; plaintext is only
+// valid in the keyless mode used by tests.
 func OpenOAuthCredentials(stored string, tokenKey []byte) ([]byte, error) {
 	if !strings.HasPrefix(stored, oauthCredsEncryptedPrefix) {
+		if len(tokenKey) > 0 {
+			return nil, fmt.Errorf("oauth credentials are not encrypted but a token key is configured")
+		}
 		return []byte(stored), nil
 	}
 	if len(tokenKey) == 0 {

@@ -30,7 +30,9 @@ type DeletePhaseConfig struct {
 	StartupDelay         time.Duration
 	ProgressTick         time.Duration
 	ShutdownContext      context.Context
+	ResumeDelete         *RuntimeSuspendV1
 	SoftSuspendRequested func() bool
+	ReportStopProgress   func(step string, inProgress int)
 	ObserverPollInterval time.Duration
 	OnQueueObserver      func(*observe.QueueObserver)
 	OnAutoscaler         func(*loop.Autoscaler)
@@ -46,15 +48,15 @@ func findDeleteStartRound(duckDB *db.DB, retry bool) int {
 	if err != nil || maxDepth < 1 {
 		return 1
 	}
-	// Delete sweeps maxDepth down to 1; depth 0 (root) is metadata-only and never processed.
+	// Delete sweeps depth 1 → maxDepth; depth 0 (root) is metadata-only and never processed.
 	if !retry {
-		return maxDepth
+		return 1
 	}
 	status := db.DeleteStatusFailed
 	minLevel := -1
 	levels, err := pull.GetAllLevels(duckDB, "SRC")
 	if err != nil {
-		return maxDepth
+		return 1
 	}
 	for _, level := range levels {
 		if level == 0 {
@@ -63,7 +65,7 @@ func findDeleteStartRound(duckDB *db.DB, retry bool) int {
 		for _, nt := range []string{db.NodeTypeFile, db.NodeTypeFolder} {
 			c, err := stats.GetDeleteCountAtDepth(duckDB, level, nt, status, true)
 			if err == nil && c > 0 {
-				if minLevel == -1 || level > minLevel {
+				if minLevel == -1 || level < minLevel {
 					minLevel = level
 				}
 			}
@@ -75,7 +77,7 @@ func findDeleteStartRound(duckDB *db.DB, retry bool) int {
 	return minLevel
 }
 
-// RunDeletePhase runs the delete phase (reverse BFS, global passes: files then folders, depths max→1; depth 0 root excluded).
+// RunDeletePhase runs the delete phase (forward BFS, global passes: folders then files, depths 1→max; depth 0 root excluded).
 func RunDeletePhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 	duckDB := cfg.DuckDB
 	if duckDB == nil {
@@ -97,7 +99,7 @@ func RunDeletePhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 				time.Sleep(startupDelay)
 			}
 		}
-		if err := logservice.InitGlobalLogger(duckDB, cfg.LogAddress, cfg.LogLevel); err != nil {
+		if err := logservice.InitGlobalLogger(duckDB.LogsDBForWrite(), cfg.LogAddress, cfg.LogLevel); err != nil {
 			return queue.QueueStats{}, fmt.Errorf("failed to initialize logger: %w", err)
 		}
 	}
@@ -109,10 +111,19 @@ func RunDeletePhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 
 	deleteQueue := queue.NewQueue("delete", mr, wc, nil, sizing)
 	deleteQueue.SetMode(queue.QueueModeDelete)
-	deleteQueue.SetCopyPass(1) // pass 1 = files for delete
+	deleteQueue.SetCopyPass(1) // pass 1 = folders for delete (recursive)
 
 	startRound := findDeleteStartRound(duckDB, false)
+	if cfg.ResumeDelete != nil && cfg.ResumeDelete.LastKnownDeleteRound > 0 {
+		startRound = cfg.ResumeDelete.LastKnownDeleteRound
+	}
+	if cfg.ResumeDelete != nil && cfg.ResumeDelete.CopyPass > 0 {
+		deleteQueue.SetCopyPass(cfg.ResumeDelete.CopyPass)
+	}
 	deleteQueue.SetRound(startRound)
+	if cfg.ResumeDelete != nil && cfg.ResumeDelete.CopyKeysetCursor != "" {
+		deleteQueue.SetKeysetCursor(cfg.ResumeDelete.CopyKeysetCursor)
+	}
 	deleteQueue.SetExpectedFromStatsBucket(deleteQueue.GetRound())
 	if maxDepth, err := stats.GetMaxDepth(duckDB, "SRC"); err == nil {
 		deleteQueue.SetMaxKnownDepth(maxDepth)
@@ -131,12 +142,22 @@ func RunDeletePhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 	if err := duckDB.BeginTraversalPhase(shutdownCtx); err != nil {
 		return queue.QueueStats{}, fmt.Errorf("begin delete phase: %w", err)
 	}
-	_ = duckDB.Flush()
+	_ = duckDB.Flush(context.Background())
+	bulkPhaseClosed := false
+	skipDurableTeardown := false
 	defer func() {
+		if bulkPhaseClosed || skipDurableTeardown {
+			return
+		}
 		_ = duckDB.CheckpointWithRetry(context.Background(), 8)
 	}()
 	defer func() {
-		_ = duckDB.EndTraversalPhase()
+		if bulkPhaseClosed || skipDurableTeardown {
+			return
+		}
+		if err := duckDB.EndTraversalPhase(); err != nil {
+			fmt.Println("error ending delete phase", err)
+		}
 	}()
 
 	deleteQueue.InitializeDeleteWithContext(duckDB, cfg.SrcAdapter, shutdownCtx)
@@ -192,9 +213,9 @@ func RunDeletePhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 					continue
 				}
 				deletePass := deleteQueue.GetCopyPass()
-				passName := "files"
+				passName := "folders"
 				if deletePass == 2 {
-					passName = "folders"
+					passName = "files"
 				}
 				roundStats := deleteQueue.GetRoundStats(lastStats.Round)
 				expected, completed := 0, 0
@@ -206,8 +227,9 @@ func RunDeletePhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 				inProgress := deleteQueue.InProgressCount()
 				lastPartial := deleteQueue.GetLastPullWasPartial()
 				workers := deleteQueue.GetWorkerCount()
-				fmt.Printf("\r  Delete: Pass %d (%s) Depth %d | Exp:%d Comp:%d | Pend:%d InProg:%d | Partial:%v Workers:%d   ",
-					deletePass, passName, lastStats.Round, expected, completed, pending, inProgress, lastPartial, workers)
+				fmt.Printf("\r  Delete: Pass %d (%s) Depth %d | Exp:%d Comp:%d | Pend:%d InProg:%d | Partial:%v Workers:%d%s   ",
+					deletePass, passName, lastStats.Round, expected, completed, pending, inProgress, lastPartial, workers,
+					FormatCatalogSyncSuffix(duckDB))
 			}
 		}
 	}()
@@ -219,14 +241,53 @@ func RunDeletePhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 		if shutdownCtx != nil {
 			select {
 			case <-shutdownCtx.Done():
-				return deleteQueue.Stats(), fmt.Errorf("delete phase force-stopped")
+				skipDurableTeardown = true
+				abandonQueuesDBOnly(deleteQueue)
+				duckDB.AbortTraversalPhase()
+				return deleteQueue.Stats(), fmt.Errorf("migration force stopped during %s", "delete")
 			default:
 			}
+		}
+		if cfg.SoftSuspendRequested != nil && cfg.SoftSuspendRequested() {
+			waitCtx, cancel := softSuspendWaitContext(cfg.ShutdownContext)
+			stats, suspend, err := performDeleteSoftSuspend(waitCtx, duckDB, deleteQueue, observer, cfg, wc, mr)
+			cancel()
+			if forceStopOverridesSoftSuspend(cfg.ShutdownContext, duckDB) {
+				skipDurableTeardown = true
+				abandonQueuesDBOnly(deleteQueue)
+				duckDB.AbortTraversalPhase()
+				return deleteQueue.Stats(), fmt.Errorf("migration force stopped during %s", "delete")
+			}
+			if err != nil {
+				return stats, fmt.Errorf("delete soft suspend: %w", err)
+			}
+			setDetail := func(d string) {
+				if observer != nil {
+					observer.SetWaitReason(d)
+				}
+			}
+			bulkPhaseClosed = true
+			finishCtx := cfg.ShutdownContext
+			if finishCtx == nil {
+				finishCtx = context.Background()
+			}
+			if err := finishSoftStopBulkPhase(finishCtx, duckDB, cfg.ReportStopProgress, setDetail); err != nil {
+				if forceStopOverridesSoftSuspend(cfg.ShutdownContext, duckDB) {
+					skipDurableTeardown = true
+					abandonQueuesDBOnly(deleteQueue)
+					duckDB.AbortTraversalPhase()
+					return deleteQueue.Stats(), fmt.Errorf("migration force stopped during %s", "delete")
+				}
+				return stats, fmt.Errorf("delete soft suspend teardown: %w", err)
+			}
+			fmt.Print("\n")
+			return stats, newDeleteSuspendedError(stats, suspend)
 		}
 		if deleteQueue.IsExhausted() {
 			progressTicker.Stop()
 			fmt.Print("\n")
 			fmt.Printf("\nDelete phase complete! Duration: %v\n", time.Since(start))
+			bulkPhaseClosed = true
 			return deleteQueue.Stats(), nil
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -271,7 +332,22 @@ func RunDeleteRetryPhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 	if err := duckDB.BeginTraversalPhase(shutdownCtx); err != nil {
 		return queue.QueueStats{}, err
 	}
-	defer func() { _ = duckDB.EndTraversalPhase() }()
+	bulkPhaseClosed := false
+	skipDurableTeardown := false
+	defer func() {
+		if bulkPhaseClosed || skipDurableTeardown {
+			return
+		}
+		_ = duckDB.CheckpointWithRetry(context.Background(), 8)
+	}()
+	defer func() {
+		if bulkPhaseClosed || skipDurableTeardown {
+			return
+		}
+		if err := duckDB.EndTraversalPhase(); err != nil {
+			fmt.Println("error ending delete phase", err)
+		}
+	}()
 	deleteQueue.InitializeDeleteWithContext(duckDB, cfg.SrcAdapter, shutdownCtx)
 	deleteQueue.SetRateLimitTelemetry(rateLimitBridgeForAdapter(cfg.SrcAdapter))
 	obsPoll := observerPollFromConfigAndSuspend(cfg.ObserverPollInterval, nil)
@@ -302,8 +378,53 @@ func RunDeleteRetryPhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 	deleteQueue.PullTasksIfNeeded(true)
 	start := time.Now()
 	for {
+		if shutdownCtx != nil {
+			select {
+			case <-shutdownCtx.Done():
+				skipDurableTeardown = true
+				abandonQueuesDBOnly(deleteQueue)
+				duckDB.AbortTraversalPhase()
+				return deleteQueue.Stats(), fmt.Errorf("migration force stopped during %s", "delete retry")
+			default:
+			}
+		}
+		if cfg.SoftSuspendRequested != nil && cfg.SoftSuspendRequested() {
+			waitCtx, cancel := softSuspendWaitContext(cfg.ShutdownContext)
+			stats, suspend, err := performDeleteSoftSuspend(waitCtx, duckDB, deleteQueue, observer, cfg, wc, mr)
+			cancel()
+			if forceStopOverridesSoftSuspend(cfg.ShutdownContext, duckDB) {
+				skipDurableTeardown = true
+				abandonQueuesDBOnly(deleteQueue)
+				duckDB.AbortTraversalPhase()
+				return deleteQueue.Stats(), fmt.Errorf("migration force stopped during %s", "delete retry")
+			}
+			if err != nil {
+				return stats, fmt.Errorf("delete soft suspend: %w", err)
+			}
+			setDetail := func(d string) {
+				if observer != nil {
+					observer.SetWaitReason(d)
+				}
+			}
+			bulkPhaseClosed = true
+			finishCtx := cfg.ShutdownContext
+			if finishCtx == nil {
+				finishCtx = context.Background()
+			}
+			if err := finishSoftStopBulkPhase(finishCtx, duckDB, cfg.ReportStopProgress, setDetail); err != nil {
+				if forceStopOverridesSoftSuspend(cfg.ShutdownContext, duckDB) {
+					skipDurableTeardown = true
+					abandonQueuesDBOnly(deleteQueue)
+					duckDB.AbortTraversalPhase()
+					return deleteQueue.Stats(), fmt.Errorf("migration force stopped during %s", "delete retry")
+				}
+				return stats, fmt.Errorf("delete soft suspend teardown: %w", err)
+			}
+			return stats, newDeleteSuspendedError(stats, suspend)
+		}
 		if deleteQueue.IsExhausted() {
 			fmt.Printf("\nDelete retry complete! Duration: %v\n", time.Since(start))
+			bulkPhaseClosed = true
 			return deleteQueue.Stats(), nil
 		}
 		time.Sleep(100 * time.Millisecond)

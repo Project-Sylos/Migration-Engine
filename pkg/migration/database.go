@@ -10,28 +10,26 @@ import (
 	"strings"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
 	_ "codeberg.org/Sylos/Migration-Engine/pkg/queue/mode"
 	_ "codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
 	_ "codeberg.org/Sylos/Migration-Engine/pkg/queue/worker"
 )
 
-// DatabaseConfig defines how the migration engine opens a DuckDB file for a run or test.
+// DatabaseConfig defines how the migration engine opens a per-migration store for a run or test.
 type DatabaseConfig struct {
-	// Path is the DuckDB file for this migration (e.g. {migrationDir}/{id}.db).
+	// Path is the logical migration path (e.g. {migrationDir}/{id}.db); ops live in {id}.ops/.
 	Path string
-	// EncryptionKey enables DuckDB native encryption; nil keeps plaintext (tests).
+	// EncryptionKey is unused for Badger ops (kept for API compatibility).
 	EncryptionKey []byte
-	// RemoveExisting deletes the database file if it already exists before creating a new database.
+	// RemoveExisting deletes legacy *.db marker and ops dir when set before creating a new migration.
 	RemoveExisting bool
 	// RequireOpen determines whether the DB instance must already be open (true) or can be auto-opened (false).
-	// When true (API mode): DB instance must be provided and already open, error if nil/closed.
-	// When false (standalone mode): Can auto-open DB if instance is nil or not open.
 	RequireOpen bool
+	// MemoryLimitGB is a host memory hint (GB). 0 = auto from free RAM.
+	MemoryLimitGB int
 }
 
 // MigrationDirAndIDFromDBPath splits a migration DB file path into its folder and migration id.
-// For /data/migration-1/migration-1.db returns (/data/migration-1, migration-1).
 func MigrationDirAndIDFromDBPath(dbPath string) (migrationDir, migrationID string) {
 	abs, err := filepath.Abs(dbPath)
 	if err != nil {
@@ -40,14 +38,29 @@ func MigrationDirAndIDFromDBPath(dbPath string) (migrationDir, migrationID strin
 	return filepath.Dir(abs), strings.TrimSuffix(filepath.Base(abs), ".db")
 }
 
-// MigrationDBPath returns the per-migration DB path when the API passes the folder for that migration.
-// migrationDir is the absolute path to the migration's folder (e.g. data/migration-123); the DB file is migrationDir/{migrationID}.db.
+// MigrationDBPath returns the per-migration logical DB path under the migration folder.
 func MigrationDBPath(migrationDir, migrationID string) string {
 	return filepath.Join(migrationDir, migrationID+".db")
 }
 
-// SetupDatabase opens a DuckDB database at cfg.Path. Returns the DB and whether it was fresh (true if new or removed).
-// The caller is responsible for closing the database when done.
+// MigrationStorageExists reports whether a migration has on-disk state (*.db marker or *.ops dir).
+func MigrationStorageExists(migrationDir, migrationID string) bool {
+	absDir, err := filepath.Abs(migrationDir)
+	if err != nil {
+		absDir = migrationDir
+	}
+	dbPath := MigrationDBPath(absDir, migrationID)
+	if info, err := os.Stat(dbPath); err == nil && !info.IsDir() {
+		return true
+	}
+	opsPath := db.MigrationOpsPath(dbPath)
+	if info, err := os.Stat(opsPath); err == nil && info.IsDir() {
+		return true
+	}
+	return false
+}
+
+// SetupDatabase opens the Badger ops store at cfg.Path.
 func SetupDatabase(cfg DatabaseConfig) (*db.DB, bool, error) {
 	if cfg.Path == "" {
 		return nil, false, fmt.Errorf("database path cannot be empty")
@@ -58,25 +71,27 @@ func SetupDatabase(cfg DatabaseConfig) (*db.DB, bool, error) {
 		if err := os.Remove(cfg.Path); err != nil && !os.IsNotExist(err) {
 			return nil, false, fmt.Errorf("failed to remove database file %s: %w", cfg.Path, err)
 		}
+		opsDir := db.MigrationOpsPath(cfg.Path)
+		if err := os.RemoveAll(opsDir); err != nil {
+			return nil, false, fmt.Errorf("failed to remove ops dir %s: %w", opsDir, err)
+		}
 		wasFresh = true
 	} else {
-		if _, err := os.Stat(cfg.Path); os.IsNotExist(err) {
+		opsDir := db.MigrationOpsPath(cfg.Path)
+		if _, err := os.Stat(opsDir); os.IsNotExist(err) {
 			wasFresh = true
 		}
 	}
 
 	opts := db.DefaultOptions()
 	opts.Path = cfg.Path
+	opts.OpsDir = db.MigrationOpsPath(cfg.Path)
 	opts.EncryptionKey = cfg.EncryptionKey
-	opts.SealBuffer = &db.SealBufferOptions{} // async seal with default interval/threshold
+	opts.MemoryLimitGB = cfg.MemoryLimitGB
+	opts.SealBuffer = &db.SealBufferOptions{}
 	database, err := db.Open(opts)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to open database %s: %w", cfg.Path, err)
 	}
-
-	// Secondary indexes on node and status-event tables are not created here: BeginTraversalPhase
-	// drops them before bulk inserts, and EndTraversalPhase (or EnsureBulkPhaseSecondaryIndexes
-	// after retry) recreates a minimal set (nodes: parent_id+depth; events: id+event_time only).
-	// Creating them at open would be redundant for new migrations and wasted work before the first phase.
 	return database, wasFresh, nil
 }

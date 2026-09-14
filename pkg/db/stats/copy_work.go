@@ -5,11 +5,11 @@ package stats
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"strings"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
 // ReadSealedWorkTotals reads O(1) sealed work cumulatives for the given stats keys.
@@ -31,78 +31,89 @@ func ReadSealedWorkTotals(database *db.DB, foldersKey, filesKey, bytesKey, genKe
 	return out, nil
 }
 
-// GetWorkCreditedAtDepth returns net SUM of append-only work deltas for depth in the given round-stats table.
+// GetWorkCreditedAtDepth returns net SUM of append-only work deltas for depth.
 func GetWorkCreditedAtDepth(database *db.DB, table string, depth int) (db.DepthWorkAbsolute, error) {
-	var out db.DepthWorkAbsolute
-	conn, err := database.GetDB()
-	if err != nil {
-		return out, err
+	prefix := "copy"
+	if table == db.TableDeleteWorkRoundStats {
+		prefix = "delete"
 	}
-	ctx := context.Background()
-	err = conn.QueryRowContext(ctx, `SELECT
-  COALESCE(SUM(folders), 0)::BIGINT,
-  COALESCE(SUM(files), 0)::BIGINT,
-  COALESCE(SUM(bytes), 0)::BIGINT
-FROM `+table+` WHERE depth = $1`, depth).Scan(&out.Folders, &out.Files, &out.Bytes)
-	return out, err
+	return workCreditedAtDepthOps(database, depth, prefix)
 }
 
 func getCopyWorkCreditedAtDepthByReasonPrefix(database *db.DB, depth int, prefix string) (db.DepthWorkAbsolute, error) {
-	var out db.DepthWorkAbsolute
-	conn, err := database.GetDB()
-	if err != nil {
-		return out, err
-	}
-	ctx := context.Background()
-	err = conn.QueryRowContext(ctx, `SELECT
-  COALESCE(SUM(folders), 0)::BIGINT,
-  COALESCE(SUM(files), 0)::BIGINT,
-  COALESCE(SUM(bytes), 0)::BIGINT
-FROM `+db.TableCopyWorkRoundStats+`
-WHERE depth = $1 AND reason LIKE $2`, depth, prefix+"%").Scan(&out.Folders, &out.Files, &out.Bytes)
-	return out, err
+	return workCreditedAtDepthOps(database, depth, prefix)
 }
 
-// GetCopyDiscoveredAtDepth returns SRC nodes at depth that count as potential copy work
-// until DST AE-corrects. Excluded (root-pick / review) nodes are omitted so they never
-// enter copy_work denominators.
+func workCreditedAtDepthOps(database *db.DB, depth int, prefix string) (db.DepthWorkAbsolute, error) {
+	var out db.DepthWorkAbsolute
+	if database == nil || database.Ops() == nil {
+		return out, fmt.Errorf("ops store required")
+	}
+	ops := database.Ops()
+	var err error
+	if out.Folders, err = ops.GetDepthStat(opsdb.SideSRC, depth, "cwcred/"+prefix+"/folders"); err != nil {
+		return out, err
+	}
+	if out.Files, err = ops.GetDepthStat(opsdb.SideSRC, depth, "cwcred/"+prefix+"/files"); err != nil {
+		return out, err
+	}
+	if out.Bytes, err = ops.GetDepthStat(opsdb.SideSRC, depth, "cwcred/"+prefix+"/bytes"); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+var copyDiscoveredStatuses = []string{
+	db.CopyStatusPending,
+	db.CopyStatusAlreadyExisted,
+	db.CopyStatusSuccessful,
+	db.CopyStatusFailed,
+	db.CopyStatusSkipped,
+}
+
+var copyEligibleStatuses = []string{
+	db.CopyStatusPending,
+	db.CopyStatusSuccessful,
+	db.CopyStatusFailed,
+}
+
+func copyWorkAbsoluteFromSrcStats(database *db.DB, depth int, statuses []string) (db.DepthWorkAbsolute, error) {
+	var out db.DepthWorkAbsolute
+	if len(statuses) == 0 || database == nil || database.Ops() == nil {
+		return out, nil
+	}
+	ops := database.Ops()
+	for _, st := range statuses {
+		fk := db.StatsKeyTyped(db.StatsKindCopy, st, db.NodeTypeFolder)
+		n, err := ops.GetDepthStat(opsdb.SideSRC, depth, fk)
+		if err != nil {
+			return out, err
+		}
+		out.Folders += n
+		fileK := db.StatsKeyTyped(db.StatsKindCopy, st, db.NodeTypeFile)
+		n, err = ops.GetDepthStat(opsdb.SideSRC, depth, fileK)
+		if err != nil {
+			return out, err
+		}
+		out.Files += n
+		byteK := db.StatsKeyCopyFileBytes(st)
+		n, err = ops.GetDepthStat(opsdb.SideSRC, depth, byteK)
+		if err != nil {
+			return out, err
+		}
+		out.Bytes += n
+	}
+	return out, nil
+}
+
+// GetCopyDiscoveredAtDepth returns SRC nodes at depth that count as potential copy work.
 func GetCopyDiscoveredAtDepth(database *db.DB, depth int) (db.DepthWorkAbsolute, error) {
-	var out db.DepthWorkAbsolute
-	conn, err := database.GetDB()
-	if err != nil {
-		return out, err
-	}
-	ctx := context.Background()
-	err = conn.QueryRowContext(ctx, `SELECT
-  COUNT(*) FILTER (WHERE n.type = 'folder')::BIGINT,
-  COUNT(*) FILTER (WHERE n.type = 'file')::BIGINT,
-  COALESCE(SUM(CASE WHEN n.type = 'file' THEN n.size ELSE 0 END), 0)::BIGINT
-FROM `+db.TableSrcNodes+` n
-LEFT JOIN `+db.CTESrcCurrentStatus+` cur ON n.id = cur.id
-WHERE n.depth = $1
-  AND COALESCE(cur.copy_status,'') NOT IN `+db.SQLCopyStatusExcludedIN, depth).
-		Scan(&out.Folders, &out.Files, &out.Bytes)
-	return out, err
+	return copyWorkAbsoluteFromSrcStats(database, depth, copyDiscoveredStatuses)
 }
 
-// GetCopyAlreadyExistedAtDepth returns SRC nodes at depth whose latest copy_status is already_existed.
+// GetCopyAlreadyExistedAtDepth returns SRC nodes at depth with copy_status already_existed.
 func GetCopyAlreadyExistedAtDepth(database *db.DB, depth int) (db.DepthWorkAbsolute, error) {
-	var out db.DepthWorkAbsolute
-	conn, err := database.GetDB()
-	if err != nil {
-		return out, err
-	}
-	ctx := context.Background()
-	err = conn.QueryRowContext(ctx, `SELECT
-  COUNT(*) FILTER (WHERE n.type = 'folder')::BIGINT,
-  COUNT(*) FILTER (WHERE n.type = 'file')::BIGINT,
-  COALESCE(SUM(CASE WHEN n.type = 'file' THEN n.size ELSE 0 END), 0)::BIGINT
-FROM `+db.TableSrcNodes+` n
-LEFT JOIN `+db.CTESrcCurrentStatus+` cur ON n.id = cur.id
-WHERE n.depth = $1
-  AND COALESCE(cur.copy_status,'') = $2`, depth, db.CopyStatusAlreadyExisted).
-		Scan(&out.Folders, &out.Files, &out.Bytes)
-	return out, err
+	return copyWorkAbsoluteFromSrcStats(database, depth, []string{db.CopyStatusAlreadyExisted})
 }
 
 func workRoundStatsTable(kind db.StatsKind) string {
@@ -119,28 +130,46 @@ func workRoundStatsKeys(kind db.StatsKind) (foldersKey, filesKey, bytesKey, genK
 	return db.StatsKeyCopyWorkFolders, db.StatsKeyCopyWorkFiles, db.StatsKeyCopyWorkBytes, db.StatsKeyCopyWorkGen
 }
 
-// GetWorkEligibleAtDepth returns absolute copy- or delete-work eligible counts/sizes at one SRC depth.
-func GetWorkEligibleAtDepth(database *db.DB, kind db.StatsKind, depth int) (db.DepthWorkAbsolute, error) {
+func deleteWorkAbsoluteFromSrcStats(database *db.DB, depth int, statuses []string) (db.DepthWorkAbsolute, error) {
 	var out db.DepthWorkAbsolute
-	conn, err := database.GetDB()
-	if err != nil {
-		return out, err
+	if len(statuses) == 0 || database == nil || database.Ops() == nil {
+		return out, nil
 	}
-	ctx := context.Background()
-	err = conn.QueryRowContext(ctx, `SELECT
-  COUNT(*) FILTER (WHERE n.type = 'folder')::BIGINT,
-  COUNT(*) FILTER (WHERE n.type = 'file')::BIGINT,
-  COALESCE(SUM(CASE WHEN n.type = 'file' THEN n.size ELSE 0 END), 0)::BIGINT
-FROM `+db.TableSrcNodes+` n
-LEFT JOIN `+db.CTESrcCurrentStatus+` cur ON n.id = cur.id
-WHERE n.depth = $1
-  AND `+workStatusWhere(kind, SelectedEligible), depth).
-		Scan(&out.Folders, &out.Files, &out.Bytes)
-	return out, err
+	ops := database.Ops()
+	for _, st := range statuses {
+		fk := db.StatsKeyTyped(db.StatsKindDelete, st, db.NodeTypeFolder)
+		n, err := ops.GetDepthStat(opsdb.SideSRC, depth, fk)
+		if err != nil {
+			return out, err
+		}
+		out.Folders += n
+		fileK := db.StatsKeyTyped(db.StatsKindDelete, st, db.NodeTypeFile)
+		n, err = ops.GetDepthStat(opsdb.SideSRC, depth, fileK)
+		if err != nil {
+			return out, err
+		}
+		out.Files += n
+		if byteK := db.StatsKeyDeleteFileBytes(st); byteK != "" {
+			n, err = ops.GetDepthStat(opsdb.SideSRC, depth, byteK)
+			if err != nil {
+				return out, err
+			}
+			out.Bytes += n
+		}
+	}
+	return out, nil
 }
 
-// SealSrcCopyWorkDiscovered appends a catch-up delta so SRC discovery rows at depth match
-// absolute discovered node counts. Idempotent across retries (delta 0 when already caught up).
+// GetWorkEligibleAtDepth returns absolute copy- or delete-work eligible counts/sizes at one SRC depth.
+func GetWorkEligibleAtDepth(database *db.DB, kind db.StatsKind, depth int) (db.DepthWorkAbsolute, error) {
+	if kind != db.StatsKindDelete {
+		return copyWorkAbsoluteFromSrcStats(database, depth, copyEligibleStatuses)
+	}
+	return deleteWorkAbsoluteFromSrcStats(database, depth, deletePopulationStatuses(SelectedEligible))
+}
+
+// SealSrcCopyWorkDiscovered appends a progress-stat catch-up delta so SRC discovery rows at depth
+// match absolute counts. This is not catalog indexing; secondary indexes ride node insert.
 func SealSrcCopyWorkDiscovered(database *db.DB, depth int, reason string) (db.DepthWorkAbsolute, error) {
 	if reason == "" || !strings.HasPrefix(reason, "src_discover") {
 		reason = db.CopyWorkReasonSrcDiscover
@@ -164,8 +193,7 @@ func SealSrcCopyWorkDiscovered(database *db.DB, depth int, reason string) (db.De
 	return delta, nil
 }
 
-// SealDstCopyWorkAlreadyExistedCorrection appends a catch-up delta so DST correction rows at
-// depth sum to -already_existed. Idempotent: re-sealing the same AE set yields delta 0.
+// SealDstCopyWorkAlreadyExistedCorrection appends a catch-up delta for DST AE correction.
 func SealDstCopyWorkAlreadyExistedCorrection(database *db.DB, depth int, reason string) (db.DepthWorkAbsolute, error) {
 	if reason == "" || !strings.HasPrefix(reason, "dst_ae_correction") {
 		reason = db.CopyWorkReasonDstAECorrection
@@ -178,7 +206,6 @@ func SealDstCopyWorkAlreadyExistedCorrection(database *db.DB, depth int, reason 
 	if err != nil {
 		return db.DepthWorkAbsolute{}, err
 	}
-	// Target correction sum is -ae; delta brings currentCorr to that target.
 	target := db.DepthWorkAbsolute{Folders: -ae.Folders, Files: -ae.Files, Bytes: -ae.Bytes}
 	delta := depthWorkDeltaSigned(target, currentCorr)
 	if delta.Folders == 0 && delta.Files == 0 && delta.Bytes == 0 {
@@ -221,6 +248,19 @@ func depthWorkDeltaSigned(absolute, credited db.DepthWorkAbsolute) db.DepthWorkA
 	}
 }
 
+func workCreditReasonPrefix(reason string) string {
+	switch {
+	case strings.HasPrefix(reason, "src_discover"):
+		return "src_discover"
+	case strings.HasPrefix(reason, "dst_ae_correction"):
+		return "dst_ae_correction"
+	case strings.HasPrefix(reason, "delete") || reason == db.DeleteWorkReasonPhaseStart:
+		return "delete"
+	default:
+		return "copy"
+	}
+}
+
 func appendWorkDelta(
 	database *db.DB,
 	table string,
@@ -229,28 +269,37 @@ func appendWorkDelta(
 	reason string,
 	foldersKey, filesKey, bytesKey, genKey string,
 ) error {
+	if database == nil || database.Ops() == nil {
+		return fmt.Errorf("ops store required")
+	}
 	if reason == "" {
 		reason = "unspecified"
 	}
-	return database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			ctx := context.Background()
-			_, err := w.Tx().ExecContext(ctx,
-				`INSERT INTO `+table+` (depth, folders, files, bytes, reason) VALUES ($1, $2, $3, $4, $5)`,
-				depth, delta.Folders, delta.Files, delta.Bytes, reason,
-			)
-			if err != nil {
-				return fmt.Errorf("append %s: %w", table, err)
-			}
-			deltas := []db.ReviewStatsDelta{
-				{Key: foldersKey, Delta: delta.Folders},
-				{Key: filesKey, Delta: delta.Files},
-				{Key: bytesKey, Delta: delta.Bytes},
-				{Key: genKey, Delta: 1},
-			}
-			return w.ApplyReviewStatsDeltas(deltas)
-		})
-	})
+	prefix := workCreditReasonPrefix(reason)
+	depthDeltas := []opsdb.DepthCounterDelta{
+		{Side: opsdb.SideSRC, Depth: depth, Key: "cwcred/" + prefix + "/folders", Delta: delta.Folders},
+		{Side: opsdb.SideSRC, Depth: depth, Key: "cwcred/" + prefix + "/files", Delta: delta.Files},
+		{Side: opsdb.SideSRC, Depth: depth, Key: "cwcred/" + prefix + "/bytes", Delta: delta.Bytes},
+	}
+	reviewDeltas := []struct {
+		key   string
+		delta int64
+	}{
+		{foldersKey, delta.Folders},
+		{filesKey, delta.Files},
+		{bytesKey, delta.Bytes},
+		{genKey, 1},
+	}
+	reviewKeys := make([]string, 0, len(reviewDeltas))
+	reviewVals := make([]int64, 0, len(reviewDeltas))
+	for _, d := range reviewDeltas {
+		if d.key == "" || d.delta == 0 {
+			continue
+		}
+		reviewKeys = append(reviewKeys, d.key)
+		reviewVals = append(reviewVals, d.delta)
+	}
+	return database.Ops().ApplyReviewAndDepth(reviewKeys, reviewVals, depthDeltas)
 }
 
 type SealCopyWorkDepthFn func(database *db.DB, depth int, reason string) (db.DepthWorkAbsolute, error)
@@ -274,9 +323,7 @@ func SealCopyWorkThroughDepth(
 	return nil
 }
 
-// AdjustCopyWorkForReview applies a signed folder/file/byte delta from path-review
-// exclude/unexclude so sealed copy_work/* stays aligned with the selected plan.
-// Depth is recorded as -1 (review-wide, not a traversal round). No-op when delta is zero.
+// AdjustCopyWorkForReview applies a signed folder/file/byte delta from path-review exclude/unexclude.
 func AdjustCopyWorkForReview(database *db.DB, delta db.DepthWorkAbsolute, reason string) error {
 	if delta.Folders == 0 && delta.Files == 0 && delta.Bytes == 0 {
 		return nil
@@ -289,7 +336,6 @@ func AdjustCopyWorkForReview(database *db.DB, delta db.DepthWorkAbsolute, reason
 }
 
 // SnapshotDeleteWorkAtPhaseStart seals delete-eligible work for all SRC depths once.
-// Safe to call again: signed catch-up only appends when absolute changed.
 func SnapshotDeleteWorkAtPhaseStart(database *db.DB) error {
 	maxDepth, err := GetMaxDepth(database, "SRC")
 	if err != nil {
@@ -306,43 +352,8 @@ func SnapshotDeleteWorkAtPhaseStart(database *db.DB) error {
 	return nil
 }
 
-// RehydrateCopyWorkCumulativesFromRounds rebuilds copy_work/* keys from the append-only table.
+// RehydrateCopyWorkCumulativesFromRounds is a no-op; Badger maintains copy_work counters inline.
 func RehydrateCopyWorkCumulativesFromRounds(database *db.DB) error {
-	conn, err := database.GetDB()
-	if err != nil {
-		return err
-	}
-	ctx := context.Background()
-	var folders, files, bytes sql.NullInt64
-	err = conn.QueryRowContext(ctx, `SELECT
-  COALESCE(SUM(folders), 0)::BIGINT,
-  COALESCE(SUM(files), 0)::BIGINT,
-  COALESCE(SUM(bytes), 0)::BIGINT
-FROM `+db.TableCopyWorkRoundStats).Scan(&folders, &files, &bytes)
-	if err != nil {
-		return err
-	}
-	return database.RunWrite(ctx, func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			pairs := []struct {
-				key   string
-				count int64
-			}{
-				{db.StatsKeyCopyWorkFolders, folders.Int64},
-				{db.StatsKeyCopyWorkFiles, files.Int64},
-				{db.StatsKeyCopyWorkBytes, bytes.Int64},
-			}
-			for _, p := range pairs {
-				_, err := w.Tx().ExecContext(ctx,
-					`INSERT INTO `+db.TableStats+` (key, count) VALUES ($1, $2)
-					 ON CONFLICT (key) DO UPDATE SET count = excluded.count`,
-					p.key, p.count,
-				)
-				if err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-	})
+	_ = context.Background()
+	return nil
 }

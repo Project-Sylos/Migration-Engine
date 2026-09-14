@@ -61,7 +61,7 @@ func runTest() error {
 		for i := 0; i < 4; i++ {
 			tr.Record("ListChildren", "EIO", workers, now.Add(time.Duration(i)*5*time.Millisecond))
 		}
-		src.InjectBeforeOp(func(operation string, attempt int) error {
+		src.SetInjectBeforeOp(func(operation string, attempt int) error {
 			if operation == "ListChildren" && attempt == 1 {
 				return fmt.Errorf("read dir: %w", syscall.EIO)
 			}

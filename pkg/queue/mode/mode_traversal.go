@@ -10,14 +10,16 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/failurelog"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
+	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue/gpl"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
 // PullTraversalTasks refills the queue from DuckDB for the current round (ID-offset pagination, ~10K batch).
-// SRC: ListNodesByDepthKeyset; DST: ListDstBatchWithSrcChildren (join for expected children). Pushed directly to queue.
+// SRC: ListNodesPendingAtDepthKeyset (folders from *_current); DST: ListDstBatchWithSrcChildren.
 func PullTraversalTasks(q *queue.Queue, force bool) queue.PullResult {
 	database := q.Database()
 	if database == nil {
@@ -56,11 +58,19 @@ func PullTraversalTasks(q *queue.Queue, force bool) queue.PullResult {
 	}
 
 	batchSize := q.EffectiveRefillBatchSize()
-	requestLimit := batchSize + 1
 	var count int
 	if q.Name() == "dst" {
 		afterID := q.GetKeysetCursor()
-		dstBatch, childrenByDstID, lastScannedID, err := pull.ListDstBatchWithSrcChildren(database, currentRound, afterID, requestLimit, db.StatusPending)
+		taskQuota := batchSize + 1
+		childQuota := q.EffectiveDstPullChildQuota(batchSize)
+		q.BeginDBPull()
+		pullStart := time.Now()
+		dstBatch, childrenByDstID, srcParentDeleteByDstID, lastEnqueuedID, exhausted, err := pull.ListDstBatchWithSrcChildrenQuota(database, currentRound, afterID, pull.DstPullQuota{
+			MaxTasks:    taskQuota,
+			MaxChildren: childQuota,
+		}, db.StatusPending)
+		q.RecordDBPull(len(dstBatch), time.Since(pullStart))
+		q.ReleaseDBPull()
 		if err != nil {
 			if q.GetRound() != currentRound {
 				return queue.PullResult{Round: currentRound, QueriedDB: true, Status: queue.PullStaleRound}
@@ -90,28 +100,33 @@ func PullTraversalTasks(q *queue.Queue, force bool) queue.PullResult {
 					task.ExpectedFiles = expectedFilesMap[fr.Key]
 					task.ExpectedSrcIDMap = srcIDMap[fr.Key]
 					task.ExpectedSrcNodeMeta = srcIDToMeta
+					task.SrcParentDeleteStatus = srcParentDeleteByDstID[fr.Key]
 				}
 				_ = q.Add(task)
 				count++
 			}
 		}
 		if processLimit > 0 && processLimit < len(dstBatch) {
-			// requestLimit peek row was not enqueued — do not skip it on the next pull.
 			q.SetKeysetCursor(dstBatch[processLimit-1].Key)
-		} else if lastScannedID != "" {
-			q.SetKeysetCursor(lastScannedID)
+		} else if lastEnqueuedID != "" {
+			q.SetKeysetCursor(lastEnqueuedID)
 		} else if processLimit > 0 {
 			q.SetKeysetCursor(dstBatch[processLimit-1].Key)
 		}
-		partial := len(dstBatch) <= batchSize
+		partial := exhausted && len(dstBatch) <= batchSize
 		q.SetLastPullWasPartial(partial)
 		q.RecordPull(currentRound, count, partial)
 		q.SetFirstPullForRound(false)
 		return queue.PullResult{Round: currentRound, Yield: count, Partial: partial, QueriedDB: true, Status: queue.PullOK}
 	} else {
+		requestLimit := batchSize + 1
 		afterID := q.GetKeysetCursor()
 		queueType := queue.GetQueueType(q.Name())
-		results, err := pull.ListNodesByDepthKeyset(database, queueType, currentRound, afterID, db.StatusPending, requestLimit)
+		q.BeginDBPull()
+		pullStart := time.Now()
+		results, err := pull.ListNodesPendingAtDepthKeyset(database, queueType, currentRound, afterID, requestLimit, db.NodeTypeFolder)
+		q.RecordDBPull(len(results), time.Since(pullStart))
+		q.ReleaseDBPull()
 		if err != nil {
 			if q.GetRound() != currentRound {
 				return queue.PullResult{Round: currentRound, QueriedDB: true, Status: queue.PullStaleRound}
@@ -163,11 +178,6 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 	nodeID := task.ID
 
 	task.Locked = false
-	task.Status = "successful"
-
-	q.IncrementRoundStatsCompleted(currentRound)
-	q.IncrementTasksCompletedTotal()
-	q.RecordTaskCompletion(currentRound, true)
 
 	// Update discovery counters (thread-safe)
 	totalChildren := len(task.DiscoveredChildren)
@@ -181,31 +191,25 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 				foldersCount++
 			}
 		}
-		q.AddDiscoveredTotals(int64(filesCount), int64(foldersCount))
+	}
+	markTraversalComplete := func() {
+		task.Status = "successful"
+		q.IncrementRoundStatsCompleted(currentRound)
+		q.IncrementTasksCompletedTotal()
+		q.RecordTaskCompletion(currentRound, true)
+		if totalChildren > 0 {
+			q.AddDiscoveredTotals(int64(filesCount), int64(foldersCount))
+		}
 	}
 
 	database := q.Database()
 	if database == nil {
+		markTraversalComplete()
 		q.RemoveInProgress(nodeID)
 		return
 	}
 
 	queueType := queue.GetQueueType(q.Name())
-
-	// Convert task to NodeState for DuckDB
-	state := queue.TaskToNodeState(task)
-	if state == nil {
-		if logservice.LS != nil {
-			err := logservice.LS.Log("error",
-				fmt.Sprintf("Complete() called with task that couldn't be converted to NodeState: %v", task),
-				"queue", q.Name(), q.Name())
-			if err != nil {
-				fmt.Println("error logging", err)
-			}
-		}
-		q.RemoveInProgress(nodeID)
-		return
-	}
 
 	nextRound := currentRound + 1
 
@@ -216,6 +220,10 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 	// Collect discovered children for insertion
 	// Deterministic IDs based on (queueType, nodeType, path) ensure no duplicates -
 	// the same logical node will always get the same ID, making this race-safe
+	parentDisplayPath := task.DisplayPath
+	if parentDisplayPath == "" && currentRound == 0 {
+		parentDisplayPath = filter.RootDisplayPath()
+	}
 	for _, child := range task.DiscoveredChildren {
 		// For DST queues, skip folder children here - they'll be handled separately
 		if queueType == "DST" && !child.IsFile {
@@ -229,13 +237,31 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 			continue
 		}
 
+		if queueType == "SRC" {
+			allow := queue.ParseIncludeOnlyJSON(task.IncludeOnlyJSON)
+			sid := child.File.ServiceID
+			if !child.IsFile {
+				sid = child.Folder.ServiceID
+			}
+			if !queue.ChildAllowedByIncludeOnly(allow, sid) {
+				continue
+			}
+		}
+
 		// Populate traversal status in the NodeState metadata
 		childState.TraversalStatus = child.Status
+		childState.Status = child.Status
+
+		if queueType == "SRC" {
+			queue.StampDisplayPath(parentDisplayPath, currentRound, childState)
+		} else {
+			childState.DisplayPath = filter.DisplayPathForChild(parentDisplayPath, currentRound, childState.Name)
+		}
 
 		childNodesToInsert = append(childNodesToInsert, db.InsertOperation{
 			QueueType: queueType,
 			Level:     nextRound,
-			Status:    child.Status,
+			Status:    childState.TraversalStatus,
 			State:     childState,
 		})
 
@@ -264,19 +290,9 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 		}
 
 		for _, child := range childFolders {
-			// Compute root-relative path first (needed for deterministic ID generation)
-			var rootRelativePath string
-			if parentPath == "/" {
-				// Child of root folder
-				rootRelativePath = "/" + child.folder.DisplayName
-			} else {
-				// Child of non-root folder
-				rootRelativePath = types.NormalizeLocationPath(parentPath + "/" + child.folder.DisplayName)
-			}
-
-			// Generate deterministic ID from logical identity (queueType, nodeType, path)
-			// This eliminates duplicate logical nodes and makes traversal race-safe
+			// Generate deterministic ID from (queueType, parentID, nodeType, basename)
 			deterministicID := db.MintNodeID(queueType, nodeID, types.NodeTypeFolder, child.folder.DisplayName)
+			idPath := db.JoinIDPath(parentPath, deterministicID)
 
 			// Create task state for DST child folder
 			taskState := &db.NodeState{
@@ -286,7 +302,8 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 				ParentServiceID: child.folder.ParentId,
 				ParentPath:      parentPath,
 				Name:            child.folder.DisplayName,
-				Path:            rootRelativePath,
+				DisplayPath:     filter.DisplayPathForChild(parentDisplayPath, currentRound, child.folder.DisplayName),
+				Path:            idPath,
 				Type:            types.NodeTypeFolder,
 				Size:            0,
 				MTime:           child.folder.LastUpdated,
@@ -316,12 +333,32 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 					states = append(states, op.State)
 				}
 			}
-			parentParts := gpl.LoadParentGPLParts(database, nodeID, "")
+			parentLen := gpl.ParseGPLPathLen(task.GPLState)
 			checkTarget := gpl.ResolvePathCheckTarget(q.ScalingSrcProvider(), q.ScalingDstProvider(), q.PathCheckProfile())
 			skipChecks := checkTarget == ""
-			gpl.ApplyGPLToSRCChildren(database, gpl.GPLTargetFromProvider(checkTarget), parentParts, states, skipChecks, q.WindowsCompat())
+			gpl.ApplyGPLToSRCChildren(database, gpl.GPLTargetFromProvider(checkTarget), parentLen, states, skipChecks, q.WindowsCompat())
 		}
-		database.AppendDiscoveredNodes(childNodesToInsert)
+		if err := database.AppendDiscoveredNodes(childNodesToInsert); err != nil {
+			if logservice.LS != nil {
+				logErr := logservice.LS.Log("error",
+					fmt.Sprintf("discovery persist failed for %s (id=%s children=%d): %v",
+						task.LocationPath(), nodeID, len(childNodesToInsert), err),
+					"queue", q.Name(), q.Name())
+				if logErr != nil {
+					fmt.Println("error logging", logErr)
+				}
+			}
+			task.LastError = fmt.Sprintf("discovery persist: %v", err)
+			FailTraversalTask(q, task, 0)
+			return
+		}
+		if task.IsFolder() && len(childNodesToInsert) > 0 {
+			side := opsdb.SideSRC
+			if queueType == "DST" {
+				side = opsdb.SideDST
+			}
+			database.AppendKidsPackReplace(side, nodeID, srckidsFromInsertOps(childNodesToInsert))
+		}
 		for _, op := range childNodesToInsert {
 			if op.State != nil && op.State.SrcID != "" {
 				database.AppendIDMapEvent(db.IDMapEvent{
@@ -329,53 +366,73 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 					DstInternalID: op.State.ID,
 					Source:        db.IDMapSourceDSTCompare,
 					Status:        db.IDMapStatusActive,
+					Depth:         op.Level,
 				})
 			}
 		}
 	}
-	fromRetry := q.GetMode() == queue.QueueModeRetry
-	// Preserve task's copy_status on completion; DST traversal does comparison and emits copy_status updates for matches.
+
+	markTraversalComplete()
+
+	prevTrav := task.SrcTraversalStatus
+	if prevTrav == "" {
+		prevTrav = db.StatusPending
+	}
+	nodeType := db.NodeTypeFolder
+	if task.IsFile() {
+		nodeType = db.NodeTypeFile
+	}
+
+	fromRetry := opsdb.IsDiscoveryRetryMark(task.ExclusionSource)
 	database.AppendStatusEvent(queueType, db.StatusEvent{
 		ID:                  nodeID,
 		TraversalStatus:     db.StatusSuccessful,
-		CopyStatus:          state.CopyStatus,
+		CopyStatus:          task.CopyStatus,
 		EventTime:           time.Now().UnixNano(),
 		Depth:               currentRound,
-		PrevTraversalStatus: state.TraversalStatus,
-		PrevCopyStatus:      state.CopyStatus,
+		PrevTraversalStatus: prevTrav,
+		PrevCopyStatus:      task.CopyStatus,
+		NodeType:            nodeType,
+		// Carry mark so review deltas can restore parked copy/pending; seal clears it.
+		ExclusionSource: task.ExclusionSource,
 	}, fromRetry)
 
-	// DST comparison: persist SRC copy status for each matched child so path review shows correct copy_status.
+	// DST comparison: persist SRC copy status for each matched child so path review
+	// and the copy frontier (pend:copy) stay aligned with copy_status.
 	if q.Name() == "dst" {
 		eventTime := time.Now().UnixNano()
 		for _, child := range task.DiscoveredChildren {
-			if child.SrcID == "" {
+			if child.SrcID == "" || child.SrcCopyStatus == "" {
 				continue
 			}
 			meta := task.ExpectedSrcNodeMeta[child.SrcID]
-			if child.SrcCopyStatus != "" && child.SrcCopyStatus != meta.CopyStatus {
-				prevTrav := meta.TraversalStatus
-				if prevTrav == "" {
-					prevTrav = db.StatusSuccessful
-				}
-				var size int64
-				nodeType := db.NodeTypeFolder
-				if child.IsFile {
-					size = child.File.Size
-					nodeType = db.NodeTypeFile
-				}
-				database.AppendStatusEvent("SRC", db.StatusEvent{
-					ID:                  child.SrcID,
-					TraversalStatus:     prevTrav,
-					CopyStatus:          child.SrcCopyStatus,
-					EventTime:           eventTime,
-					Depth:               nextRound,
-					PrevTraversalStatus: prevTrav,
-					PrevCopyStatus:      meta.CopyStatus,
-					Size:                size,
-					NodeType:            nodeType,
-				}, false)
+			copyChanged := child.SrcCopyStatus != meta.CopyStatus
+			if !copyChanged && !db.CopyStatusIsComplete(child.SrcCopyStatus) {
+				continue
 			}
+			var size int64
+			nodeType := db.NodeTypeFolder
+			if child.IsFile {
+				size = child.File.Size
+				nodeType = db.NodeTypeFile
+			}
+			deleteStatus := ""
+			if copyChanged && db.CopyStatusIsComplete(child.SrcCopyStatus) {
+				deleteStatus = db.DeleteStatusAfterCopyComplete(task.SrcParentDeleteStatus, meta.DeleteStatus)
+			}
+			// Leave TraversalStatus empty so Badger status merge keeps the live value
+			// (pull-time ExpectedSrcNodeMeta may still say pending after SRC completed).
+			database.AppendStatusEvent("SRC", db.StatusEvent{
+				ID:               child.SrcID,
+				CopyStatus:       child.SrcCopyStatus,
+				DeleteStatus:     deleteStatus,
+				EventTime:        eventTime,
+				Depth:            nextRound,
+				PrevCopyStatus:   meta.CopyStatus,
+				PrevDeleteStatus: meta.DeleteStatus,
+				Size:             size,
+				NodeType:         nodeType,
+			}, false)
 		}
 		gpl.AppendDSTSiblingCollisionIssues(database, q, task)
 	}
@@ -389,6 +446,7 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 			EventTime:           time.Now().UnixNano(),
 			Depth:               task.Round,
 			PrevTraversalStatus: c.DstOldStatus,
+			NodeType:            db.NodeTypeFolder,
 		}, false)
 		deletions := make([]db.NodeDeletion, 0, len(c.Children))
 		for _, ch := range c.Children {
@@ -483,15 +541,25 @@ func FailTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta time
 	}
 
 	if nodeID != "" {
+		prevTrav := task.SrcTraversalStatus
+		if prevTrav == "" {
+			prevTrav = db.StatusPending
+		}
+		nodeType := db.NodeTypeFolder
+		if task.IsFile() {
+			nodeType = db.NodeTypeFile
+		}
 		ev := db.StatusEvent{
 			ID:                  nodeID,
 			TraversalStatus:     db.StatusFailed,
 			EventTime:           time.Now().UnixNano(),
 			Depth:               currentRound,
-			PrevTraversalStatus: db.StatusPending,
+			PrevTraversalStatus: prevTrav,
+			NodeType:            nodeType,
 		}
 		failurelog.AttachTaskFailureLog(&ev, "traversal", q.Name(), nodeID, task.LocationPath(), task.Attempts, task.LastError)
-		database.AppendStatusEvent(queueType, ev, q.GetMode() == queue.QueueModeRetry)
+		ev.ExclusionSource = task.ExclusionSource
+		database.AppendStatusEvent(queueType, ev, opsdb.IsDiscoveryRetryMark(task.ExclusionSource))
 	}
 
 	q.RemoveInProgress(nodeID)
@@ -564,7 +632,6 @@ func AdvanceTraversalRound(q *queue.Queue) {
 	currentRound := q.GetRound()
 	newRound := currentRound + 1
 
-	// Get stats for logging
 	q.SetRound(newRound)
 	q.SetExpectedFromStatsBucket(newRound)
 
@@ -599,4 +666,34 @@ func AdvanceTraversalRound(q *queue.Queue) {
 
 	// Pull tasks for the new round (must record a DB-committed pull for completion/advance gates).
 	q.PullWithRetryIfNeeded(true)
+}
+
+func srckidsFromInsertOps(ops []db.InsertOperation) []opsdb.KidRecord {
+	kids := make([]opsdb.KidRecord, 0, len(ops))
+	for _, op := range ops {
+		if op.State == nil {
+			continue
+		}
+		n := op.State
+		trav := n.TraversalStatus
+		if trav == "" {
+			trav = n.Status
+		}
+		kids = append(kids, opsdb.KidRecord{
+			ID:              n.ID,
+			ServiceID:       n.ServiceID,
+			ParentServiceID: n.ParentServiceID,
+			Path:            n.Path,
+			ParentPath:      n.ParentPath,
+			Name:            n.Name,
+			Type:            n.Type,
+			Size:            n.Size,
+			MTime:           n.MTime,
+			Depth:           n.Depth,
+			TraversalStatus: trav,
+			CopyStatus:      n.CopyStatus,
+			DeleteStatus:    n.DeleteStatus,
+		})
+	}
+	return kids
 }

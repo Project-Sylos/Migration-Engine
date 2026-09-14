@@ -28,14 +28,15 @@ Both operate in BFS rounds (levels).
 
 At **Start discovery** (`AddRoots`), the engine always writes SRC/DST root rows into DuckDB (not earlier). Classic seeding inserts each root as `traversal_status = pending` so workers run **round 0** (`ListChildren` on the root).
 
-When the UI has already reviewed immediate root children (root-pick review), `RootPreparation` is passed into `AddRoots`:
+When the UI has already reviewed root children (root-pick review), `RootPreparation` is passed into `AddRoots`:
 
-* Prepared side: root is seeded as `traversal_status = successful`, reviewed depth-1 children are inserted (included / excluded / dst-only statuses mirror a finished round 0), and that side's queues **start at round 1**.
+* Prepared side: root is seeded as `traversal_status = successful`, reviewed children are inserted as a **sparse forest** (nested `Children` when the UI visited deeper folders). Included folders without nested children stay `pending` (unrestricted subtree). Partial parents get `src_nodes.include_only` (JSON child service IDs); unchecked siblings are **omitted** (silent), not counted `excluded`.
+* Queues start at `ComputeSourceStartRound` (minimum depth of still-pending included folders), typically 1 for classic depth-1 prep.
 * Unprepared side (for example destination-first with no child review): classic pending root and **round 0**.
-* Source excludes apply only to immediate children of the confirmed root; off-path marks are ignored. Unchecked **folders** get `traversal_status = excluded` (do not walk the subtree; count as one excluded item). Unchecked **files** stay `traversal_status = successful` (listed/injected) with `copy_status = excluded_explicit` so they can be unexcluded later in copy review.
 * Destination never excludes; dst-only children get `traversal_status = not_on_src`.
+* Traversal workers honor `include_only` after `ListChildren` (drop non-members before seal).
 
-The `filters-set` phase (between `AddRoots` and `StartTraversal`) is the gate after this seed; root-child preparation fulfills that phase's intent for the first level only. Full-tree excludes remain in awaiting-traversal-review after discovery.
+The `filters-set` phase (between `AddRoots` and `StartTraversal`) remains available for binding a ruleset snapshot. Filter **evaluation** runs after discovery in path review (SQL over DuckDB), not during BFS. Full-tree counted excludes happen in awaiting-traversal-review via exclude-by-search / manual exclude.
 
 ---
 
@@ -50,6 +51,8 @@ Algorithm:
 5. Child folders are inserted into the level cache rather than traversed immediately. They are processed when the engine advances to the next BFS level.
 
 Source traversal is largely independent, it can advance to whatever round it wants unlike dst traversal which is dependent on src's current completed round number.
+
+On round advance, seal Flush updates Badger frontier indexes and pending keys. Round **Expected** is read from per-depth stats in Badger.
 
 ---
 
@@ -189,35 +192,37 @@ No additional structural differences exist beyond scope restriction.
 
 ## Delete Phase
 
-The delete phase removes successfully copied source (SRC) content after copy review. It mirrors the copy phase structurally but runs in **reverse BFS** (deepest depth first) and uses the **opposite pass order** (files before folders) so children are removed before parents.
+The delete phase removes successfully copied source (SRC) content after copy review. It mirrors the copy phase structurally: **forward BFS** (depth 1 → max) and **folders before files**. Only `pending_explicit` roots are pulled; providers perform recursive folder deletes, and `pending_inherited` descendants are marked deleted when their covering root succeeds.
 
 ### Scope
 
 * **SRC only** — one delete queue; destination nodes are not deleted.
-* **Operational depths:** `maxKnownDepth` down to **1** (from `GetMaxDepth("SRC")`).
+* **Operational depths:** **1** through `maxKnownDepth` (from `GetMaxDepth("SRC")`).
 * **Depth 0 (root) is never processed** — the root row is metadata-only (same as copy: seeded `copy_status = already_existed`, no delete work). `PrepareSourceCleanup` does not assign `delete_status` to depth-0 nodes.
-* **Eligible nodes:** copy-complete (`successful` or `already_existed`), not excluded, and `delete_status = pending` (set during copy-review cleanup planning via `PrepareSourceCleanup`).
+* **Eligible pull nodes:** copy-complete (`successful` or `already_existed`), not excluded, and `delete_status = pending_explicit`. Covered children use `pending_inherited` and are not pulled.
+* **When `delete_status` is assigned:** discovery leaves it unset. On copy-complete (`CompleteCopyTask` or SRC `already_existed` from DST match), the engine writes `pending_explicit` unless a strict parent is already pending* (then `pending_inherited`). `PrepareSourceCleanup` remains a safety net (seed unset copy-complete + normalize forest) and applies skip/keep edits.
+* **Work totals / metrics** count both `pending_explicit` and `pending_inherited` (nodes and file bytes that will leave the source). Live progress credits cascaded descendants when an explicit folder delete succeeds.
 
 ### Two global passes (copy-shaped)
 
-Like copy, delete exhausts **all depths in pass 1** before switching to pass 2. Unlike copy, depth decreases each round (reverse BFS).
+Like copy, delete exhausts **all depths in pass 1** before switching to pass 2. Depth increases each round (forward BFS).
 
 | Pass | Node type | Depth sweep |
 |------|-----------|-------------|
-| 1 | Files | `maxKnownDepth` → … → 1 |
-| 2 | Folders | `maxKnownDepth` → … → 1 |
+| 1 | Folders | 1 → … → `maxKnownDepth` |
+| 2 | Files | 1 → … → `maxKnownDepth` |
 
-**Pass switch** occurs only after pass 1 has fully exhausted depth 1 (the bottom of the reverse sweep), with the same in-memory gates as round completion: pending buffer empty, in-progress zero, `lastPullWasPartial = true`, and at least one counted pull for the round. The queue then resets to `maxKnownDepth` for pass 2.
+**Pass switch** occurs only after pass 1 has fully exhausted `maxKnownDepth`, with the same in-memory gates as round completion: pending buffer empty, in-progress zero, `lastPullWasPartial = true`, and at least one counted pull for the round. The queue then resets to depth 1 for pass 2.
 
-**Phase complete** when pass 2 has exhausted depth 1 under the same round-completion gates. Completion trusts per-round exhaustion (like copy); it does not re-query global `delete_status = pending` across the tree.
+**Phase complete** when pass 2 has exhausted `maxKnownDepth` under the same round-completion gates. Completion trusts per-round exhaustion (like copy); it does not re-query global pending* across the tree.
 
 ### Per-depth round advancement
 
 Within a pass, when a depth’s keyspace is exhausted:
 
 1. `advanceToNextRound` flushes the seal buffer.
-2. `AdvanceDeleteRound` decrements depth (`currentRound - 1`) and **keeps the same pass**.
-3. When depth 1 completes, `CheckDeleteCompletion` runs (pass switch or phase complete).
+2. `AdvanceDeleteRound` increments depth (`currentRound + 1`) and **keeps the same pass**.
+3. When past `maxKnownDepth`, `CheckDeleteCompletion` runs (pass switch or phase complete).
 
 Round completion gates (shared with traversal/copy) require:
 
@@ -227,26 +232,25 @@ Round completion gates (shared with traversal/copy) require:
 * `PullCount > 0` for the round
 * Not currently pulling
 
-### Pull and folder gate
+### Pull and recursive delete
 
-`PullDeleteTasks` loads SRC nodes at the current depth with the current pass filter (`pending` for normal delete, `failed` for delete-retry). Depth 0 pulls are skipped (`currentRound == 0` → no pull).
+`PullDeleteTasks` loads SRC nodes at the current depth from the `pend:del` frontier (enrolled only for `pending_explicit`, or `failed` in delete-retry). `pending_inherited` nodes are never enrolled; they are covered by ancestor recursive deletes. Depth 0 pulls are skipped (`currentRound == 0` → no pull). There is no folder emptiness gate: children of an explicit folder are `pending_inherited` and are not deleted individually.
 
-Before enqueueing folder tasks (pass 2), the engine calls `FolderDeleteBlockedIDs`: a folder is not deletable until **every direct non-excluded child** has `delete_status = deleted`. Blocked folders are marked failed with a `copy_blocked` error rather than wedging the queue.
+Skip/unskip during copy review maintains the forest incrementally (subtree mark, ancestor `skipped_descendant_count`, sibling promote/demote). `NormalizeDeleteForestOps` runs as a safety net at `StartDelete` / prepare, not on every click.
 
-Workers call `DeleteNode` on the source adapter; success emits `delete_status = deleted` via the seal buffer.
+Workers call `DeleteNode` on the source adapter (folders = recursive provider delete). Success cascades `delete_status = deleted` to the explicit root and all pending* under its path.
 
 ### Delete retry mode
 
-Delete retry reuses the same reverse-BFS and two-pass structure. It only pulls nodes whose current `delete_status = failed`. `findDeleteStartRound` scans depths from high to low (skipping depth 0) to find the highest depth with failed work.
+Delete retry reuses the same forward-BFS and two-pass structure. It only pulls nodes whose current `delete_status = failed`. `findDeleteStartRound` scans depths from low to high (skipping depth 0) to find the lowest depth with failed work.
 
 ### Comparison to copy
 
-| | Copy (forward BFS) | Delete (reverse BFS) |
+| | Copy (forward BFS) | Delete (forward BFS) |
 |---|-------------------|----------------------|
-| Pass order | Folders → files | Files → folders |
-| Depth direction | 1 → maxKnownDepth | maxKnownDepth → 1 |
-| Pass switch after | All depths in pass 1 | All depths in pass 1 (ends at depth 1) |
-| Restart depth on pass 2 | 1 | maxKnownDepth |
+| Pass order | Folders → files | Folders → files |
+| Depth direction | 1 → maxKnownDepth | 1 → maxKnownDepth |
+| Pull filter | `copy_status = pending` | `delete_status = pending_explicit` |
 | Root (depth 0) | Never copied (`already_existed`) | Never deleted (null delete_status) |
 
 ---

@@ -7,7 +7,6 @@ import (
 	"fmt"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
 )
 
@@ -49,8 +48,7 @@ func (s MigrationStatus) IsComplete() bool {
 	return !s.HasPending()
 }
 
-// InspectMigrationStatus inspects node tables and materialized src_current / dst_current.
-// Pending/failed come from current tables (maintained per sealed depth), not event-log arg_max.
+// InspectMigrationStatus reads delta-maintained traversal counters from src_stats/dst_stats.
 func InspectMigrationStatus(database *db.DB) (MigrationStatus, error) {
 	if database == nil {
 		return MigrationStatus{}, fmt.Errorf("database cannot be nil")
@@ -58,31 +56,21 @@ func InspectMigrationStatus(database *db.DB) (MigrationStatus, error) {
 
 	status := MigrationStatus{}
 
-	srcTotal, err := pull.CountNodes(database, "SRC")
+	srcCounts, err := stats.GetTraversalStatusCounts(database, "SRC", true)
 	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to count src nodes: %w", err)
-	}
-	status.SrcTotal = srcTotal
-
-	dstTotal, err := pull.CountNodes(database, "DST")
-	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to count dst nodes: %w", err)
-	}
-	status.DstTotal = dstTotal
-
-	srcCounts, err := stats.GetTraversalStatusCountsFromCurrent(database, "SRC")
-	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to get SRC traversal counts from current: %w", err)
+		return MigrationStatus{}, fmt.Errorf("failed to get SRC traversal counts: %w", err)
 	}
 	status.SrcPending = int(srcCounts.Pending)
 	status.SrcFailed = int(srcCounts.Failed)
+	status.SrcTotal = int(srcCounts.Pending + srcCounts.Successful + srcCounts.Failed + srcCounts.NotOnSrc + srcCounts.Excluded)
 
-	dstCounts, err := stats.GetTraversalStatusCountsFromCurrent(database, "DST")
+	dstCounts, err := stats.GetTraversalStatusCounts(database, "DST", true)
 	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("failed to get DST traversal counts from current: %w", err)
+		return MigrationStatus{}, fmt.Errorf("failed to get DST traversal counts: %w", err)
 	}
 	status.DstPending = int(dstCounts.Pending)
 	status.DstFailed = int(dstCounts.Failed)
+	status.DstTotal = int(dstCounts.Pending + dstCounts.Successful + dstCounts.Failed + dstCounts.NotOnSrc + dstCounts.Excluded)
 
 	if d, err := stats.MinPendingTraversalDepth(database, "SRC"); err == nil {
 		status.MinPendingDepthSrc = d

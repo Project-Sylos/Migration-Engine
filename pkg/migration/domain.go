@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
+	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
 	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/loop"
 	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/profile"
@@ -130,18 +132,23 @@ type Migration struct {
 	pathCheckDstProvider string
 	pathCheckProfile     string
 	windowsCompatFlag    bool
+	filterRuleset        *filter.CompiledRuleset
 	runCancel            context.CancelFunc
 	running              bool
 	softSuspendRequested atomic.Bool
 	stopGraceMu          sync.Mutex
 	stopGraceTimer       *time.Timer
+	stopProgressMu       sync.Mutex
+	stopProgress         StopProgress
 	// persistRecord holds the last known migrations row (refreshed on DB sync); used to avoid DuckDB reads on hot API paths while Live.
 	persistRecord atomic.Value // migrationRecord
 	// activeQueueObs is set for the duration of traversal/copy/retry runs so queue metrics APIs can read memory instead of queue_stats.
 	activeQueueObs atomic.Pointer[observe.QueueObserver]
 	// activeAutoscaler is set while a phase autoscaler is running (for live MaxWorkers overrides).
-	activeAutoscaler atomic.Pointer[loop.Autoscaler]
+	activeAutoscaler   atomic.Pointer[loop.Autoscaler]
 	workerCapOverrides atomic.Value // profile.WorkerCapOverrides
+	finalizeError      string       // last durable-teardown failure (also in runtime_state JSON)
+	reviewOps          reviewOpGate // path-review mutation / interactive-read gate
 }
 
 func newMigration(manager *MigrationManager, record migrationRecord, database *db.DB, tokenKey []byte) *Migration {
@@ -153,10 +160,23 @@ func newMigration(manager *MigrationManager, record migrationRecord, database *d
 		manager:            manager,
 		tokenEncryptionKey: tokenKey,
 		phase:              record.Phase,
-		logRing:            newLogRing(256),
+		logRing:            newLogRing(1000),
+		finalizeError:      finalizeErrorFromRuntimeJSON(record.RuntimeStateJSON),
+		reviewOps:          newReviewOpGate(),
 	}
 	m.persistRecord.Store(record)
 	return m
+}
+
+func finalizeErrorFromRuntimeJSON(runtimeJSON string) string {
+	if runtimeJSON == "" || runtimeJSON == "{}" {
+		return ""
+	}
+	var top finalizeErrorRuntime
+	if err := json.Unmarshal([]byte(runtimeJSON), &top); err != nil {
+		return ""
+	}
+	return top.FinalizeError
 }
 
 // SetWorkerCapOverrides updates MaxWorkers overlays for this migration and pushes them
@@ -261,6 +281,35 @@ func (m *Migration) setLastRunConfig(cfg Config) {
 	m.pathCheckDstProvider = c.Destination.ProviderID
 	m.pathCheckProfile = c.PathCheckTarget
 	m.windowsCompatFlag = c.WindowsCompat
+	if c.FilterRuleset != nil {
+		m.filterRuleset = c.FilterRuleset
+	}
+}
+
+// SetFilterRuleset retains a compiled ruleset for compatibility with existing callers.
+// Allowed in roots-set / filters-set / review / suspended; rejected while traversal is in progress.
+func (m *Migration) SetFilterRuleset(rs *filter.CompiledRuleset) error {
+	if m == nil {
+		return fmt.Errorf("nil migration")
+	}
+	phase := m.Phase()
+	if phase == PhaseTraversing {
+		return fmt.Errorf("cannot change filter rules while discovery is running")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.filterRuleset = rs
+	return nil
+}
+
+// FilterRuleset returns the compiled filter ruleset (may be nil).
+func (m *Migration) FilterRuleset() *filter.CompiledRuleset {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.filterRuleset
 }
 
 // SetPathCheckProviders records source/destination provider IDs and optional path-check profile
@@ -346,6 +395,7 @@ func (m *Migration) IsLive() bool {
 
 // NormalizeDeadInProgressToSuspended moves a non-live *-in-progress phase to the matching
 // *-suspended phase so resume can restart. No-op when live or when not in an in-progress phase.
+// Dead *-finalizing becomes *-finalize-failed so the UI can retry durable teardown.
 func (m *Migration) NormalizeDeadInProgressToSuspended() (bool, error) {
 	if m.IsLive() {
 		return false, nil
@@ -358,11 +408,20 @@ func (m *Migration) NormalizeDeadInProgressToSuspended() (bool, error) {
 		target = PhaseCopySuspended
 	case PhaseDeleting:
 		target = PhaseDeleteSuspended
+	case PhaseTraversalFinalizing:
+		target = PhaseTraversalFinalizeFailed
+	case PhaseCopyFinalizing:
+		target = PhaseCopyFinalizeFailed
+	case PhaseDeleteFinalizing:
+		target = PhaseDeleteFinalizeFailed
 	default:
 		return false, nil
 	}
 	if err := m.transitionTo(target); err != nil {
 		return false, err
+	}
+	if IsFinalizeFailedPhase(target) && m.FinalizeError() == "" {
+		m.setFinalizeError(fmt.Errorf("durable teardown interrupted (process stopped during finalizing)"))
 	}
 	return true, nil
 }
@@ -397,6 +456,7 @@ func (m *Migration) transitionTo(next string) error {
 // (success, error, or soft suspend) so queue Run loops and workers exit; otherwise they keep polling while paused.
 func (m *Migration) beginRun(shutdownCtx context.Context) (runCtx context.Context, cancelRun context.CancelFunc) {
 	m.disarmStopGraceTimer()
+	m.clearStopProgress()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.softSuspendRequested.Store(false)
@@ -429,14 +489,18 @@ func (m *Migration) endRun() {
 }
 
 func (m *Migration) refreshRuntimeState() {
-	status, err := InspectMigrationStatus(m.DB)
+	if m.DB == nil {
+		return
+	}
+	snap, err := stats.GetReviewStatsSnapshot(m.DB)
 	if err != nil {
 		return
 	}
+	discovered := snap.TraversalPending + snap.TraversalSuccessful + snap.TraversalFailed
 	m.mu.Lock()
-	m.runtimeState.NodesDiscovered = int64(status.SrcTotal + status.DstTotal)
-	m.runtimeState.TasksPending = int64(status.SrcPending + status.DstPending)
-	m.runtimeState.TasksCompleted = int64((status.SrcTotal + status.DstTotal) - (status.SrcPending + status.DstPending))
-	m.runtimeState.Errors = int64(status.SrcFailed + status.DstFailed)
+	m.runtimeState.NodesDiscovered = discovered
+	m.runtimeState.TasksPending = snap.TraversalPending
+	m.runtimeState.TasksCompleted = snap.TraversalSuccessful
+	m.runtimeState.Errors = snap.TraversalFailed
 	m.mu.Unlock()
 }

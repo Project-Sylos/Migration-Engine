@@ -15,6 +15,9 @@ import (
 
 // PullGPLTasks pulls nodes with gpl_status=pending at the current depth (BFS cascade).
 func PullGPLTasks(q *queue.Queue, force bool) queue.PullResult {
+	if db.GPLDisabled {
+		return queue.PullResult{Round: q.GetRound(), Status: queue.PullSkipped}
+	}
 	database := q.Database()
 	if database == nil {
 		return queue.PullResult{Status: queue.PullAborted}
@@ -43,7 +46,11 @@ func PullGPLTasks(q *queue.Queue, force bool) queue.PullResult {
 
 	cursor := q.GetKeysetCursor()
 
+	q.BeginDBPull()
+	defer q.ReleaseDBPull()
+	pullStart := time.Now()
 	results, err := pull.ListNodesGPLKeyset(database, queueType, currentRound, cursor, db.GPLStatusPending, requestLimit)
+	q.RecordDBPull(len(results), time.Since(pullStart))
 	if err != nil {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("debug", fmt.Sprintf("Failed to fetch GPL batch: %v", err), "queue", q.Name(), q.Name())
@@ -142,12 +149,17 @@ func CompleteGPLTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.D
 	if task.LastError != "" {
 		status = db.GPLStatusFailed
 	}
+	nodeType := db.NodeTypeFolder
+	if task.IsFile() {
+		nodeType = db.NodeTypeFile
+	}
 	database.AppendStatusEvent(queueType, db.StatusEvent{
 		ID:            nodeID,
 		GPLStatus:     status,
 		EventTime:     time.Now().UnixNano(),
 		Depth:         task.Round,
 		PrevGPLStatus: db.GPLStatusPending,
+		NodeType:      nodeType,
 	}, false)
 	q.RemoveInProgress(nodeID)
 }
@@ -163,12 +175,17 @@ func FailGPLTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.Durat
 
 	database := q.Database()
 	if database != nil {
+		nodeType := db.NodeTypeFolder
+		if task.IsFile() {
+			nodeType = db.NodeTypeFile
+		}
 		database.AppendStatusEvent(queue.GetQueueType(q.Name()), db.StatusEvent{
 			ID:            nodeID,
 			GPLStatus:     db.GPLStatusFailed,
 			EventTime:     time.Now().UnixNano(),
 			Depth:         task.Round,
 			PrevGPLStatus: db.GPLStatusPending,
+			NodeType:      nodeType,
 		}, false)
 	}
 	q.RemoveInProgress(nodeID)

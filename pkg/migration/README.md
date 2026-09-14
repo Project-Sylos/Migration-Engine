@@ -76,11 +76,13 @@ There is **no** `GetDB()` / `Result()` / `Error()` on the controller in the curr
 
 ### Phases (string constants)
 
-Examples: **`roots-set`**, **`filters-set`**, **`traversal-in-progress`**, **`traversal-suspended`**, **`awaiting-traversal-review`**, **`copy-in-progress`**, **`copy-suspended`**, **`awaiting-copy-review`** (`phase.go`).
+Examples: **`roots-set`**, **`filters-set`**, **`traversal-in-progress`**, **`traversal-suspended`**, **`awaiting-traversal-review`**, **`copy-in-progress`**, **`copy-suspended`**, **`awaiting-copy-review`**, **`delete-in-progress`**, **`delete-suspended`**, **`aborted`** (`phase.go`).
 
-**Soft suspend:** While phase is **`traversal-in-progress`** or **`copy-in-progress`**, **`Stop()`** requests a **coordinated suspend** (pause queues, drop non-leased pending work, drain in-flight tasks, flush seal/appender buffers, checkpoint, persist **`runtime_state_json.suspend_v1`**). The phase becomes **`traversal-suspended`** or **`copy-suspended`**. **Hard cancel** still uses **`ShutdownContext`** cancellation (abbreviated shutdown, not the full soft path).
+**Soft suspend:** While phase is **`traversal-in-progress`**, **`copy-in-progress`**, or **`delete-in-progress`**, **`Stop()`** requests a **coordinated suspend**: set soft flag, publish **`StopProgress`** (checklist for API/UI), **immediately pause** registered queues (no new pulls/leases), clear non-leased pending buffers, then drain in-flight tasks, flush seal/appender buffers, checkpoint, and persist **`runtime_state_json.suspend_v1`**. Secondary indexes are **not** rebuilt on soft stop (that is end-of-mode **`*-finalizing`**); resume calls **`BeginTraversalPhase`** again and continues without them until finalize. The phase becomes **`traversal-suspended`**, **`copy-suspended`**, or **`delete-suspended`**. Soft suspend remains resumable. There is **no automatic grace Abort**; only an explicit **`Abort()`** / force-stop hard-kills.
 
-**Resume:** **`StartTraversal(cfg)`** from **`traversal-suspended`** reloads **`suspend_v1`** and restarts with **retry-style** queues (round 0, persisted max depth and batch sizing) so the frontier is rebuilt from DuckDB—not from restored in-memory buffers. **`StartCopy(cfg)`** from **`copy-suspended`** restores tuning from **`suspend_v1`**; pending depths and copy passes still come from **DB scans** in **`RunCopyPhase`**. If phase is still **`*-in-progress`** but the run is not live, **`NormalizeDeadInProgressToSuspended()`** moves to the matching suspended phase so API resume can restart. Duplicate resume while **`IsLive()`** is a no-op at the API.
+**Force stop / abort:** **`ForceStop()`** cancels the run context and abandons in-flight queue work. **`Abort()`** does that and transitions to terminal **`aborted`** (no Resume). Prefer soft stop; use abort only when stuck.
+
+**Resume:** **`StartTraversal(cfg)`** from **`traversal-suspended`** reloads **`suspend_v1`** and continues the same traversal mode at the saved SRC/DST rounds and keyset cursors (empty cursor reconstructs the first pending folder at that depth). It does **not** enter retry mode or walk from round 0. **`StartCopy(cfg)`** from **`copy-suspended`** restores **`LastKnownCopyRound`**, copy pass, and **`CopyKeysetCursor`** when present (otherwise the min pending-depth scan). **`StartDelete`** from **`delete-suspended`** restores delete round/pass/cursor the same way. **Retry sweep** (`RunRetrySweep` from Path Review / `awaiting-traversal-review`) stays **`QueueModeRetry`** from round 0. If phase is still **`*-in-progress`** but the run is not live, **`NormalizeDeadInProgressToSuspended()`** moves to the matching suspended phase so API resume can restart. Duplicate resume while **`IsLive()`** is a no-op at the API. Phase **`aborted`** has no resume transitions.
 
 ### Common methods
 
@@ -89,7 +91,8 @@ Examples: **`roots-set`**, **`filters-set`**, **`traversal-in-progress`**, **`tr
 - **`RunCopyRetry(cfg, opts)`**, **`PreparePhase(PreparePhaseCopyRetry)`** – Same pattern for copy retry when exposed asynchronously. Use **`PreparePhaseDeleteRetry`** before **`RunDeleteRetry`**.
 - **`UpdateConfig(cfg)`** – persists **`root_config_json`** only (serializable fields); callers still pass **`cfg`** with adapters for each run.
 - Review helpers: query nodes, path review, exclude, mark retry, etc.
-- **`Stop()`** – for live traversal/copy, sets **soft suspend** (see above) and returns **`StopResult.SoftSuspendRequested`**. For other live phases, cancels the run context. **`runtime_state_json`** is updated when the suspend drain finishes (asynchronous relative to **`Stop()`** returning).
+- **`Stop()`** – for live traversal/copy/delete, sets **soft suspend** (see above) and returns **`StopResult.SoftSuspendRequested`** with current **`GetStopProgress()`**. For other live phases, cancels the run context. **`runtime_state_json`** is updated when the suspend drain finishes (asynchronous relative to **`Stop()`** returning).
+- **`ForceStop()`** / **`Abort()`** – hard kill; **`Abort()`** ends in **`aborted`**. **`GetStopProgress()`** exposes the live checklist for status polling.
 
 ---
 

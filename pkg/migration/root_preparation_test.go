@@ -9,7 +9,8 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
-	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -31,7 +32,7 @@ func TestSeedRootTasksWithPreparation_srcPrepared(t *testing.T) {
 		},
 	}
 
-	if _, err := SeedRootTasksWithPreparation(src, dst, database, prep); err != nil {
+	if _, err := SeedRootTasksWithPreparation(src, dst, database, prep, "", "", "", false, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -61,14 +62,21 @@ func TestSeedRootTasksWithPreparation_srcPrepared(t *testing.T) {
 
 	skipID := db.MintNodeID("SRC", srcRootID, types.NodeTypeFolder, "skip")
 	skip, err := pull.GetNodeByID(database, "SRC", skipID)
-	if err != nil || skip == nil {
-		t.Fatalf("skip folder: %v", err)
+	if err != nil {
+		t.Fatalf("skip folder lookup: %v", err)
 	}
-	if skip.TraversalStatus != db.StatusExcluded {
-		t.Fatalf("excluded folder traversal=%s want excluded", skip.TraversalStatus)
+	if skip != nil {
+		t.Fatalf("excluded folder should be omitted (silent), got trav=%s", skip.TraversalStatus)
 	}
-	if skip.CopyStatus != db.CopyStatusExcludedExplicit {
-		t.Fatalf("excluded copy=%s", skip.CopyStatus)
+	if got := mustIncludeOnly(t, database, srcRootID); len(got) != 2 {
+		t.Fatalf("root include_only=%v want keep+file service ids", got)
+	} else {
+		if _, ok := got["a"]; !ok {
+			t.Fatalf("include_only missing keep id a: %v", got)
+		}
+		if _, ok := got["c"]; !ok {
+			t.Fatalf("include_only missing file id c: %v", got)
+		}
 	}
 
 	fileID := db.MintNodeID("SRC", srcRootID, types.NodeTypeFile, "file.txt")
@@ -104,9 +112,14 @@ func TestSeedRootTasksWithPreparation_srcPrepared(t *testing.T) {
 	if totals2 != totals {
 		t.Fatalf("catch-up changed totals: %+v vs %+v", totals2, totals)
 	}
+
+	pending, err := database.Ops().GetStat(db.ReviewKeyCopyPending)
+	if err != nil || pending != 2 {
+		t.Fatalf("copy/pending=%d err=%v want 2 (keep folder + file, counted once)", pending, err)
+	}
 }
 
-func TestSeedRootTasksWithPreparation_excludedFileStaysSuccessful(t *testing.T) {
+func TestSeedRootTasksWithPreparation_excludedFileOmitted(t *testing.T) {
 	database, err := db.Open(db.Options{Path: t.TempDir() + "/prep-excl-file.db"})
 	if err != nil {
 		t.Fatal(err)
@@ -122,7 +135,7 @@ func TestSeedRootTasksWithPreparation_excludedFileStaysSuccessful(t *testing.T) 
 			{ServiceID: "skip.txt", Name: "skip.txt", Type: "file", Size: 3, Excluded: true},
 		},
 	}
-	if _, err := SeedRootTasksWithPreparation(src, dst, database, prep); err != nil {
+	if _, err := SeedRootTasksWithPreparation(src, dst, database, prep, "", "", "", false, nil); err != nil {
 		t.Fatal(err)
 	}
 	srcRootID, _, ok := pull.GetRootNode(database, "SRC")
@@ -131,14 +144,15 @@ func TestSeedRootTasksWithPreparation_excludedFileStaysSuccessful(t *testing.T) 
 	}
 	fileID := db.MintNodeID("SRC", srcRootID, types.NodeTypeFile, "skip.txt")
 	file, err := pull.GetNodeByID(database, "SRC", fileID)
-	if err != nil || file == nil {
-		t.Fatalf("excluded file: %v", err)
+	if err != nil {
+		t.Fatalf("excluded file lookup: %v", err)
 	}
-	if file.TraversalStatus != db.StatusSuccessful {
-		t.Fatalf("excluded file trav=%s want successful", file.TraversalStatus)
+	if file != nil {
+		t.Fatalf("excluded file should be omitted, got trav=%s", file.TraversalStatus)
 	}
-	if file.CopyStatus != db.CopyStatusExcludedExplicit {
-		t.Fatalf("excluded file copy=%s", file.CopyStatus)
+	allow := mustIncludeOnly(t, database, srcRootID)
+	if _, ok := allow["keep"]; !ok || len(allow) != 1 {
+		t.Fatalf("include_only=%v want only keep", allow)
 	}
 }
 
@@ -163,7 +177,7 @@ func TestSeedRootTasksWithPreparation_bothPreparedDstOnly(t *testing.T) {
 		},
 	}
 
-	if _, err := SeedRootTasksWithPreparation(src, dst, database, prep); err != nil {
+	if _, err := SeedRootTasksWithPreparation(src, dst, database, prep, "", "", "", false, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -204,18 +218,88 @@ func TestSeedRootTasksWithPreparation_bothPreparedDstOnly(t *testing.T) {
 	if mapped != sharedID {
 		t.Fatalf("id_map dst=%s want %s", mapped, sharedID)
 	}
+
+	pending, err := database.Ops().GetStat(db.ReviewKeyCopyPending)
+	if err != nil || pending != 0 {
+		t.Fatalf("copy/pending=%d err=%v want 0 (shared folder already_existed)", pending, err)
+	}
 }
 
-func TestSeedRootTasks_unprepared(t *testing.T) {
-	database, err := db.Open(db.Options{Path: t.TempDir() + "/unprep.db"})
+func TestSeedRootTasksWithPreparation_bothPreparedCopyPendingOnce(t *testing.T) {
+	database, err := db.Open(db.Options{Path: t.TempDir() + "/prep-both-pending.db"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
 
+	src := types.Folder{ServiceID: "src-root", DisplayName: "A", LocationPath: "/", Type: types.NodeTypeFolder}
+	dst := types.Folder{ServiceID: "dst-root", DisplayName: "B", LocationPath: "/", Type: types.NodeTypeFolder}
+	prep := RootPreparation{
+		SourcePrepared: true,
+		DestPrepared:   true,
+		SourceChildren: []RootChildSeed{
+			{ServiceID: "dir_empty", Name: "dir_empty", Type: "folder"},
+			{ServiceID: "dir_shared", Name: "dir_shared", Type: "folder"},
+			{ServiceID: "dir_mid", Name: "dir_mid", Type: "folder"},
+			{ServiceID: "src_only_dir", Name: "src_only_dir", Type: "folder"},
+			{ServiceID: "shared_alpha.txt", Name: "shared_alpha.txt", Type: "file", Size: 13},
+			{ServiceID: "src_only_1.txt", Name: "src_only_1.txt", Type: "file", Size: 11},
+		},
+		DestChildren: []RootChildSeed{
+			{ServiceID: "dir_empty", Name: "dir_empty", Type: "folder"},
+			{ServiceID: "dir_shared", Name: "dir_shared", Type: "folder"},
+			{ServiceID: "dir_mid", Name: "dir_mid", Type: "folder"},
+			{ServiceID: "dst_only_dir", Name: "dst_only_dir", Type: "folder", DstOnly: true},
+			{ServiceID: "shared_alpha.txt", Name: "shared_alpha.txt", Type: "file", Size: 13},
+			{ServiceID: "dst_only_1.txt", Name: "dst_only_1.txt", Type: "file", Size: 11, DstOnly: true},
+		},
+	}
+
+	if _, err := SeedRootTasksWithPreparation(src, dst, database, prep, "", "", "", false, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	srcRootID, _, ok := pull.GetRootNode(database, "SRC")
+	if !ok {
+		t.Fatal("missing SRC root")
+	}
+	onlyDir := db.MintNodeID("SRC", srcRootID, types.NodeTypeFolder, "src_only_dir")
+	onlyFile := db.MintNodeID("SRC", srcRootID, types.NodeTypeFile, "src_only_1.txt")
+	sharedDir := db.MintNodeID("SRC", srcRootID, types.NodeTypeFolder, "dir_shared")
+	onlyDirNode, err := pull.GetNodeByID(database, "SRC", onlyDir)
+	if err != nil || onlyDirNode == nil {
+		t.Fatalf("src_only_dir: %v", err)
+	}
+	if onlyDirNode.CopyStatus != db.CopyStatusPending {
+		t.Fatalf("src_only_dir copy=%s want pending", onlyDirNode.CopyStatus)
+	}
+	onlyFileNode, err := pull.GetNodeByID(database, "SRC", onlyFile)
+	if err != nil || onlyFileNode == nil {
+		t.Fatalf("src_only_1.txt: %v", err)
+	}
+	if onlyFileNode.CopyStatus != db.CopyStatusPending {
+		t.Fatalf("src_only_1.txt copy=%s want pending", onlyFileNode.CopyStatus)
+	}
+	sharedNode, err := pull.GetNodeByID(database, "SRC", sharedDir)
+	if err != nil || sharedNode == nil {
+		t.Fatalf("dir_shared: %v", err)
+	}
+	if sharedNode.CopyStatus != db.CopyStatusAlreadyExisted {
+		t.Fatalf("dir_shared copy=%s want already_existed", sharedNode.CopyStatus)
+	}
+
+	pending, err := database.Ops().GetStat(db.ReviewKeyCopyPending)
+	if err != nil || pending != 2 {
+		t.Fatalf("copy/pending=%d err=%v want 2 (src_only_dir + src_only_1.txt, counted once)", pending, err)
+	}
+}
+
+func TestSeedRootTasks_unprepared(t *testing.T) {
+	database := db.TestOpen(t, "unprep")
+
 	src := types.Folder{ServiceID: "src-root", DisplayName: "Src", LocationPath: "/", Type: types.NodeTypeFolder}
 	dst := types.Folder{ServiceID: "dst-root", DisplayName: "Dst", LocationPath: "/", Type: types.NodeTypeFolder}
-	if _, err := SeedRootTasks(src, dst, database); err != nil {
+	if _, err := SeedRootTasksWithPreparation(src, dst, database, RootPreparation{}, "", "", "", false, nil); err != nil {
 		t.Fatal(err)
 	}
 	srcRootID, srcRoot, ok := pull.GetRootNode(database, "SRC")
@@ -226,4 +310,78 @@ func TestSeedRootTasks_unprepared(t *testing.T) {
 	if srcRoot.TraversalStatus != db.StatusPending {
 		t.Fatalf("unprepared SRC root=%s", srcRoot.TraversalStatus)
 	}
+}
+
+func TestSeedRootTasksWithPreparation_preservesTrailingSpaceName(t *testing.T) {
+	database, err := db.Open(db.Options{Path: t.TempDir() + "/prep-space.db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	src := types.Folder{ServiceID: "src-root", DisplayName: "Src", LocationPath: "/", Type: types.NodeTypeFolder}
+	dst := types.Folder{ServiceID: "dst-root", DisplayName: "Dst", LocationPath: "/", Type: types.NodeTypeFolder}
+	prep := RootPreparation{
+		SourcePrepared: true,
+		SourceChildren: []RootChildSeed{
+			{ServiceID: "space", Name: "Extra Space ", Type: "folder"},
+		},
+	}
+	if _, err := SeedRootTasksWithPreparation(src, dst, database, prep, "local", "local", "windows", false, nil); err != nil {
+		t.Fatal(err)
+	}
+	srcRootID, _, ok := pull.GetRootNode(database, "SRC")
+	if !ok {
+		t.Fatal("missing SRC root")
+	}
+	id := db.MintNodeID("SRC", srcRootID, types.NodeTypeFolder, "Extra Space ")
+	node, err := pull.GetNodeByID(database, "SRC", id)
+	if err != nil || node == nil {
+		t.Fatalf("node: %v", err)
+	}
+	if node.Name != "Extra Space " {
+		t.Fatalf("name=%q want trailing space preserved", node.Name)
+	}
+}
+
+func TestSeedRootTasksWithPreparation_appliesWindowsGPL(t *testing.T) {
+	t.Skip("GPL gated off on Badger branch (db.GPLDisabled)")
+}
+
+func TestComputeSourceStartRound(t *testing.T) {
+	if got := ComputeSourceStartRound(nil); got != 1 {
+		t.Fatalf("empty=%d", got)
+	}
+	kids := []RootChildSeed{
+		{Name: "a", Type: "folder", ServiceID: "a"},
+		{
+			Name: "b", Type: "folder", ServiceID: "b",
+			Children: []RootChildSeed{
+				{Name: "c", Type: "folder", ServiceID: "c"},
+			},
+		},
+	}
+	if got := ComputeSourceStartRound(kids); got != 1 {
+		t.Fatalf("got %d want 1 (pending leaf a at depth 1)", got)
+	}
+	deepOnly := []RootChildSeed{
+		{
+			Name: "b", Type: "folder", ServiceID: "b",
+			Children: []RootChildSeed{
+				{Name: "c", Type: "folder", ServiceID: "c"},
+			},
+		},
+	}
+	if got := ComputeSourceStartRound(deepOnly); got != 2 {
+		t.Fatalf("got %d want 2", got)
+	}
+}
+
+func mustIncludeOnly(t *testing.T, database *db.DB, nodeID string) map[string]struct{} {
+	t.Helper()
+	n, ok, err := database.Ops().GetNode(opsdb.SideSRC, nodeID)
+	if err != nil || !ok {
+		t.Fatalf("include_only for %s: ok=%v err=%v", nodeID, ok, err)
+	}
+	return queue.ParseIncludeOnlyJSON(n.IncludeOnly)
 }

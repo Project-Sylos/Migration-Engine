@@ -5,9 +5,7 @@ package migration
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"path"
 	"strconv"
@@ -16,10 +14,13 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/failurelog"
-	"codeberg.org/Sylos/Migration-Engine/pkg/db/subtree"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/filterapply"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/review"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/subtree"
+	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
 // deltaKeyToReviewKey maps a migration-layer delta key to the universal stats table key.
@@ -33,6 +34,8 @@ func deltaKeyToReviewKey(k string) string {
 		return db.ReviewKeyTraversalFailed
 	case DeltaCopyPending:
 		return db.ReviewKeyCopyPending
+	case DeltaCopyPendingRetry:
+		return db.ReviewKeyCopyPendingRetry
 	case DeltaCopyFailed:
 		return db.ReviewKeyCopyFailed
 	case DeltaCopySuccessful:
@@ -43,6 +46,8 @@ func deltaKeyToReviewKey(k string) string {
 		return db.ReviewKeyDeleteFailed
 	case DeltaDeleteDeleted:
 		return db.ReviewKeyDeleteDeleted
+	case DeltaDeleteSkipped:
+		return db.ReviewKeyDeleteSkipped
 	case DeltaExcluded:
 		return db.ReviewKeyExcluded
 	case DeltaFolders:
@@ -86,11 +91,7 @@ func (s *migrationStore) persistReviewDeltas(deltas map[string]int64) error {
 	if len(dbDeltas) == 0 {
 		return nil
 	}
-	return s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
-		return sess.WithTx(func(w *db.Writer) error {
-			return w.ApplyReviewStatsDeltas(dbDeltas)
-		})
-	})
+	return s.db.ApplyReviewStatsDeltas(dbDeltas)
 }
 
 func mergedRowToDiffItem(r review.MergedReviewRow) DiffItem {
@@ -107,6 +108,8 @@ func mergedRowToDiffItem(r review.MergedReviewRow) DiffItem {
 		DeleteStatus:       r.DeleteStatus,
 		Excluded:           r.Excluded,
 		Size:               r.Size,
+		DstSize:            r.DstSize,
+		HasDstSize:         r.HasDstSize,
 		MissingOnSource:    r.SrcNodeID == "",
 		MissingOnDest:      r.DstNodeID == "",
 		ResolvedDstName:    strings.TrimSpace(r.ResolvedDstName),
@@ -118,6 +121,46 @@ func mergedRowToDiffItem(r review.MergedReviewRow) DiffItem {
 		item.Name = path.Base(item.Path)
 	}
 	return item
+}
+
+func (s *migrationStore) enrichDiffItemsWithDisplayPaths(items []DiffItem) error {
+	if s == nil || s.db == nil || len(items) == 0 {
+		return nil
+	}
+	srcIDs := make([]string, 0, len(items))
+	dstIDs := make([]string, 0, len(items))
+	for i := range items {
+		if items[i].SrcNodeID != "" {
+			srcIDs = append(srcIDs, items[i].SrcNodeID)
+		}
+		if items[i].DstNodeID != "" {
+			dstIDs = append(dstIDs, items[i].DstNodeID)
+		}
+	}
+	srcPaths, err := db.ComposeDisplayPaths(s.db, "SRC", srcIDs)
+	if err != nil {
+		return err
+	}
+	dstPaths, err := db.ComposeDisplayPaths(s.db, "DST", dstIDs)
+	if err != nil {
+		return err
+	}
+	for i := range items {
+		if items[i].SrcNodeID != "" {
+			items[i].DisplayPath = srcPaths[items[i].SrcNodeID]
+		} else if items[i].DstNodeID != "" {
+			items[i].DisplayPath = dstPaths[items[i].DstNodeID]
+		}
+		if items[i].DstNodeID != "" {
+			items[i].DstDisplayPath = dstPaths[items[i].DstNodeID]
+		}
+		// When SRC exists and DST was renamed, keep DisplayPath as SRC names;
+		// DstDisplayPath carries the destination-side friendly path for the leaf.
+		if items[i].DisplayPath == "" && items[i].DstDisplayPath != "" {
+			items[i].DisplayPath = items[i].DstDisplayPath
+		}
+	}
+	return nil
 }
 
 func diffItemNeedsSrcFailureLog(item DiffItem) bool {
@@ -212,26 +255,10 @@ func (s *migrationStore) queryNodes(filter NodeQueryFilter) ([]db.NodeState, err
 }
 
 func statusCountsAsPending(status, pendingStatus string) bool {
-	switch status {
-	case "", pendingStatus:
-		return true
-	default:
-		return false
+	if pendingStatus == db.DeleteStatusPendingExplicit {
+		return status == "" || db.DeleteStatusIsPending(status)
 	}
-}
-
-// copyWorkDeltaForNode returns the signed folder/file/byte adjustment for one node
-// entering (+) or leaving (−) the copy-work denominator.
-func copyWorkDeltaForNode(nodeType string, size int64, sign int64) db.DepthWorkAbsolute {
-	var d db.DepthWorkAbsolute
-	switch nodeType {
-	case db.NodeTypeFolder:
-		d.Folders = sign
-	case db.NodeTypeFile:
-		d.Files = sign
-		d.Bytes = sign * size
-	}
-	return d
+	return status == "" || status == pendingStatus
 }
 
 // addPendingTypeCountDelta adjusts Path Review folders/files counts (selected set) for one node.
@@ -261,8 +288,8 @@ func addDeleteSelectedSizeDelta(deltas map[string]int64, node *db.NodeState, fro
 	if node == nil || !copyStatusIsComplete(node.CopyStatus) {
 		return
 	}
-	wasPending := statusCountsAsPending(from, db.DeleteStatusPending)
-	nowPending := statusCountsAsPending(to, db.DeleteStatusPending)
+	wasPending := statusCountsAsPending(from, db.DeleteStatusPendingExplicit)
+	nowPending := statusCountsAsPending(to, db.DeleteStatusPendingExplicit)
 	var sign int64
 	switch {
 	case wasPending && !nowPending:
@@ -299,128 +326,45 @@ func (s *migrationStore) setNodeExcluded(nodeID string, excluded bool) (int64, m
 			return 0, nil, nil
 		}
 	}
-	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
-		return sess.WithTx(func(w *db.Writer) error {
-			if !excluded {
-				prior, err2 := w.LatestNonExclusionCopyStatus(nodeID)
-				if err2 != nil {
-					return err2
-				}
-				if prior != "" && prior != db.CopyStatusPending {
-					return nil
-				}
-			}
-			return w.SetNodeExcluded("SRC", nodeID, excluded)
-		})
-	})
+	mut, err := s.db.ApplyNodeCopyExclusion(nodeID, excluded)
 	if err != nil {
 		return 0, nil, err
 	}
-	// Re-read: SetNodeExcluded may no-op inside the tx without surfacing it.
-	after, err := pull.GetNodeByID(s.db, "SRC", nodeID)
-	if err != nil || after == nil {
+	if mut.Affected == 0 {
+		return 0, nil, nil
+	}
+	subMut := subtree.SubtreeCopyMutationResult{
+		Affected: mut.Affected, Folders: mut.Folders, Files: mut.Files, PendingBytes: mut.PendingBytes,
+	}
+	deltas, err := s.persistCopyExclusionMutation(subMut, excluded)
+	if err != nil {
 		return 0, nil, err
 	}
-	if excluded && !after.Excluded {
-		return 0, nil, nil
-	}
-	if !excluded && after.Excluded {
-		return 0, nil, nil
-	}
-	deltas := make(map[string]int64)
-	if excluded {
-		addReviewDelta(deltas, DeltaExcluded, 1)
-		addReviewDelta(deltas, DeltaCopyPending, -1)
-		addPendingTypeCountDelta(deltas, node.Type, -1)
-		if node.Type == db.NodeTypeFile {
-			addReviewDelta(deltas, DeltaSizeSelected, -node.Size)
-		}
-		if err := stats.AdjustCopyWorkForReview(s.db, copyWorkDeltaForNode(node.Type, node.Size, -1), db.CopyWorkReasonReviewExclude); err != nil {
-			return 0, nil, fmt.Errorf("adjust copy work on exclude: %w", err)
-		}
-	} else {
-		addReviewDelta(deltas, DeltaExcluded, -1)
-		addReviewDelta(deltas, DeltaCopyPending, 1)
-		addPendingTypeCountDelta(deltas, node.Type, 1)
-		if node.Type == db.NodeTypeFile {
-			addReviewDelta(deltas, DeltaSizeSelected, node.Size)
-		}
-		if err := stats.AdjustCopyWorkForReview(s.db, copyWorkDeltaForNode(node.Type, node.Size, 1), db.CopyWorkReasonReviewUnexclude); err != nil {
-			return 0, nil, fmt.Errorf("adjust copy work on unexclude: %w", err)
-		}
-	}
-	if err := s.persistReviewDeltas(deltas); err != nil {
-		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
-	}
-	return 1, deltas, nil
+	return mut.Affected, deltas, nil
 }
 
 func (s *migrationStore) listRecentLogs(limit int) ([]LogEntry, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	conn, err := s.db.GetDB()
-	if err != nil {
-		return nil, err
-	}
-	rows, err := conn.QueryContext(
-		context.Background(),
-		`SELECT id, created_at, level, message FROM logs ORDER BY created_at DESC LIMIT $1`,
-		limit,
-	)
+	recs, err := s.db.Ops().ListRecentLogs(limit)
 	if err != nil {
 		return nil, fmt.Errorf("get recent logs: %w", err)
 	}
-	defer rows.Close()
-	out := make([]LogEntry, 0, limit)
-	for rows.Next() {
-		var (
-			id        string
-			timestamp time.Time
-			level     string
-			message   string
-		)
-		if err := rows.Scan(&id, &timestamp, &level, &message); err != nil {
-			return nil, err
+	out := make([]LogEntry, 0, len(recs))
+	for _, rec := range recs {
+		ts := rec.At
+		if ts.IsZero() {
+			ts = time.Now()
 		}
 		out = append(out, LogEntry{
-			ID:        id,
-			Timestamp: timestamp,
-			Level:     level,
-			Message:   message,
+			ID:        rec.ID,
+			Timestamp: ts,
+			Level:     rec.Level,
+			Message:   rec.Message,
 		})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
 	}
 	return out, nil
-}
-
-func (s *migrationStore) setNodeTraversalStatus(nodeID, status string) error {
-	// Try SRC first, then DST. This avoids a read-before-write table resolution hop.
-	err := s.db.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			return w.SetNodeTraversalStatus("SRC", nodeID, status)
-		})
-	})
-	if err == nil {
-		return nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	err = s.db.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			return w.SetNodeTraversalStatus("DST", nodeID, status)
-		})
-	})
-	if err == nil {
-		return nil
-	}
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("node %s not found", nodeID)
-	}
-	return err
 }
 
 func (s *migrationStore) setNodeCopyStatus(nodeID, status string) (int64, map[string]int64, error) {
@@ -443,26 +387,43 @@ func (s *migrationStore) setNodeCopyStatus(nodeID, status string) (int64, map[st
 	default:
 		return 0, nil, fmt.Errorf("unsupported copy status transition to %q", status)
 	}
-	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
-		return sess.WithTx(func(w *db.Writer) error {
-			return w.SetNodeCopyStatus("SRC", nodeID, status)
-		})
-	})
+	mark := status == db.CopyStatusPending
+	var opsMut opsdb.SubtreeMutationResult
+	if node.Type == db.NodeTypeFolder {
+		opsMut, err = s.db.Ops().ApplySubtreeCopyRetry(node.Path, mark)
+	} else {
+		opsMut, err = s.db.Ops().ApplyNodeCopyRetry(nodeID, mark)
+	}
 	if err != nil {
 		return 0, nil, err
 	}
+	mut := db.CopyMutationResult{
+		Affected: opsMut.Affected, Folders: opsMut.Folders, Files: opsMut.Files, PendingBytes: opsMut.SelectedBytes,
+	}
+	if mut.Affected == 0 {
+		return 0, nil, nil
+	}
 	deltas := make(map[string]int64)
+	n := mut.Affected
 	if status == db.CopyStatusPending {
-		addReviewDelta(deltas, DeltaCopyFailed, -1)
-		addReviewDelta(deltas, DeltaCopyPending, 1)
+		addReviewDelta(deltas, DeltaCopyFailed, -n)
+		addReviewDelta(deltas, DeltaCopyPending, n)
+		addReviewDelta(deltas, DeltaCopyPendingRetry, n)
+		addReviewDelta(deltas, DeltaFolders, mut.Folders)
+		addReviewDelta(deltas, DeltaFiles, mut.Files)
+		addReviewDelta(deltas, DeltaSizeSelected, mut.PendingBytes)
 	} else {
-		addReviewDelta(deltas, DeltaCopyPending, -1)
-		addReviewDelta(deltas, DeltaCopyFailed, 1)
+		addReviewDelta(deltas, DeltaCopyPending, -n)
+		addReviewDelta(deltas, DeltaCopyPendingRetry, -n)
+		addReviewDelta(deltas, DeltaCopyFailed, n)
+		addReviewDelta(deltas, DeltaFolders, -mut.Folders)
+		addReviewDelta(deltas, DeltaFiles, -mut.Files)
+		addReviewDelta(deltas, DeltaSizeSelected, -mut.PendingBytes)
 	}
 	if err := s.persistReviewDeltas(deltas); err != nil {
 		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
 	}
-	return 1, deltas, nil
+	return mut.Affected, deltas, nil
 }
 
 func (s *migrationStore) setNodeDeleteStatus(nodeID, status string) (int64, map[string]int64, error) {
@@ -478,54 +439,87 @@ func (s *migrationStore) setNodeDeleteStatus(nodeID, status string) (int64, map[
 		return 0, nil, nil
 	}
 	switch status {
-	case db.DeleteStatusPending:
-		// init (empty→pending), mark-retry (failed→pending), or unskip (skipped→pending)
-		if oldDelete != "" && oldDelete != db.DeleteStatusFailed && oldDelete != db.DeleteStatusSkipped {
+	case db.DeleteStatusPendingExplicit, db.DeleteStatusPendingInherited:
+		// init, mark-retry (failed→pending*), or unskip (skipped→pending*)
+		if oldDelete != "" && oldDelete != db.DeleteStatusFailed && oldDelete != db.DeleteStatusSkipped &&
+			!db.DeleteStatusIsPending(oldDelete) {
 			return 0, nil, nil
 		}
 	case db.DeleteStatusFailed:
-		if oldDelete != db.DeleteStatusPending && oldDelete != "" {
+		if !db.DeleteStatusIsPending(oldDelete) && oldDelete != "" {
 			return 0, nil, nil
 		}
 	case db.DeleteStatusSkipped:
-		if oldDelete != db.DeleteStatusPending && oldDelete != "" {
+		if !db.DeleteStatusIsPending(oldDelete) && oldDelete != "" {
 			return 0, nil, nil
 		}
 	}
-	var anc subtree.SubtreeDeleteMutationResult
-	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
-		return sess.WithTx(func(w *db.Writer) error {
-			if err := w.SetNodeDeleteStatus("SRC", nodeID, status); err != nil {
-				return err
+	var mut db.DeleteMutationResult
+	if node.Type == db.NodeTypeFolder {
+		switch {
+		case db.DeleteStatusIsPending(status):
+			opsMut, aerr := s.db.Ops().ApplySubtreeDeleteRetry(node.Path, true)
+			err = aerr
+			mut = db.DeleteMutationResult{
+				Affected: opsMut.Affected, Folders: opsMut.Folders, Files: opsMut.Files, SelectedBytes: opsMut.SelectedBytes,
 			}
-			if status == db.DeleteStatusSkipped {
-				var aerr error
-				anc, aerr = subtree.InsertDeleteStatusEventsForAncestors(w, node.Path, db.DeleteStatusSkipped, db.SQLDeleteSubtreeSkipEligible)
-				return aerr
+		case status == db.DeleteStatusFailed:
+			opsMut, aerr := s.db.Ops().ApplySubtreeDeleteRetry(node.Path, false)
+			err = aerr
+			mut = db.DeleteMutationResult{
+				Affected: opsMut.Affected, Folders: opsMut.Folders, Files: opsMut.Files, SelectedBytes: opsMut.SelectedBytes,
 			}
-			return nil
-		})
-	})
+		case status == db.DeleteStatusSkipped:
+			mut, err = s.db.ApplyDeleteForestSkip(node.Path)
+		}
+	} else {
+		switch {
+		case db.DeleteStatusIsPending(status) && oldDelete == db.DeleteStatusSkipped:
+			mut, err = s.db.ApplyDeleteForestUnskip(node.Path)
+		case db.DeleteStatusIsPending(status):
+			opsMut, aerr := s.db.Ops().ApplyNodeDeleteRetry(nodeID, true)
+			err = aerr
+			mut = db.DeleteMutationResult{
+				Affected: opsMut.Affected, Folders: opsMut.Folders, Files: opsMut.Files, SelectedBytes: opsMut.SelectedBytes,
+			}
+		case status == db.DeleteStatusFailed:
+			opsMut, aerr := s.db.Ops().ApplyNodeDeleteRetry(nodeID, false)
+			err = aerr
+			mut = db.DeleteMutationResult{
+				Affected: opsMut.Affected, Folders: opsMut.Folders, Files: opsMut.Files, SelectedBytes: opsMut.SelectedBytes,
+			}
+		case status == db.DeleteStatusSkipped:
+			mut, err = s.db.ApplyDeleteForestSkip(node.Path)
+		}
+	}
 	if err != nil {
 		return 0, nil, err
 	}
+	if mut.Affected == 0 {
+		return 0, nil, nil
+	}
 	deltas := make(map[string]int64)
-	addReviewDeltaForDeleteStatusTransition(deltas, oldDelete, status)
-	addDeleteSelectedSizeDelta(deltas, node, oldDelete, status)
-	if anc.Affected > 0 {
-		addReviewDeltaForDeleteStatus(deltas, db.DeleteStatusPending, -anc.Affected)
-		addReviewDeltaForDeleteStatus(deltas, db.DeleteStatusSkipped, anc.Affected)
-		addReviewDelta(deltas, DeltaFolders, -anc.Folders)
-		addReviewDelta(deltas, DeltaFiles, -anc.Files)
-		if anc.SelectedBytes != 0 {
-			addReviewDelta(deltas, DeltaSizeDeleteSelected, -anc.SelectedBytes)
-			addReviewDelta(deltas, DeltaSizeSelected, -anc.SelectedBytes)
+	n := mut.Affected
+	addReviewDeltaForDeleteStatus(deltas, oldDelete, -n)
+	addReviewDeltaForDeleteStatus(deltas, status, n)
+	wasPending := statusCountsAsPending(oldDelete, db.DeleteStatusPendingExplicit)
+	nowPending := statusCountsAsPending(status, db.DeleteStatusPendingExplicit)
+	if wasPending != nowPending {
+		sign := int64(1)
+		if wasPending {
+			sign = -1
+		}
+		addReviewDelta(deltas, DeltaFolders, sign*mut.Folders)
+		addReviewDelta(deltas, DeltaFiles, sign*mut.Files)
+		if mut.SelectedBytes != 0 {
+			addReviewDelta(deltas, DeltaSizeDeleteSelected, sign*mut.SelectedBytes)
+			addReviewDelta(deltas, DeltaSizeSelected, sign*mut.SelectedBytes)
 		}
 	}
 	if err := s.persistReviewDeltas(deltas); err != nil {
 		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
 	}
-	return 1 + anc.Affected, deltas, nil
+	return mut.Affected, deltas, nil
 }
 
 func (s *migrationStore) setNodeDeleteStatusWithPropagation(nodeID, targetStatus string) (int64, map[string]int64, error) {
@@ -540,33 +534,12 @@ func (s *migrationStore) setNodeDeleteStatusWithPropagation(nodeID, targetStatus
 		return s.setNodeDeleteStatus(nodeID, targetStatus)
 	}
 	rootPath := node.Path
-	var mut subtree.SubtreeDeleteMutationResult
-	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
-		return sess.WithTx(func(w *db.Writer) error {
-			var err error
-			switch targetStatus {
-			case db.DeleteStatusSkipped:
-				mut, err = subtree.InsertDeleteStatusEventsForSubtree(w, rootPath, db.DeleteStatusSkipped, db.SQLDeleteSubtreeSkipEligible)
-				if err != nil {
-					return err
-				}
-				anc, aerr := subtree.InsertDeleteStatusEventsForAncestors(w, rootPath, db.DeleteStatusSkipped, db.SQLDeleteSubtreeSkipEligible)
-				if aerr != nil {
-					return aerr
-				}
-				mut.Affected += anc.Affected
-				mut.Folders += anc.Folders
-				mut.Files += anc.Files
-				mut.SelectedBytes += anc.SelectedBytes
-				return nil
-			case db.DeleteStatusPending:
-				mut, err = subtree.InsertDeleteStatusEventsForSubtree(w, rootPath, db.DeleteStatusPending, db.SQLDeleteSubtreeUnskipEligible)
-			default:
-				return fmt.Errorf("delete status propagation only supports skip or unskip")
-			}
-			return err
-		})
-	})
+	var mut db.DeleteMutationResult
+	if targetStatus == db.DeleteStatusSkipped {
+		mut, err = s.db.ApplyDeleteForestSkip(rootPath)
+	} else {
+		mut, err = s.db.ApplyDeleteForestUnskip(rootPath)
+	}
 	if err != nil {
 		return 0, nil, fmt.Errorf("set delete status with propagation: %w", err)
 	}
@@ -584,7 +557,7 @@ func (s *migrationStore) setNodeDeleteStatusWithPropagation(nodeID, targetStatus
 		foldersDelta = -mut.Folders
 		filesDelta = -mut.Files
 	}
-	addReviewDeltaForDeleteStatus(deltas, db.DeleteStatusPending, pendingDelta)
+	addReviewDeltaForDeleteStatus(deltas, db.DeleteStatusPendingExplicit, pendingDelta)
 	addReviewDeltaForDeleteStatus(deltas, db.DeleteStatusSkipped, -pendingDelta)
 	addReviewDelta(deltas, DeltaFolders, foldersDelta)
 	addReviewDelta(deltas, DeltaFiles, filesDelta)
@@ -598,197 +571,173 @@ func (s *migrationStore) setNodeDeleteStatusWithPropagation(nodeID, targetStatus
 	return mut.Affected, deltas, nil
 }
 
-// markNodeForRetryDiscovery looks up the node by ID in SRC then DST (nodeID is either a SRC or DST node ID).
-// For a SRC node at path P: deletes all DST descendants under P (not the DST node at P), marks SRC and DST node at P as pending. Non-recursive; DST children are removed so they can be re-derived on next traversal.
-// Accepts failed (normal retry) or excluded (root-pick / traversal-skipped activate).
+func (s *migrationStore) loadReviewNode(table, id string) (*db.NodeState, error) {
+	return pull.GetNodeByID(s.db, table, id)
+}
+
+func (s *migrationStore) pairedReviewNode(table, path, mappedID string) (*db.NodeState, error) {
+	n, err := pull.GetNodeByPath(s.db, table, path)
+	if err != nil {
+		return nil, err
+	}
+	if n != nil {
+		return n, nil
+	}
+	if mappedID == "" {
+		return nil, nil
+	}
+	return s.loadReviewNode(table, mappedID)
+}
+
+func (s *migrationStore) mappedID(side, nodeID string) (string, error) {
+	if s.db.Ops() == nil {
+		return "", nil
+	}
+	if side == "DST" {
+		m, ok, err := s.db.Ops().GetMapBySrc(nodeID)
+		if err != nil || !ok {
+			return "", err
+		}
+		return m.DstID, nil
+	}
+	m, ok, err := s.db.Ops().GetMapByDst(nodeID)
+	if err != nil || !ok {
+		return "", err
+	}
+	return m.SrcID, nil
+}
+
+// reviewPairFromID resolves the SRC/DST pair for a review node id (either side).
+func (s *migrationStore) reviewPairFromID(nodeID string) (src, dst *db.NodeState, err error) {
+	src, err = s.loadReviewNode("SRC", nodeID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if src != nil {
+		mapped, err := s.mappedID("DST", src.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		dst, err = s.pairedReviewNode("DST", src.Path, mapped)
+		return src, dst, err
+	}
+	dst, err = s.loadReviewNode("DST", nodeID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if dst == nil {
+		return nil, nil, fmt.Errorf("node %s not found", nodeID)
+	}
+	mapped, err := s.mappedID("SRC", dst.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	src, err = s.pairedReviewNode("SRC", dst.Path, mapped)
+	return src, dst, err
+}
+
+// markNodeForRetryDiscovery marks whichever side(s) of the pair are failed (or SRC excluded)
+// via live Badger path-prefix mutations.
 func (s *migrationStore) markNodeForRetryDiscovery(nodeID string) (int64, map[string]int64, error) {
-	srcNode, err := pull.GetNodeByID(s.db, "SRC", nodeID)
+	srcNode, dstNode, err := s.reviewPairFromID(nodeID)
 	if err != nil {
 		return 0, nil, err
 	}
-	if srcNode != nil {
-		fromExcluded := srcNode.TraversalStatus == db.StatusExcluded
-		if srcNode.TraversalStatus != db.StatusFailed && !fromExcluded {
-			return 0, nil, nil
+	srcRetry := srcNode != nil && (srcNode.TraversalStatus == db.StatusFailed || srcNode.TraversalStatus == db.StatusExcluded)
+	dstRetry := dstNode != nil && dstNode.TraversalStatus == db.StatusFailed
+	if !srcRetry && !dstRetry {
+		return 0, nil, nil
+	}
+	if srcRetry {
+		dstID := ""
+		if dstNode != nil {
+			dstID = dstNode.ID
 		}
-		path := srcNode.Path
-		dstAtPath, _ := pull.GetNodeByPath(s.db, "DST", path)
-		var desc subtree.DstDescendantsReviewStats
-		err := s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
-			return sess.WithTx(func(w *db.Writer) error {
-				var err error
-				desc, err = subtree.CountDstDescendantsReviewStats(w, path)
-				if err != nil {
-					return err
-				}
-				if err := w.SetNodeTraversalStatus("SRC", nodeID, db.StatusPending); err != nil {
-					return err
-				}
-				if fromExcluded {
-					if err := w.SetNodeExcluded("SRC", nodeID, false); err != nil {
-						return err
-					}
-				}
-				if dstAtPath != nil {
-					if err := w.SetNodeTraversalStatus("DST", dstAtPath.ID, db.StatusPending); err != nil {
-						return err
-					}
-					// Deletes DST descendants; review deltas come from desc aggregates (no RecomputeStatsForDepth).
-					if err := w.DeleteDescendantsUnderPath("DST", path); err != nil {
-						return err
-					}
-				}
-				return nil
-			})
-		})
+		res, err := s.db.Ops().ApplyTraversalRetryMark(srcNode.ID, dstID)
 		if err != nil {
 			return 0, nil, err
 		}
+		if res.Affected == 0 {
+			return 0, nil, nil
+		}
+		purged := res.DstPurged
 		deltas := make(map[string]int64)
-		if fromExcluded {
-			addReviewDelta(deltas, DeltaExcluded, -1)
-			addReviewDelta(deltas, DeltaTraversalPendingRetry, 1)
-			addReviewDelta(deltas, DeltaCopyPending, 1)
-			addPendingTypeCountDelta(deltas, srcNode.Type, 1)
+		addReviewDelta(deltas, DeltaTraversalFailed, -res.FromFailed)
+		addReviewDelta(deltas, DeltaExcluded, -res.FromExcluded)
+		addReviewDelta(deltas, DeltaTraversalPendingRetry, res.Affected)
+		// Excluded→retry becomes copy-pending in Badger; credit the copy counter once here.
+		// Failed→retry keeps copy_status=pending (already in copy/pending); do not debit/credit it.
+		if res.FromExcluded > 0 {
+			addReviewDelta(deltas, DeltaCopyPending, res.FromExcluded)
+			addPendingTypeCountDelta(deltas, srcNode.Type, res.FromExcluded)
 			if srcNode.Type == db.NodeTypeFile {
 				addReviewDelta(deltas, DeltaSizeSelected, srcNode.Size)
 			}
-		} else {
-			addReviewDelta(deltas, DeltaTraversalFailed, -1+-desc.TraversalFailed)
-			addReviewDelta(deltas, DeltaTraversalPendingRetry, 1)
-			addReviewDelta(deltas, DeltaFolders, -desc.Folders)
-			addReviewDelta(deltas, DeltaFiles, -desc.Files)
-			addReviewDelta(deltas, DeltaExcluded, -desc.Excluded)
-			addReviewDelta(deltas, DeltaSizeDst, -desc.SizeDst)
 		}
+		// DST purge removes destination nodes only. folders/files and traversal failed/excluded
+		// review keys are SRC inventory; only sizeDst tracks purged DST bytes.
+		addReviewDelta(deltas, DeltaSizeDst, -purged.SizeDst)
 		if err := s.persistReviewDeltas(deltas); err != nil {
 			return 0, nil, fmt.Errorf("persist review deltas: %w", err)
 		}
-		return 1, deltas, nil
+		return res.Affected, deltas, nil
 	}
-	dstNode, err := pull.GetNodeByID(s.db, "DST", nodeID)
-	if err != nil || dstNode == nil {
-		if err != nil {
-			return 0, nil, err
-		}
-		return 0, nil, fmt.Errorf("node %s not found", nodeID)
+	res, err := s.db.Ops().ApplyDSTTraversalRetry(dstNode.ID, true)
+	if err != nil {
+		return 0, nil, err
 	}
-	if dstNode.TraversalStatus != db.StatusFailed {
+	if res.Affected == 0 {
 		return 0, nil, nil
 	}
-	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
-		return sess.WithTx(func(w *db.Writer) error {
-			return w.SetNodeTraversalStatus("DST", nodeID, db.StatusPending)
-		})
-	})
-	if err != nil {
-		return 0, nil, err
-	}
-	deltas := make(map[string]int64)
-	addReviewDelta(deltas, DeltaTraversalFailed, -1)
-	addReviewDelta(deltas, DeltaTraversalPendingRetry, 1)
-	if err := s.persistReviewDeltas(deltas); err != nil {
-		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
-	}
-	return 1, deltas, nil
+	// DST-only marks enroll pend:trav but do not move SRC Failed / pending_retry.
+	return res.Affected, nil, nil
 }
 
-// unmarkNodeForRetryDiscovery sets SRC node back to failed (or excluded when that was the prior status)
-// and restores the paired DST node (if any) to its prior non-pending traversal status.
-// not_on_src is only for DST-only paths; a DST node at a path that still has SRC must not get it.
-// Does not recreate DST children that were deleted on mark-for-retry.
+// unmarkNodeForRetryDiscovery clears a live discovery-retry mark on the pair.
 func (s *migrationStore) unmarkNodeForRetryDiscovery(nodeID string) (int64, map[string]int64, error) {
-	srcNode, err := pull.GetNodeByID(s.db, "SRC", nodeID)
+	srcNode, dstNode, err := s.reviewPairFromID(nodeID)
 	if err != nil {
 		return 0, nil, err
 	}
-	if srcNode != nil {
-		if srcNode.TraversalStatus != db.StatusPending {
-			return 0, nil, nil
+	if srcNode != nil && srcNode.TraversalStatus == db.StatusPending {
+		dstID := ""
+		if dstNode != nil {
+			dstID = dstNode.ID
 		}
-		path := srcNode.Path
-		dstAtPath, _ := pull.GetNodeByPath(s.db, "DST", path)
-		restoreExcluded := false
-		err := s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
-			return sess.WithTx(func(w *db.Writer) error {
-				prior, err2 := w.LatestNonPendingTraversalStatus("SRC", nodeID)
-				if err2 != nil {
-					return err2
-				}
-				restoreExcluded = prior == db.StatusExcluded
-				restore := db.StatusFailed
-				if restoreExcluded {
-					restore = db.StatusExcluded
-				}
-				if err := w.SetNodeTraversalStatus("SRC", nodeID, restore); err != nil {
-					return err
-				}
-				if restoreExcluded {
-					if err := w.SetNodeExcluded("SRC", nodeID, true); err != nil {
-						return err
-					}
-				}
-				if dstAtPath != nil {
-					dstPrior, err2 := w.LatestNonPendingTraversalStatus("DST", dstAtPath.ID)
-					if err2 != nil {
-						return err2
-					}
-					dstRestore := dstPrior
-					if dstRestore == "" || dstRestore == db.StatusNotOnSrc {
-						dstRestore = db.StatusSuccessful
-					}
-					if err := w.SetNodeTraversalStatus("DST", dstAtPath.ID, dstRestore); err != nil {
-						return err
-					}
-				}
-				return nil
-			})
-		})
+		res, err := s.db.Ops().ApplyTraversalRetryUnmark(srcNode.ID, dstID)
 		if err != nil {
 			return 0, nil, err
 		}
+		if res.Affected == 0 {
+			return 0, nil, nil
+		}
 		deltas := make(map[string]int64)
-		addReviewDelta(deltas, DeltaTraversalPendingRetry, -1)
-		if restoreExcluded {
-			addReviewDelta(deltas, DeltaExcluded, 1)
-			addReviewDelta(deltas, DeltaCopyPending, -1)
-			addPendingTypeCountDelta(deltas, srcNode.Type, -1)
+		addReviewDelta(deltas, DeltaTraversalPendingRetry, -res.Affected)
+		addReviewDelta(deltas, DeltaExcluded, res.FromExcluded)
+		addReviewDelta(deltas, DeltaTraversalFailed, res.FromFailed)
+		if res.FromExcluded > 0 {
+			addReviewDelta(deltas, DeltaCopyPending, -res.FromExcluded)
+			addPendingTypeCountDelta(deltas, srcNode.Type, -res.FromExcluded)
 			if srcNode.Type == db.NodeTypeFile {
 				addReviewDelta(deltas, DeltaSizeSelected, -srcNode.Size)
 			}
-		} else {
-			addReviewDelta(deltas, DeltaTraversalFailed, 1)
 		}
 		if err := s.persistReviewDeltas(deltas); err != nil {
 			return 0, nil, fmt.Errorf("persist review deltas: %w", err)
 		}
-		return 1, deltas, nil
+		return res.Affected, deltas, nil
 	}
-	dstNode, err := pull.GetNodeByID(s.db, "DST", nodeID)
-	if err != nil || dstNode == nil {
-		if err != nil {
-			return 0, nil, err
-		}
-		return 0, nil, fmt.Errorf("node %s not found", nodeID)
-	}
-	if dstNode.TraversalStatus != db.StatusPending {
+	if dstNode == nil || dstNode.TraversalStatus != db.StatusPending {
 		return 0, nil, nil
 	}
-	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
-		return sess.WithTx(func(w *db.Writer) error {
-			return w.SetNodeTraversalStatus("DST", nodeID, db.StatusFailed)
-		})
-	})
+	res, err := s.db.Ops().ApplyDSTTraversalRetry(dstNode.ID, false)
 	if err != nil {
 		return 0, nil, err
 	}
-	deltas := make(map[string]int64)
-	addReviewDelta(deltas, DeltaTraversalPendingRetry, -1)
-	addReviewDelta(deltas, DeltaTraversalFailed, 1)
-	if err := s.persistReviewDeltas(deltas); err != nil {
-		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+	if res.Affected == 0 {
+		return 0, nil, nil
 	}
-	return 1, deltas, nil
+	return res.Affected, nil, nil
 }
 
 func (s *migrationStore) setNodeExcludedWithPropagation(nodeID string, excluded bool) (int64, map[string]int64, error) {
@@ -799,43 +748,77 @@ func (s *migrationStore) setNodeExcludedWithPropagation(nodeID string, excluded 
 	if node == nil {
 		return 0, nil, fmt.Errorf("node %s not found in SRC", nodeID)
 	}
-	rootPath := node.Path
-	var mut subtree.SubtreeCopyMutationResult
-	err = s.db.RunWrite(context.Background(), func(sess *db.WriteSession) error {
-		return sess.WithTx(func(w *db.Writer) error {
-			var err2 error
-			if excluded {
-				mut, err2 = subtree.InsertExclusionEventsForSubtree(w, "SRC", rootPath)
-				if err2 != nil {
-					return err2
-				}
-				if mut.Affected == 0 {
-					return nil
-				}
-				if err := subtree.InsertGPLStatusEventsForSubtree(w, "SRC", rootPath, db.GPLStatusIgnored, true); err != nil {
-					return err
-				}
-				return subtree.InsertGPLStatusEventsForSubtree(w, "DST", rootPath, db.GPLStatusIgnored, true)
-			}
-			mut, err2 = subtree.InsertUnexcludeEventsForSubtree(w, "SRC", rootPath)
-			if err2 != nil {
-				return err2
-			}
-			if mut.Affected == 0 {
-				return nil
-			}
-			if err := subtree.InsertGPLRestoredEventsForSubtree(w, "SRC", rootPath); err != nil {
-				return err
-			}
-			return subtree.InsertGPLRestoredEventsForSubtree(w, "DST", rootPath)
-		})
-	})
+	if excluded {
+		if node.Excluded || !statusCountsAsPending(node.CopyStatus, db.CopyStatusPending) {
+			return 0, nil, nil
+		}
+	} else if !node.Excluded {
+		return 0, nil, nil
+	}
+	mut, err := s.db.ApplySubtreeCopyExclusion(node.Path, excluded, nil)
 	if err != nil {
 		return 0, nil, fmt.Errorf("set exclusion with propagation: %w", err)
 	}
 	if mut.Affected == 0 {
 		return 0, nil, nil
 	}
+	subMut := subtree.SubtreeCopyMutationResult{
+		Affected: mut.Affected, Folders: mut.Folders, Files: mut.Files, PendingBytes: mut.PendingBytes,
+	}
+	deltas, err := s.persistCopyExclusionMutation(subMut, excluded)
+	if err != nil {
+		return 0, nil, err
+	}
+	return mut.Affected, deltas, nil
+}
+
+func (s *migrationStore) applySearchExclusion(
+	f review.ReviewFilter,
+	criteriaJSON string,
+	exceptIDs []string,
+	applicationID string,
+	eventTime int64,
+) (int64, map[string]int64, error) {
+	mut, err := filterapply.ApplySearchExclusionOps(s.db, f, criteriaJSON, exceptIDs, applicationID, eventTime)
+	if err != nil {
+		return 0, nil, fmt.Errorf("apply search exclusion: %w", err)
+	}
+	if mut.Affected == 0 {
+		return 0, nil, nil
+	}
+	subMut := subtree.SubtreeCopyMutationResult{
+		Affected: mut.Affected, Folders: mut.Folders, Files: mut.Files, PendingBytes: mut.PendingBytes,
+	}
+	deltas, err := s.persistCopyExclusionMutation(subMut, true)
+	if err != nil {
+		return 0, nil, err
+	}
+	return mut.Affected, deltas, nil
+}
+
+func (s *migrationStore) applySearchUnexclusion(
+	f review.ReviewFilter,
+	exceptIDs []string,
+	eventTime int64,
+) (int64, map[string]int64, error) {
+	mut, err := filterapply.ApplySearchUnexclusionOps(s.db, f, exceptIDs, eventTime)
+	if err != nil {
+		return 0, nil, fmt.Errorf("apply search unexclusion: %w", err)
+	}
+	if mut.Affected == 0 {
+		return 0, nil, nil
+	}
+	subMut := subtree.SubtreeCopyMutationResult{
+		Affected: mut.Affected, Folders: mut.Folders, Files: mut.Files, PendingBytes: mut.PendingBytes,
+	}
+	deltas, err := s.persistCopyExclusionMutation(subMut, false)
+	if err != nil {
+		return 0, nil, err
+	}
+	return mut.Affected, deltas, nil
+}
+
+func (s *migrationStore) persistCopyExclusionMutation(mut subtree.SubtreeCopyMutationResult, excluded bool) (map[string]int64, error) {
 	deltas := make(map[string]int64)
 	sign := int64(1)
 	if excluded {
@@ -852,12 +835,12 @@ func (s *migrationStore) setNodeExcludedWithPropagation(nodeID string, excluded 
 		reason = db.CopyWorkReasonReviewExclude
 	}
 	if err := stats.AdjustCopyWorkForReview(s.db, cw, reason); err != nil {
-		return 0, nil, fmt.Errorf("adjust copy work: %w", err)
+		return nil, fmt.Errorf("adjust copy work: %w", err)
 	}
 	if err := s.persistReviewDeltas(deltas); err != nil {
-		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+		return nil, fmt.Errorf("persist review deltas: %w", err)
 	}
-	return mut.Affected, deltas, nil
+	return deltas, nil
 }
 
 func conditionStringValue(v any) (string, bool) {
@@ -928,9 +911,10 @@ func normalizeDepthSizeOp(op string) string {
 }
 
 // searchRequestToReviewFilter maps API/UI SearchRequest onto review.ReviewFilter (merged view, status from events).
-func searchRequestToReviewFilter(req SearchRequest) review.ReviewFilter {
+func searchRequestToReviewFilter(req SearchRequest) (review.ReviewFilter, error) {
 	f := review.ReviewFilter{
 		ParentPath:             strings.TrimSpace(req.Path),
+		UnderPath:              strings.TrimSpace(req.UnderPath),
 		Query:                  strings.TrimSpace(req.Query),
 		FoldersOnly:            req.FoldersOnly,
 		ExcludeRoot:            req.Path == "",
@@ -939,14 +923,16 @@ func searchRequestToReviewFilter(req SearchRequest) review.ReviewFilter {
 		CopyStatus:             strings.TrimSpace(req.CopyStatus),
 		DeleteStatus:           strings.TrimSpace(req.DeleteStatus),
 		ExcludeDestinationOnly: excludeDestinationOnly(req.IncludeDestinationOnly),
+		AfterPath:              strings.TrimSpace(req.AfterPath),
+		AfterID:                strings.TrimSpace(req.AfterID),
 	}
 	for _, c := range req.Conditions {
 		field := strings.ToLower(strings.TrimSpace(c.Field))
 		switch field {
 		case "path":
 			if s, ok := conditionStringValue(c.Value); ok && strings.TrimSpace(s) != "" {
-				f.Query = strings.TrimSpace(s)
-				f.QueryField = "path"
+				// Repeated path conditions are ordered "in path" segments (not id_path LIKE).
+				f.PathSegments = append(f.PathSegments, strings.TrimSpace(s))
 			}
 		case "name":
 			if s, ok := conditionStringValue(c.Value); ok && strings.TrimSpace(s) != "" {
@@ -989,7 +975,169 @@ func searchRequestToReviewFilter(req SearchRequest) review.ReviewFilter {
 			}
 		}
 	}
-	return f
+	if !filter.EmptyRuleset(req.Ruleset) {
+		rs := *req.Ruleset
+		segs, rest, hasRest := splitSearchPathSegments(rs.RootGroup)
+		for _, seg := range segs {
+			f.PathSegments = append(f.PathSegments, seg)
+		}
+		if hasRest {
+			rs.RootGroup = rest
+			compiled, err := filter.Compile(rs)
+			if err != nil {
+				return f, fmt.Errorf("compile search ruleset: %w", err)
+			}
+			f.CompiledFilter = compiled
+			liftReviewSearchFieldsFromRuleset(&f, compiled.Ruleset.RootGroup)
+		}
+	}
+	return f, nil
+}
+
+// splitSearchPathSegments lifts path rules into ordered in-path segments and
+// returns the ruleset without those leaves. Open path contains/glob/regex is
+// not a search index; segments use the same idx:seg ancestry path as the search bar.
+// Overview: docs/search_indexes.md.
+func splitSearchPathSegments(g filter.Group) (segs []string, rest filter.Group, hasRest bool) {
+	rest = g
+	rest.Children = nil
+	for _, ch := range g.Children {
+		if ch.Condition != nil && ch.Condition.Field == filter.FieldPath {
+			if !ch.Condition.Negate {
+				segs = append(segs, pathSegmentValues(ch.Condition.Value)...)
+			}
+			continue
+		}
+		if ch.Group != nil {
+			nestedSegs, nested, nestedOK := splitSearchPathSegments(*ch.Group)
+			segs = append(segs, nestedSegs...)
+			if nestedOK {
+				copy := nested
+				rest.Children = append(rest.Children, filter.Child{Group: &copy})
+			}
+			continue
+		}
+		if ch.Condition != nil {
+			rest.Children = append(rest.Children, ch)
+		}
+	}
+	return segs, rest, len(rest.Children) > 0
+}
+
+func pathSegmentValues(v any) []string {
+	var raw []string
+	switch t := v.(type) {
+	case string:
+		raw = []string{t}
+	case []string:
+		raw = t
+	case []any:
+		for _, x := range t {
+			if s, ok := x.(string); ok {
+				raw = append(raw, s)
+			}
+		}
+	}
+	out := make([]string, 0, len(raw))
+	for _, s := range raw {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// liftReviewSearchFieldsFromRuleset maps search-only ruleset leaves onto flat ReviewFilter
+// status / path-issue fields so Badger post-filters and status overlays stay consistent.
+func liftReviewSearchFieldsFromRuleset(f *review.ReviewFilter, g filter.Group) {
+	if f == nil {
+		return
+	}
+	for _, ch := range g.Children {
+		if ch.Group != nil {
+			liftReviewSearchFieldsFromRuleset(f, *ch.Group)
+			continue
+		}
+		if ch.Condition == nil {
+			continue
+		}
+		c := ch.Condition
+		switch c.Field {
+		case filter.FieldReviewStatus:
+			if c.Operator != filter.OpEQ && c.Operator != "" {
+				continue
+			}
+			s, ok := conditionStringValue(c.Value)
+			if !ok || strings.TrimSpace(s) == "" {
+				continue
+			}
+			applyReviewStatusToken(f, strings.TrimSpace(s))
+		case filter.FieldPathIssueStatus:
+			if c.Operator != filter.OpEQ && c.Operator != "" {
+				continue
+			}
+			s, ok := conditionStringValue(c.Value)
+			if !ok || strings.TrimSpace(s) == "" {
+				continue
+			}
+			if f.PathIssueFilter == "" {
+				f.PathIssueFilter = strings.TrimSpace(s)
+			}
+		case filter.FieldPathIssueCategory:
+			if c.Operator != filter.OpEQ && c.Operator != "" {
+				continue
+			}
+			s, ok := conditionStringValue(c.Value)
+			if !ok || strings.TrimSpace(s) == "" {
+				continue
+			}
+			if f.PathIssueCategory == "" {
+				f.PathIssueCategory = strings.TrimSpace(s)
+			}
+		}
+	}
+}
+
+// applyReviewStatusToken maps UI review_status onto flat copy/traversal filters (copy-plan defaults).
+func applyReviewStatusToken(f *review.ReviewFilter, token string) {
+	switch strings.ToLower(token) {
+	case "pending", "pending_retry":
+		if f.CopyStatus == "" {
+			f.CopyStatus = db.CopyStatusPending
+			if f.StatusSearchType == "" {
+				f.StatusSearchType = "copy"
+			}
+		}
+	case "excluded":
+		if f.CopyStatus == "" {
+			f.CopyStatus = db.CopyStatusExcluded
+			if f.StatusSearchType == "" {
+				f.StatusSearchType = "copy"
+			}
+		}
+	case "failed":
+		if f.CopyStatus == "" {
+			f.CopyStatus = db.StatusFailed
+			if f.StatusSearchType == "" {
+				f.StatusSearchType = "copy"
+			}
+		}
+	case "successful":
+		if f.CopyStatus == "" {
+			f.CopyStatus = db.CopyStatusSuccessful
+			if f.StatusSearchType == "" {
+				f.StatusSearchType = "copy"
+			}
+		}
+	case "not_on_src":
+		if f.TraversalStatus == "" {
+			f.TraversalStatus = db.StatusNotOnSrc
+			if f.StatusSearchType == "" {
+				f.StatusSearchType = "traversal"
+			}
+		}
+	}
 }
 
 // excludeDestinationOnly maps includeDestinationOnly pointer: nil/true → keep dst-only; false → hide.
@@ -1043,8 +1191,13 @@ func (s *migrationStore) listChildrenDiffs(req ListChildrenDiffsRequest) (ListCh
 		TraversalStatus:        strings.TrimSpace(req.TraversalStatus),
 		CopyStatus:             strings.TrimSpace(req.CopyStatus),
 		ExcludeDestinationOnly: excludeDestinationOnly(req.IncludeDestinationOnly),
+		AfterPath:              strings.TrimSpace(req.AfterPath),
+		AfterID:                strings.TrimSpace(req.AfterID),
 	}
-	rows, total, err := review.ListMergedReviewDiffs(s.db, f, orderBy, limit, offset)
+	if f.AfterPath != "" || f.AfterID != "" {
+		offset = 0
+	}
+	rows, hasMore, err := review.ListFolderChildrenPage(s.db, f, orderBy, limit, offset)
 	if err != nil {
 		return ListChildrenDiffsResult{}, err
 	}
@@ -1052,18 +1205,22 @@ func (s *migrationStore) listChildrenDiffs(req ListChildrenDiffsRequest) (ListCh
 	for i := range rows {
 		items = append(items, mergedRowToDiffItem(rows[i]))
 	}
+	if err := s.enrichDiffItemsWithDisplayPaths(items); err != nil {
+		return ListChildrenDiffsResult{}, err
+	}
 	if err := s.enrichDiffItemsWithFailureLogs(items); err != nil {
 		return ListChildrenDiffsResult{}, err
 	}
 	return ListChildrenDiffsResult{
-		Items:  items,
-		Total:  total,
-		Limit:  limit,
-		Offset: offset,
+		Items:   items,
+		Total:   nil,
+		HasMore: hasMore,
+		Limit:   limit,
+		Offset:  offset,
 	}, nil
 }
 
-func (s *migrationStore) searchPathReviewItems(req SearchRequest) (SearchResult, error) {
+func (s *migrationStore) searchPathReviewItems(ctx context.Context, req SearchRequest) (SearchResult, error) {
 	limit := req.Limit
 	if limit <= 0 {
 		limit = 100
@@ -1073,17 +1230,30 @@ func (s *migrationStore) searchPathReviewItems(req SearchRequest) (SearchResult,
 		offset = 0
 	}
 	orderBy := sanitizeSort(req.SortBy, req.SortDirection)
-	f := searchRequestToReviewFilter(req)
+	f, err := searchRequestToReviewFilter(req)
+	if err != nil {
+		return SearchResult{}, err
+	}
 	if !review.ReviewFilterHasSearchPredicate(f) {
 		return SearchResult{}, ErrSearchRequiresFilter
 	}
-	rows, hasMore, err := review.ListMergedReviewDiffsPage(s.db, f, orderBy, limit, offset)
+	if review.StatusDrivenSearch(f) {
+		// Status pages by id; ignore path sort so we do not join nodes before LIMIT.
+		orderBy = "id ASC"
+		if strings.EqualFold(strings.TrimSpace(req.SortDirection), "desc") {
+			orderBy = "id DESC"
+		}
+	}
+	rows, hasMore, err := review.ListMergedReviewDiffsPageCtx(ctx, s.db, f, orderBy, limit, offset)
 	if err != nil {
 		return SearchResult{}, err
 	}
 	items := make([]DiffItem, 0, len(rows))
 	for i := range rows {
 		items = append(items, mergedRowToDiffItem(rows[i]))
+	}
+	if err := s.enrichDiffItemsWithDisplayPaths(items); err != nil {
+		return SearchResult{}, err
 	}
 	if err := s.enrichDiffItemsWithFailureLogs(items); err != nil {
 		return SearchResult{}, err
@@ -1117,12 +1287,15 @@ func (s *migrationStore) getChildrenDiffsStats(path string, foldersOnly bool, in
 	}, nil
 }
 
-func (s *migrationStore) getSearchStats(req SearchRequest) (DiffsStats, error) {
-	f := searchRequestToReviewFilter(req)
+func (s *migrationStore) getSearchStats(ctx context.Context, req SearchRequest) (DiffsStats, error) {
+	f, err := searchRequestToReviewFilter(req)
+	if err != nil {
+		return DiffsStats{}, err
+	}
 	if !review.ReviewFilterHasSearchPredicate(f) {
 		return DiffsStats{}, ErrSearchRequiresFilter
 	}
-	stats, err := review.GetMergedReviewStats(s.db, f)
+	stats, err := review.GetMergedReviewStatsCtx(ctx, s.db, f)
 	if err != nil {
 		return DiffsStats{}, err
 	}
@@ -1133,6 +1306,7 @@ func (s *migrationStore) getSearchStats(req SearchRequest) (DiffsStats, error) {
 		MissingOnSource: stats.MissingOnSource,
 		MissingOnDest:   stats.MissingOnDest,
 		Excluded:        stats.Excluded,
+		Truncated:       stats.Truncated,
 	}, nil
 }
 

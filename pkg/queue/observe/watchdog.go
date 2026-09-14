@@ -159,6 +159,12 @@ func (wd *QueueWatchdog) checkForStall() {
 		wd.possibleStall.Store(false)
 		return
 	}
+	// Shared pull-ticket wait or in-flight DuckDB pull: not a completion stall.
+	if wd.queue.IsWaitingOnDB() || wd.queue.IsPulling() {
+		wd.lastProgress.Store(time.Now().UnixNano())
+		wd.possibleStall.Store(false)
+		return
+	}
 
 	// Progress = task completions (ReportTaskResult Beat) or explicit Beats during rate-limit waits.
 	// Also treat round Completed growth as progress so mid-flight FS work that hasn't reported

@@ -8,7 +8,9 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
+	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue/gpl"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -18,13 +20,9 @@ type RootSeedSummary struct {
 	DstRoots int
 }
 
-// SeedRootTasks inserts the supplied source and destination root folders into the database.
-func SeedRootTasks(srcRoot types.Folder, dstRoot types.Folder, database *db.DB) (RootSeedSummary, error) {
-	return SeedRootTasksWithPreparation(srcRoot, dstRoot, database, RootPreparation{})
-}
-
 // SeedRootTasksWithPreparation seeds roots and optionally injects UI-reviewed depth-1 children.
-func SeedRootTasksWithPreparation(srcRoot, dstRoot types.Folder, database *db.DB, prep RootPreparation) (RootSeedSummary, error) {
+// Path-check args mirror traversal seal: same ResolvePathCheckTarget + ApplyGPLToSRCChildren on SRC kids.
+func SeedRootTasksWithPreparation(srcRoot, dstRoot types.Folder, database *db.DB, prep RootPreparation, srcProvider, dstProvider, pathCheckProfile string, windowsCompat bool, rules *filter.CompiledRuleset) (RootSeedSummary, error) {
 	if database == nil {
 		return RootSeedSummary{}, fmt.Errorf("database cannot be nil")
 	}
@@ -40,7 +38,13 @@ func SeedRootTasksWithPreparation(srcRoot, dstRoot types.Folder, database *db.DB
 	if prep.SourcePrepared || prep.DestPrepared {
 		srcKids := toPreparedChildren(prep.SourceChildren)
 		dstKids := toPreparedChildren(prep.DestChildren)
-		if err := queue.SeedPreparedDepth1Children(database, srcKids, dstKids); err != nil {
+		checkTarget := gpl.ResolvePathCheckTarget(srcProvider, dstProvider, pathCheckProfile)
+		skipChecks := checkTarget == ""
+		target := gpl.GPLTargetFromProvider(checkTarget)
+		if err := queue.SeedPreparedDepth1Children(database, srcKids, dstKids, func(srcNodes []*db.NodeState) {
+			// Root-relative children: parent path_len is 0 (same as listing under "/").
+			gpl.ApplyGPLToSRCChildren(database, target, 0, srcNodes, skipChecks, windowsCompat)
+		}, rules); err != nil {
 			return RootSeedSummary{}, fmt.Errorf("failed to seed prepared children: %w", err)
 		}
 	}
@@ -80,13 +84,15 @@ func toPreparedChildren(in []RootChildSeed) []queue.PreparedChild {
 	out := make([]queue.PreparedChild, 0, len(in))
 	for _, c := range in {
 		out = append(out, queue.PreparedChild{
-			ServiceID: c.ServiceID,
-			Name:      c.Name,
-			Type:      c.Type,
-			Size:      c.Size,
-			MTime:     c.MTime,
-			Excluded:  c.Excluded,
-			DstOnly:   c.DstOnly,
+			ServiceID:   c.ServiceID,
+			Name:        c.Name,
+			Type:        c.Type,
+			Size:        c.Size,
+			MTime:       c.MTime,
+			Excluded:    c.Excluded,
+			DstOnly:     c.DstOnly,
+			Children:    toPreparedChildren(c.Children),
+			IncludeOnly: append([]string(nil), c.IncludeOnly...),
 		})
 	}
 	return out

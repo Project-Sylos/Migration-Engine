@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
 	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -25,57 +26,53 @@ func (m *Migration) ApplyDSTRename(srcID string) error {
 		return fstypes.ErrRenameUnsupported
 	}
 
-	conn, err := m.DB.GetDB()
+	gplRec, ok, err := m.DB.Ops().GetGPL(srcID)
 	if err != nil {
 		return err
 	}
-	ctx := context.Background()
-	var proposed, nodeType, dstID, dstServiceID, dstParentServiceID string
-	err = conn.QueryRowContext(ctx, `
-SELECT COALESCE(gi.proposed_name,''), COALESCE(n.type,''),
-       COALESCE(d.id,''), COALESCE(d.service_id,''), COALESCE(d.parent_service_id,'')
-FROM gpl_issues gi
-JOIN src_nodes n ON n.id = gi.src_id
-JOIN id_map im ON im.src_internal_id = gi.src_id AND im.status = 'active'
-JOIN dst_nodes d ON d.id = im.dst_internal_id
-WHERE gi.src_id = $1 AND gi.status = $2 AND COALESCE(gi.dst_action,'') = $3
-ORDER BY im.event_time DESC
-LIMIT 1`, srcID, db.GPLIssueStatusAccepted, db.DstActionRename).
-		Scan(&proposed, &nodeType, &dstID, &dstServiceID, &dstParentServiceID)
-	if err != nil {
-		return fmt.Errorf("load rename work for %s: %w", srcID, err)
+	if !ok || gplRec.Status != db.GPLIssueStatusAccepted || gplRec.DstAction != db.DstActionRename {
+		return fmt.Errorf("load rename work for %s: not found", srcID)
 	}
-	proposed = db.NormalizeNodeBasename(proposed)
-	if proposed == "" || dstServiceID == "" {
+	mapped, mappedOK, err := m.DB.Ops().GetMapBySrc(srcID)
+	if err != nil {
+		return err
+	}
+	if !mappedOK || mapped.DstID == "" {
+		return fmt.Errorf("load rename work for %s: no destination map", srcID)
+	}
+	srcNode, err := pull.GetNodeByID(m.DB, "SRC", srcID)
+	if err != nil {
+		return err
+	}
+	dstNode, err := pull.GetNodeByID(m.DB, "DST", mapped.DstID)
+	if err != nil {
+		return err
+	}
+	if srcNode == nil || dstNode == nil {
+		return fmt.Errorf("load rename work for %s: node missing", srcID)
+	}
+	proposed := db.NormalizeNodeBasename(gplRec.ProposedName)
+	if proposed == "" || dstNode.ServiceID == "" {
 		return fmt.Errorf("rename work incomplete for %s", srcID)
 	}
 
-	res, err := renamer.RenameNode(ctx, dstParentServiceID, dstServiceID, proposed, nodeType)
+	ctx := context.Background()
+	res, err := renamer.RenameNode(ctx, dstNode.ParentServiceID, dstNode.ServiceID, proposed, srcNode.Type)
 	if err != nil {
 		return err
 	}
 	newServiceID := res.ServiceID
 	if newServiceID == "" {
-		newServiceID = dstServiceID
+		newServiceID = dstNode.ServiceID
 	}
 	newName := res.DisplayName
 	if newName == "" {
 		newName = proposed
 	}
-
-	return m.DB.RunWrite(ctx, func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			if err := w.UpdateDstNodeName(dstID, newName); err != nil {
-				return err
-			}
-			if newServiceID != dstServiceID {
-				if err := w.UpdateDstNodeServiceID(dstID, newServiceID); err != nil {
-					return err
-				}
-			}
-			return w.ClearGPLIssueDstAction(srcID)
-		})
-	})
+	if err := m.DB.ApplyNodeRename("dst", dstNode.ID, newName, dstNode.ServiceID, newServiceID); err != nil {
+		return err
+	}
+	return m.DB.ClearGPLIssueDstAction(srcID)
 }
 
 // RunDSTRenameSweep applies all pending dst_action=rename rows in depth order (BFS).
@@ -83,31 +80,21 @@ func (m *Migration) RunDSTRenameSweep() error {
 	if m == nil || m.DB == nil {
 		return fmt.Errorf("migration db not open")
 	}
-	conn, err := m.DB.GetDB()
+	ids, err := m.DB.Ops().ListGPLByStatus(db.GPLIssueStatusAccepted, 0)
 	if err != nil {
 		return err
 	}
-	rows, err := conn.QueryContext(context.Background(), `
-SELECT gi.src_id
-FROM gpl_issues gi
-JOIN src_nodes n ON n.id = gi.src_id
-WHERE gi.status = $1 AND COALESCE(gi.dst_action,'') = $2
-ORDER BY n.depth ASC, n.path ASC`, db.GPLIssueStatusAccepted, db.DstActionRename)
+	recs, err := m.DB.Ops().BatchGetGPL(ids)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return err
+	filtered := ids[:0]
+	for _, id := range ids {
+		if recs[id].DstAction == db.DstActionRename {
+			filtered = append(filtered, id)
 		}
-		ids = append(ids, id)
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
+	ids = filtered
 	for _, id := range ids {
 		if err := m.ApplyDSTRename(id); err != nil {
 			return err

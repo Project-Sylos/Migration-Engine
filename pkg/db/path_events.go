@@ -3,22 +3,11 @@
 
 package db
 
-// Legacy path-event names are retained for API/test source compatibility. They
-// map onto the sparse gpl_issues table; no path_events table is created.
+// GPL naming issues are stored in the sparse gpl_issues table; no path_events table exists.
 const (
-	PathEventCategoryGPLClean    = "gpl_clean"
-	PathEventCategoryManualRemap = "manual_remap"
-
-	PathEventStatusPending      = "pending"
-	PathEventStatusCollision    = "collision"
-	PathEventStatusManualReview = "manual_review" // no safe auto-suggestion; user must rename
-	PathEventStatusAccepted     = "accepted"
-	PathEventStatusCommitted    = "committed"
-	PathEventStatusReverted     = "reverted"
-
-	GPLIssueStatusPending      = PathEventStatusPending
-	GPLIssueStatusManualReview = PathEventStatusManualReview
-	GPLIssueStatusAccepted     = PathEventStatusAccepted
+	GPLIssueStatusPending      = "pending"
+	GPLIssueStatusManualReview = "manual_review" // no safe auto-suggestion; user must rename
+	GPLIssueStatusAccepted     = "accepted"
 
 	// DstActionRename marks Accept on an already_existed SRC node: rename DST in place.
 	DstActionRename = "rename"
@@ -32,16 +21,6 @@ const (
 
 	IDMapStatusActive = "active"
 )
-
-// PathEvent is the legacy input shape bridged to GPLIssue.
-type PathEvent struct {
-	ID           string
-	EventTime    int64
-	Category     string
-	ProposedPath string
-	Status       string
-	GPLIssues    string // serialized issue log; preserved across overrides
-}
 
 // GPLIssue is the sparse current naming-issue shape.
 type GPLIssue struct {
@@ -60,21 +39,18 @@ type IDMapEvent struct {
 	EventTime     int64
 	Source        string
 	Status        string
+	Depth         int // BFS round when the map row was written (Duck ingest gate).
 }
 
 // GPLStatePayload is the compact JSON stored on src_nodes.gpl_state.
-// Part holds segment-local findings; Path holds path-scoped findings; Parts is the
-// effective migration-relative segment list for AddPart / ValidatePath cascades.
+// Part holds segment-local findings; Path holds path-scoped findings.
+// PathLen is the joined migration-relative path length after this node's leaf eval
+// (parent PathLen + sep + leaf).
 type GPLStatePayload struct {
-	Valid bool          `json:"valid"`
-	Part  GPLScopeState `json:"part"`
-	Path  GPLScopeState `json:"path"`
-	Parts []string      `json:"parts,omitempty"`
-
-	// Flat fields retained for reading older gpl_state rows written before part/path split.
-	Collision     bool     `json:"collision,omitempty"`
-	Categories    []string `json:"categories,omitempty"`
-	ProposedClean string   `json:"proposed_clean,omitempty"`
+	Valid   bool          `json:"valid"`
+	Part    GPLScopeState `json:"part"`
+	Path    GPLScopeState `json:"path"`
+	PathLen int           `json:"path_len,omitempty"`
 }
 
 // GPLScopeState is part-local or path-scoped GPL findings.
@@ -83,20 +59,4 @@ type GPLScopeState struct {
 	Categories    []string `json:"categories,omitempty"`
 	ProposedClean string   `json:"proposed_clean,omitempty"`
 	Collision     bool     `json:"collision,omitempty"`
-}
-
-// EffectiveProposedClean returns the part-level proposed clean, falling back to legacy flat field.
-func (p GPLStatePayload) EffectiveProposedClean() string {
-	if p.Part.ProposedClean != "" {
-		return p.Part.ProposedClean
-	}
-	return p.ProposedClean
-}
-
-// OverallValid reports whether both scopes are valid (legacy flat Valid if scopes empty).
-func (p GPLStatePayload) OverallValid() bool {
-	if len(p.Part.Categories) == 0 && len(p.Path.Categories) == 0 && !p.Part.Collision && p.ProposedClean == "" && len(p.Categories) > 0 {
-		return p.Valid
-	}
-	return p.Part.Valid && p.Path.Valid && !p.Part.Collision
 }

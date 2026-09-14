@@ -4,13 +4,12 @@
 package migration
 
 import (
-	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
 type migrationRecord struct {
@@ -25,8 +24,8 @@ type migrationRecord struct {
 }
 
 type migrationStore struct {
-	db       *db.DB // set on Migration-bound stores only
-	tokenKey []byte // nil = plaintext oauth_credentials rows (tests)
+	db       *db.DB
+	tokenKey []byte
 }
 
 func newMigrationStore(database *db.DB, tokenKey []byte) *migrationStore {
@@ -37,157 +36,160 @@ func (s *migrationStore) setTokenKey(tokenKey []byte) {
 	s.tokenKey = tokenKey
 }
 
+func (s *migrationStore) ops() *opsdb.Store {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Ops()
+}
+
+func migrationToOps(record migrationRecord) opsdb.MigrationMetaRecord {
+	return opsdb.MigrationMetaRecord{
+		MigrationID:         record.ID,
+		Name:                record.Name,
+		Phase:               record.Phase,
+		CreatedAt:           record.CreatedAt.UnixNano(),
+		UpdatedAt:           record.UpdatedAt.UnixNano(),
+		ServiceMetadataJSON: record.ServiceMetadataJSON,
+		RootConfigJSON:      record.RootConfigJSON,
+		RuntimeStateJSON:    record.RuntimeStateJSON,
+	}
+}
+
+func migrationFromOps(rec opsdb.MigrationMetaRecord) (*migrationRecord, error) {
+	phase, err := ParsePhase(rec.Phase)
+	if err != nil {
+		return nil, fmt.Errorf("parse migration %s phase: %w", rec.MigrationID, err)
+	}
+	return &migrationRecord{
+		ID:                  rec.MigrationID,
+		Name:                rec.Name,
+		Phase:               phase,
+		CreatedAt:           time.Unix(0, rec.CreatedAt).UTC(),
+		UpdatedAt:           time.Unix(0, rec.UpdatedAt).UTC(),
+		ServiceMetadataJSON: rec.ServiceMetadataJSON,
+		RootConfigJSON:      rec.RootConfigJSON,
+		RuntimeStateJSON:    rec.RuntimeStateJSON,
+	}, nil
+}
+
 func (s *migrationStore) createMigration(database *db.DB, record migrationRecord) error {
-	if database == nil {
+	if database == nil || database.Ops() == nil {
 		return fmt.Errorf("database required")
 	}
-	conn, err := database.GetDB()
+	existing, ok, err := database.Ops().GetMigrationMeta(record.ID)
 	if err != nil {
 		return err
 	}
-	_, err = conn.ExecContext(
-		context.Background(),
-		`INSERT INTO `+db.TableMigrations+` (
-			migration_id,
-			name,
-			phase,
-			created_at,
-			updated_at,
-			service_metadata_json,
-			root_config_json,
-			runtime_state_json
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (migration_id) DO NOTHING`,
-		record.ID,
-		record.Name,
-		record.Phase,
-		record.CreatedAt,
-		record.UpdatedAt,
-		record.ServiceMetadataJSON,
-		record.RootConfigJSON,
-		record.RuntimeStateJSON,
-	)
-	if err != nil {
+	if ok && existing.MigrationID != "" {
+		return nil
+	}
+	if record.CreatedAt.IsZero() {
+		record.CreatedAt = time.Now().UTC()
+	}
+	if record.UpdatedAt.IsZero() {
+		record.UpdatedAt = record.CreatedAt
+	}
+	if err := database.Ops().PutMigrationMeta(migrationToOps(record)); err != nil {
 		return fmt.Errorf("create migration %s: %w", record.ID, err)
 	}
 	return nil
 }
 
 func (s *migrationStore) getMigration(database *db.DB, id string) (*migrationRecord, error) {
-	if database == nil {
+	if database == nil || database.Ops() == nil {
 		return nil, fmt.Errorf("database required")
 	}
-	conn, err := database.GetDB()
-	if err != nil {
-		return nil, err
-	}
-	var (
-		record   migrationRecord
-		phaseRaw string
-	)
-	err = conn.QueryRowContext(
-		context.Background(),
-		`SELECT migration_id, name, phase, created_at, updated_at, service_metadata_json, root_config_json, COALESCE(runtime_state_json,'')
-		 FROM `+db.TableMigrations+` WHERE migration_id = $1`,
-		id,
-	).Scan(
-		&record.ID,
-		&record.Name,
-		&phaseRaw,
-		&record.CreatedAt,
-		&record.UpdatedAt,
-		&record.ServiceMetadataJSON,
-		&record.RootConfigJSON,
-		&record.RuntimeStateJSON,
-	)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
+	rec, ok, err := database.Ops().GetMigrationMeta(id)
 	if err != nil {
 		return nil, fmt.Errorf("get migration %s: %w", id, err)
 	}
-	record.Phase, err = ParsePhase(phaseRaw)
-	if err != nil {
-		return nil, fmt.Errorf("parse migration %s phase: %w", id, err)
+	if !ok {
+		return nil, nil
 	}
-	return &record, nil
+	return migrationFromOps(rec)
 }
 
 func (s *migrationStore) deleteMigration(database *db.DB, id string) error {
-	if database == nil {
+	if database == nil || database.Ops() == nil {
 		return fmt.Errorf("database required")
 	}
-	conn, err := database.GetDB()
-	if err != nil {
-		return err
-	}
-	_, err = conn.ExecContext(context.Background(), `DELETE FROM `+db.TableMigrations+` WHERE migration_id = $1`, id)
-	if err != nil {
+	if err := database.Ops().DeleteMigrationMeta(id); err != nil {
 		return fmt.Errorf("delete migration %s: %w", id, err)
 	}
 	return nil
 }
 
-func (s *migrationStore) withConn(op string, fn func(*sql.DB) error) error {
-	if s.db == nil {
+func (s *migrationStore) updateMigrationField(id, column, value string, op string) error {
+	ops := s.ops()
+	if ops == nil {
 		return fmt.Errorf("%s requires store db", op)
 	}
-	conn, err := s.db.GetDB()
+	rec, ok, err := ops.GetMigrationMeta(id)
 	if err != nil {
 		return err
 	}
-	return fn(conn)
+	if !ok {
+		return fmt.Errorf("update migration %s %s: not found", id, column)
+	}
+	switch column {
+	case "name":
+		rec.Name = value
+	case "phase":
+		rec.Phase = value
+	case "service_metadata_json":
+		rec.ServiceMetadataJSON = value
+	case "root_config_json":
+		rec.RootConfigJSON = value
+	case "runtime_state_json":
+		rec.RuntimeStateJSON = value
+	default:
+		return fmt.Errorf("update migration %s: unknown column %s", id, column)
+	}
+	rec.UpdatedAt = time.Now().UTC().UnixNano()
+	if err := ops.PutMigrationMeta(rec); err != nil {
+		return fmt.Errorf("update migration %s %s: %w", id, column, err)
+	}
+	return nil
 }
 
-func (s *migrationStore) updateMigrationField(id, column, value string, op string) error {
-	return s.withConn(op, func(conn *sql.DB) error {
-		_, err := conn.ExecContext(
-			context.Background(),
-			`UPDATE `+db.TableMigrations+` SET `+column+` = $1, updated_at = $2 WHERE migration_id = $3`,
-			value,
-			time.Now().UTC(),
-			id,
-		)
-		if err != nil {
-			return fmt.Errorf("update migration %s %s: %w", id, column, err)
-		}
-		return nil
-	})
-}
-
-// updateUpdatedAt sets updated_at to now for the migration (e.g. after roots inserted or run ended).
 func (s *migrationStore) updateUpdatedAt(id string) error {
-	return s.withConn("updateUpdatedAt", func(conn *sql.DB) error {
-		_, err := conn.ExecContext(
-			context.Background(),
-			`UPDATE `+db.TableMigrations+` SET updated_at = $1 WHERE migration_id = $2`,
-			time.Now().UTC(),
-			id,
-		)
-		if err != nil {
-			return fmt.Errorf("update migration %s updated_at: %w", id, err)
-		}
-		return nil
-	})
-}
-
-// updateRuntimeState merges stateJSON into existing runtime_state_json (suspend_v1 and other keys). Pass partial JSON to update only some keys.
-func (s *migrationStore) updateRuntimeState(id string, stateJSON string) error {
-	if s.db == nil || stateJSON == "" {
-		return nil
+	ops := s.ops()
+	if ops == nil {
+		return fmt.Errorf("updateUpdatedAt requires store db")
 	}
-	conn, err := s.db.GetDB()
+	rec, ok, err := ops.GetMigrationMeta(id)
 	if err != nil {
 		return err
 	}
-	ctx := context.Background()
-	var existing string
-	err = conn.QueryRowContext(ctx, `SELECT COALESCE(runtime_state_json,'{}') FROM `+db.TableMigrations+` WHERE migration_id = $1`, id).Scan(&existing)
+	if !ok {
+		return fmt.Errorf("update migration %s updated_at: not found", id)
+	}
+	rec.UpdatedAt = time.Now().UTC().UnixNano()
+	if err := ops.PutMigrationMeta(rec); err != nil {
+		return fmt.Errorf("update migration %s updated_at: %w", id, err)
+	}
+	return nil
+}
+
+func (s *migrationStore) updateRuntimeState(id string, stateJSON string) error {
+	ops := s.ops()
+	if ops == nil || stateJSON == "" {
+		return nil
+	}
+	rec, ok, err := ops.GetMigrationMeta(id)
 	if err != nil {
 		return fmt.Errorf("read runtime_state %s: %w", id, err)
 	}
+	if !ok {
+		return fmt.Errorf("read runtime_state %s: not found", id)
+	}
+	existing := rec.RuntimeStateJSON
+	if existing == "" {
+		existing = "{}"
+	}
 	merged := make(map[string]any)
-	if existing != "" && existing != "{}" {
+	if existing != "{}" {
 		if err := json.Unmarshal([]byte(existing), &merged); err != nil {
 			merged = make(map[string]any)
 		}
@@ -203,9 +205,9 @@ func (s *migrationStore) updateRuntimeState(id string, stateJSON string) error {
 	if err != nil {
 		return fmt.Errorf("runtime_state marshal: %w", err)
 	}
-	now := time.Now().UTC()
-	_, err = conn.ExecContext(ctx, `UPDATE `+db.TableMigrations+` SET runtime_state_json = $1, updated_at = $2 WHERE migration_id = $3`, string(out), now, id)
-	if err != nil {
+	rec.RuntimeStateJSON = string(out)
+	rec.UpdatedAt = time.Now().UTC().UnixNano()
+	if err := ops.PutMigrationMeta(rec); err != nil {
 		return fmt.Errorf("update migration %s runtime_state: %w", id, err)
 	}
 	return nil

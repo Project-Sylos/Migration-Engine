@@ -26,16 +26,21 @@ func (q *Queue) ClearPendingBufferForSuspend() {
 	q.mu.Unlock()
 }
 
-// WaitInProgressZero blocks until InProgressCount is zero or ctx is canceled.
-func (q *Queue) WaitInProgressZero(ctx context.Context, every time.Duration) error {
+// WaitInProgressZeroFunc blocks until InProgressCount is zero or ctx is canceled.
+// onTick is optional and receives the current in-progress count each poll.
+func (q *Queue) WaitInProgressZeroFunc(ctx context.Context, every time.Duration, onTick func(inProgress int)) error {
 	if every <= 0 {
 		every = 50 * time.Millisecond
 	}
 	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
-		if q.InProgressCount() == 0 {
+		n := q.InProgressCount()
+		if n == 0 {
 			return nil
+		}
+		if onTick != nil {
+			onTick(n)
 		}
 		select {
 		case <-ctx.Done():

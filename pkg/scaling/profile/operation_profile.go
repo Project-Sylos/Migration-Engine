@@ -27,6 +27,13 @@ type FSPerformanceProfile struct {
 	MaxInterOpDelay time.Duration // cap for inter-op pacing fallback at worker floor
 }
 
+const (
+	// DstTraversalDefaultRefillBatch is the default DST traversal refill when the list profile uses large SRC-sized batches.
+	DstTraversalDefaultRefillBatch = 1000
+	// DstTraversalMaxRefillBatch caps DST traversal refill scale-up under memory budget.
+	DstTraversalMaxRefillBatch = 2000
+)
+
 // ClampInt clamps v to [min, max].
 func ClampInt(v, min, max int) int {
 	if v < min {
@@ -210,14 +217,19 @@ var operationProfiles = map[string]ProviderOperationProfiles{
 		cloudDefaultProfile(4, 8),
 	),
 	// Dropbox list quotas are harsh; keep list below create/delete (4/8).
-	"dropbox": buildCloudProviderProfilesMutate("dropbox", 8, 16,
+	// Copy files (upload/download): cap at 4 — higher concurrency tends to trip rate limits.
+	"dropbox": buildCloudProviderProfilesWithTransfer("dropbox", 8, 16,
 		cloudListProfile(4, 5, 100, 500, false),
 		cloudDefaultProfile(4, 8),
+		cloudDefaultProfile(4, 8),
+		cloudDefaultProfile(4, 4),
 	),
-	"onedrive": buildCloudProviderProfiles("onedrive", 8, 16,
+	// OneDrive Graph upload sessions: copy-files capped at 4 (same rationale as Dropbox).
+	"onedrive": buildCloudProviderProfilesWithTransfer("onedrive", 8, 16,
 		cloudListProfile(6, 12, 200, 200, false),
 		cloudDefaultProfile(4, 12),
 		cloudDefaultProfile(4, 8),
+		cloudDefaultProfile(4, 4),
 	),
 	// SharePoint Online RU is shared tenant-wide; stay more conservative than OneDrive.
 	"sharepoint": buildCloudProviderProfilesMutate("sharepoint", 6, 12,
@@ -236,7 +248,7 @@ func genericListProfile() OperationProfile {
 		MaxListPageSize:     10000,
 		ListPageStep:        20,
 		PreferLargePages:    true,
-		DefaultLeaseBatch:   1000,
+		DefaultLeaseBatch:   5000,
 		MaxLeaseBatch:       10000,
 		MinLeaseBatch:       100,
 		DefaultRefillBatch:  10000,
@@ -254,7 +266,7 @@ func localListProfile() OperationProfile {
 		MaxListPageSize:     1000,
 		ListPageStep:        20,
 		PreferLargePages:    false,
-		DefaultLeaseBatch:   1000,
+		DefaultLeaseBatch:   5000,
 		MaxLeaseBatch:       10000,
 		MinLeaseBatch:       100,
 		DefaultRefillBatch:  10000,
@@ -292,16 +304,18 @@ func buildGenericOperationProfiles() ProviderOperationProfiles {
 func buildSpectraOperationProfiles() ProviderOperationProfiles {
 	return ProviderOperationProfiles{
 		ProviderID: "spectra",
-		Default:    spectraUncappedOp(),
+		Default:    spectraHighThroughputOp(),
 		Ops:        nil,
 	}
 }
 
-func spectraUncappedOp() OperationProfile {
+// spectraHighThroughputOp is for the synthetic FS: high concurrency by default.
+// Chaos rate limits (when enabled) still drive soft-cap AIMD downward.
+func spectraHighThroughputOp() OperationProfile {
 	return OperationProfile{
 		MinWorkers:       1,
-		DefaultWorkers:   DefaultWorkersForUnbounded,
-		MaxWorkers:       0,
+		DefaultWorkers:   16,
+		MaxWorkers:       64,
 		MaxInterOpDelay:  0,
 		MinListPageSize:  20,
 		PreferLargePages: true,
@@ -367,6 +381,22 @@ func buildCloudProviderProfilesMutate(providerID string, defDefault, defMax int,
 			OpListChildren: list,
 			OpCreateFolder: mutate,
 			OpDelete:       mutate,
+		}),
+	}
+}
+
+// buildCloudProviderProfilesWithTransfer is buildCloudProviderProfiles plus explicit
+// upload/download profiles (copy pass 2). transfer is used for both legs.
+func buildCloudProviderProfilesWithTransfer(providerID string, defDefault, defMax int, list, create, delete, transfer OperationProfile) ProviderOperationProfiles {
+	return ProviderOperationProfiles{
+		ProviderID: providerID,
+		Default:    cloudDefaultProfile(defDefault, defMax),
+		Ops: buildOps(map[FSOperation]OperationProfile{
+			OpListChildren: list,
+			OpCreateFolder: create,
+			OpDelete:       delete,
+			OpUpload:       transfer,
+			OpDownload:     transfer,
 		}),
 	}
 }

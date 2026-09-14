@@ -20,8 +20,10 @@ func (q *Queue) AbandonInProgressTasks() {
 	dbOnly := q.Spin.AbandonDBOnly.Load()
 	q.mu.Lock()
 	tasks := make([]*TaskBase, 0, len(q.inProgress))
-	for _, task := range q.inProgress {
-		tasks = append(tasks, task)
+	for _, f := range q.inProgress {
+		if f.task != nil {
+			tasks = append(tasks, f.task)
+		}
 	}
 	q.mu.Unlock()
 
@@ -39,7 +41,7 @@ func (q *Queue) AbandonInProgressTasks() {
 		task.Locked = false
 		q.RemoveInProgress(nodeID)
 		if task.IsFile() && offset > 0 {
-			_ = q.PersistTransferCheckpoint(ctx, task, offset, dstRef)
+			_ = q.PersistTransferCheckpointToken(ctx, task, offset, dstRef, "")
 		}
 		if dbOnly {
 			continue
@@ -51,21 +53,5 @@ func (q *Queue) AbandonInProgressTasks() {
 					"queue", q.name, q.name)
 			}
 		}
-	}
-}
-
-// ReleaseInFlightOnThrottle requeues all in-progress leases without bumping attempts.
-// Used when AIMD steps down for FS_THROTTLE so traversal/list work does not sit mid-RPC
-// while the pool shrinks. Prefer calling after SetTargetWorkerCount cancels retiring workers.
-func (q *Queue) ReleaseInFlightOnThrottle() {
-	if q == nil {
-		return
-	}
-	was := q.Spin.AbandonDBOnly.Load()
-	q.Spin.AbandonDBOnly.Store(false)
-	q.AbandonInProgressTasks()
-	q.Spin.AbandonDBOnly.Store(was)
-	if q.watchdog != nil {
-		q.watchdog.Beat()
 	}
 }

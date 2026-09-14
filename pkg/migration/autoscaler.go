@@ -274,10 +274,6 @@ func degradationStateFrom(adapter fstypes.FSAdapter) *fstypes.FSDegradationState
 	if r, ok := adapter.(fstypes.FSDegradationReporter); ok {
 		return r.GetDegradationState()
 	}
-	// Legacy fallback for adapters that expose the bridge method without the full reporter.
-	if r, ok := adapter.(interface{ GetDegradationState() *fstypes.FSDegradationState }); ok {
-		return r.GetDegradationState()
-	}
 	return nil
 }
 

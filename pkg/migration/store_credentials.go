@@ -4,12 +4,9 @@
 package migration
 
 import (
-	"context"
-	"database/sql"
 	"fmt"
-	"time"
 
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
 // FS credential roles (match roots.SetRootRequest.Role).
@@ -28,109 +25,66 @@ type FSCredentialBinding struct {
 }
 
 func (s *migrationStore) UpsertFSCredentialBinding(binding FSCredentialBinding) error {
-	if s.db == nil {
+	ops := s.ops()
+	if ops == nil {
 		return fmt.Errorf("UpsertFSCredentialBinding requires store db")
 	}
 	if binding.Role != FSCredentialRoleSource && binding.Role != FSCredentialRoleDestination {
 		return fmt.Errorf("invalid credential role %q", binding.Role)
 	}
-	conn, err := s.db.GetDB()
-	if err != nil {
-		return err
-	}
-	now := time.Now().UTC()
-	_, err = conn.ExecContext(context.Background(),
-		`INSERT INTO `+db.TableFSCredentialBinding+` (role, connection_id, creds_conf_relpath, service_id, root_folder_json, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6)
-		 ON CONFLICT (role) DO UPDATE SET
-		 connection_id = excluded.connection_id,
-		 creds_conf_relpath = excluded.creds_conf_relpath,
-		 service_id = excluded.service_id,
-		 root_folder_json = excluded.root_folder_json,
-		 updated_at = excluded.updated_at`,
-		binding.Role,
-		binding.ConnectionID,
-		nullStr(binding.CredsConfRelPath),
-		nullStr(binding.ServiceID),
-		nullStr(binding.RootFolderJSON),
-		now,
-	)
-	if err != nil {
-		return fmt.Errorf("upsert fs_credential_binding %s: %w", binding.Role, err)
-	}
-	return nil
-}
-
-func nullStr(s string) any {
-	if s == "" {
-		return nil
-	}
-	return s
+	return ops.PutFSBinding(opsdb.FSBindingRecord{
+		Side:           binding.Role,
+		ConnectionID:   binding.ConnectionID,
+		CredsPath:      binding.CredsConfRelPath,
+		ServiceID:      binding.ServiceID,
+		RootFolderJSON: binding.RootFolderJSON,
+	})
 }
 
 func (s *migrationStore) getFSCredentialBinding(role string) (*FSCredentialBinding, error) {
-	if s.db == nil {
+	ops := s.ops()
+	if ops == nil {
 		return nil, fmt.Errorf("getFSCredentialBinding requires store db")
 	}
-	conn, err := s.db.GetDB()
+	rec, ok, err := ops.GetFSBinding(role)
 	if err != nil {
 		return nil, err
 	}
-	var b FSCredentialBinding
-	var creds, svc, root sql.NullString
-	err = conn.QueryRowContext(context.Background(),
-		`SELECT role, connection_id, creds_conf_relpath, service_id, root_folder_json
-		 FROM `+db.TableFSCredentialBinding+` WHERE role = $1`,
-		role,
-	).Scan(&b.Role, &b.ConnectionID, &creds, &svc, &root)
-	if err != nil {
-		return nil, err
+	if !ok {
+		return nil, fmt.Errorf("fs binding %s not found", role)
 	}
-	if creds.Valid {
-		b.CredsConfRelPath = creds.String
-	}
-	if svc.Valid {
-		b.ServiceID = svc.String
-	}
-	if root.Valid {
-		b.RootFolderJSON = root.String
-	}
-	return &b, nil
+	return &FSCredentialBinding{
+		Role:             rec.Side,
+		ConnectionID:     rec.ConnectionID,
+		CredsConfRelPath: rec.CredsPath,
+		ServiceID:        rec.ServiceID,
+		RootFolderJSON:   rec.RootFolderJSON,
+	}, nil
 }
 
 func (s *migrationStore) listFSCredentialBindings() ([]FSCredentialBinding, error) {
-	if s.db == nil {
+	ops := s.ops()
+	if ops == nil {
 		return nil, fmt.Errorf("listFSCredentialBindings requires store db")
 	}
-	conn, err := s.db.GetDB()
+	recs, err := ops.ListFSBindings()
 	if err != nil {
 		return nil, err
 	}
-	rows, err := conn.QueryContext(context.Background(),
-		`SELECT role, connection_id, creds_conf_relpath, service_id, root_folder_json
-		 FROM `+db.TableFSCredentialBinding+` ORDER BY role`,
-	)
-	if err != nil {
-		return nil, err
+	out := make([]FSCredentialBinding, 0, len(recs))
+	seen := map[string]struct{}{}
+	for _, rec := range recs {
+		if _, ok := seen[rec.Side]; ok {
+			continue
+		}
+		seen[rec.Side] = struct{}{}
+		out = append(out, FSCredentialBinding{
+			Role:             rec.Side,
+			ConnectionID:     rec.ConnectionID,
+			CredsConfRelPath: rec.CredsPath,
+			ServiceID:        rec.ServiceID,
+			RootFolderJSON:   rec.RootFolderJSON,
+		})
 	}
-	defer rows.Close()
-	var out []FSCredentialBinding
-	for rows.Next() {
-		var b FSCredentialBinding
-		var creds, svc, root sql.NullString
-		if err := rows.Scan(&b.Role, &b.ConnectionID, &creds, &svc, &root); err != nil {
-			return nil, err
-		}
-		if creds.Valid {
-			b.CredsConfRelPath = creds.String
-		}
-		if svc.Valid {
-			b.ServiceID = svc.String
-		}
-		if root.Valid {
-			b.RootFolderJSON = root.String
-		}
-		out = append(out, b)
-	}
-	return out, rows.Err()
+	return out, nil
 }

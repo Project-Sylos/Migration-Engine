@@ -10,12 +10,12 @@ import (
 )
 
 // DstChildMatchName returns the bare child name used when matching DST listed children to SRC expected children.
-// Adapters may set DisplayName to a root-relative path (e.g. "/file_1.txt"); DB rows use path with basename names.
+// Prefer DisplayName/Name (mutable basename). LocationPath may be an id_path ancestry key and is only a fallback.
 func DstChildMatchName(displayName, locationPath string) string {
-	if locationPath != "" {
-		return rootRelativeBaseName(locationPath)
+	if base := rootRelativeBaseName(displayName); base != "" {
+		return base
 	}
-	return rootRelativeBaseName(displayName)
+	return rootRelativeBaseName(locationPath)
 }
 
 func rootRelativeBaseName(p string) string {

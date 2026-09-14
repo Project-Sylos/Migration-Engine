@@ -6,7 +6,28 @@ package queue
 import (
 	"fmt"
 	"time"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
+
+type stallTaskSnap struct {
+	id           string
+	owner        string
+	epoch        uint64
+	taskType     string
+	nodeKind     string
+	name         string
+	idPath       string
+	srcLogical   string
+	round        int
+	copyPass     int
+	attempts     int
+	leaseAge     time.Duration
+	locked       bool
+	workerResult string
+	status       string
+	lastError    string
+}
 
 // DumpStallState prints in-progress and pending task diagnostics for the queue watchdog.
 func (q *Queue) DumpStallState(stalledFor time.Duration, inProgress, pending int) {
@@ -30,58 +51,154 @@ func (q *Queue) DumpStallState(stalledFor time.Duration, inProgress, pending int
 			round, stats.Expected, stats.Completed, stats.Failed)
 	}
 
+	inSnaps, pendSnaps := q.snapshotStallTasks()
+	displayPaths := q.displayPathsForSnaps(inSnaps, pendSnaps)
+
 	fmt.Printf("\n--- IN-PROGRESS TASKS ---\n")
-	q.mu.RLock()
-	if len(q.inProgress) == 0 {
+	if len(inSnaps) == 0 {
 		fmt.Printf("  (none)\n")
 	} else {
-		for id, task := range q.inProgress {
-			taskType := "file"
-			if task.IsFolder() {
-				taskType = "folder"
-			}
-			leaseAge := time.Since(task.LeaseTime).Round(time.Second)
-			workerResult := task.WorkerResult
-			if workerResult == "" {
-				workerResult = "(executing)"
-			}
-			fmt.Printf("  ID: %s\n", id)
-			fmt.Printf("    Path: %s\n", task.LocationPath())
-			fmt.Printf("    Type: %s\n", taskType)
-			fmt.Printf("    Round: %d\n", task.Round)
-			fmt.Printf("    CopyPass: %d\n", task.CopyPass)
-			fmt.Printf("    Attempts: %d\n", task.Attempts)
-			fmt.Printf("    LeaseAge: %v\n", leaseAge)
-			fmt.Printf("    Locked: %v\n", task.Locked)
-			fmt.Printf("    WorkerResult: %s\n", workerResult)
-			fmt.Printf("    Status: %s\n", task.Status)
-			if task.LastError != "" {
-				fmt.Printf("    LastError: %s\n", task.LastError)
-			}
+		for _, s := range inSnaps {
+			printStallTask("  ", s, displayPaths[s.id])
 		}
 	}
-	q.mu.RUnlock()
 
 	fmt.Printf("\n--- PENDING TASKS (first 5) ---\n")
-	q.mu.RLock()
-	if len(q.pendingBuff) == 0 {
+	if len(pendSnaps) == 0 {
 		fmt.Printf("  (none)\n")
 	} else {
-		count := len(q.pendingBuff)
-		if count > 5 {
-			count = 5
+		for i, s := range pendSnaps {
+			prefix := fmt.Sprintf("  [%d] ", i)
+			printStallTask(prefix, s, displayPaths[s.id])
 		}
-		for i := 0; i < count; i++ {
-			task := q.pendingBuff[i]
-			fmt.Printf("  [%d] %s (round=%d)\n", i, task.LocationPath(), task.Round)
-		}
-		if len(q.pendingBuff) > 5 {
-			fmt.Printf("  ... and %d more\n", len(q.pendingBuff)-5)
+		pendingTotal := q.GetPendingCount()
+		if pendingTotal > len(pendSnaps) {
+			fmt.Printf("  ... and %d more\n", pendingTotal-len(pendSnaps))
 		}
 	}
-	q.mu.RUnlock()
 
 	fmt.Printf("========================================\n\n")
+}
+
+func (q *Queue) snapshotStallTasks() (inProgress, pending []stallTaskSnap) {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+
+	inProgress = make([]stallTaskSnap, 0, len(q.inProgress))
+	for id, f := range q.inProgress {
+		task := f.task
+		if task == nil {
+			continue
+		}
+		inProgress = append(inProgress, stallSnapFromTask(id, f.owner, f.epoch, task))
+	}
+
+	count := len(q.pendingBuff)
+	if count > 5 {
+		count = 5
+	}
+	pending = make([]stallTaskSnap, 0, count)
+	for i := 0; i < count; i++ {
+		task := q.pendingBuff[i]
+		if task == nil {
+			continue
+		}
+		pending = append(pending, stallSnapFromTask(task.ID, "", 0, task))
+	}
+	return inProgress, pending
+}
+
+func stallSnapFromTask(id, owner string, epoch uint64, task *TaskBase) stallTaskSnap {
+	nodeKind := "file"
+	if task.IsFolder() {
+		nodeKind = "folder"
+	}
+	workerResult := task.WorkerResult
+	if workerResult == "" {
+		workerResult = "(executing)"
+	}
+	return stallTaskSnap{
+		id:           id,
+		owner:        owner,
+		epoch:        epoch,
+		taskType:     task.Type,
+		nodeKind:     nodeKind,
+		name:         task.DisplayName(),
+		idPath:       task.LocationPath(),
+		srcLogical:   task.SrcLogicalPath,
+		round:        task.Round,
+		copyPass:     task.CopyPass,
+		attempts:     task.Attempts,
+		leaseAge:     time.Since(task.LeaseTime).Round(time.Second),
+		locked:       task.Locked,
+		workerResult: workerResult,
+		status:       task.Status,
+		lastError:    task.LastError,
+	}
+}
+
+func (q *Queue) displayPathsForSnaps(snaps ...[]stallTaskSnap) map[string]string {
+	out := make(map[string]string)
+	database := q.Database()
+	queueType := GetQueueType(q.Name())
+	if database == nil || queueType == "" {
+		return out
+	}
+	var ids []string
+	seen := make(map[string]struct{})
+	for _, group := range snaps {
+		for _, s := range group {
+			if s.id == "" {
+				continue
+			}
+			if _, ok := seen[s.id]; ok {
+				continue
+			}
+			seen[s.id] = struct{}{}
+			ids = append(ids, s.id)
+		}
+	}
+	if len(ids) == 0 {
+		return out
+	}
+	paths, err := db.ComposeDisplayPaths(database, queueType, ids)
+	if err != nil || paths == nil {
+		return out
+	}
+	return paths
+}
+
+func printStallTask(prefix string, s stallTaskSnap, displayPath string) {
+	fmt.Printf("%sID: %s\n", prefix, s.id)
+	if s.name != "" {
+		fmt.Printf("%s  Name: %s\n", prefix, s.name)
+	}
+	if displayPath != "" {
+		fmt.Printf("%s  DisplayPath: %s\n", prefix, displayPath)
+	}
+	if s.idPath != "" {
+		fmt.Printf("%s  IdPath: %s\n", prefix, s.idPath)
+	}
+	if s.srcLogical != "" && s.srcLogical != s.idPath && s.srcLogical != displayPath {
+		fmt.Printf("%s  SrcLogicalPath: %s\n", prefix, s.srcLogical)
+	}
+	fmt.Printf("%s  Type: %s\n", prefix, s.nodeKind)
+	if s.taskType != "" {
+		fmt.Printf("%s  TaskType: %s\n", prefix, s.taskType)
+	}
+	fmt.Printf("%s  Round: %d\n", prefix, s.round)
+	fmt.Printf("%s  CopyPass: %d\n", prefix, s.copyPass)
+	fmt.Printf("%s  Attempts: %d\n", prefix, s.attempts)
+	fmt.Printf("%s  LeaseAge: %v\n", prefix, s.leaseAge)
+	fmt.Printf("%s  Locked: %v\n", prefix, s.locked)
+	if s.owner != "" {
+		fmt.Printf("%s  Owner: %s epoch=%d\n", prefix, s.owner, s.epoch)
+	}
+	fmt.Printf("%s  WorkerResult: %s\n", prefix, s.workerResult)
+	fmt.Printf("%s  Status: %s\n", prefix, s.status)
+	if s.lastError != "" {
+		fmt.Printf("%s  LastError: %s\n", prefix, s.lastError)
+	}
 }
 
 // DumpCompletionStall prints diagnostics when the queue is idle but not advancing.
@@ -99,6 +216,7 @@ func (q *Queue) DumpCompletionStall(stalledFor time.Duration) {
 	fmt.Printf("Round: %d\n", round)
 	fmt.Printf("Pending: 0 | InProgress: 0\n")
 	fmt.Printf("Pulling: %v\n", q.IsPulling())
+	fmt.Printf("WaitingOnDB: %v\n", q.IsWaitingOnDB())
 	fmt.Printf("LastPullWasPartial: %v\n", q.GetLastPullWasPartial())
 	if info != nil {
 		fmt.Printf("RoundInfo[%d]: PullCount=%d LastPartialPull=%v LastBatchYield=%d\n",

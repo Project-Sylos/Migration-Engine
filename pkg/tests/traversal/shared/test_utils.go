@@ -4,7 +4,6 @@
 package shared
 
 import (
-	"context"
 	"fmt"
 	"math/rand"
 	"time"
@@ -12,23 +11,54 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
-// CountSubtree returns aggregate counts for the subtree at rootPath using a single SQL query (path prefix).
+// CountSubtree returns aggregate counts for the subtree at rootPath.
 func CountSubtree(database *db.DB, queueType string, rootPath string) (pull.SubtreeStats, error) {
 	return pull.CountSubtree(database, queueType, rootPath)
 }
 
-// DeleteSubtree deletes all nodes in the subtree at rootPath and recomputes stats for affected depths. Uses Writer.DeleteSubtree.
-func DeleteSubtree(database *db.DB, queueType string, rootPath string) error {
-	return database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			return w.DeleteSubtree(queueType, rootPath)
-		})
-	})
+func opsSide(table string) string {
+	if table == "DST" {
+		return opsdb.SideDST
+	}
+	return opsdb.SideSRC
 }
 
-// MarkNodeAsPending marks a node as pending in the database (direct live-table update + stats recompute).
+// DeleteSubtree deletes all nodes in the subtree at rootPath.
+func DeleteSubtree(database *db.DB, queueType string, rootPath string) error {
+	if database == nil || database.Ops() == nil {
+		return fmt.Errorf("ops store not open")
+	}
+	ids, err := database.Ops().ListSubtreeIDs(opsSide(queueType), rootPath, 0)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := database.Ops().DeleteNode(opsSide(queueType), id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func appendTraversalStatus(database *db.DB, queueType string, node *db.NodeState, status string) error {
+	if node == nil {
+		return fmt.Errorf("nil node")
+	}
+	database.AppendStatusEvent(queueType, db.StatusEvent{
+		ID:                node.ID,
+		TraversalStatus:   status,
+		EventTime:         time.Now().UnixNano(),
+		Depth:             node.Depth,
+		PrevTraversalStatus: node.TraversalStatus,
+		NodeType:          node.Type,
+	}, false)
+	return database.Flush(nil)
+}
+
+// MarkNodeAsPending marks a node as pending in the database.
 func MarkNodeAsPending(database *db.DB, queueType string, nodePath string) error {
 	nodeState, err := pull.GetNodeByPath(database, queueType, nodePath)
 	if err != nil {
@@ -37,14 +67,10 @@ func MarkNodeAsPending(database *db.DB, queueType string, nodePath string) error
 	if nodeState == nil {
 		return fmt.Errorf("node not found: %s", nodePath)
 	}
-	return database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			return w.SetNodeTraversalStatus(queueType, nodeState.ID, db.StatusPending)
-		})
-	})
+	return appendTraversalStatus(database, queueType, nodeState, db.StatusPending)
 }
 
-// MarkNodeAsFailed marks a node as failed in the database (direct live-table update + stats recompute).
+// MarkNodeAsFailed marks a node as failed in the database.
 func MarkNodeAsFailed(database *db.DB, queueType string, nodePath string) error {
 	nodeState, err := pull.GetNodeByPath(database, queueType, nodePath)
 	if err != nil {
@@ -53,14 +79,30 @@ func MarkNodeAsFailed(database *db.DB, queueType string, nodePath string) error 
 	if nodeState == nil {
 		return fmt.Errorf("node not found: %s", nodePath)
 	}
-	return database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			return w.SetNodeTraversalStatus(queueType, nodeState.ID, db.StatusFailed)
-		})
-	})
+	return appendTraversalStatus(database, queueType, nodeState, db.StatusFailed)
 }
 
-// MarkNodeAsExcluded marks a node as excluded in the database (direct live-table update).
+func setCopyExcluded(database *db.DB, queueType string, node *db.NodeState, excluded bool) error {
+	if queueType != "SRC" || node == nil {
+		return fmt.Errorf("exclusion is SRC-only")
+	}
+	status := db.CopyStatusExcludedExplicit
+	if !excluded {
+		status = db.CopyStatusPending
+	}
+	database.AppendStatusEvent(queueType, db.StatusEvent{
+		ID:              node.ID,
+		CopyStatus:      status,
+		EventTime:       time.Now().UnixNano(),
+		Depth:           node.Depth,
+		PrevCopyStatus:  node.CopyStatus,
+		NodeType:        node.Type,
+		Size:            node.Size,
+	}, false)
+	return database.Flush(nil)
+}
+
+// MarkNodeAsExcluded marks a node as excluded in the database.
 func MarkNodeAsExcluded(database *db.DB, queueType string, nodePath string) error {
 	nodeState, err := pull.GetNodeByPath(database, queueType, nodePath)
 	if err != nil {
@@ -69,14 +111,10 @@ func MarkNodeAsExcluded(database *db.DB, queueType string, nodePath string) erro
 	if nodeState == nil {
 		return fmt.Errorf("node not found: %s", nodePath)
 	}
-	return database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			return w.SetNodeExcluded(queueType, nodeState.ID, true)
-		})
-	})
+	return setCopyExcluded(database, queueType, nodeState, true)
 }
 
-// MarkNodeAsUnexcluded marks a node as not excluded in the database (direct live-table update).
+// MarkNodeAsUnexcluded marks a node as not excluded in the database.
 func MarkNodeAsUnexcluded(database *db.DB, queueType string, nodePath string) error {
 	nodeState, err := pull.GetNodeByPath(database, queueType, nodePath)
 	if err != nil {
@@ -85,11 +123,7 @@ func MarkNodeAsUnexcluded(database *db.DB, queueType string, nodePath string) er
 	if nodeState == nil {
 		return fmt.Errorf("node not found: %s", nodePath)
 	}
-	return database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			return w.SetNodeExcluded(queueType, nodeState.ID, false)
-		})
-	})
+	return setCopyExcluded(database, queueType, nodeState, false)
 }
 
 // PickRandomExcludedTopLevelChild picks a random top-level child that is currently excluded.
@@ -202,7 +236,7 @@ func CountExcludedNodes(database *db.DB, queueType string) (int, error) {
 	return pull.CountExcluded(database, queueType)
 }
 
-// CountExcludedInSubtree counts excluded nodes within the subtree at rootPath (single SQL query).
+// CountExcludedInSubtree counts excluded nodes within the subtree at rootPath.
 func CountExcludedInSubtree(database *db.DB, queueType string, rootPath string) (int, error) {
 	return pull.CountExcludedInSubtree(database, queueType, rootPath)
 }

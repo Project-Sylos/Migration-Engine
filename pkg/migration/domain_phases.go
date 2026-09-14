@@ -9,10 +9,18 @@ import (
 	"slices"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
+	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
+
+func firstFilter(a, b *filter.CompiledRuleset) *filter.CompiledRuleset {
+	if a != nil {
+		return a
+	}
+	return b
+}
 
 // AddRoots seeds source and destination root tasks into the migration DB.
 // This is the explicit root insert step before starting traversal.
@@ -29,7 +37,10 @@ func (m *Migration) AddRoots(srcRoot, dstRoot types.Folder, prep RootPreparation
 	if err != nil {
 		return RootSeedSummary{}, fmt.Errorf("destination root: %w", err)
 	}
-	summary, err := SeedRootTasksWithPreparation(normalizedSrc, normalizedDst, m.DB, prep)
+	m.mu.RLock()
+	srcProv, dstProv, profile, winCompat := m.pathCheckSrcProvider, m.pathCheckDstProvider, m.pathCheckProfile, m.windowsCompatFlag
+	m.mu.RUnlock()
+	summary, err := SeedRootTasksWithPreparation(normalizedSrc, normalizedDst, m.DB, prep, srcProv, dstProv, profile, winCompat, m.FilterRuleset())
 	if err != nil {
 		return RootSeedSummary{}, fmt.Errorf("seed roots: %w", err)
 	}
@@ -69,6 +80,8 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 	if prevPhase == PhaseTraversalSuspended {
 		if s, ok := parseRuntimeSuspendV1(m.runtimeStateJSON()); ok && s.Kind == "traversal" {
 			resume = &s
+		} else {
+			resume = &RuntimeSuspendV1{Version: 1, Kind: "traversal"}
 		}
 	}
 
@@ -109,6 +122,7 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 		ResumeTraversal:      resume,
 		RootPreparation:      cfg.RootPreparation,
 		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
+		ReportStopProgress:   m.reportStopProgress,
 		OnQueueObserver:      func(o *observe.QueueObserver) { m.activeQueueObs.Store(o) },
 		OnAutoscaler:         m.bindAutoscaler,
 		Autoscaler:           m.resolveAutoscalerConfig(cfg.Autoscaler),
@@ -116,6 +130,7 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 		DstService:           cfg.Destination,
 		PathCheckTarget:      cfg.PathCheckTarget,
 		WindowsCompat:        cfg.WindowsCompat,
+		FilterRuleset:        firstFilter(cfg.FilterRuleset, m.FilterRuleset()),
 	})
 	if err != nil {
 		if errors.Is(err, ErrTraversalSoftSuspended) {
@@ -125,6 +140,11 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 					_ = m.store.updateRuntimeState(m.ID, patch)
 				}
 				if e3 := m.transitionTo(PhaseTraversalSuspended); e3 != nil {
+					if m.Phase() == PhaseAborted {
+						m.softSuspendRequested.Store(false)
+						m.refreshRuntimeState()
+						return rstats, nil
+					}
 					return rstats, e3
 				}
 				m.softSuspendRequested.Store(false)
@@ -132,12 +152,15 @@ func (m *Migration) StartTraversal(cfg Config) (RuntimeStats, error) {
 				return rstats, nil
 			}
 		}
+		if m.Phase() == PhaseAborted {
+			return RuntimeStats{}, nil
+		}
 		return RuntimeStats{}, err
 	}
-	if err := m.transitionTo(PhaseTraversalReview); err != nil {
-		return RuntimeStats{}, err
+	if err := m.completeDurableFinalize(PhaseTraversalFinalizing, PhaseTraversalFinalizeFailed, PhaseTraversalReview, FinalizeOverrides{}); err != nil {
+		m.refreshRuntimeState()
+		return stats, err
 	}
-	m.refreshRuntimeState()
 	return stats, nil
 }
 
@@ -148,6 +171,15 @@ func (m *Migration) StartCopy(cfg Config) (queue.QueueStats, error) {
 	validCopyStartPhases := []string{PhaseTraversalReview, PhaseCopySuspended, PhaseCopyReview}
 	if !slices.Contains(validCopyStartPhases, prevPhase) {
 		return queue.QueueStats{}, fmt.Errorf("start copy requires awaiting-traversal-review or copy-suspended phase, got %s", prevPhase)
+	}
+	if prevPhase == PhaseTraversalReview {
+		snap, err := stats.GetReviewStatsSnapshot(m.DB)
+		if err != nil {
+			return queue.QueueStats{}, fmt.Errorf("read review stats before copy: %w", err)
+		}
+		if snap.TraversalPendingRetry > 0 {
+			return queue.QueueStats{}, fmt.Errorf("start copy requires retry of %d pending discovery items first", snap.TraversalPendingRetry)
+		}
 	}
 	if err := m.transitionTo(PhaseCopying); err != nil {
 		return queue.QueueStats{}, err
@@ -190,6 +222,7 @@ func (m *Migration) StartCopy(cfg Config) (queue.QueueStats, error) {
 		ShutdownContext:      runCtx,
 		ResumeCopy:           resumeCopy,
 		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
+		ReportStopProgress:   m.reportStopProgress,
 		OnQueueObserver:      func(o *observe.QueueObserver) { m.activeQueueObs.Store(o) },
 		OnAutoscaler:         m.bindAutoscaler,
 		Autoscaler:           m.resolveAutoscalerConfig(cfg.Autoscaler),
@@ -206,6 +239,11 @@ func (m *Migration) StartCopy(cfg Config) (queue.QueueStats, error) {
 					_ = m.store.updateRuntimeState(m.ID, patch)
 				}
 				if e3 := m.transitionTo(PhaseCopySuspended); e3 != nil {
+					if m.Phase() == PhaseAborted {
+						m.softSuspendRequested.Store(false)
+						m.refreshRuntimeState()
+						return cstats, nil
+					}
 					return cstats, e3
 				}
 				m.softSuspendRequested.Store(false)
@@ -213,12 +251,15 @@ func (m *Migration) StartCopy(cfg Config) (queue.QueueStats, error) {
 				return cstats, nil
 			}
 		}
+		if m.Phase() == PhaseAborted {
+			return queue.QueueStats{}, nil
+		}
 		return queue.QueueStats{}, err
 	}
-	if err := m.transitionTo(PhaseCopyReview); err != nil {
-		return queue.QueueStats{}, err
+	if err := m.completeDurableFinalize(PhaseCopyFinalizing, PhaseCopyFinalizeFailed, PhaseCopyReview, FinalizeOverrides{}); err != nil {
+		m.refreshRuntimeState()
+		return stats, err
 	}
-	m.refreshRuntimeState()
 	return stats, nil
 }
 
@@ -259,6 +300,15 @@ func (m *Migration) StartDelete(cfg Config) (queue.QueueStats, error) {
 	if err := m.transitionTo(PhaseDeleting); err != nil {
 		return queue.QueueStats{}, err
 	}
+	if err := m.DB.NormalizeDeleteForestOps(); err != nil {
+		return queue.QueueStats{}, fmt.Errorf("normalize delete forest before delete: %w", err)
+	}
+	var resumeDelete *RuntimeSuspendV1
+	if prevPhase == PhaseDeleteSuspended {
+		if s, ok := parseRuntimeSuspendV1(m.runtimeStateJSON()); ok && s.Kind == "delete" {
+			resumeDelete = &s
+		}
+	}
 	if cfg.Source.Adapter == nil {
 		return queue.QueueStats{}, fmt.Errorf("delete requires source adapter in config")
 	}
@@ -284,7 +334,9 @@ func (m *Migration) StartDelete(cfg Config) (queue.QueueStats, error) {
 		StartupDelay:         cfg.StartupDelay,
 		ProgressTick:         cfg.ProgressTick,
 		ShutdownContext:      runCtx,
+		ResumeDelete:         resumeDelete,
 		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
+		ReportStopProgress:   m.reportStopProgress,
 		OnQueueObserver:      func(o *observe.QueueObserver) { m.activeQueueObs.Store(o) },
 		OnAutoscaler:         m.bindAutoscaler,
 		Autoscaler:           m.resolveAutoscalerConfig(cfg.Autoscaler),
@@ -294,10 +346,33 @@ func (m *Migration) StartDelete(cfg Config) (queue.QueueStats, error) {
 		WindowsCompat:        cfg.WindowsCompat,
 	})
 	if err != nil {
+		if errors.Is(err, ErrDeleteSoftSuspended) {
+			dstats, sus, ok := AsDeleteSuspended(err)
+			if ok {
+				if patch, e2 := suspendRuntimeMergePatch(sus); e2 == nil {
+					_ = m.store.updateRuntimeState(m.ID, patch)
+				}
+				if e3 := m.transitionTo(PhaseDeleteSuspended); e3 != nil {
+					if m.Phase() == PhaseAborted {
+						m.softSuspendRequested.Store(false)
+						m.refreshRuntimeState()
+						return dstats, nil
+					}
+					return dstats, e3
+				}
+				m.softSuspendRequested.Store(false)
+				m.refreshRuntimeState()
+				return dstats, nil
+			}
+		}
+		if m.Phase() == PhaseAborted {
+			return queue.QueueStats{}, nil
+		}
 		return queue.QueueStats{}, err
 	}
-	if err := m.transitionTo(PhaseDeleteReview); err != nil {
-		return queue.QueueStats{}, err
+	if err := m.completeDurableFinalize(PhaseDeleteFinalizing, PhaseDeleteFinalizeFailed, PhaseDeleteReview, FinalizeOverrides{}); err != nil {
+		m.refreshRuntimeState()
+		return stats, err
 	}
 	m.refreshRuntimeState()
 	return stats, nil
@@ -371,6 +446,9 @@ func (m *Migration) RunDeleteRetry(cfg Config, opts CopyPhaseOptions) (queue.Que
 	}
 	m.setLastRunConfig(cfg)
 	if phase == PhaseDeleteReview || phase == PhaseDeleteSuspended {
+		if err := m.DB.NormalizeDeleteForestOps(); err != nil {
+			return queue.QueueStats{}, fmt.Errorf("normalize delete forest before delete retry: %w", err)
+		}
 		if err := m.transitionTo(PhaseDeleting); err != nil {
 			return queue.QueueStats{}, err
 		}
@@ -390,28 +468,53 @@ func (m *Migration) RunDeleteRetry(cfg Config, opts CopyPhaseOptions) (queue.Que
 		maxRetries = cfg.MaxRetries
 	}
 	stats, err := RunDeleteRetryPhase(DeletePhaseConfig{
-		DuckDB:          m.DB,
-		SrcAdapter:      cfg.Source.Adapter,
-		WorkerCount:     workerCount,
-		MaxRetries:      maxRetries,
-		LogAddress:      cfg.LogAddress,
-		LogLevel:        cfg.LogLevel,
-		SkipListener:    opts.SkipListener || cfg.SkipListener,
-		StartupDelay:    cfg.StartupDelay,
-		ShutdownContext: runCtx,
-		OnQueueObserver: func(o *observe.QueueObserver) { m.activeQueueObs.Store(o) },
+		DuckDB:               m.DB,
+		SrcAdapter:           cfg.Source.Adapter,
+		WorkerCount:          workerCount,
+		MaxRetries:           maxRetries,
+		LogAddress:           cfg.LogAddress,
+		LogLevel:             cfg.LogLevel,
+		SkipListener:         opts.SkipListener || cfg.SkipListener,
+		StartupDelay:         cfg.StartupDelay,
+		ShutdownContext:      runCtx,
+		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
+		ReportStopProgress:   m.reportStopProgress,
+		OnQueueObserver:      func(o *observe.QueueObserver) { m.activeQueueObs.Store(o) },
 		OnAutoscaler:         m.bindAutoscaler,
-		Autoscaler:      m.resolveAutoscalerConfig(cfg.Autoscaler),
-		SrcService:      cfg.Source,
-		DstService:      cfg.Destination,
-		PathCheckTarget: cfg.PathCheckTarget,
-		WindowsCompat:   cfg.WindowsCompat,
+		Autoscaler:           m.resolveAutoscalerConfig(cfg.Autoscaler),
+		SrcService:           cfg.Source,
+		DstService:           cfg.Destination,
+		PathCheckTarget:      cfg.PathCheckTarget,
+		WindowsCompat:        cfg.WindowsCompat,
 	})
 	if err != nil {
+		if errors.Is(err, ErrDeleteSoftSuspended) {
+			dstats, sus, ok := AsDeleteSuspended(err)
+			if ok {
+				if patch, e2 := suspendRuntimeMergePatch(sus); e2 == nil {
+					_ = m.store.updateRuntimeState(m.ID, patch)
+				}
+				if e3 := m.transitionTo(PhaseDeleteSuspended); e3 != nil {
+					if m.Phase() == PhaseAborted {
+						m.softSuspendRequested.Store(false)
+						m.refreshRuntimeState()
+						return dstats, nil
+					}
+					return dstats, e3
+				}
+				m.softSuspendRequested.Store(false)
+				m.refreshRuntimeState()
+				return dstats, nil
+			}
+		}
+		if m.Phase() == PhaseAborted {
+			return queue.QueueStats{}, nil
+		}
 		return queue.QueueStats{}, err
 	}
-	if err := m.transitionTo(PhaseDeleteReview); err != nil {
-		return queue.QueueStats{}, err
+	if err := m.completeDurableFinalize(PhaseDeleteFinalizing, PhaseDeleteFinalizeFailed, PhaseDeleteReview, FinalizeOverrides{}); err != nil {
+		m.refreshRuntimeState()
+		return stats, err
 	}
 	m.refreshRuntimeState()
 	return stats, nil
@@ -480,6 +583,7 @@ func (m *Migration) RunRetrySweep(cfg Config, opts RetrySweepOptions) (RuntimeSt
 		}(),
 		ShutdownContext:      runCtx,
 		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
+		ReportStopProgress:   m.reportStopProgress,
 		OnQueueObserver:      func(o *observe.QueueObserver) { m.activeQueueObs.Store(o) },
 		OnAutoscaler:         m.bindAutoscaler,
 		Autoscaler:           m.resolveAutoscalerConfig(cfg.Autoscaler),
@@ -487,6 +591,7 @@ func (m *Migration) RunRetrySweep(cfg Config, opts RetrySweepOptions) (RuntimeSt
 		DstService:           cfg.Destination,
 		PathCheckTarget:      cfg.PathCheckTarget,
 		WindowsCompat:        cfg.WindowsCompat,
+		FilterRuleset:        firstFilter(cfg.FilterRuleset, m.FilterRuleset()),
 	})
 	if err != nil {
 		if errors.Is(err, ErrTraversalSoftSuspended) {
@@ -496,6 +601,11 @@ func (m *Migration) RunRetrySweep(cfg Config, opts RetrySweepOptions) (RuntimeSt
 					_ = m.store.updateRuntimeState(m.ID, patch)
 				}
 				if e3 := m.transitionTo(PhaseTraversalSuspended); e3 != nil {
+					if m.Phase() == PhaseAborted {
+						m.softSuspendRequested.Store(false)
+						m.refreshRuntimeState()
+						return rstats, nil
+					}
 					return rstats, e3
 				}
 				m.softSuspendRequested.Store(false)
@@ -505,14 +615,14 @@ func (m *Migration) RunRetrySweep(cfg Config, opts RetrySweepOptions) (RuntimeSt
 		}
 		return RuntimeStats{}, err
 	}
-	if err := m.transitionTo(PhaseTraversalReview); err != nil {
-		return RuntimeStats{}, err
+	if err := m.completeDurableFinalize(PhaseTraversalFinalizing, PhaseTraversalFinalizeFailed, PhaseTraversalReview, FinalizeOverrides{}); err != nil {
+		m.refreshRuntimeState()
+		return stats, err
 	}
-	m.refreshRuntimeState()
 	return stats, nil
 }
 
-// RunCopyRetry runs the copy phase in retry mode (only copy_status = failed). On success transitions back to awaiting-copy-review.
+// RunCopyRetry runs the copy phase in retry mode (marked failed→pending items). On success transitions back to awaiting-copy-review.
 func (m *Migration) RunCopyRetry(cfg Config, opts CopyPhaseOptions) (queue.QueueStats, error) {
 	phase := m.Phase()
 	if phase != PhaseCopyReview && phase != PhaseCopying && phase != PhaseCopySuspended {
@@ -567,6 +677,7 @@ func (m *Migration) RunCopyRetry(cfg Config, opts CopyPhaseOptions) (queue.Queue
 		ProgressTick:         cfg.ProgressTick,
 		ShutdownContext:      runCtx,
 		SoftSuspendRequested: func() bool { return m.softSuspendRequested.Load() },
+		ReportStopProgress:   m.reportStopProgress,
 		OnQueueObserver:      func(o *observe.QueueObserver) { m.activeQueueObs.Store(o) },
 		OnAutoscaler:         m.bindAutoscaler,
 		Autoscaler:           m.resolveAutoscalerConfig(cfg.Autoscaler),
@@ -592,10 +703,10 @@ func (m *Migration) RunCopyRetry(cfg Config, opts CopyPhaseOptions) (queue.Queue
 		}
 		return queue.QueueStats{}, err
 	}
-	if err := m.transitionTo(PhaseCopyReview); err != nil {
-		return queue.QueueStats{}, err
+	if err := m.completeDurableFinalize(PhaseCopyFinalizing, PhaseCopyFinalizeFailed, PhaseCopyReview, FinalizeOverrides{}); err != nil {
+		m.refreshRuntimeState()
+		return stats, err
 	}
-	m.refreshRuntimeState()
 	return stats, nil
 }
 
@@ -618,10 +729,13 @@ func (m *Migration) Stop() (StopResult, error) {
 	}
 
 	switch phase {
-	case PhaseTraversing, PhaseCopying:
+	case PhaseTraversing, PhaseCopying, PhaseDeleting:
 		m.softSuspendRequested.Store(true)
+		m.beginSoftStopProgress(phase)
+		inProgress := m.pauseLiveQueues()
+		m.setStopStepDetail(StopStepDraining, inProgress, drainWaitDetail(inProgress, "items"))
+		m.startSoftStopProgressPump()
 		result.SoftSuspendRequested = true
-		m.armStopGraceTimer(DefaultStopGracePeriod)
 		return result, nil
 	default:
 		if cancel != nil {
@@ -632,7 +746,7 @@ func (m *Migration) Stop() (StopResult, error) {
 }
 
 // ForceStop cancels the active run context and abandons in-flight queue work.
-// Use after a soft-suspend grace period when workers are stuck (e.g. FS retry loops).
+// Prefer soft Stop; use Abort/ForceStop only when the user chooses hard kill.
 func (m *Migration) ForceStop() (StopResult, error) {
 	m.mu.RLock()
 	cancel := m.runCancel
@@ -653,8 +767,40 @@ func (m *Migration) ForceStop() (StopResult, error) {
 
 	m.disarmStopGraceTimer()
 	m.softSuspendRequested.Store(false)
+	m.beginForceStopProgress()
+	_ = m.pauseLiveQueues()
+	if o := m.activeQueueObs.Load(); o != nil {
+		o.AbandonRegisteredQueues()
+	}
+	// Abort durable seal teardown immediately so soft-stop Flush/rebuild/checkpoint cannot continue.
+	if m.DB != nil {
+		m.DB.AbortTraversalPhase()
+	}
 	if cancel != nil {
 		cancel()
 	}
+	return result, nil
+}
+
+// Abort force-stops the live run and transitions to PhaseAborted (not resumable).
+func (m *Migration) Abort() (StopResult, error) {
+	result, err := m.ForceStop()
+	if err != nil {
+		return result, err
+	}
+	if !result.Stopped && !m.IsLive() {
+		// Still try to mark aborted if we are mid-phase.
+	}
+	phase := m.Phase()
+	switch phase {
+	case PhaseTraversing, PhaseCopying, PhaseDeleting:
+		if e := m.transitionTo(PhaseAborted); e != nil {
+			return result, e
+		}
+		result.Phase = PhaseAborted
+	}
+	m.setStopStepDetail(StopStepAborted, 0, "")
+	m.refreshRuntimeState()
+	result.RuntimeStatus = m.GetRuntimeStatus()
 	return result, nil
 }

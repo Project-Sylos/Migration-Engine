@@ -100,8 +100,8 @@ type State struct {
 	PeakPerWorkerFSOpRate float64       // best recent task/sec per worker before inter-op delay
 
 	// Soft-cap discovery (FS_THROTTLE): resting ceiling separate from probe patience.
-	CeilingSafe     int           // 0 = unset (pre-first RL); believed safe/next-boundary estimate
-	SoftCap         int           // resting worker target when ceiling set
+	CeilingSafe     int           // 0 = unset; SoftCap+1 next-probe boundary after FS_THROTTLE
+	SoftCap         int           // resting worker target (n-1 after RL at n)
 	ProbeBounce     time.Duration // FS probe-only wait before SoftCap+1
 	LastProbeBounce time.Duration // last ratcheted probe bounce (sustain + fail formula)
 	LastProbeFail   time.Time     // when ProbeBounce was last ratcheted

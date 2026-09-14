@@ -23,9 +23,9 @@ const defaultBatchSize = 50_000
 var LS *Sender
 
 // InitGlobalLogger initializes the global LS instance.
-// Logs are persisted to the main DB's logs table when mainDB is non-nil (single DuckDB).
-func InitGlobalLogger(mainDB *db.DB, addr, level string) error {
-	sender, err := NewSender(mainDB, addr, level)
+// Logs are persisted to logDB (typically the migration logs sidecar) when non-nil.
+func InitGlobalLogger(logDB *db.DB, addr, level string) error {
+	sender, err := NewSender(logDB, addr, level)
 	if err != nil {
 		return fmt.Errorf("failed to initialize global logger: %w", err)
 	}
@@ -53,6 +53,7 @@ type Sender struct {
 	buf        *bytes.Buffer
 	enc        *json.Encoder
 	tmp        LogPacket // reusable scratch struct
+	recent     *recentRing
 }
 
 // getLevelIndex assigns numeric priority to levels.
@@ -102,7 +103,16 @@ func NewSender(logDB *db.DB, addr, level string) (*Sender, error) {
 		minLevelIx: minIx,
 		buf:        buf,
 		enc:        json.NewEncoder(buf),
+		recent:     newRecentRing(recentLogCap),
 	}, nil
+}
+
+// Recent returns the newest in-memory log lines (live UI). Does not read the DB.
+func (s *Sender) Recent(limit int) []RecentLog {
+	if s == nil {
+		return nil
+	}
+	return s.recent.recent(limit)
 }
 
 // Log sends the message via UDP (if level >= threshold) and optionally to the log DB via the buffer.
@@ -115,9 +125,9 @@ func (s *Sender) Log(level, message, entity, entityID string, queues ...string) 
 		queue = queues[0]
 	}
 
-	// --- DB write (when log DB is set, buffered) ---
+	id := uuid.New().String()
+	s.recent.add(RecentLog{ID: id, At: timestamp, Level: level, Message: message})
 	if s.logBuffer != nil {
-		id := uuid.New().String()
 		s.logBuffer.Add(logbuf.LogEntry{
 			ID:        id,
 			Timestamp: timestamp.Format(time.RFC3339Nano),

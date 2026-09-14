@@ -4,7 +4,6 @@
 package migration
 
 import (
-	"context"
 	"testing"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
@@ -18,13 +17,8 @@ func TestSeedQueueCountersFromDB(t *testing.T) {
 	}
 	defer database.Close()
 
-	ctx := context.Background()
 	metrics := `{"files_discovered_total":20000,"folders_discovered_total":500}`
-	if err := database.RunWrite(ctx, func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			return w.AppendQueueStats("src-traversal", db.QueueStatsPhaseTraversal, metrics)
-		})
-	}); err != nil {
+	if err := database.AppendQueueStats("src-traversal", db.QueueStatsPhaseTraversal, metrics); err != nil {
 		t.Fatal(err)
 	}
 

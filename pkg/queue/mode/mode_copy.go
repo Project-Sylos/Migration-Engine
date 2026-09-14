@@ -12,8 +12,9 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/failurelog"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
-	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/subtree"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue/worker"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
@@ -54,7 +55,7 @@ func CheckCopyCompletion(q *queue.Queue, currentRound int) bool {
 	}
 
 	if copyPass == 1 {
-			// Pass 1 (folders) done - switch to pass 2 (files); find starting round
+		// Pass 1 (folders) done - switch to pass 2 (files); find starting round
 		q.SetCopyPass(2)
 		q.ResetRoundStatsCompleted()
 
@@ -160,11 +161,16 @@ func PullCopyTasks(q *queue.Queue, force bool) queue.PullResult {
 	batchSize := q.EffectiveLeaseBatchSize()
 	copyStatusFilter := db.CopyStatusPending
 	if q.GetMode() == queue.QueueModeCopyRetry {
-		copyStatusFilter = db.CopyStatusFailed
+		// Marks convert failed→pending; retry pulls those pending marks (and any leftover pending).
+		copyStatusFilter = db.CopyStatusPending
 	}
 	// Request limit+1 to detect keyspace exhaustion: if we get <= limit, we're done; else more exists.
 	requestLimit := batchSize + 1
+	q.BeginDBPull()
+	defer q.ReleaseDBPull()
+	pullStart := time.Now()
 	results, err := pull.ListNodesCopyKeyset(database, currentRound, nodeType, q.GetKeysetCursor(), requestLimit, copyStatusFilter)
+	q.RecordDBPull(len(results), time.Since(pullStart))
 	if err != nil {
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("error", fmt.Sprintf("ListNodesCopyKeyset failed: %v", err), "queue", q.Name(), q.Name())
@@ -217,20 +223,15 @@ func PullCopyTasks(q *queue.Queue, force bool) queue.PullResult {
 		}
 
 		task := nodeStateToCopyTask(item.State, taskType, copyPass)
-		// Ensure task has the ULID from the database
-		if task != nil && task.ID == "" {
+		if task == nil {
+			continue
+		}
+		if task.ID == "" {
 			task.ID = item.State.ID
 		}
 
-		// DstParentServiceID from id_map → dst_nodes join in ListNodesCopyKeyset
-		if item.State.ParentID == "" {
-			if logservice.LS != nil {
-				err := logservice.LS.Log("error", fmt.Sprintf("Item at round %d has empty ParentID (path=%s) - this should not happen", item.State.Depth, item.State.Path), "queue", q.Name(), q.Name())
-				if err != nil {
-					fmt.Println("error logging", err)
-				}
-			}
-			continue
+		if item.State.ParentID == "" && logservice.LS != nil {
+			_ = logservice.LS.Log("error", fmt.Sprintf("Item at round %d has empty ParentID (path=%s)", item.State.Depth, item.State.Path), "queue", q.Name(), q.Name())
 		}
 		dstParentServiceID := item.DstParentServiceID
 		if dstParentServiceID == "" {
@@ -241,14 +242,8 @@ func PullCopyTasks(q *queue.Queue, force bool) queue.PullResult {
 				}
 			}
 		}
-		if dstParentServiceID == "" {
-			if logservice.LS != nil {
-				err := logservice.LS.Log("error", fmt.Sprintf("No DST parent for %s (parent_path=%s parent_id=%s) — skipping copy task", item.State.Path, item.State.ParentPath, item.State.ParentID), "queue", q.Name(), q.Name())
-				if err != nil {
-					fmt.Println("error logging", err)
-				}
-			}
-			continue
+		if dstParentServiceID == "" && logservice.LS != nil {
+			_ = logservice.LS.Log("error", fmt.Sprintf("No DST parent for %s (parent_path=%s parent_id=%s); enqueueing so copy still claims the task", item.State.Path, item.State.ParentPath, item.State.ParentID), "queue", q.Name(), q.Name())
 		}
 		task.DstParentID = dstParentServiceID
 		task.DstParentNodeID = item.DstParentNodeID
@@ -256,6 +251,7 @@ func PullCopyTasks(q *queue.Queue, force bool) queue.PullResult {
 			task.DstParentNodeID = db.MintNodeID("DST", "", db.NodeTypeFolder, "/")
 		}
 		task.ResolvedDstName = item.ResolvedDstPath
+		task.SrcParentDeleteStatus = item.SrcParentDeleteStatus
 
 		if q.Add(task) {
 			enqueueSuccessCount++
@@ -296,6 +292,7 @@ func nodeStateToCopyTask(state *db.NodeState, taskType string, copyPass int) *qu
 		SrcLogicalPath:       logicalPath,
 		SrcLogicalParentPath: logicalParent,
 		SrcTraversalStatus:   state.TraversalStatus,
+		ExclusionSource:      state.ExclusionSource,
 	}
 
 	// Populate folder or file based on node type
@@ -365,15 +362,24 @@ func CompleteCopyTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.
 		taskName = path.Base(taskPath)
 	}
 
-	database.AppendStatusEvent("SRC", db.StatusEvent{
-		ID:              nodeID,
-		TraversalStatus: task.SrcTraversalStatus,
-		CopyStatus:      db.CopyStatusSuccessful,
-		PrevCopyStatus:  task.CopyStatus,
-		EventTime:       time.Now().UnixNano(),
-		Depth:           currentRound,
-		Size:            taskSize,
-		NodeType:        taskType,
+	parentDelete := task.SrcParentDeleteStatus
+	deleteStatus := db.DeleteStatusAfterCopyComplete(parentDelete, task.DeleteStatus)
+
+	copyStatus := db.CopyStatusSuccessful
+	if task.ProgressAlreadyExists {
+		copyStatus = db.CopyStatusAlreadyExisted
+	}
+	accepted := database.AppendStatusEvent("SRC", db.StatusEvent{
+		ID:               nodeID,
+		CopyStatus:       copyStatus,
+		PrevCopyStatus:   task.CopyStatus,
+		DeleteStatus:     deleteStatus,
+		PrevDeleteStatus: task.DeleteStatus,
+		EventTime:        time.Now().UnixNano(),
+		Depth:            currentRound,
+		Size:             taskSize,
+		NodeType:         taskType,
+		ExclusionSource:  task.ExclusionSource,
 	}, false)
 	dstParentID := db.MintNodeID("DST", "", db.NodeTypeFolder, "/")
 	if task.DstParentNodeID != "" {
@@ -405,9 +411,31 @@ func CompleteCopyTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.
 		TraversalStatus: db.StatusSuccessful,
 		Status:          db.StatusSuccessful,
 	}
-	database.AppendDiscoveredNodes([]db.InsertOperation{
+	if err := database.AppendDiscoveredNodes([]db.InsertOperation{
 		{QueueType: "DST", Level: currentRound, Status: db.StatusSuccessful, State: dstNode},
-	})
+	}); err != nil {
+		if logservice.LS != nil {
+			logErr := logservice.LS.Log("error",
+				fmt.Sprintf("DST node persist failed after copy for %s (id=%s dst=%s): %v",
+					task.LocationPath(), nodeID, dstNodeID, err),
+				"queue", q.Name(), q.Name())
+			if logErr != nil {
+				fmt.Println("error logging", logErr)
+			}
+		}
+	}
+	parentDepth := currentRound - 1
+	if parentDepth < 0 {
+		parentDepth = 0
+	}
+	if err := database.AppendKidTicket(opsdb.SideDST, dstParentID, parentDepth, opsdb.KidRecord{
+		ID: dstNodeID, ServiceID: dstServiceID, ParentServiceID: task.DstParentID,
+		Path: taskPath, ParentPath: parentPath, Name: createName, Type: taskType,
+		Size: taskSize, MTime: taskMTime, Depth: currentRound,
+		TraversalStatus: db.StatusSuccessful,
+	}); err != nil && logservice.LS != nil {
+		_ = logservice.LS.Log("error", fmt.Sprintf("dst kids ticket failed for %s: %v", taskPath, err), "queue", q.Name(), q.Name())
+	}
 	database.AppendIDMapEvent(db.IDMapEvent{
 		SrcInternalID: nodeID,
 		DstInternalID: dstNodeID,
@@ -415,7 +443,15 @@ func CompleteCopyTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.
 		Status:        db.IDMapStatusActive,
 	})
 
-	q.RecordCreatedAndClearInProgress(nodeID, task.IsFolder(), task.IsFile(), task.BytesTransferred)
+	if !accepted {
+		q.RemoveInProgress(nodeID)
+		return
+	}
+	outcome := queue.TerminalProgressCopied
+	if task.ProgressAlreadyExists {
+		outcome = queue.TerminalProgressAlreadyExists
+	}
+	q.RecordTerminalProgress(outcome, nodeID, task.IsFolder(), task.IsFile(), task.BytesTransferred)
 }
 
 // FailCopyTask handles failure of copy tasks.
@@ -489,9 +525,6 @@ func FailCopyTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.Dura
 
 	database := q.Database()
 	if database == nil {
-		if task.IsFile() {
-			q.RecordFailedBytes(task.File.Size)
-		}
 		q.RemoveInProgress(nodeID)
 		return
 	}
@@ -509,29 +542,30 @@ func FailCopyTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.Dura
 	}
 	copyEv := db.StatusEvent{
 		ID:              nodeID,
-		TraversalStatus: task.SrcTraversalStatus,
 		CopyStatus:      db.CopyStatusFailed,
 		PrevCopyStatus:  task.CopyStatus,
 		EventTime:       time.Now().UnixNano(),
 		Depth:           currentRound,
 		Size:            failSize,
 		NodeType:        failType,
+		ExclusionSource: task.ExclusionSource,
 	}
 	failurelog.AttachTaskFailureLog(&copyEv, "copy", q.Name(), nodeID, task.LocationPath(), task.Attempts, task.LastError)
-	database.AppendStatusEvent("SRC", copyEv, false)
+	accepted := database.AppendStatusEvent("SRC", copyEv, false)
 
-	// Folder failure cascades: mark all pending descendants as failed so they aren't
-	// pulled in the file pass (they'd be skipped anyway since the DST parent won't exist).
+	// Folder failure cascades: mark pending descendants failed in the same write pass
+	// that accumulates SelectedBytes (no separate recount scan for progress).
 	if task.IsFolder() {
 		taskPath := db.NormalizeSubtreeRootPathForPropagation(task.LocationPath())
 		if taskPath != "" && taskPath != "/" {
-			if pendingBytes, err := stats.SumPendingEligibleFileSizeUnderPath(database, taskPath); err == nil {
-				failSize = pendingBytes
+			if mut, err := subtree.PropagateCopyFailure(database, taskPath); err == nil {
+				failSize = mut.SelectedBytes
 			}
-			database.AppendFailedSubtree(taskPath)
 		}
 	}
-	q.RecordFailedBytes(failSize)
-
-	q.RemoveInProgress(nodeID)
+	if !accepted {
+		q.RemoveInProgress(nodeID)
+		return
+	}
+	q.RecordTerminalProgress(queue.TerminalProgressFailed, nodeID, task.IsFolder(), task.IsFile(), failSize)
 }

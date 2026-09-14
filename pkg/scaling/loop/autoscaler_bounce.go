@@ -32,37 +32,3 @@ func (a *Autoscaler) noteSoftCapThrottle(st *aimd.State, now time.Time, rateLimi
 			st.ProbeBounce.Round(time.Millisecond), st.CeilingSafe, st.SoftCap))
 	}
 }
-
-// noteThrottleBounce is kept as an alias for efficiency-abort paths that still expect
-// a universal bounce stamp; FS worker drops should call noteSoftCapThrottle instead.
-// When soft-cap is active it only ratchets ProbeBounce; otherwise elevates efficiency timer
-// for back-compat with tests that call this directly.
-func (a *Autoscaler) noteThrottleBounce(st *aimd.State, now time.Time, rateLimitedUntil time.Time) {
-	if a == nil || st == nil {
-		return
-	}
-	if st.CeilingSafe > 0 || st.SoftCap > 0 {
-		a.noteSoftCapThrottle(st, now, rateLimitedUntil)
-		return
-	}
-	// Pre-ceiling discovery: still pace climbs via efficiency/universal timer.
-	max := a.bounceMaxCooldown()
-	st.RatchetProbeBackoff(a.aimd.ProbeCooldown, max)
-	if !rateLimitedUntil.IsZero() && rateLimitedUntil.After(now) {
-		need := rateLimitedUntil.Sub(now) + aimd.DefaultBounceCushion
-		if need > st.EffectiveProbeCooldown {
-			st.EffectiveProbeCooldown = need
-			if max > 0 && st.EffectiveProbeCooldown > max {
-				st.EffectiveProbeCooldown = max
-			}
-		}
-	}
-	st.LastDecrease = now
-	// Also seed soft-cap probe bounce so the first post-RL probe is patient.
-	st.RatchetProbeBounce(a.aimd.ProbeCooldown, max, now, rateLimitedUntil)
-	if a.debugAIMD {
-		a.debugAIMDPrint(fmt.Sprintf("  bounce ratchet: wait=%s probeBounce=%s failed=%d",
-			st.ProbeCooldownDuration(a.aimd.ProbeCooldown).Round(time.Millisecond),
-			st.ProbeBounce.Round(time.Millisecond), st.FailedProbes))
-	}
-}

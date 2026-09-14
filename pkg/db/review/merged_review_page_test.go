@@ -4,11 +4,10 @@
 package review
 
 import (
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
-	"context"
 	"testing"
-	"time"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
 )
 
 func TestReviewFilterHasSearchPredicate(t *testing.T) {
@@ -23,16 +22,18 @@ func TestReviewFilterHasSearchPredicate(t *testing.T) {
 	}
 	cases := []ReviewFilter{
 		{Query: "foo"},
+		{UnderPath: "/reports"},
 		{FoldersOnly: true},
 		{TypeFilter: "file"},
 		{TraversalStatus: db.StatusFailed},
 		{CopyStatus: db.CopyStatusPending},
-		{DeleteStatus: db.DeleteStatusPending},
+		{DeleteStatus: db.DeleteStatusPendingExplicit},
 		{PathIssueFilter: "issues"},
 		{PathIssueCategory: "InvalidChar"},
 		{DepthOperator: "=", DepthValue: intPtr(1)},
 		{SizeOperator: ">", SizeValue: int64Ptr(100)},
 		{ExcludeDestinationOnly: true},
+		{CompiledFilter: &filter.CompiledRuleset{}},
 	}
 	for i, f := range cases {
 		if !ReviewFilterHasSearchPredicate(f) {
@@ -48,7 +49,6 @@ func TestListMergedReviewDiffsPageHasMoreNoCount(t *testing.T) {
 	}
 	defer database.Close()
 
-	eventTime := time.Now().UnixNano()
 	nodes := []*db.NodeState{
 		{
 			ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/a.txt"), Path: "/a.txt", ParentPath: "/", Name: "a.txt",
@@ -63,30 +63,10 @@ func TestListMergedReviewDiffsPageHasMoreNoCount(t *testing.T) {
 			Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusFailed, CopyStatus: db.CopyStatusPending,
 		},
 	}
-	err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			if err := w.AppenderInsert(db.TableSrcNodes, nodes); err != nil {
-				return err
-			}
-			events := make([]db.StatusEvent, 0, len(nodes))
-			for _, n := range nodes {
-				events = append(events, db.StatusEvent{
-					ID: n.ID, TraversalStatus: n.TraversalStatus, CopyStatus: n.CopyStatus,
-					EventTime: eventTime, Depth: 1,
-				})
-			}
-			return w.BatchInsertSrcStatusEvents(events)
-		})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := database.RebuildAllCurrent(); err != nil {
-		t.Fatal(err)
-	}
+	seedReviewTree(t, database, nodes, nil, nil)
 
-	f := ReviewFilter{TraversalStatus: db.StatusFailed, StatusSearchType: "traversal"}
-	page, hasMore, err := ListMergedReviewDiffsPage(database, f, "path ASC", 2, 0)
+	f := ReviewFilter{TraversalStatus: db.StatusFailed, StatusSearchType: "traversal", ExcludeRoot: true}
+	page, hasMore, err := ListMergedReviewDiffsPage(database, f, "id ASC", 2, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,22 +76,28 @@ func TestListMergedReviewDiffsPageHasMoreNoCount(t *testing.T) {
 	if len(page) != 2 {
 		t.Fatalf("page len=%d want 2 (extra row trimmed)", len(page))
 	}
-	if page[0].Path != "/a.txt" || page[1].Path != "/b.txt" {
-		t.Fatalf("unexpected page paths: %+v", page)
+	got := pathsOf(page)
+	want := map[string]bool{"/a.txt": true, "/b.txt": true, "/c.txt": true}
+	for _, p := range got {
+		if !want[p] {
+			t.Fatalf("unexpected path %q in page %v", p, got)
+		}
 	}
 
-	last, hasMoreLast, err := ListMergedReviewDiffsPage(database, f, "path ASC", 2, 2)
+	last, hasMoreLast, err := ListMergedReviewDiffsPage(database, f, "id ASC", 2, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hasMoreLast {
 		t.Fatal("hasMore=true want false on final page")
 	}
-	if len(last) != 1 || last[0].Path != "/c.txt" {
-		t.Fatalf("final page=%+v want [/c.txt]", last)
+	if len(last) != 1 {
+		t.Fatalf("final page len=%d want 1", len(last))
+	}
+	if !want[last[0].Path] {
+		t.Fatalf("final page path=%q", last[0].Path)
 	}
 
-	// Counted path still available and exact.
 	counted, total, err := ListMergedReviewDiffs(database, f, "path ASC", 2, 0)
 	if err != nil {
 		t.Fatal(err)

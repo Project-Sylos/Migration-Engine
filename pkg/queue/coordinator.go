@@ -4,6 +4,7 @@
 package queue
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -111,7 +112,7 @@ func (c *QueueCoordinator) WaitSealBackpressure(_ string, round int, database *d
 	if database == nil || round < 0 {
 		return true
 	}
-	if err := database.Flush(); err != nil {
+	if err := database.Flush(context.Background()); err != nil {
 		fmt.Println("error flushing seal buffer", err)
 		return false
 	}

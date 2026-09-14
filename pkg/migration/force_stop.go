@@ -11,7 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
 )
@@ -37,72 +36,34 @@ func mergeWaitContexts(primary context.Context, shutdown context.Context) (conte
 	return ctx, cancel
 }
 
+// performTraversalForceStop abandons in-flight work only. No Flush / rebuild / checkpoint:
+// hard kill must not block on DuckDB writeMu after Abort (soft-then-hard UX).
 func performTraversalForceStop(
-	database *db.DB,
 	srcQueue, dstQueue *queue.Queue,
 	observer *observe.QueueObserver,
-	coordinator *queue.QueueCoordinator,
 ) {
 	if observer != nil {
 		observer.Stop()
 	}
-	srcQueue.SetState(queue.QueueStatePaused)
-	dstQueue.SetState(queue.QueueStatePaused)
-	srcQueue.StopWatchdog()
-	dstQueue.StopWatchdog()
-	srcQueue.ClearPendingBufferForSuspend()
-	dstQueue.ClearPendingBufferForSuspend()
-	srcQueue.AbandonInProgressTasks()
-	dstQueue.AbandonInProgressTasks()
-	drainCtx, drainCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer drainCancel()
-	_ = srcQueue.WaitInProgressZero(drainCtx, 50*time.Millisecond)
-	_ = dstQueue.WaitInProgressZero(drainCtx, 50*time.Millisecond)
-	flushCtx, flushCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer flushCancel()
-	flushDone := make(chan struct{})
-	go func() {
-		_ = database.Flush()
-		close(flushDone)
-	}()
-	select {
-	case <-flushDone:
-	case <-flushCtx.Done():
-	}
-	_ = queue.FinalizeCopyWorkOnStop(database, coordinator)
-	_ = database.CheckpointWithRetry(flushCtx, 1)
+	abandonQueuesDBOnly(srcQueue, dstQueue)
 }
 
-func performCopyForceStop(
-	database *db.DB,
-	copyQueue *queue.Queue,
-	observer *observe.QueueObserver,
-) {
+// performCopyForceStop abandons in-flight copy work only (no Flush / checkpoint).
+func performCopyForceStop(copyQueue *queue.Queue, observer *observe.QueueObserver) {
 	if observer != nil {
 		observer.Stop()
+	}
+	if copyQueue == nil {
+		return
 	}
 	copyQueue.SetState(queue.QueueStatePaused)
 	copyQueue.StopWatchdog()
+	copyQueue.Spin.AbandonDBOnly.Store(true)
 	copyQueue.ClearPendingBufferForSuspend()
-	copyQueue.EnterStopAbandonWindow(queue.DefaultSpinDownGrace)
 	copyQueue.RequestForceCheckoutAllWorkersForStop()
+	copyQueue.CancelBusyWorkerContexts()
 	copyQueue.AbandonInProgressTasks()
-	copyQueue.Spin.AbandonDBOnly.Store(false)
-	drainCtx, drainCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer drainCancel()
-	_ = copyQueue.WaitInProgressZero(drainCtx, 50*time.Millisecond)
-	flushCtx, flushCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer flushCancel()
-	flushDone := make(chan struct{})
-	go func() {
-		_ = database.Flush()
-		close(flushDone)
-	}()
-	select {
-	case <-flushDone:
-	case <-flushCtx.Done():
-	}
-	_ = database.CheckpointWithRetry(flushCtx, 1)
+	copyQueue.ClearPendingBufferForSuspend()
 }
 
 func copyForceStopStats(copyQueue *queue.Queue) queue.QueueStats {

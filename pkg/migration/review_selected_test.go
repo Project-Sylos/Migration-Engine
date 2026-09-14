@@ -19,6 +19,7 @@ func TestReviewSelectedSpec(t *testing.T) {
 	}{
 		{PhaseTraversalReview, "", db.StatsKindCopy, stats.SelectedPending},
 		{PhaseTraversalSuspended, "", db.StatsKindCopy, stats.SelectedPending},
+		{PhaseTraversalReview, "copy-plan", db.StatsKindCopy, stats.SelectedPending},
 		{PhaseCopyReview, "", db.StatsKindCopy, stats.SelectedEligible},
 		{PhaseCopying, "", db.StatsKindCopy, stats.SelectedEligible},
 		{PhaseCopySuspended, "", db.StatsKindCopy, stats.SelectedEligible},

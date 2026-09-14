@@ -14,7 +14,7 @@ import (
 
 func TestEnsureLeaseBatchSizeAtLeast(t *testing.T) {
 	q := queue.NewQueue("copy", 3, 1, nil, nil)
-	if q.EffectiveLeaseBatchSize() != 1000 {
+	if q.EffectiveLeaseBatchSize() != 5000 {
 		t.Fatalf("default=%d", q.EffectiveLeaseBatchSize())
 	}
 	q.EnsureLeaseBatchSizeAtLeast(types.DefaultCreateFolderBatchPullSize)

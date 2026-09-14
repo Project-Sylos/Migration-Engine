@@ -21,6 +21,7 @@ const (
 	estBytesPerLeaseSlot  = 16 * 1024
 	estBytesPerRefillSlot = 8 * 1024
 	estBytesPerSealRow    = 512
+	estBytesPerExpectedChild = 512
 )
 
 // SystemUsedFraction returns (MemTotal - MemAvailable) / MemTotal, or 0 if unknown.
@@ -79,6 +80,14 @@ func EstimateBatchIncrementKB(kind BatchIncrementKind, cur, next int) int64 {
 		unit = estBytesPerSealRow
 	}
 	return int64(next-cur) * unit / 1024
+}
+
+// EstimateDstChildQuotaKB is the rough RAM for hydrated expected SRC children in a DST pull batch.
+func EstimateDstChildQuotaKB(childQuota int) int64 {
+	if childQuota <= 0 {
+		return 0
+	}
+	return int64(childQuota) * estBytesPerExpectedChild / 1024
 }
 
 // FormatMemoryBudgetLine summarizes a sample for debug logs.

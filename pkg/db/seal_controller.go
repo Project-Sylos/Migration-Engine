@@ -4,22 +4,18 @@
 package db
 
 import (
-	"database/sql"
-	"errors"
 	"time"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
 // SealBufferOptions configures the seal buffer. Zero value uses defaults.
-// The knobs live here (not in pkg/db/seal) so scaling and migration can tune the buffer
-// without importing the implementation.
 type SealBufferOptions struct {
 	FlushInterval time.Duration
 	RowThreshold  int
 	HardCap       int
-	FlushTimeout  time.Duration // max wall time for one flush; 0 or negative = no deadline (default). Positive = optional cap.
-	// CheckpointEveryRows: after each successful flush, CHECKPOINT when this many node+event rows have been written since the last checkpoint (default 500_000). Set <= 0 for default.
+	FlushTimeout  time.Duration
 	CheckpointEveryRows int
-	// CheckpointMaxInterval: also CHECKPOINT when this much wall time has passed since the last checkpoint (default 5m). Set <= 0 for default.
 	CheckpointMaxInterval time.Duration
 }
 
@@ -29,55 +25,49 @@ type SealBufferTelemetry struct {
 	HWMSinceLastPoll         int64
 	HardCapHitsSinceLastPoll int64
 	FlushCountSinceLastPoll  int64
+	LastFlushRows       int64
+	LastFlushDurationNs int64
+}
+
+// SealFlushStats is a non-resetting snapshot of the last successful seal flush.
+type SealFlushStats struct {
+	Rows       int64
+	DurationNs int64
 }
 
 // SealController is the write-behind buffer that DB delegates all sealing to.
-// The implementation lives in pkg/db/seal so the flush machinery can depend on the
-// pull/stats/subtree query packages; DB only knows this contract.
 type SealController interface {
 	Add(table string, depth int, nodes []*NodeState, pending, successful, failed, completed, copyP, copyS, copyF int64) error
-	AddDiscoveryNodes(ops []InsertOperation)
+	AddDiscoveryNodes(ops []InsertOperation) error
 	AddDiscoveryStatusEvent(table string, e StatusEvent, fromRetry bool)
 	AddTaskError(rec TaskErrorRecord)
 	AddFailedSubtreePath(parentPath string)
 	AddGPLIssue(e GPLIssue)
 	AddIDMapEvent(e IDMapEvent)
+	AddKidsPackReplace(side, parentID string, kids []opsdb.KidRecord)
+	AddKidTicket(side, parentID string, parentDepth int, kid opsdb.KidRecord)
 	Flush() error
 	WaitUntilFlushedThrough(depth int)
 	IOWaitActive() bool
 	TelemetrySnapshot() SealBufferTelemetry
+	LastFlushStats() SealFlushStats
 	UpdateOptions(opts SealBufferOptions)
-	StartPhase(conn *sql.Conn) error
+	StartPhase() error
 	StopPhase() error
+	AbortPhase()
+	HardAborted() bool
 	OnCheckpointOK()
 	Stop()
 }
 
-// ErrNoSealController is returned by Open when no seal implementation has been registered.
-var ErrNoSealController = errors.New(`no seal controller registered: import codeberg.org/Sylos/Migration-Engine/pkg/db/seal`)
-
-// sealAttach is installed by pkg/db/seal's init. Open calls it so callers keep using db.Open
-// while the buffer implementation stays out of this package's import graph.
-var sealAttach func(*DB, SealBufferOptions) SealController
-
-// RegisterSealAttach installs the seal buffer factory. Called from pkg/db/seal init.
-func RegisterSealAttach(fn func(*DB, SealBufferOptions) SealController) {
-	sealAttach = fn
-}
-
-// AttachSeal sets the controller DB delegates sealing to. Open does this via the registered
-// factory; call it directly only when constructing a DB with a bespoke controller.
 func (db *DB) AttachSeal(c SealController) {
 	db.sealBuffer = c
 }
 
-// LockWrites acquires the global write mutex. The seal buffer holds it across phase flushes
-// (deferred CHECKPOINT plus one appender transaction) instead of taking a pooled connection.
 func (db *DB) LockWrites() {
 	db.writeMu.Lock()
 }
 
-// UnlockWrites releases the global write mutex taken by LockWrites.
 func (db *DB) UnlockWrites() {
 	db.writeMu.Unlock()
 }

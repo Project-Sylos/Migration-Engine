@@ -4,15 +4,14 @@
 package migration
 
 import (
-	"context"
 	"fmt"
-	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/oauth"
 )
 
 func (s *migrationStore) UpsertOAuthCredentials(connectionID string, credsJSON []byte) error {
-	if s.db == nil {
+	ops := s.ops()
+	if ops == nil {
 		return fmt.Errorf("UpsertOAuthCredentials requires store db")
 	}
 	if connectionID == "" {
@@ -25,40 +24,23 @@ func (s *migrationStore) UpsertOAuthCredentials(connectionID string, credsJSON [
 	if err != nil {
 		return fmt.Errorf("seal oauth credentials: %w", err)
 	}
-	conn, err := s.db.GetDB()
-	if err != nil {
-		return err
-	}
-	now := time.Now().UTC()
-	_, err = conn.ExecContext(context.Background(),
-		`INSERT INTO oauth_credentials (connection_id, creds_json, updated_at)
-		 VALUES ($1, $2, $3)
-		 ON CONFLICT (connection_id) DO UPDATE SET
-		 creds_json = excluded.creds_json,
-		 updated_at = excluded.updated_at`,
-		connectionID, stored, now,
-	)
-	if err != nil {
+	if err := ops.PutOAuthCred(connectionID, stored); err != nil {
 		return fmt.Errorf("upsert oauth_credentials: %w", err)
 	}
 	return nil
 }
 
 func (s *migrationStore) getOAuthCredentials(connectionID string) ([]byte, error) {
-	if s.db == nil {
+	ops := s.ops()
+	if ops == nil {
 		return nil, fmt.Errorf("getOAuthCredentials requires store db")
 	}
-	conn, err := s.db.GetDB()
+	credsJSON, ok, err := ops.GetOAuthCred(connectionID)
 	if err != nil {
 		return nil, err
 	}
-	var credsJSON string
-	err = conn.QueryRowContext(context.Background(),
-		`SELECT creds_json FROM oauth_credentials WHERE connection_id = $1`,
-		connectionID,
-	).Scan(&credsJSON)
-	if err != nil {
-		return nil, err
+	if !ok {
+		return nil, fmt.Errorf("oauth credentials not found")
 	}
 	plain, err := oauth.OpenOAuthCredentials(credsJSON, s.tokenKey)
 	if err != nil {
@@ -68,16 +50,9 @@ func (s *migrationStore) getOAuthCredentials(connectionID string) ([]byte, error
 }
 
 func (s *migrationStore) DeleteOAuthCredentials(connectionID string) error {
-	if s.db == nil {
+	ops := s.ops()
+	if ops == nil {
 		return fmt.Errorf("DeleteOAuthCredentials requires store db")
 	}
-	conn, err := s.db.GetDB()
-	if err != nil {
-		return err
-	}
-	_, err = conn.ExecContext(context.Background(),
-		`DELETE FROM oauth_credentials WHERE connection_id = $1`,
-		connectionID,
-	)
-	return err
+	return ops.DeleteOAuthCred(connectionID)
 }

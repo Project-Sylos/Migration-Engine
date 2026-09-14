@@ -12,6 +12,9 @@ import (
 )
 
 func TestApplyGPLToSRCChildren_setsStateAndCollision(t *testing.T) {
+	if db.GPLDisabled {
+		t.Skip("GPL gated off (db.GPLDisabled)")
+	}
 	root := db.MintNodeID("SRC", "", db.NodeTypeFolder, "/")
 	a := &db.NodeState{
 		ID: db.MintNodeID("SRC", root, db.NodeTypeFile, "a*b.txt"), Name: "a*b.txt", Type: db.NodeTypeFile, Depth: 1,
@@ -19,7 +22,7 @@ func TestApplyGPLToSRCChildren_setsStateAndCollision(t *testing.T) {
 	b := &db.NodeState{
 		ID: db.MintNodeID("SRC", root, db.NodeTypeFile, "a|b.txt"), Name: "a|b.txt", Type: db.NodeTypeFile, Depth: 1,
 	}
-	ApplyGPLToSRCChildren(nil, pathgpl.Windows, nil, []*db.NodeState{a, b}, false, false)
+	ApplyGPLToSRCChildren(nil, pathgpl.Windows, 0, []*db.NodeState{a, b}, false, false)
 	if a.GPLState == "" || b.GPLState == "" {
 		t.Fatal("expected gpl_state on both children")
 	}
@@ -30,14 +33,14 @@ func TestApplyGPLToSRCChildren_setsStateAndCollision(t *testing.T) {
 	if err := json.Unmarshal([]byte(b.GPLState), &pb); err != nil {
 		t.Fatal(err)
 	}
-	if pa.EffectiveProposedClean() == "" && pb.EffectiveProposedClean() == "" {
+	if pa.Part.ProposedClean == "" && pb.Part.ProposedClean == "" {
 		t.Fatal("expected at least one proposed clean")
 	}
-	if !pa.Part.Collision && !pb.Part.Collision && pa.EffectiveProposedClean() == pb.EffectiveProposedClean() && pa.EffectiveProposedClean() != "" {
+	if !pa.Part.Collision && !pb.Part.Collision && pa.Part.ProposedClean == pb.Part.ProposedClean && pa.Part.ProposedClean != "" {
 		t.Fatal("expected collision when cleans collide")
 	}
-	if len(pa.Parts) == 0 {
-		t.Fatal("expected parts on gpl_state")
+	if pa.PathLen <= 0 {
+		t.Fatal("expected path_len on gpl_state")
 	}
 }
 
@@ -72,22 +75,28 @@ func TestPathChecksRequired(t *testing.T) {
 }
 
 func TestApplyGPLToSRCChildren_skipChecks_passthroughNoEvents(t *testing.T) {
+	if db.GPLDisabled {
+		t.Skip("GPL gated off (db.GPLDisabled)")
+	}
 	root := db.MintNodeID("SRC", "", db.NodeTypeFolder, "/")
 	child := &db.NodeState{
 		ID: db.MintNodeID("SRC", root, db.NodeTypeFile, "ok.txt"), Name: "ok.txt", Type: db.NodeTypeFile, Depth: 1,
 	}
-	ApplyGPLToSRCChildren(nil, pathgpl.Windows, []string{"folder"}, []*db.NodeState{child}, true, false)
+	ApplyGPLToSRCChildren(nil, pathgpl.Windows, len("folder"), []*db.NodeState{child}, true, false)
 	if child.GPLState == "" {
 		t.Fatal("expected passthrough gpl_state")
 	}
 }
 
 func TestApplyGPLToSRCChildren_windowsTrailingSpace(t *testing.T) {
+	if db.GPLDisabled {
+		t.Skip("GPL gated off (db.GPLDisabled)")
+	}
 	root := db.MintNodeID("SRC", "", db.NodeTypeFolder, "/")
 	child := &db.NodeState{
 		ID: db.MintNodeID("SRC", root, db.NodeTypeFolder, "name "), Name: "name ", Type: db.NodeTypeFolder, Depth: 1,
 	}
-	ApplyGPLToSRCChildren(nil, pathgpl.Windows, nil, []*db.NodeState{child}, false, false)
+	ApplyGPLToSRCChildren(nil, pathgpl.Windows, 0, []*db.NodeState{child}, false, false)
 	if child.GPLState == "" {
 		t.Fatal("expected gpl_state")
 	}

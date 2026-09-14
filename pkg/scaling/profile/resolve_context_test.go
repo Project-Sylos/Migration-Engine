@@ -61,7 +61,7 @@ func TestResolveOperationProfileCopyPass2GDriveSpectra(t *testing.T) {
 	}
 	op := ResolveOperationProfile(ctx)
 	if op.MaxWorkers != 16 {
-		t.Fatalf("spectra uncapped upload; gdrive download cap=%d want 16", op.MaxWorkers)
+		t.Fatalf("spectra upload 64; gdrive download cap=%d want 16", op.MaxWorkers)
 	}
 }
 

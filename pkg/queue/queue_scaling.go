@@ -44,6 +44,7 @@ func (q *Queue) applyQueueLocked(fn func()) {
 }
 
 type managedWorker struct {
+	id     string // matches worker name / activeLeaseSize key (e.g. "copy-worker-3")
 	cancel context.CancelFunc
 	idle   atomic.Bool
 	retire atomic.Bool
@@ -200,30 +201,31 @@ func (q *Queue) SetTargetWorkerCount(target int) error {
 	if target > cur {
 		for i := cur; i < target; i++ {
 			workerCtx, cancel := context.WithCancel(shutdownCtx)
-			h := &managedWorker{cancel: cancel}
-			h.idle.Store(true)
-			q.pool.handles = append(q.pool.handles, h)
 			id := q.pool.nextID
 			q.pool.nextID++
+			workerID := fmt.Sprintf("%s-worker-%d", q.name, id)
+			h := &managedWorker{id: workerID, cancel: cancel}
+			h.idle.Store(true)
+			q.pool.handles = append(q.pool.handles, h)
 			if q.pool.isCopy {
 				if workerHooks.NewCopyWorker == nil {
 					return fmt.Errorf("copy worker factory not registered: import codeberg.org/Sylos/Migration-Engine/pkg/queue/worker")
 				}
-				w := workerHooks.NewCopyWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.copySrcAdapter, q.pool.copyDstAdapter, shutdownCtx, workerCtx, &h.idle, &h.retire)
+				w := workerHooks.NewCopyWorker(workerID, q, q.pool.copySrcAdapter, q.pool.copyDstAdapter, shutdownCtx, workerCtx, &h.idle, &h.retire)
 				q.workers = append(q.workers, w)
 				go w.Run()
 			} else if q.pool.isDelete {
 				if workerHooks.NewDeleteWorker == nil {
 					return fmt.Errorf("delete worker factory not registered: import codeberg.org/Sylos/Migration-Engine/pkg/queue/worker")
 				}
-				w := workerHooks.NewDeleteWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.deleteSrcAdapter, shutdownCtx, workerCtx, &h.idle, &h.retire)
+				w := workerHooks.NewDeleteWorker(workerID, q, q.pool.deleteSrcAdapter, shutdownCtx, workerCtx, &h.idle, &h.retire)
 				q.workers = append(q.workers, w)
 				go w.Run()
 			} else {
 				if workerHooks.NewTraversalWorker == nil {
 					return fmt.Errorf("traversal worker factory not registered: import codeberg.org/Sylos/Migration-Engine/pkg/queue/worker")
 				}
-				w := workerHooks.NewTraversalWorker(fmt.Sprintf("%s-worker-%d", q.name, id), q, q.pool.traversalAdapter, q.name, shutdownCtx, workerCtx, &h.idle, &h.retire)
+				w := workerHooks.NewTraversalWorker(workerID, q, q.pool.traversalAdapter, q.name, shutdownCtx, workerCtx, &h.idle, &h.retire)
 				q.workers = append(q.workers, w)
 				go w.Run()
 			}
@@ -231,23 +233,75 @@ func (q *Queue) SetTargetWorkerCount(target int) error {
 		q.applyWorkerHintLocked()
 		return nil
 	}
-	// Scale down: cancel retiring workers immediately (including busy) so mid-flight
-	// ListChildren/transfers abort; mark retire for cooperative exit. FS_THROTTLE also
-	// calls ReleaseInFlightOnThrottle to requeue abandoned leases.
-	busyRetiring := false
-	for i := cur - 1; i >= target; i-- {
-		h := q.pool.handles[i]
-		if !h.idle.Load() {
-			busyRetiring = true
-		}
-		h.retire.Store(true)
-		h.cancel()
+	// Scale down: prefer idle workers (retire+cancel immediately). For the rest, pick the
+	// smallest active leases, mark retire without cancelling, and enter a grace window so
+	// the first to finish exits cleanly; only then force-checkout remaining deferred retirees.
+	need := cur - target
+	type ranked struct {
+		idx  int
+		h    *managedWorker
+		size int64
+		idle bool
 	}
-	q.pool.handles = q.pool.handles[:target]
-	q.workers = q.workers[:target]
+	rankedHandles := make([]ranked, 0, cur)
+	for i, h := range q.pool.handles {
+		if h == nil {
+			continue
+		}
+		size := int64(0)
+		if v, ok := q.Spin.activeLeaseSize.Load(h.id); ok {
+			size, _ = v.(int64)
+		}
+		rankedHandles = append(rankedHandles, ranked{idx: i, h: h, size: size, idle: h.idle.Load()})
+	}
+	// Idle first, then ascending lease size among busy.
+	for i := 1; i < len(rankedHandles); i++ {
+		j := i
+		for j > 0 {
+			a, b := rankedHandles[j-1], rankedHandles[j]
+			swap := (!a.idle && b.idle) || (a.idle == b.idle && a.size > b.size)
+			if !swap {
+				break
+			}
+			rankedHandles[j], rankedHandles[j-1] = rankedHandles[j-1], rankedHandles[j]
+			j--
+		}
+	}
+	dropIdx := make(map[int]struct{}, need)
+	var deferred []*managedWorker
+	for _, r := range rankedHandles {
+		if len(dropIdx) >= need {
+			break
+		}
+		dropIdx[r.idx] = struct{}{}
+		r.h.retire.Store(true)
+		if r.idle {
+			if r.h.cancel != nil {
+				r.h.cancel()
+			}
+			continue
+		}
+		// Busy: leave context alive through grace; force-checkout only if still working.
+		deferred = append(deferred, r.h)
+	}
+	newHandles := make([]*managedWorker, 0, target)
+	newWorkers := make([]Worker, 0, target)
+	for i, h := range q.pool.handles {
+		if _, drop := dropIdx[i]; drop {
+			continue
+		}
+		newHandles = append(newHandles, h)
+		if i < len(q.workers) {
+			newWorkers = append(newWorkers, q.workers[i])
+		}
+	}
+	q.pool.handles = newHandles
+	q.workers = newWorkers
 	q.applyWorkerHintLocked()
-	if busyRetiring {
-		// Freeze further actuation for grace; after grace, smallest file workers force-checkout.
+	for _, h := range deferred {
+		q.trackDeferredRetiree(h.id, h)
+	}
+	if len(deferred) > 0 {
 		q.EnterProvisionalFreeze(DefaultSpinDownGrace)
 	}
 	return nil
@@ -298,6 +352,16 @@ func (q *Queue) SetRefillBatchSize(n int) {
 	}
 	q.mu.Lock()
 	q.refillBatchSize = n
+	q.mu.Unlock()
+}
+
+// SetDstPullChildMultiplier sets the DST expected-children quota multiplier (taskQuota * multiplier).
+func (q *Queue) SetDstPullChildMultiplier(n int) {
+	if n <= 0 {
+		return
+	}
+	q.mu.Lock()
+	q.dstPullChildMultiplier = n
 	q.mu.Unlock()
 }
 

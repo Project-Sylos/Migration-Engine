@@ -25,6 +25,31 @@ func MintNodeID(side, parentID, nodeType, basename string) string {
 	return uuid.NewSHA1(nodeIDNamespace, []byte(name)).String()
 }
 
+// JoinIDPath builds an immutable ancestry key from parent id_path and child id.
+// Root rows use path "/"; children of root are "/<id>"; deeper nodes append "/<id>".
+func JoinIDPath(parentIDPath, nodeID string) string {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return NormalizeRootRelativePath(parentIDPath)
+	}
+	parentIDPath = strings.TrimSpace(parentIDPath)
+	if parentIDPath == "" || parentIDPath == "/" {
+		return "/" + nodeID
+	}
+	return strings.TrimSuffix(parentIDPath, "/") + "/" + nodeID
+}
+
+// LooksLikeNodeID reports whether s is a UUID-shaped segment (MintNodeID / id_path leaf).
+// Used to refuse FS create names derived from id_path fallbacks.
+func LooksLikeNodeID(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	_, err := uuid.Parse(s)
+	return err == nil
+}
+
 // NormalizeNodeBasename returns the final path segment used for minting, sibling checks, and GPL.
 // Full paths (e.g. "/a/b.txt" or adapters that put LocationPath in DisplayName) collapse to "b.txt".
 //

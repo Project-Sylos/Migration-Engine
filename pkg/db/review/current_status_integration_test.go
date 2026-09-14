@@ -4,87 +4,39 @@
 package review
 
 import (
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
-	"codeberg.org/Sylos/Migration-Engine/pkg/db/subtree"
-	"context"
 	"testing"
 
-	"time"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
-func TestRebuildSrcCurrentByDepthMatchesArgMax(t *testing.T) {
-	database, err := db.Open(db.Options{Path: t.TempDir() + "/current-depth.db"})
+func TestRebuildCurrentMaterializes(t *testing.T) {
+	database, err := db.Open(db.Options{Path: t.TempDir() + "/current-materialize.db"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer database.Close()
 
 	idA := db.DeterministicNodeID("SRC", db.NodeTypeFile, "/a.txt")
-	idB := db.DeterministicNodeID("SRC", db.NodeTypeFile, "/b.txt")
-	t0 := time.Now().UnixNano()
-	t1 := t0 + 1
+	seedReviewTree(t, database, []*db.NodeState{{
+		ID: idA, Path: "/a.txt", ParentPath: "/", Name: "a.txt", Type: db.NodeTypeFile, Depth: 1,
+		TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
+	}}, nil, nil)
 
-	err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			if err := w.AppenderInsert(db.TableSrcNodes, []*db.NodeState{
-				{ID: idA, Path: "/a.txt", ParentPath: "/", Name: "a.txt", Type: db.NodeTypeFile, Depth: 1},
-				{ID: idB, Path: "/b.txt", ParentPath: "/", Name: "b.txt", Type: db.NodeTypeFile, Depth: 2},
-			}); err != nil {
-				return err
-			}
-			return w.BatchInsertSrcStatusEvents([]db.StatusEvent{
-				{ID: idA, TraversalStatus: db.StatusPending, CopyStatus: db.CopyStatusPending, EventTime: t0, Depth: 1},
-				{ID: idA, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending, EventTime: t1, Depth: 1},
-				{ID: idB, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusSuccessful, EventTime: t0, Depth: 2},
-			})
-		})
-	})
+	st, ok, err := database.Ops().GetStatus(opsdb.SideSRC, idA)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	if err := database.RebuildCurrentAtDepth("SRC", 1); err != nil {
-		t.Fatal(err)
+	if !ok {
+		t.Fatal("missing ops status")
 	}
-
-	conn, err := database.GetDB()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var trav, copy string
-	var depth int
-	err = conn.QueryRowContext(context.Background(),
-		`SELECT traversal_status, copy_status, depth FROM src_current WHERE id = $1`, idA).Scan(&trav, &copy, &depth)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if trav != db.StatusSuccessful || copy != db.CopyStatusPending || depth != 1 {
-		t.Fatalf("idA current=%s/%s depth=%d", trav, copy, depth)
-	}
-	var n int
-	if err := conn.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM src_current WHERE id = $1`, idB).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	if n != 0 {
-		t.Fatalf("depth-1 rebuild should not include depth-2 idB, got count=%d", n)
-	}
-
-	if err := database.RebuildCurrentByIDs("SRC", []string{idB}); err != nil {
-		t.Fatal(err)
-	}
-	err = conn.QueryRowContext(context.Background(),
-		`SELECT traversal_status, copy_status FROM src_current WHERE id = $1`, idB).Scan(&trav, &copy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if trav != db.StatusSuccessful || copy != db.CopyStatusSuccessful {
-		t.Fatalf("idB current=%s/%s", trav, copy)
+	if st.CopyStatus != db.CopyStatusPending {
+		t.Fatalf("copy=%q want %s", st.CopyStatus, db.CopyStatusPending)
 	}
 }
 
-func TestExcludeSubtreeVisibleInMergedReviewWithoutRebuild(t *testing.T) {
-	database, err := db.Open(db.Options{Path: t.TempDir() + "/dualwrite.db"})
+func TestExcludeSubtreeVisibleInMergedReviewAfterRefresh(t *testing.T) {
+	database, err := db.Open(db.Options{Path: t.TempDir() + "/exclude-refresh.db"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,38 +44,16 @@ func TestExcludeSubtreeVisibleInMergedReviewWithoutRebuild(t *testing.T) {
 
 	rootID := db.DeterministicNodeID("SRC", db.NodeTypeFolder, "/folder")
 	childID := db.DeterministicNodeID("SRC", db.NodeTypeFile, "/folder/a.txt")
-	eventTime := time.Now().UnixNano()
-
-	err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			if err := w.AppenderInsert(db.TableSrcNodes, []*db.NodeState{
-				{ID: rootID, Path: "/folder", ParentPath: "/", Name: "folder", Type: db.NodeTypeFolder, Depth: 1},
-				{ID: childID, Path: "/folder/a.txt", ParentPath: "/folder", Name: "a.txt", Type: db.NodeTypeFile, Depth: 2},
-			}); err != nil {
-				return err
-			}
-			return w.BatchInsertSrcStatusEvents([]db.StatusEvent{
-				{ID: rootID, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending, EventTime: eventTime, Depth: 1},
-				{ID: childID, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending, EventTime: eventTime, Depth: 2},
-			})
-		})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := database.RebuildAllCurrent(); err != nil {
-		t.Fatal(err)
-	}
-
-	err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			_, err := subtree.InsertExclusionEventsForSubtree(w, "SRC", "/folder")
-			return err
-		})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	seedReviewTree(t, database, []*db.NodeState{
+		{
+			ID: rootID, Path: "/folder", ParentPath: "/", Name: "folder", Type: db.NodeTypeFolder, Depth: 1,
+			TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusExcludedExplicit,
+		},
+		{
+			ID: childID, Path: "/folder/a.txt", ParentPath: "/folder", ParentID: rootID, Name: "a.txt", Type: db.NodeTypeFile, Depth: 2,
+			TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusExcludedInherited,
+		},
+	}, nil, nil)
 
 	rows, total, err := ListMergedReviewDiffs(database, ReviewFilter{ParentPath: "/"}, "path ASC", 100, 0)
 	if err != nil {
@@ -137,7 +67,7 @@ func TestExcludeSubtreeVisibleInMergedReviewWithoutRebuild(t *testing.T) {
 		if r.Path == "/folder" {
 			found = true
 			if !r.Excluded && r.CopyStatus != db.CopyStatusExcludedExplicit {
-				t.Fatalf("folder not excluded after dual-write: copy=%q excluded=%v", r.CopyStatus, r.Excluded)
+				t.Fatalf("folder not excluded after exclude+refresh: copy=%q excluded=%v", r.CopyStatus, r.Excluded)
 			}
 		}
 	}
@@ -151,7 +81,32 @@ func TestExcludeSubtreeVisibleInMergedReviewWithoutRebuild(t *testing.T) {
 	}
 	for _, r := range childRows {
 		if r.Path == "/folder/a.txt" && !r.Excluded && r.CopyStatus != db.CopyStatusExcludedInherited {
-			t.Fatalf("child not excluded after dual-write: copy=%q", r.CopyStatus)
+			t.Fatalf("child not excluded after exclude+refresh: copy=%q", r.CopyStatus)
 		}
+	}
+}
+
+func TestMergedReviewReadsSrcCurrent(t *testing.T) {
+	database, err := db.Open(db.Options{Path: t.TempDir() + "/review-current.db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	id := db.DeterministicNodeID("SRC", db.NodeTypeFile, "/a.txt")
+	seedReviewTree(t, database, []*db.NodeState{{
+		ID: id, Path: "/a.txt", ParentPath: "/", Name: "a.txt", Type: db.NodeTypeFile, Depth: 1,
+		TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusSuccessful,
+	}}, nil, nil)
+
+	rows, total, err := ListMergedReviewDiffs(database, ReviewFilter{ParentPath: "/"}, "path ASC", 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(rows) != 1 {
+		t.Fatalf("total=%d rows=%d", total, len(rows))
+	}
+	if rows[0].CopyStatus != db.CopyStatusSuccessful || rows[0].SrcTraversalStatus != db.StatusSuccessful {
+		t.Fatalf("row=%+v", rows[0])
 	}
 }

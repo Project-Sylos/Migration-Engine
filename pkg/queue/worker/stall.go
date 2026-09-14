@@ -10,14 +10,21 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
+	"codeberg.org/Sylos/Sylos-FS/pkg/fs/optimeout"
 )
 
 const (
 	// copyStallTimeout / deleteStallTimeout: cancel a copy or delete FS op after this
 	// long with no progress Beat while not rate-limited and not blocked on seal I/O.
 	// Queue STALL DETECTED dumps are separate (30s diagnostic).
-	copyStallTimeout   = 60 * time.Second
-	deleteStallTimeout = 60 * time.Second
+	copyStallTimeout = 60 * time.Second
+	// copyIOReadTimeout / copyIOWriteTimeout: per-Read / per-Write await budgets (match
+	// Sylos-FS ctxstream + chunk deadlines). Fresh deadline each call.
+	copyIOReadTimeout  = optimeout.IORead
+	copyIOWriteTimeout = optimeout.IOWrite
+	// copyCommitStallTimeout bounds dstWriter.Close (session finish / commit).
+	copyCommitStallTimeout = 10 * time.Minute
+	deleteStallTimeout     = 60 * time.Second
 	// gplStallTimeout bounds path-rule revalidation (CPU/DB; no FS) so a wedged GPL
 	// task cannot hold a traversal worker forever.
 	gplStallTimeout = 60 * time.Second
@@ -50,11 +57,10 @@ func awaitCancellable[T any](ctx context.Context, fn func() T) (v T, ok bool) {
 	}
 }
 
-// awaitCancellableBeating is awaitCancellable plus periodic progress Beats so long
-// adapter ops (Graph fragment PUT, Dropbox/GDrive session finish on Close, slow
-// SFTP/Write) are not treated as idle stalls. Applies to every FSAdapter: heartbeats
-// live in ME's shared copy loop, not per provider. Rate-limit/seal still freeze the
-// watchdog via stallSuppress. Truly hung ops need adapter/HTTP deadlines.
+// awaitCancellableBeating is awaitCancellable plus periodic Beats while fn runs.
+// Callers should pass a queue-only beater here so ProgressWatchdog still cancels hung
+// RPCs; real progress (bytes written) should Beat the ProgressWatchdog separately.
+// Adapter/HTTP per-chunk and per-RPC deadlines are the primary hang protection.
 func awaitCancellableBeating[T any](ctx context.Context, beat func(), interval time.Duration, fn func() T) (v T, ok bool) {
 	if beat == nil || interval <= 0 {
 		return awaitCancellable(ctx, fn)
@@ -86,13 +92,22 @@ func copyStallBeatInterval(timeout time.Duration) time.Duration {
 	return d
 }
 
-// newProgressBeater returns a func that beats the per-task ProgressWatchdog and,
-// when present, the queue watchdog. Shared by every FSAdapter on the copy path.
+// newProgressBeater beats ProgressWatchdog and the queue watchdog (real progress only).
 func newProgressBeater(q *queue.Queue, wd *observe.ProgressWatchdog) func() {
 	return func() {
 		if wd != nil {
 			wd.Beat()
 		}
+		if q != nil && q.HasWatchdog() {
+			q.BeatWatchdog()
+		}
+	}
+}
+
+// newQueueOnlyBeater keeps STALL DETECTED quiet during long FS RPCs without resetting
+// ProgressWatchdog (so hung ops still cancel after copyStallTimeout).
+func newQueueOnlyBeater(q *queue.Queue) func() {
+	return func() {
 		if q != nil && q.HasWatchdog() {
 			q.BeatWatchdog()
 		}

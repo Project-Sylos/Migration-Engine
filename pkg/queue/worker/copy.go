@@ -14,7 +14,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
@@ -75,6 +74,7 @@ func (w *CopyWorker) shouldRetire() bool {
 // When no work is available or queue is paused, it briefly sleeps before polling again.
 // When queue is exhausted, the worker exits.
 func (w *CopyWorker) Run() {
+	defer w.queue.NotifyWorkerExit(w.id)
 	if logservice.LS != nil {
 		err := logservice.LS.Log("info", "Copy worker started", "worker", w.id, w.queueName)
 		if err != nil {
@@ -175,11 +175,12 @@ func (w *CopyWorker) Run() {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
+		w.queue.BindLeaseOwner(task, w.id)
 
 		setWorkerBusy(w.idle)
 		// Execute the task (check for shutdown during execution if needed)
 		err := w.execute(task)
-		setWorkerIdle(w.idle)
+		markWorkerIdle(w.queue, w.id, w.idle)
 		if errors.Is(err, errTransferAbandoned) {
 			// File path may already have checkpointed/removed; folder/list abandons still need yield.
 			if w.queue.HasInProgress(task.ID) {
@@ -280,22 +281,19 @@ func (w *CopyWorker) createFolder(task *queue.TaskBase, ctx context.Context, wd 
 			return err
 		}
 		if skipCopy {
+			markCopyAlreadyExists(task)
 			return nil
 		}
 	}
 
-	folderName := filepath.Base(folder.LocationPath)
-	if folderName == "" || folderName == "." {
-		folderName = folder.DisplayName
-	}
-	if task.ResolvedDstName != "" {
-		folderName = db.NormalizeNodeBasename(task.ResolvedDstName)
+	folderName := copyTaskCreateBasename(task)
+	if folderName == "" {
+		return fmt.Errorf("empty create basename for folder %s", folder.LocationPath)
 	}
 
 	wd.Beat()
 	parent := fsOpContext(w.workerCtx, w.shutdownCtx)
-	beat := newProgressBeater(w.queue, wd)
-	err := awaitErrBeating(ctx, parent, copyStallTimeout, beat, "create folder", folder.LocationPath, func() error {
+	err := awaitErrBeating(ctx, parent, copyStallTimeout, newQueueOnlyBeater(w.queue), "create folder", folder.LocationPath, func() error {
 		created, err := w.dstAdapter.CreateFolder(ctx, dstParentServiceID, folderName, copyTaskCreateMetadata(task))
 		if err != nil {
 			return fmt.Errorf("failed to create folder %s in parent %s: %w", folder.DisplayName, dstParentServiceID, err)
@@ -316,6 +314,7 @@ func (w *CopyWorker) createFolder(task *queue.TaskBase, ctx context.Context, wd 
 // copyFile streams a file from source to destination.
 // Uses a read/write loop with Beat() so the progress watchdog resets while data is flowing.
 // Honors transfer checkpoints and FSTransferRestartPolicy for stop/scale-down resume.
+// Resume/attempt state is consulted before any DST existence precheck.
 func (w *CopyWorker) copyFile(task *queue.TaskBase, ctx context.Context, wd *observe.ProgressWatchdog) error {
 	file := task.File
 
@@ -324,27 +323,41 @@ func (w *CopyWorker) copyFile(task *queue.TaskBase, ctx context.Context, wd *obs
 		return fmt.Errorf("task missing DstParentID (ServiceID) for file %s", file.LocationPath)
 	}
 
-	skipCopy, updateTarget, err := w.applyCopyDstFilePrecheck(task, ctx, wd)
-	if err != nil {
-		return err
-	}
-	if skipCopy {
-		return nil
-	}
-
 	parent := fsOpContext(w.workerCtx, w.shutdownCtx)
 	beat := newProgressBeater(w.queue, wd)
-	resumeOffset, err := awaitResultBeating(ctx, parent, copyStallTimeout, beat, "prepare resume", file.LocationPath, func() (int64, error) {
+	queueBeat := newQueueOnlyBeater(w.queue)
+	plan, err := awaitResultBeating(ctx, parent, copyStallTimeout, queueBeat, "prepare resume", file.LocationPath, func() (queue.FileTransferPlan, error) {
 		return queue.PrepareFileTransferResume(ctx, w.queue, w.dstAdapter, task)
 	})
 	if err != nil {
 		return fmt.Errorf("prepare transfer resume for %s: %w", file.LocationPath, err)
 	}
+
+	var updateTarget *types.File
+	// Skip existence precheck whenever this migration already touched the file
+	// (resume, attempt marker, or delete-and-restart plan). Prepare may clear the
+	// marker after delete; plan.Restart still must suppress already_exists.
+	skipPrecheck := plan.ResumeOffset > 0 || plan.ResumeToken != "" || plan.Restart || plan.DstRef != "" || queue.HasCopyAttempt(task)
+	if !skipPrecheck {
+		skipCopy, target, preErr := w.applyCopyDstFilePrecheck(task, ctx, wd)
+		if preErr != nil {
+			return preErr
+		}
+		if skipCopy {
+			markCopyAlreadyExists(task)
+			return nil
+		}
+		updateTarget = target
+	}
+
+	resumeOffset := plan.ResumeOffset
 	w.queue.SetActiveLeaseSize(w.id, file.Size)
 	defer w.queue.ClearActiveLeaseSize(w.id)
 
-	srcReader, err := awaitResultBeating(ctx, parent, copyStallTimeout, beat, "open source", file.LocationPath, func() (io.ReadCloser, error) {
-		return w.srcAdapter.OpenRead(ctx, file.ServiceID)
+	srcReader, err := awaitResultBeating(ctx, parent, copyStallTimeout, queueBeat, "open source", file.LocationPath, func() (io.ReadCloser, error) {
+		// Stream lifetime uses parent (not ProgressWatchdog) so mid-transfer chunk
+		// deadlines own hang protection; Open RPC is still bounded by this await.
+		return w.srcAdapter.OpenRead(parent, file.ServiceID)
 	})
 	if err != nil {
 		if isForceCheckoutAbort(err, w.shouldRetire(), w.queue.ForceCheckoutWorker(w.id)) {
@@ -352,7 +365,7 @@ func (w *CopyWorker) copyFile(task *queue.TaskBase, ctx context.Context, wd *obs
 			if w.queue.Spin.AbandonDBOnly.Load() {
 				mode = queue.TransferAbandonDBOnly
 			}
-			_ = w.queue.AbandonTransferCheckpoint(ctx, task, resumeOffset, task.XferDstRef, mode)
+			_ = w.queue.AbandonTransferCheckpointToken(ctx, task, resumeOffset, task.XferDstRef, "", mode)
 			return errTransferAbandoned
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -363,103 +376,124 @@ func (w *CopyWorker) copyFile(task *queue.TaskBase, ctx context.Context, wd *obs
 	defer srcReader.Close()
 	wd.Beat()
 
-	if resumeOffset > 0 {
-		if err := awaitErrBeating(ctx, parent, copyStallTimeout, beat, "seek source", file.LocationPath, func() error {
-			return queue.SeekReaderTo(srcReader, resumeOffset)
-		}); err != nil {
-			_ = w.queue.ClearTransferCheckpoint(ctx, task)
-			return fmt.Errorf("seek source to checkpoint offset %d for %s: %w", resumeOffset, file.LocationPath, err)
-		}
-	}
-
-	fileName := filepath.Base(file.LocationPath)
-	if fileName == "" || fileName == "." {
-		fileName = file.DisplayName
-	}
-	if task.ResolvedDstName != "" {
-		fileName = db.NormalizeNodeBasename(task.ResolvedDstName)
+	fileName := copyTaskCreateBasename(task)
+	if fileName == "" {
+		return fmt.Errorf("empty create basename for file %s", file.LocationPath)
 	}
 	var destFile types.File
-	if updateTarget != nil {
-		destFile = *updateTarget
-	} else if resumeOffset > 0 && task.XferDstRef != "" {
+	var dstWriter io.WriteCloser
+
+	if plan.ResumeToken != "" {
+		rw, ok := types.OpenWriteFromResumeTokenFrom(w.dstAdapter)
+		if !ok {
+			return fmt.Errorf("resume token present but destination does not support OpenWriteFromResumeToken for %s", file.LocationPath)
+		}
+		type resumeOut struct {
+			w   io.WriteCloser
+			off int64
+		}
+		ro, openErr := awaitResultBeating(ctx, parent, copyStallTimeout, queueBeat, "open write resume", file.LocationPath, func() (resumeOut, error) {
+			wc, off, e := rw.OpenWriteFromResumeToken(parent, plan.ResumeToken, resumeOffset, file.Size)
+			return resumeOut{wc, off}, e
+		})
+		if openErr != nil {
+			return fmt.Errorf("failed to resume destination write for %s: %w", file.LocationPath, openErr)
+		}
+		dstWriter = ro.w
+		resumeOffset = ro.off
 		destFile = types.File{ServiceID: task.XferDstRef, DisplayName: fileName, Type: types.NodeTypeFile}
+		if destFile.ServiceID == "" {
+			destFile.ServiceID = plan.DstRef
+		}
 	} else {
-		createMeta := copyTaskCreateMetadata(task)
-		destFile, err = awaitResultBeating(ctx, parent, copyStallTimeout, beat, "create file", file.LocationPath, func() (types.File, error) {
-			return w.dstAdapter.CreateFile(ctx, dstParentServiceID, fileName, file.Size, createMeta)
+		if updateTarget != nil {
+			destFile = *updateTarget
+		} else if task.XferDstRef != "" {
+			destFile = types.File{ServiceID: task.XferDstRef, DisplayName: fileName, Type: types.NodeTypeFile}
+		} else if plan.DstRef != "" {
+			destFile = types.File{ServiceID: plan.DstRef, DisplayName: fileName, Type: types.NodeTypeFile}
+		} else {
+			createMeta := copyTaskCreateMetadata(task)
+			destFile, err = awaitResultBeating(ctx, parent, copyStallTimeout, queueBeat, "create file", file.LocationPath, func() (types.File, error) {
+				return w.dstAdapter.CreateFile(ctx, dstParentServiceID, fileName, file.Size, createMeta)
+			})
+			if err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return fmt.Errorf("create file cancelled by watchdog for %s: %w", file.LocationPath, err)
+				}
+				return fmt.Errorf("failed to create destination file %s in parent %s: %w", fileName, dstParentServiceID, err)
+			}
+		}
+		wd.Beat()
+
+		dstWriter, err = awaitResultBeating(ctx, parent, copyStallTimeout, queueBeat, "open write", file.LocationPath, func() (io.WriteCloser, error) {
+			if resumeOffset > 0 {
+				if rw, ok := types.OpenWriteFromOffsetFrom(w.dstAdapter); ok {
+					return rw.OpenWriteFromOffset(parent, destFile.ServiceID, resumeOffset)
+				}
+			}
+			if sw, ok := types.OpenWriteWithSizeFrom(w.dstAdapter); ok {
+				return sw.OpenWriteWithSize(parent, destFile.ServiceID, file.Size)
+			}
+			return w.dstAdapter.OpenWrite(parent, destFile.ServiceID)
 		})
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return fmt.Errorf("create file cancelled by watchdog for %s: %w", file.LocationPath, err)
+				return fmt.Errorf("open write cancelled by watchdog for %s: %w", file.LocationPath, err)
 			}
-			return fmt.Errorf("failed to create destination file %s in parent %s: %w", fileName, dstParentServiceID, err)
+			return fmt.Errorf("failed to open destination file %s for writing: %w", destFile.ServiceID, err)
 		}
 	}
 	wd.Beat()
 
-	var dstWriter io.WriteCloser
-	dstWriter, err = awaitResultBeating(ctx, parent, copyStallTimeout, beat, "open write", file.LocationPath, func() (io.WriteCloser, error) {
-		if resumeOffset > 0 {
-			if rw, ok := types.OpenWriteFromOffsetFrom(w.dstAdapter); ok {
-				return rw.OpenWriteFromOffset(ctx, destFile.ServiceID, resumeOffset)
-			}
-			if sw, ok := types.OpenWriteWithSizeFrom(w.dstAdapter); ok {
-				return sw.OpenWriteWithSize(ctx, destFile.ServiceID, file.Size)
-			}
-			return w.dstAdapter.OpenWrite(ctx, destFile.ServiceID)
+	// Attempt marker at OpenWrite (offset may still be 0).
+	_ = w.queue.PersistTransferCheckpointToken(context.WithoutCancel(ctx), task, resumeOffset, destFile.ServiceID, types.WriterResumeToken(dstWriter))
+
+	if resumeOffset > 0 {
+		if err := awaitErrBeating(ctx, parent, copyStallTimeout, queueBeat, "seek source", file.LocationPath, func() error {
+			return queue.SeekReaderTo(srcReader, resumeOffset)
+		}); err != nil {
+			_ = w.queue.ClearResumeState(ctx, task)
+			return fmt.Errorf("seek source to checkpoint offset %d for %s: %w", resumeOffset, file.LocationPath, err)
 		}
-		if sw, ok := types.OpenWriteWithSizeFrom(w.dstAdapter); ok {
-			return sw.OpenWriteWithSize(ctx, destFile.ServiceID, file.Size)
-		}
-		return w.dstAdapter.OpenWrite(ctx, destFile.ServiceID)
-	})
-	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("open write cancelled by watchdog for %s: %w", file.LocationPath, err)
-		}
-		return fmt.Errorf("failed to open destination file %s for writing: %w", destFile.ServiceID, err)
 	}
-	wd.Beat()
 
 	bytesTransferred := resumeOffset
 	lastCheckpoint := resumeOffset
 	const checkpointEvery = int64(16 << 20) // ~Dropbox chunk size
 	buf := w.copyBuffer
-	// Checkpoint only; leave in-progress removal to ReportTaskResult/failTask so attempts bump.
 	persistCheckpoint := func() {
-		if bytesTransferred > 0 {
-			_ = w.queue.PersistTransferCheckpoint(context.WithoutCancel(ctx), task, bytesTransferred, destFile.ServiceID)
-		}
+		token := types.WriterResumeToken(dstWriter)
+		_ = w.queue.PersistTransferCheckpointToken(context.WithoutCancel(ctx), task, bytesTransferred, destFile.ServiceID, token)
 	}
 	dropWriter := func() {
-		go func() { _ = dstWriter.Close() }()
+		go func() { _ = types.SuspendWrite(dstWriter) }()
 		persistCheckpoint()
 	}
 	for {
 		if w.shouldRetire() || w.queue.ForceCheckoutWorker(w.id) {
-			go func() { _ = dstWriter.Close() }()
+			go func() { _ = types.SuspendWrite(dstWriter) }()
 			mode := queue.TransferAbandonRequeue
 			if w.queue.Spin.AbandonDBOnly.Load() {
 				mode = queue.TransferAbandonDBOnly
 			}
-			_ = w.queue.AbandonTransferCheckpoint(ctx, task, bytesTransferred, destFile.ServiceID, mode)
+			token := types.WriterResumeToken(dstWriter)
+			_ = w.queue.AbandonTransferCheckpointToken(ctx, task, bytesTransferred, destFile.ServiceID, token, mode)
 			return errTransferAbandoned
 		}
-		// Read/Write often ignore cancel (e.g. Graph Write holds mu across a hung PUT).
-		// Await async so ProgressWatchdog cancel frees the worker after copyStallTimeout.
-		// Periodic Beats keep Dropbox/GDrive/Box/Graph/SFTP long ops from looking idle.
 		type readOut struct {
 			n   int
 			err error
 		}
-		ro, ok := awaitCancellableBeating(ctx, beat, copyStallBeatInterval(copyStallTimeout), func() readOut {
+		readCtx, readCancel := context.WithTimeout(parent, copyIOReadTimeout)
+		ro, ok := awaitCancellableBeating(readCtx, queueBeat, copyStallBeatInterval(copyIOReadTimeout), func() readOut {
 			n, err := srcReader.Read(buf)
 			return readOut{n: n, err: err}
 		})
+		readCancel()
 		if !ok {
 			dropWriter()
-			return stallOrAbandoned(ctx, parent, "copy read", file.LocationPath, copyStallTimeout)
+			return stallOrAbandoned(readCtx, parent, "copy read", file.LocationPath, copyIOReadTimeout)
 		}
 		n, readErr := ro.n, ro.err
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
@@ -473,13 +507,15 @@ func (w *CopyWorker) copyFile(task *queue.TaskBase, ctx context.Context, wd *obs
 			return fmt.Errorf("failed to copy file data for %s: %w", file.LocationPath, readErr)
 		}
 		if n > 0 {
-			writeErr, writeOk := awaitCancellableBeating(ctx, beat, copyStallBeatInterval(copyStallTimeout), func() error {
+			writeCtx, writeCancel := context.WithTimeout(parent, copyIOWriteTimeout)
+			writeErr, writeOk := awaitCancellableBeating(writeCtx, queueBeat, copyStallBeatInterval(copyIOWriteTimeout), func() error {
 				_, err := dstWriter.Write(buf[:n])
 				return err
 			})
+			writeCancel()
 			if !writeOk {
 				dropWriter()
-				return stallOrAbandoned(ctx, parent, "copy write", file.LocationPath, copyStallTimeout)
+				return stallOrAbandoned(writeCtx, parent, "copy write", file.LocationPath, copyIOWriteTimeout)
 			}
 			if writeErr != nil {
 				dropWriter()
@@ -495,7 +531,7 @@ func (w *CopyWorker) copyFile(task *queue.TaskBase, ctx context.Context, wd *obs
 			w.queue.ReportTaskBytesTransferred(task, bytesTransferred)
 			beat()
 			if bytesTransferred-lastCheckpoint >= checkpointEvery {
-				_ = w.queue.PersistTransferCheckpoint(ctx, task, bytesTransferred, destFile.ServiceID)
+				persistCheckpoint()
 				lastCheckpoint = bytesTransferred
 			}
 		}
@@ -504,13 +540,14 @@ func (w *CopyWorker) copyFile(task *queue.TaskBase, ctx context.Context, wd *obs
 		}
 	}
 
-	// Close may wait on pipe upload finish (Dropbox/GDrive) or session commit (Box/Graph).
-	closeErr, closeOk := awaitCancellableBeating(ctx, beat, copyStallBeatInterval(copyStallTimeout), func() error {
+	closeWd, closeCtx := observe.NewProgressWatchdog(parent, copyCommitStallTimeout, progressStallSuppress(w.queue))
+	defer closeWd.Stop()
+	closeErr, closeOk := awaitCancellableBeating(closeCtx, queueBeat, copyStallBeatInterval(copyCommitStallTimeout), func() error {
 		return dstWriter.Close()
 	})
 	if !closeOk {
-		persistCheckpoint() // Close already running in awaitCancellable goroutine
-		return stallOrAbandoned(ctx, parent, "commit", file.LocationPath, copyStallTimeout)
+		persistCheckpoint()
+		return stallOrAbandoned(closeCtx, parent, "commit", file.LocationPath, copyCommitStallTimeout)
 	}
 	if closeErr != nil {
 		if errors.Is(closeErr, context.Canceled) || errors.Is(closeErr, context.DeadlineExceeded) {
@@ -525,7 +562,6 @@ func (w *CopyWorker) copyFile(task *queue.TaskBase, ctx context.Context, wd *obs
 		}
 	}
 
-	task.BytesTransferred = bytesTransferred
 	w.queue.ReportTaskBytesTransferred(task, bytesTransferred)
 	_ = w.queue.ClearTransferCheckpoint(ctx, task)
 	applyCopyDstFileFromAdapter(task, destFile)
@@ -537,7 +573,6 @@ var errTransferAbandoned = errors.New("transfer abandoned for scale-down or stop
 
 // errTraversalStalled is returned when ListChildren makes no progress within traversalStallTimeout.
 var errTraversalStalled = errors.New("traversal stalled")
-
 
 // applyResumeCopyDstFolderPrecheck lists the dst parent and short-circuits if the folder already exists
 // or errors on name/type clash. Used only when ShouldApplyCopyDstResumeExistenceCheck() is true.
@@ -607,13 +642,15 @@ func (w *CopyWorker) partitionFolderGroupForResumeExistence(ctx context.Context,
 		childRound := tasks[0].Round
 		folderMap, fileMap := copyTaskChildMaps(aggregated, childRound)
 		for _, task := range tasks {
-			name := task.Folder.DisplayName
+			name := copyTaskCreateBasename(task)
 			if name == "" {
-				name = filepath.Base(task.LocationPath())
+				reportTaskOutcome(w.queue, task, fmt.Errorf("empty match basename for folder %s", task.LocationPath()))
+				continue
 			}
 			matchKey := task.Folder.Type + ":" + name
 			if existing, ok := folderMap[matchKey]; ok {
 				applyCopyDstFolderFromAdapter(task, existing)
+				markCopyAlreadyExists(task)
 				wd.Beat()
 				reportTaskOutcome(w.queue, task, nil)
 				continue
@@ -671,9 +708,10 @@ func (w *CopyWorker) partitionFileGroupForResumeExistence(ctx context.Context, w
 		childRound := tasks[0].Round
 		folderMap, fileMap := copyTaskChildMaps(aggregated, childRound)
 		for _, task := range tasks {
-			name := task.File.DisplayName
+			name := copyTaskCreateBasename(task)
 			if name == "" {
-				name = filepath.Base(task.LocationPath())
+				reportTaskOutcome(w.queue, task, fmt.Errorf("empty match basename for file %s", task.LocationPath()))
+				continue
 			}
 			if _, ok := folderMap[types.NodeTypeFolder+":"+name]; ok {
 				reportTaskOutcome(w.queue, task, fmt.Errorf("destination has folder %q but task expects file at %s", name, task.LocationPath()))
@@ -681,13 +719,19 @@ func (w *CopyWorker) partitionFileGroupForResumeExistence(ctx context.Context, w
 			}
 			matchKey := task.File.Type + ":" + name
 			if existing, ok := fileMap[matchKey]; ok {
-				if compareTimestamps(task.File.LastUpdated, existing.LastUpdated) == "Successful" {
+				_ = w.queue.LoadTransferCheckpointOntoTask(ctx, task)
+				if queue.HasCopyAttempt(task) {
+					needUpload = append(needUpload, task)
+					continue
+				}
+				if copyFileMatchesDestination(task.File, existing) {
 					applyCopyDstFileFromAdapter(task, existing)
+					markCopyAlreadyExists(task)
 					wd.Beat()
 					reportTaskOutcome(w.queue, task, nil)
 					continue
 				}
-				// Src newer or unparseable timestamps — keep for batch overwrite.
+				// Src newer, size mismatch, or unparseable timestamps — keep for batch overwrite.
 			}
 			needUpload = append(needUpload, task)
 		}
@@ -714,7 +758,7 @@ func (w *CopyWorker) applyCopyDstFilePrecheck(task *queue.TaskBase, ctx context.
 		return false, nil, fmt.Errorf("destination has folder %q but task expects file at %s", file.DisplayName, file.LocationPath)
 	}
 	if existing, ok := fileMap[matchKey]; ok {
-		if compareTimestamps(file.LastUpdated, existing.LastUpdated) == "Successful" {
+		if copyFileMatchesDestination(file, existing) {
 			applyCopyDstFileFromAdapter(task, existing)
 			wd.Beat()
 			return true, nil, nil
@@ -723,6 +767,11 @@ func (w *CopyWorker) applyCopyDstFilePrecheck(task *queue.TaskBase, ctx context.
 		return false, &ex, nil
 	}
 	return false, nil, nil
+}
+
+func copyFileMatchesDestination(src, dst types.File) bool {
+	return src.Size == dst.Size &&
+		compareTimestamps(src.LastUpdated, dst.LastUpdated) == "Successful"
 }
 
 // copyTaskParentListArgs returns parent path and depth for ListChildren on the destination parent,
@@ -759,7 +808,7 @@ func copyTaskChildMaps(aggregated types.ListResult, childRound int) (map[string]
 func (w *CopyWorker) listDstChildrenAggregated(dstParentID, parentPath string, parentDepth int, ctx context.Context, wd *observe.ProgressWatchdog) (types.ListResult, error) {
 	parent := fsOpContext(w.workerCtx, w.shutdownCtx)
 	depth := parentDepth
-	result, err := awaitResultBeating(ctx, parent, copyStallTimeout, newProgressBeater(w.queue, wd), "list destination children", parentPath, func() (types.ListResult, error) {
+	result, err := awaitResultBeating(ctx, parent, copyStallTimeout, newQueueOnlyBeater(w.queue), "list destination children", parentPath, func() (types.ListResult, error) {
 		return w.dstAdapter.ListChildren(ctx, dstParentID, &depth, parentPath)
 	})
 	if err != nil {

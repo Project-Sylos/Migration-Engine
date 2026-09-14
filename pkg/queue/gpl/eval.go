@@ -4,7 +4,6 @@
 package gpl
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"path"
@@ -116,8 +115,15 @@ func AppendDSTSiblingCollisionIssues(database *db.DB, q *queue.Queue, task *queu
 		return
 	}
 
-	parentParts := LoadParentGPLParts(database, task.ID, task.GPLState)
+	parentLen := LoadParentPathLen(database, task.ID, task.GPLState)
 	seen := make(map[string]struct{})
+	// SRC nodes already paired via exact match or cleaned-name rematch.
+	mappedSRC := make(map[string]struct{})
+	for _, c := range task.DiscoveredChildren {
+		if c.SrcID != "" {
+			mappedSRC[c.SrcID] = struct{}{}
+		}
+	}
 
 	consider := func(srcID, basename string, isFile bool) {
 		if srcID == "" || basename == "" {
@@ -127,6 +133,9 @@ func AppendDSTSiblingCollisionIssues(database *db.DB, q *queue.Queue, task *queu
 			return
 		}
 		seen[srcID] = struct{}{}
+		if _, ok := mappedSRC[srcID]; ok {
+			return
+		}
 		// Exclude this node's own basename from sibling set so AE self-match is not a collision.
 		siblings := make([]string, 0, len(dstBases))
 		for _, s := range dstBases {
@@ -138,7 +147,7 @@ func AppendDSTSiblingCollisionIssues(database *db.DB, q *queue.Queue, task *queu
 		if len(siblings) == 0 {
 			return
 		}
-		payload, pe := evaluateGPLAddPart(target, parentParts, basename, siblings, isFile, windowsCompat)
+		payload, pe := evaluateGPLAddPart(target, parentLen, basename, siblings, isFile, windowsCompat)
 		collides := payload.Part.Collision
 		if !collides && pe != nil && pe.ProposedName != "" {
 			if _, ok := dstSet[pe.ProposedName]; ok && pe.ProposedName != basename {
@@ -185,15 +194,18 @@ func discoveredChildBasename(c queue.ChildResult) string {
 	return queue.DstChildMatchName(c.Folder.DisplayName, c.Folder.LocationPath)
 }
 
-// applyGPLToSRCChildren runs destination-rule GPL on each SRC child via parent parts + AddPart.
+// ApplyGPLToSRCChildren runs destination-rule GPL on each SRC child via parent path_len + AddPart.
 // Sets NodeState.GPLState JSON and enqueues sparse GPL issues for pending/manual review.
-// When skipChecks is true (same-provider migration), only identity parts are stored.
-func ApplyGPLToSRCChildren(database *db.DB, target pathgpl.Target, parentParts []string, children []*db.NodeState, skipChecks, windowsCompat bool) {
+// When skipChecks is true (same-provider migration), only identity path_len is stored.
+func ApplyGPLToSRCChildren(database *db.DB, target pathgpl.Target, parentPathLen int, children []*db.NodeState, skipChecks, windowsCompat bool) {
+	if db.GPLDisabled {
+		return
+	}
 	if len(children) == 0 {
 		return
 	}
 	if skipChecks {
-		applyPassthroughPartsToSRCChildren(children, parentParts)
+		applyPassthroughPathLenToSRCChildren(children, parentPathLen)
 		return
 	}
 	siblings := make([]string, 0, len(children))
@@ -209,7 +221,7 @@ func ApplyGPLToSRCChildren(database *db.DB, target pathgpl.Target, parentParts [
 		}
 		base := db.NormalizeNodeBasename(c.Name)
 		isFile := c.Type == db.NodeTypeFile
-		payload, pe := evaluateGPLAddPart(target, parentParts, base, siblings, isFile, windowsCompat)
+		payload, pe := evaluateGPLAddPart(target, parentPathLen, base, siblings, isFile, windowsCompat)
 		if b, err := json.Marshal(payload); err == nil {
 			c.GPLState = string(b)
 		}
@@ -223,19 +235,18 @@ func ApplyGPLToSRCChildren(database *db.DB, target pathgpl.Target, parentParts [
 	}
 }
 
-// applyPassthroughPartsToSRCChildren writes valid gpl_state.parts without linting or path_events.
-func applyPassthroughPartsToSRCChildren(children []*db.NodeState, parentParts []string) {
+// applyPassthroughPathLenToSRCChildren writes valid gpl_state with path_len and no lint findings.
+func applyPassthroughPathLenToSRCChildren(children []*db.NodeState, parentPathLen int) {
 	for _, c := range children {
 		if c == nil {
 			continue
 		}
 		base := db.NormalizeNodeBasename(c.Name)
-		parts := append(append([]string(nil), parentParts...), base)
 		payload := db.GPLStatePayload{
-			Valid: true,
-			Part:  db.GPLScopeState{Valid: true},
-			Path:  db.GPLScopeState{Valid: true},
-			Parts: parts,
+			Valid:   true,
+			Part:    db.GPLScopeState{Valid: true},
+			Path:    db.GPLScopeState{Valid: true},
+			PathLen: pathLenAfterLeaf(parentPathLen, base, "/"),
 		}
 		if b, err := json.Marshal(payload); err == nil {
 			c.GPLState = string(b)
@@ -243,26 +254,22 @@ func applyPassthroughPartsToSRCChildren(children []*db.NodeState, parentParts []
 	}
 }
 
-// loadParentGPLParts returns effective migration-relative parts for the parent node.
-func LoadParentGPLParts(database *db.DB, parentID string, parentGPLState string) []string {
-	if parts := ParseGPLParts(parentGPLState); len(parts) > 0 || parentGPLState != "" {
-		return parts
+// LoadParentPathLen returns the parent's stored path_len, reading src_nodes when not supplied.
+func LoadParentPathLen(database *db.DB, parentID string, parentGPLState string) int {
+	if n := ParseGPLPathLen(parentGPLState); n > 0 || parentGPLState != "" {
+		return n
 	}
-	if database == nil || parentID == "" {
-		return nil
+	if database == nil || parentID == "" || database.Ops() == nil {
+		return 0
 	}
-	conn, err := database.GetDB()
-	if err != nil {
-		return nil
+	n, ok, err := database.Ops().GetNode("src", parentID)
+	if err != nil || !ok {
+		return 0
 	}
-	var gplState string
-	_ = conn.QueryRowContext(context.Background(),
-		`SELECT COALESCE(gpl_state,'') FROM src_nodes WHERE id = $1`, parentID,
-	).Scan(&gplState)
-	return ParseGPLParts(gplState)
+	return ParseGPLPathLen(n.GPLState)
 }
 
-func evaluateGPLAddPart(target pathgpl.Target, parentParts []string, basename string, siblings []string, isFile, windowsCompat bool) (db.GPLStatePayload, *db.GPLIssue) {
+func evaluateGPLAddPart(target pathgpl.Target, parentPathLen int, basename string, siblings []string, isFile, windowsCompat bool) (db.GPLStatePayload, *db.GPLIssue) {
 	out := db.GPLStatePayload{
 		Valid: true,
 		Part:  db.GPLScopeState{Valid: true},
@@ -274,6 +281,7 @@ func evaluateGPLAddPart(target pathgpl.Target, parentParts []string, basename st
 		pathgpl.WithRaiseErrors(false),
 		pathgpl.WithSiblings(siblings),
 		pathgpl.WithAutoValidate(false),
+		pathgpl.WithParentPathLen(parentPathLen),
 		// Never collapse hierarchy by deleting a path part (empty-after-strip, etc.).
 		pathgpl.WithDisallowPartRemoval(true),
 	}
@@ -287,24 +295,18 @@ func evaluateGPLAddPart(target pathgpl.Target, parentParts []string, basename st
 		out.Part.Categories = []string{"gpl_init_error"}
 		return out, nil
 	}
-	if len(parentParts) > 0 {
-		l.SetParts(parentParts)
-	}
 	partOpts := []pathgpl.PartOption(nil)
 	if isFile {
 		partOpts = append(partOpts, pathgpl.AsFile())
 	}
 	_ = l.AddPart(basename, partOpts...)
-	originalPartCount := len(l.Parts())
-	leafIdx := originalPartCount - 1
-	if leafIdx < 0 {
-		leafIdx = 0
-	}
+	leafIdx := 0
 	cleaned, _ := l.Clean()
 	cleanedParts := l.Parts()
 	cleanedBase := basename
 	if len(cleanedParts) > 0 {
 		cleanedBase = cleanedParts[len(cleanedParts)-1]
+		leafIdx = len(cleanedParts) - 1
 	} else {
 		cleanedBase = path.Base(strings.ReplaceAll(cleaned, "\\", "/"))
 		if cleanedBase == "." || cleanedBase == "/" {
@@ -316,9 +318,7 @@ func evaluateGPLAddPart(target pathgpl.Target, parentParts []string, basename st
 	pathCats := make([]string, 0)
 	collision := false
 	manualReview := false
-	// Clean() re-validates the full composed path, so ancestor EmptyPart/etc. can appear
-	// on earlier PartIndexes. Queue decisions and path_events only apply to the *leaf*
-	// basename being evaluated (the node itself), not inherited parent findings.
+	// Leaf-only eval: PartIndex is relative to the leaf-only parts slice.
 	for _, act := range l.Log.Actions {
 		if act.Category == "" || act.PartIndex != leafIdx {
 			continue
@@ -344,12 +344,8 @@ func evaluateGPLAddPart(target pathgpl.Target, parentParts []string, basename st
 			manualReview = true
 		}
 	}
-	// Leaf emptied or removed → cannot auto-suggest a safe rename for this node.
-	if len(cleanedParts) < originalPartCount && strings.TrimSpace(basename) != "" {
-		// Only treat as leaf manual-review when the leaf segment itself disappeared.
-		if len(cleanedParts) <= leafIdx {
-			manualReview = true
-		}
+	if len(cleanedParts) == 0 && strings.TrimSpace(basename) != "" {
+		manualReview = true
 	}
 	if strings.TrimSpace(cleanedBase) == "" && strings.TrimSpace(basename) != "" {
 		manualReview = true
@@ -364,12 +360,11 @@ func evaluateGPLAddPart(target pathgpl.Target, parentParts []string, basename st
 	}
 	out.Part.Valid = !collision && !manualReview && len(partCats) == 0
 	out.Path.Valid = len(pathCats) == 0
-	out.Parts = append([]string(nil), cleanedParts...)
+	out.PathLen = l.PathLength()
+	if out.PathLen == 0 && cleanedBase != "" {
+		out.PathLen = pathLenAfterLeaf(parentPathLen, cleanedBase, "/")
+	}
 	out.Valid = out.Part.Valid && out.Path.Valid
-	// Mirror flat fields for older readers.
-	out.Collision = collision
-	out.Categories = append(append([]string(nil), partCats...), pathCats...)
-	out.ProposedClean = out.Part.ProposedClean
 
 	leafIssues := filterIssuesForPartIndex(mergeIssuesFromActions(l.Log.Issues, l.Log.Actions), leafIdx)
 	issuesJSON, _ := json.Marshal(leafIssues)
@@ -395,6 +390,17 @@ func evaluateGPLAddPart(target pathgpl.Target, parentParts []string, basename st
 		}
 	}
 	return out, nil
+}
+
+func pathLenAfterLeaf(parentPathLen int, leaf, sep string) int {
+	leaf = strings.TrimSpace(leaf)
+	if parentPathLen <= 0 {
+		return len(leaf)
+	}
+	if leaf == "" {
+		return parentPathLen
+	}
+	return parentPathLen + len(sep) + len(leaf)
 }
 
 // filterIssuesForPartIndex keeps path-scoped issues and part-local issues at partIndex.
@@ -443,26 +449,16 @@ func mergeIssuesFromActions(issues []issue.Issue, actions []issue.Action) []issu
 }
 
 // mergePathScopeIntoGPLState refreshes only the path scope of an existing gpl_state JSON.
-func mergePathScopeIntoGPLState(existing string, pathState db.GPLScopeState, parts []string) string {
+func mergePathScopeIntoGPLState(existing string, pathState db.GPLScopeState, pathLen int) string {
 	var p db.GPLStatePayload
 	if existing != "" {
 		_ = json.Unmarshal([]byte(existing), &p)
 	}
-	if p.Part.Categories == nil && len(p.Categories) > 0 {
-		// Legacy flat row: treat flat categories as part-local except we cannot split; keep as part.
-		p.Part.Categories = p.Categories
-		p.Part.Valid = p.Valid
-		p.Part.ProposedClean = p.ProposedClean
-		p.Part.Collision = p.Collision
-	}
 	p.Path = pathState
-	if parts != nil {
-		p.Parts = append([]string(nil), parts...)
+	if pathLen > 0 {
+		p.PathLen = pathLen
 	}
 	p.Valid = p.Part.Valid && p.Path.Valid && !p.Part.Collision
-	p.Categories = append(append([]string(nil), p.Part.Categories...), p.Path.Categories...)
-	p.ProposedClean = p.Part.ProposedClean
-	p.Collision = p.Part.Collision
 	b, err := json.Marshal(p)
 	if err != nil {
 		return existing
@@ -470,13 +466,14 @@ func mergePathScopeIntoGPLState(existing string, pathState db.GPLScopeState, par
 	return string(b)
 }
 
-// evaluateGPLPathOnly revalidates path-scoped rules for composed parts without re-linting segments.
-func EvaluateGPLPathOnly(target pathgpl.Target, parts []string, existingGPLState string, isFile, windowsCompat bool) (string, []issue.Issue, error) {
+// EvaluateGPLPathOnly revalidates path-scoped rules using parent path_len + leaf basename.
+func EvaluateGPLPathOnly(target pathgpl.Target, parentPathLen int, leaf string, existingGPLState string, isFile, windowsCompat bool) (string, []issue.Issue, error) {
 	opts := []pathgpl.Option{
 		pathgpl.WithRelative(true),
 		pathgpl.WithAutoClean(false),
 		pathgpl.WithRaiseErrors(false),
 		pathgpl.WithAutoValidate(false),
+		pathgpl.WithParentPathLen(parentPathLen),
 	}
 	if isFile {
 		opts = append(opts, pathgpl.WithFileAdded(true))
@@ -492,22 +489,11 @@ func EvaluateGPLPathOnly(target pathgpl.Target, parts []string, existingGPLState
 			for _, cat := range p.Part.Categories {
 				l.Log.AddIssue(issue.Issue{Category: issue.Category(cat), Scope: issue.ScopePart})
 			}
-			for _, cat := range p.Categories {
-				// Legacy: skip if already in part
-				found := false
-				for _, pc := range p.Part.Categories {
-					if pc == cat {
-						found = true
-						break
-					}
-				}
-				if !found && len(p.Part.Categories) == 0 {
-					l.Log.AddIssue(issue.Issue{Category: issue.Category(cat), Scope: issue.ScopePart})
-				}
-			}
 		}
 	}
-	l.SetParts(parts)
+	if leaf != "" {
+		_ = l.AddPart(leaf)
+	}
 	_ = l.ValidatePath()
 
 	pathCats := make([]string, 0)
@@ -519,7 +505,7 @@ func EvaluateGPLPathOnly(target pathgpl.Target, parts []string, existingGPLState
 		}
 	}
 	pathState := db.GPLScopeState{Valid: len(pathCats) == 0, Categories: pathCats}
-	merged := mergePathScopeIntoGPLState(existingGPLState, pathState, parts)
+	merged := mergePathScopeIntoGPLState(existingGPLState, pathState, l.PathLength())
 	return merged, pathIssues, nil
 }
 
@@ -532,34 +518,40 @@ func firstNonEmpty(ss ...string) string {
 	return ""
 }
 
-func ParseGPLParts(gplState string) []string {
+// ParseGPLPathLen returns the migration-relative path length stored on a node's gpl_state.
+func ParseGPLPathLen(gplState string) int {
 	if gplState == "" {
-		return nil
+		return 0
 	}
 	var p db.GPLStatePayload
 	if err := json.Unmarshal([]byte(gplState), &p); err != nil {
-		return nil
+		return 0
 	}
-	if len(p.Parts) == 0 {
-		return nil
-	}
-	return append([]string(nil), p.Parts...)
+	return p.PathLen
 }
 
-// ProcessGPLTaskSRC runs path-only revalidation and only appends a sparse issue.
-// Review is the sole phase allowed to mutate existing GPL rows/node state.
+// ProcessGPLTaskSRC revalidates path scope from parent path_len + leaf name and persists gpl_state.
 func ProcessGPLTaskSRC(database *db.DB, target pathgpl.Target, task *queue.TaskBase, windowsCompat bool) error {
 	if database == nil || task == nil {
 		return fmt.Errorf("nil database or task")
 	}
-	parentParts := ParseGPLParts(task.ParentGPLState)
+	parentLen := ParseGPLPathLen(task.ParentGPLState)
 	base := task.ResolvedDstName
+	if base == "" {
+		if task.IsFile() {
+			base = db.NormalizeNodeBasename(task.File.DisplayName)
+		} else {
+			base = db.NormalizeNodeBasename(task.Folder.DisplayName)
+		}
+	}
 	if base == "" {
 		base = db.NormalizeNodeBasename(task.LocationPath())
 	}
-	parts := append(append([]string(nil), parentParts...), base)
-	_, pathIssues, err := EvaluateGPLPathOnly(target, parts, task.GPLState, task.IsFile(), windowsCompat)
+	merged, pathIssues, err := EvaluateGPLPathOnly(target, parentLen, base, task.GPLState, task.IsFile(), windowsCompat)
 	if err != nil {
+		return err
+	}
+	if err := database.UpdateNodeGPLState(task.ID, merged); err != nil {
 		return err
 	}
 	if len(pathIssues) == 0 {

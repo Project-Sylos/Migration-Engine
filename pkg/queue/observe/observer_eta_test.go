@@ -7,6 +7,8 @@ import (
 	"math"
 	"testing"
 	"time"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 )
 
 func TestChooseEtaBasis_folderOnlyForcesItems(t *testing.T) {
@@ -155,14 +157,125 @@ func TestFolderOnlyPass(t *testing.T) {
 	}
 }
 
+func TestEtaSaturated(t *testing.T) {
+	if etaSaturated(16, 16) != true {
+		t.Fatal("16/16 should be saturated")
+	}
+	if etaSaturated(16, 12) != true { // 0.75
+		t.Fatal("12/16 should be saturated")
+	}
+	if etaSaturated(16, 2) {
+		t.Fatal("2/16 should be underfed")
+	}
+	if etaSaturated(0, 0) {
+		t.Fatal("zero workers should not be saturated")
+	}
+}
+
+func TestEtaSecondsWithCruise_underfeedSplit(t *testing.T) {
+	// Phase: 1002 items left; round drain: 2; observed collapsed to 2/s; cruise 16/s.
+	// Naive remaining/observed = 1002/2 = 501s. Split: 2/2 + 1000/16 = 1 + 62.5 = 63.5s.
+	sec := etaSecondsWithCruise(
+		EtaBasisItems,
+		1002, 0,
+		2, true,
+		2, 0,
+		16, 0,
+		true,
+		1002.0/2,
+	)
+	want := 1.0 + 1000.0/16.0
+	if math.Abs(sec-want) > 0.01 {
+		t.Fatalf("sec=%v want %v", sec, want)
+	}
+}
+
+func TestEtaSecondsWithCruise_saturatedUsesFallback(t *testing.T) {
+	sec := etaSecondsWithCruise(
+		EtaBasisItems,
+		800, 0,
+		50, true,
+		16, 0,
+		16, 0,
+		false,
+		50,
+	)
+	if sec != 50 {
+		t.Fatalf("sec=%v want fallback 50", sec)
+	}
+}
+
+func TestEtaSecondsWithCruise_noRoundStatsUsesCruise(t *testing.T) {
+	sec := etaSecondsWithCruise(
+		EtaBasisItems,
+		800, 0,
+		0, false,
+		2, 0,
+		16, 0,
+		true,
+		400,
+	)
+	want := 800.0 / 16.0
+	if math.Abs(sec-want) > 0.01 {
+		t.Fatalf("sec=%v want %v", sec, want)
+	}
+}
+
+func TestApplyCopyDeleteETA_underfeedUsesCruiseForRest(t *testing.T) {
+	o := NewQueueObserver(nil, time.Second)
+	now := time.Now()
+
+	// Saturate: refresh cruise at 16 items/s.
+	for i := 0; i < 5; i++ {
+		at := now.Add(time.Duration(i) * time.Second)
+		metric := &ExternalQueueMetrics{
+			ItemsCompleted: int64(i * 16),
+			ItemsTotal:     5000,
+			BytesTotal:     1,
+			ItemsPerSecond: 16,
+			BytesPerSecond: 1,
+			CopyPass:       2,
+			RoundExpected:  200,
+			RoundCompleted: 50 + i*16,
+			QueueStats:     queue.QueueStats{Workers: 16, InProgress: 16},
+		}
+		o.applyCopyDeleteETA("copy", metric, at)
+	}
+
+	// Underfeed at round end: 2 in progress, observed 2/s, still lots of phase work.
+	under := &ExternalQueueMetrics{
+		ItemsCompleted: 2000,
+		ItemsTotal:     5000,
+		BytesTotal:     1,
+		ItemsPerSecond: 2,
+		BytesPerSecond: 1,
+		CopyPass:       2,
+		RoundExpected:  200,
+		RoundCompleted: 198,
+		QueueStats:     queue.QueueStats{Workers: 16, InProgress: 2},
+	}
+	o.applyCopyDeleteETA("copy", under, now.Add(10*time.Second))
+	if under.EtaSeconds == nil {
+		t.Fatal("missing eta")
+	}
+	// drain 2 @ 2/s + rest 2998 @ 16/s ≈ 1 + 187.375
+	want := 1.0 + 2998.0/16.0
+	naive := 3000.0 / 2.0
+	if math.Abs(*under.EtaSeconds-want) > 0.5 {
+		t.Fatalf("eta=%v want ~%v (naive would be %v)", *under.EtaSeconds, want, naive)
+	}
+	if *under.EtaSeconds >= naive/2 {
+		t.Fatalf("eta=%v still close to naive underfeed spike %v", *under.EtaSeconds, naive)
+	}
+}
+
 func TestApplyTraversalBatchETA(t *testing.T) {
 	t.Run("remaining over rate", func(t *testing.T) {
 		m := &ExternalQueueMetrics{
-			RoundExpected:            100,
-			RoundCompleted:           40,
-			DiscoveryRateItemsPerSec: 10,
+			RoundExpected:  100,
+			RoundCompleted: 40,
 		}
-		applyTraversalBatchETA(m)
+		applyTraversalBatchETA(m, 10)
 		if m.EtaBasis != EtaBasisItems || m.EtaSeconds == nil {
 			t.Fatalf("got basis=%q eta=%v", m.EtaBasis, m.EtaSeconds)
 		}
@@ -172,33 +285,30 @@ func TestApplyTraversalBatchETA(t *testing.T) {
 	})
 	t.Run("batch complete", func(t *testing.T) {
 		m := &ExternalQueueMetrics{
-			RoundExpected:            50,
-			RoundCompleted:           50,
-			DiscoveryRateItemsPerSec: 5,
+			RoundExpected:  50,
+			RoundCompleted: 50,
 		}
-		applyTraversalBatchETA(m)
+		applyTraversalBatchETA(m, 5)
 		if m.EtaBasis != EtaBasisItems || m.EtaSeconds == nil || *m.EtaSeconds != 0 {
 			t.Fatalf("got basis=%q eta=%v want 0", m.EtaBasis, m.EtaSeconds)
 		}
 	})
 	t.Run("no expected leaves unset", func(t *testing.T) {
 		m := &ExternalQueueMetrics{
-			RoundExpected:            0,
-			RoundCompleted:           0,
-			DiscoveryRateItemsPerSec: 10,
+			RoundExpected:  0,
+			RoundCompleted: 0,
 		}
-		applyTraversalBatchETA(m)
+		applyTraversalBatchETA(m, 10)
 		if m.EtaBasis != "" || m.EtaSeconds != nil {
 			t.Fatalf("want unset, got basis=%q eta=%v", m.EtaBasis, m.EtaSeconds)
 		}
 	})
 	t.Run("zero rate leaves unset", func(t *testing.T) {
 		m := &ExternalQueueMetrics{
-			RoundExpected:            20,
-			RoundCompleted:           5,
-			DiscoveryRateItemsPerSec: 0,
+			RoundExpected:  20,
+			RoundCompleted: 5,
 		}
-		applyTraversalBatchETA(m)
+		applyTraversalBatchETA(m, 0)
 		if m.EtaBasis != "" || m.EtaSeconds != nil {
 			t.Fatalf("want unset, got basis=%q eta=%v", m.EtaBasis, m.EtaSeconds)
 		}

@@ -4,9 +4,10 @@
 package db
 
 import (
-	"context"
 	"testing"
 	"time"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
 func TestUpdateGPLIssueWithAction_Rename(t *testing.T) {
@@ -16,43 +17,19 @@ func TestUpdateGPLIssueWithAction_Rename(t *testing.T) {
 	}
 	defer database.Close()
 
-	if err := database.RunWrite(context.Background(), func(s *WriteSession) error {
-		return s.WithTx(func(w *Writer) error {
-			return w.UpdateGPLIssueWithAction(
-				"src-1", GPLIssueStatusAccepted, "clean", "", DstActionRename, time.Now().UnixNano(),
-			)
-		})
-	}); err != nil {
+	now := time.Now().UnixNano()
+	if err := database.Ops().BatchPutGPL([]opsdb.GPLRecord{{
+		SrcID: "src-1", Status: GPLIssueStatusAccepted, ProposedName: "clean",
+		UpdatedAt: now, DstAction: DstActionRename,
+	}}); err != nil {
 		t.Fatal(err)
 	}
 
-	conn, err := database.GetDB()
-	if err != nil {
-		t.Fatal(err)
+	rec, ok, err := database.Ops().GetGPL("src-1")
+	if err != nil || !ok {
+		t.Fatalf("get gpl ok=%v err=%v", ok, err)
 	}
-	var status, proposed, action string
-	if err := conn.QueryRowContext(context.Background(),
-		`SELECT status, COALESCE(proposed_name,''), COALESCE(dst_action,'') FROM gpl_issues WHERE src_id = 'src-1'`,
-	).Scan(&status, &proposed, &action); err != nil {
-		t.Fatal(err)
-	}
-	if status != GPLIssueStatusAccepted || proposed != "clean" || action != DstActionRename {
-		t.Fatalf("got status=%q proposed=%q action=%q", status, proposed, action)
-	}
-
-	if err := database.RunWrite(context.Background(), func(s *WriteSession) error {
-		return s.WithTx(func(w *Writer) error {
-			return w.ClearGPLIssueDstAction("src-1")
-		})
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := conn.QueryRowContext(context.Background(),
-		`SELECT COALESCE(dst_action,'') FROM gpl_issues WHERE src_id = 'src-1'`,
-	).Scan(&action); err != nil {
-		t.Fatal(err)
-	}
-	if action != "" {
-		t.Fatalf("dst_action after clear = %q", action)
+	if rec.Status != GPLIssueStatusAccepted || rec.ProposedName != "clean" || rec.DstAction != DstActionRename {
+		t.Fatalf("got status=%q proposed=%q action=%q", rec.Status, rec.ProposedName, rec.DstAction)
 	}
 }

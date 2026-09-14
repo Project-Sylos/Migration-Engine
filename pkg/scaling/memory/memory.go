@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-// MemoryLevel indicates host memory headroom for scale-up gating.
+// MemoryLevel indicates host memory headroom for batch/seal scale-up gating.
 type MemoryLevel int
 
 const (
@@ -122,7 +122,8 @@ func readProcessRSSKB() int64 {
 	return 0
 }
 
-// ScaleUpAllowed returns true when memory headroom permits increasing throughput knobs.
+// ScaleUpAllowed returns true when memory headroom permits increasing batch/seal knobs.
+// Worker AIMD does not use this gate.
 func ScaleUpAllowed(level MemoryLevel) bool {
 	return level == MemoryGreen
 }

@@ -4,7 +4,6 @@
 package migration
 
 import (
-	"context"
 	"fmt"
 	"time"
 
@@ -96,16 +95,12 @@ func processGPLSweepRow(database *db.DB, side string, target gpl.Target, fr db.F
 			status = db.GPLStatusFailed
 		}
 	}
-	return database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			ev := &db.StatusEvent{
-				ID:            fr.State.ID,
-				GPLStatus:     status,
-				EventTime:     time.Now().UnixNano(),
-				Depth:         fr.State.Depth,
-				PrevGPLStatus: db.GPLStatusPending,
-			}
-			return w.InsertStatusEvent(side, ev)
-		})
-	})
+	database.AppendStatusEvent(side, db.StatusEvent{
+		ID:            fr.State.ID,
+		GPLStatus:     status,
+		EventTime:     time.Now().UnixNano(),
+		Depth:         fr.State.Depth,
+		PrevGPLStatus: db.GPLStatusPending,
+	}, false)
+	return nil
 }

@@ -10,19 +10,24 @@ import (
 
 func TestComposePipelineMinZeroCap(t *testing.T) {
 	gdrive := LookupOperationProfile("google_drive", "", OpDownload)
-	spectra := spectraUncappedOp()
-	got := ComposePipelineMin(gdrive, spectra)
+	uncapped := OperationProfile{MaxWorkers: 0, DefaultWorkers: 0}
+	got := ComposePipelineMin(gdrive, uncapped)
 	if got.MaxWorkers != 16 {
 		t.Fatalf("MaxWorkers=%d want 16 (gdrive cap wins)", got.MaxWorkers)
 	}
-	got2 := ComposePipelineMin(spectra, spectra)
+	got2 := ComposePipelineMin(uncapped, uncapped)
 	if got2.MaxWorkers != 0 {
 		t.Fatalf("both uncapped MaxWorkers=%d want 0", got2.MaxWorkers)
+	}
+	spectra := LookupOperationProfile("spectra", "", OpUpload)
+	got3 := ComposePipelineMin(gdrive, spectra)
+	if got3.MaxWorkers != 16 {
+		t.Fatalf("gdrive∩spectra MaxWorkers=%d want 16", got3.MaxWorkers)
 	}
 }
 
 func TestToActuatorProfileZeroCap(t *testing.T) {
-	prof := ToActuatorProfile(spectraUncappedOp())
+	prof := ToActuatorProfile(OperationProfile{})
 	if prof.DefaultWorkers != DefaultWorkersForUnbounded {
 		t.Fatalf("DefaultWorkers=%d", prof.DefaultWorkers)
 	}
@@ -31,6 +36,22 @@ func TestToActuatorProfileZeroCap(t *testing.T) {
 	}
 	if prof.MaxInterOpDelay != DefaultMaxInterOpDelay {
 		t.Fatalf("MaxInterOpDelay=%v", prof.MaxInterOpDelay)
+	}
+}
+
+func TestSpectraHighThroughputDefaults(t *testing.T) {
+	for _, op := range []FSOperation{OpListChildren, OpCreateFolder, OpDelete, OpDownload, OpUpload} {
+		p := LookupOperationProfile("spectra", "", op)
+		if p.MaxWorkers != 64 {
+			t.Fatalf("%s MaxWorkers=%d want 64", op, p.MaxWorkers)
+		}
+		if p.DefaultWorkers != 16 {
+			t.Fatalf("%s DefaultWorkers=%d want 16", op, p.DefaultWorkers)
+		}
+	}
+	prof := ToActuatorProfile(LookupOperationProfile("spectra", "", OpListChildren))
+	if prof.DefaultWorkers != 16 || prof.MaxWorkers != 64 {
+		t.Fatalf("actuator profile: %+v", prof)
 	}
 }
 
@@ -51,8 +72,12 @@ func TestLookupOperationProfileGoogleDrive(t *testing.T) {
 
 func TestLookupOperationProfileDropbox(t *testing.T) {
 	dl := LookupOperationProfile("dropbox", "", OpDownload)
-	if dl.MaxWorkers != 16 || dl.DefaultWorkers != 8 {
+	if dl.MaxWorkers != 4 || dl.DefaultWorkers != 4 {
 		t.Fatalf("download profile: %+v", dl)
+	}
+	up := LookupOperationProfile("dropbox", "", OpUpload)
+	if up.MaxWorkers != 4 || up.DefaultWorkers != 4 {
+		t.Fatalf("upload profile: %+v", up)
 	}
 	list := LookupOperationProfile("dropbox", "", OpListChildren)
 	if list.MaxListPageSize != 500 || list.DefaultWorkers != 4 || list.MaxWorkers != 5 {
@@ -70,8 +95,12 @@ func TestLookupOperationProfileDropbox(t *testing.T) {
 
 func TestLookupOperationProfileOneDrive(t *testing.T) {
 	dl := LookupOperationProfile("onedrive", "", OpDownload)
-	if dl.MaxWorkers != 16 || dl.DefaultWorkers != 8 {
+	if dl.MaxWorkers != 4 || dl.DefaultWorkers != 4 {
 		t.Fatalf("download profile: %+v", dl)
+	}
+	up := LookupOperationProfile("onedrive", "", OpUpload)
+	if up.MaxWorkers != 4 || up.DefaultWorkers != 4 {
+		t.Fatalf("upload profile: %+v", up)
 	}
 	list := LookupOperationProfile("onedrive", "", OpListChildren)
 	if list.DefaultWorkers != 6 || list.MaxWorkers != 12 {
@@ -110,18 +139,6 @@ func TestLookupFallsBackToProviderDefault(t *testing.T) {
 	del := LookupOperationProfile("local", "", OpDelete)
 	if del.DefaultWorkers != 8 || del.MaxWorkers != 64 {
 		t.Fatalf("local delete via Default: %+v", del)
-	}
-}
-
-func TestSpectraAllOpsUncapped(t *testing.T) {
-	for _, op := range []FSOperation{OpListChildren, OpCreateFolder, OpDelete, OpDownload, OpUpload} {
-		p := LookupOperationProfile("spectra", "", op)
-		if p.MaxWorkers != 0 {
-			t.Fatalf("%s MaxWorkers=%d want 0", op, p.MaxWorkers)
-		}
-		if p.DefaultWorkers != DefaultWorkersForUnbounded {
-			t.Fatalf("%s DefaultWorkers=%d", op, p.DefaultWorkers)
-		}
 	}
 }
 

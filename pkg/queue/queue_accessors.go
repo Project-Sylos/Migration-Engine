@@ -6,11 +6,13 @@ package queue
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
 // ============================================================================
@@ -47,6 +49,34 @@ func (q *Queue) IsPulling() bool {
 	return q.pulling
 }
 
+// IsWaitingOnDB reports whether this queue is waiting on the shared pull ticket or a DuckDB pull.
+func (q *Queue) IsWaitingOnDB() bool {
+	return q != nil && q.waitingOnDB.Load()
+}
+
+// BeginDBPull waits for the shared DB pull ticket (Beats the stall watchdog while waiting).
+// Pair with ReleaseDBPull (typically via defer) around the DuckDB query only.
+func (q *Queue) BeginDBPull() {
+	if q == nil {
+		return
+	}
+	q.waitingOnDB.Store(true)
+	if d := q.Database(); d != nil {
+		d.AcquirePull(q.BeatWatchdog)
+	}
+}
+
+// ReleaseDBPull returns the shared DB pull ticket and clears the waiting-on-DB flag.
+func (q *Queue) ReleaseDBPull() {
+	if q == nil {
+		return
+	}
+	if d := q.Database(); d != nil {
+		d.ReleasePull()
+	}
+	q.waitingOnDB.Store(false)
+}
+
 // TryBeginPulling atomically acquires the pull lock. Returns false if another pull is in flight.
 // Pair with SetPulling(false) (typically via defer) after a successful acquire.
 func (q *Queue) TryBeginPulling() bool {
@@ -58,7 +88,6 @@ func (q *Queue) TryBeginPulling() bool {
 	q.pulling = true
 	return true
 }
-
 
 // GetCopyPass returns the current copy pass.
 func (q *Queue) GetCopyPass() int {
@@ -214,11 +243,37 @@ func (q *Queue) EffectiveLeaseBatchSize() int {
 func (q *Queue) EffectiveRefillBatchSize() int {
 	q.mu.RLock()
 	n := q.refillBatchSize
+	name := q.name
+	mode := q.mode
 	q.mu.RUnlock()
 	if n <= 0 {
+		if name == "dst" && (mode == QueueModeTraversal || mode == "") {
+			return refillFromDBBatchSizeDst
+		}
 		return refillFromDBBatchSize
 	}
 	return n
+}
+
+func (q *Queue) EffectiveDstPullChildMultiplier() int {
+	q.mu.RLock()
+	n := q.dstPullChildMultiplier
+	q.mu.RUnlock()
+	if n <= 0 {
+		return DefaultDstPullChildMultiplier
+	}
+	if n < MinDstPullChildMultiplier {
+		return MinDstPullChildMultiplier
+	}
+	if n > MaxDstPullChildMultiplier {
+		return MaxDstPullChildMultiplier
+	}
+	return n
+}
+
+// EffectiveDstPullChildQuota returns taskQuota * child multiplier for DST expected-children hydration.
+func (q *Queue) EffectiveDstPullChildQuota(taskQuota int) int {
+	return taskQuota * q.EffectiveDstPullChildMultiplier()
 }
 
 // EffectivePullLowWM returns the low watermark for pulling more work from DuckDB into pendingBuff.
@@ -330,9 +385,27 @@ func (q *Queue) SeedCopyCounters(folders, files, bytes, bytesFailed int64) {
 	q.foldersCreatedTotal = folders
 	q.filesCreatedTotal = files
 	q.bytesTransferredTotal = bytes
+	q.bytesCopiedLive.Store(bytes)
 	if bytesFailed > 0 {
 		q.bytesFailedTotal = bytesFailed
 	}
+}
+
+// SeedAlreadyExistsCounters restores already-exists / not-deleting progress from persisted metrics.
+func (q *Queue) SeedAlreadyExistsCounters(folders, files, bytes int64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.foldersAlreadyExistsTotal = folders
+	q.filesAlreadyExistsTotal = files
+	q.bytesAlreadyExistsTotal = bytes
+}
+
+// SeedFailedItemCounters restores permanent folder/file failure counts from persisted metrics.
+func (q *Queue) SeedFailedItemCounters(folders, files int64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.foldersFailedTotal = folders
+	q.filesFailedTotal = files
 }
 
 // RecordFailedBytes adds eligible file bytes for a permanent copy/delete failure (touched progress).
@@ -372,28 +445,59 @@ func (q *Queue) GetBytesTransferredTotal() int64 {
 }
 
 // ReportTaskBytesTransferred records absolute mid-flight bytes on a leased task.
-// Does not bump bytesTransferredTotal; observer uses GetLiveBytesTransferredTotal.
+// Chunk deltas go to the live byte snapshot (atomic, no queue mutex). Already-exists
+// tasks are ignored. Completing a task does not subtract; the snapshot stays monotonic.
 func (q *Queue) ReportTaskBytesTransferred(task *TaskBase, absoluteBytes int64) {
-	if q == nil || task == nil || absoluteBytes < 0 {
+	if q == nil || task == nil || absoluteBytes < 0 || task.ProgressAlreadyExists {
 		return
 	}
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	task.BytesTransferred = absoluteBytes
+	if atomic.LoadInt32(&task.liveBytesDone) != 0 {
+		return
+	}
+	prev := atomic.LoadInt64(&task.BytesTransferred)
+	for absoluteBytes > prev {
+		if atomic.CompareAndSwapInt64(&task.BytesTransferred, prev, absoluteBytes) {
+			delta := absoluteBytes - prev
+			atomic.AddInt64(&task.bytesLivePublished, delta)
+			q.bytesCopiedLive.Add(delta)
+			return
+		}
+		prev = atomic.LoadInt64(&task.BytesTransferred)
+	}
 }
 
-// GetLiveBytesTransferredTotal returns completed bytes plus in-flight task progress
-// so the observer can show live throughput during long batch/single-file transfers.
-func (q *Queue) GetLiveBytesTransferredTotal() int64 {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	var inFlight int64
-	for _, task := range q.inProgress {
-		if task != nil && task.BytesTransferred > 0 {
-			inFlight += task.BytesTransferred
+func (q *Queue) markLiveBytesDone(task *TaskBase) {
+	if task != nil {
+		atomic.StoreInt32(&task.liveBytesDone, 1)
+	}
+}
+
+// creditLiveCopiedRemainder adds any file size not already streamed into the live snapshot.
+func (q *Queue) creditLiveCopiedRemainder(task *TaskBase, bytes int64) {
+	q.markLiveBytesDone(task)
+	published := int64(0)
+	if task != nil {
+		published = atomic.LoadInt64(&task.bytesLivePublished)
+	}
+	extra := bytes - published
+	if extra > 0 {
+		q.bytesCopiedLive.Add(extra)
+		if task != nil {
+			atomic.AddInt64(&task.bytesLivePublished, extra)
 		}
 	}
-	return q.bytesTransferredTotal + inFlight
+}
+
+// GetLiveBytesTransferredTotal returns the live byte snapshot (streamed chunks).
+func (q *Queue) GetLiveBytesTransferredTotal() int64 {
+	if q == nil {
+		return 0
+	}
+	n := q.bytesCopiedLive.Load()
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 // GetFoldersCreatedTotal returns the total folders created during copy phase.
@@ -408,6 +512,41 @@ func (q *Queue) GetFilesCreatedTotal() int64 {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.filesCreatedTotal
+}
+
+// GetFoldersAlreadyExistsTotal returns folders completed as already-on-destination / not-deleting.
+func (q *Queue) GetFoldersAlreadyExistsTotal() int64 {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.foldersAlreadyExistsTotal
+}
+
+// GetFilesAlreadyExistsTotal returns files completed as already-on-destination / not-deleting.
+func (q *Queue) GetFilesAlreadyExistsTotal() int64 {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.filesAlreadyExistsTotal
+}
+
+// GetBytesAlreadyExistsTotal returns file bytes credited for already-on-destination / not-deleting.
+func (q *Queue) GetBytesAlreadyExistsTotal() int64 {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.bytesAlreadyExistsTotal
+}
+
+// GetFoldersFailedTotal returns permanently failed folders counted after seal accept.
+func (q *Queue) GetFoldersFailedTotal() int64 {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.foldersFailedTotal
+}
+
+// GetFilesFailedTotal returns permanently failed files counted after seal accept.
+func (q *Queue) GetFilesFailedTotal() int64 {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.filesFailedTotal
 }
 
 // GetTotalFailed returns the total number of failed tasks across all rounds.
@@ -616,6 +755,40 @@ func (q *Queue) RecordPull(round int, itemsYielded int, wasPartial bool) {
 	}
 }
 
+// RecordDBPull stores the last DuckDB frontier pull size and wall time for queue_stats.
+// rows is the raw result count from the query (before enqueue filtering).
+func (q *Queue) RecordDBPull(rows int, d time.Duration) {
+	if q == nil {
+		return
+	}
+	if d < 0 {
+		d = 0
+	}
+	atomic.StoreInt64(&q.dbPullLastRows, int64(rows))
+	atomic.StoreInt64(&q.dbPullLastDurationNs, d.Nanoseconds())
+	if q.database != nil {
+		q.database.RecordOp(db.OpFrontierPull, q.name, int64(rows), d, nil)
+	}
+}
+
+// DBPullStats returns the last recorded DuckDB pull gauges (rows, duration ms, rows/sec).
+func (q *Queue) DBPullStats() (rows int64, durationMs, rowsPerSec float64) {
+	if q == nil {
+		return 0, 0, 0
+	}
+	rows = atomic.LoadInt64(&q.dbPullLastRows)
+	ns := atomic.LoadInt64(&q.dbPullLastDurationNs)
+	if ns <= 0 {
+		return rows, 0, 0
+	}
+	durationMs = float64(ns) / 1e6
+	sec := float64(ns) / 1e9
+	if sec > 0 {
+		rowsPerSec = float64(rows) / sec
+	}
+	return rows, durationMs, rowsPerSec
+}
+
 // RecordTaskCompletion records a completed task for the current round.
 func (q *Queue) RecordTaskCompletion(round int, success bool) {
 	q.mu.Lock()
@@ -704,13 +877,67 @@ func (q *Queue) setLastAvgTime(t time.Time) {
 func (q *Queue) AddInProgress(nodeID string, task *TaskBase) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.inProgress[nodeID] = task
+	q.addInProgressLocked(nodeID, task, "")
+}
+
+// BindLeaseOwner assigns the leasing worker to an already in-progress task.
+// Call immediately after Lease/LeaseGroup/LeaseGroupBudget when the worker id is known.
+func (q *Queue) BindLeaseOwner(task *TaskBase, owner string) {
+	if q == nil || task == nil || task.ID == "" {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	f, ok := q.inProgress[task.ID]
+	if !ok || f.task == nil {
+		return
+	}
+	f.owner = owner
+	task.LeaseOwner = owner
+	task.LeaseEpoch = f.epoch
+	q.inProgress[task.ID] = f
+}
+
+// addInProgressLocked records a lease. Caller must hold q.mu.
+func (q *Queue) addInProgressLocked(nodeID string, task *TaskBase, owner string) {
+	if nodeID == "" || task == nil {
+		return
+	}
+	q.leaseEpochSeq++
+	epoch := q.leaseEpochSeq
+	task.LeaseOwner = owner
+	task.LeaseEpoch = epoch
+	q.inProgress[nodeID] = inFlight{task: task, owner: owner, epoch: epoch}
 }
 
 func (q *Queue) RemoveInProgress(nodeID string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	delete(q.inProgress, nodeID)
+	if f, ok := q.inProgress[nodeID]; ok {
+		q.markLiveBytesDone(f.task)
+		delete(q.inProgress, nodeID)
+	}
+}
+
+// LeaseMatches reports whether task still holds the current in-progress lease.
+// Empty owner on the flight entry accepts any completer (test helpers).
+func (q *Queue) LeaseMatches(task *TaskBase) bool {
+	if q == nil || task == nil || task.ID == "" {
+		return false
+	}
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	f, ok := q.inProgress[task.ID]
+	if !ok || f.task == nil {
+		return false
+	}
+	if f.epoch != task.LeaseEpoch {
+		return false
+	}
+	if f.owner != "" && task.LeaseOwner != "" && f.owner != task.LeaseOwner {
+		return false
+	}
+	return true
 }
 
 func (q *Queue) HasInProgress(nodeID string) bool {
@@ -764,9 +991,17 @@ func (q *Queue) getOrCreateRoundStatsUnlocked(round int) *RoundStats {
 	return q.roundStats[round]
 }
 
-// SetExpectedFromStatsBucket sets roundStats[round].Expected from the live DB count (or stats for init/resume).
-// For traversal/retry: always compute from live pending count when advancing, to avoid stale stats from prior runs.
-// For copy: compute from live. For init (EnsureRoundExpectedFromStats): try stats first for resume, else compute.
+// RoundExpected returns the Expected count for round, or -1 if not set yet.
+func (q *Queue) RoundExpected(round int) int {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	if q.roundStats[round] == nil {
+		return -1
+	}
+	return q.roundStats[round].Expected
+}
+
+// SetExpectedFromStatsBucket sets roundStats[round].Expected from src_stats/dst_stats PK reads.
 func (q *Queue) SetExpectedFromStatsBucket(round int) {
 	database := q.Database()
 	if database == nil {
@@ -777,24 +1012,44 @@ func (q *Queue) SetExpectedFromStatsBucket(round int) {
 	var expected int64
 	var err error
 
-	// For traversal/retry, always compute from live count when advancing (no stale stats from prior runs).
-	// EnsureRoundExpectedFromStats (init/resume) still goes through this; we compute for traversal there too.
 	switch mode {
 	case QueueModeTraversal:
-		if round == 0 {
+		if database.Ops() != nil {
+			side := opsdb.SideSRC
+			if queueType == "DST" {
+				side = opsdb.SideDST
+			}
+			expected, err = database.GetSchedCountAtDepth(side, opsdb.PhaseTrav, round, db.NodeTypeFolder)
+			if err != nil {
+				fmt.Println("error getting sched pending count at depth", err)
+				return
+			}
+		} else if round == 0 {
 			expected = 1
 		} else {
-			expected, err = stats.GetTraversalCountAtDepthFromLive(database, queueType, round, db.StatusPending)
+			expected, err = stats.GetStatsCountAtDepth(database, queueType, round, db.StatsKey(db.StatsKindTraversal, db.StatusPending))
 			if err != nil {
-				fmt.Println("error getting pending traversal count at depth from live", err)
+				fmt.Println("error getting pending traversal count at depth from stats", err)
 				return
 			}
 		}
 	case QueueModeRetry:
-		expected, err = stats.GetTraversalCountAtDepthFromLive(database, queueType, round, db.StatusPending)
-		if err != nil {
-			fmt.Println("error getting pending traversal count at depth from live", err)
-			return
+		if database.Ops() != nil {
+			side := opsdb.SideSRC
+			if queueType == "DST" {
+				side = opsdb.SideDST
+			}
+			expected, err = database.GetSchedCountAtDepth(side, opsdb.PhaseTrav, round, db.NodeTypeFolder)
+			if err != nil {
+				fmt.Println("error getting sched pending count at depth for retry", err)
+				return
+			}
+		} else {
+			expected, err = stats.GetStatsCountAtDepth(database, queueType, round, db.StatsKey(db.StatsKindTraversal, db.StatusPending))
+			if err != nil {
+				fmt.Println("error getting pending traversal count at depth from stats", err)
+				return
+			}
 		}
 	case QueueModeGPL:
 		expected, err = stats.GetGPLCountAtDepthFromLive(database, queueType, round, db.GPLStatusPending)
@@ -808,10 +1063,18 @@ func (q *Queue) SetExpectedFromStatsBucket(round int) {
 		if copyPass == 2 {
 			nodeType = db.NodeTypeFile
 		}
-		expected, err = stats.GetCopyCountAtDepth(database, round, nodeType, db.CopyStatusPending, false)
-		if err != nil {
-			fmt.Println("error getting copy count at depth", err)
-			return
+		if database.Ops() != nil {
+			expected, err = database.GetSchedCountAtDepth(opsdb.SideSRC, opsdb.PhaseCopy, round, nodeType)
+			if err != nil {
+				fmt.Println("error getting copy sched count at depth", err)
+				return
+			}
+		} else {
+			expected, err = stats.GetCopyCountAtDepth(database, round, nodeType, db.CopyStatusPending, false)
+			if err != nil {
+				fmt.Println("error getting copy count at depth", err)
+				return
+			}
 		}
 	case QueueModeCopyRetry:
 		copyPass := q.GetCopyPass()
@@ -826,20 +1089,28 @@ func (q *Queue) SetExpectedFromStatsBucket(round int) {
 		}
 	case QueueModeDelete:
 		deletePass := q.GetCopyPass()
-		nodeType := db.NodeTypeFile
+		nodeType := db.NodeTypeFolder
 		if deletePass == 2 {
-			nodeType = db.NodeTypeFolder
+			nodeType = db.NodeTypeFile
 		}
-		expected, err = stats.GetDeleteCountAtDepth(database, round, nodeType, db.DeleteStatusPending, false)
-		if err != nil {
-			fmt.Println("error getting delete count at depth", err)
-			return
+		if database.Ops() != nil {
+			expected, err = database.GetSchedCountAtDepth(opsdb.SideSRC, opsdb.PhaseDel, round, nodeType)
+			if err != nil {
+				fmt.Println("error getting delete sched count at depth", err)
+				return
+			}
+		} else {
+			expected, err = stats.GetDeleteCountAtDepth(database, round, nodeType, db.DeleteStatusPendingExplicit, false)
+			if err != nil {
+				fmt.Println("error getting delete count at depth", err)
+				return
+			}
 		}
 	case QueueModeDeleteRetry:
 		deletePass := q.GetCopyPass()
-		nodeType := db.NodeTypeFile
+		nodeType := db.NodeTypeFolder
 		if deletePass == 2 {
-			nodeType = db.NodeTypeFolder
+			nodeType = db.NodeTypeFile
 		}
 		expected, err = stats.GetDeleteCountAtDepth(database, round, nodeType, db.DeleteStatusFailed, false)
 		if err != nil {

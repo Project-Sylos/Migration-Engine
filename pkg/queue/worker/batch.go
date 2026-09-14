@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"path"
 	"strings"
 	"time"
 
@@ -129,31 +128,14 @@ func beatWhile(ctx context.Context, wd progressBeater, interval time.Duration) (
 }
 
 func beatBatchWatchdogs(ctx context.Context, q *queue.Queue, wd *observe.ProgressWatchdog) (stop func()) {
-	// Keep both watchdogs alive for Dropbox UploadFilesBatch finish (and similar) where
-	// transferProgressReader may go quiet after bodies are consumed but before commit returns.
-	var stopProgress, stopQueue func()
-	if wd != nil {
-		stopProgress = beatWhile(ctx, progressWatchdogBeater{wd}, 5*time.Second)
-	}
+	// Queue-only fake beats: ProgressWatchdog must still cancel hung batch FS work.
+	// Real byte progress comes from transferProgressReader. Adapter commit deadlines
+	// cover finish_batch quiet periods.
+	_ = wd
 	if q != nil && q.HasWatchdog() {
-		stopQueue = beatWhile(ctx, queueWatchdogBeater{q}, 5*time.Second)
+		return beatWhile(ctx, queueWatchdogBeater{q}, 5*time.Second)
 	}
-	return func() {
-		if stopProgress != nil {
-			stopProgress()
-		}
-		if stopQueue != nil {
-			stopQueue()
-		}
-	}
-}
-
-type progressWatchdogBeater struct{ wd *observe.ProgressWatchdog }
-
-func (b progressWatchdogBeater) Beat() {
-	if b.wd != nil {
-		b.wd.Beat()
-	}
+	return func() {}
 }
 
 type queueWatchdogBeater struct{ q *queue.Queue }
@@ -198,9 +180,12 @@ func (w *CopyWorker) runFolderBatchTurn() {
 		time.Sleep(50 * time.Millisecond)
 		return
 	}
+	for _, t := range group {
+		w.queue.BindLeaseOwner(t, w.id)
+	}
 
 	setWorkerBusy(w.idle)
-	defer setWorkerIdle(w.idle)
+	defer markWorkerIdle(w.queue, w.id, w.idle)
 	w.queue.SetActiveLeaseSize(w.id, 0)
 	defer w.queue.ClearActiveLeaseSize(w.id)
 
@@ -231,9 +216,10 @@ func (w *CopyWorker) runFolderBatchTurn() {
 			reportTaskOutcome(w.queue, task, fmt.Errorf("task missing DstParentID for %s", task.LocationPath()))
 			continue
 		}
-		name := task.Folder.DisplayName
+		name := copyTaskCreateBasename(task)
 		if name == "" {
-			name = path.Base(task.LocationPath())
+			reportTaskOutcome(w.queue, task, fmt.Errorf("empty create basename for folder %s", task.LocationPath()))
+			continue
 		}
 		items = append(items, types.CreateFolderBatchItem{
 			ParentID: dstParent,
@@ -279,6 +265,7 @@ func (w *CopyWorker) runFolderBatchTurn() {
 			if w.queue.ShouldApplyCopyDstResumeExistenceCheck() || isDstPathConflictError(res.Err) {
 				done, preErr := w.applyResumeCopyDstFolderPrecheck(task, ctx, wd)
 				if preErr == nil && done {
+					markCopyAlreadyExists(task)
 					reportTaskOutcome(w.queue, task, nil)
 					continue
 				}
@@ -314,9 +301,12 @@ func (w *CopyWorker) runFileBatchTurn() {
 		time.Sleep(50 * time.Millisecond)
 		return
 	}
+	for _, t := range group {
+		w.queue.BindLeaseOwner(t, w.id)
+	}
 
 	setWorkerBusy(w.idle)
-	defer setWorkerIdle(w.idle)
+	defer markWorkerIdle(w.queue, w.id, w.idle)
 	var leaseBytes int64
 	for _, task := range group {
 		if task != nil && task.IsFile() {
@@ -376,19 +366,21 @@ func (w *CopyWorker) runFileBatchTurn() {
 			reportTaskOutcome(w.queue, task, fmt.Errorf("task missing source ServiceID for %s", task.LocationPath()))
 			continue
 		}
-		resumeOffset, err := awaitResult(ctx, parent, fileBatchStallTimeout, "prepare resume", task.LocationPath(), func() (int64, error) {
+		plan, err := awaitResult(ctx, parent, fileBatchStallTimeout, "prepare resume", task.LocationPath(), func() (queue.FileTransferPlan, error) {
 			return queue.PrepareFileTransferResume(ctx, w.queue, w.dstAdapter, task)
 		})
 		if err != nil {
 			reportTaskOutcome(w.queue, task, fmt.Errorf("prepare transfer resume for %s: %w", task.LocationPath(), err))
 			continue
 		}
-		name := task.File.DisplayName
+		resumeOffset := plan.ResumeOffset
+		name := copyTaskCreateBasename(task)
 		if name == "" {
-			name = path.Base(task.LocationPath())
+			reportTaskOutcome(w.queue, task, fmt.Errorf("empty create basename for file %s", task.LocationPath()))
+			continue
 		}
 		rc, err := awaitResult(ctx, parent, fileBatchStallTimeout, "open source", task.LocationPath(), func() (io.ReadCloser, error) {
-			return w.srcAdapter.OpenRead(ctx, srcID)
+			return w.srcAdapter.OpenRead(parent, srcID)
 		})
 		if err != nil {
 			if isForceCheckoutAbort(err, w.shouldRetire(), w.queue.ForceCheckoutWorker(w.id)) {
@@ -403,7 +395,7 @@ func (w *CopyWorker) runFileBatchTurn() {
 				return queue.SeekReaderTo(rc, resumeOffset)
 			}); seekErr != nil {
 				_ = rc.Close()
-				_ = w.queue.ClearTransferCheckpoint(ctx, task)
+				_ = w.queue.ClearResumeState(ctx, task)
 				reportTaskOutcome(w.queue, task, fmt.Errorf("seek source for batch resume %s: %w", task.LocationPath(), seekErr))
 				continue
 			}
@@ -530,9 +522,12 @@ func (w *DeleteWorker) runDeleteBatchTurn() {
 		time.Sleep(50 * time.Millisecond)
 		return
 	}
+	for _, t := range group {
+		w.queue.BindLeaseOwner(t, w.id)
+	}
 
 	setWorkerBusy(w.idle)
-	defer setWorkerIdle(w.idle)
+	defer markWorkerIdle(w.queue, w.id, w.idle)
 	w.queue.SetActiveLeaseSize(w.id, 0)
 	defer w.queue.ClearActiveLeaseSize(w.id)
 

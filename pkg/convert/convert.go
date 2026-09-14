@@ -2,6 +2,11 @@
 // (for example map[string]any decoded from engine metrics) into concrete Go types.
 package convert
 
+import (
+	"encoding/json"
+	"strconv"
+)
+
 // Number is the set of numeric types ToNumber can produce.
 type Number interface {
 	~int | ~int8 | ~int16 | ~int32 | ~int64 |
@@ -38,6 +43,18 @@ func ToNumber[T Number](v any) T {
 		return T(t)
 	case float64:
 		return T(t)
+	case json.Number:
+		if f, err := t.Float64(); err == nil {
+			return T(f)
+		}
+		var zero T
+		return zero
+	case string:
+		if f, err := strconv.ParseFloat(t, 64); err == nil {
+			return T(f)
+		}
+		var zero T
+		return zero
 	default:
 		var zero T
 		return zero
