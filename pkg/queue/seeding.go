@@ -11,6 +11,7 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
+	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
@@ -43,6 +44,7 @@ func SeedRootTask(queueType string, rootFolder types.Folder, rootNodeID string, 
 		ParentServiceID: rootFolder.ParentId,
 		ParentPath:      "",
 		Name:            rootFolder.DisplayName,
+		DisplayPath:     filter.RootDisplayPath(),
 		Path:            "/",
 		Type:            types.NodeTypeFolder,
 		Size:            0,
@@ -73,11 +75,6 @@ func SeedRootTask(queueType string, rootFolder types.Folder, rootNodeID string, 
 	}
 
 	return nil
-}
-
-// SeedRootTasks seeds both src and dst roots with pending traversal (classic round 0).
-func SeedRootTasks(srcRoot types.Folder, dstRoot types.Folder, database *db.DB) error {
-	return SeedRootTasksPrepared(srcRoot, dstRoot, database, false, false)
 }
 
 // SeedRootTasksPrepared seeds roots; prepared sides get traversal-successful roots.
@@ -113,6 +110,7 @@ func SeedRootTasksPrepared(srcRoot, dstRoot types.Folder, database *db.DB, srcPr
 		DstInternalID: dstRootID,
 		Source:        db.IDMapSourceRootSeed,
 		Status:        db.IDMapStatusActive,
+		Depth:         0,
 	})
 
 	if err := database.Checkpoint(); err != nil {
@@ -163,6 +161,7 @@ func SeedRootTaskWithSrcID(queueType string, rootFolder types.Folder, rootNodeID
 		ParentServiceID: rootFolder.ParentId,
 		ParentPath:      "",
 		Name:            rootFolder.DisplayName,
+		DisplayPath:     filter.RootDisplayPath(),
 		Path:            "/",
 		Type:            types.NodeTypeFolder,
 		Size:            0,
@@ -193,20 +192,27 @@ func SeedRootTaskWithSrcID(queueType string, rootFolder types.Folder, rootNodeID
 	return nil
 }
 
-// PreparedChild is one depth-1 child to inject at AddRoots after a UI root review.
+// PreparedChild is one reviewed child to inject at AddRoots (depth-1 or nested sparse forest).
 type PreparedChild struct {
-	ServiceID string
-	Name      string
-	Type      string // folder | file
-	Size      int64
-	MTime     string
-	Excluded  bool
-	DstOnly   bool
+	ServiceID   string
+	Name        string
+	Type        string // folder | file
+	Size        int64
+	MTime       string
+	Excluded    bool // omit from DB (silent allowlist); not counted excluded
+	DstOnly     bool
+	Children    []PreparedChild
+	IncludeOnly []string
 }
 
-// SeedPreparedDepth1Children inserts reviewed root children and id_map links for name matches.
-// Only children with non-empty Name are inserted. Off-path / uncle excludes must already be filtered out.
-func SeedPreparedDepth1Children(database *db.DB, srcChildren, dstChildren []PreparedChild) error {
+// PrepareSRCNodesHook runs after SRC NodeStates are built and before insert.
+// Used to apply the same destination-name GPL pass as traversal seal (round 1+).
+type PrepareSRCNodesHook func(srcNodes []*db.NodeState)
+
+// SeedPreparedDepth1Children inserts reviewed root children (and nested sparse SRC forest)
+// plus DST depth-1 children and id_map links for name matches at depth 1.
+// Excluded SRC children are omitted; partial parents get include_only allowlists.
+func SeedPreparedDepth1Children(database *db.DB, srcChildren, dstChildren []PreparedChild, prepareSRC PrepareSRCNodesHook, _ *filter.CompiledRuleset) error {
 	if database == nil {
 		return fmt.Errorf("database cannot be nil")
 	}
@@ -215,110 +221,100 @@ func SeedPreparedDepth1Children(database *db.DB, srcChildren, dstChildren []Prep
 
 	srcByName := make(map[string]PreparedChild, len(srcChildren))
 	for _, c := range srcChildren {
-		name := strings.TrimSpace(c.Name)
-		if name == "" {
+		if c.Name == "" {
 			continue
 		}
-		srcByName[strings.ToLower(name)] = c
+		srcByName[strings.ToLower(c.Name)] = c
 	}
 	dstByName := make(map[string]PreparedChild, len(dstChildren))
 	for _, c := range dstChildren {
-		name := strings.TrimSpace(c.Name)
-		if name == "" {
+		if c.Name == "" {
 			continue
 		}
-		dstByName[strings.ToLower(name)] = c
+		dstByName[strings.ToLower(c.Name)] = c
 	}
 
 	var ops []db.InsertOperation
+	var srcStates []*db.NodeState
 	var idMaps []db.IDMapEvent
-	var reviewDeltas []db.ReviewStatsDelta
+	includeOnlyUpdates := map[string]string{} // nodeID -> JSON
+	maxSRCDepth := 1
 
-	for key, src := range srcByName {
-		nodeType := types.NodeTypeFolder
-		if strings.EqualFold(src.Type, types.NodeTypeFile) || strings.EqualFold(src.Type, "file") {
-			nodeType = types.NodeTypeFile
+	var seedSRC func(kids []PreparedChild, parentID, parentPath, parentDisplayPath string, depth int)
+	seedSRC = func(kids []PreparedChild, parentID, parentPath, parentDisplayPath string, depth int) {
+		if depth > maxSRCDepth {
+			maxSRCDepth = depth
 		}
-		path := "/" + src.Name
-		id := db.MintNodeID("SRC", srcRootID, nodeType, src.Name)
-		trav := db.StatusPending
-		copyStatus := db.CopyStatusPending
-		deleteStatus := db.DeleteStatusPending
-		if nodeType == types.NodeTypeFile {
-			trav = db.StatusSuccessful
+		if raw := includeOnlyJSONForKids(kids); raw != "" {
+			includeOnlyUpdates[parentID] = raw
 		}
-		if src.Excluded {
+		for _, src := range kids {
+			if src.Name == "" || src.Excluded {
+				continue
+			}
+			nodeType := types.NodeTypeFolder
+			if strings.EqualFold(src.Type, types.NodeTypeFile) || strings.EqualFold(src.Type, "file") {
+				nodeType = types.NodeTypeFile
+			}
+			id := db.MintNodeID("SRC", parentID, nodeType, src.Name)
+			path := db.JoinIDPath(parentPath, id)
+			trav := db.StatusPending
+			copyStatus := db.CopyStatusPending
+			deleteStatus := ""
 			if nodeType == types.NodeTypeFile {
-				// Listed/found, but not copied; can be unexcluded later in copy review.
 				trav = db.StatusSuccessful
-				copyStatus = db.CopyStatusExcludedExplicit
-				deleteStatus = ""
-			} else {
-				// Folder: do not traverse the subtree.
-				trav = db.StatusExcluded
-				copyStatus = db.CopyStatusExcludedExplicit
-				deleteStatus = ""
+			} else if len(src.Children) > 0 {
+				// Nested children already reviewed — corridor/parent is done for this depth.
+				trav = db.StatusSuccessful
 			}
-		} else if dst, ok := dstByName[key]; ok && !dst.DstOnly {
-			dstType := types.NodeTypeFolder
-			if strings.EqualFold(dst.Type, types.NodeTypeFile) || strings.EqualFold(dst.Type, "file") {
-				dstType = types.NodeTypeFile
-			}
-			if dstType == nodeType {
-				copyStatus = db.CopyStatusAlreadyExisted
-			}
-		}
-		state := &db.NodeState{
-			ID:              id,
-			ServiceID:       src.ServiceID,
-			ParentID:        srcRootID,
-			ParentPath:      "/",
-			Name:            src.Name,
-			Path:            path,
-			Type:            nodeType,
-			Size:            src.Size,
-			MTime:           src.MTime,
-			Depth:           1,
-			Status:          trav,
-			TraversalStatus: trav,
-			CopyStatus:      copyStatus,
-			DeleteStatus:    deleteStatus,
-		}
-		ops = append(ops, db.InsertOperation{QueueType: "SRC", Level: 1, Status: trav, State: state})
-		if key := db.ReviewKeyForStatus("traversal", trav); key != "" {
-			reviewDeltas = append(reviewDeltas, db.ReviewStatsDelta{Key: key, Delta: 1})
-		}
-		if src.Excluded {
-			if nodeType == types.NodeTypeFile {
-				// Traversal successful already counted; also mark excluded (copy-excluded file).
-				reviewDeltas = append(reviewDeltas, db.ReviewStatsDelta{Key: db.ReviewKeyExcluded, Delta: 1})
-				if src.Size > 0 {
-					reviewDeltas = append(reviewDeltas, db.ReviewStatsDelta{Key: db.ReviewKeySizeSrc, Delta: src.Size})
+			if depth == 1 {
+				key := strings.ToLower(src.Name)
+				if dst, ok := dstByName[key]; ok && !dst.DstOnly {
+					dstType := types.NodeTypeFolder
+					if strings.EqualFold(dst.Type, types.NodeTypeFile) || strings.EqualFold(dst.Type, "file") {
+						dstType = types.NodeTypeFile
+					}
+					if dstType == nodeType {
+						copyStatus = db.CopyStatusAlreadyExisted
+						deleteStatus = db.DeleteStatusAfterCopyComplete("", "")
+					}
 				}
 			}
-			// Excluded folders: ReviewKeyExcluded comes from traversal StatusExcluded above.
-			continue
-		}
-		if key := db.ReviewKeyForStatus("copy", copyStatus); key != "" {
-			reviewDeltas = append(reviewDeltas, db.ReviewStatsDelta{Key: key, Delta: 1})
-		}
-		if nodeType == types.NodeTypeFolder {
-			reviewDeltas = append(reviewDeltas, db.ReviewStatsDelta{Key: db.ReviewKeyFolders, Delta: 1})
-		} else {
-			reviewDeltas = append(reviewDeltas, db.ReviewStatsDelta{Key: db.ReviewKeyFiles, Delta: 1})
-			if src.Size > 0 {
-				reviewDeltas = append(reviewDeltas, db.ReviewStatsDelta{Key: db.ReviewKeySizeSrc, Delta: src.Size})
+			displayPath := filter.DisplayPathForChild(parentDisplayPath, depth-1, src.Name)
+			state := &db.NodeState{
+				ID:              id,
+				ServiceID:       src.ServiceID,
+				ParentID:        parentID,
+				ParentPath:      parentPath,
+				Name:            src.Name,
+				DisplayPath:     displayPath,
+				Path:            path,
+				Type:            nodeType,
+				Size:            src.Size,
+				MTime:           src.MTime,
+				Depth:           depth,
+				Status:          trav,
+				TraversalStatus: trav,
+				CopyStatus:      copyStatus,
+				DeleteStatus:    deleteStatus,
+			}
+			srcStates = append(srcStates, state)
+			ops = append(ops, db.InsertOperation{QueueType: "SRC", Level: depth, Status: state.TraversalStatus, State: state})
+			if nodeType == types.NodeTypeFolder && len(src.Children) > 0 {
+				seedSRC(src.Children, id, path, state.DisplayPath, depth+1)
 			}
 		}
 	}
+
+	seedSRC(srcChildren, srcRootID, "/", filter.RootDisplayPath(), 1)
 
 	for key, dst := range dstByName {
 		nodeType := types.NodeTypeFolder
 		if strings.EqualFold(dst.Type, types.NodeTypeFile) || strings.EqualFold(dst.Type, "file") {
 			nodeType = types.NodeTypeFile
 		}
-		path := "/" + dst.Name
 		id := db.MintNodeID("DST", dstRootID, nodeType, dst.Name)
+		path := db.JoinIDPath("/", id)
 		trav := db.StatusPending
 		if nodeType == types.NodeTypeFile {
 			trav = db.StatusSuccessful
@@ -358,50 +354,68 @@ func SeedPreparedDepth1Children(database *db.DB, srcChildren, dstChildren []Prep
 				DstInternalID: id,
 				Source:        db.IDMapSourceDSTCompare,
 				Status:        db.IDMapStatusActive,
+				Depth:         1,
 			})
-		}
-		if key := db.ReviewKeyForStatus("traversal", trav); key != "" {
-			reviewDeltas = append(reviewDeltas, db.ReviewStatsDelta{Key: key, Delta: 1})
-		}
-		if nodeType == types.NodeTypeFile && dst.Size > 0 {
-			reviewDeltas = append(reviewDeltas, db.ReviewStatsDelta{Key: db.ReviewKeySizeDst, Delta: dst.Size})
 		}
 	}
 
-	if len(ops) == 0 {
+	if len(ops) == 0 && len(includeOnlyUpdates) == 0 {
 		return nil
 	}
-	if err := pull.BatchInsertNodes(database, ops); err != nil {
-		return fmt.Errorf("seed prepared depth-1 children: %w", err)
+	if prepareSRC != nil && len(srcStates) > 0 {
+		prepareSRC(srcStates)
 	}
-	for _, ev := range idMaps {
-		database.AppendIDMapEvent(ev)
-	}
-	if len(reviewDeltas) > 0 {
-		if err := database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-			return s.WithTx(func(w *db.Writer) error {
-				return w.ApplyReviewStatsDeltas(reviewDeltas)
-			})
-		}); err != nil {
-			return fmt.Errorf("seed prepared review stats: %w", err)
+	if len(ops) > 0 {
+		if err := pull.BatchInsertNodes(database, ops); err != nil {
+			return fmt.Errorf("seed prepared children: %w", err)
 		}
 	}
-	// Seal copy-work for depths 0–1 now (excluded children omitted by GetCopyDiscoveredAtDepth).
-	// Later round seals are idempotent catch-ups against the same absolute.
-	if _, err := stats.SealSrcCopyWorkDiscovered(database, 0, db.CopyWorkReasonSrcDiscoverRootPrep); err != nil {
-		return fmt.Errorf("seed prepared copy-work depth 0: %w", err)
+	if err := database.Flush(context.Background()); err != nil {
+		return fmt.Errorf("flush prepared-child GPL issues: %w", err)
 	}
-	if _, err := stats.SealSrcCopyWorkDiscovered(database, 1, db.CopyWorkReasonSrcDiscoverRootPrep); err != nil {
-		return fmt.Errorf("seed prepared copy-work depth 1: %w", err)
+	if len(includeOnlyUpdates) > 0 {
+		for nodeID, raw := range includeOnlyUpdates {
+			if err := database.UpdateNodeIncludeOnly(nodeID, raw); err != nil {
+				return fmt.Errorf("seed prepared include_only: %w", err)
+			}
+		}
 	}
-	if _, err := stats.SealDstCopyWorkAlreadyExistedCorrection(database, 0, db.CopyWorkReasonDstAECorrectionRootPrep); err != nil {
-		return fmt.Errorf("seed prepared AE correction depth 0: %w", err)
+	if len(idMaps) > 0 {
+		if err := database.SeedIDMapEvents(idMaps); err != nil {
+			return fmt.Errorf("seed prepared id_map: %w", err)
+		}
 	}
-	if _, err := stats.SealDstCopyWorkAlreadyExistedCorrection(database, 1, db.CopyWorkReasonDstAECorrectionRootPrep); err != nil {
-		return fmt.Errorf("seed prepared AE correction depth 1: %w", err)
+	for d := 0; d <= maxSRCDepth; d++ {
+		if _, err := stats.SealSrcCopyWorkDiscovered(database, d, db.CopyWorkReasonSrcDiscoverRootPrep); err != nil {
+			return fmt.Errorf("seed prepared copy-work depth %d: %w", d, err)
+		}
+		if _, err := stats.SealDstCopyWorkAlreadyExistedCorrection(database, d, db.CopyWorkReasonDstAECorrectionRootPrep); err != nil {
+			return fmt.Errorf("seed prepared AE correction depth %d: %w", d, err)
+		}
 	}
 	if err := database.Checkpoint(); err != nil {
 		fmt.Println("error checkpointing prepared children", err)
 	}
 	return nil
+}
+
+func includeOnlyJSONForKids(kids []PreparedChild) string {
+	anyExcluded := false
+	included := make([]string, 0, len(kids))
+	for _, c := range kids {
+		if c.Name == "" {
+			continue
+		}
+		if c.Excluded {
+			anyExcluded = true
+			continue
+		}
+		if c.ServiceID != "" {
+			included = append(included, c.ServiceID)
+		}
+	}
+	if !anyExcluded {
+		return ""
+	}
+	return EncodeIncludeOnlyJSON(included)
 }

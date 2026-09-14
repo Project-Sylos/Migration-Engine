@@ -22,20 +22,39 @@ const (
 	TransferAbandonDBOnly
 )
 
-// PersistTransferCheckpoint writes mid-transfer progress. copy_status stays pending.
-func (q *Queue) PersistTransferCheckpoint(ctx context.Context, task *TaskBase, offset int64, dstRef string) error {
-	if q == nil || task == nil || !task.IsFile() || offset <= 0 {
+// FileTransferPlan is the result of PrepareFileTransferResume.
+type FileTransferPlan struct {
+	ResumeOffset int64  // seek SRC to this offset (0 = start/restart)
+	ResumeToken  string // provider resume token when resuming
+	DstRef       string // existing dst attempt ref (empty = create fresh)
+	Restart      bool   // true when an attempt exists but must delete+restart
+}
+
+// PersistTransferCheckpointToken writes mid-transfer progress including an opaque provider resume token.
+// copy_status stays pending. offset may be 0 when recording an attempt marker (dstRef) at OpenWrite time.
+func (q *Queue) PersistTransferCheckpointToken(ctx context.Context, task *TaskBase, offset int64, dstRef, resumeToken string) error {
+	if q == nil || task == nil || !task.IsFile() {
+		return nil
+	}
+	if offset <= 0 && dstRef == "" && resumeToken == "" {
 		return nil
 	}
 	database := q.Database()
 	if database == nil {
 		return fmt.Errorf("PersistTransferCheckpoint: no database")
 	}
+	if dstRef == "" {
+		dstRef = task.XferDstRef
+	}
+	if resumeToken == "" {
+		resumeToken = task.XferResumeToken
+	}
 	ckpt := checkpoint.TransferCheckpoint{
-		Offset:   offset,
-		SrcSize:  task.File.Size,
-		SrcMTime: task.File.LastUpdated,
-		DstRef:   dstRef,
+		Offset:      offset,
+		SrcSize:     task.File.Size,
+		SrcMTime:    task.File.LastUpdated,
+		DstRef:      dstRef,
+		ResumeToken: resumeToken,
 	}
 	if err := checkpoint.UpsertTransferCheckpoint(database, ctx, task.ID, ckpt); err != nil {
 		return err
@@ -44,10 +63,11 @@ func (q *Queue) PersistTransferCheckpoint(ctx context.Context, task *TaskBase, o
 	task.XferSrcSize = ckpt.SrcSize
 	task.XferSrcMTime = ckpt.SrcMTime
 	task.XferDstRef = dstRef
+	task.XferResumeToken = resumeToken
 	return nil
 }
 
-// ClearTransferCheckpoint clears durable resume state after success or forced full restart.
+// ClearTransferCheckpoint clears all durable resume/attempt state after success.
 func (q *Queue) ClearTransferCheckpoint(ctx context.Context, task *TaskBase) error {
 	if q == nil || task == nil || task.ID == "" {
 		return nil
@@ -63,6 +83,26 @@ func (q *Queue) ClearTransferCheckpoint(ctx context.Context, task *TaskBase) err
 	task.XferSrcSize = 0
 	task.XferSrcMTime = ""
 	task.XferDstRef = ""
+	task.XferResumeToken = ""
+	return nil
+}
+
+// ClearResumeState clears offset/fingerprint/token but keeps the attempt marker (DstRef).
+func (q *Queue) ClearResumeState(ctx context.Context, task *TaskBase) error {
+	if q == nil || task == nil || task.ID == "" {
+		return nil
+	}
+	database := q.Database()
+	if database == nil {
+		return nil
+	}
+	if err := checkpoint.ClearResumeState(database, ctx, task.ID); err != nil {
+		return err
+	}
+	task.XferOffset = 0
+	task.XferSrcSize = 0
+	task.XferSrcMTime = ""
+	task.XferResumeToken = ""
 	return nil
 }
 
@@ -83,7 +123,13 @@ func (q *Queue) LoadTransferCheckpointOntoTask(ctx context.Context, task *TaskBa
 	task.XferSrcSize = ckpt.SrcSize
 	task.XferSrcMTime = ckpt.SrcMTime
 	task.XferDstRef = ckpt.DstRef
+	task.XferResumeToken = ckpt.ResumeToken
 	return nil
+}
+
+// HasCopyAttempt reports whether this task has a durable DST attempt marker from this migration.
+func HasCopyAttempt(task *TaskBase) bool {
+	return task != nil && task.IsFile() && task.XferDstRef != ""
 }
 
 // fingerprintMatches reports whether the checkpoint fingerprint still matches the task's SRC file.
@@ -95,30 +141,42 @@ func fingerprintMatches(task *TaskBase) bool {
 }
 
 // PrepareFileTransferResume applies FS restart policy after lease.
-// Returns the byte offset to seek SRC to (0 = full start/restart).
+// Returns a plan: resume from offset, or restart (optionally deleting the prior attempt).
 // dst may be an FSAdapter or any value that implements FSTransferRestartPolicy.
-func PrepareFileTransferResume(ctx context.Context, q *Queue, dst any, task *TaskBase) (resumeOffset int64, err error) {
+func PrepareFileTransferResume(ctx context.Context, q *Queue, dst any, task *TaskBase) (FileTransferPlan, error) {
 	if err := q.LoadTransferCheckpointOntoTask(ctx, task); err != nil {
-		return 0, err
-	}
-	if task.XferOffset <= 0 {
-		return 0, nil
+		return FileTransferPlan{}, err
 	}
 	policy := types.ResolveTransferRestartPolicy(dst)
+	if task.XferOffset <= 0 && task.XferDstRef == "" {
+		return FileTransferPlan{}, nil
+	}
 	if fingerprintMatches(task) && policy.SupportsResumableTransfer() {
-		return task.XferOffset, nil
+		return FileTransferPlan{
+			ResumeOffset: task.XferOffset,
+			ResumeToken:  task.XferResumeToken,
+			DstRef:       task.XferDstRef,
+		}, nil
 	}
-	// Mismatch or non-resumable: clear checkpoint; optionally delete dst before full restart.
+	// Mismatch or non-resumable: clear resume state; keep attempt marker for delete-before-restart.
 	dstRef := task.XferDstRef
-	if err := q.ClearTransferCheckpoint(ctx, task); err != nil {
-		return 0, err
+	if err := q.ClearResumeState(ctx, task); err != nil {
+		return FileTransferPlan{}, err
 	}
-	if policy.RequiresDeleteBeforeRestart() && dstRef != "" {
+	task.XferDstRef = dstRef
+	if dstRef == "" {
+		return FileTransferPlan{}, nil
+	}
+	if policy.RequiresDeleteBeforeRestart() || !policy.SupportsResumableTransfer() {
 		if adapter, ok := dst.(types.FSAdapter); ok {
 			_ = adapter.DeleteNode(ctx, dstRef, types.NodeTypeFile)
 		}
+		if err := q.ClearTransferCheckpoint(ctx, task); err != nil {
+			return FileTransferPlan{}, err
+		}
+		return FileTransferPlan{Restart: true}, nil
 	}
-	return 0, nil
+	return FileTransferPlan{DstRef: dstRef, Restart: true}, nil
 }
 
 // SeekReaderTo discards or seeks src to offset. Prefer io.Seeker when available.
@@ -134,17 +192,16 @@ func SeekReaderTo(r io.Reader, offset int64) error {
 	return err
 }
 
-// AbandonTransferCheckpoint closes the live transfer path (caller closes FS handles),
-// persists checkpoint, unlocks the task, and either requeues or leaves DB-only.
-// Does not bump attempts.
-func (q *Queue) AbandonTransferCheckpoint(ctx context.Context, task *TaskBase, offset int64, dstRef string, mode TransferAbandonMode) error {
+// AbandonTransferCheckpointToken closes the live transfer path (caller closes FS handles),
+// persists checkpoint (with optional provider resume token), unlocks the task, and either
+// requeues or leaves DB-only. Does not bump attempts.
+func (q *Queue) AbandonTransferCheckpointToken(ctx context.Context, task *TaskBase, offset int64, dstRef, resumeToken string, mode TransferAbandonMode) error {
 	if q == nil || task == nil {
 		return nil
 	}
-	if offset > 0 && task.IsFile() {
-		// ProgressWatchdog may have cancelled ctx; persist must still succeed.
+	if task.IsFile() && (offset > 0 || dstRef != "" || resumeToken != "") {
 		persistCtx := context.WithoutCancel(ctx)
-		if err := q.PersistTransferCheckpoint(persistCtx, task, offset, dstRef); err != nil {
+		if err := q.PersistTransferCheckpointToken(persistCtx, task, offset, dstRef, resumeToken); err != nil {
 			return err
 		}
 	}

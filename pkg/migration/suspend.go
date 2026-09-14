@@ -21,6 +21,7 @@ import (
 var (
 	ErrTraversalSoftSuspended = errors.New("traversal soft suspended")
 	ErrCopySoftSuspended      = errors.New("copy phase soft suspended")
+	ErrDeleteSoftSuspended    = errors.New("delete phase soft suspended")
 )
 
 type traversalSuspendedError struct {
@@ -67,13 +68,35 @@ func AsCopySuspended(err error) (queue.QueueStats, RuntimeSuspendV1, bool) {
 	return queue.QueueStats{}, RuntimeSuspendV1{}, false
 }
 
+type deleteSuspendedError struct {
+	stats   queue.QueueStats
+	suspend RuntimeSuspendV1
+}
+
+func (e *deleteSuspendedError) Error() string { return ErrDeleteSoftSuspended.Error() }
+
+func (e *deleteSuspendedError) Unwrap() error { return ErrDeleteSoftSuspended }
+
+func newDeleteSuspendedError(stats queue.QueueStats, s RuntimeSuspendV1) error {
+	return &deleteSuspendedError{stats: stats, suspend: s}
+}
+
+// AsDeleteSuspended unwraps stats and suspend payload from RunDeletePhase soft suspend.
+func AsDeleteSuspended(err error) (queue.QueueStats, RuntimeSuspendV1, bool) {
+	var de *deleteSuspendedError
+	if errors.As(err, &de) {
+		return de.stats, de.suspend, true
+	}
+	return queue.QueueStats{}, RuntimeSuspendV1{}, false
+}
+
 // RuntimeSuspendV1 is merged into migrations.runtime_state_json under key "suspend_v1".
 // It holds only what resume needs: tuning knobs and last-known position for UI / max-depth.
 type RuntimeSuspendV1 struct {
 	Version int `json:"version"` // 1
 
 	SuspendedAtUnix int64  `json:"suspended_at_unix"`
-	Kind            string `json:"kind"` // "traversal" | "copy"
+	Kind            string `json:"kind"` // "traversal" | "copy" | "delete"
 
 	WorkerCount int `json:"worker_count"`
 	MaxRetries  int `json:"max_retries"`
@@ -85,13 +108,19 @@ type RuntimeSuspendV1 struct {
 	ProgressTickMs  int `json:"progress_tick_ms,omitempty"`
 
 	// Traversal / coordinator
-	LastRoundSrc  int `json:"last_round_src,omitempty"`
-	LastRoundDst  int `json:"last_round_dst,omitempty"`
-	MaxKnownDepth int `json:"max_known_depth,omitempty"`
+	LastRoundSrc    int    `json:"last_round_src,omitempty"`
+	LastRoundDst    int    `json:"last_round_dst,omitempty"`
+	MaxKnownDepth   int    `json:"max_known_depth,omitempty"`
+	SrcKeysetCursor string `json:"src_keyset_cursor,omitempty"`
+	DstKeysetCursor string `json:"dst_keyset_cursor,omitempty"`
 
 	// Copy
-	CopyPass           int `json:"copy_pass,omitempty"`
-	LastKnownCopyRound int `json:"last_known_copy_round,omitempty"`
+	CopyPass           int    `json:"copy_pass,omitempty"`
+	LastKnownCopyRound int    `json:"last_known_copy_round,omitempty"`
+	CopyKeysetCursor   string `json:"copy_keyset_cursor,omitempty"`
+
+	// Delete (reuses CopyPass as delete pass 1=folders / 2=files)
+	LastKnownDeleteRound int `json:"last_known_delete_round,omitempty"`
 }
 
 const runtimeSuspendJSONKey = "suspend_v1"
@@ -143,6 +172,7 @@ func parseRuntimeSuspendV1(runtimeStateJSON string) (RuntimeSuspendV1, bool) {
 func newTraversalSuspendState(
 	workerCount, maxRetries, leaseBatch, refillBatch, observerPollMs, progressTickMs int,
 	lastRoundSrc, lastRoundDst, maxKnownDepth int,
+	srcCursor, dstCursor string,
 ) RuntimeSuspendV1 {
 	return RuntimeSuspendV1{
 		Version:         1,
@@ -157,12 +187,15 @@ func newTraversalSuspendState(
 		LastRoundSrc:    lastRoundSrc,
 		LastRoundDst:    lastRoundDst,
 		MaxKnownDepth:   maxKnownDepth,
+		SrcKeysetCursor: srcCursor,
+		DstKeysetCursor: dstCursor,
 	}
 }
 
 func newCopySuspendState(
 	workerCount, maxRetries, leaseBatch, refillBatch, observerPollMs, progressTickMs int,
 	copyPass, lastRound, maxKnownDepth int,
+	cursor string,
 ) RuntimeSuspendV1 {
 	return RuntimeSuspendV1{
 		Version:            1,
@@ -177,6 +210,7 @@ func newCopySuspendState(
 		CopyPass:           copyPass,
 		LastKnownCopyRound: lastRound,
 		MaxKnownDepth:      maxKnownDepth,
+		CopyKeysetCursor:   cursor,
 	}
 }
 
@@ -233,6 +267,19 @@ func progressTickFromConfigAndSuspend(cfg time.Duration, s *RuntimeSuspendV1, fa
 	return fallback
 }
 
+func reportStopProgress(fn func(string, int), step string, inProgress int) {
+	if fn != nil {
+		fn(step, inProgress)
+	}
+}
+
+func reportStopProgressDetail(fn func(string, int), step string, inProgress int, detail string, setDetail func(string)) {
+	reportStopProgress(fn, step, inProgress)
+	if setDetail != nil && detail != "" {
+		setDetail(detail)
+	}
+}
+
 func performTraversalSoftSuspend(
 	waitCtx context.Context,
 	database *db.DB,
@@ -253,38 +300,49 @@ func performTraversalSoftSuspend(
 	srcQueue.ClearPendingBufferForSuspend()
 	dstQueue.ClearPendingBufferForSuspend()
 
+	setDetail := func(d string) {
+		if observer != nil {
+			observer.SetWaitReason(d)
+		}
+	}
+	n0 := srcQueue.InProgressCount() + dstQueue.InProgressCount()
+	reportStopProgressDetail(cfg.ReportStopProgress, StopStepDraining, n0, drainWaitDetail(n0, "items"), setDetail)
+
 	mergedCtx, cancelMerged := mergeWaitContexts(waitCtx, cfg.ShutdownContext)
 	defer cancelMerged()
 
-	if err := srcQueue.WaitInProgressZero(mergedCtx, 50*time.Millisecond); err != nil {
-		if cfg.ShutdownContext != nil && cfg.ShutdownContext.Err() != nil {
-			srcQueue.AbandonInProgressTasks()
-			dstQueue.AbandonInProgressTasks()
+	onDrainTick := func(n int) {
+		reportStopProgressDetail(cfg.ReportStopProgress, StopStepDraining, n, drainWaitDetail(n, "items"), setDetail)
+	}
+	if err := srcQueue.WaitInProgressZeroFunc(mergedCtx, 50*time.Millisecond, onDrainTick); err != nil {
+		if softSuspendHardKilled(cfg.ShutdownContext) {
+			abandonQueuesDBOnly(srcQueue, dstQueue)
 		}
 		return RuntimeStats{}, RuntimeSuspendV1{}, fmt.Errorf("src queue drain in-flight: %w", err)
 	}
-	if err := dstQueue.WaitInProgressZero(mergedCtx, 50*time.Millisecond); err != nil {
-		if cfg.ShutdownContext != nil && cfg.ShutdownContext.Err() != nil {
-			srcQueue.AbandonInProgressTasks()
-			dstQueue.AbandonInProgressTasks()
+	if err := dstQueue.WaitInProgressZeroFunc(mergedCtx, 50*time.Millisecond, onDrainTick); err != nil {
+		if softSuspendHardKilled(cfg.ShutdownContext) {
+			abandonQueuesDBOnly(srcQueue, dstQueue)
 		}
 		return RuntimeStats{}, RuntimeSuspendV1{}, fmt.Errorf("dst queue drain in-flight: %w", err)
 	}
+	// Hard kill may clear in-progress so Wait succeeds; do not continue soft-save.
+	if err := errIfSoftSuspendHardKilled(cfg.ShutdownContext); err != nil {
+		abandonQueuesDBOnly(srcQueue, dstQueue)
+		return RuntimeStats{}, RuntimeSuspendV1{}, err
+	}
 
-	if err := database.Flush(); err != nil {
+	reportStopProgressDetail(cfg.ReportStopProgress, StopStepSaving, 0, "Writing the latest updates…", setDetail)
+
+	if err := awaitSoftSuspendDB(mergedCtx, cfg.ShutdownContext, func() error {
+		return database.Flush(context.Background())
+	}); err != nil {
 		return RuntimeStats{}, RuntimeSuspendV1{}, fmt.Errorf("flush seal buffer: %w", err)
 	}
-	if err := database.RebuildCurrentByDepth(srcQueue.GetRound()); err != nil {
-		return RuntimeStats{}, RuntimeSuspendV1{}, fmt.Errorf("rebuild src current: %w", err)
-	}
-	if err := database.RebuildCurrentByDepth(dstQueue.GetRound()); err != nil {
-		return RuntimeStats{}, RuntimeSuspendV1{}, fmt.Errorf("rebuild dst current: %w", err)
-	}
-	if err := queue.FinalizeCopyWorkOnStop(database, coordinator); err != nil {
+	if err := awaitSoftSuspendDB(mergedCtx, cfg.ShutdownContext, func() error {
+		return queue.FinalizeCopyWorkOnStop(database, coordinator)
+	}); err != nil {
 		return RuntimeStats{}, RuntimeSuspendV1{}, fmt.Errorf("finalize copy work on stop: %w", err)
-	}
-	if err := database.CheckpointWithRetry(mergedCtx, 5); err != nil {
-		return RuntimeStats{}, RuntimeSuspendV1{}, fmt.Errorf("checkpoint: %w", err)
 	}
 
 	srcStats, dstStats := snapshotTraversalQueueStats(database, coordinator)
@@ -312,12 +370,23 @@ func performTraversalSoftSuspend(
 		srcQueue.EffectiveLeaseBatchSize(), srcQueue.EffectiveRefillBatchSize(),
 		obsMs, progMs,
 		srcStats.Round, dstStats.Round, maxD,
+		srcQueue.GetKeysetCursor(), dstQueue.GetKeysetCursor(),
 	)
+	if database.Ops() != nil {
+		_ = database.SaveTraversalQueuePositions(
+			srcStats.Round, srcQueue.GetKeysetCursor(),
+			dstStats.Round, dstQueue.GetKeysetCursor(),
+		)
+	}
 
 	stats := RuntimeStats{
 		Duration: time.Since(start),
 		Src:      srcStats,
 		Dst:      dstStats,
+	}
+	// StopStepDone is reported after seal stop + checkpoint (see finishSoftStopBulkPhase).
+	if observer != nil {
+		observer.SetWaitReason("Saving buffered progress…")
 	}
 	return stats, suspend, nil
 }
@@ -338,30 +407,52 @@ func performCopySoftSuspend(
 	copyQueue.ClearPendingBufferForSuspend()
 	copyQueue.EnterStopAbandonWindow(queue.DefaultSpinDownGrace)
 
+	setDetail := func(d string) {
+		if observer != nil {
+			observer.SetWaitReason(d)
+		}
+	}
+	n0 := copyQueue.InProgressCount()
+	reportStopProgressDetail(cfg.ReportStopProgress, StopStepDraining, n0, drainWaitDetail(n0, "copies"), setDetail)
+
 	mergedCtx, cancelMerged := mergeWaitContexts(waitCtx, cfg.ShutdownContext)
 	defer cancelMerged()
 
+	onDrainTick := func(n int) {
+		reportStopProgressDetail(cfg.ReportStopProgress, StopStepDraining, n, drainWaitDetail(n, "copies"), setDetail)
+	}
 	graceCtx, graceCancel := context.WithTimeout(mergedCtx, queue.DefaultSpinDownGrace)
 	defer graceCancel()
-	if err := copyQueue.WaitInProgressZero(graceCtx, 50*time.Millisecond); err != nil {
+	if err := copyQueue.WaitInProgressZeroFunc(graceCtx, 50*time.Millisecond, onDrainTick); err != nil {
 		// After grace: force-checkout smallest file workers (freeze callback also does this).
 		copyQueue.RequestForceCheckoutAllWorkersForStop()
 		drainCtx, drainCancel := context.WithTimeout(mergedCtx, 5*time.Second)
 		defer drainCancel()
-		if err2 := copyQueue.WaitInProgressZero(drainCtx, 50*time.Millisecond); err2 != nil {
+		if err2 := copyQueue.WaitInProgressZeroFunc(drainCtx, 50*time.Millisecond, onDrainTick); err2 != nil {
+			copyQueue.Spin.AbandonDBOnly.Store(true)
 			copyQueue.AbandonInProgressTasks()
 		}
 	}
+	if err := errIfSoftSuspendHardKilled(cfg.ShutdownContext); err != nil {
+		copyQueue.Spin.AbandonDBOnly.Store(true)
+		copyQueue.ClearPendingBufferForSuspend()
+		copyQueue.AbandonInProgressTasks()
+		return queue.QueueStats{}, RuntimeSuspendV1{}, err
+	}
 	copyQueue.Spin.AbandonDBOnly.Store(false)
 
-	if err := database.Flush(); err != nil {
+	reportStopProgressDetail(cfg.ReportStopProgress, StopStepSaving, 0, "Writing the latest updates…", setDetail)
+
+	if err := awaitSoftSuspendDB(mergedCtx, cfg.ShutdownContext, func() error {
+		return database.Flush(context.Background())
+	}); err != nil {
 		return queue.QueueStats{}, RuntimeSuspendV1{}, fmt.Errorf("flush seal buffer: %w", err)
 	}
-	if err := database.RebuildCurrentByDepth(copyQueue.GetRound()); err != nil {
-		return queue.QueueStats{}, RuntimeSuspendV1{}, fmt.Errorf("rebuild current: %w", err)
-	}
-	if err := database.CheckpointWithRetry(mergedCtx, 5); err != nil {
-		return queue.QueueStats{}, RuntimeSuspendV1{}, fmt.Errorf("checkpoint: %w", err)
+	setDetail("Updating where things left off…")
+	if err := awaitSoftSuspendDB(mergedCtx, cfg.ShutdownContext, func() error {
+		return database.Flush(context.Background())
+	}); err != nil {
+		return queue.QueueStats{}, RuntimeSuspendV1{}, fmt.Errorf("flush seal buffer: %w", err)
 	}
 
 	stats := copyQueue.Stats()
@@ -379,36 +470,192 @@ func performCopySoftSuspend(
 		copyQueue.EffectiveLeaseBatchSize(), copyQueue.EffectiveRefillBatchSize(),
 		obsMs, progMs,
 		copyQueue.GetCopyPass(), stats.Round, copyQueue.GetMaxKnownDepth(),
+		copyQueue.GetKeysetCursor(),
 	)
+	if database.Ops() != nil {
+		_ = database.SaveCopyQueuePosition(stats.Round, copyQueue.GetKeysetCursor())
+	}
 
+	if observer != nil {
+		observer.SetWaitReason("Saving buffered progress…")
+	}
 	return stats, suspend, nil
+}
+
+func newDeleteSuspendState(
+	workerCount, maxRetries, leaseBatch, refillBatch, observerPollMs, progressTickMs int,
+	deletePass, lastRound, maxKnownDepth int,
+	cursor string,
+) RuntimeSuspendV1 {
+	return RuntimeSuspendV1{
+		Version:              1,
+		SuspendedAtUnix:      time.Now().Unix(),
+		Kind:                 "delete",
+		WorkerCount:          workerCount,
+		MaxRetries:           maxRetries,
+		LeaseBatchSize:       leaseBatch,
+		RefillBatchSize:      refillBatch,
+		ObserverPollMs:       observerPollMs,
+		ProgressTickMs:       progressTickMs,
+		CopyPass:             deletePass,
+		LastKnownDeleteRound: lastRound,
+		MaxKnownDepth:        maxKnownDepth,
+		CopyKeysetCursor:     cursor,
+	}
+}
+
+func performDeleteSoftSuspend(
+	waitCtx context.Context,
+	database *db.DB,
+	deleteQueue *queue.Queue,
+	observer *observe.QueueObserver,
+	cfg DeletePhaseConfig,
+	workerCount, maxRetries int,
+) (queue.QueueStats, RuntimeSuspendV1, error) {
+	if observer != nil {
+		observer.Stop()
+	}
+	deleteQueue.SetState(queue.QueueStatePaused)
+	deleteQueue.StopWatchdog()
+	deleteQueue.ClearPendingBufferForSuspend()
+
+	setDetail := func(d string) {
+		if observer != nil {
+			observer.SetWaitReason(d)
+		}
+	}
+	n0 := deleteQueue.InProgressCount()
+	reportStopProgressDetail(cfg.ReportStopProgress, StopStepDraining, n0, drainWaitDetail(n0, "removals"), setDetail)
+
+	mergedCtx, cancelMerged := mergeWaitContexts(waitCtx, cfg.ShutdownContext)
+	defer cancelMerged()
+
+	onDrainTick := func(n int) {
+		reportStopProgressDetail(cfg.ReportStopProgress, StopStepDraining, n, drainWaitDetail(n, "removals"), setDetail)
+	}
+	if err := deleteQueue.WaitInProgressZeroFunc(mergedCtx, 50*time.Millisecond, onDrainTick); err != nil {
+		if softSuspendHardKilled(cfg.ShutdownContext) {
+			deleteQueue.Spin.AbandonDBOnly.Store(true)
+			deleteQueue.AbandonInProgressTasks()
+		}
+		return queue.QueueStats{}, RuntimeSuspendV1{}, fmt.Errorf("delete queue drain in-flight: %w", err)
+	}
+	if err := errIfSoftSuspendHardKilled(cfg.ShutdownContext); err != nil {
+		deleteQueue.Spin.AbandonDBOnly.Store(true)
+		deleteQueue.ClearPendingBufferForSuspend()
+		deleteQueue.AbandonInProgressTasks()
+		return queue.QueueStats{}, RuntimeSuspendV1{}, err
+	}
+
+	reportStopProgressDetail(cfg.ReportStopProgress, StopStepSaving, 0, "Writing the latest updates…", setDetail)
+
+	if err := awaitSoftSuspendDB(mergedCtx, cfg.ShutdownContext, func() error {
+		return database.Flush(context.Background())
+	}); err != nil {
+		return queue.QueueStats{}, RuntimeSuspendV1{}, fmt.Errorf("flush seal buffer: %w", err)
+	}
+	setDetail("Updating where things left off…")
+	if err := awaitSoftSuspendDB(mergedCtx, cfg.ShutdownContext, func() error {
+		return database.Flush(context.Background())
+	}); err != nil {
+		return queue.QueueStats{}, RuntimeSuspendV1{}, fmt.Errorf("flush seal buffer: %w", err)
+	}
+
+	stats := deleteQueue.Stats()
+	obsMs := int(cfg.ObserverPollInterval / time.Millisecond)
+	if obsMs <= 0 {
+		obsMs = 200
+	}
+	progMs := int(cfg.ProgressTick / time.Millisecond)
+	if progMs <= 0 {
+		progMs = 2000
+	}
+
+	suspend := newDeleteSuspendState(
+		workerCount, maxRetries,
+		deleteQueue.EffectiveLeaseBatchSize(), deleteQueue.EffectiveRefillBatchSize(),
+		obsMs, progMs,
+		deleteQueue.GetCopyPass(), stats.Round, deleteQueue.GetMaxKnownDepth(),
+		deleteQueue.GetKeysetCursor(),
+	)
+	if database.Ops() != nil {
+		_ = database.SaveDeleteQueuePosition(stats.Round, deleteQueue.GetKeysetCursor())
+	}
+	if observer != nil {
+		observer.SetWaitReason("Saving buffered progress…")
+	}
+	return stats, suspend, nil
+}
+
+// finishSoftStopBulkPhase flushes the seal buffer and checkpoints without rebuilding secondary indexes.
+// Index rebuild belongs to end-of-mode finalize (*-finalizing), not soft Stop.
+// Call after perform*SoftSuspend and before returning suspended so Stop progress
+// stays on "Saving" until teardown is finished (Resume-ready).
+// Honors ctx cancellation and HardAborted (force stop must not Flush/checkpoint).
+func finishSoftStopBulkPhase(
+	ctx context.Context,
+	database *db.DB,
+	reportFn func(string, int),
+	setDetail func(string),
+) error {
+	if database == nil {
+		reportStopProgress(reportFn, StopStepDone, 0)
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if database.HardAborted() {
+		return fmt.Errorf("soft stop bulk phase aborted by force stop")
+	}
+	reportStopProgressDetail(reportFn, StopStepSaving, 0, "Saving buffered progress…", setDetail)
+	database.SetActivity("Saving buffered progress…")
+	if err := database.StopBulkPhaseSeal(); err != nil {
+		database.SetActivity("")
+		return fmt.Errorf("stop bulk phase seal: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if database.HardAborted() {
+		return fmt.Errorf("soft stop bulk phase aborted by force stop")
+	}
+	reportStopProgressDetail(reportFn, StopStepSaving, 0, "Making sure everything is safely stored…", setDetail)
+	if err := database.CheckpointWithRetry(ctx, 5); err != nil {
+		return fmt.Errorf("checkpoint: %w", err)
+	}
+	database.SetActivity("")
+	if setDetail != nil {
+		setDetail("")
+	}
+	reportStopProgress(reportFn, StopStepDone, 0)
+	return nil
+}
+
+func forceStopOverridesSoftSuspend(shutdown context.Context, database *db.DB) bool {
+	return softSuspendHardKilled(shutdown) || (database != nil && database.HardAborted())
 }
 
 func logTraversalResumePositionCheck(resume *RuntimeSuspendV1, srcQueue, dstQueue *queue.Queue) {
 	if resume == nil || srcQueue == nil || dstQueue == nil {
 		return
 	}
-	if srcQueue.GetMode() != queue.QueueModeRetry || dstQueue.GetMode() != queue.QueueModeRetry {
+	if srcQueue.GetMode() != queue.QueueModeTraversal || dstQueue.GetMode() != queue.QueueModeTraversal {
 		logResumeCheck("warning", fmt.Sprintf(
-			"traversal resume: expected retry mode (src=%s dst=%s)",
+			"traversal resume: expected traversal mode (src=%s dst=%s)",
 			srcQueue.GetMode(), dstQueue.GetMode(),
 		))
 		return
 	}
 	srcRound := srcQueue.Stats().Round
 	dstRound := dstQueue.Stats().Round
-	if resume.LastRoundSrc > 0 && srcRound != resume.LastRoundSrc {
-		logResumeCheck("info", fmt.Sprintf(
-			"traversal resume: restarting at src round %d (suspended at %d) in retry mode",
-			srcRound, resume.LastRoundSrc,
-		))
-	}
-	if resume.LastRoundDst > 0 && dstRound != resume.LastRoundDst {
-		logResumeCheck("info", fmt.Sprintf(
-			"traversal resume: restarting at dst round %d (suspended at %d) in retry mode",
-			dstRound, resume.LastRoundDst,
-		))
-	}
+	logResumeCheck("info", fmt.Sprintf(
+		"traversal resume: continuing src round %d dst round %d (suspended src=%d dst=%d)",
+		srcRound, dstRound, resume.LastRoundSrc, resume.LastRoundDst,
+	))
 }
 
 func logCopyResumePositionCheck(resume *RuntimeSuspendV1, copyQueue *queue.Queue, startRound int) {
@@ -436,32 +683,70 @@ func logResumeCheck(level, message string) {
 	_ = logservice.LS.Log(level, message, "migration", "resume-check", "")
 }
 
-// DefaultStopGracePeriod is how long a soft-suspend drain may run before the run context is canceled.
-const DefaultStopGracePeriod = 30 * time.Second
-
-const softSuspendMaxWait = 4 * time.Minute
-
-// softSuspendWaitContext bounds soft-suspend I/O; it is canceled when ShutdownContext is canceled.
+// softSuspendWaitContext cancels when ShutdownContext is canceled (force abort / process shutdown).
+// Soft stop itself has no wall-clock kill timer; use Abort() for hard kill.
 func softSuspendWaitContext(shutdown context.Context) (context.Context, context.CancelFunc) {
 	parent := shutdown
 	if parent == nil {
 		parent = context.Background()
 	}
-	return context.WithTimeout(parent, softSuspendMaxWait)
+	return context.WithCancel(parent)
 }
 
-func (m *Migration) armStopGraceTimer(period time.Duration) {
-	if period <= 0 {
-		period = DefaultStopGracePeriod
+func softSuspendHardKilled(shutdown context.Context) bool {
+	return shutdown != nil && shutdown.Err() != nil
+}
+
+func errIfSoftSuspendHardKilled(shutdown context.Context) error {
+	if !softSuspendHardKilled(shutdown) {
+		return nil
 	}
-	m.stopGraceMu.Lock()
-	defer m.stopGraceMu.Unlock()
-	if m.stopGraceTimer != nil {
-		m.stopGraceTimer.Stop()
+	return fmt.Errorf("soft suspend aborted by force stop: %w", shutdown.Err())
+}
+
+// awaitSoftSuspendDB runs fn but returns immediately when hard kill cancels waitCtx/shutdown.
+// An in-flight DuckDB op may still finish in the background; hard kill must not block the run loop on it.
+func awaitSoftSuspendDB(waitCtx, shutdown context.Context, fn func() error) error {
+	if waitCtx == nil {
+		waitCtx = context.Background()
 	}
-	m.stopGraceTimer = time.AfterFunc(period, func() {
-		_, _ = m.ForceStop()
-	})
+	if err := errIfSoftSuspendHardKilled(shutdown); err != nil {
+		return err
+	}
+	if err := waitCtx.Err(); err != nil {
+		if kill := errIfSoftSuspendHardKilled(shutdown); kill != nil {
+			return kill
+		}
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		if kill := errIfSoftSuspendHardKilled(shutdown); kill != nil {
+			return kill
+		}
+		return err
+	case <-waitCtx.Done():
+		if kill := errIfSoftSuspendHardKilled(shutdown); kill != nil {
+			return kill
+		}
+		return waitCtx.Err()
+	}
+}
+
+func abandonQueuesDBOnly(queues ...*queue.Queue) {
+	for _, q := range queues {
+		if q == nil {
+			continue
+		}
+		q.Spin.AbandonDBOnly.Store(true)
+		q.ClearPendingBufferForSuspend()
+		q.RequestForceCheckoutAllWorkersForStop()
+		q.CancelBusyWorkerContexts()
+		q.AbandonInProgressTasks()
+		q.ClearPendingBufferForSuspend()
+	}
 }
 
 func (m *Migration) disarmStopGraceTimer() {

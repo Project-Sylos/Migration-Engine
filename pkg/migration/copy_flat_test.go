@@ -186,7 +186,7 @@ func seedFlatCopyLayout(t *testing.T, database *db.DB) {
 		Source:        db.IDMapSourceRootSeed,
 		Status:        db.IDMapStatusActive,
 	})
-	if err := database.Flush(); err != nil {
+	if err := database.Flush(context.Background()); err != nil {
 		t.Fatalf("flush id_map: %v", err)
 	}
 
@@ -201,44 +201,29 @@ func seedFlatCopyLayout(t *testing.T, database *db.DB) {
 		{name: flatCopyFile, typ: db.NodeTypeFile, size: 12},
 	}
 
-	err := database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			now := time.Now().UTC().Format(time.RFC3339)
-			for _, ch := range children {
-				path := "/" + ch.name
-				nodeID := db.MintNodeID("SRC", srcRootID, ch.typ, ch.name)
-				node := &db.NodeState{
-					ID:              nodeID,
-					ServiceID:       "src-" + ch.name,
-					ParentID:        srcRootID,
-					ParentServiceID: srcRootService,
-					Path:            path,
-					ParentPath:      "/",
-					Name:            ch.name,
-					Type:            ch.typ,
-					Size:            ch.size,
-					MTime:           now,
-					Depth:           1,
-					TraversalStatus: db.StatusSuccessful,
-					CopyStatus:      db.CopyStatusPending,
-				}
-				if err := w.AppenderInsert("src_nodes", []*db.NodeState{node}); err != nil {
-					return err
-				}
-				if err := w.InsertStatusEvent("SRC", &db.StatusEvent{
-					ID:              nodeID,
-					TraversalStatus: db.StatusSuccessful,
-					CopyStatus:      db.CopyStatusPending,
-					EventTime:       time.Now().UnixNano(),
-					Depth:           1,
-				}); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-	})
-	if err != nil {
+	now := time.Now().UTC().Format(time.RFC3339)
+	ops := make([]db.InsertOperation, 0, len(children))
+	for _, ch := range children {
+		path := "/" + ch.name
+		nodeID := db.MintNodeID("SRC", srcRootID, ch.typ, ch.name)
+		node := &db.NodeState{
+			ID:              nodeID,
+			ServiceID:       "src-" + ch.name,
+			ParentID:        srcRootID,
+			ParentServiceID: srcRootService,
+			Path:            path,
+			ParentPath:      "/",
+			Name:            ch.name,
+			Type:            ch.typ,
+			Size:            ch.size,
+			MTime:           now,
+			Depth:           1,
+			TraversalStatus: db.StatusSuccessful,
+			CopyStatus:      db.CopyStatusPending,
+		}
+		ops = append(ops, db.InsertOperation{QueueType: "SRC", Level: 1, Status: db.StatusSuccessful, State: node})
+	}
+	if err := database.SeedDiscoveredNodes(ops); err != nil {
 		t.Fatalf("seed children: %v", err)
 	}
 }

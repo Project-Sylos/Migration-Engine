@@ -7,6 +7,7 @@ import (
 	"errors"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
 )
 
 // RetrySweepOptions are manager-level knobs for retry sweep runs.
@@ -56,6 +57,8 @@ type DiffItem struct {
 	MissingOnSource    bool
 	MissingOnDest      bool
 	Size               int64
+	DstSize            int64
+	HasDstSize         bool
 	SrcFailureLogID    string
 	SrcFailureMessage  string
 	DstFailureLogID    string
@@ -63,6 +66,10 @@ type DiffItem struct {
 	// ResolvedDstName is the accepted/committed destination basename from path_events.
 	// Empty when no remap was applied. Review identity (Path/Name) stays SRC-original.
 	ResolvedDstName string
+	// DisplayPath is the user-facing name path (e.g. /Reports/a.txt). Path stays id_path for nav.
+	DisplayPath string
+	// DstDisplayPath is the destination-side friendly path when it differs (rename leaf).
+	DstDisplayPath string
 }
 
 type ListChildrenDiffsRequest struct {
@@ -74,15 +81,19 @@ type ListChildrenDiffsRequest struct {
 	FoldersOnly     bool
 	TraversalStatus string
 	CopyStatus      string
-	// IncludeDestinationOnly when false hides destination-only rows. Nil means include (legacy default).
+	// AfterPath / AfterID keyset cursor within the folder (path ASC). When set, Offset is ignored for filtering.
+	AfterPath string
+	AfterID   string
+	// IncludeDestinationOnly when false hides destination-only rows. Nil means include.
 	IncludeDestinationOnly *bool
 }
 
 type ListChildrenDiffsResult struct {
-	Items  []DiffItem
-	Total  int
-	Limit  int
-	Offset int
+	Items   []DiffItem
+	Total   *int // nil when unknown (hasMore pagination)
+	HasMore bool
+	Limit   int
+	Offset  int
 }
 
 // PathReviewSearchCondition mirrors API/UI search filters (field names lowercase in JSON).
@@ -93,13 +104,18 @@ type PathReviewSearchCondition struct {
 }
 
 type SearchRequest struct {
-	Query         string
-	Path          string // empty = global search over all review paths
+	Query string
+	Path  string // empty = global search over all review paths
+	// UnderPath scopes to a folder and descendants (not direct children). Empty or "/" = global.
+	UnderPath     string
 	Limit         int
 	Offset        int
 	SortBy        string
 	SortDirection string
-	FoldersOnly   bool
+	AfterPath     string
+	AfterID       string
+
+	FoldersOnly bool
 
 	// Structured search. StatusSearchType + TraversalStatus + CopyStatus filter rows.
 	Conditions       []PathReviewSearchCondition `json:"conditions,omitempty"`
@@ -107,8 +123,10 @@ type SearchRequest struct {
 	TraversalStatus  string                      `json:"traversalStatus,omitempty"`
 	CopyStatus       string                      `json:"copyStatus,omitempty"`
 	DeleteStatus     string                      `json:"deleteStatus,omitempty"`
-	// IncludeDestinationOnly when false hides destination-only rows. Nil means include (legacy default).
+	// IncludeDestinationOnly when false hides destination-only rows. Nil means include.
 	IncludeDestinationOnly *bool `json:"includeDestinationOnly,omitempty"`
+	// Ruleset is an optional filter-rules predicate compiled into SRC search SQL.
+	Ruleset *filter.Ruleset `json:"ruleset,omitempty"`
 }
 
 type SearchResult struct {
@@ -130,6 +148,8 @@ type DiffsStats struct {
 	MissingOnSource int
 	MissingOnDest   int
 	Excluded        int
+	// Truncated means the count stopped early (deadline); Total is a lower bound.
+	Truncated bool
 }
 
 // Canonical delta keys for PathReviewActionResult.Deltas. Only keys that changed (non-zero) are included.
@@ -138,6 +158,7 @@ const (
 	DeltaTraversalPendingRetry = "traversalPendingRetry"
 	DeltaTraversalFailed       = "traversalFailed"
 	DeltaCopyPending           = "copyPending"
+	DeltaCopyPendingRetry      = "copyPendingRetry"
 	DeltaCopyFailed            = "copyFailed"
 	DeltaCopySuccessful        = "copySuccessful"
 	DeltaDeletePending         = "deletePending"
@@ -164,7 +185,7 @@ func addReviewDelta(deltas map[string]int64, key string, delta int64) {
 // Statuses without a tracked review counter (e.g. skipped) return "".
 func deleteStatusReviewDeltaKey(status string) string {
 	switch status {
-	case db.DeleteStatusPending:
+	case db.DeleteStatusPendingExplicit, db.DeleteStatusPendingInherited:
 		return DeltaDeletePending
 	case db.DeleteStatusFailed:
 		return DeltaDeleteFailed
@@ -197,8 +218,10 @@ type PathReviewActionResult struct {
 }
 
 // PathReviewStats is the UI/API-facing review stats shape. pendingCount, failedCount, and pendingRetriesCount are phase-aware.
+// PendingCount is nil when the current review view has no Pending column (Discover / delete results);
+// it is never zeroed to "hide" a live counter.
 type PathReviewStats struct {
-	PendingCount        int
+	PendingCount        *int
 	FailedCount         int
 	ExcludedCount       int
 	PendingRetriesCount int
@@ -221,10 +244,12 @@ func ReviewStatsRawFromSnapshot(s db.ReviewStatsSnapshot) ReviewStatsRaw {
 		TraversalPendingRetry: s.TraversalPendingRetry,
 		TraversalFailed:       s.TraversalFailed,
 		CopyPending:           s.CopyPending,
+		CopyPendingRetry:      s.CopyPendingRetry,
 		CopyFailed:            s.CopyFailed,
 		CopySuccessful:        s.CopySuccessful,
 		DeletePending:         s.DeletePending,
 		DeleteFailed:          s.DeleteFailed,
+		DeleteSkipped:         s.DeleteSkipped,
 		Excluded:              s.Excluded,
 		Folders:               s.Folders,
 		Files:                 s.Files,
@@ -241,10 +266,12 @@ type ReviewStatsRaw struct {
 	TraversalPendingRetry int64
 	TraversalFailed       int64
 	CopyPending           int64
+	CopyPendingRetry      int64
 	CopyFailed            int64
 	CopySuccessful        int64
 	DeletePending         int64
 	DeleteFailed          int64
+	DeleteSkipped         int64
 	Excluded              int64
 	Folders               int64
 	Files                 int64
@@ -254,26 +281,33 @@ type ReviewStatsRaw struct {
 }
 
 // ToPathReviewStats projects raw stats into the API shape using phase.
+// PendingCount is for plan/preview and live runs only; Discover and post-review
+// (copy results, delete results) omit it (nil) rather than zeroing live counters.
 func (r ReviewStatsRaw) ToPathReviewStats(phase string) PathReviewStats {
-	var pendingCount, failedCount, pendingRetriesCount int64
+	var pendingCount *int
+	var failedCount, pendingRetriesCount int64
 	switch phase {
 	case PhaseTraversing, PhaseTraversalSuspended, PhaseTraversalReview:
-		// Traversing includes initial traversal and traversal retry sweep; same counters as review for API polls.
-		pendingCount = r.CopyPending
-		failedCount = r.TraversalFailed
-		pendingRetriesCount = r.TraversalPendingRetry
-	case PhaseCopying, PhaseCopySuspended, PhaseCopyReview:
-		pendingCount = 0
-		failedCount = r.CopyFailed
-		pendingRetriesCount = r.CopyPending // copy phase: no separate retry counter
-	case PhaseDeleting, PhaseDeleteSuspended, PhaseDeleteReview:
-		pendingCount = r.DeletePending
-		failedCount = r.DeleteFailed
-		pendingRetriesCount = r.DeletePending // items marked pending for delete retry (mirrors copy review)
+		failedCount = clampNonNeg(r.TraversalFailed)
+		pendingRetriesCount = clampNonNeg(r.TraversalPendingRetry)
+	case PhaseCopying, PhaseCopySuspended, PhaseCopyFinalizing, PhaseCopyFinalizeFailed:
+		retry := clampNonNeg(r.CopyPendingRetry)
+		pendingCount = intPtr(int(clampNonNeg(r.CopyPending - retry)))
+		failedCount = clampNonNeg(r.CopyFailed)
+		pendingRetriesCount = retry
+	case PhaseCopyReview:
+		// Post-copy review: no Pending column; marked leftovers stay under Pending Retry.
+		failedCount = clampNonNeg(r.CopyFailed)
+		pendingRetriesCount = clampNonNeg(r.CopyPendingRetry)
+	case PhaseDeleting, PhaseDeleteSuspended:
+		pendingCount = intPtr(int(clampNonNeg(r.DeletePending)))
+		failedCount = clampNonNeg(r.DeleteFailed)
+	case PhaseDeleteReview:
+		failedCount = clampNonNeg(r.DeleteFailed)
+		pendingRetriesCount = clampNonNeg(r.DeletePending)
 	default:
-		pendingCount = r.CopyPending
-		failedCount = r.TraversalFailed
-		pendingRetriesCount = r.TraversalPendingRetry
+		failedCount = clampNonNeg(r.TraversalFailed)
+		pendingRetriesCount = clampNonNeg(r.TraversalPendingRetry)
 	}
 	total := r.Folders + r.Files
 	var foldersRatio, filesRatio float64
@@ -282,7 +316,7 @@ func (r ReviewStatsRaw) ToPathReviewStats(phase string) PathReviewStats {
 		filesRatio = roundRatio(float64(r.Files)/float64(total), 2)
 	}
 	return PathReviewStats{
-		PendingCount:        int(pendingCount),
+		PendingCount:        pendingCount,
 		FailedCount:         int(failedCount),
 		ExcludedCount:       int(r.Excluded),
 		PendingRetriesCount: int(pendingRetriesCount),
@@ -297,6 +331,15 @@ func (r ReviewStatsRaw) ToPathReviewStats(phase string) PathReviewStats {
 			Selected: maxInt64(0, r.SizeSelected),
 		},
 	}
+}
+
+func intPtr(n int) *int { return &n }
+
+func clampNonNeg(n int64) int64 {
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 func maxInt64(a, b int64) int64 {

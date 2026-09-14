@@ -66,10 +66,16 @@ func queueSizingForScalingContext(ctx queue.ScalingContext, suspend *RuntimeSusp
 		if op == profile.OpListChildren {
 			prof := profile.ToActuatorProfile(profile.ResolveOperationProfile(ctx))
 			if batch := profile.QueueBatchSizingFromProfile(prof); batch != nil {
-				return &queue.QueueSizing{
+				sizing := &queue.QueueSizing{
 					LeaseBatchSize:  batch.LeaseBatchSize,
 					RefillBatchSize: batch.RefillBatchSize,
 				}
+				if ctx.QueueName == "dst" && (ctx.Mode == "" || ctx.Mode == queue.ScalingModeTraversal) {
+					if sizing.RefillBatchSize <= 0 || sizing.RefillBatchSize >= 10000 {
+						sizing.RefillBatchSize = profile.DstTraversalDefaultRefillBatch
+					}
+				}
+				return sizing
 			}
 		}
 	}

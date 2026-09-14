@@ -44,6 +44,9 @@ type Autoscaler struct {
 	debugAIMD   bool
 	memoryKnobCooldownUntil time.Time
 	workerCapOverrides profile.WorkerCapOverrides
+	// lastMaxWorkers tracks effective MaxWorkers per AIMD state key so SoftCap can
+	// be cleared when the hard ceiling rises (overrides / profile changes).
+	lastMaxWorkers map[string]int
 }
 
 // Config configures the autoscaler loop.
@@ -110,6 +113,7 @@ func NewAutoscaler(database *db.DB, observer *observe.QueueObserver, registry *b
 		memSampler: memory.DefaultMemorySampler,
 		debugAIMD:  aimd.DebugEnabled(cfg.DebugAIMD),
 		workerCapOverrides: cfg.WorkerCapOverrides.Clone(),
+		lastMaxWorkers:     make(map[string]int),
 	}
 }
 
@@ -189,28 +193,18 @@ func (a *Autoscaler) tick() {
 	now := time.Now()
 	sealBackpressure := seal.HardCapHitsSinceLastPoll > 0
 
+	// Host memory only moves lease/refill/seal knobs. Worker AIMD ignores memory level.
 	switch pressure {
-	case scaling.PressureFSThrottle:
-		a.stepDownWorkers(internal)
 	case scaling.PressureMemory:
-		a.stepDownWorkers(nil)
 		a.stepDownMemoryKnobs(now, scaling.PressureMemory)
 		a.noteMemoryKnobCooldown(now)
 	case scaling.PressureUnderfeed:
-		if memory.ScaleUpAllowed(memLevel) {
-			a.stepUpWorkers(internal, inProgress, pending, scaleUpUnderfeed)
-			if a.memoryKnobIncreaseAllowed(now) && memory.MemoryBudgetAllowsIncrease(memSample, 0) {
-				a.stepUpMemoryKnobs(now, memSample)
-			}
-		} else if a.debugAIMD {
-			a.debugAIMDPrint(fmt.Sprintf("  aimd worker scale-up blocked: host memory=%v (need green)", memLevel))
-		}
-	case scaling.PressureNone:
-		if memory.ScaleUpAllowed(memLevel) {
-			a.stepUpWorkers(internal, inProgress, pending, scaleUpCalmProbe)
+		if a.memoryKnobIncreaseAllowed(now) && memory.ScaleUpAllowed(memLevel) && memory.MemoryBudgetAllowsIncrease(memSample, 0) {
+			a.stepUpMemoryKnobs(now, memSample)
+		} else if a.debugAIMD && !memory.ScaleUpAllowed(memLevel) {
+			a.debugAIMDPrint(fmt.Sprintf("  aimd batch/seal scale-up blocked: host memory=%v (need green)", memLevel))
 		}
 	}
-
 	if sealBackpressure {
 		a.stepDownMemoryKnobs(now, scaling.PressureSeal)
 		a.noteMemoryKnobCooldown(now)
@@ -218,15 +212,43 @@ func (a *Autoscaler) tick() {
 			a.debugAIMDPrint("  aimd seal backpressure: stepped down batch/seal knobs (not host memory pressure)")
 		}
 	}
+
+	workerPressure := pressure
+	if pressure == scaling.PressureMemory {
+		// Reclassify without host-memory red so FS/underfeed/none still drive workers.
+		workerPressure = scaling.Classify(scaling.ClassifierInput{
+			Internal:      internal,
+			SealTelemetry: seal,
+			MemoryLevel:   memory.MemoryGreen,
+			InProgress:    inProgress,
+			Pending:       pending,
+		})
+		a.mu.Lock()
+		a.lastClass = workerPressure
+		a.mu.Unlock()
+	}
+	switch workerPressure {
+	case scaling.PressureFSThrottle:
+		a.stepDownWorkers(internal)
+	case scaling.PressureUnderfeed:
+		a.stepUpWorkers(internal, inProgress, pending, scaleUpUnderfeed)
+	case scaling.PressureNone:
+		a.stepUpWorkers(internal, inProgress, pending, scaleUpCalmProbe)
+	}
+	if pressure == scaling.PressureMemory {
+		a.mu.Lock()
+		a.lastClass = scaling.PressureMemory
+		a.mu.Unlock()
+	}
 }
 
 func (a *Autoscaler) noteMemoryKnobCooldown(now time.Time) {
 	if a == nil {
 		return
 	}
-	cooldown := 3 * a.interval
+	cooldown := 2 * a.interval
 	if cooldown <= 0 {
-		cooldown = 30 * time.Second
+		cooldown = 20 * time.Second
 	}
 	until := now.Add(cooldown)
 	if until.After(a.memoryKnobCooldownUntil) {
@@ -409,7 +431,7 @@ func (a *Autoscaler) maxThroughputRate(queueNames []string) float64 {
 }
 
 func (a *Autoscaler) prepareScaleUpState(st *aimd.State, maxWorkers int, now time.Time) {
-	underPressure := a.lastClass == scaling.PressureFSThrottle || a.lastClass == scaling.PressureMemory
+	underPressure := a.lastClass == scaling.PressureFSThrottle
 	if !underPressure {
 		st.ClearFSBackoff()
 	}

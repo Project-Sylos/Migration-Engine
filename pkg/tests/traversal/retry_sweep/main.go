@@ -11,8 +11,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Migration-Engine/pkg/tests/traversal/shared"
@@ -137,7 +135,7 @@ func runTest() error {
 	fmt.Printf("Selected SRC node: %s (depth: %d, type: %s)\n", selectedChild.Path, selectedChild.Depth, selectedChild.Type)
 
 	// Find corresponding DST node (join by path)
-	dstNodeID, err := db.GetDstIDFromSrcID(database, selectedChild.ID)
+	dstNodeID, err := pull.GetDstIDFromSrcID(database, selectedChild.ID)
 	if err != nil {
 		return fmt.Errorf("failed to get DST node ID from SRC node: %w", err)
 	}

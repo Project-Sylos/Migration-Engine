@@ -4,11 +4,11 @@
 package review
 
 import (
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
-	"context"
 	"testing"
 	"time"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
 func TestListMergedReviewDiffsPathIssueFilter(t *testing.T) {
@@ -38,40 +38,21 @@ func TestListMergedReviewDiffsPathIssueFilter(t *testing.T) {
 		ID:   db.DeterministicNodeID("SRC", db.NodeTypeFile, "/ignored.txt"),
 		Path: "/ignored.txt", ParentPath: "/", Name: "ignored.txt",
 		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
+		GPLStatus: db.GPLStatusIgnored,
 	}
 	manual := &db.NodeState{
 		ID:   db.DeterministicNodeID("SRC", db.NodeTypeFile, "/*"),
 		Path: "/*", ParentPath: "/", Name: "*",
 		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
 	}
+	seedReviewTree(t, database, []*db.NodeState{clean, issue, accepted, rejected, manual}, nil, nil)
 
-	err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			if err := w.AppenderInsert(db.TableSrcNodes, []*db.NodeState{clean, issue, accepted, rejected, manual}); err != nil {
-				return err
-			}
-			events := []db.StatusEvent{
-				{ID: clean.ID, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending, EventTime: eventTime, Depth: 1},
-				{ID: issue.ID, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending, EventTime: eventTime, Depth: 1},
-				{ID: accepted.ID, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending, EventTime: eventTime, Depth: 1},
-				{ID: rejected.ID, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending, GPLStatus: db.GPLStatusIgnored, EventTime: eventTime, Depth: 1},
-				{ID: manual.ID, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending, EventTime: eventTime, Depth: 1},
-			}
-			if err := w.BatchInsertSrcStatusEvents(events); err != nil {
-				return err
-			}
-			return w.BatchInsertPathEvents([]db.PathEvent{
-				{ID: issue.ID, EventTime: eventTime, Category: db.PathEventCategoryGPLClean, ProposedPath: "bad_name.txt", Status: db.PathEventStatusPending},
-				{ID: accepted.ID, EventTime: eventTime, Category: db.PathEventCategoryGPLClean, ProposedPath: "accepted.txt", Status: db.PathEventStatusAccepted},
-				{ID: rejected.ID, EventTime: eventTime, Category: db.PathEventCategoryGPLClean, ProposedPath: "ignored.txt", Status: db.PathEventStatusPending},
-				{ID: manual.ID, EventTime: eventTime, Category: db.PathEventCategoryGPLClean, ProposedPath: "", Status: db.PathEventStatusManualReview},
-			})
-		})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := database.RebuildAllCurrent(); err != nil {
+	if err := database.Ops().BatchPutGPL([]opsdb.GPLRecord{
+		{SrcID: issue.ID, UpdatedAt: eventTime, ProposedName: "bad_name.txt", Status: db.GPLIssueStatusPending},
+		{SrcID: accepted.ID, UpdatedAt: eventTime, ProposedName: "accepted.txt", Status: db.GPLIssueStatusAccepted},
+		{SrcID: rejected.ID, UpdatedAt: eventTime, ProposedName: "ignored.txt", Status: db.GPLIssueStatusPending},
+		{SrcID: manual.ID, UpdatedAt: eventTime, ProposedName: "", Status: db.GPLIssueStatusManualReview},
+	}); err != nil {
 		t.Fatal(err)
 	}
 

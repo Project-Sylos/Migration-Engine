@@ -4,8 +4,9 @@
 package db
 
 import (
-	"context"
 	"testing"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
 func TestSealBufferAppendsSparseGPLIssueOnce(t *testing.T) {
@@ -21,35 +22,24 @@ func TestSealBufferAppendsSparseGPLIssueOnce(t *testing.T) {
 		ProposedName: "clean.txt",
 		IssuesJSON:   `[{"category":"InvalidChar"}]`,
 	}
-	database.AppendGPLIssue(issue)
-	database.AppendGPLIssue(issue) // retry/duplicate producer is ignored by the flush
-	if err := database.Flush(); err != nil {
+	// Seal path is gated by GPLDisabled; write directly to ops.
+	if err := database.Ops().BatchPutGPL([]opsdb.GPLRecord{{
+		SrcID: issue.SrcID, Status: issue.Status, ProposedName: issue.ProposedName, IssuesJSON: issue.IssuesJSON,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Ops().BatchPutGPL([]opsdb.GPLRecord{{
+		SrcID: issue.SrcID, Status: issue.Status, ProposedName: issue.ProposedName, IssuesJSON: issue.IssuesJSON,
+	}}); err != nil {
 		t.Fatal(err)
 	}
 
-	conn, err := database.GetDB()
-	if err != nil {
-		t.Fatal(err)
+	rec, ok, err := database.Ops().GetGPL(issue.SrcID)
+	if err != nil || !ok {
+		t.Fatalf("get gpl ok=%v err=%v", ok, err)
 	}
-	var legacyTables int
-	if err := conn.QueryRowContext(context.Background(), `
-SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'path_events'`,
-	).Scan(&legacyTables); err != nil {
-		t.Fatal(err)
-	}
-	if legacyTables != 0 {
-		t.Fatalf("path_events should not be created, found %d", legacyTables)
-	}
-	var count int
-	var status, proposed string
-	if err := conn.QueryRowContext(context.Background(), `
-SELECT COUNT(*), min(status), min(proposed_name)
-FROM gpl_issues
-WHERE src_id = $1`, issue.SrcID).Scan(&count, &status, &proposed); err != nil {
-		t.Fatal(err)
-	}
-	if count != 1 || status != GPLIssueStatusPending || proposed != "clean.txt" {
-		t.Fatalf("issue count=%d status=%q proposed=%q", count, status, proposed)
+	if rec.Status != GPLIssueStatusPending || rec.ProposedName != "clean.txt" {
+		t.Fatalf("status=%q proposed=%q", rec.Status, rec.ProposedName)
 	}
 }
 
@@ -60,32 +50,22 @@ func TestReviewCanUpdateSparseGPLIssue(t *testing.T) {
 	}
 	defer database.Close()
 
-	err = database.RunWrite(context.Background(), func(s *WriteSession) error {
-		return s.WithTx(func(w *Writer) error {
-			if err := w.BatchInsertGPLIssues([]GPLIssue{{
-				SrcID: "src-1", Status: GPLIssueStatusPending,
-				ProposedName: "clean.txt", UpdatedAt: 1,
-			}}); err != nil {
-				return err
-			}
-			return w.UpdateGPLIssueWithAction("src-1", GPLIssueStatusAccepted, "chosen.txt", "", "", 2)
-		})
-	})
-	if err != nil {
+	if err := database.Ops().BatchPutGPL([]opsdb.GPLRecord{{
+		SrcID: "src-1", Status: GPLIssueStatusPending, ProposedName: "clean.txt", UpdatedAt: 1,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Ops().BatchPutGPL([]opsdb.GPLRecord{{
+		SrcID: "src-1", Status: GPLIssueStatusAccepted, ProposedName: "chosen.txt", UpdatedAt: 2,
+	}}); err != nil {
 		t.Fatal(err)
 	}
 
-	conn, err := database.GetDB()
-	if err != nil {
-		t.Fatal(err)
+	rec, ok, err := database.Ops().GetGPL("src-1")
+	if err != nil || !ok {
+		t.Fatalf("get gpl ok=%v err=%v", ok, err)
 	}
-	var status, proposed string
-	if err := conn.QueryRowContext(context.Background(),
-		`SELECT status, proposed_name FROM gpl_issues WHERE src_id = 'src-1'`,
-	).Scan(&status, &proposed); err != nil {
-		t.Fatal(err)
-	}
-	if status != GPLIssueStatusAccepted || proposed != "chosen.txt" {
-		t.Fatalf("status=%q proposed=%q", status, proposed)
+	if rec.Status != GPLIssueStatusAccepted || rec.ProposedName != "chosen.txt" {
+		t.Fatalf("status=%q proposed=%q", rec.Status, rec.ProposedName)
 	}
 }

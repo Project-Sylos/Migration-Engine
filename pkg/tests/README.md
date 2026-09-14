@@ -12,6 +12,8 @@ Do **not** rely on `go test ./...` for these; use the scripts when you want full
 
 ```
 pkg/tests/
+├── shared/
+│   └── dual_tree/        # Local FS A/B trees: build, deny, restore, cleanup (bash)
 ├── traversal/
 │   ├── shared/           # setup.go, verify.go, test_utils.go, spectra.json, cleanup scripts
 │   ├── normal/           # Happy-path traversal (main.go, run.sh / run.ps1)
@@ -20,14 +22,29 @@ pkg/tests/
 │   ├── local/            # Local-focused runner
 │   ├── resumption/       # Shutdown + resume (run_resumption_test.sh / .ps1)
 │   └── retry_sweep/      # Mark retry, subtree behavior, re-run sweep (main.go, run.sh / run.ps1)
-│       └── scripts_for_quick_tests/   # Optional Windows permission scripts + README
-└── copy/
-    ├── shared/           # setup, verify, cleanup scripts
-    ├── normal/
+│       └── scripts_for_quick_tests/   # Wrappers -> shared/dual_tree (+ older Windows .ps1)
+├── copy/
+│   ├── shared/           # setup, verify, cleanup scripts
+│   ├── normal/
+│   └── local/
+└── delete/
     └── local/
 ```
 
 There is **no** top-level `pkg/tests/normal/` or `pkg/tests/retry_sweep/`—those paths live under **`traversal/`**.
+
+### Local dual-tree permission fixtures (`shared/dual_tree`)
+
+Manual bash helpers for real-disk SRC/DST trees (nearly identical, with SRC-only and DST-only items). Useful for UI/API checks of **traversal / copy / delete** and **retry** after permission failures:
+
+```bash
+bash pkg/tests/shared/dual_tree/build.sh
+bash pkg/tests/shared/dual_tree/deny.sh      # lock A's top-level children
+bash pkg/tests/shared/dual_tree/restore.sh   # unlock before retry
+bash pkg/tests/shared/dual_tree/cleanup.sh
+```
+
+Point Sylos SRC at `~/sylos_dual_tree_test/A` and DST at `~/sylos_dual_tree_test/B`. Details: [`shared/dual_tree/README.md`](./shared/dual_tree/README.md).
 
 ---
 
@@ -49,6 +66,7 @@ There is **no** top-level `pkg/tests/normal/` or `pkg/tests/retry_sweep/`—thos
 | **`traversal/resumption`** | **`StartMigration`**, interrupt, then **`LetsMigrate`** again with `-resume` (see script + `main.go`). |
 | **`traversal/retry_sweep`** | Full migration, then mark-for-retry / subtree / **`RunRetrySweep`** (engine retry sweep)—uses **DuckDB** tables and status events. |
 | **`copy/normal`**, **`copy/local`** | Copy-phase exercises after a traversal DB exists. |
+| **`copy/scale_down_resume`** | Spectra chaos 429s + AIMD scale-down during copy; asserts no duplicate copy success events and no `already_existed` on attempt-marked nodes. Run: `./pkg/tests/copy/scale_down_resume/run.sh` |
 | **`delete/local`** | Full pipeline traversal → copy → delete; asserts source tree empty. |
 
 ---

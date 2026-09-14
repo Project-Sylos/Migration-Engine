@@ -10,6 +10,7 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
+	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
@@ -39,10 +40,12 @@ type MigrationConfig struct {
 	ShutdownContext context.Context
 	// RootPreparation selects start rounds after UI-injected depth-1 children at AddRoots.
 	RootPreparation RootPreparation
-	// ResumeTraversal: non-nil after traversal-suspended; retry-style frontier rebuild (round 0, persisted max depth / sizing).
+	// ResumeTraversal: non-nil after traversal-suspended; continue the same traversal from saved round/cursor.
 	ResumeTraversal *RuntimeSuspendV1
 	// SoftSuspendRequested is polled in the run loop; when true, queues drain and state is flushed (see ErrTraversalSoftSuspended).
 	SoftSuspendRequested func() bool
+	// ReportStopProgress updates live stop checklist (step id + in-progress count).
+	ReportStopProgress   func(step string, inProgress int)
 	ObserverPollInterval time.Duration
 	// OnQueueObserver is called with the live observer after queues register, and with nil when the run exits (before observer.Stop).
 	OnQueueObserver func(*observe.QueueObserver)
@@ -58,6 +61,8 @@ type MigrationConfig struct {
 	PathCheckTarget string
 	// WindowsCompat enables Windows desktop-sync overlays on soft cloud destinations.
 	WindowsCompat bool
+	// FilterRuleset is retained for caller compatibility. Discovery does not evaluate it.
+	FilterRuleset *filter.CompiledRuleset
 }
 
 // RuntimeStats captures execution statistics at the end of a migration run.
@@ -96,7 +101,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 				time.Sleep(startupDelay)
 			}
 		}
-		if err := logservice.InitGlobalLogger(database, cfg.LogAddress, cfg.LogLevel); err != nil {
+		if err := logservice.InitGlobalLogger(database.LogsDBForWrite(), cfg.LogAddress, cfg.LogLevel); err != nil {
 			return RuntimeStats{}, fmt.Errorf("failed to initialize logger: %w", err)
 		}
 	}
@@ -105,10 +110,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 
 	srcCtx := scalingContextForTraversal("src", cfg.SrcService, cfg.DstService, queue.QueueModeTraversal)
 	dstCtx := scalingContextForTraversal("dst", cfg.SrcService, cfg.DstService, queue.QueueModeTraversal)
-	if cfg.ResumeTraversal != nil {
-		srcCtx.Mode = queue.ScalingModeRetry
-		dstCtx.Mode = queue.ScalingModeRetry
-	}
 	srcSizing := queueSizingForScalingContext(srcCtx, cfg.ResumeTraversal)
 	dstSizing := queueSizingForScalingContext(dstCtx, cfg.ResumeTraversal)
 	srcWC := resolveWorkersForScalingContext(srcCtx, cfg.WorkerCount, cfg.ResumeTraversal)
@@ -124,8 +125,6 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	dstQueue := queue.NewQueue("dst", mr, dstWC, coordinator, dstSizing)
 
 	if cfg.ResumeTraversal != nil {
-		srcQueue.SetMode(queue.QueueModeRetry)
-		dstQueue.SetMode(queue.QueueModeRetry)
 		maxKD := cfg.ResumeTraversal.MaxKnownDepth
 		if maxKD <= 0 {
 			if d, err := stats.GetMaxDepth(database, "SRC"); err == nil {
@@ -136,6 +135,15 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		dstQueue.SetMaxKnownDepth(maxKD)
 		seedQueueCountersFromDB(database, srcQueue, "src-traversal", db.QueueStatsPhaseTraversal)
 		seedQueueCountersFromDB(database, dstQueue, "dst-traversal", db.QueueStatsPhaseTraversal)
+	}
+
+	srcQueue.SetDatabase(database)
+	dstQueue.SetDatabase(database)
+	if cfg.ResumeTraversal != nil {
+		applyTraversalResume(database, cfg.ResumeTraversal, srcQueue, dstQueue, coordinator)
+		logTraversalResumePositionCheck(cfg.ResumeTraversal, srcQueue, dstQueue)
+	} else if err := initializeQueues(cfg, srcQueue, dstQueue, coordinator); err != nil {
+		return RuntimeStats{}, err
 	}
 
 	srcQueue.InitializeWithContext(database, cfg.SrcAdapter, cfg.ShutdownContext)
@@ -151,29 +159,14 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		scalingContextForTraversal("dst", cfg.SrcService, cfg.DstService, queue.QueueModeTraversal),
 		cfg.SrcAdapter, cfg.DstAdapter,
 	)
-	// Per-queue list pagination uses each side's operation profile at init.
 	profile.ApplyQueueListPagination(srcQueue, srcListProfile)
 	profile.ApplyQueueListPagination(dstQueue, dstListProfile)
 
 	if cfg.ResumeTraversal != nil {
-		srcQueue.SetRound(0)
-		dstQueue.SetRound(0)
-		if coordinator != nil {
-			coordinator.UpdateRound("src", 0)
-			coordinator.UpdateRound("dst", 0)
-		}
-		srcQueue.SetExpectedFromStatsBucket(srcQueue.GetRound())
-		dstQueue.SetExpectedFromStatsBucket(dstQueue.GetRound())
-		srcQueue.SetTraversalCacheLoaded(true)
-		dstQueue.SetTraversalCacheLoaded(true)
-		logTraversalResumePositionCheck(cfg.ResumeTraversal, srcQueue, dstQueue)
 		time.Sleep(500 * time.Millisecond)
 		srcQueue.PullTasksIfNeeded(true)
 		dstQueue.PullTasksIfNeeded(true)
 	} else {
-		if err := initializeQueues(cfg, srcQueue, dstQueue, coordinator); err != nil {
-			return RuntimeStats{}, err
-		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
@@ -185,12 +178,20 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	if err := database.BeginTraversalPhase(phaseCtx); err != nil {
 		return RuntimeStats{}, fmt.Errorf("begin traversal phase: %w", err)
 	}
+	bulkPhaseClosed := false
+	skipDurableTeardown := false
 	defer func() {
+		if bulkPhaseClosed || skipDurableTeardown {
+			return
+		}
 		if err := database.CheckpointWithRetry(context.Background(), 8); err != nil {
 			fmt.Println("checkpoint after traversal phase:", err)
 		}
 	}()
 	defer func() {
+		if bulkPhaseClosed || skipDurableTeardown {
+			return
+		}
 		if err := database.EndTraversalPhase(); err != nil {
 			fmt.Println("error ending traversal phase", err)
 		}
@@ -265,7 +266,9 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		if cfg.ShutdownContext != nil {
 			select {
 			case <-cfg.ShutdownContext.Done():
-				performTraversalForceStop(database, srcQueue, dstQueue, observer, coordinator)
+				skipDurableTeardown = true
+				performTraversalForceStop(srcQueue, dstQueue, observer)
+				database.AbortTraversalPhase()
 				srcStats, dstStats := snapshotTraversalQueueStats(database, coordinator)
 				return RuntimeStats{
 					Duration: time.Since(start),
@@ -280,8 +283,41 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			waitCtx, cancel := softSuspendWaitContext(cfg.ShutdownContext)
 			stats, suspend, err := performTraversalSoftSuspend(waitCtx, database, srcQueue, dstQueue, observer, coordinator, cfg, start, srcWC, mr)
 			cancel()
+			if forceStopOverridesSoftSuspend(cfg.ShutdownContext, database) {
+				skipDurableTeardown = true
+				performTraversalForceStop(srcQueue, dstQueue, observer)
+				database.AbortTraversalPhase()
+				return RuntimeStats{
+					Duration: time.Since(start),
+					Src:      srcQueue.Stats(),
+					Dst:      dstQueue.Stats(),
+				}, fmt.Errorf("migration force stopped during %s", "traversal")
+			}
 			if err != nil {
 				return stats, fmt.Errorf("traversal soft suspend: %w", err)
+			}
+			setDetail := func(d string) {
+				if observer != nil {
+					observer.SetWaitReason(d)
+				}
+			}
+			bulkPhaseClosed = true
+			finishCtx := cfg.ShutdownContext
+			if finishCtx == nil {
+				finishCtx = context.Background()
+			}
+			if err := finishSoftStopBulkPhase(finishCtx, database, cfg.ReportStopProgress, setDetail); err != nil {
+				if forceStopOverridesSoftSuspend(cfg.ShutdownContext, database) {
+					skipDurableTeardown = true
+					performTraversalForceStop(srcQueue, dstQueue, observer)
+					database.AbortTraversalPhase()
+					return RuntimeStats{
+						Duration: time.Since(start),
+						Src:      srcQueue.Stats(),
+						Dst:      dstQueue.Stats(),
+					}, fmt.Errorf("migration force stopped during %s", "traversal")
+				}
+				return stats, fmt.Errorf("traversal soft suspend teardown: %w", err)
 			}
 			fmt.Print("\n")
 			return stats, newTraversalSuspendedError(stats, suspend)
@@ -294,6 +330,8 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 		if bothCompleted {
 			observer.Stop()
 			time.Sleep(250 * time.Millisecond) // let observer loop exit before we close the logger
+			// Durable teardown (indexes + checkpoint) runs in domain_phases after *-finalizing.
+			bulkPhaseClosed = true
 			return completeTraversalRun(database, coordinator, progressTicker, start), nil
 		}
 
@@ -305,6 +343,7 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 			if coordinator.IsCompleted("both") {
 				observer.Stop()
 				time.Sleep(250 * time.Millisecond)
+				bulkPhaseClosed = true
 				return completeTraversalRun(database, coordinator, progressTicker, start), nil
 			}
 
@@ -342,9 +381,10 @@ func printTraversalProgressLine(srcQueue, dstQueue *queue.Queue, srcLive, dstLiv
 		dstExpected = dstRoundStats.Expected
 		dstCompleted = dstRoundStats.Completed
 	}
-	fmt.Printf("\r  Src: Round %d (Exp:%d Comp:%d Pend:%d W:%d) | Dst: Round %d (Exp:%d Comp:%d Pend:%d W:%d)   ",
+	fmt.Printf("\r  Src: Round %d (Exp:%d Comp:%d Pend:%d W:%d) | Dst: Round %d (Exp:%d Comp:%d Pend:%d W:%d)%s   ",
 		srcLive.Round, srcExpected, srcCompleted, srcLive.Pending, srcLive.Workers,
-		dstLive.Round, dstExpected, dstCompleted, dstLive.Pending, dstLive.Workers)
+		dstLive.Round, dstExpected, dstCompleted, dstLive.Pending, dstLive.Workers,
+		FormatCatalogSyncSuffix(srcQueue.Database()))
 }
 
 func snapshotTraversalQueueStats(database *db.DB, coordinator *queue.QueueCoordinator) (queue.QueueStats, queue.QueueStats) {
@@ -371,7 +411,7 @@ func snapshotTraversalQueueStats(database *db.DB, coordinator *queue.QueueCoordi
 
 func completeTraversalRun(database *db.DB, coordinator *queue.QueueCoordinator, progressTicker *time.Ticker, start time.Time) RuntimeStats {
 	if database != nil {
-		_ = database.Flush()
+		_ = database.Flush(context.Background())
 		_ = queue.FinalizeCopyWorkOnStop(database, coordinator)
 	}
 	srcStats, dstStats := snapshotTraversalQueueStats(database, coordinator)

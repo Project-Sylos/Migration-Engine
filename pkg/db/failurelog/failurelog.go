@@ -6,10 +6,10 @@ package failurelog
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 
 	"github.com/google/uuid"
 )
@@ -48,52 +48,37 @@ func FailureLogDisplayText(log FailureLog) string {
 	return log.Message
 }
 
-// LatestFailureLogIDsByNodeIDs returns error_log_id from src_current / dst_current for each node id.
+func sideFromEventTable(eventTable string) string {
+	switch eventTable {
+	case db.TableDstStatusEvents, db.TableDstCurrent:
+		return opsdb.SideDST
+	default:
+		return opsdb.SideSRC
+	}
+}
+
+// LatestFailureLogIDsByNodeIDs returns error_log_id for each node id from
+// materialized *_current when populated (A), otherwise from status events (B).
+// On the Badger ops branch, reads error_log_id from st:* overlays.
 func LatestFailureLogIDsByNodeIDs(ctx context.Context, d *db.DB, eventTable string, nodeIDs []string) (map[string]string, error) {
 	out := make(map[string]string)
 	if d == nil || len(nodeIDs) == 0 {
 		return out, nil
 	}
-	currentTable := db.TableSrcCurrent
-	switch eventTable {
-	case db.TableSrcStatusEvents, db.TableSrcCurrent:
-		currentTable = db.TableSrcCurrent
-	case db.TableDstStatusEvents, db.TableDstCurrent:
-		currentTable = db.TableDstCurrent
-	default:
-		return nil, fmt.Errorf("unsupported status event table %q", eventTable)
-	}
-
-	placeholders := make([]string, len(nodeIDs))
-	args := make([]any, len(nodeIDs))
-	for i, id := range nodeIDs {
-		placeholders[i] = "$" + strconv.Itoa(i+1)
-		args[i] = id
-	}
-	q := `SELECT id, COALESCE(error_log_id, '') FROM ` + currentTable + `
-WHERE id IN (` + strings.Join(placeholders, ",") + `)
-  AND error_log_id IS NOT NULL AND error_log_id != ''`
-
-	conn, err := d.GetDB()
-	if err != nil {
-		return nil, err
-	}
-	rows, err := conn.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var nodeID, logID string
-		if err := rows.Scan(&nodeID, &logID); err != nil {
+	if d.Ops() != nil {
+		side := sideFromEventTable(eventTable)
+		stMap, err := d.Ops().BatchGetStatus(side, nodeIDs)
+		if err != nil {
 			return nil, err
 		}
-		if logID != "" {
-			out[nodeID] = logID
+		for _, nodeID := range nodeIDs {
+			if st, ok := stMap[nodeID]; ok && st.ErrorLogID != "" {
+				out[nodeID] = st.ErrorLogID
+			}
 		}
+		return out, nil
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // GetFailureLogsByIDs loads logs rows keyed by id.
@@ -120,30 +105,21 @@ func GetFailureLogsByIDs(ctx context.Context, d *db.DB, logIDs []string) (map[st
 		return out, nil
 	}
 
-	placeholders := make([]string, len(unique))
-	args := make([]any, len(unique))
-	for i, id := range unique {
-		placeholders[i] = "$" + strconv.Itoa(i+1)
-		args[i] = id
-	}
-	q := `SELECT id, level, message, COALESCE(detail, ''), component FROM logs WHERE id IN (` + strings.Join(placeholders, ",") + `)`
-
-	conn, err := d.GetDB()
-	if err != nil {
-		return nil, err
-	}
-	rows, err := conn.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var row FailureLog
-		if err := rows.Scan(&row.ID, &row.Level, &row.Message, &row.Detail, &row.Component); err != nil {
+	if d.Ops() != nil {
+		recs, err := d.Ops().GetLogsByIDs(unique)
+		if err != nil {
 			return nil, err
 		}
-		out[row.ID] = row
+		for id, rec := range recs {
+			out[id] = FailureLog{
+				ID:        rec.ID,
+				Level:     rec.Level,
+				Message:   rec.Message,
+				Detail:    rec.Detail,
+				Component: rec.Component,
+			}
+		}
+		return out, nil
 	}
-	return out, rows.Err()
+	return out, nil
 }

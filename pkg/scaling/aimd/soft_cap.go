@@ -27,32 +27,41 @@ func SoftCapDecreaseTarget(cur, minWorkers, maxWorkers int, state *State, now ti
 	return state.SoftCap
 }
 
-// ApplyThrottleCeiling records that worker count n just rate-limited: safe ceiling
-// pulls toward n-1, SoftCap = ceiling-1 (clamped).
+// ApplyThrottleCeiling records that worker count n just rate-limited.
+// SoftCap rests at n-1; CeilingSafe is the failing level n (next SoftCap+1 boundary).
 func (st *State) ApplyThrottleCeiling(n, minWorkers, maxWorkers int) {
 	if st == nil {
 		return
 	}
-	safe := n - 1
-	if safe < minWorkers {
-		safe = minWorkers
+	safeRest := n - 1
+	if safeRest < minWorkers {
+		safeRest = minWorkers
 	}
-	if maxWorkers > 0 && safe > maxWorkers {
-		safe = maxWorkers
+	if maxWorkers > 0 && safeRest > maxWorkers {
+		safeRest = maxWorkers
+	}
+	// CeilingSafe tracks the next unknown boundary (SoftCap+1), matching RaiseCeilingFromSustainedProbe.
+	boundary := safeRest + 1
+	if maxWorkers > 0 && boundary > maxWorkers {
+		boundary = maxWorkers
 	}
 	if st.CeilingSafe <= 0 {
-		st.CeilingSafe = safe
+		st.CeilingSafe = boundary
 	} else {
-		st.CeilingSafe = int(math.Round(softCapEMAAlpha*float64(safe) + (1-softCapEMAAlpha)*float64(st.CeilingSafe)))
+		st.CeilingSafe = int(math.Round(softCapEMAAlpha*float64(boundary) + (1-softCapEMAAlpha)*float64(st.CeilingSafe)))
 		if st.CeilingSafe < minWorkers {
 			st.CeilingSafe = minWorkers
+		}
+		if maxWorkers > 0 && st.CeilingSafe > maxWorkers {
+			st.CeilingSafe = maxWorkers
 		}
 	}
 	st.RecomputeSoftCap(minWorkers, maxWorkers)
 	st.Ssthresh = st.SoftCap
 }
 
-// RecomputeSoftCap sets SoftCap = CeilingSafe-1 within [min, max].
+// RecomputeSoftCap sets SoftCap = CeilingSafe-1 within [min, max]
+// (CeilingSafe is the next probe boundary; SoftCap is the resting worker count).
 func (st *State) RecomputeSoftCap(minWorkers, maxWorkers int) {
 	if st == nil {
 		return
@@ -150,6 +159,18 @@ func (st *State) ClearProbeBounceOnSuccess() {
 	st.ProbeBounce = 0
 	st.LastProbeBounce = 0
 	st.LastProbeFail = time.Time{}
+}
+
+// ClearSoftCapForHigherMax drops soft-cap / probe memory when the hard MaxWorkers
+// ceiling rises (user override or profile change) so AIMD can rediscover under the new bound.
+func (st *State) ClearSoftCapForHigherMax(prevMax, newMax int) {
+	if st == nil || prevMax <= 0 || newMax <= prevMax {
+		return
+	}
+	st.CeilingSafe = 0
+	st.SoftCap = 0
+	st.AbortSoftCapProbe()
+	st.ClearProbeBounceOnSuccess()
 }
 
 // ClampSoftCapToBounds shrinks ceiling/SoftCap when profile max drops.

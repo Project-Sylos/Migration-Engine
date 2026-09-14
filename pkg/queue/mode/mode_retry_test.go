@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 )
 

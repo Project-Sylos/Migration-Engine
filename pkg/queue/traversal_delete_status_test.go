@@ -10,13 +10,14 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
-func TestChildResultToNodeStateInitializesDeleteStatusForSrcOnly(t *testing.T) {
+func TestChildResultToNodeStateLeavesDeleteUnsetUntilCopyComplete(t *testing.T) {
 	tests := []struct {
-		name       string
-		queueType  string
-		child      ChildResult
-		wantCopy   string
-		wantDelete string
+		name      string
+		queueType string
+		child     ChildResult
+		depth     int
+		parentPath string
+		wantCopy  string
 	}{
 		{
 			name:      "src file",
@@ -26,8 +27,9 @@ func TestChildResultToNodeStateInitializesDeleteStatusForSrcOnly(t *testing.T) {
 				Status: db.StatusSuccessful,
 				IsFile: true,
 			},
+			depth:      1,
+			parentPath: "/",
 			wantCopy:   db.CopyStatusPending,
-			wantDelete: db.DeleteStatusPending,
 		},
 		{
 			name:      "src folder",
@@ -37,8 +39,9 @@ func TestChildResultToNodeStateInitializesDeleteStatusForSrcOnly(t *testing.T) {
 				Status: db.StatusPending,
 				IsFile: false,
 			},
+			depth:      1,
+			parentPath: "/",
 			wantCopy:   db.CopyStatusPending,
-			wantDelete: db.DeleteStatusPending,
 		},
 		{
 			name:      "dst only file",
@@ -48,20 +51,34 @@ func TestChildResultToNodeStateInitializesDeleteStatusForSrcOnly(t *testing.T) {
 				Status: db.StatusNotOnSrc,
 				IsFile: true,
 			},
+			depth:      1,
+			parentPath: "/",
+		},
+		{
+			name:      "src deeper child",
+			queueType: "SRC",
+			child: ChildResult{
+				File:   types.File{DisplayName: "nested.txt"},
+				Status: db.StatusSuccessful,
+				IsFile: true,
+			},
+			depth:      2,
+			parentPath: "/folder",
+			wantCopy:   db.CopyStatusPending,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			state := ChildResultToNodeState(tt.child, "/", 1, tt.queueType, "parent")
+			state := ChildResultToNodeState(tt.child, tt.parentPath, tt.depth, tt.queueType, "parent")
 			if state == nil {
 				t.Fatal("expected node state")
 			}
 			if state.CopyStatus != tt.wantCopy {
 				t.Fatalf("copy status = %q, want %q", state.CopyStatus, tt.wantCopy)
 			}
-			if state.DeleteStatus != tt.wantDelete {
-				t.Fatalf("delete status = %q, want %q", state.DeleteStatus, tt.wantDelete)
+			if state.DeleteStatus != "" {
+				t.Fatalf("delete status = %q, want unset until copy-complete", state.DeleteStatus)
 			}
 		})
 	}

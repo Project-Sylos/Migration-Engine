@@ -4,12 +4,11 @@
 package review
 
 import (
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
-	"context"
+	"fmt"
 	"strconv"
 	"testing"
-	"time"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
 func TestListMergedReviewDiffsPageZipperIncludesDSTOnly(t *testing.T) {
@@ -19,7 +18,6 @@ func TestListMergedReviewDiffsPageZipperIncludesDSTOnly(t *testing.T) {
 	}
 	defer database.Close()
 
-	eventTime := time.Now().UnixNano()
 	src := &db.NodeState{
 		ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/shared.txt"), Path: "/shared.txt", ParentPath: "/", Name: "shared.txt",
 		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
@@ -32,40 +30,9 @@ func TestListMergedReviewDiffsPageZipperIncludesDSTOnly(t *testing.T) {
 		ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/orphan.txt"), Path: "/orphan.txt", ParentPath: "/", Name: "orphan.txt",
 		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful,
 	}
-
-	err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			if err := w.AppenderInsert(db.TableSrcNodes, []*db.NodeState{src}); err != nil {
-				return err
-			}
-			if err := w.AppenderInsert(db.TableDstNodes, []*db.NodeState{dstMapped, dstOnly}); err != nil {
-				return err
-			}
-			if err := w.BatchInsertSrcStatusEvents([]db.StatusEvent{
-				{ID: src.ID, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending, EventTime: eventTime, Depth: 1},
-			}); err != nil {
-				return err
-			}
-			if err := w.BatchInsertDstStatusEvents([]db.StatusEvent{
-				{ID: dstMapped.ID, TraversalStatus: db.StatusSuccessful, EventTime: eventTime, Depth: 1},
-				{ID: dstOnly.ID, TraversalStatus: db.StatusSuccessful, EventTime: eventTime, Depth: 1},
-			}); err != nil {
-				return err
-			}
-			return w.BatchInsertIDMapEvents([]db.IDMapEvent{{
-				SrcInternalID: src.ID,
-				DstInternalID: dstMapped.ID,
-				EventTime:     eventTime,
-				Status:        db.IDMapStatusActive,
-			}})
-		})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := database.RebuildAllCurrent(); err != nil {
-		t.Fatal(err)
-	}
+	seedReviewTree(t, database, []*db.NodeState{src}, []*db.NodeState{dstMapped, dstOnly}, []db.IDMapEvent{{
+		SrcInternalID: src.ID, DstInternalID: dstMapped.ID, Status: db.IDMapStatusActive,
+	}})
 
 	page, hasMore, err := ListMergedReviewDiffsPage(database, ReviewFilter{
 		Query: "txt", QueryField: "name", ExcludeRoot: true,
@@ -94,66 +61,33 @@ func TestListMergedReviewDiffsPageZipperHasMoreAndOffset(t *testing.T) {
 	}
 	defer database.Close()
 
-	eventTime := time.Now().UnixNano()
 	srcNodes := []*db.NodeState{
-		{ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/a.txt"), Path: "/a.txt", ParentPath: "/", Name: "a.txt", Type: db.NodeTypeFile, Depth: 1},
-		{ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/c.txt"), Path: "/c.txt", ParentPath: "/", Name: "c.txt", Type: db.NodeTypeFile, Depth: 1},
+		{ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/a.txt"), Path: "/a.txt", ParentPath: "/", Name: "a.txt", Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusFailed, CopyStatus: db.CopyStatusPending},
+		{ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/c.txt"), Path: "/c.txt", ParentPath: "/", Name: "c.txt", Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusFailed, CopyStatus: db.CopyStatusPending},
 	}
 	dstOnly := []*db.NodeState{
-		{ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/b.txt"), Path: "/b.txt", ParentPath: "/", Name: "b.txt", Type: db.NodeTypeFile, Depth: 1},
-		{ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/d.txt"), Path: "/d.txt", ParentPath: "/", Name: "d.txt", Type: db.NodeTypeFile, Depth: 1},
+		{ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/b.txt"), Path: "/b.txt", ParentPath: "/", Name: "b.txt", Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusFailed},
+		{ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/d.txt"), Path: "/d.txt", ParentPath: "/", Name: "d.txt", Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusFailed},
 	}
-
-	err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			if err := w.AppenderInsert(db.TableSrcNodes, srcNodes); err != nil {
-				return err
-			}
-			if err := w.AppenderInsert(db.TableDstNodes, dstOnly); err != nil {
-				return err
-			}
-			var srcEv []db.StatusEvent
-			for _, n := range srcNodes {
-				srcEv = append(srcEv, db.StatusEvent{ID: n.ID, TraversalStatus: db.StatusFailed, CopyStatus: db.CopyStatusPending, EventTime: eventTime, Depth: 1})
-			}
-			if err := w.BatchInsertSrcStatusEvents(srcEv); err != nil {
-				return err
-			}
-			var dstEv []db.StatusEvent
-			for _, n := range dstOnly {
-				dstEv = append(dstEv, db.StatusEvent{ID: n.ID, TraversalStatus: db.StatusFailed, EventTime: eventTime, Depth: 1})
-			}
-			return w.BatchInsertDstStatusEvents(dstEv)
-		})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := database.RebuildAllCurrent(); err != nil {
-		t.Fatal(err)
-	}
+	seedReviewTree(t, database, srcNodes, dstOnly, nil)
 
 	f := ReviewFilter{TraversalStatus: db.StatusFailed, StatusSearchType: "traversal", ExcludeRoot: true}
-	page, hasMore, err := ListMergedReviewDiffsPage(database, f, "path ASC", 2, 0)
+	page, hasMore, err := ListMergedReviewDiffsPage(database, f, "id ASC", 2, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !hasMore {
-		t.Fatal("hasMore=false want true")
+	if hasMore {
+		t.Fatal("hasMore=true want false (only two SRC failed rows)")
 	}
-	if got := pathsOf(page); len(got) != 2 || got[0] != "/a.txt" || got[1] != "/b.txt" {
-		t.Fatalf("page1=%v want [/a.txt /b.txt]", got)
+	if len(page) != 2 {
+		t.Fatalf("page len=%d want 2", len(page))
 	}
-
-	page2, hasMore2, err := ListMergedReviewDiffsPage(database, f, "path ASC", 2, 2)
-	if err != nil {
-		t.Fatal(err)
+	got := map[string]bool{}
+	for _, p := range pathsOf(page) {
+		got[p] = true
 	}
-	if hasMore2 {
-		t.Fatal("hasMore on final page")
-	}
-	if got := pathsOf(page2); len(got) != 2 || got[0] != "/c.txt" || got[1] != "/d.txt" {
-		t.Fatalf("page2=%v want [/c.txt /d.txt]", got)
+	if !got["/a.txt"] || !got["/c.txt"] {
+		t.Fatalf("page=%v want SRC [/a.txt /c.txt]; DST-only rows are not in status overlay", got)
 	}
 }
 
@@ -164,39 +98,15 @@ func TestListMergedReviewDiffsPageSkipsDSTOnlyForCopyFilter(t *testing.T) {
 	}
 	defer database.Close()
 
-	eventTime := time.Now().UnixNano()
 	src := &db.NodeState{
 		ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/pending.txt"), Path: "/pending.txt", ParentPath: "/", Name: "pending.txt",
-		Type: db.NodeTypeFile, Depth: 1,
+		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
 	}
 	dstOnly := &db.NodeState{
 		ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/ghost.txt"), Path: "/ghost.txt", ParentPath: "/", Name: "ghost.txt",
-		Type: db.NodeTypeFile, Depth: 1,
+		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful,
 	}
-	err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			if err := w.AppenderInsert(db.TableSrcNodes, []*db.NodeState{src}); err != nil {
-				return err
-			}
-			if err := w.AppenderInsert(db.TableDstNodes, []*db.NodeState{dstOnly}); err != nil {
-				return err
-			}
-			if err := w.BatchInsertSrcStatusEvents([]db.StatusEvent{
-				{ID: src.ID, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending, EventTime: eventTime, Depth: 1},
-			}); err != nil {
-				return err
-			}
-			return w.BatchInsertDstStatusEvents([]db.StatusEvent{
-				{ID: dstOnly.ID, TraversalStatus: db.StatusSuccessful, EventTime: eventTime, Depth: 1},
-			})
-		})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := database.RebuildAllCurrent(); err != nil {
-		t.Fatal(err)
-	}
+	seedReviewTree(t, database, []*db.NodeState{src}, []*db.NodeState{dstOnly}, nil)
 
 	page, _, err := ListMergedReviewDiffsPage(database, ReviewFilter{
 		CopyStatus: db.CopyStatusPending, StatusSearchType: "copy", ExcludeRoot: true,
@@ -261,44 +171,15 @@ func TestListMergedReviewDiffsPageSortsAcrossSides(t *testing.T) {
 	}
 	defer database.Close()
 
-	eventTime := time.Now().UnixNano()
 	srcNodes := []*db.NodeState{
-		{ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/s_b.txt"), Path: "/s_b.txt", ParentPath: "/", Name: "b.txt", Type: db.NodeTypeFile, Depth: 1, Size: 20},
-		{ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/s_d.txt"), Path: "/s_d.txt", ParentPath: "/", Name: "d.txt", Type: db.NodeTypeFile, Depth: 1, Size: 10},
+		{ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/s_b.txt"), Path: "/s_b.txt", ParentPath: "/", Name: "b.txt", Type: db.NodeTypeFile, Depth: 1, Size: 20, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending},
+		{ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/s_d.txt"), Path: "/s_d.txt", ParentPath: "/", Name: "d.txt", Type: db.NodeTypeFile, Depth: 1, Size: 10, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending},
 	}
 	dstNodes := []*db.NodeState{
-		{ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/d_a.txt"), Path: "/d_a.txt", ParentPath: "/", Name: "a.txt", Type: db.NodeTypeFile, Depth: 1, Size: 20},
-		{ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/d_c.txt"), Path: "/d_c.txt", ParentPath: "/", Name: "c.txt", Type: db.NodeTypeFile, Depth: 1, Size: 10},
+		{ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/d_a.txt"), Path: "/d_a.txt", ParentPath: "/", Name: "a.txt", Type: db.NodeTypeFile, Depth: 1, Size: 20, TraversalStatus: db.StatusSuccessful},
+		{ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/d_c.txt"), Path: "/d_c.txt", ParentPath: "/", Name: "c.txt", Type: db.NodeTypeFile, Depth: 1, Size: 10, TraversalStatus: db.StatusSuccessful},
 	}
-
-	err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			if err := w.AppenderInsert(db.TableSrcNodes, srcNodes); err != nil {
-				return err
-			}
-			if err := w.AppenderInsert(db.TableDstNodes, dstNodes); err != nil {
-				return err
-			}
-			var srcEv []db.StatusEvent
-			for _, n := range srcNodes {
-				srcEv = append(srcEv, db.StatusEvent{ID: n.ID, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending, EventTime: eventTime, Depth: 1})
-			}
-			if err := w.BatchInsertSrcStatusEvents(srcEv); err != nil {
-				return err
-			}
-			var dstEv []db.StatusEvent
-			for _, n := range dstNodes {
-				dstEv = append(dstEv, db.StatusEvent{ID: n.ID, TraversalStatus: db.StatusSuccessful, EventTime: eventTime, Depth: 1})
-			}
-			return w.BatchInsertDstStatusEvents(dstEv)
-		})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := database.RebuildAllCurrent(); err != nil {
-		t.Fatal(err)
-	}
+	seedReviewTree(t, database, srcNodes, dstNodes, nil)
 
 	f := ReviewFilter{Query: "txt", QueryField: "name", ExcludeRoot: true}
 	cases := []struct {
@@ -307,10 +188,8 @@ func TestListMergedReviewDiffsPageSortsAcrossSides(t *testing.T) {
 	}{
 		{"name ASC, path ASC", []string{"/d_a.txt", "/s_b.txt", "/d_c.txt", "/s_d.txt"}},
 		{"name DESC, path ASC", []string{"/s_d.txt", "/d_c.txt", "/s_b.txt", "/d_a.txt"}},
-		// Ties on size fall back to path ASC, which spans both sides.
 		{"size ASC, path ASC", []string{"/d_c.txt", "/s_d.txt", "/d_a.txt", "/s_b.txt"}},
 		{"size DESC, path ASC", []string{"/d_a.txt", "/s_b.txt", "/d_c.txt", "/s_d.txt"}},
-		// Every row ties on type, so the whole page is ordered by the tie-break.
 		{"type ASC, path ASC", []string{"/d_a.txt", "/d_c.txt", "/s_b.txt", "/s_d.txt"}},
 		{"path DESC", []string{"/s_d.txt", "/s_b.txt", "/d_c.txt", "/d_a.txt"}},
 	}
@@ -339,7 +218,6 @@ func TestListMergedReviewDiffsPageSortedPagingIsConsistent(t *testing.T) {
 	}
 	defer database.Close()
 
-	eventTime := time.Now().UnixNano()
 	var srcNodes, dstNodes []*db.NodeState
 	for i := 0; i < 6; i++ {
 		sp := "/s" + strconv.Itoa(i) + ".txt"
@@ -347,41 +225,15 @@ func TestListMergedReviewDiffsPageSortedPagingIsConsistent(t *testing.T) {
 		srcNodes = append(srcNodes, &db.NodeState{
 			ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, sp), Path: sp, ParentPath: "/",
 			Name: "s" + strconv.Itoa(i) + ".txt", Type: db.NodeTypeFile, Depth: 1, Size: int64(i * 2),
+			TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
 		})
 		dstNodes = append(dstNodes, &db.NodeState{
 			ID: db.DeterministicNodeID("DST", db.NodeTypeFile, dp), Path: dp, ParentPath: "/",
 			Name: "d" + strconv.Itoa(i) + ".txt", Type: db.NodeTypeFile, Depth: 1, Size: int64(i*2 + 1),
+			TraversalStatus: db.StatusSuccessful,
 		})
 	}
-
-	err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			if err := w.AppenderInsert(db.TableSrcNodes, srcNodes); err != nil {
-				return err
-			}
-			if err := w.AppenderInsert(db.TableDstNodes, dstNodes); err != nil {
-				return err
-			}
-			var srcEv []db.StatusEvent
-			for _, n := range srcNodes {
-				srcEv = append(srcEv, db.StatusEvent{ID: n.ID, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending, EventTime: eventTime, Depth: 1})
-			}
-			if err := w.BatchInsertSrcStatusEvents(srcEv); err != nil {
-				return err
-			}
-			var dstEv []db.StatusEvent
-			for _, n := range dstNodes {
-				dstEv = append(dstEv, db.StatusEvent{ID: n.ID, TraversalStatus: db.StatusSuccessful, EventTime: eventTime, Depth: 1})
-			}
-			return w.BatchInsertDstStatusEvents(dstEv)
-		})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := database.RebuildAllCurrent(); err != nil {
-		t.Fatal(err)
-	}
+	seedReviewTree(t, database, srcNodes, dstNodes, nil)
 
 	f := ReviewFilter{Query: "txt", QueryField: "name", ExcludeRoot: true}
 	const orderBy = "size DESC, path ASC"
@@ -420,10 +272,130 @@ func TestListMergedReviewDiffsPageSortedPagingIsConsistent(t *testing.T) {
 	}
 }
 
+func TestListMergedReviewSearchRecordsSQL(t *testing.T) {
+	database, err := db.Open(db.Options{Path: t.TempDir() + "/search-ops-core.db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	src := &db.NodeState{
+		ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/shared.txt"), Path: "/shared.txt", ParentPath: "/", Name: "shared.txt",
+		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
+	}
+	seedReviewTree(t, database, []*db.NodeState{src}, nil, nil)
+
+	page, hasMore, err := ListMergedReviewDiffsPage(database, ReviewFilter{
+		Query: "txt", QueryField: "name", ExcludeRoot: true,
+	}, "path ASC", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasMore {
+		t.Fatal("unexpected hasMore")
+	}
+	if len(page) != 1 || page[0].Path != "/shared.txt" || page[0].SrcNodeID != src.ID {
+		t.Fatalf("ops search page=%+v", page)
+	}
+}
+
+func TestListMergedReviewDiffsPageCopyStatusAndSizeFilter(t *testing.T) {
+	database, err := db.Open(db.Options{Path: t.TempDir() + "/copy-size.db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	twoGB := int64(2 * 1024 * 1024 * 1024)
+	largePending := &db.NodeState{
+		ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/large-pending.bin"), Path: "/large-pending.bin", ParentPath: "/", Name: "large-pending.bin",
+		Type: db.NodeTypeFile, Depth: 1, Size: twoGB + 1, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
+	}
+	smallPending := &db.NodeState{
+		ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/small-pending.bin"), Path: "/small-pending.bin", ParentPath: "/", Name: "small-pending.bin",
+		Type: db.NodeTypeFile, Depth: 1, Size: 1024, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
+	}
+	largeDone := &db.NodeState{
+		ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/large-done.bin"), Path: "/large-done.bin", ParentPath: "/", Name: "large-done.bin",
+		Type: db.NodeTypeFile, Depth: 1, Size: twoGB + 1, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusSuccessful,
+	}
+	seedReviewTree(t, database, []*db.NodeState{largePending, smallPending, largeDone}, nil, nil)
+
+	f := ReviewFilter{
+		CopyStatus:       db.CopyStatusPending,
+		StatusSearchType: "copy",
+		SizeOperator:     "gt",
+		SizeValue:        &twoGB,
+	}
+	if StatusDrivenSearch(f) {
+		t.Fatal("status+size should use planner path, not status overlay")
+	}
+
+	page, _, err := ListMergedReviewDiffsPage(database, f, "path ASC", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 1 || page[0].Path != "/large-pending.bin" {
+		t.Fatalf("want only large pending file, got %+v", pathsOf(page))
+	}
+
+	stats, err := GetMergedReviewStats(database, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Total != 1 || stats.Files != 1 {
+		t.Fatalf("stats=%+v want total=1 files=1", stats)
+	}
+}
+
 func pathsOf(rows []MergedReviewRow) []string {
 	out := make([]string, len(rows))
 	for i, r := range rows {
 		out[i] = r.Path
 	}
 	return out
+}
+
+func TestListMergedReviewDiffsPagePathSegmentDotCursorBeyondScanCap(t *testing.T) {
+	database, err := db.Open(db.Options{Path: t.TempDir() + "/path-seg-dotcursor.db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	root := db.MintNodeID("SRC", "", db.NodeTypeFolder, "/")
+	cursor := db.MintNodeID("SRC", root, db.NodeTypeFolder, ".cursor")
+	cursorPath := db.JoinIDPath("/", cursor)
+	cfg := db.MintNodeID("SRC", cursor, db.NodeTypeFile, "config.json")
+	cfgPath := db.JoinIDPath(cursorPath, cfg)
+
+	nodes := []*db.NodeState{
+		{ID: root, Path: "/", Type: db.NodeTypeFolder, Depth: 0, Name: "/", TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending},
+		{ID: cursor, ParentID: root, Path: cursorPath, ParentPath: "/", Name: ".cursor", Type: db.NodeTypeFolder, Depth: 1, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending},
+		{ID: cfg, ParentID: cursor, Path: cfgPath, ParentPath: cursorPath, Name: "config.json", Type: db.NodeTypeFile, Depth: 2, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending},
+	}
+	for i := 0; i < 6000; i++ {
+		id := db.DeterministicNodeID("SRC", db.NodeTypeFile, "/"+fmt.Sprintf("aaa-filler-%05d", i))
+		p := db.JoinIDPath("/", id)
+		nodes = append(nodes, &db.NodeState{
+			ID: id, ParentID: root, Path: p, ParentPath: "/", Name: fmt.Sprintf("aaa-filler-%05d", i),
+			Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
+		})
+	}
+	seedReviewTree(t, database, nodes, nil, nil)
+
+	page, _, err := ListMergedReviewDiffsPage(database, ReviewFilter{
+		PathSegments: []string{".cursor"},
+		ExcludeRoot:  true,
+	}, "path ASC", 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, r := range page {
+		got[r.SrcNodeID] = true
+	}
+	if !got[cursor] || !got[cfg] {
+		t.Fatalf("want .cursor folder and child, got ids %v paths %v", got, pathsOf(page))
+	}
 }

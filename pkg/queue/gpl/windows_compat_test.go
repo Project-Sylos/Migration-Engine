@@ -11,7 +11,7 @@ import (
 )
 
 func TestEvaluateGPLAddPart_DropboxBaselineSkipsTrailingDots(t *testing.T) {
-	payload, issue := evaluateGPLAddPart(pathgpl.Dropbox, nil, "folder...", nil, false, false)
+	payload, issue := evaluateGPLAddPart(pathgpl.Dropbox, 0, "folder...", nil, false, false)
 	if !payload.Valid {
 		t.Fatalf("baseline Dropbox should accept trailing dots: %#v", payload)
 	}
@@ -21,7 +21,7 @@ func TestEvaluateGPLAddPart_DropboxBaselineSkipsTrailingDots(t *testing.T) {
 }
 
 func TestEvaluateGPLAddPart_DropboxWindowsCompatFlagsTrailingDots(t *testing.T) {
-	payload, issue := evaluateGPLAddPart(pathgpl.Dropbox, nil, "folder...", nil, false, true)
+	payload, issue := evaluateGPLAddPart(pathgpl.Dropbox, 0, "folder...", nil, false, true)
 	if payload.Valid {
 		t.Fatalf("WindowsCompat Dropbox should reject trailing dots: %#v", payload)
 	}
@@ -37,7 +37,7 @@ func TestEvaluateGPLAddPart_DSTSiblingCollisionManual(t *testing.T) {
 	// Cleaned name collides with existing DST sibling "folder".
 	payload, issue := evaluateGPLAddPart(
 		pathgpl.Dropbox,
-		nil,
+		0,
 		"folder...",
 		[]string{"folder"},
 		false,

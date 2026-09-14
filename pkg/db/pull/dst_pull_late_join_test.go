@@ -4,12 +4,10 @@
 package pull
 
 import (
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
-	"context"
 	"fmt"
 	"testing"
-	"time"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
 func TestDstPullScanWindow(t *testing.T) {
@@ -31,83 +29,67 @@ func TestDstPullScanWindow(t *testing.T) {
 }
 
 func TestListDstBatchWithSrcChildren_lateJoinAndCursor(t *testing.T) {
-	database, err := db.Open(db.Options{Path: t.TempDir() + "/dst-pull.db"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
+	database := db.TestOpen(t, "dst-pull")
 
-	eventTime := time.Now().UnixNano()
 	srcRoot := &db.NodeState{
 		ID: db.MintNodeID("SRC", "", db.NodeTypeFolder, "/"), Path: "/", ParentPath: "", Name: "", Type: db.NodeTypeFolder, Depth: 0,
-	}
-	srcChild := &db.NodeState{
-		ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/a/f.txt"), Path: "/a/f.txt", ParentPath: "/a",
-		ParentID: db.DeterministicNodeID("SRC", db.NodeTypeFolder, "/a"), Name: "f.txt",
-		Type: db.NodeTypeFile, Depth: 2, Size: 9,
+		TraversalStatus: db.StatusSuccessful,
 	}
 	srcFolder := &db.NodeState{
 		ID: db.DeterministicNodeID("SRC", db.NodeTypeFolder, "/a"), Path: "/a", ParentPath: "/",
 		ParentID: db.MintNodeID("SRC", "", db.NodeTypeFolder, "/"), Name: "a", Type: db.NodeTypeFolder, Depth: 1,
+		TraversalStatus: db.StatusSuccessful, DeleteStatus: db.DeleteStatusPendingExplicit,
+	}
+	srcChild := &db.NodeState{
+		ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/a/f.txt"), Path: "/a/f.txt", ParentPath: "/a",
+		ParentID: srcFolder.ID, Name: "f.txt",
+		Type: db.NodeTypeFile, Depth: 2, Size: 9,
+		TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
 	}
 
-	var dstNodes []*db.NodeState
-	var dstEvents []db.StatusEvent
-	// Mix successful + pending so gather must filter; pending ids sort after some successful ones.
+	ops := []db.InsertOperation{
+		{QueueType: "SRC", Level: 0, Status: db.StatusSuccessful, State: srcRoot},
+		{QueueType: "SRC", Level: 1, Status: db.StatusSuccessful, State: srcFolder},
+		{QueueType: "SRC", Level: 2, Status: db.StatusSuccessful, State: srcChild},
+	}
 	for i := 0; i < 8; i++ {
 		path := fmt.Sprintf("/done-%d", i)
 		id := db.DeterministicNodeID("DST", db.NodeTypeFolder, path)
-		dstNodes = append(dstNodes, &db.NodeState{
-			ID: id, Path: path, ParentPath: "/", Name: fmt.Sprintf("done-%d", i),
-			Type: db.NodeTypeFolder, Depth: 1,
+		ops = append(ops, db.InsertOperation{
+			QueueType: "DST", Level: 1, Status: db.StatusSuccessful,
+			State: &db.NodeState{
+				ID: id, Path: path, ParentPath: "/", Name: fmt.Sprintf("done-%d", i),
+				Type: db.NodeTypeFolder, Depth: 1, TraversalStatus: db.StatusSuccessful,
+			},
 		})
-		dstEvents = append(dstEvents, db.StatusEvent{ID: id, TraversalStatus: db.StatusSuccessful, EventTime: eventTime, Depth: 1})
 	}
 	pendingIDs := make([]string, 0, 3)
 	for i := 0; i < 3; i++ {
 		path := fmt.Sprintf("/pend-%d", i)
 		id := db.DeterministicNodeID("DST", db.NodeTypeFolder, path)
 		pendingIDs = append(pendingIDs, id)
-		dstNodes = append(dstNodes, &db.NodeState{
-			ID: id, Path: path, ParentPath: "/", Name: fmt.Sprintf("pend-%d", i),
-			Type: db.NodeTypeFolder, Depth: 1,
+		ops = append(ops, db.InsertOperation{
+			QueueType: "DST", Level: 1, Status: db.StatusPending,
+			State: &db.NodeState{
+				ID: id, Path: path, ParentPath: "/", Name: fmt.Sprintf("pend-%d", i),
+				Type: db.NodeTypeFolder, Depth: 1, TraversalStatus: db.StatusPending,
+			},
 		})
-		dstEvents = append(dstEvents, db.StatusEvent{ID: id, TraversalStatus: db.StatusPending, EventTime: eventTime, Depth: 1})
 	}
-
-	err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			if err := w.AppenderInsert(db.TableSrcNodes, []*db.NodeState{srcRoot, srcFolder, srcChild}); err != nil {
-				return err
-			}
-			if err := w.AppenderInsert(db.TableDstNodes, dstNodes); err != nil {
-				return err
-			}
-			if err := w.BatchInsertSrcStatusEvents([]db.StatusEvent{
-				{ID: srcRoot.ID, TraversalStatus: db.StatusSuccessful, EventTime: eventTime, Depth: 0},
-				{ID: srcFolder.ID, TraversalStatus: db.StatusSuccessful, EventTime: eventTime, Depth: 1},
-				{ID: srcChild.ID, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending, EventTime: eventTime, Depth: 2},
-			}); err != nil {
-				return err
-			}
-			if err := w.BatchInsertDstStatusEvents(dstEvents); err != nil {
-				return err
-			}
-			var maps []db.IDMapEvent
-			for _, dstID := range pendingIDs {
-				maps = append(maps, db.IDMapEvent{
-					SrcInternalID: srcFolder.ID, DstInternalID: dstID,
-					EventTime: eventTime, Status: db.IDMapStatusActive,
-				})
-			}
-			return w.BatchInsertIDMapEvents(maps)
+	if err := database.AppendDiscoveredNodes(ops); err != nil {
+		t.Fatal(err)
+	}
+	for _, dstID := range pendingIDs {
+		database.AppendIDMapEvent(db.IDMapEvent{
+			SrcInternalID: srcFolder.ID, DstInternalID: dstID,
+			Status: db.IDMapStatusActive, Depth: 1,
 		})
-	})
-	if err != nil {
+	}
+	if err := database.Flush(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
-	batch, children, lastScanned, err := ListDstBatchWithSrcChildren(database, 1, "", 2, db.StatusPending)
+	batch, children, srcParentDelete, lastScanned, err := ListDstBatchWithSrcChildren(database, 1, "", 2, db.StatusPending)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,13 +107,15 @@ func TestListDstBatchWithSrcChildren_lateJoinAndCursor(t *testing.T) {
 		if ch[0].CopyStatus != db.CopyStatusPending {
 			t.Fatalf("child copy status=%q want pending", ch[0].CopyStatus)
 		}
+		if got := srcParentDelete[fr.Key]; got != db.DeleteStatusPendingExplicit {
+			t.Fatalf("src parent delete for %s = %q want %q", fr.Key, got, db.DeleteStatusPendingExplicit)
+		}
 	}
 	if lastScanned != batch[len(batch)-1].Key {
-		t.Fatalf("lastScanned=%q want last pending %q (mid-window fill)", lastScanned, batch[len(batch)-1].Key)
+		t.Fatalf("lastScanned=%q want last pending %q", lastScanned, batch[len(batch)-1].Key)
 	}
 
-	// Second page: remaining pending.
-	batch2, _, last2, err := ListDstBatchWithSrcChildren(database, 1, lastScanned, 10, db.StatusPending)
+	batch2, _, _, last2, err := ListDstBatchWithSrcChildren(database, 1, lastScanned, 10, db.StatusPending)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,60 +131,48 @@ func TestListDstBatchWithSrcChildren_lateJoinAndCursor(t *testing.T) {
 }
 
 func TestListDstBatchWithSrcChildren_skipsFilesInWindow(t *testing.T) {
-	database, err := db.Open(db.Options{Path: t.TempDir() + "/dst-pull-folders.db"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
+	database := db.TestOpen(t, "dst-pull-folders")
 
-	eventTime := time.Now().UnixNano()
 	srcRoot := &db.NodeState{
 		ID: db.MintNodeID("SRC", "", db.NodeTypeFolder, "/"), Path: "/", ParentPath: "", Name: "", Type: db.NodeTypeFolder, Depth: 0,
+		TraversalStatus: db.StatusSuccessful,
 	}
-	// Interleave file IDs between folder IDs in sort order via path-derived deterministic IDs.
 	fileA := &db.NodeState{
 		ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/a.txt"), Path: "/a.txt", ParentPath: "/",
-		Name: "a.txt", Type: db.NodeTypeFile, Depth: 1, Size: 1,
+		Name: "a.txt", Type: db.NodeTypeFile, Depth: 1, Size: 1, TraversalStatus: db.StatusSuccessful,
 	}
 	folderPend := &db.NodeState{
 		ID: db.DeterministicNodeID("DST", db.NodeTypeFolder, "/b"), Path: "/b", ParentPath: "/",
-		Name: "b", Type: db.NodeTypeFolder, Depth: 1,
+		Name: "b", Type: db.NodeTypeFolder, Depth: 1, TraversalStatus: db.StatusPending,
 	}
 	fileC := &db.NodeState{
 		ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/c.txt"), Path: "/c.txt", ParentPath: "/",
-		Name: "c.txt", Type: db.NodeTypeFile, Depth: 1, Size: 1,
+		Name: "c.txt", Type: db.NodeTypeFile, Depth: 1, Size: 1, TraversalStatus: db.StatusSuccessful,
 	}
 	srcFolder := &db.NodeState{
 		ID: db.DeterministicNodeID("SRC", db.NodeTypeFolder, "/b"), Path: "/b", ParentPath: "/",
 		ParentID: db.MintNodeID("SRC", "", db.NodeTypeFolder, "/"), Name: "b", Type: db.NodeTypeFolder, Depth: 1,
+		TraversalStatus: db.StatusSuccessful,
 	}
 
-	err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			if err := w.AppenderInsert(db.TableSrcNodes, []*db.NodeState{srcRoot, srcFolder}); err != nil {
-				return err
-			}
-			if err := w.AppenderInsert(db.TableDstNodes, []*db.NodeState{fileA, folderPend, fileC}); err != nil {
-				return err
-			}
-			if err := w.BatchInsertDstStatusEvents([]db.StatusEvent{
-				{ID: fileA.ID, TraversalStatus: db.StatusSuccessful, EventTime: eventTime, Depth: 1},
-				{ID: folderPend.ID, TraversalStatus: db.StatusPending, EventTime: eventTime, Depth: 1},
-				{ID: fileC.ID, TraversalStatus: db.StatusSuccessful, EventTime: eventTime, Depth: 1},
-			}); err != nil {
-				return err
-			}
-			return w.BatchInsertIDMapEvents([]db.IDMapEvent{{
-				SrcInternalID: srcFolder.ID, DstInternalID: folderPend.ID,
-				EventTime: eventTime, Status: db.IDMapStatusActive,
-			}})
-		})
+	if err := database.AppendDiscoveredNodes([]db.InsertOperation{
+		{QueueType: "SRC", Level: 0, Status: db.StatusSuccessful, State: srcRoot},
+		{QueueType: "SRC", Level: 1, Status: db.StatusSuccessful, State: srcFolder},
+		{QueueType: "DST", Level: 1, Status: db.StatusSuccessful, State: fileA},
+		{QueueType: "DST", Level: 1, Status: db.StatusPending, State: folderPend},
+		{QueueType: "DST", Level: 1, Status: db.StatusSuccessful, State: fileC},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	database.AppendIDMapEvent(db.IDMapEvent{
+		SrcInternalID: srcFolder.ID, DstInternalID: folderPend.ID,
+		Status: db.IDMapStatusActive, Depth: 1,
 	})
-	if err != nil {
+	if err := database.Flush(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
-	batch, _, lastScanned, err := ListDstBatchWithSrcChildren(database, 1, "", 10, db.StatusPending)
+	batch, _, _, lastScanned, err := ListDstBatchWithSrcChildren(database, 1, "", 10, db.StatusPending)
 	if err != nil {
 		t.Fatal(err)
 	}

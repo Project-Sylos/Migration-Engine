@@ -10,35 +10,7 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/aimd"
 )
 
-func TestNoteThrottleBounceIndependentOfEfficiency(t *testing.T) {
-	a := &Autoscaler{
-		aimd:       aimd.DefaultAIMDPolicy(6 * time.Second),
-		efficiency: aimd.EfficiencyProbeConfig{}.Normalized(time.Second), // Enabled=false
-		debugAIMD:  false,
-	}
-	st := &aimd.State{}
-	now := time.Now()
-	a.noteThrottleBounce(st, now, time.Time{})
-	if st.EffectiveProbeCooldown != aimd.DefaultFirstBounceWait {
-		t.Fatalf("first throttle bounce=%v want %v", st.EffectiveProbeCooldown, aimd.DefaultFirstBounceWait)
-	}
-	if st.ProbeBounce != aimd.DefaultFirstBounceWait {
-		t.Fatalf("ProbeBounce=%v want %v", st.ProbeBounce, aimd.DefaultFirstBounceWait)
-	}
-	if st.FailedProbes != 1 {
-		t.Fatalf("FailedProbes=%d want 1", st.FailedProbes)
-	}
-	a.noteThrottleBounce(st, now.Add(time.Second), time.Time{})
-	// Pre-ceiling: efficiency timer doubles; ProbeBounce also doubles from LastProbeBounce.
-	if st.EffectiveProbeCooldown != 2*aimd.DefaultFirstBounceWait {
-		t.Fatalf("second efficiency bounce=%v want %v", st.EffectiveProbeCooldown, 2*aimd.DefaultFirstBounceWait)
-	}
-	if st.ProbeBounce != 2*aimd.DefaultFirstBounceWait {
-		t.Fatalf("second ProbeBounce=%v want %v", st.ProbeBounce, 2*aimd.DefaultFirstBounceWait)
-	}
-}
-
-func TestNoteThrottleBounceCoversRetryAfter(t *testing.T) {
+func TestNoteSoftCapThrottleRatchetsProbeBounce(t *testing.T) {
 	a := &Autoscaler{
 		aimd:       aimd.DefaultAIMDPolicy(6 * time.Second),
 		efficiency: aimd.EfficiencyProbeConfig{MaxProbeCooldown: 10 * time.Minute},
@@ -46,12 +18,7 @@ func TestNoteThrottleBounceCoversRetryAfter(t *testing.T) {
 	st := &aimd.State{}
 	now := time.Now()
 	until := now.Add(5 * time.Minute)
-	a.noteThrottleBounce(st, now, until)
-	// Pre-ceiling noteThrottleBounce: efficiency timer covers Retry-After+cushion;
-	// ProbeBounce uses fail formula max(2×serverWait, …) = 10m.
-	if st.EffectiveProbeCooldown != 5*time.Minute+aimd.DefaultBounceCushion {
-		t.Fatalf("efficiency bounce=%v want %v", st.EffectiveProbeCooldown, 5*time.Minute+aimd.DefaultBounceCushion)
-	}
+	a.noteSoftCapThrottle(st, now, until)
 	if st.ProbeBounce != 10*time.Minute {
 		t.Fatalf("ProbeBounce=%v want 10m", st.ProbeBounce)
 	}

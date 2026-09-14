@@ -31,6 +31,9 @@ type QueueActuator interface {
 	SetLeaseBatchSize(n int)
 	EffectiveRefillBatchSize() int
 	SetRefillBatchSize(n int)
+	EffectiveDstPullChildMultiplier() int
+	SetDstPullChildMultiplier(n int)
+	EffectiveDstPullChildQuota(taskQuota int) int
 	GetListPageSize() int
 	SetListPageSize(n int)
 	ListItemsP95() int
@@ -38,6 +41,4 @@ type QueueActuator interface {
 	InProgressCount() int
 	ScalingContext() queue.ScalingContext
 	ScalingAdapter(srcSide bool) fstypes.FSAdapter
-	// ReleaseInFlightOnThrottle requeues in-progress work after an FS_THROTTLE step-down.
-	ReleaseInFlightOnThrottle()
 }

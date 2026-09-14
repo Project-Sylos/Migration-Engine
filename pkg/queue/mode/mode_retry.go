@@ -4,13 +4,14 @@
 package mode
 
 import (
-	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"fmt"
+	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -18,6 +19,10 @@ import (
 // Rounds at or below maxKnownDepth use the retry pending keyset pull. Rounds past that
 // floor (or when maxKnownDepth is unknown) delegate to traversal pull without holding the
 // retry pull lock — nested TryBeginPulling would always Skip and block completion.
+//
+// When the round Expected pending count is already 0, the expensive full-depth keyset walk is
+// skipped (empty partial pull) so empty retry depths advance immediately. SRC pending rows are
+// loaded via *_current (not scanning every node at the depth).
 func PullRetryTasks(q *queue.Queue, force bool) queue.PullResult {
 	database := q.Database()
 	if database == nil {
@@ -44,6 +49,11 @@ func PullRetryTasks(q *queue.Queue, force bool) queue.PullResult {
 	if q.State() == queue.QueueStateCompleted {
 		return queue.PullResult{Status: queue.PullAborted}
 	}
+	if ctx := q.ShutdownCtx(); ctx != nil && ctx.Err() != nil {
+		// Soft-stop mid-sweep: do not mark an empty partial frontier; Expected already
+		// records whether more work remains at this depth.
+		return queue.PullResult{Round: currentRound, Status: queue.PullAborted}
+	}
 
 	snapshot := q.StateSnapshot()
 
@@ -66,6 +76,18 @@ func PullRetryTasks(q *queue.Queue, force bool) queue.PullResult {
 		}
 	}
 
+	expected := q.RoundExpected(currentRound)
+	if expected < 0 {
+		q.SetExpectedFromStatsBucket(currentRound)
+		expected = q.RoundExpected(currentRound)
+	}
+	if expected == 0 {
+		q.SetLastPullWasPartial(true)
+		q.RecordPull(currentRound, 0, true)
+		q.SetFirstPullForRound(false)
+		return queue.PullResult{Round: currentRound, Yield: 0, Partial: true, QueriedDB: true, Status: queue.PullOK}
+	}
+
 	queueType := queue.GetQueueType(q.Name())
 	batchSize := q.EffectiveLeaseBatchSize()
 	requestLimit := batchSize + 1
@@ -74,37 +96,39 @@ func PullRetryTasks(q *queue.Queue, force bool) queue.PullResult {
 	var expectedFilesMap map[string][]types.File
 	var srcIDMap map[string]map[string]string
 	var srcIDToMeta map[string]queue.SrcNodeMeta
+	var srcParentDeleteByDstID map[string]string
 	var err error
 
 	rawResultCount := 0
+	dstPullPartial := false
+	var retryDstCleanupMap map[string]*queue.RetryDstCleanup
+	q.BeginDBPull()
+	defer q.ReleaseDBPull()
 	if q.Name() == "dst" {
 		var childrenByDstID map[string][]*db.NodeState
-		var lastScannedID string
-		batch, childrenByDstID, lastScannedID, err = pull.ListDstBatchWithSrcChildren(database, currentRound, q.GetKeysetCursor(), requestLimit, db.StatusPending)
+		var lastEnqueuedID string
+		taskQuota := batchSize
+		childQuota := q.EffectiveDstPullChildQuota(taskQuota)
+		pullStart := time.Now()
+		batch, childrenByDstID, srcParentDeleteByDstID, lastEnqueuedID, dstPullPartial, err = pull.ListDstBatchWithSrcChildrenQuota(database, currentRound, q.GetKeysetCursor(), pull.DstPullQuota{
+			MaxTasks:    taskQuota,
+			MaxChildren: childQuota,
+		}, db.StatusPending)
+		q.RecordDBPull(len(batch), time.Since(pullStart))
 		if err == nil && len(batch) > 0 {
 			rawResultCount = len(batch)
-			processLimit := batchSize
-			if len(batch) <= batchSize {
-				processLimit = len(batch)
+			if lastEnqueuedID != "" {
+				q.SetKeysetCursor(lastEnqueuedID)
 			}
-			if processLimit < len(batch) {
-				q.SetKeysetCursor(batch[processLimit-1].Key)
-			} else if lastScannedID != "" {
-				q.SetKeysetCursor(lastScannedID)
-			} else {
-				q.SetKeysetCursor(batch[processLimit-1].Key)
-			}
-			expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta = queue.BuildExpectedMapsFromDstWithChildren(batch[:processLimit], childrenByDstID)
-			batch = batch[:processLimit]
-		} else if err == nil && lastScannedID != "" {
-			// Advanced past non-pending rows with an empty yield.
-			q.SetKeysetCursor(lastScannedID)
+			expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta = queue.BuildExpectedMapsFromDstWithChildren(batch, childrenByDstID)
 		}
 		if err != nil {
 			batch = nil
 		}
 	} else {
-		batch, err = pull.ListNodesByDepthKeyset(database, queueType, currentRound, q.GetKeysetCursor(), db.StatusPending, requestLimit)
+		pullStart := time.Now()
+		batch, err = pull.ListNodesPendingAtDepthKeyset(database, queueType, currentRound, q.GetKeysetCursor(), requestLimit, db.NodeTypeFolder)
+		q.RecordDBPull(len(batch), time.Since(pullStart))
 		if err == nil && len(batch) > 0 {
 			rawResultCount = len(batch)
 			processLimit := batchSize
@@ -113,6 +137,30 @@ func PullRetryTasks(q *queue.Queue, force bool) queue.PullResult {
 			}
 			q.SetKeysetCursor(batch[processLimit-1].Key)
 			batch = batch[:processLimit]
+		}
+		if err == nil && len(batch) > 0 {
+			var srcFolderIDs []string
+			for _, item := range batch {
+				task := queue.NodeStateToTask(item.State, queue.TaskTypeSrcTraversal)
+				if task != nil && task.IsFolder() {
+					srcFolderIDs = append(srcFolderIDs, item.State.ID)
+				}
+			}
+			if len(srcFolderIDs) > 0 {
+				var loadErr error
+				retryDstCleanupMap, loadErr = queue.BatchLoadRetryDstCleanup(database, srcFolderIDs)
+				if loadErr != nil {
+					if logservice.LS != nil {
+						err := logservice.LS.Log("debug", fmt.Sprintf("Failed to batch load retry DST cleanup: %v", loadErr), "queue", q.Name(), q.Name())
+						if err != nil {
+							fmt.Println("error logging", err)
+						}
+					}
+					retryDstCleanupMap = make(map[string]*queue.RetryDstCleanup)
+				}
+			} else {
+				retryDstCleanupMap = make(map[string]*queue.RetryDstCleanup)
+			}
 		}
 	}
 	if err != nil {
@@ -136,33 +184,6 @@ func PullRetryTasks(q *queue.Queue, force bool) queue.PullResult {
 		taskType = queue.TaskTypeDstTraversal
 	}
 
-	// For SRC: Batch-load retry DST cleanup (DST counterpart + children meta) for folder tasks
-	var retryDstCleanupMap map[string]*queue.RetryDstCleanup
-	if q.Name() == "src" {
-		var srcFolderIDs []string
-		for _, item := range batch {
-			task := queue.NodeStateToTask(item.State, taskType)
-			if task != nil && task.IsFolder() {
-				srcFolderIDs = append(srcFolderIDs, item.State.ID)
-			}
-		}
-		if len(srcFolderIDs) > 0 {
-			var loadErr error
-			retryDstCleanupMap, loadErr = queue.BatchLoadRetryDstCleanup(database, srcFolderIDs)
-			if loadErr != nil {
-				if logservice.LS != nil {
-					err := logservice.LS.Log("debug", fmt.Sprintf("Failed to batch load retry DST cleanup: %v", loadErr), "queue", q.Name(), q.Name())
-					if err != nil {
-						fmt.Println("error logging", err)
-					}
-				}
-				retryDstCleanupMap = make(map[string]*queue.RetryDstCleanup)
-			}
-		} else {
-			retryDstCleanupMap = make(map[string]*queue.RetryDstCleanup)
-		}
-	}
-
 	enqueuedCount := 0
 	for _, item := range batch {
 		task := queue.NodeStateToTask(item.State, taskType)
@@ -183,6 +204,7 @@ func PullRetryTasks(q *queue.Queue, force bool) queue.PullResult {
 			dstID := item.State.ID
 			task.ExpectedFolders = expectedFoldersMap[dstID]
 			task.ExpectedFiles = expectedFilesMap[dstID]
+			task.SrcParentDeleteStatus = srcParentDeleteByDstID[dstID]
 			if srcIDMap != nil {
 				task.ExpectedSrcIDMap = srcIDMap[dstID]
 			}
@@ -202,6 +224,9 @@ func PullRetryTasks(q *queue.Queue, force bool) queue.PullResult {
 	}
 
 	partial := rawResultCount <= batchSize
+	if q.Name() == "dst" {
+		partial = dstPullPartial
+	}
 	q.SetLastPullWasPartial(partial)
 	q.RecordPull(currentRound, enqueuedCount, partial)
 	q.SetFirstPullForRound(false)

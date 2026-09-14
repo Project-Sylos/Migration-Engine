@@ -4,11 +4,9 @@
 package review
 
 import (
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
-	"context"
 	"testing"
-	"time"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
 func TestListMergedReviewDiffsExcludeDestinationOnly(t *testing.T) {
@@ -18,7 +16,6 @@ func TestListMergedReviewDiffsExcludeDestinationOnly(t *testing.T) {
 	}
 	defer database.Close()
 
-	eventTime := time.Now().UnixNano()
 	srcBoth := &db.NodeState{
 		ID:   db.DeterministicNodeID("SRC", db.NodeTypeFile, "/both.txt"),
 		Path: "/both.txt", ParentPath: "/", Name: "both.txt",
@@ -39,35 +36,9 @@ func TestListMergedReviewDiffsExcludeDestinationOnly(t *testing.T) {
 		Path: "/dst-only.txt", ParentPath: "/", Name: "dst-only.txt",
 		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusNotOnSrc,
 	}
-
-	err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			if err := w.AppenderInsert(db.TableSrcNodes, []*db.NodeState{srcBoth, srcOnly}); err != nil {
-				return err
-			}
-			if err := w.AppenderInsert(db.TableDstNodes, []*db.NodeState{dstBoth, dstOnly}); err != nil {
-				return err
-			}
-			srcEvents := []db.StatusEvent{
-				{ID: srcBoth.ID, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusSuccessful, EventTime: eventTime, Depth: 1},
-				{ID: srcOnly.ID, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending, EventTime: eventTime, Depth: 1},
-			}
-			dstEvents := []db.StatusEvent{
-				{ID: dstBoth.ID, TraversalStatus: db.StatusSuccessful, EventTime: eventTime, Depth: 1},
-				{ID: dstOnly.ID, TraversalStatus: db.StatusNotOnSrc, EventTime: eventTime, Depth: 1},
-			}
-			if err := w.BatchInsertSrcStatusEvents(srcEvents); err != nil {
-				return err
-			}
-			return w.BatchInsertDstStatusEvents(dstEvents)
-		})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := database.RebuildAllCurrent(); err != nil {
-		t.Fatal(err)
-	}
+	seedReviewTree(t, database, []*db.NodeState{srcBoth, srcOnly}, []*db.NodeState{dstBoth, dstOnly}, []db.IDMapEvent{{
+		SrcInternalID: srcBoth.ID, DstInternalID: dstBoth.ID, Status: db.IDMapStatusActive,
+	}})
 
 	all, totalAll, err := ListMergedReviewDiffs(database, ReviewFilter{ParentPath: "/"}, "path ASC", 100, 0)
 	if err != nil {

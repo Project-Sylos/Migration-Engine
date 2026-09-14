@@ -7,13 +7,22 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Migration-Engine/pkg/scaling"
 	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/memory"
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/profile"
 )
 
 const (
-	defaultSealRowThreshold    = 20_000
-	maxSealRowThreshold        = 40_000
+	minDstPullChildMultiplier = queue.MinDstPullChildMultiplier
+	maxDstPullChildMultiplier = queue.MaxDstPullChildMultiplier
+)
+
+const (
+	// Seal AIMD only moves the soft flush threshold, never HardCap (100k).
+	defaultSealRowThreshold    = 50_000
+	maxSealRowThreshold        = 50_000
 	defaultSealFlushInterval   = 10 * time.Second
 	maxSealFlushInterval       = 10 * time.Second
 	minSealRowThreshold        = 5_000
@@ -45,6 +54,14 @@ func (a *Autoscaler) stepDownMemoryKnobs(now time.Time, pressure scaling.Pressur
 		if next, ok := halveTowardMin(curRefill, minRefill); ok {
 			q.SetRefillBatchSize(next)
 			a.emit(scaling.ScalingEvent{Queue: name, Knob: "RefillBatchSize", OldValue: curRefill, NewValue: next, Pressure: pressure, At: now})
+		}
+
+		if name == "dst" {
+			curMult := q.EffectiveDstPullChildMultiplier()
+			if next, ok := halveTowardMin(curMult, minDstPullChildMultiplier); ok {
+				q.SetDstPullChildMultiplier(next)
+				a.emit(scaling.ScalingEvent{Queue: name, Knob: "DstPullChildMultiplier", OldValue: curMult, NewValue: next, Pressure: pressure, At: now})
+			}
 		}
 	}
 
@@ -116,9 +133,12 @@ func (a *Autoscaler) stepUpMemoryKnobs(now time.Time, sample memory.MemorySample
 		if maxRefill <= 0 {
 			maxRefill = 10_000
 		}
+		if name == "dst" && maxRefill > profile.DstTraversalMaxRefillBatch {
+			maxRefill = profile.DstTraversalMaxRefillBatch
+		}
 
 		curLease := q.EffectiveLeaseBatchSize()
-		if next, ok := memory.IncreaseTowardMax(curLease, minLease, maxLease, maxLease/10); ok {
+		if next, ok := memory.IncreaseTowardMax(curLease, minLease, maxLease, maxLease/4); ok {
 			extra := memory.EstimateBatchIncrementKB(memory.BatchIncrementLease, curLease, next)
 			if memory.MemoryBudgetAllowsIncrease(sample, extra) {
 				q.SetLeaseBatchSize(next)
@@ -127,11 +147,27 @@ func (a *Autoscaler) stepUpMemoryKnobs(now time.Time, sample memory.MemorySample
 		}
 
 		curRefill := q.EffectiveRefillBatchSize()
-		if next, ok := memory.IncreaseTowardMax(curRefill, minRefill, maxRefill, maxRefill/10); ok {
+		if next, ok := memory.IncreaseTowardMax(curRefill, minRefill, maxRefill, maxRefill/4); ok {
 			extra := memory.EstimateBatchIncrementKB(memory.BatchIncrementRefill, curRefill, next)
+			if name == "dst" {
+				childQuota := pull.DstPullChildQuota(next, q.EffectiveDstPullChildMultiplier())
+				extra += memory.EstimateDstChildQuotaKB(childQuota)
+			}
 			if memory.MemoryBudgetAllowsIncrease(sample, extra) {
 				q.SetRefillBatchSize(next)
 				a.emit(scaling.ScalingEvent{Queue: name, Knob: "RefillBatchSize", OldValue: curRefill, NewValue: next, Pressure: scaling.PressureNone, At: now})
+			}
+		}
+
+		if name == "dst" {
+			curMult := q.EffectiveDstPullChildMultiplier()
+			if next, ok := memory.IncreaseTowardMax(curMult, minDstPullChildMultiplier, maxDstPullChildMultiplier, 2); ok {
+				childQuota := pull.DstPullChildQuota(q.EffectiveRefillBatchSize(), next)
+				extra := memory.EstimateDstChildQuotaKB(childQuota)
+				if memory.MemoryBudgetAllowsIncrease(sample, extra) {
+					q.SetDstPullChildMultiplier(next)
+					a.emit(scaling.ScalingEvent{Queue: name, Knob: "DstPullChildMultiplier", OldValue: curMult, NewValue: next, Pressure: scaling.PressureNone, At: now})
+				}
 			}
 		}
 	}

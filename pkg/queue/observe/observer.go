@@ -3,9 +3,9 @@
 
 // Package observe provides QueueObserver and stall watchdogs for pkg/queue.
 //
-// The QueueObserver polls queues directly at regular intervals (default: 200ms) and publishes
-// metrics to DuckDB. This allows external APIs to poll DuckDB for real-time queue statistics
-// without disrupting queue operations.
+// The QueueObserver polls queues directly at regular intervals (default: 200ms) and keeps an
+// in-memory metrics snapshot for live API reads. Durable queue_stats rows are written
+// asynchronously so DuckDB write locks cannot stall progress-monitor freshness.
 //
 // Usage:
 //   observer := observe.NewQueueObserver(database, 200*time.Millisecond)
@@ -18,21 +18,22 @@
 //   statsJSON, err := database.GetLatestQueueStats("src-traversal", db.QueueStatsPhaseTraversal)
 //   allStats, err := database.GetAllQueueStats()
 //
-// For low-latency APIs while a run is active, use LastQueueMetricsForAPI(): same JSON as written to
-// queue_stats, updated every observer tick without requiring a DB read.
+// For low-latency APIs while a run is active, use LastQueueMetricsForAPI(): same JSON shape as
+// queue_stats audit rows, refreshed every observer tick from memory. Durable queue_stats writes
+// run on a separate goroutine so DuckDB writeMu contention cannot stall live API metrics.
 
 package observe
 
 import (
-	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
-	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 )
 
 // ExternalQueueMetrics contains user-facing metrics published to DuckDB for API access.
@@ -42,7 +43,7 @@ type ExternalQueueMetrics struct {
 	FoldersDiscoveredTotal int64 `json:"folders_discovered_total"`
 
 	// EMA-smoothed rates (2-5 second window) - traversal phase.
-	// Published as list-task completions/sec (not newly discovered children).
+	// Newly discovered children (files + folders) per second.
 	DiscoveryRateItemsPerSec float64 `json:"discovery_rate_items_per_sec"`
 
 	// Verification counts (for O(1) stats bucket lookups)
@@ -56,6 +57,15 @@ type ExternalQueueMetrics struct {
 	Total   int64 `json:"total"`   // Total items (folders + files)
 	Bytes   int64 `json:"bytes"`   // Total bytes transferred (done)
 
+	// Already-on-destination (copy) or not-deleting (delete) completions.
+	FoldersAlreadyExists int64 `json:"folders_already_exists,omitempty"`
+	FilesAlreadyExists   int64 `json:"files_already_exists,omitempty"`
+	BytesAlreadyExists   int64 `json:"bytes_already_exists,omitempty"`
+
+	// Permanent failures counted after seal-buffer accept (folder/file split for UI grid).
+	FoldersFailed int64 `json:"folders_failed,omitempty"`
+	FilesFailed   int64 `json:"files_failed,omitempty"`
+
 	// Migration-wide expected denominators for Files/Folders/Total (copy/delete).
 	FoldersExpected int64 `json:"folders_expected,omitempty"`
 	FilesExpected   int64 `json:"files_expected,omitempty"`
@@ -65,16 +75,22 @@ type ExternalQueueMetrics struct {
 	ItemsCompleted       int64   `json:"items_completed,omitempty"`
 	ItemsTotal           int64   `json:"items_total,omitempty"`
 	ItemsProgressPercent float64 `json:"items_progress_percent,omitempty"`
+	// Segment shares of ItemsTotal (0–100) for stacked bars: ok → already_exists → failed.
+	ItemsOkPercent            float64 `json:"items_ok_percent,omitempty"`
+	ItemsAlreadyExistsPercent float64 `json:"items_already_exists_percent,omitempty"`
 
 	// Bytes progress (copy/delete): done vs fixed migration-wide eligible file size total.
 	// Bytes is transferred (and in-flight); BytesFailed is permanent-failure file sizes.
-	// BytesProgressPercent uses touched bytes (Bytes+BytesFailed) in normal mode, Bytes in retry mode.
+	// BytesProgressPercent uses touched bytes (Bytes+BytesAlreadyExists+BytesFailed) in normal mode.
 	BytesTotal           int64   `json:"bytes_total,omitempty"`
 	BytesFailed          int64   `json:"bytes_failed,omitempty"`
 	BytesProgressPercent float64 `json:"bytes_progress_percent,omitempty"`
-	// Failed share of the bytes bar (0–100 of BytesTotal); UI paints this red at the start.
+	// Segment shares of BytesTotal (0–100) for stacked bars.
+	BytesOkPercent            float64 `json:"bytes_ok_percent,omitempty"`
+	BytesAlreadyExistsPercent float64 `json:"bytes_already_exists_percent,omitempty"`
+	// Failed share of the bytes bar (0–100 of BytesTotal); UI paints this red.
 	BytesFailedPercent float64 `json:"bytes_failed_percent,omitempty"`
-	// Failed share of the items bar (0–100 of ItemsTotal); UI paints this red at the start.
+	// Failed share of the items bar (0–100 of ItemsTotal); UI paints this red.
 	ItemsFailedPercent float64 `json:"items_failed_percent,omitempty"`
 
 	// Copy phase rates (EMA-smoothed)
@@ -100,6 +116,16 @@ type ExternalQueueMetrics struct {
 
 	// AIMD inter-op pacing delay (ns→ms for API). Non-zero means workers are artificially slowed.
 	InterOpDelayMs int64 `json:"inter_op_delay_ms,omitempty"`
+
+	// Last DuckDB frontier pull (this queue). Surfaced via observer → queue_stats.
+	DBPullDurationMs float64 `json:"db_pull_duration_ms,omitempty"`
+	DBPullRows       int64   `json:"db_pull_rows,omitempty"`
+	DBPullRowsPerSec float64 `json:"db_pull_rows_per_sec,omitempty"`
+
+	// Last successful seal buffer flush (migration-wide; same gauges on each queue snapshot).
+	SealFlushDurationMs float64 `json:"seal_flush_duration_ms,omitempty"`
+	SealFlushRows       int64   `json:"seal_flush_rows,omitempty"`
+	SealFlushRowsPerSec float64 `json:"seal_flush_rows_per_sec,omitempty"`
 
 	// Engine-owned remaining-time estimate (UI renders only).
 	// Copy/delete: overall phase. Traversal: current batch only (round_expected - round_completed).
@@ -157,17 +183,39 @@ type QueueObserver struct {
 		folders int64
 		time    time.Time
 	} // Previous discovery totals and time for each queue
-	// Copy metrics tracking for sliding-window rates (Dropbox/Graph batch completions are bursty).
+	// Copy/delete item rates: sliding window on completed folder+file counters.
 	copyRateHistory map[string][]rateSample
 	taskRateHistory map[string][]rateSample
+	// Live byte snapshot + time for EMA bytes/sec (key: queueName).
+	prevByteTotals map[string]struct {
+		bytes int64
+		time  time.Time
+	}
 	// etaState holds CV interval rates and sticky eta_basis per copy/delete queue.
 	etaState map[string]*etaState
 	// lastAPIMetrics: marshaled ExternalQueueMetrics per queue_stats key (e.g. src-traversal), for O(1) API reads.
 	lastAPIMetricsMu sync.RWMutex
 	lastAPIMetrics   map[string][]byte
-	// lastDBPersist tracks when audit metrics were last appended to DuckDB.
+	// lastDBPersist tracks when an audit snapshot was last successfully written to DuckDB.
 	lastDBPersistMu sync.Mutex
 	lastDBPersist   time.Time
+	// Async queue_stats audit: observe loop never blocks on writeMu.
+	auditCh   chan auditSnapshot // buffer 1; latest-wins when the writer is busy
+	auditStop chan struct{}
+	auditWG   sync.WaitGroup
+	// waitReason is a human-readable soft-stop / DB wait label for status polling.
+	waitReason atomic.Value // string
+}
+
+// auditSnapshot is a pre-marshaled queue_stats write batch (built on the observe tick).
+type auditSnapshot struct {
+	rows []auditRow
+}
+
+type auditRow struct {
+	key   string
+	phase string
+	json  string
 }
 
 // rateSample is one monotonic counter observation for sliding-window rate math.
@@ -179,9 +227,9 @@ type rateSample struct {
 const (
 	// emaAlpha is the smoothing factor for exponential moving average (0.2 ≈ several seconds).
 	emaAlpha = 0.2
-	// rateWindow is the lookback used for copy/delete throughput. EMA-per-tick decays to ~0
-	// within ~2s after a Dropbox batch completes; a wall-clock window keeps burst completions
-	// visible for the full window.
+	// rateWindow is the lookback for copy/delete items/sec and task-completion rate.
+	// Bytes/sec uses EMA on the live snapshot instead. Item completions stay windowed
+	// so Dropbox/Graph batch finishes remain visible for the full window.
 	rateWindow = 5 * time.Second
 	// Audit snapshots are durable history, not part of live metrics. Keep writes
 	// infrequent so observability cannot contend with migration I/O.
@@ -222,7 +270,12 @@ func NewQueueObserver(database *db.DB, updateInterval time.Duration) *QueueObser
 		}),
 		copyRateHistory: make(map[string][]rateSample),
 		taskRateHistory: make(map[string][]rateSample),
-		etaState:        make(map[string]*etaState),
+		prevByteTotals: make(map[string]struct {
+			bytes int64
+			time  time.Time
+		}),
+		etaState: make(map[string]*etaState),
+		auditCh:  make(chan auditSnapshot, 1),
 	}
 }
 
@@ -233,11 +286,94 @@ func (o *QueueObserver) RegisterQueue(queueName string, q *queue.Queue) {
 	defer o.mu.Unlock()
 
 	o.queues[queueName] = q
+	o.startLoopsLocked()
+}
 
-	// Start observer loop if not already running
-	if !o.running && o.updateTicker != nil {
-		o.running = true
-		go o.observeLoop()
+// PauseRegisteredQueues pauses every registered queue, clears pending buffers, and stops
+// watchdogs so soft Stop refuses new leases immediately. Returns total in-progress tasks.
+func (o *QueueObserver) PauseRegisteredQueues() int {
+	if o == nil {
+		return 0
+	}
+	o.mu.Lock()
+	queues := make([]*queue.Queue, 0, len(o.queues))
+	for _, q := range o.queues {
+		if q != nil {
+			queues = append(queues, q)
+		}
+	}
+	o.mu.Unlock()
+	inProgress := 0
+	for _, q := range queues {
+		q.SetState(queue.QueueStatePaused)
+		q.StopWatchdog()
+		q.ClearPendingBufferForSuspend()
+		inProgress += q.InProgressCount()
+	}
+	return inProgress
+}
+
+// InProgressTotal returns the sum of in-progress tasks across registered queues.
+func (o *QueueObserver) InProgressTotal() int {
+	if o == nil {
+		return 0
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	n := 0
+	for _, q := range o.queues {
+		if q != nil {
+			n += q.InProgressCount()
+		}
+	}
+	return n
+}
+
+// SetWaitReason records a human-readable wait label for soft-stop UI (empty clears).
+func (o *QueueObserver) SetWaitReason(reason string) {
+	if o == nil {
+		return
+	}
+	o.waitReason.Store(reason)
+}
+
+// WaitReason returns the current soft-stop / DB wait label.
+func (o *QueueObserver) WaitReason() string {
+	if o == nil {
+		return ""
+	}
+	v := o.waitReason.Load()
+	if v == nil {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
+// AbandonRegisteredQueues abandons in-flight tasks on every registered queue (force stop).
+// Uses DB-only abandon (no requeue into pending) and cancels busy worker contexts so
+// mid-flight ListChildren / FS work aborts instead of draining like a soft suspend.
+func (o *QueueObserver) AbandonRegisteredQueues() {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	queues := make([]*queue.Queue, 0, len(o.queues))
+	for _, q := range o.queues {
+		if q != nil {
+			queues = append(queues, q)
+		}
+	}
+	o.mu.Unlock()
+	for _, q := range queues {
+		q.SetState(queue.QueueStatePaused)
+		q.StopWatchdog()
+		q.Spin.AbandonDBOnly.Store(true)
+		q.ClearPendingBufferForSuspend()
+		q.RequestForceCheckoutAllWorkersForStop()
+		q.CancelBusyWorkerContexts()
+		q.AbandonInProgressTasks()
+		q.ClearPendingBufferForSuspend()
 	}
 }
 
@@ -253,13 +389,13 @@ func (o *QueueObserver) UnregisterQueue(queueName string) {
 	delete(o.prevEMARates, queueName+"-items")
 	delete(o.prevEMARates, queueName+"-bytes")
 	delete(o.prevDiscoveryTotals, queueName)
+	delete(o.prevByteTotals, queueName)
 	delete(o.copyRateHistory, queueName)
-	delete(o.copyRateHistory, queueName+"-bytes")
 	delete(o.taskRateHistory, queueName)
 	delete(o.etaState, queueName)
 }
 
-// Start begins the observer loop that publishes stats to DuckDB.
+// Start begins the observer loop (and async audit writer).
 // This is called automatically when the first queue is registered, but can be called manually.
 func (o *QueueObserver) Start() {
 	o.mu.Lock()
@@ -268,10 +404,29 @@ func (o *QueueObserver) Start() {
 	if o.updateTicker == nil {
 		o.updateTicker = time.NewTicker(o.updateInterval)
 	}
-	if !o.running {
-		o.running = true
-		go o.observeLoop()
+	o.startLoopsLocked()
+}
+
+// startLoopsLocked starts observe + audit goroutines once. Caller must hold o.mu.
+func (o *QueueObserver) startLoopsLocked() {
+	if o.running {
+		return
 	}
+	if o.updateTicker == nil {
+		return
+	}
+	// After Stop, stopChan is closed; reopen so the new observe loop does not exit immediately.
+	select {
+	case <-o.stopChan:
+		o.stopChan = make(chan struct{})
+	default:
+	}
+	o.running = true
+	o.auditStop = make(chan struct{})
+	o.auditCh = make(chan auditSnapshot, 1)
+	o.auditWG.Add(1)
+	go o.auditLoop()
+	go o.observeLoop()
 }
 
 // Stop stops the observer loop and cleans up resources.
@@ -283,11 +438,12 @@ func (o *QueueObserver) Stop() {
 		return
 	}
 
-	// Flush final metrics before tearing down queue references.
+	// Final live snapshot while queues are still registered.
 	queues := make(map[string]*queue.Queue, len(o.queues))
 	for name, queue := range o.queues {
 		queues[name] = queue
 	}
+	auditStop := o.auditStop
 	o.mu.Unlock()
 
 	if len(queues) > 0 {
@@ -299,40 +455,49 @@ func (o *QueueObserver) Stop() {
 		}
 		if len(metrics) > 0 {
 			o.storeLastAPIMetrics(metrics)
-			if o.database != nil {
-				o.publishMetricsToDuckDB(metrics, queues)
-			}
 		}
 	}
 
 	o.mu.Lock()
-	defer o.mu.Unlock()
-
 	if !o.running {
-		return // Already stopped by concurrent Stop
+		o.mu.Unlock()
+		return
 	}
-
 	o.running = false
 
-	// Signal the observe loop to exit first (so it can check running flag)
-	// Only close if not already closed
 	select {
 	case <-o.stopChan:
-		// Already closed, create a new one for potential future use
 		o.stopChan = make(chan struct{})
 		close(o.stopChan)
 	default:
 		close(o.stopChan)
 	}
-
-	// Stop ticker after signaling (this prevents new ticks from firing)
-	// The observe loop will exit on next iteration due to running=false check
 	if o.updateTicker != nil {
 		o.updateTicker.Stop()
 		o.updateTicker = nil
 	}
+	o.mu.Unlock()
 
-	// Clear queues
+	// Drain async audit writer before a synchronous final persist.
+	if auditStop != nil {
+		close(auditStop)
+	}
+	o.auditWG.Wait()
+
+	if len(queues) > 0 && o.database != nil {
+		metrics := make(map[string]ExternalQueueMetrics, len(queues))
+		for queueName, queue := range queues {
+			if metric := o.pollQueue(queueName, queue); metric != nil {
+				metrics[queueName] = *metric
+			}
+		}
+		if len(metrics) > 0 {
+			o.publishAuditSnapshot(buildAuditSnapshot(metrics, queues))
+		}
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	o.queues = make(map[string]*queue.Queue)
 	o.internalMetrics = make(map[string]*InternalQueueMetrics)
 	o.prevEMARates = make(map[string]float64)
@@ -343,7 +508,12 @@ func (o *QueueObserver) Stop() {
 	})
 	o.copyRateHistory = make(map[string][]rateSample)
 	o.taskRateHistory = make(map[string][]rateSample)
+	o.prevByteTotals = make(map[string]struct {
+		bytes int64
+		time  time.Time
+	})
 	o.etaState = make(map[string]*etaState)
+	o.auditStop = nil
 	o.lastAPIMetricsMu.Lock()
 	o.lastAPIMetrics = nil
 	o.lastAPIMetricsMu.Unlock()
@@ -395,8 +565,105 @@ func (o *QueueObserver) observeLoop() {
 			if len(metrics) > 0 {
 				o.storeLastAPIMetrics(metrics)
 				if o.database != nil && o.shouldPersistToDB() {
-					o.publishMetricsToDuckDB(metrics, queues)
+					o.enqueueAuditSnapshot(metrics, queues)
 				}
+			}
+		}
+	}
+}
+
+// auditLoop writes queued queue_stats snapshots without blocking the observe tick.
+func (o *QueueObserver) auditLoop() {
+	defer o.auditWG.Done()
+	for {
+		o.mu.RLock()
+		stop := o.auditStop
+		o.mu.RUnlock()
+		if stop == nil {
+			return
+		}
+		select {
+		case <-stop:
+			o.drainAuditChannel()
+			return
+		case snap := <-o.auditCh:
+			o.publishAuditSnapshot(snap)
+		}
+	}
+}
+
+func (o *QueueObserver) enqueueAuditSnapshot(metrics map[string]ExternalQueueMetrics, queues map[string]*queue.Queue) {
+	snap := buildAuditSnapshot(metrics, queues)
+	if len(snap.rows) == 0 || o.auditCh == nil {
+		return
+	}
+	select {
+	case o.auditCh <- snap:
+	default:
+		// Writer busy: keep only the newest snapshot.
+		select {
+		case <-o.auditCh:
+		default:
+		}
+		select {
+		case o.auditCh <- snap:
+		default:
+		}
+	}
+}
+
+func (o *QueueObserver) drainAuditChannel() {
+	for {
+		select {
+		case snap := <-o.auditCh:
+			o.publishAuditSnapshot(snap)
+		default:
+			return
+		}
+	}
+}
+
+func buildAuditSnapshot(metrics map[string]ExternalQueueMetrics, queues map[string]*queue.Queue) auditSnapshot {
+	rows := make([]auditRow, 0, len(metrics))
+	for queueName, met := range metrics {
+		phase := db.QueueStatsPhaseTraversal
+		if q := queues[queueName]; q != nil {
+			phase = PhaseFamilyForMode(q.GetMode())
+		}
+		b, err := json.Marshal(met)
+		if err != nil {
+			continue
+		}
+		rows = append(rows, auditRow{
+			key:   queueStatsKeyForAPI(queueName),
+			phase: phase,
+			json:  string(b),
+		})
+	}
+	return auditSnapshot{rows: rows}
+}
+
+func (o *QueueObserver) publishAuditSnapshot(snap auditSnapshot) {
+	if o.database == nil || len(snap.rows) == 0 {
+		return
+	}
+	var err error
+	for _, row := range snap.rows {
+		if e := o.database.AppendQueueStats(row.key, row.phase, row.json); e != nil {
+			err = fmt.Errorf("failed to append metrics for %s: %w", row.key, e)
+			break
+		}
+	}
+	o.lastDBPersistMu.Lock()
+	o.lastDBPersist = time.Now()
+	o.lastDBPersistMu.Unlock()
+	if err != nil {
+		if logservice.LS != nil {
+			err := logservice.LS.Log("error",
+				fmt.Sprintf("Failed to publish queue metrics: %v", err),
+				"observer", "publish", "")
+			if err != nil {
+				fmt.Println("error logging", err)
 			}
 		}
 	}
@@ -465,10 +732,15 @@ func (o *QueueObserver) pollQueue(queueName string, q *queue.Queue) *ExternalQue
 	foldersTotal := q.GetFoldersDiscoveredTotal()
 	totalDiscovered := q.GetTotalDiscovered()
 
-	// Get copy phase totals (live bytes include in-flight leased progress).
+	// Live byte snapshot (streamed chunks; not completed+inflight overlay).
 	bytesTransferredTotal := q.GetLiveBytesTransferredTotal()
 	foldersCreatedTotal := q.GetFoldersCreatedTotal()
 	filesCreatedTotal := q.GetFilesCreatedTotal()
+	foldersAlreadyExists := q.GetFoldersAlreadyExistsTotal()
+	filesAlreadyExists := q.GetFilesAlreadyExistsTotal()
+	bytesAlreadyExists := q.GetBytesAlreadyExistsTotal()
+	foldersFailed := q.GetFoldersFailedTotal()
+	filesFailed := q.GetFilesFailedTotal()
 
 	// Live observability is memory-only. DB status aggregation here used to replay
 	// event tables every 200ms and starved the two-connection migration database.
@@ -479,25 +751,24 @@ func (o *QueueObserver) pollQueue(queueName string, q *queue.Queue) *ExternalQue
 	o.updateRateLimitMetrics(queueName, now)
 
 	// Calculate EMA-smoothed rates.
-	// Discovery rate for the UI tracks list-task completions (matches Comp growth), not
-	// newly discovered children — leaf/empty folders complete work without adding children.
-	_ = o.calculateDiscoveryRate(queueName, filesTotal, foldersTotal, now)
+	// Discovery rate = newly discovered children (files+folders)/sec.
+	// Task completion rate drives batch ETA (remaining work is list tasks, not children).
+	discoveryRate := o.calculateDiscoveryRate(queueName, filesTotal, foldersTotal, now)
 	taskCompletionRate := o.calculateTaskCompletionRate(queueName, q.GetTasksCompletedTotal(), now)
 
-	// Copy/delete phase rates over a sliding window (shared create+bytes snapshot).
-	itemsPerSecond, bytesPerSecond := o.calculateCopyPhaseRates(
-		queueName, foldersCreatedTotal, filesCreatedTotal, bytesTransferredTotal, now,
-	)
-	// Prefer task-completion rate for items/sec on copy/delete so Dropbox batch finishes
-	// and permanent failures still show activity matching the Comp ticker. Create-counter
-	// rate alone stays 0 between rare batch commits and undercounts failed work.
-	if queueName == "copy" || queueName == "delete" {
-		if taskCompletionRate > itemsPerSecond {
-			itemsPerSecond = taskCompletionRate
-		}
+	// Items/sec: completed folder+file counts over a sliding window.
+	// Bytes/sec: EMA of the live byte snapshot (chunk progress during long copies).
+	itemsPerSecond := o.calculateCopyItemsRate(queueName, foldersCreatedTotal, filesCreatedTotal, now)
+	bytesPerSecond := o.calculateBytesEMA(queueName, bytesTransferredTotal, now)
+	if discoveryRate > itemsPerSecond {
+		itemsPerSecond = discoveryRate
 	}
-
-	discoveryRate := taskCompletionRate
+	// Prefer task-completion rate when it is higher so list/copy/delete work still
+	// shows items/sec while children-discovered or create counters are quiet
+	// (leaf folders, fat-file copy, Dropbox batch finishes, permanent failures).
+	if taskCompletionRate > itemsPerSecond {
+		itemsPerSecond = taskCompletionRate
+	}
 
 	// Calculate total items (folders + files)
 	totalItems := foldersCreatedTotal + filesCreatedTotal
@@ -514,6 +785,11 @@ func (o *QueueObserver) pollQueue(queueName string, q *queue.Queue) *ExternalQue
 		Files:                    filesCreatedTotal,
 		Total:                    totalItems,
 		Bytes:                    bytesTransferredTotal,
+		FoldersAlreadyExists:     foldersAlreadyExists,
+		FilesAlreadyExists:       filesAlreadyExists,
+		BytesAlreadyExists:       bytesAlreadyExists,
+		FoldersFailed:            foldersFailed,
+		FilesFailed:              filesFailed,
 		ItemsPerSecond:           itemsPerSecond,
 		BytesPerSecond:           bytesPerSecond,
 		QueueStats:               stats,
@@ -543,10 +819,26 @@ func (o *QueueObserver) pollQueue(queueName string, q *queue.Queue) *ExternalQue
 		}
 	}
 
+	pullRows, pullMs, pullRPS := q.DBPullStats()
+	metric.DBPullRows = pullRows
+	metric.DBPullDurationMs = pullMs
+	metric.DBPullRowsPerSec = pullRPS
+	if o.database != nil {
+		flush := o.database.LastSealFlushStats()
+		metric.SealFlushRows = flush.Rows
+		if flush.DurationNs > 0 {
+			metric.SealFlushDurationMs = float64(flush.DurationNs) / 1e6
+			sec := float64(flush.DurationNs) / 1e9
+			if sec > 0 {
+				metric.SealFlushRowsPerSec = float64(flush.Rows) / sec
+			}
+		}
+	}
+
 	if queueName == "copy" || queueName == "delete" {
 		o.applyCopyDeleteETA(queueName, &metric, now)
 	} else {
-		applyTraversalBatchETA(&metric)
+		applyTraversalBatchETA(&metric, taskCompletionRate)
 	}
 
 	return &metric
@@ -568,14 +860,20 @@ func enrichCopyDeleteProgressFromMemory(metric *ExternalQueueMetrics, q *queue.Q
 	}
 	retryMode := mode == queue.QueueModeCopyRetry || mode == queue.QueueModeDeleteRetry
 	totals := q.GetWorkTotals()
-	_, failedInt := q.MemoryStatusTotals()
-	failed := int64(failedInt)
+	_, failedMem := q.MemoryStatusTotals()
+	failedItems := metric.FoldersFailed + metric.FilesFailed
+	if failedItems == 0 && failedMem > 0 {
+		// Older persisted metrics / mid-run before seal-coupled failed item counters.
+		failedItems = int64(failedMem)
+	}
 	bytesFailed := q.GetBytesFailedTotal()
+	alreadyItems := metric.FoldersAlreadyExists + metric.FilesAlreadyExists
+	bytesAlready := metric.BytesAlreadyExists
 
 	successful := metric.Folders + metric.Files
-	itemsCompleted := successful
+	itemsCompleted := successful + alreadyItems
 	if !retryMode {
-		itemsCompleted = successful + failed
+		itemsCompleted = successful + alreadyItems + failedItems
 	}
 	itemsTotal := totals.Items()
 	itemsPct := sealedProgressPercent(itemsCompleted, itemsTotal)
@@ -584,8 +882,10 @@ func enrichCopyDeleteProgressFromMemory(metric *ExternalQueueMetrics, q *queue.Q
 	metric.ItemsTotal = itemsTotal
 	metric.ItemsProgressPercent = itemsPct
 	metric.ProgressPercent = itemsPct
+	metric.ItemsOkPercent = db.BytesProgressPercent(successful, itemsTotal)
+	metric.ItemsAlreadyExistsPercent = db.BytesProgressPercent(alreadyItems, itemsTotal)
 	if !retryMode {
-		metric.ItemsFailedPercent = db.BytesProgressPercent(failed, itemsTotal)
+		metric.ItemsFailedPercent = db.BytesProgressPercent(failedItems, itemsTotal)
 	}
 
 	metric.FoldersExpected = totals.Folders
@@ -594,15 +894,20 @@ func enrichCopyDeleteProgressFromMemory(metric *ExternalQueueMetrics, q *queue.Q
 
 	metric.BytesTotal = totals.Bytes
 	metric.BytesFailed = bytesFailed
-	bytesDone := metric.Bytes
+	metric.BytesOkPercent = db.BytesProgressPercent(metric.Bytes, totals.Bytes)
+	metric.BytesAlreadyExistsPercent = db.BytesProgressPercent(bytesAlready, totals.Bytes)
+	bytesDone := metric.Bytes + bytesAlready
 	if !retryMode {
-		bytesDone = metric.Bytes + bytesFailed
+		bytesDone = metric.Bytes + bytesAlready + bytesFailed
 		metric.BytesFailedPercent = db.BytesProgressPercent(bytesFailed, totals.Bytes)
 	}
 	metric.BytesProgressPercent = db.BytesProgressPercent(bytesDone, totals.Bytes)
 }
 
 // applyCopyDeleteETA fills eta_seconds / eta_basis using dual-metric CV selection.
+// While workers are saturated, observed throughput refreshes a cruise rate. Near round
+// end (underfeed), cruise is frozen and only the current-round drain uses the depressed
+// observed rate; the rest of the phase is priced at cruise.
 func (o *QueueObserver) applyCopyDeleteETA(queueName string, metric *ExternalQueueMetrics, now time.Time) {
 	if o == nil || metric == nil {
 		return
@@ -611,21 +916,32 @@ func (o *QueueObserver) applyCopyDeleteETA(queueName string, metric *ExternalQue
 	if itemsRemaining < 0 {
 		itemsRemaining = 0
 	}
-	bytesRemaining := metric.BytesTotal - metric.Bytes - metric.BytesFailed
+	bytesRemaining := metric.BytesTotal - metric.Bytes - metric.BytesAlreadyExists - metric.BytesFailed
 	if bytesRemaining < 0 {
 		bytesRemaining = 0
 	}
 
 	itemsCV, bytesCV := o.recordETAIntervalRates(queueName, metric.ItemsCompleted, metric.Bytes, now)
 
+	saturated := etaSaturated(metric.Workers, metric.InProgress)
 	o.mu.Lock()
 	st := o.etaState[queueName]
-	var prevBasis string
-	var prevSince time.Time
-	if st != nil {
-		prevBasis = st.basis
-		prevSince = st.basisSince
+	if st == nil {
+		st = &etaState{}
+		o.etaState[queueName] = st
 	}
+	if saturated {
+		if metric.ItemsPerSecond > 0 {
+			st.cruiseItemsRate = metric.ItemsPerSecond
+		}
+		if metric.BytesPerSecond > 0 {
+			st.cruiseBytesRate = metric.BytesPerSecond
+		}
+	}
+	prevBasis := st.basis
+	prevSince := st.basisSince
+	cruiseItems := st.cruiseItemsRate
+	cruiseBytes := st.cruiseBytesRate
 	o.mu.Unlock()
 
 	out := chooseEtaBasis(etaChooseInput{
@@ -643,10 +959,35 @@ func (o *QueueObserver) applyCopyDeleteETA(queueName string, metric *ExternalQue
 	if !out.OK {
 		return
 	}
+
+	hasRoundStats := metric.RoundExpected > 0
+	roundItemsRemaining := int64(0)
+	if hasRoundStats {
+		roundItemsRemaining = int64(metric.RoundExpected - metric.RoundCompleted)
+		if roundItemsRemaining < 0 {
+			roundItemsRemaining = 0
+		}
+	}
+	underfed := !saturated && (cruiseItems > 0 || cruiseBytes > 0)
+	seconds := etaSecondsWithCruise(
+		out.Basis,
+		itemsRemaining,
+		bytesRemaining,
+		roundItemsRemaining,
+		hasRoundStats,
+		metric.ItemsPerSecond,
+		metric.BytesPerSecond,
+		cruiseItems,
+		cruiseBytes,
+		underfed,
+		out.Seconds,
+	)
+
 	metric.EtaBasis = out.Basis
-	metric.EtaSeconds = float64Ptr(out.Seconds)
+	metric.EtaSeconds = float64Ptr(seconds)
 
 	o.mu.Lock()
+	st = o.etaState[queueName]
 	if st == nil {
 		st = &etaState{}
 		o.etaState[queueName] = st
@@ -746,17 +1087,19 @@ func (o *QueueObserver) calculateDiscoveryRate(queueName string, filesTotal, fol
 		return 0.0
 	}
 
-	if o.database != nil && o.database.SealIOWaitActive() {
-		return o.prevEMARates[queueName]
-	}
-
-	// Calculate current instantaneous rate
 	timeDelta := now.Sub(prev.time).Seconds()
 	if timeDelta <= 0 {
 		return o.prevEMARates[queueName]
 	}
 
 	itemsDelta := (filesTotal - prev.files) + (foldersTotal - prev.folders)
+	// Hold EMA only when a seal flush produced no new discoveries. Live discovery
+	// (and copy bytes below) must keep updating even while flush is active, or
+	// the progress page sticks at 0 items/sec / 0 B/s through the whole run.
+	if itemsDelta == 0 && o.database != nil && o.database.SealIOWaitActive() {
+		return o.prevEMARates[queueName]
+	}
+
 	currentRate := float64(itemsDelta) / timeDelta
 
 	// Update EMA: newEMA = alpha * currentRate + (1-alpha) * previousEMA
@@ -783,35 +1126,65 @@ func (o *QueueObserver) calculateTaskCompletionRate(queueName string, tasksTotal
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	if o.database != nil && o.database.SealIOWaitActive() {
-		return slidingWindowRate(o.taskRateHistory[queueName], now, tasksTotal)
-	}
 	rate, hist := appendSlidingRate(o.taskRateHistory[queueName], now, tasksTotal)
 	o.taskRateHistory[queueName] = hist
 	return rate
 }
 
-// calculateCopyPhaseRates returns items/sec and bytes/sec over a shared rateWindow.
-// Items use successful create counters (folders+files). Bursty Dropbox batch completions
-// stay visible for the full window instead of EMA-decaying to 0 within ~2s.
-func (o *QueueObserver) calculateCopyPhaseRates(
-	queueName string,
-	foldersTotal, filesTotal, bytesTotal int64,
-	now time.Time,
-) (itemsPerSec, bytesPerSec float64) {
+// calculateCopyItemsRate returns completed items/sec (folders+files) over rateWindow.
+// Bursty Dropbox batch completions stay visible for the full window instead of
+// EMA-decaying to 0 within ~2s.
+func (o *QueueObserver) calculateCopyItemsRate(queueName string, foldersTotal, filesTotal int64, now time.Time) float64 {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	itemsTotal := foldersTotal + filesTotal
-	if o.database != nil && o.database.SealIOWaitActive() {
-		return slidingWindowRate(o.copyRateHistory[queueName], now, itemsTotal),
-			slidingWindowRate(o.copyRateHistory[queueName+"-bytes"], now, bytesTotal)
+	rate, hist := appendSlidingRate(o.copyRateHistory[queueName], now, foldersTotal+filesTotal)
+	o.copyRateHistory[queueName] = hist
+	return rate
+}
+
+// calculateBytesEMA returns rolling EMA bytes/sec from the live byte snapshot.
+func (o *QueueObserver) calculateBytesEMA(queueName string, bytesTotal int64, now time.Time) float64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	emaKey := queueName + "-bytes"
+	prev, hasPrev := o.prevByteTotals[queueName]
+	if !hasPrev {
+		o.prevByteTotals[queueName] = struct {
+			bytes int64
+			time  time.Time
+		}{
+			bytes: bytesTotal,
+			time:  now,
+		}
+		o.prevEMARates[emaKey] = 0
+		return 0
 	}
-	itemsPerSec, itemsHist := appendSlidingRate(o.copyRateHistory[queueName], now, itemsTotal)
-	bytesPerSec, bytesHist := appendSlidingRate(o.copyRateHistory[queueName+"-bytes"], now, bytesTotal)
-	o.copyRateHistory[queueName] = itemsHist
-	o.copyRateHistory[queueName+"-bytes"] = bytesHist
-	return itemsPerSec, bytesPerSec
+
+	timeDelta := now.Sub(prev.time).Seconds()
+	if timeDelta <= 0 {
+		return o.prevEMARates[emaKey]
+	}
+
+	delta := bytesTotal - prev.bytes
+	if delta < 0 {
+		delta = 0
+	}
+	if delta == 0 && o.database != nil && o.database.SealIOWaitActive() {
+		return o.prevEMARates[emaKey]
+	}
+
+	newEMA := emaAlpha*(float64(delta)/timeDelta) + (1-emaAlpha)*o.prevEMARates[emaKey]
+	o.prevEMARates[emaKey] = newEMA
+	o.prevByteTotals[queueName] = struct {
+		bytes int64
+		time  time.Time
+	}{
+		bytes: bytesTotal,
+		time:  now,
+	}
+	return newEMA
 }
 
 // appendSlidingRate records value at now and returns (value-oldest)/dt over rateWindow.
@@ -948,56 +1321,6 @@ func (o *QueueObserver) updateRateLimitMetrics(queueName string, now time.Time) 
 	}
 }
 
-// publishMetricsToDuckDB appends external queue metrics as audit history.
-func (o *QueueObserver) publishMetricsToDuckDB(metricsMap map[string]ExternalQueueMetrics, queues map[string]*queue.Queue) {
-	if o.database == nil {
-		return
-	}
-
-	err := o.database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			for queueName, metrics := range metricsMap {
-				key := queueStatsKeyForAPI(queueName)
-				phase := db.QueueStatsPhaseTraversal
-				if q := queues[queueName]; q != nil {
-					phase = PhaseFamilyForMode(q.GetMode())
-				}
-				metricsJSON, err := json.Marshal(metrics)
-				if err != nil {
-					if logservice.LS != nil {
-						err := logservice.LS.Log("error",
-							fmt.Sprintf("Failed to marshal metrics for queue %s: %v", queueName, err),
-							"observer", "publish", "")
-						if err != nil {
-							fmt.Println("error logging", err)
-						}
-					}
-					continue
-				}
-				if err := w.AppendQueueStats(key, phase, string(metricsJSON)); err != nil {
-					return fmt.Errorf("failed to append metrics for %s: %w", key, err)
-				}
-			}
-			return nil
-		})
-	})
-
-	o.lastDBPersistMu.Lock()
-	o.lastDBPersist = time.Now()
-	o.lastDBPersistMu.Unlock()
-
-	if err != nil {
-		if logservice.LS != nil {
-			err := logservice.LS.Log("error",
-				fmt.Sprintf("Failed to publish metrics to DuckDB: %v", err),
-				"observer", "publish", "")
-			if err != nil {
-				fmt.Println("error logging", err)
-			}
-		}
-	}
-}
-
 func (o *QueueObserver) shouldPersistToDB() bool {
 	o.lastDBPersistMu.Lock()
 	defer o.lastDBPersistMu.Unlock()
@@ -1021,6 +1344,8 @@ func RehydrateCountersFromMetricsJSON(q *queue.Queue, metricsJSON []byte) error 
 		q.SeedDiscoveryCounters(metrics.FilesDiscoveredTotal, metrics.FoldersDiscoveredTotal)
 	case "copy", "delete":
 		q.SeedCopyCounters(metrics.Folders, metrics.Files, metrics.Bytes, metrics.BytesFailed)
+		q.SeedAlreadyExistsCounters(metrics.FoldersAlreadyExists, metrics.FilesAlreadyExists, metrics.BytesAlreadyExists)
+		q.SeedFailedItemCounters(metrics.FoldersFailed, metrics.FilesFailed)
 	}
 	return nil
 }
@@ -1030,15 +1355,15 @@ type RateLimitTelemetry = queue.RateLimitTelemetry
 
 // InternalMetricsSnapshot is a copy of internal queue metrics for autoscaler decisions.
 type InternalMetricsSnapshot struct {
-	TimeProcessing          time.Duration
-	TimeWaitingOnQueue      time.Duration
-	TimeWaitingOnFS         time.Duration
-	TimeRateLimited         time.Duration
-	TimePausedRoundBoundary time.Duration
-	TimeIdleNoWork          time.Duration
-	TasksCompletedWhileActive int64
+	TimeProcessing             time.Duration
+	TimeWaitingOnQueue         time.Duration
+	TimeWaitingOnFS            time.Duration
+	TimeRateLimited            time.Duration
+	TimePausedRoundBoundary    time.Duration
+	TimeIdleNoWork             time.Duration
+	TasksCompletedWhileActive  int64
 	RateLimitHitsSinceLastPoll int64
-	RateLimitedUntil        time.Time // shared FS adapter retry-after window (if any)
+	RateLimitedUntil           time.Time // shared FS adapter retry-after window (if any)
 }
 
 // RegisterRateLimitTelemetry attaches FS degradation telemetry for a queue name.
@@ -1098,12 +1423,12 @@ func (o *QueueObserver) SnapshotInternalMetrics() map[string]InternalMetricsSnap
 			continue
 		}
 		snap := InternalMetricsSnapshot{
-			TimeProcessing:          m.TimeProcessing,
-			TimeWaitingOnQueue:      m.TimeWaitingOnQueue,
-			TimeWaitingOnFS:         m.TimeWaitingOnFS,
-			TimeRateLimited:         m.TimeRateLimited,
-			TimePausedRoundBoundary: m.TimePausedRoundBoundary,
-			TimeIdleNoWork:          m.TimeIdleNoWork,
+			TimeProcessing:            m.TimeProcessing,
+			TimeWaitingOnQueue:        m.TimeWaitingOnQueue,
+			TimeWaitingOnFS:           m.TimeWaitingOnFS,
+			TimeRateLimited:           m.TimeRateLimited,
+			TimePausedRoundBoundary:   m.TimePausedRoundBoundary,
+			TimeIdleNoWork:            m.TimeIdleNoWork,
 			TasksCompletedWhileActive: m.TasksCompletedWhileActive,
 		}
 		if src, ok := o.rateLimitSources[name]; ok && src != nil {

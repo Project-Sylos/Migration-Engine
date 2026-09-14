@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
@@ -18,28 +19,28 @@ const persistedRunConfigVersion = 1
 
 // persistedRunConfig is stored in migrations.root_config_json (JSON). It omits FS adapters and context.
 type persistedRunConfig struct {
-	V                 int            `json:"v"`
-	DatabasePath      string         `json:"databasePath,omitempty"`
-	SourceName        string         `json:"sourceName"`
-	SourceRoot        types.Folder   `json:"sourceRoot"`
-	DestinationName   string         `json:"destinationName"`
-	DestinationRoot   types.Folder   `json:"destinationRoot"`
-	SourceProviderID  string         `json:"sourceProviderId,omitempty"`
-	DestProviderID    string         `json:"destinationProviderId,omitempty"`
-	PathCheckTarget   string         `json:"pathCheckTarget,omitempty"`
-	WindowsCompat     bool           `json:"windowsCompat,omitempty"`
-	SeedRoots         bool           `json:"seedRoots"`
-	WorkerCount       int            `json:"workerCount"`
-	MaxRetries        int            `json:"maxRetries"`
-	CoordinatorLead   int            `json:"coordinatorLead"`
-	LogAddress        string         `json:"logAddress"`
-	LogLevel          string         `json:"logLevel"`
-	SkipListener      bool           `json:"skipListener"`
-	StartupDelayNanos int64          `json:"startupDelayNanos"`
-	ProgressTickNanos int64          `json:"progressTickNanos"`
-	Verification      VerifyOptions  `json:"verification"`
-	RemoveExistingDB  bool           `json:"removeExistingDb,omitempty"`
-	RequireOpenDB     bool           `json:"requireOpenDb,omitempty"`
+	V                 int           `json:"v"`
+	DatabasePath      string        `json:"databasePath,omitempty"`
+	SourceName        string        `json:"sourceName"`
+	SourceRoot        types.Folder  `json:"sourceRoot"`
+	DestinationName   string        `json:"destinationName"`
+	DestinationRoot   types.Folder  `json:"destinationRoot"`
+	SourceProviderID  string        `json:"sourceProviderId,omitempty"`
+	DestProviderID    string        `json:"destinationProviderId,omitempty"`
+	PathCheckTarget   string        `json:"pathCheckTarget,omitempty"`
+	WindowsCompat     bool          `json:"windowsCompat,omitempty"`
+	SeedRoots         bool          `json:"seedRoots"`
+	WorkerCount       int           `json:"workerCount"`
+	MaxRetries        int           `json:"maxRetries"`
+	CoordinatorLead   int           `json:"coordinatorLead"`
+	LogAddress        string        `json:"logAddress"`
+	LogLevel          string        `json:"logLevel"`
+	SkipListener      bool          `json:"skipListener"`
+	StartupDelayNanos int64         `json:"startupDelayNanos"`
+	ProgressTickNanos int64         `json:"progressTickNanos"`
+	Verification      VerifyOptions `json:"verification"`
+	RemoveExistingDB  bool          `json:"removeExistingDb,omitempty"`
+	RequireOpenDB     bool          `json:"requireOpenDb,omitempty"`
 }
 
 func persistedRunConfigFrom(cfg Config) persistedRunConfig {
@@ -115,6 +116,10 @@ type Config struct {
 
 	// RootPreparation is set when the UI reviewed root children before Start discovery.
 	RootPreparation RootPreparation
+
+	// FilterRuleset is retained configuration; discovery does not evaluate it.
+	// Nil / empty means no filter rules (current behavior).
+	FilterRuleset *filter.CompiledRuleset
 }
 
 // Result captures the outcome of a migration run.
@@ -265,7 +270,7 @@ func LetsMigrate(cfg Config) (Result, error) {
 
 	result := Result{RootsSeeded: cfg.SeedRoots}
 	if cfg.SeedRoots {
-		summary, err := SeedRootTasks(srcRoot, dstRoot, migrationInstance.DB)
+		summary, err := SeedRootTasksWithPreparation(srcRoot, dstRoot, migrationInstance.DB, RootPreparation{}, "", "", "", false, nil)
 		if err != nil {
 			return Result{}, fmt.Errorf("seed roots: %w", err)
 		}

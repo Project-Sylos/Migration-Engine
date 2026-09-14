@@ -5,40 +5,32 @@ package shared
 
 import (
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
 )
 
-// VerifySrcTreeEmpty walks srcDir and returns an error if any file or subfolder exists (root may remain).
+// VerifySrcTreeEmpty returns an error if any file or subfolder exists under srcDir (the root itself may remain).
 func VerifySrcTreeEmpty(srcDir string) error {
 	entries, err := os.ReadDir(srcDir)
 	if err != nil {
 		return err
 	}
-	for _, e := range entries {
-		if e.IsDir() {
-			sub := filepath.Join(srcDir, e.Name())
-			if err := filepath.WalkDir(sub, func(path string, d fs.DirEntry, err error) error {
-				if err != nil {
-					return err
-				}
-				return nil
-			}); err != nil {
-				return fmt.Errorf("src still has subtree %s: %w", sub, err)
-			}
-			return fmt.Errorf("src still has directory: %s", sub)
-		}
-		return fmt.Errorf("src still has file: %s", e.Name())
+	if len(entries) == 0 {
+		return nil
 	}
-	return nil
+	e := entries[0]
+	if e.IsDir() {
+		return fmt.Errorf("src still has directory: %s", filepath.Join(srcDir, e.Name()))
+	}
+	return fmt.Errorf("src still has file: %s", e.Name())
 }
 
 // VerifyDeleteCounts checks universal stats for deleted count when duckDB is available.
 func VerifyDeleteCounts(duckDB *db.DB, minDeleted int64) error {
-	counts, err := duckDB.GetDeleteStatusCountsFromEvents()
+	counts, err := stats.GetDeleteStatusCountsFromEvents(duckDB)
 	if err != nil {
 		return err
 	}

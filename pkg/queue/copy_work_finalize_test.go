@@ -1,12 +1,9 @@
 package queue
 
 import (
-	"context"
 	"testing"
-	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
 )
 
@@ -64,18 +61,9 @@ func insertStopFlushNode(t *testing.T, database *db.DB, path string, depth int, 
 		Type: db.NodeTypeFile, Depth: depth, Size: size,
 		TraversalStatus: db.StatusSuccessful, CopyStatus: copyStatus,
 	}
-	err := database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			if err := w.AppenderInsert("src_nodes", []*db.NodeState{n}); err != nil {
-				return err
-			}
-			return w.BatchInsertSrcStatusEvents([]db.StatusEvent{{
-				ID: n.ID, TraversalStatus: n.TraversalStatus, CopyStatus: n.CopyStatus,
-				EventTime: time.Now().UnixNano(), Depth: depth,
-			}})
-		})
-	})
-	if err != nil {
+	if err := database.SeedDiscoveredNodes([]db.InsertOperation{{
+		QueueType: "SRC", Level: depth, Status: db.StatusSuccessful, State: n,
+	}}); err != nil {
 		t.Fatal(err)
 	}
 }

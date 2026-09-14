@@ -10,6 +10,7 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
+	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
@@ -37,6 +38,7 @@ type SweepConfig struct {
 	SkipAutoETLBeforeRetry bool   // If true, skip automatic ETL from DuckDB to DuckDB before retry sweep
 	DuckDBPath             string // Optional: Path to DuckDB file (auto-derived from DuckDB path if empty and ETL is enabled)
 	SoftSuspendRequested   func() bool
+	ReportStopProgress     func(step string, inProgress int)
 	ObserverPollInterval   time.Duration
 	OnQueueObserver        func(*observe.QueueObserver)
 	OnAutoscaler           func(*loop.Autoscaler)
@@ -47,6 +49,7 @@ type SweepConfig struct {
 	DstService             Service
 	PathCheckTarget        string
 	WindowsCompat          bool
+	FilterRuleset          *filter.CompiledRuleset
 }
 
 // RunRetrySweep runs a retry sweep to re-process failed or pending tasks from a previous traversal.
@@ -94,7 +97,7 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 				time.Sleep(startupDelay)
 			}
 		}
-		if err := logservice.InitGlobalLogger(duckDB, cfg.LogAddress, cfg.LogLevel); err != nil {
+		if err := logservice.InitGlobalLogger(duckDB.LogsDBForWrite(), cfg.LogAddress, cfg.LogLevel); err != nil {
 			return RuntimeStats{}, fmt.Errorf("failed to initialize logger: %w", err)
 		}
 	}
@@ -236,9 +239,10 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 						dstCompleted = dstRoundStats.Completed
 					}
 
-					fmt.Printf("\r  Retry Sweep - Src: Round %d (Expected:%d Completed:%d) | Dst: Round %d (Expected:%d Completed:%d)   ",
+					fmt.Printf("\r  Retry Sweep - Src: Round %d (Expected:%d Completed:%d) | Dst: Round %d (Expected:%d Completed:%d)%s   ",
 						lastSrcStats.Round, srcExpected, srcCompleted,
-						lastDstStats.Round, dstExpected, dstCompleted)
+						lastDstStats.Round, dstExpected, dstCompleted,
+						FormatCatalogSyncSuffix(duckDB))
 				}
 			case dstStats := <-dstStatsChan:
 				lastDstStats = &dstStats
@@ -260,9 +264,10 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 						dstCompleted = dstRoundStats.Completed
 					}
 
-					fmt.Printf("\r  Retry Sweep - Src: Round %d (Expected:%d Completed:%d) | Dst: Round %d (Expected:%d Completed:%d)   ",
+					fmt.Printf("\r  Retry Sweep - Src: Round %d (Expected:%d Completed:%d) | Dst: Round %d (Expected:%d Completed:%d)%s   ",
 						lastSrcStats.Round, srcExpected, srcCompleted,
-						lastDstStats.Round, dstExpected, dstCompleted)
+						lastDstStats.Round, dstExpected, dstCompleted,
+						FormatCatalogSyncSuffix(duckDB))
 				}
 			}
 		}
@@ -285,21 +290,13 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 		if cfg.ShutdownContext != nil {
 			select {
 			case <-cfg.ShutdownContext.Done():
-				_ = duckDB.Flush()
-				_ = queue.FinalizeCopyWorkOnStop(duckDB, coordinator)
-				srcQueue.SetState(queue.QueueStatePaused)
-				dstQueue.SetState(queue.QueueStatePaused)
-
-				time.Sleep(200 * time.Millisecond)
-
-				srcStats := srcQueue.Stats()
-				dstStats := dstQueue.Stats()
-
+				performTraversalForceStop(srcQueue, dstQueue, observer)
+				duckDB.AbortTraversalPhase()
 				return RuntimeStats{
 					Duration: time.Since(start),
-					Src:      srcStats,
-					Dst:      dstStats,
-				}, fmt.Errorf("retry sweep suspended by force shutdown")
+					Src:      srcQueue.Stats(),
+					Dst:      dstQueue.Stats(),
+				}, fmt.Errorf("migration force stopped during %s", "retry sweep")
 			default:
 			}
 		}
@@ -309,6 +306,8 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 				ProgressTick:         cfg.ProgressTick,
 				ObserverPollInterval: cfg.ObserverPollInterval,
 				ShutdownContext:      cfg.ShutdownContext,
+				SoftSuspendRequested: cfg.SoftSuspendRequested,
+				ReportStopProgress:   cfg.ReportStopProgress,
 			}
 			if mcfg.ObserverPollInterval <= 0 {
 				mcfg.ObserverPollInterval = obsPoll
@@ -316,8 +315,38 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 			waitCtx, cancel := softSuspendWaitContext(cfg.ShutdownContext)
 			stats, suspend, err := performTraversalSoftSuspend(waitCtx, duckDB, srcQueue, dstQueue, observer, coordinator, mcfg, start, srcWC, mr)
 			cancel()
+			if forceStopOverridesSoftSuspend(cfg.ShutdownContext, duckDB) {
+				performTraversalForceStop(srcQueue, dstQueue, observer)
+				duckDB.AbortTraversalPhase()
+				return RuntimeStats{
+					Duration: time.Since(start),
+					Src:      srcQueue.Stats(),
+					Dst:      dstQueue.Stats(),
+				}, fmt.Errorf("migration force stopped during %s", "retry sweep")
+			}
 			if err != nil {
 				return stats, fmt.Errorf("retry sweep soft suspend: %w", err)
+			}
+			finishCtx := cfg.ShutdownContext
+			if finishCtx == nil {
+				finishCtx = context.Background()
+			}
+			setDetail := func(d string) {
+				if observer != nil {
+					observer.SetWaitReason(d)
+				}
+			}
+			if err := finishSoftStopBulkPhase(finishCtx, duckDB, cfg.ReportStopProgress, setDetail); err != nil {
+				if forceStopOverridesSoftSuspend(cfg.ShutdownContext, duckDB) {
+					performTraversalForceStop(srcQueue, dstQueue, observer)
+					duckDB.AbortTraversalPhase()
+					return RuntimeStats{
+						Duration: time.Since(start),
+						Src:      srcQueue.Stats(),
+						Dst:      dstQueue.Stats(),
+					}, fmt.Errorf("migration force stopped during %s", "retry sweep")
+				}
+				return stats, fmt.Errorf("retry sweep soft suspend teardown: %w", err)
 			}
 			fmt.Print("\n")
 			return stats, newTraversalSuspendedError(stats, suspend)
@@ -424,11 +453,4 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 	}
 }
 
-func rebuildCurrentSinceSweep(duckDB *db.DB, sweepStartNanos int64) {
-	if err := duckDB.RebuildCurrentSince("SRC", sweepStartNanos); err != nil {
-		fmt.Println("rebuild src_current after retry sweep:", err)
-	}
-	if err := duckDB.RebuildCurrentSince("DST", sweepStartNanos); err != nil {
-		fmt.Println("rebuild dst_current after retry sweep:", err)
-	}
-}
+func rebuildCurrentSinceSweep(_ *db.DB, _ int64) {}

@@ -19,6 +19,29 @@ func StatsKey(kind StatsKind, status string) string {
 	return string(kind) + "/" + status
 }
 
+// StatsKeyTyped returns kind/status/nodeType for copy and delete Expected buckets
+// (e.g. copy/pending/folder, delete/pending_explicit/file).
+func StatsKeyTyped(kind StatsKind, status, nodeType string) string {
+	nt := NormalizeQueueNodeType(nodeType)
+	return string(kind) + "/" + status + "/" + nt
+}
+
+// StatsKeyCopyFileBytes is the src_stats key for summed SRC file sizes at a copy_status.
+func StatsKeyCopyFileBytes(status string) string {
+	if status == "" {
+		status = CopyStatusPending
+	}
+	return string(StatsKindCopy) + "/" + status + "/file_bytes"
+}
+
+// StatsKeyDeleteFileBytes is the src_stats key for summed SRC file sizes at a delete_status.
+func StatsKeyDeleteFileBytes(status string) string {
+	if status == "" {
+		return ""
+	}
+	return string(StatsKindDelete) + "/" + status + "/file_bytes"
+}
+
 // StatsKeyExpected is the stats key for expected count at a depth (set at round start).
 const StatsKeyExpected = "expected"
 
@@ -32,18 +55,20 @@ const (
 	ReviewKeyTraversalSuccessful   = "traversal/successful"
 	ReviewKeyTraversalFailed       = "traversal/failed"
 	ReviewKeyCopyPending           = "copy/pending"
+	ReviewKeyCopyPendingRetry      = "copy/pending_retry"
 	ReviewKeyCopySuccessful        = "copy/successful"
 	ReviewKeyCopyFailed            = "copy/failed"
 	ReviewKeyDeletePending         = "delete/pending"
 	ReviewKeyDeleteDeleted         = "delete/deleted"
 	ReviewKeyDeleteFailed          = "delete/failed"
+	ReviewKeyDeleteSkipped         = "delete/skipped"
 	ReviewKeyExcluded              = "excluded"
 	ReviewKeyFolders               = "folders"
 	ReviewKeyFiles                 = "files"
 	ReviewKeySizeSrc               = "size_src"
 	ReviewKeySizeDst               = "size_dst"
 	ReviewKeySizeSelected          = "size_selected"
-	// ReviewKeySizeDeleteSelected is Σ file bytes with copy-complete + delete_status=pending.
+	// ReviewKeySizeDeleteSelected is Σ file bytes with copy-complete + delete_status pending*.
 	// Updated on seal flush (not round seal) so source-cleanup Selected survives mid-round stop.
 	ReviewKeySizeDeleteSelected = "size_delete_selected"
 )
@@ -54,11 +79,13 @@ var CanonicalReviewKeys = []string{
 	ReviewKeyTraversalSuccessful,
 	ReviewKeyTraversalFailed,
 	ReviewKeyCopyPending,
+	ReviewKeyCopyPendingRetry,
 	ReviewKeyCopySuccessful,
 	ReviewKeyCopyFailed,
 	ReviewKeyDeletePending,
 	ReviewKeyDeleteDeleted,
 	ReviewKeyDeleteFailed,
+	ReviewKeyDeleteSkipped,
 	ReviewKeyExcluded,
 	ReviewKeyFolders,
 	ReviewKeyFiles,
@@ -71,12 +98,14 @@ var CanonicalReviewKeys = []string{
 func ReviewKeyForStatus(phase, status string) string {
 	if phase == "delete" {
 		switch status {
-		case DeleteStatusPending:
+		case DeleteStatusPendingExplicit, DeleteStatusPendingInherited:
 			return ReviewKeyDeletePending
 		case DeleteStatusDeleted:
 			return ReviewKeyDeleteDeleted
 		case DeleteStatusFailed:
 			return ReviewKeyDeleteFailed
+		case DeleteStatusSkipped:
+			return ReviewKeyDeleteSkipped
 		default:
 			return ""
 		}
@@ -102,6 +131,8 @@ func ReviewKeyForStatus(phase, status string) string {
 		return ReviewKeyTraversalFailed
 	case StatusExcluded, StatusExclusionInherited:
 		return ReviewKeyExcluded
+	case StatusSilentExcluded:
+		return "" // prep/allowlist skip; never counts in review excluded totals
 	default:
 		return ""
 	}
@@ -114,11 +145,13 @@ type ReviewStatsSnapshot struct {
 	TraversalSuccessful   int64
 	TraversalFailed       int64
 	CopyPending           int64
+	CopyPendingRetry      int64
 	CopySuccessful        int64
 	CopyFailed            int64
 	DeletePending         int64
 	DeleteDeleted         int64
 	DeleteFailed          int64
+	DeleteSkipped         int64
 	Excluded              int64
 	Folders               int64
 	Files                 int64

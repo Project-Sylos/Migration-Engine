@@ -4,13 +4,13 @@
 package logbuf
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
 // LogEntry is a single log line for persistence.
@@ -87,16 +87,17 @@ func (lb *LogBuffer) setFlushingDone() {
 }
 
 func (lb *LogBuffer) writeBatch(batch []LogEntry) error {
-	return lb.database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			for _, e := range batch {
-				if err := w.InsertLog(e.ID, e.Level, e.Message, e.Entity, e.Entity, e.EntityID, e.Queue); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-	})
+	if lb.database == nil || lb.database.Ops() == nil {
+		return fmt.Errorf("ops store not open")
+	}
+	recs := make([]opsdb.LogRecord, len(batch))
+	for i, e := range batch {
+		recs[i] = opsdb.LogRecord{
+			ID: e.ID, Level: e.Level, Message: e.Message,
+			Component: e.Entity, Entity: e.Entity, EntityID: e.EntityID, Queue: e.Queue,
+		}
+	}
+	return lb.database.Ops().AppendLogs(recs)
 }
 
 // drainAll writes the entire buffer in batches until empty. Call when at backpressure (caller must set draining so Add() blocks).
@@ -107,33 +108,9 @@ func (lb *LogBuffer) drainAll() {
 			return
 		}
 		if err := lb.writeBatch(batch); err != nil {
-			fmt.Println("error running write", err)
+			fmt.Printf("logbuf drain: %v\n", err)
 		}
 		lb.setFlushingDone()
-	}
-}
-
-// Add adds an entry to the buffer. When buffer reaches 2*batchSize we block all writers, drain the entire buffer, then resume.
-func (lb *LogBuffer) Add(e LogEntry) {
-	hardCap := lb.batchSize * 2
-	lb.mu.Lock()
-	for len(lb.entries) >= hardCap {
-		if !lb.draining {
-			lb.draining = true
-			lb.mu.Unlock()
-			lb.drainAll()
-			lb.mu.Lock()
-			lb.draining = false
-			lb.cond.Broadcast()
-			continue
-		}
-		lb.cond.Wait()
-	}
-	lb.entries = append(lb.entries, e)
-	count := len(lb.entries)
-	lb.mu.Unlock()
-	if count >= lb.batchSize {
-		lb.Flush()
 	}
 }
 
@@ -143,29 +120,50 @@ func (lb *LogBuffer) flushLoop() {
 	for {
 		select {
 		case <-lb.stopCh:
+			lb.drainAll()
 			return
 		case <-ticker.C:
-			lb.Flush()
+			batch, hadWork := lb.takeBatch()
+			if !hadWork {
+				continue
+			}
+			if err := lb.writeBatch(batch); err != nil {
+				fmt.Printf("logbuf flush: %v\n", err)
+			}
+			lb.setFlushingDone()
 		}
 	}
 }
 
-// Flush writes one batch if the buffer has entries. Does not block writers.
-func (lb *LogBuffer) Flush() {
-	batch, hadWork := lb.takeBatch()
-	if !hadWork || len(batch) == 0 {
-		return
+// Add appends one log entry. Blocks when buffer is at 2*batchSize until drain completes.
+func (lb *LogBuffer) Add(entry LogEntry) {
+	lb.mu.Lock()
+	for len(lb.entries) >= lb.batchSize*2 && !lb.draining {
+		lb.draining = true
+		lb.mu.Unlock()
+		lb.drainAll()
+		lb.mu.Lock()
+		lb.draining = false
+		lb.cond.Broadcast()
 	}
-	defer lb.setFlushingDone()
-	if err := lb.writeBatch(batch); err != nil {
-		fmt.Println("error running write", err)
+	lb.entries = append(lb.entries, entry)
+	shouldFlush := len(lb.entries) >= lb.batchSize
+	lb.mu.Unlock()
+	if shouldFlush {
+		batch, hadWork := lb.takeBatch()
+		if hadWork {
+			if err := lb.writeBatch(batch); err != nil {
+				fmt.Printf("logbuf add flush: %v\n", err)
+			}
+			lb.setFlushingDone()
+		}
 	}
 }
 
-// Stop stops the flush loop and drains the entire buffer. Does not close the DB.
+// Stop drains and stops the background flush loop.
 func (lb *LogBuffer) Stop() {
-	if atomic.CompareAndSwapInt32(&lb.stopped, 0, 1) {
-		close(lb.stopCh)
+	if !atomic.CompareAndSwapInt32(&lb.stopped, 0, 1) {
+		return
 	}
-	lb.drainAll()
+	close(lb.stopCh)
 }

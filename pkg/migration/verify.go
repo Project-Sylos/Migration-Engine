@@ -71,7 +71,7 @@ func VerifyMigration(database *db.DB, opts VerifyOptions) (VerificationReport, e
 	}
 
 	// Status totals from status_events (COUNT by current traversal_status per node)
-	srcCounts, err := stats.GetTraversalStatusCountsFromEvents(database, "SRC")
+	srcCounts, err := stats.GetTraversalStatusCounts(database, "SRC", false)
 	if err != nil {
 		return VerificationReport{}, fmt.Errorf("failed to get SRC status counts from events: %w", err)
 	}
@@ -79,7 +79,7 @@ func VerifyMigration(database *db.DB, opts VerifyOptions) (VerificationReport, e
 	report.SrcSuccessful = int(srcCounts.Successful)
 	report.SrcFailed = int(srcCounts.Failed)
 
-	dstCounts, err := stats.GetTraversalStatusCountsFromEvents(database, "DST")
+	dstCounts, err := stats.GetTraversalStatusCounts(database, "DST", false)
 	if err != nil {
 		return VerificationReport{}, fmt.Errorf("failed to get DST status counts from events: %w", err)
 	}

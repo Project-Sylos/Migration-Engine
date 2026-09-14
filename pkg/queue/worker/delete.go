@@ -50,6 +50,7 @@ func (w *DeleteWorker) shouldRetire() bool {
 }
 
 func (w *DeleteWorker) Run() {
+	defer w.queue.NotifyWorkerExit(w.id)
 	for {
 		select {
 		case <-w.workerCtx.Done():
@@ -74,9 +75,10 @@ func (w *DeleteWorker) Run() {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
+		w.queue.BindLeaseOwner(task, w.id)
 		setWorkerBusy(w.idle)
 		err := w.execute(task)
-		setWorkerIdle(w.idle)
+		markWorkerIdle(w.queue, w.id, w.idle)
 		if errors.Is(err, errTransferAbandoned) {
 			if w.queue.HasInProgress(task.ID) {
 				task.Locked = false

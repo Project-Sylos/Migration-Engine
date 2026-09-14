@@ -1,30 +1,88 @@
 package stats
 
 import (
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	"codeberg.org/Sylos/Migration-Engine/pkg/db/subtree"
-	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
-	"context"
 	"testing"
-	"time"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
 func insertSrcCopyNode(t *testing.T, database *db.DB, n *db.NodeState) {
 	t.Helper()
-	err := database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			if err := w.AppenderInsert(db.TableSrcNodes, []*db.NodeState{n}); err != nil {
-				return err
-			}
-			return w.BatchInsertSrcStatusEvents([]db.StatusEvent{{
-				ID: n.ID, TraversalStatus: n.TraversalStatus, CopyStatus: n.CopyStatus,
-				EventTime: time.Now().UnixNano(), Depth: n.Depth,
-			}})
-		})
-	})
+	if n.TraversalStatus == "" {
+		n.TraversalStatus = db.StatusPending
+	}
+	if n.CopyStatus == "" {
+		n.CopyStatus = db.CopyStatusPending
+	}
+	if err := database.SeedDiscoveredNodes([]db.InsertOperation{{
+		QueueType: "SRC", Level: n.Depth, Status: n.TraversalStatus, State: n,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// markSrcCopyStatusAtDepth adjusts depth counters when a node's copy status changes in tests.
+func markSrcCopyStatusAtDepth(t *testing.T, database *db.DB, n *db.NodeState, from, to string) {
+	t.Helper()
+	nt := db.NormalizeQueueNodeType(n.Type)
+	deltas := []db.DepthStatsDelta{
+		{Table: "SRC", Depth: n.Depth, Key: db.StatsKeyTyped(db.StatsKindCopy, from, nt), Delta: -1},
+		{Table: "SRC", Depth: n.Depth, Key: db.StatsKeyTyped(db.StatsKindCopy, to, nt), Delta: 1},
+	}
+	if nt == db.NodeTypeFile && n.Size > 0 {
+		deltas = append(deltas,
+			db.DepthStatsDelta{Table: "SRC", Depth: n.Depth, Key: db.StatsKeyCopyFileBytes(from), Delta: -n.Size},
+			db.DepthStatsDelta{Table: "SRC", Depth: n.Depth, Key: db.StatsKeyCopyFileBytes(to), Delta: n.Size},
+		)
+	}
+	st, ok, err := database.Ops().GetStatus(opsdb.SideSRC, n.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !ok {
+		st = opsdb.StatusRecord{TraversalStatus: n.TraversalStatus}
+	}
+	st.CopyStatus = to
+	if err := database.Ops().PutStatus(opsdb.SideSRC, n.ID, st); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.ApplyDepthStatsDeltas(deltas); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func countCopyWorkEligibleUnderPath(t *testing.T, database *db.DB, rootPath string) db.DepthWorkAbsolute {
+	t.Helper()
+	ids, err := database.Ops().ListSubtreeIDs(opsdb.SideSRC, rootPath, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes, statuses, err := database.Ops().BatchGetNodeStatus(opsdb.SideSRC, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out db.DepthWorkAbsolute
+	for id, n := range nodes {
+		st := statuses[id]
+		if st.TraversalStatus == db.StatusExcluded || st.TraversalStatus == db.StatusExclusionInherited {
+			continue
+		}
+		if st.CopyStatus == db.CopyStatusExcludedExplicit || st.CopyStatus == db.CopyStatusExcludedInherited {
+			continue
+		}
+		if st.CopyStatus == db.CopyStatusAlreadyExisted {
+			continue
+		}
+		switch db.NormalizeQueueNodeType(n.Type) {
+		case db.NodeTypeFolder:
+			out.Folders++
+		case db.NodeTypeFile:
+			out.Files++
+			out.Bytes += n.Size
+		}
+	}
+	return out
 }
 
 func TestSrcDiscoverOmitsExcluded(t *testing.T) {
@@ -54,7 +112,7 @@ func TestSrcDiscoverOmitsExcluded(t *testing.T) {
 		TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusExcludedExplicit,
 	})
 
-	got, err := GetCopyDiscoveredAtDepth(database, 1)
+	got, err := copyWorkAbsoluteFromSrcStats(database, 1, copyDiscoveredStatuses)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +137,6 @@ func TestSrcDiscoverThenDstAECorrection(t *testing.T) {
 	}
 	defer database.Close()
 
-	// 1 pending folder + 1 pending file + 1 already_existed file at depth 1.
 	insertSrcCopyNode(t, database, &db.NodeState{
 		ID: db.DeterministicNodeID("SRC", db.NodeTypeFolder, "/dir"), Path: "/dir", ParentPath: "/", Name: "dir",
 		Type: db.NodeTypeFolder, Depth: 1, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
@@ -115,12 +172,10 @@ func TestSrcDiscoverThenDstAECorrection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Net: 1 folder + 1 file + 100 bytes (already_existed subtracted).
 	if totals.Folders != 1 || totals.Files != 1 || totals.Bytes != 100 {
 		t.Fatalf("net totals=%+v want folders=1 files=1 bytes=100", totals)
 	}
 
-	// Idempotent re-seal.
 	if _, err := SealSrcCopyWorkDiscovered(database, 1, db.CopyWorkReasonSrcDiscover); err != nil {
 		t.Fatal(err)
 	}
@@ -144,21 +199,22 @@ func TestSrcDiscoverRetryGrowsThenDstCorrects(t *testing.T) {
 	}
 	defer database.Close()
 
-	insertSrcCopyNode(t, database, &db.NodeState{
+	a := &db.NodeState{
 		ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/a.txt"), Path: "/a.txt", ParentPath: "/", Name: "a.txt",
 		Type: db.NodeTypeFile, Depth: 1, Size: 10,
 		TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
-	})
+	}
+	insertSrcCopyNode(t, database, a)
 	if _, err := SealSrcCopyWorkDiscovered(database, 1, db.CopyWorkReasonSrcDiscover); err != nil {
 		t.Fatal(err)
 	}
 
-	// Retry traversal discovers more at same depth.
-	insertSrcCopyNode(t, database, &db.NodeState{
+	b := &db.NodeState{
 		ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/b.txt"), Path: "/b.txt", ParentPath: "/", Name: "b.txt",
 		Type: db.NodeTypeFile, Depth: 1, Size: 40,
 		TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
-	})
+	}
+	insertSrcCopyNode(t, database, b)
 	delta, err := SealSrcCopyWorkDiscovered(database, 1, db.CopyWorkReasonSrcDiscover)
 	if err != nil {
 		t.Fatal(err)
@@ -167,19 +223,8 @@ func TestSrcDiscoverRetryGrowsThenDstCorrects(t *testing.T) {
 		t.Fatalf("retry src delta=%+v want files=1 bytes=40", delta)
 	}
 
-	// DST marks both already_existed on a later pass.
-	err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			t0 := time.Now().UnixNano()
-			return w.BatchInsertSrcStatusEvents([]db.StatusEvent{
-				{ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/a.txt"), TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusAlreadyExisted, EventTime: t0, Depth: 1},
-				{ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/b.txt"), TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusAlreadyExisted, EventTime: t0, Depth: 1},
-			})
-		})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	markSrcCopyStatusAtDepth(t, database, a, db.CopyStatusPending, db.CopyStatusAlreadyExisted)
+	markSrcCopyStatusAtDepth(t, database, b, db.CopyStatusPending, db.CopyStatusAlreadyExisted)
 
 	corr, err := SealDstCopyWorkAlreadyExistedCorrection(database, 1, db.CopyWorkReasonDstAECorrection)
 	if err != nil {
@@ -196,7 +241,6 @@ func TestSrcDiscoverRetryGrowsThenDstCorrects(t *testing.T) {
 		t.Fatalf("after full AE correction totals=%+v want 0", totals)
 	}
 
-	// Second DST seal must not double-subtract.
 	corr2, err := SealDstCopyWorkAlreadyExistedCorrection(database, 1, db.CopyWorkReasonDstAECorrection)
 	if err != nil {
 		t.Fatal(err)
@@ -229,18 +273,7 @@ func TestCountCopyWorkEligibleSubtreeNotExcluded(t *testing.T) {
 		TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusAlreadyExisted,
 	})
 
-	var got db.DepthWorkAbsolute
-	err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			var err2 error
-			got, err2 = subtree.CountCopyWorkEligibleSubtreeNotExcluded(w, "/dir")
-			return err2
-		})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Folder + pending file; already_existed file omitted.
+	got := countCopyWorkEligibleUnderPath(t, database, "/dir")
 	if got.Folders != 1 || got.Files != 1 || got.Bytes != 100 {
 		t.Fatalf("got=%+v want folders=1 files=1 bytes=100", got)
 	}
@@ -254,7 +287,6 @@ func TestAdjustCopyWorkForReviewOnExclude(t *testing.T) {
 	}
 	defer database.Close()
 
-	// Discovery: 1 folder + 2 files (350 bytes).
 	insertSrcCopyNode(t, database, &db.NodeState{
 		ID: db.DeterministicNodeID("SRC", db.NodeTypeFolder, "/dir"), Path: "/dir", ParentPath: "/", Name: "dir",
 		Type: db.NodeTypeFolder, Depth: 1, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
@@ -284,7 +316,6 @@ func TestAdjustCopyWorkForReviewOnExclude(t *testing.T) {
 		t.Fatalf("pre-exclusion totals=%+v want folders=1 files=2 bytes=350", pre)
 	}
 
-	// Path review excludes the larger file — sealed copy_work must shrink immediately.
 	if err := AdjustCopyWorkForReview(database, db.DepthWorkAbsolute{Files: -1, Bytes: -250}, db.CopyWorkReasonReviewExclude); err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +327,6 @@ func TestAdjustCopyWorkForReviewOnExclude(t *testing.T) {
 		t.Fatalf("post-exclude totals=%+v want folders=1 files=1 bytes=100", totals)
 	}
 
-	// Unexclude restores the denominator.
 	if err := AdjustCopyWorkForReview(database, db.DepthWorkAbsolute{Files: 1, Bytes: 250}, db.CopyWorkReasonReviewUnexclude); err != nil {
 		t.Fatal(err)
 	}
@@ -317,25 +347,13 @@ func TestSnapshotDeleteWorkAtPhaseStart(t *testing.T) {
 	}
 	defer database.Close()
 
-	err = database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			n := &db.NodeState{
-				ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/a.txt"), Path: "/a.txt", ParentPath: "/", Name: "a.txt",
-				Type: db.NodeTypeFile, Depth: 1, Size: 100,
-				TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusSuccessful, DeleteStatus: db.DeleteStatusPending,
-			}
-			if err := w.AppenderInsert(db.TableSrcNodes, []*db.NodeState{n}); err != nil {
-				return err
-			}
-			return w.BatchInsertSrcStatusEvents([]db.StatusEvent{{
-				ID: n.ID, TraversalStatus: n.TraversalStatus, CopyStatus: n.CopyStatus,
-				DeleteStatus: n.DeleteStatus, EventTime: time.Now().UnixNano(), Depth: 1,
-			}})
-		})
+	seedSrcDepthStats(t, database, []*db.NodeState{
+		{
+			Type: db.NodeTypeFile, Depth: 1, Size: 100,
+			TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusSuccessful,
+			DeleteStatus: db.DeleteStatusPendingExplicit,
+		},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	if err := SnapshotDeleteWorkAtPhaseStart(database); err != nil {
 		t.Fatal(err)

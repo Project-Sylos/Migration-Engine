@@ -33,6 +33,7 @@ type CopyPhaseConfig struct {
 	ShutdownContext      context.Context
 	ResumeCopy           *RuntimeSuspendV1
 	SoftSuspendRequested func() bool
+	ReportStopProgress   func(step string, inProgress int)
 	ObserverPollInterval time.Duration
 	OnQueueObserver      func(*observe.QueueObserver)
 	OnAutoscaler         func(*loop.Autoscaler)
@@ -45,7 +46,7 @@ type CopyPhaseConfig struct {
 
 // applyCopyResumeDstExistenceWindow enables the copy queue's one-shot dst ListChildren precheck when
 // restarting after real copy progress (Successful = actual copy-phase completes, not DST matches).
-// Uses GetCopyStatusCountsFromEvents: requires both successful and pending SRC copy rows.
+// Uses GetCopyStatusCountsFromEvents (src_current): requires both successful and pending SRC copy rows.
 // If any folder copy is still pending, anchors pass 1 at startRound; if only file copies are pending,
 // anchors pass 2 at the minimum depth that still has pending files (so empty shallow file rounds
 // do not consume the window before real work runs).
@@ -63,8 +64,8 @@ func applyCopyResumeDstExistenceWindow(q *queue.Queue, duckDB *db.DB, startRound
 	}
 }
 
-// RunCopyRetryPhase runs the copy phase in retry mode: only copy_status = failed items are pulled.
-// Uses the same two-pass BFS and max-depth guarded completion as traversal retry.
+// RunCopyRetryPhase runs copy retry: pulls copy_status=pending (user marks convert
+// failed→pending). Unmarked failures are left alone until marked.
 func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	duckDB := cfg.DuckDB
 	if duckDB == nil {
@@ -87,7 +88,7 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 				time.Sleep(startupDelay)
 			}
 		}
-		if err := logservice.InitGlobalLogger(duckDB, cfg.LogAddress, cfg.LogLevel); err != nil {
+		if err := logservice.InitGlobalLogger(duckDB.LogsDBForWrite(), cfg.LogAddress, cfg.LogLevel); err != nil {
 			return queue.QueueStats{}, fmt.Errorf("failed to initialize logger: %w", err)
 		}
 	}
@@ -112,8 +113,14 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 			if level == 0 {
 				continue
 			}
-			c, err := stats.GetCopyCountAtDepth(duckDB, level, db.NodeTypeFolder, db.CopyStatusFailed, true)
+			c, err := stats.GetCopyCountAtDepth(duckDB, level, db.NodeTypeFolder, db.CopyStatusPending, true)
 			if err == nil && c > 0 {
+				if minLevel == -1 || level < minLevel {
+					minLevel = level
+				}
+			}
+			cf, err := stats.GetCopyCountAtDepth(duckDB, level, db.NodeTypeFile, db.CopyStatusPending, true)
+			if err == nil && cf > 0 {
 				if minLevel == -1 || level < minLevel {
 					minLevel = level
 				}
@@ -135,12 +142,20 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	if err := duckDB.BeginTraversalPhase(shutdownCtx); err != nil {
 		return queue.QueueStats{}, fmt.Errorf("begin copy phase: %w", err)
 	}
+	bulkPhaseClosed := false
+	skipDurableTeardown := false
 	defer func() {
+		if bulkPhaseClosed || skipDurableTeardown {
+			return
+		}
 		if err := duckDB.CheckpointWithRetry(context.Background(), 8); err != nil {
 			fmt.Println("checkpoint after copy retry phase:", err)
 		}
 	}()
 	defer func() {
+		if bulkPhaseClosed || skipDurableTeardown {
+			return
+		}
 		if err := duckDB.EndTraversalPhase(); err != nil {
 			fmt.Println("error ending copy phase", err)
 		}
@@ -209,8 +224,9 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 					inProgress := copyQueue.InProgressCount()
 					lastPartial := copyQueue.GetLastPullWasPartial()
 					workers := copyQueue.GetWorkerCount()
-					fmt.Printf("\r  Copy retry: Pass %d (%s) Round %d | Exp:%d Comp:%d | Pend:%d InProg:%d | Partial:%v Workers:%d   ",
-						copyPass, passName, lastStats.Round, expected, completed, pending, inProgress, lastPartial, workers)
+					fmt.Printf("\r  Copy retry: Pass %d (%s) Round %d | Exp:%d Comp:%d | Pend:%d InProg:%d | Partial:%v Workers:%d%s   ",
+						copyPass, passName, lastStats.Round, expected, completed, pending, inProgress, lastPartial, workers,
+						FormatCatalogSyncSuffix(duckDB))
 				}
 			}
 		}
@@ -221,7 +237,9 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		if shutdownCtx != nil {
 			select {
 			case <-shutdownCtx.Done():
-				performCopyForceStop(duckDB, copyQueue, observer)
+				skipDurableTeardown = true
+				performCopyForceStop(copyQueue, observer)
+				duckDB.AbortTraversalPhase()
 				return copyForceStopStats(copyQueue), fmt.Errorf("migration force stopped during %s", "copy retry")
 			default:
 			}
@@ -231,8 +249,33 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 			waitCtx, cancel := softSuspendWaitContext(cfg.ShutdownContext)
 			stats, suspend, err := performCopySoftSuspend(waitCtx, duckDB, copyQueue, observer, cfg, wc, mr)
 			cancel()
+			if forceStopOverridesSoftSuspend(cfg.ShutdownContext, duckDB) {
+				skipDurableTeardown = true
+				performCopyForceStop(copyQueue, observer)
+				duckDB.AbortTraversalPhase()
+				return copyForceStopStats(copyQueue), fmt.Errorf("migration force stopped during %s", "copy retry")
+			}
 			if err != nil {
 				return stats, fmt.Errorf("copy retry soft suspend: %w", err)
+			}
+			setDetail := func(d string) {
+				if observer != nil {
+					observer.SetWaitReason(d)
+				}
+			}
+			bulkPhaseClosed = true
+			finishCtx := cfg.ShutdownContext
+			if finishCtx == nil {
+				finishCtx = context.Background()
+			}
+			if err := finishSoftStopBulkPhase(finishCtx, duckDB, cfg.ReportStopProgress, setDetail); err != nil {
+				if forceStopOverridesSoftSuspend(cfg.ShutdownContext, duckDB) {
+					skipDurableTeardown = true
+					performCopyForceStop(copyQueue, observer)
+					duckDB.AbortTraversalPhase()
+					return copyForceStopStats(copyQueue), fmt.Errorf("migration force stopped during %s", "copy retry")
+				}
+				return stats, fmt.Errorf("copy retry soft suspend teardown: %w", err)
 			}
 			fmt.Print("\n")
 			return stats, newCopySuspendedError(stats, suspend)
@@ -254,6 +297,7 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 				}
 			}
 			fmt.Printf("\nCopy retry complete! Duration: %v\n", time.Since(start))
+			bulkPhaseClosed = true
 			return stats, nil
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -288,7 +332,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 				time.Sleep(startupDelay)
 			}
 		}
-		if err := logservice.InitGlobalLogger(duckDB, cfg.LogAddress, cfg.LogLevel); err != nil {
+		if err := logservice.InitGlobalLogger(duckDB.LogsDBForWrite(), cfg.LogAddress, cfg.LogLevel); err != nil {
 			return queue.QueueStats{}, fmt.Errorf("failed to initialize logger: %w", err)
 		}
 	}
@@ -339,7 +383,16 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	if minFolderPendingLevel != -1 {
 		startRound = minFolderPendingLevel
 	}
+	if cfg.ResumeCopy != nil && cfg.ResumeCopy.LastKnownCopyRound > 0 {
+		startRound = cfg.ResumeCopy.LastKnownCopyRound
+	}
+	if cfg.ResumeCopy != nil && cfg.ResumeCopy.CopyPass > 0 {
+		copyQueue.SetCopyPass(cfg.ResumeCopy.CopyPass)
+	}
 	copyQueue.SetRound(startRound)
+	if cfg.ResumeCopy != nil && cfg.ResumeCopy.CopyKeysetCursor != "" {
+		copyQueue.SetKeysetCursor(cfg.ResumeCopy.CopyKeysetCursor)
+	}
 	applyCopyResumeDstExistenceWindow(copyQueue, duckDB, startRound, minFolderPendingLevel, minFilePendingLevel)
 	copyQueue.SetExpectedFromStatsBucket(copyQueue.GetRound())
 	logCopyResumePositionCheck(cfg.ResumeCopy, copyQueue, startRound)
@@ -389,12 +442,20 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	if err := duckDB.BeginTraversalPhase(shutdownCtx); err != nil {
 		return queue.QueueStats{}, fmt.Errorf("begin copy phase: %w", err)
 	}
+	bulkPhaseClosed := false
+	skipDurableTeardown := false
 	defer func() {
+		if bulkPhaseClosed || skipDurableTeardown {
+			return
+		}
 		if err := duckDB.CheckpointWithRetry(context.Background(), 8); err != nil {
 			fmt.Println("checkpoint after copy phase:", err)
 		}
 	}()
 	defer func() {
+		if bulkPhaseClosed || skipDurableTeardown {
+			return
+		}
 		if err := duckDB.EndTraversalPhase(); err != nil {
 			fmt.Println("error ending copy phase", err)
 		}
@@ -473,8 +534,9 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 					inProgress := copyQueue.InProgressCount()
 					lastPartial := copyQueue.GetLastPullWasPartial()
 					workers := copyQueue.GetWorkerCount()
-					fmt.Printf("\r  Copy: Pass %d (%s) Round %d | Exp:%d Comp:%d | Pend:%d InProg:%d | Partial:%v Workers:%d   ",
-						copyPass, passName, lastStats.Round, expected, completed, pending, inProgress, lastPartial, workers)
+					fmt.Printf("\r  Copy: Pass %d (%s) Round %d | Exp:%d Comp:%d | Pend:%d InProg:%d | Partial:%v Workers:%d%s   ",
+						copyPass, passName, lastStats.Round, expected, completed, pending, inProgress, lastPartial, workers,
+						FormatCatalogSyncSuffix(duckDB))
 				}
 			}
 		}
@@ -488,7 +550,9 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 		if shutdownCtx != nil {
 			select {
 			case <-shutdownCtx.Done():
-				performCopyForceStop(duckDB, copyQueue, observer)
+				skipDurableTeardown = true
+				performCopyForceStop(copyQueue, observer)
+				duckDB.AbortTraversalPhase()
 				return copyForceStopStats(copyQueue), fmt.Errorf("migration force stopped during %s", "copy")
 			default:
 			}
@@ -498,8 +562,33 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 			waitCtx, cancel := softSuspendWaitContext(cfg.ShutdownContext)
 			stats, suspend, err := performCopySoftSuspend(waitCtx, duckDB, copyQueue, observer, cfg, wc, mr)
 			cancel()
+			if forceStopOverridesSoftSuspend(cfg.ShutdownContext, duckDB) {
+				skipDurableTeardown = true
+				performCopyForceStop(copyQueue, observer)
+				duckDB.AbortTraversalPhase()
+				return copyForceStopStats(copyQueue), fmt.Errorf("migration force stopped during %s", "copy")
+			}
 			if err != nil {
 				return stats, fmt.Errorf("copy soft suspend: %w", err)
+			}
+			setDetail := func(d string) {
+				if observer != nil {
+					observer.SetWaitReason(d)
+				}
+			}
+			bulkPhaseClosed = true
+			finishCtx := cfg.ShutdownContext
+			if finishCtx == nil {
+				finishCtx = context.Background()
+			}
+			if err := finishSoftStopBulkPhase(finishCtx, duckDB, cfg.ReportStopProgress, setDetail); err != nil {
+				if forceStopOverridesSoftSuspend(cfg.ShutdownContext, duckDB) {
+					skipDurableTeardown = true
+					performCopyForceStop(copyQueue, observer)
+					duckDB.AbortTraversalPhase()
+					return copyForceStopStats(copyQueue), fmt.Errorf("migration force stopped during %s", "copy")
+				}
+				return stats, fmt.Errorf("copy soft suspend teardown: %w", err)
 			}
 			fmt.Print("\n")
 			return stats, newCopySuspendedError(stats, suspend)
@@ -531,6 +620,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 			}
 
 			fmt.Printf("\nCopy phase complete! Duration: %v\n", time.Since(start))
+			bulkPhaseClosed = true
 			return stats, nil
 		}
 

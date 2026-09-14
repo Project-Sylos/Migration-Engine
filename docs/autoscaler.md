@@ -20,7 +20,7 @@ Related reading:
 2. **Detect bottlenecks** in the sequential pipeline and apply the *right* relief (not all knobs move the same direction).
 3. **Guarantee safety** via per-knob lower and upper bounds — mins for liveness, maxes for stability.
 4. **Provider-aware defaults** via FS performance profiles in ME, with **authoritative list pagination bounds** read from each connected Sylos-FS adapter at run startup.
-5. **Respect host memory headroom** — gate memory-increasing decisions on system/process availability, not only in-engine buffer metrics.
+5. **Respect host memory headroom** — gate lease/refill/seal size increases on system/process availability; worker AIMD is independent of host memory level.
 
 Coordinator gating (DST trailing SRC by two rounds) is **out of scope** for scaling decisions. SRC scales independently; DST scales on its own FS pressure. Coordinator metrics are diagnostic only.
 
@@ -100,10 +100,11 @@ On each tick (`loop.Autoscaler` tick):
 1. **Resolve profiles** — read each queue's `ScalingContext()` (mode, copy pass, src/dst provider), compose the effective operation profile, merge adapter list pagination when `list_children` is active, and reconcile worker caps when the effective max drops (e.g. copy pass 1 → 2).
 2. **Snapshot** per-queue `InProgress`, `Pending`, observer internal metrics, seal telemetry (read-and-reset), and memory sample (`MemAvailable` + process RSS from `/proc`, autoscaler tick only).
 3. **Classify** → exactly one `PressureClass` (priority order below).
-4. **Actuate** (at most one primary pressure response per tick, plus optional seal backpressure step-down):
-   - `FS_THROTTLE` or `MEMORY_PRESSURE` → step **down** workers (and inter-op delay ↑ at worker floor); **list page size ↑** on FS throttle when `PreferLargePages`
-   - `UNDERFEED` → step **up** workers if memory is green (delay recovery first); **batch/seal knobs ↑** when memory budget allows
-   - `NONE` → **calm AIMD probe:** worker ↑ (or inter-op delay ↓ at floor) when probe cooldown elapsed and memory green
+4. **Actuate** (batch/seal and workers are separate axes on each tick, plus optional seal backpressure step-down):
+   - `MEMORY_PRESSURE` → step **down** lease/refill/seal knobs only; workers still AIMD from a memory-agnostic reclassify (FS / underfeed / none)
+   - `FS_THROTTLE` → step **down** workers (and inter-op delay ↑ at worker floor); **list page size ↑** when `PreferLargePages`
+   - `UNDERFEED` → step **up** workers (delay recovery first); **batch/seal knobs ↑** when memory is green and budget allows
+   - `NONE` → **calm AIMD probe:** worker ↑ (or inter-op delay ↓ at floor) when probe cooldown elapsed
    - **Seal hard-cap hits** (since last tick) → step down batch/seal knobs independently (`PressureSeal` label); does not change pressure class
 
 **Actuated knobs:** `WorkerCount`, `InterOpDelayMs`, `ListPageSize` (FS throttle, when `PreferLargePages`), `LeaseBatchSize`, `RefillBatchSize`, seal buffer `RowThreshold` / `FlushInterval` (memory pressure step-down; underfeed step-up; seal hard-cap step-down).
@@ -148,16 +149,16 @@ Priority (first match wins):
 
 | Class | Trigger (current thresholds) | Autoscaler response |
 |-------|------------------------------|---------------------|
-| `MEMORY_PRESSURE` | Host RAM use ≥ **90%** (`MemTotal` − `MemAvailable`) / `MemTotal`, or MemAvailable &lt; 512 MiB when `MemTotal` unknown | AIMD worker ↓; batch/seal knobs ↓ |
+| `MEMORY_PRESSURE` | Host RAM use ≥ **90%** (`MemTotal` − `MemAvailable`) / `MemTotal`, or MemAvailable &lt; 512 MiB when `MemTotal` unknown | Batch/seal knobs ↓ only; workers reclassified without memory and AIMD as FS / underfeed / none |
 | `FS_THROTTLE` | Any `RateLimitHitsSinceLastPoll > 0` on src/dst/copy (from FS degradation telemetry) | AIMD worker ↓ (or inter-op delay ↑ at floor); list page ↑ when eligible; **at most one step-down per retry-after window** |
 | `UNDERFEED` | `TimeWaitingOnQueue > 500ms` **and** `Pending > 0` for a queue | AIMD delay ↓ then worker ↑; batch/seal knobs ↑ if memory green + budget allows |
-| `NONE` | Otherwise | **Calm AIMD probe:** worker ↑ (or inter-op delay ↓ at floor) when probe cooldown elapsed and host memory green |
+| `NONE` | Otherwise | **Calm AIMD probe:** worker ↑ (or inter-op delay ↓ at floor) when probe cooldown elapsed |
 
 **Separate from classifier:** `HardCapHitsSinceLastPoll > 0` on seal telemetry triggers batch/seal step-down on the same tick (labeled `SEAL_BACKPRESSURE` on events). `HWMSinceLastPoll` is collected for diagnostics but does not classify pressure today.
 
 **Explicitly not a trigger:** `SealIOWaitActive()` (slow DuckDB flush). SealBuffer already blocks producers on hard cap; we act on hard-cap **hit events**, not flush wait state alone.
 
-**Scale-up gate:** `ScaleUpAllowed()` requires host RAM use **below 80%** (yellow zone at 80–90% blocks worker/batch scale-up). Process RSS is sampled but does not trigger memory pressure when the host still has headroom.
+**Batch/seal scale-up gate:** `ScaleUpAllowed()` requires host RAM use **below 80%** (yellow zone at 80–90% blocks lease/refill/seal increases only). Worker AIMD is not gated on host memory. Process RSS is sampled but does not trigger memory pressure when the host still has headroom.
 
 **Batch/seal scale-up:** On `UNDERFEED` only (not calm `NONE`), when host use stays below 90% and `MemoryBudgetAllowsIncrease` passes, the autoscaler increases lease/refill batches and seal row threshold / flush interval toward profile max (inverse of memory-pressure halving). A **3 × Interval** cooldown applies after any batch/seal step-down.
 
@@ -196,7 +197,7 @@ If an adapter buffers the whole file and only uploads inside `Close()`, ME still
 
 | Phase | When | Behavior |
 |-------|------|----------|
-| Multiplicative decrease | `FS_THROTTLE` or `MEMORY_PRESSURE` | `target = floor(cur × 0.5)`, min `MinWorkers` (1); records `ssthresh` |
+| Multiplicative decrease | `FS_THROTTLE` (SoftCap path when eligible) | SoftCap or `target = floor(cur × 0.5)`, min `MinWorkers` (1); records `ssthresh`. Host memory does not decrease workers. |
 | Probe cooldown | After any worker decrease | No worker scale-up for `2 × Autoscaler.Interval` (default **6s** at 3s tick) |
 | Slow start | `NONE` or `UNDERFEED`, `cur < ssthresh` | Double workers per tick toward `ssthresh` / `MaxWorkers` |
 | Congestion avoidance | `NONE` or `UNDERFEED`, `cur ≥ ssthresh` | `+1` worker per tick |
@@ -222,14 +223,14 @@ Classic AIMD only remembers congestion via `ssthresh` and used a **shared climb 
 
 | Axis | Answers |
 |------|---------|
-| `ceilingSafe` / `softCap` | Where to **rest** after rate limits (EMA of last known-safe ceiling; softCap starts as ceiling−1, then rests at the proven probe level after sustain) |
+| `ceilingSafe` / `softCap` | SoftCap = resting believed-safe workers; CeilingSafe = SoftCap+1 (next SoftCap+1 boundary). On RL at n, SoftCap becomes n−1 |
 | `probeBounce` | How patiently to attempt **softCap+1** again (not recovery to softCap) |
 | `effectiveProbeCooldown` | Efficiency-probe miss/success timer only (when `EfficiencyProbe.Enabled`) |
 
 **`FS_THROTTLE` worker step-down** (not a ×0.5 cliff):
 
-1. Update `ceilingSafe` toward `n−1` (EMA α=0.5; first hit initializes).
-2. Drop workers to **`softCap`** (one step under the estimated safe ceiling, clamped to Min/MaxWorkers).
+1. SoftCap → **`n−1`** (drop by one); CeilingSafe → **`n`** (next SoftCap+1 boundary; EMA α=0.5 after the first hit).
+2. Drop workers to **`softCap`**.
 3. Ratchet **probe bounce** only: `max(2×lastProbeBounce, 2×serverWait)` with first floor `max(ProbeCooldown, 30s)`, and at least `Retry-After + 30s` cushion when the FS reports a ban window. Cap = `MaxProbeCooldown` (default 10m).
 4. `fsBackoffUntil` still blocks **stacked** decreases inside one Retry-After window.
 
@@ -242,7 +243,7 @@ Classic AIMD only remembers congestion via `ssthresh` and used a **shared climb 
 | Probing | Hold until the probed level runs without throttle for **≥ last probe bounce**; then raise softCap to that level, clear bounce, rest (next probe on a later tick) |
 | RL mid-sustain | Soft-cap drop + bounce ratchet; no ceiling raise |
 
-Example (Dropbox-style): steady at 4 → probe 5 → RL → softCap≈3 (not cliff to 2) → fast climb back to softCap → wait bounce → probe 4 → sustain for bounce duration → rest at 4 → later probe 5 with longer patience if it fails again.
+Example (Dropbox-style): steady at 4 → probe 5 → RL → softCap=4 (drop by 1, not cliff to 2) → fast climb back to softCap → wait bounce → probe 5 → sustain for bounce duration → rest at 5 → later probe 6 with longer patience if it fails again.
 
 Hard `MinWorkers` / `MaxWorkers` remain safety rails; soft-cap operates inside them.
 
@@ -336,9 +337,11 @@ Resolved profiles map to the actuator shape `FSPerformanceProfile` via `ToActuat
 | `onedrive` | pages 200/200, workers 6/12 | workers 4/12 | workers 4/8 | Default 8/16 | Default 8/16 |
 | `sharepoint` | pages 200/200, workers 4/8 | workers 4/6 | workers 4/6 | Default 6/12 | Default 6/12 |
 | `box` | pages 1000/1000, workers 6/12 | Default 6/12 | Default 6/12 | Default 6/12 | workers 3/4 (upload-tight) |
-| `spectra` | **all max caps = 0** | **0** | **0** | **0** | **0** |
+| `spectra` | **workers 16/64** (all ops) | same | same | same | same |
 
-**Zero-cap semantics (`MaxWorkers == 0`, etc.):** Spectra chaos limits vary per test config, so Spectra operation profiles do not encode fixed throughput caps. **`0` = no provider-imposed ceiling** — AIMD + throttle/memory gating only:
+**Spectra:** Synthetic FS defaults to high concurrency (startup 16, hard ceiling 64). Chaos rate limits (when enabled in the Spectra config) still drive soft-cap AIMD downward. Raising a MaxWorkers override clears soft-cap memory so AIMD can climb again under the new hard ceiling.
+
+**Zero-cap semantics (`MaxWorkers == 0`, etc.):** Some compose legs still use **`0` = no provider-imposed ceiling** (AIMD + throttle/memory gating only):
 
 | Field | `0` means |
 |-------|-----------|
@@ -347,13 +350,13 @@ Resolved profiles map to the actuator shape `FSPerformanceProfile` via `ToActuat
 | `MaxListPageSize`, batch maxes, etc. | No cap — adapter/runtime defaults or AIMD list-page logic |
 | `MaxInterOpDelay` | Generic autoscaler default (5s) |
 
-**Compose with zero caps:** `ComposePipelineMin` treats `0` as "no limit from this leg" (same as `minPositive` — if one side is 0, the other side's cap wins). GDrive→Spectra copy pass 2 uses GDrive download cap; Spectra upload leg contributes no ceiling.
+**Compose with zero caps:** `ComposePipelineMin` treats `0` as "no limit from this leg" (same as `minPositive` — if one side is 0, the other side's cap wins). GDrive→Spectra copy pass 2 uses GDrive download cap; Spectra's higher upload ceiling does not raise that compose result.
 
 **Copy pass 2 efficiency probe:** When classifying calm/underfeed probes on the copy queue in pass 2, throughput rate prefers `SnapshotEMARate("copy", "-bytes")` (bytes/sec EMA) over items/sec so export-bound GDrive→local runs get meaningful efficiency signals.
 
 **FS operation name mapping:** Sylos-FS degradation signals carry operation strings (`ListChildren`, `OpenRead`, `UploadFile`, etc.). `scaling.MapFSOperation` / `ClassifyFSOperation` map these to `FSOperation` for future per-op throttle filtering. Today all operations share one degradation bridge per adapter instance.
 
-**Profile bound reconciliation:** When the effective `MaxWorkers` **drops** (copy pass 1→2, tighter upload cap), the autoscaler clamps `SetTargetWorkerCount` immediately instead of waiting for throttle. When max **rises**, existing underfeed/calm-probe paths apply.
+**Profile bound reconciliation:** When the effective `MaxWorkers` **drops** (copy pass 1→2, tighter upload cap), the autoscaler clamps `SetTargetWorkerCount` immediately instead of waiting for throttle. When max **rises** (including live MaxWorkers overrides), soft-cap / probe-bounce memory is **cleared** so AIMD can rediscover under the new hard ceiling.
 
 ### Backend grouping
 
@@ -370,7 +373,7 @@ Knobs: `WorkerCount`, `InterOpDelayMs` (microseconds in events), `ListPageSize`,
 
 ### Dynamic workers
 
-`Queue.SetTargetWorkerCount` spawns workers with per-worker cancel contexts; scale-down cancels excess workers (they finish the current task then exit). See `pkg/queue/queue_scaling.go`.
+`Queue.SetTargetWorkerCount` spawns workers with per-worker cancel contexts. Scale-down prefers idle workers (cancel immediately). Busy retirees are marked `retire` without cancelling, enter a **15s provisional freeze**, and either finish naturally (first to go idle wins) or are **force-checked out** (smallest active lease among the deferred set only). FS_THROTTLE step-down does **not** bulk-requeue every in-flight lease; only the retiring worker checkpoints and releases its own task. See `pkg/queue/queue_scaling.go` and `queue_grace.go`.
 
 ---
 
@@ -415,7 +418,8 @@ worker completes task  ──►  AppendStatusEvent / AppendDiscoveredNodes  ─
 
 **Existing back-pressure (stage B)**
 
-- `SealBuffer.HardCap` (default 40k rows): producers block when the buffer is full (`waitBelowHardCapLocked`).
+- `SealBuffer.HardCap` (default 100k rows): producers block when the buffer is full (`waitBelowHardCapLocked`).
+- `SealBuffer.RowThreshold` (default 50k rows): drain/flush; keep this below HardCap so a batch can fill while the previous flush runs.
 - Workers treat seal I/O as non-stall via `sealIOWaitActive()` in progress watchdogs.
 - Round advance may call `FlushSealBuffer` / `WaitUntilSealFlushedThrough` before dropping a level.
 
@@ -425,7 +429,7 @@ worker completes task  ──►  AppendStatusEvent / AppendDiscoveredNodes  ─
 |--------|----------------|------------------|
 | `SealIOWaitActive()` true, in-progress high | DB write / seal flush lag | **No** — SealBuffer blocks producers; only act if memory signals fire |
 | Rising task completion time with flat FS metrics | Seal or checkpoint contention | Diagnostic only |
-| Memory growth with large pendingBuff + fat DST batches | Refill batch too large (DST loads expected-child maps per folder) |
+| Memory growth with large pendingBuff + fat DST batches | Refill batch too large (DST loads expected-child maps per folder) | **Yes** — DST uses dual quota (task cap + child cap); autoscaler steps down `DstPullChildMultiplier` on dst queue under memory pressure |
 
 ### Stage B coupling (workers × buffer × memory)
 
@@ -448,20 +452,20 @@ Different pressure classes need **opposite** knob moves. Within a class, actuato
 | Pressure | 1st lever | 2nd lever | 3rd lever |
 |----------|-----------|-----------|-----------|
 | FS rate limit | ↓ workers | ↑ list page size (if profile allows) | ↓ burst batches |
-| Memory | ↓ seal `RowThreshold` / flush more aggressively | ↓ refill / lease batch | ↓ workers |
-| Under-feed | ↑ refill batch | ↑ workers (if FS + memory headroom) | — |
+| Memory | ↓ seal `RowThreshold` / flush more aggressively | ↓ refill / lease batch | — (workers untouched) |
+| Under-feed | ↑ workers (if FS headroom) | ↑ refill batch (if memory green) | — |
 
 Direction reference (same classes):
 
 | Pressure | Workers | List page size | DB refill / lease batch | Seal buffer |
 |----------|---------|----------------|-------------------------|-------------|
 | FS rate limit | ↓ | ↑ (if provider supports large pages) | neutral or ↓ burst | neutral |
-| Memory | ↓ (3rd) | neutral | ↓ | ↓ threshold / ↑ flush (1st) |
-| Under-feed | ↑ cautiously | neutral | ↑ | neutral |
+| Memory | neutral (AIMD continues from FS/underfeed/none) | neutral | ↓ | ↓ threshold / ↑ flush (1st) |
+| Under-feed | ↑ cautiously | neutral | ↑ (if memory green) | ↑ (if memory green) |
 
 The autoscaler must classify first, then act in priority order. Knob actuation covers workers, inter-op delay, list page size (FS throttle), and batch/seal settings — see [How it works](#how-it-works).
 
-**Before any actuation that increases memory** (workers, batches, seal caps), the loop checks `ScaleUpAllowed()` (host MemAvailable green on Linux).
+**Before any actuation that increases batch/seal memory**, the loop checks `ScaleUpAllowed()` (host MemAvailable green on Linux). Worker scale-up does not use that gate.
 
 ---
 
@@ -475,7 +479,8 @@ Each knob should have **Min**, **Default**, **Max**, and **Current** (runtime). 
 |------|------------|---------|-------------|---------------|-------|
 | `WorkerCount` | `migration.Config`, `NewQueue` | 10 (tests) | 1 | profile `MaxWorkers` per **backend group** (or per queue if groups differ) | Primary FS concurrency lever; shared backend → split one cap |
 | `LeaseBatchSize` | `queue.QueueSizing` | 1,000 | 100 | 10,000 (code cap) | Sizes `pendingBuff`; drives `PullLowWM` |
-| `RefillBatchSize` | `queue.QueueSizing` | 10,000 | 500 | 10,000 | Traversal DB pulls only; retry/copy use lease batch |
+| `RefillBatchSize` | `queue.QueueSizing` | 10,000 (SRC) / **1,000 (DST traversal)** | 500 | 10,000 (SRC) / **2,000 (DST)** | Traversal DB pulls only; retry/copy use lease batch |
+| `DstPullChildMultiplier` | `queue.Queue` (dst only) | 10 | 2 | 10 | Child quota = task quota × multiplier for DST expected-children hydration |
 | `ListPageSize` | `Queue.SetListPageSize` | 100 | 20 | 10,000 (cloud) | **Autoscaler tunes on FS throttle** (when `PreferLargePages`) |
 
 ### Where knobs live
@@ -489,11 +494,11 @@ Each knob should have **Min**, **Default**, **Max**, and **Current** (runtime). 
 
 | Knob | Code today | Default | Suggested min | Suggested max | Notes |
 |------|------------|---------|-------------|---------------|-------|
-| `SealBuffer.HardCap` | `SealBufferOptions` | 40,000 rows | 5,000 | 40,000+ | Producer back-pressure tripwire |
-| `SealBuffer.RowThreshold` | `SealBufferOptions` | 20,000 | 1,000 | 50,000 | Discovery flush burst |
+| `SealBuffer.HardCap` | `SealBufferOptions` | 100,000 rows | 5,000 | 100,000 | Producer back-pressure tripwire (not AIMD'd) |
+| `SealBuffer.RowThreshold` | `SealBufferOptions` | 50,000 | 1,000 | 50,000 | Soft flush/drain; autoscaler must not raise this to HardCap |
 | `SealBuffer.FlushInterval` | `SealBufferOptions` | 10s | 1s | 30s | Background flush cadence |
-| `SealBuffer.CheckpointEveryRows` | `SealBufferOptions` | 100,000 | — | — | Periodic checkpoint |
-| DuckDB `memory_limit` | `db.Open` PRAGMA | 4GB | — | host-dependent | Hardcoded today |
+| `SealBuffer.CheckpointEveryRows` | `SealBufferOptions` | 100,000 | — | — | Periodic checkpoint; DuckDB `checkpoint_threshold` is 2GB so auto-fold does not beat this |
+| DuckDB `memory_limit` | `db.Open` / Settings → Advanced → Performance | auto 4–12 GB from free RAM (override up to 64 GB) | — | host-dependent | Install `duckdb_memory_limit_gb` |
 | DuckDB `threads` | `db.Open` PRAGMA | 4 | 1 | 8 | Hardcoded today |
 | `ObserverPollInterval` | `MigrationConfig` | 200ms | 100ms | 2s | Observer EMA / internal metrics sampling (separate from autoscaler tick) |
 | `Autoscaler.Interval` | `AutoscalerConfig` | 3s | 1s | 30s | Decision + actuation tick; probe cooldown = 2× this value |
@@ -678,7 +683,7 @@ Clamp each side to at least `MinWorkers` (1). Different backends: each queue has
 Workers are scaled via **`Queue.SetTargetWorkerCount`** (`pkg/queue/queue_scaling.go`):
 
 - **Scale up:** spawn worker goroutines with per-worker cancel contexts
-- **Scale down:** cancel idle workers immediately; busy workers finish their task then exit via retire flag
+- **Scale down:** cancel idle workers immediately; busy retirees finish or are force-checked out after the 15s grace (scoped retiree set)
 - FS adapter concurrency hints updated on each change
 
 **On group throttle** (shared backend): step down **total** workers first, then re-split (`SplitWorkersTotal`).
@@ -732,7 +737,7 @@ See [Backend grouping](#backend-grouping) for combined vs per-backend budgets.
 - Pending / failed totals, round, in-progress
 - Per-queue `QueueStats`
 
-During seal I/O wait (`SealIOWaitActive`), rate EMA updates are frozen so transient flush pauses do not skew throughput signals.
+During seal I/O wait (`SealIOWaitActive`), discovery EMA is held only when no new children arrived that tick. Copy/delete sliding-window items/sec and bytes/sec keep sampling so live transfer progress still shows on the progress page. Stall watchdogs still suppress dumps while flush is active.
 
 ### Internal metrics (in-memory, for scaling)
 
@@ -754,7 +759,7 @@ During seal I/O wait (`SealIOWaitActive`), rate EMA updates are frozen so transi
 |--------|--------|--------|
 | FS degradation bridge | `RateLimitHitsSinceLastPoll`, `RateLimitedUntil` | `FS_THROTTLE` |
 | Seal buffer telemetry | `HardCapHitsSinceLastPoll`, `HWMSinceLastPoll`, `CurrentRows` | Hard-cap hits → batch/seal step-down; HWM diagnostic only |
-| Host memory sampler | `MemTotal`, `MemAvailable`, process RSS | `MEMORY_PRESSURE` / scale-up gate |
+| Host memory sampler | `MemTotal`, `MemAvailable`, process RSS | `MEMORY_PRESSURE` / batch-seal scale-up gate |
 
 Also used by watchdogs (not autoscaler triggers):
 
@@ -765,7 +770,7 @@ Also used by watchdogs (not autoscaler triggers):
 
 | Knob | Gauge signals | Event signals |
 |------|---------------|---------------|
-| `WorkerCount` | in-progress, completion rate EMA, FS latency buckets | rate-limit hits; host memory headroom |
+| `WorkerCount` | in-progress, completion rate EMA, FS latency buckets | rate-limit hits |
 | `RefillBatchSize` / `LeaseBatchSize` | `pendingBuff` depth | seal hard-cap hits; host memory budget |
 | `ListPageSize` | list p95 item count | rate-limit hits (when `PreferLargePages`) |
 | `SealBuffer.RowThreshold` / `FlushInterval` | `CurrentRows`, flush latency | hard-cap hits |
@@ -781,13 +786,13 @@ Also used by watchdogs (not autoscaler triggers):
 │ 200ms EMA/sample │     │ one class /  │     │ workers, inter-op, list page│
 │ BackendRegistry  │     │ tick         │     │ batches, seal opts          │
 │ SealBuffer telem │     └──────▲───────┘     └─────────────────────────────┘
-│ FS rate-limit    │            │ ScaleUpAllowed() gates increases
-│ Host mem sample  │            │ Efficiency probe gates scale-up
+│ FS rate-limit    │            │ ScaleUpAllowed() gates batch/seal ↑
+│ Host mem sample  │            │ Efficiency probe gates worker scale-up
 └──────────────────┘            └──────────────────────────────────────────
          ▲ autoscaler tick (default 3s) reads snapshots; observer runs faster
 ```
 
-The classifier reads **backend group** state for FS throttle (combined when src/dst share an instance) and **migration-wide** state for seal/memory. Efficiency probing uses observer EMA throughput vs worker deltas.
+The classifier reads **backend group** state for FS throttle (combined when src/dst share an instance) and **migration-wide** state for seal/memory. Worker AIMD ignores host memory level; batch/seal knobs use it. Efficiency probing uses observer EMA throughput vs worker deltas.
 
 ### Actuator targets
 
@@ -816,17 +821,17 @@ When `MemTotal` is available (typical Linux):
 
 | Level | Threshold | Effect |
 |-------|-----------|--------|
-| Green | Host used &lt; **80%** | `ScaleUpAllowed()` true |
-| Yellow | Host used **80–90%** | Scale-up blocked; no `MEMORY_PRESSURE` yet |
-| Red | Host used ≥ **90%** | `MEMORY_PRESSURE` → worker + batch/seal step-down |
+| Green | Host used &lt; **80%** | `ScaleUpAllowed()` true (batch/seal ↑) |
+| Yellow | Host used **80–90%** | Batch/seal scale-up blocked; workers still AIMD; no `MEMORY_PRESSURE` yet |
+| Red | Host used ≥ **90%** | `MEMORY_PRESSURE` → batch/seal step-down only (workers continue AIMD from FS/underfeed/none) |
 
 When `MemTotal` is unavailable (non-Linux / restricted `/proc`):
 
 | Level | Threshold | Effect |
 |-------|-----------|--------|
-| Green | `MemAvailable` ≥ 2 GiB | Scale-up allowed |
-| Yellow | 512 MiB – 2 GiB | Scale-up blocked |
-| Red | &lt; 512 MiB | `MEMORY_PRESSURE` |
+| Green | `MemAvailable` ≥ 2 GiB | Batch/seal scale-up allowed |
+| Yellow | 512 MiB – 2 GiB | Batch/seal scale-up blocked |
+| Red | &lt; 512 MiB | `MEMORY_PRESSURE` (batch/seal ↓; workers untouched by memory) |
 
 Process RSS is sampled and logged but **does not** trigger red when the host still has headroom.
 

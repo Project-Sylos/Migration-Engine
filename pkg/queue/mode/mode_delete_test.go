@@ -21,45 +21,45 @@ func markDeleteRoundPulled(q *queue.Queue, round int) {
 	q.SetLastPullWasPartial(true)
 }
 
-func TestCheckDeleteCompletion_notAtDepth1(t *testing.T) {
+func TestCheckDeleteCompletion_notAtMaxDepth(t *testing.T) {
 	q := newDeleteQueueForTest()
 	q.SetRound(3)
 	q.SetCopyPass(1)
 	markDeleteRoundPulled(q, 3)
 
 	if q.CheckModeCompletion(queue.ModeDelete, 3) {
-		t.Fatal("expected false before depth 1 sweep completes")
+		t.Fatal("expected false before maxKnownDepth sweep completes")
 	}
 	if q.GetCopyPass() != 1 {
 		t.Fatalf("pass should remain 1, got %d", q.GetCopyPass())
 	}
 }
 
-func TestCheckDeleteCompletion_passSwitchAtDepth1(t *testing.T) {
+func TestCheckDeleteCompletion_passSwitchAtMaxDepth(t *testing.T) {
 	q := newDeleteQueueForTest()
-	q.SetRound(1)
+	q.SetRound(5)
 	q.SetCopyPass(1)
-	markDeleteRoundPulled(q, 1)
+	markDeleteRoundPulled(q, 5)
 
-	if q.CheckModeCompletion(queue.ModeDelete, 1) {
+	if q.CheckModeCompletion(queue.ModeDelete, 5) {
 		t.Fatal("pass switch should return false (phase not complete)")
 	}
 	if q.GetCopyPass() != 2 {
-		t.Fatalf("expected pass 2 after file sweep, got %d", q.GetCopyPass())
+		t.Fatalf("expected pass 2 after folder sweep, got %d", q.GetCopyPass())
 	}
-	if q.GetRound() != 5 {
-		t.Fatalf("expected round reset to maxKnownDepth 5, got %d", q.GetRound())
+	if q.GetRound() != 1 {
+		t.Fatalf("expected round reset to 1, got %d", q.GetRound())
 	}
 }
 
 func TestCheckDeleteCompletion_marksCompletePass2(t *testing.T) {
 	q := newDeleteQueueForTest()
-	q.SetRound(1)
+	q.SetRound(5)
 	q.SetCopyPass(2)
-	markDeleteRoundPulled(q, 1)
+	markDeleteRoundPulled(q, 5)
 
-	if !q.CheckModeCompletion(queue.ModeDelete, 1) {
-		t.Fatal("expected phase complete at depth 1 pass 2")
+	if !q.CheckModeCompletion(queue.ModeDelete, 5) {
+		t.Fatal("expected phase complete at maxKnownDepth pass 2")
 	}
 	if q.State() != queue.QueueStateCompleted {
 		t.Fatalf("expected queue completed, got %v", q.State())
@@ -68,14 +68,14 @@ func TestCheckDeleteCompletion_marksCompletePass2(t *testing.T) {
 
 func TestCheckDeleteCompletion_blockedWithPending(t *testing.T) {
 	q := newDeleteQueueForTest()
-	q.SetRound(1)
+	q.SetRound(5)
 	q.SetCopyPass(2)
-	markDeleteRoundPulled(q, 1)
-	if !q.Add(&queue.TaskBase{ID: "x", Round: 1}) {
+	markDeleteRoundPulled(q, 5)
+	if !q.Add(&queue.TaskBase{ID: "x", Round: 5}) {
 		t.Fatal("failed to enqueue pending task")
 	}
 
-	if q.CheckModeCompletion(queue.ModeDelete, 1) {
+	if q.CheckModeCompletion(queue.ModeDelete, 5) {
 		t.Fatal("expected false with pending buffer work")
 	}
 	if q.State() == queue.QueueStateCompleted {
@@ -83,45 +83,45 @@ func TestCheckDeleteCompletion_blockedWithPending(t *testing.T) {
 	}
 }
 
-func TestAdvanceDeleteRound_decrementsDepthSamePass(t *testing.T) {
+func TestAdvanceDeleteRound_incrementsDepthSamePass(t *testing.T) {
 	q := newDeleteQueueForTest()
 	q.SetRound(3)
 	q.SetCopyPass(1)
 
 	q.AdvanceModeRound(queue.ModeDelete)
 
-	if q.GetRound() != 2 {
-		t.Fatalf("expected depth 2, got %d", q.GetRound())
+	if q.GetRound() != 4 {
+		t.Fatalf("expected depth 4, got %d", q.GetRound())
 	}
 	if q.GetCopyPass() != 1 {
 		t.Fatalf("expected pass 1 unchanged, got %d", q.GetCopyPass())
 	}
 }
 
-func TestAdvanceDeleteRound_decrementsDepthPass2(t *testing.T) {
+func TestAdvanceDeleteRound_incrementsDepthPass2(t *testing.T) {
 	q := newDeleteQueueForTest()
 	q.SetRound(4)
 	q.SetCopyPass(2)
 
 	q.AdvanceModeRound(queue.ModeDelete)
 
-	if q.GetRound() != 3 {
-		t.Fatalf("expected depth 3, got %d", q.GetRound())
+	if q.GetRound() != 5 {
+		t.Fatalf("expected depth 5, got %d", q.GetRound())
 	}
 	if q.GetCopyPass() != 2 {
 		t.Fatalf("expected pass 2 unchanged, got %d", q.GetCopyPass())
 	}
 }
 
-func TestAdvanceDeleteRound_atDepth1Pass2Completes(t *testing.T) {
+func TestAdvanceDeleteRound_atMaxDepthPass2Completes(t *testing.T) {
 	q := newDeleteQueueForTest()
-	q.SetRound(1)
+	q.SetRound(5)
 	q.SetCopyPass(2)
-	markDeleteRoundPulled(q, 1)
+	markDeleteRoundPulled(q, 5)
 
 	q.AdvanceModeRound(queue.ModeDelete)
 
 	if q.State() != queue.QueueStateCompleted {
-		t.Fatalf("expected completed at depth 1 pass 2 boundary, got %v", q.State())
+		t.Fatalf("expected completed at maxKnownDepth pass 2 boundary, got %v", q.State())
 	}
 }

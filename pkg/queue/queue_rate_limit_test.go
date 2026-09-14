@@ -75,10 +75,8 @@ func TestRateLimitedUntilSides(t *testing.T) {
 func TestYieldTaskOnRateLimitDoesNotIncrementAttempts(t *testing.T) {
 	q := NewQueue("src", 3, 1, nil, nil)
 	task := &TaskBase{ID: "abc", Round: 0, Attempts: 0}
-	q.mu.Lock()
-	q.inProgress[task.ID] = task
+	q.AddInProgress(task.ID, task)
 	task.Locked = true
-	q.mu.Unlock()
 
 	q.yieldTaskOnRateLimit(task, time.Millisecond)
 

@@ -61,6 +61,9 @@ func (a *Autoscaler) reconcileProfileBounds() {
 	for name, prof := range a.profiles {
 		profiles[name] = prof
 	}
+	if a.lastMaxWorkers == nil {
+		a.lastMaxWorkers = make(map[string]int)
+	}
 	a.mu.Unlock()
 	for name, q := range a.queues {
 		if q == nil {
@@ -79,6 +82,11 @@ func (a *Autoscaler) reconcileProfileBounds() {
 			minW = 1
 		}
 		if st := a.queueState(name); st != nil {
+			a.mu.Lock()
+			prev := a.lastMaxWorkers[name]
+			a.lastMaxWorkers[name] = maxW
+			a.mu.Unlock()
+			st.ClearSoftCapForHigherMax(prev, maxW)
 			st.ClampSoftCapToBounds(minW, maxW)
 		}
 		if q.GetWorkerCount() > maxW {
@@ -95,7 +103,13 @@ func (a *Autoscaler) reconcileProfileBounds() {
 			if p, ok := profiles[queues[0]]; ok && p.MinWorkers > 0 {
 				minPer = p.MinWorkers
 			}
-			if st := a.queueState(backend.GroupAIMDKey(groupID)); st != nil {
+			key := backend.GroupAIMDKey(groupID)
+			if st := a.queueState(key); st != nil {
+				a.mu.Lock()
+				prev := a.lastMaxWorkers[key]
+				a.lastMaxWorkers[key] = maxTotal
+				a.mu.Unlock()
+				st.ClearSoftCapForHigherMax(prev, maxTotal)
 				st.ClampSoftCapToBounds(minPer*len(queues), maxTotal)
 			}
 		}

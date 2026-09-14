@@ -48,6 +48,32 @@ func copyTaskCreateMetadata(task *queue.TaskBase) map[string]string {
 	}
 }
 
+// copyTaskCreateBasename is the FS create/upload basename for a copy task.
+// Prefer ResolvedDstName / DisplayName. Never create with an id_path UUID leaf as the name.
+func copyTaskCreateBasename(task *queue.TaskBase) string {
+	if task == nil {
+		return ""
+	}
+	if task.ResolvedDstName != "" {
+		return db.NormalizeNodeBasename(task.ResolvedDstName)
+	}
+	var display string
+	if task.IsFolder() {
+		display = task.Folder.DisplayName
+	} else {
+		display = task.File.DisplayName
+	}
+	if base := db.NormalizeNodeBasename(display); base != "" && base != "/" {
+		return base
+	}
+	// LocationPath is often an id_path; a UUID leaf must not become the Drive/FS name.
+	fallback := queue.DstChildMatchName(display, task.LocationPath())
+	if fallback == "" || fallback == "/" || db.LooksLikeNodeID(fallback) {
+		return ""
+	}
+	return fallback
+}
+
 // applyCopyDstFolderFromAdapter keeps SRC logical paths on the task while adopting dst service ids.
 func applyCopyDstFolderFromAdapter(task *queue.TaskBase, adapter types.Folder) {
 	if task == nil {
@@ -60,7 +86,9 @@ func applyCopyDstFolderFromAdapter(task *queue.TaskBase, adapter types.Folder) {
 		displayName = adapter.DisplayName
 	}
 	if displayName == "" {
-		displayName = path.Base(logicalPath)
+		if base := path.Base(logicalPath); base != "" && base != "." && base != "/" && !db.LooksLikeNodeID(base) {
+			displayName = base
+		}
 	}
 	mtime := adapter.LastUpdated
 	if mtime == "" {
@@ -90,7 +118,9 @@ func applyCopyDstFileFromAdapter(task *queue.TaskBase, adapter types.File) {
 		displayName = adapter.DisplayName
 	}
 	if displayName == "" {
-		displayName = path.Base(logicalPath)
+		if base := path.Base(logicalPath); base != "" && base != "." && base != "/" && !db.LooksLikeNodeID(base) {
+			displayName = base
+		}
 	}
 	mtime := adapter.LastUpdated
 	if mtime == "" {
@@ -111,4 +141,13 @@ func applyCopyDstFileFromAdapter(task *queue.TaskBase, adapter types.File) {
 		DepthLevel:   task.Round,
 		Type:         types.NodeTypeFile,
 	}
+}
+
+// markCopyAlreadyExists flags a successful existence-precheck short-circuit so CompleteCopyTask
+// credits already-exists counters instead of streamed copy totals.
+func markCopyAlreadyExists(task *queue.TaskBase) {
+	if task == nil {
+		return
+	}
+	task.ProgressAlreadyExists = true
 }

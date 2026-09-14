@@ -7,43 +7,24 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
 func seedFailedSearchFixture(t *testing.T, database *db.DB, n int) {
 	t.Helper()
-	eventTime := time.Now().UnixNano()
 	srcRoot := db.MintNodeID("SRC", "", db.NodeTypeFolder, "/")
-	nodes := make([]*db.NodeState, 0, n)
+	ops := make([]db.InsertOperation, 0, n)
 	for i := 0; i < n; i++ {
 		name := string(rune('a'+i)) + ".txt"
 		path := "/" + name
-		nodes = append(nodes, &db.NodeState{
+		node := &db.NodeState{
 			ID: db.MintNodeID("SRC", srcRoot, db.NodeTypeFile, name), Path: path, ParentPath: "/", Name: name,
 			Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusFailed, CopyStatus: db.CopyStatusPending,
-		})
+		}
+		ops = append(ops, db.InsertOperation{QueueType: "SRC", Level: 1, Status: db.StatusFailed, State: node})
 	}
-	err := database.RunWrite(context.Background(), func(s *db.WriteSession) error {
-		return s.WithTx(func(w *db.Writer) error {
-			if err := w.AppenderInsert("src_nodes", nodes); err != nil {
-				return err
-			}
-			events := make([]db.StatusEvent, 0, len(nodes))
-			for _, node := range nodes {
-				events = append(events, db.StatusEvent{
-					ID: node.ID, TraversalStatus: node.TraversalStatus, CopyStatus: node.CopyStatus,
-					EventTime: eventTime, Depth: 1,
-				})
-			}
-			return w.BatchInsertSrcStatusEvents(events)
-		})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := database.RebuildAllCurrent(); err != nil {
+	if err := database.SeedDiscoveredNodes(ops); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -56,13 +37,12 @@ func TestSearchPathReviewItemsRejectsEmptyFilter(t *testing.T) {
 	defer database.Close()
 	store := newMigrationStore(database, nil)
 
-	_, err = store.searchPathReviewItems(SearchRequest{Limit: 10})
+	_, err = store.searchPathReviewItems(context.Background(), SearchRequest{Limit: 10})
 	if !errors.Is(err, ErrSearchRequiresFilter) {
 		t.Fatalf("err=%v want ErrSearchRequiresFilter", err)
 	}
 
-	// Path/ExcludeRoot alone is still zero-filter.
-	_, err = store.searchPathReviewItems(SearchRequest{Path: "", Limit: 10})
+	_, err = store.searchPathReviewItems(context.Background(), SearchRequest{Path: "", Limit: 10})
 	if !errors.Is(err, ErrSearchRequiresFilter) {
 		t.Fatalf("global empty err=%v want ErrSearchRequiresFilter", err)
 	}
@@ -85,7 +65,7 @@ func TestSearchPathReviewItemsHasMoreWithoutTotal(t *testing.T) {
 		SortBy:           "path",
 		SortDirection:    "asc",
 	}
-	page, err := store.searchPathReviewItems(req)
+	page, err := store.searchPathReviewItems(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +80,7 @@ func TestSearchPathReviewItemsHasMoreWithoutTotal(t *testing.T) {
 	}
 
 	req.Offset = 2
-	last, err := store.searchPathReviewItems(req)
+	last, err := store.searchPathReviewItems(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,8 +94,7 @@ func TestSearchPathReviewItemsHasMoreWithoutTotal(t *testing.T) {
 		t.Fatalf("last items=%d want 1", len(last.Items))
 	}
 
-	// Exact count remains available via GetSearchStats.
-	stats, err := store.getSearchStats(req)
+	stats, err := store.getSearchStats(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
 	}

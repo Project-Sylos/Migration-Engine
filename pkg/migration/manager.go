@@ -64,6 +64,8 @@ type MigrationManager struct {
 	openDBsMu      sync.Mutex
 	pendingMu      sync.Mutex
 	pendingLocks   map[string]*sync.Mutex
+	// duckDBMemoryLimitGB is passed to newly opened migration DBs. 0 = auto at open.
+	duckDBMemoryLimitGB int
 }
 
 var migrationIDCounter int64
@@ -118,6 +120,7 @@ func (m *MigrationManager) ResetState() error {
 }
 
 // openDB opens (or returns cached) the plaintext DB for the given migration folder path and ID.
+// Also opens and links the sibling logs DuckDB for the life of the cache entry.
 func (m *MigrationManager) openDB(migrationDir, id string) (*db.DB, error) {
 	absDir, err := filepath.Abs(migrationDir)
 	if err != nil {
@@ -133,13 +136,31 @@ func (m *MigrationManager) openDB(migrationDir, id string) (*db.DB, error) {
 	if err := os.MkdirAll(absDir, 0755); err != nil {
 		return nil, fmt.Errorf("create migration dir: %w", err)
 	}
-	cfg := DatabaseConfig{Path: dbPath}
+	cfg := DatabaseConfig{Path: dbPath, MemoryLimitGB: m.duckDBMemoryLimitGB}
 	database, _, err := SetupDatabase(cfg)
 	if err != nil {
 		return nil, err
 	}
 	m.openDBs[cacheKey] = database
 	return database, nil
+}
+
+// SetDuckDBMemoryLimitGB sets the limit used for newly opened migration DBs and applies
+// it to all currently open handles. gb <= 0 means auto (DefaultMemoryLimitGB) at apply/open.
+func (m *MigrationManager) SetDuckDBMemoryLimitGB(gb int) {
+	m.openDBsMu.Lock()
+	defer m.openDBsMu.Unlock()
+	m.duckDBMemoryLimitGB = gb
+	for _, database := range m.openDBs {
+		_ = database.SetMemoryLimitGB(gb)
+	}
+}
+
+// DuckDBMemoryLimitGB returns the configured limit (0 = auto).
+func (m *MigrationManager) DuckDBMemoryLimitGB() int {
+	m.openDBsMu.Lock()
+	defer m.openDBsMu.Unlock()
+	return m.duckDBMemoryLimitGB
 }
 
 func (m *MigrationManager) applyTokenKey(mig *Migration, tokenKey []byte) {
@@ -306,11 +327,7 @@ func (m *MigrationManager) GetMigration(id string, migrationDir string, tokenEnc
 		return nil, fmt.Errorf("migration %q not loaded: pass migrationDir to open its DB", id)
 	}
 
-	dbPath := MigrationDBPath(migrationDir, id)
-	if absDir, err := filepath.Abs(migrationDir); err == nil {
-		dbPath = MigrationDBPath(absDir, id)
-	}
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	if !MigrationStorageExists(migrationDir, id) {
 		return nil, nil
 	}
 	database, err := m.openDB(migrationDir, id)
@@ -347,8 +364,7 @@ func (m *MigrationManager) ListMigrations(dataDir string) ([]MigrationSummary, e
 			}
 			id := e.Name()
 			migrationDir := filepath.Join(absDir, id)
-			dbPath := MigrationDBPath(migrationDir, id)
-			if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+			if !MigrationStorageExists(migrationDir, id) {
 				continue
 			}
 			database, err := m.openDB(migrationDir, id)
@@ -470,6 +486,7 @@ func (m *MigrationManager) DeleteMigration(id string, migrationDir string, _ []b
 		return err
 	}
 	_ = database.Close()
+	_ = os.Remove(filepath.Join(absDir, id+".logs.db"))
 	m.openDBsMu.Lock()
 	delete(m.openDBs, dbPath)
 	m.openDBsMu.Unlock()

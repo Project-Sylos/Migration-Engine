@@ -185,6 +185,8 @@ func IsNonRetryableCopyError(errMsg string) bool {
 		"access_restricted",
 		"cannot create files or folders at team space root",
 		"missing scope",
+		"invalid_part_size",
+		"bytes but declared size",
 	} {
 		if strings.Contains(msg, frag) {
 			return true
