@@ -467,7 +467,9 @@ func (m *MigrationManager) overlayRuntimeFromCache(id string, live *bool, phase 
 	}
 }
 
-// DeleteMigration removes the migration from memory and, when a DB exists, deletes its record. Pass migrationDir so the engine can open the DB, delete the row, and close it; otherwise only in-memory state is removed.
+// DeleteMigration removes the migration from memory and closes any open ops handle.
+// Pass migrationDir to release the Badger lock for that folder; the caller removes
+// the directory from disk. Empty migrationDir only clears in-memory state.
 func (m *MigrationManager) DeleteMigration(id string, migrationDir string, _ []byte) error {
 	m.mu.Lock()
 	delete(m.migrations, id)
@@ -476,20 +478,18 @@ func (m *MigrationManager) DeleteMigration(id string, migrationDir string, _ []b
 	if migrationDir == "" {
 		return nil
 	}
-	absDir, _ := filepath.Abs(migrationDir)
-	dbPath := MigrationDBPath(absDir, id)
-	database, err := m.openDB(migrationDir, id)
+	absDir, err := filepath.Abs(migrationDir)
 	if err != nil {
-		return err
+		absDir = migrationDir
 	}
-	if err := m.store.deleteMigration(database, id); err != nil {
-		return err
-	}
-	_ = database.Close()
-	_ = os.Remove(filepath.Join(absDir, id+".logs.db"))
+	dbPath := MigrationDBPath(absDir, id)
 	m.openDBsMu.Lock()
-	delete(m.openDBs, dbPath)
+	if database := m.openDBs[dbPath]; database != nil {
+		_ = database.Close()
+		delete(m.openDBs, dbPath)
+	}
 	m.openDBsMu.Unlock()
+	_ = os.Remove(filepath.Join(absDir, id+".logs.db"))
 	return nil
 }
 
