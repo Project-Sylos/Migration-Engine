@@ -4,8 +4,6 @@
 package worker
 
 import (
-	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
-	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +13,9 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -275,7 +276,7 @@ func (w *CopyWorker) createFolder(task *queue.TaskBase, ctx context.Context, wd 
 	w.queue.SetActiveLeaseSize(w.id, 0)
 	defer w.queue.ClearActiveLeaseSize(w.id)
 
-	if w.queue.ShouldApplyCopyDstResumeExistenceCheck() {
+	if w.queue.ShouldApplyCopyDstResumeExistenceCheck() && !opsdb.IsForceReplaceMark(task.ExclusionSource) {
 		skipCopy, err := w.applyResumeCopyDstFolderPrecheck(task, ctx, wd)
 		if err != nil {
 			return err
@@ -337,7 +338,7 @@ func (w *CopyWorker) copyFile(task *queue.TaskBase, ctx context.Context, wd *obs
 	// Skip existence precheck whenever this migration already touched the file
 	// (resume, attempt marker, or delete-and-restart plan). Prepare may clear the
 	// marker after delete; plan.Restart still must suppress already_exists.
-	skipPrecheck := plan.ResumeOffset > 0 || plan.ResumeToken != "" || plan.Restart || plan.DstRef != "" || queue.HasCopyAttempt(task)
+	skipPrecheck := plan.ResumeOffset > 0 || plan.ResumeToken != "" || plan.Restart || plan.DstRef != "" || queue.HasCopyAttempt(task) || opsdb.IsForceReplaceMark(task.ExclusionSource)
 	if !skipPrecheck {
 		skipCopy, target, preErr := w.applyCopyDstFilePrecheck(task, ctx, wd)
 		if preErr != nil {
@@ -650,7 +651,11 @@ func (w *CopyWorker) partitionFolderGroupForResumeExistence(ctx context.Context,
 			matchKey := task.Folder.Type + ":" + name
 			if existing, ok := folderMap[matchKey]; ok {
 				applyCopyDstFolderFromAdapter(task, existing)
-				markCopyAlreadyExists(task)
+				// Force-replace on folders: adopt existing dest (no re-create) and
+				// seal as successful so the force mark clears; descendants carry the work.
+				if !opsdb.IsForceReplaceMark(task.ExclusionSource) {
+					markCopyAlreadyExists(task)
+				}
 				wd.Beat()
 				reportTaskOutcome(w.queue, task, nil)
 				continue
@@ -720,7 +725,7 @@ func (w *CopyWorker) partitionFileGroupForResumeExistence(ctx context.Context, w
 			matchKey := task.File.Type + ":" + name
 			if existing, ok := fileMap[matchKey]; ok {
 				_ = w.queue.LoadTransferCheckpointOntoTask(ctx, task)
-				if queue.HasCopyAttempt(task) {
+				if queue.HasCopyAttempt(task) || opsdb.IsForceReplaceMark(task.ExclusionSource) {
 					needUpload = append(needUpload, task)
 					continue
 				}

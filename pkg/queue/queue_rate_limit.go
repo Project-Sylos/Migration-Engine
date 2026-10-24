@@ -164,6 +164,10 @@ func IsThrottleError(err error) bool {
 	if strings.Contains(msg, "rate limit") || strings.Contains(msg, "too many requests") {
 		return true
 	}
+	// Dropbox namespace write lock contention (often surfaced as path/too_many_write_operations).
+	if strings.Contains(msg, "too_many_write_operations") {
+		return true
+	}
 	if strings.Contains(msg, "429") {
 		return true
 	}

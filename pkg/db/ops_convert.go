@@ -66,6 +66,10 @@ func statusFromEvent(e StatusEvent) opsdb.StatusRecord {
 		e.CopyStatus != CopyStatusPending {
 		excl = ""
 	}
+	if opsdb.IsForceReplaceMark(excl) && e.CopyStatus != "" &&
+		e.CopyStatus != CopyStatusPending {
+		excl = ""
+	}
 	return opsdb.StatusRecord{
 		TraversalStatus:   e.TraversalStatus,
 		CopyStatus:        e.CopyStatus,

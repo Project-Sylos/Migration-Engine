@@ -9,7 +9,26 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
+
+// copyRetryFlags derives the copy retry provenance booleans for one merged
+// status record. Both stay under the hood: rows render as plain pending or
+// excluded either way.
+func copyRetryFlags(st opsdb.StatusRecord) (marked, excludedFromFailed bool) {
+	marked = (st.CopyStatus == "" || st.CopyStatus == db.CopyStatusPending) &&
+		opsdb.IsCopyRetryMark(st.ExclusionSource)
+	excludedFromFailed = (st.CopyStatus == db.CopyStatusExcludedExplicit ||
+		st.CopyStatus == db.CopyStatusExcludedInherited) &&
+		opsdb.IsCopyExcludedFromFailed(st.ExclusionSource)
+	return marked, excludedFromFailed
+}
+
+// copyForceReplaceMarked reports pending prefer-source overwrite from already_existed.
+func copyForceReplaceMarked(st opsdb.StatusRecord) bool {
+	return (st.CopyStatus == "" || st.CopyStatus == db.CopyStatusPending) &&
+		opsdb.IsForceReplaceMark(st.ExclusionSource)
+}
 
 // MergedReviewRow is one row from the merged review view (SRC+DST joined via id_map/path, status from events).
 type MergedReviewRow struct {
@@ -24,10 +43,18 @@ type MergedReviewRow struct {
 	CopyStatus         string
 	DeleteStatus       string
 	Excluded           bool
-	Size               int64
+	// CopyRetryMarked reports a copy-pending node queued for retry from a
+	// previous copy failure (provenance only; renders as plain pending).
+	CopyRetryMarked bool
+	// CopyExcludedFromFailed reports a copy-excluded node whose exclusion
+	// started from a retry-marked failure; unexcluding restores failed.
+	CopyExcludedFromFailed bool
+	// CopyForceReplaceMarked reports pending prefer-source overwrite.
+	CopyForceReplaceMarked bool
+	Size                   int64
 	// DstSize is the destination folder's identity child size when HasDstSize is set.
-	DstSize            int64
-	HasDstSize         bool
+	DstSize    int64
+	HasDstSize bool
 	// ResolvedDstName is the accepted/committed destination basename from path_events (empty if none).
 	ResolvedDstName string
 }

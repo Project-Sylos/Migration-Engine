@@ -245,6 +245,17 @@ const (
 	RetryMutationDelete    RetryMutationKind = "delete"
 )
 
+// SetNodeCopyForceReplace prefers source for exists-on-both (mark=true) or undoes it.
+// Folders cascade to already_existed descendants; the folder container stays matched.
+func (m *Migration) SetNodeCopyForceReplace(nodeID string, mark bool) (PathReviewActionResult, error) {
+	return m.mutatePathReviewRetry(nodeID,
+		[]string{PhaseTraversalReview, PhaseCopying, PhaseCopyReview},
+		"force-replace requires traversal review, copying, or copy review phase",
+		func(id string) (int64, map[string]int64, error) {
+			return m.store.setNodeCopyForceReplace(id, mark)
+		})
+}
+
 // SetNodeRetryMark marks (mark=true) or clears (mark=false) a retry of the given kind.
 func (m *Migration) SetNodeRetryMark(kind RetryMutationKind, nodeID string, mark bool) (PathReviewActionResult, error) {
 	switch kind {

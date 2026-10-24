@@ -100,6 +100,10 @@ func statusEventReviewDeltas(table string, e StatusEvent, fromRetry bool) []Revi
 			(curCopy == CopyStatusSuccessful || curCopy == CopyStatusAlreadyExisted || curCopy == CopyStatusFailed) {
 			out = addReviewDelta(out, ReviewKeyCopyPendingRetry, -1)
 		}
+		if copyChanged && opsdb.IsCopyExcludedFromFailed(e.ExclusionSource) &&
+			(curCopy == CopyStatusExcludedExplicit || curCopy == CopyStatusExcludedInherited) {
+			out = addReviewDelta(out, ReviewKeyCopyPendingRetry, -1)
+		}
 	}
 	if table == "SRC" && fromRetry && travChanged && prevTrav == StatusPending &&
 		(curTrav == StatusSuccessful || curTrav == StatusFailed) {

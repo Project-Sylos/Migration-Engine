@@ -92,17 +92,21 @@ func childrenMergedRows(d *db.DB, side, parentID string, f ReviewFilter, sortCol
 			continue
 		}
 		st := stMap[id]
+		marked, excludedFromFailed := copyRetryFlags(st)
 		row := MergedReviewRow{
-			Path:               rec.Path,
-			Name:               rec.Name,
-			Depth:              rec.Depth,
-			Type:               rec.Type,
-			SrcNodeID:          rec.ID,
-			Size:               opsdb.DisplayBytes(rec.Type, rec.Size, st.ChildSize),
-			SrcTraversalStatus: st.TraversalStatus,
-			CopyStatus:         st.CopyStatus,
-			DeleteStatus:       st.DeleteStatus,
-			Excluded:           st.CopyStatus == db.CopyStatusExcludedExplicit || st.CopyStatus == db.CopyStatusExcludedInherited,
+			Path:                   rec.Path,
+			Name:                   rec.Name,
+			Depth:                  rec.Depth,
+			Type:                   rec.Type,
+			SrcNodeID:              rec.ID,
+			Size:                   opsdb.DisplayBytes(rec.Type, rec.Size, st.ChildSize),
+			SrcTraversalStatus:     st.TraversalStatus,
+			CopyStatus:             st.CopyStatus,
+			DeleteStatus:           st.DeleteStatus,
+			Excluded:               st.CopyStatus == db.CopyStatusExcludedExplicit || st.CopyStatus == db.CopyStatusExcludedInherited,
+			CopyRetryMarked:        marked,
+			CopyExcludedFromFailed: excludedFromFailed,
+			CopyForceReplaceMarked: copyForceReplaceMarked(st),
 		}
 		if side == opsdb.SideSRC {
 			if m, ok, _ := d.Ops().GetMapBySrc(rec.ID); ok {

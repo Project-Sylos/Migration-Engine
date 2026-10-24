@@ -54,15 +54,23 @@ type DiffItem struct {
 	CopyStatus         string
 	DeleteStatus       string
 	Excluded           bool
-	MissingOnSource    bool
-	MissingOnDest      bool
-	Size               int64
-	DstSize            int64
-	HasDstSize         bool
-	SrcFailureLogID    string
-	SrcFailureMessage  string
-	DstFailureLogID    string
-	DstFailureMessage  string
+	// CopyRetryMarked reports a copy-pending node queued for retry from a
+	// previous copy failure (provenance only; renders as plain pending).
+	CopyRetryMarked bool
+	// CopyExcludedFromFailed reports a copy-excluded node whose exclusion
+	// started from a retry-marked failure; unexcluding restores failed.
+	CopyExcludedFromFailed bool
+	// CopyForceReplaceMarked reports pending prefer-source overwrite.
+	CopyForceReplaceMarked bool
+	MissingOnSource        bool
+	MissingOnDest          bool
+	Size                   int64
+	DstSize                int64
+	HasDstSize             bool
+	SrcFailureLogID        string
+	SrcFailureMessage      string
+	DstFailureLogID        string
+	DstFailureMessage      string
 	// ResolvedDstName is the accepted/committed destination basename from path_events.
 	// Empty when no remap was applied. Review identity (Path/Name) stays SRC-original.
 	ResolvedDstName string
@@ -203,12 +211,6 @@ func addReviewDeltaForDeleteStatus(deltas map[string]int64, status string, delta
 	if key := deleteStatusReviewDeltaKey(status); key != "" {
 		addReviewDelta(deltas, key, delta)
 	}
-}
-
-// addReviewDeltaForDeleteStatusTransition updates review counters when delete_status changes.
-func addReviewDeltaForDeleteStatusTransition(deltas map[string]int64, from, to string) {
-	addReviewDeltaForDeleteStatus(deltas, from, -1)
-	addReviewDeltaForDeleteStatus(deltas, to, 1)
 }
 
 // PathReviewActionResult is the result of a path review mutation. Deltas holds per-status/category changes (only non-zero keys). UI applies them to the matching counter; phase determines which counters are shown.

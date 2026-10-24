@@ -16,6 +16,11 @@ type CopyMutationResult struct {
 	Folders      int64
 	Files        int64
 	PendingBytes int64
+	// RestoredFailed counts unexcluded nodes returned to copy failed instead
+	// of copy pending (excluded from a retry-marked failure).
+	RestoredFailed int64
+	// RetryExcluded counts retry-marked pending nodes moved to excluded.
+	RetryExcluded int64
 }
 
 // DeleteMutationResult aggregates live delete forest/retry writes.
@@ -60,6 +65,7 @@ func (db *DB) ApplyNodeCopyExclusion(nodeID string, excluded bool) (CopyMutation
 func copyMutationFromOps(mut opsdb.SubtreeMutationResult) CopyMutationResult {
 	return CopyMutationResult{
 		Affected: mut.Affected, Folders: mut.Folders, Files: mut.Files, PendingBytes: mut.SelectedBytes,
+		RestoredFailed: mut.RestoredFailed, RetryExcluded: mut.RetryExcluded,
 	}
 }
 

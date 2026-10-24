@@ -51,19 +51,3 @@ func boolDelta(v bool) int64 {
 	}
 	return -1
 }
-
-func (db *DB) putOpsStatusField(table, nodeID string, apply func(*opsdb.StatusRecord)) error {
-	if db == nil || db.opsStore == nil || nodeID == "" {
-		return fmt.Errorf("ops store required")
-	}
-	side := opsdb.SideSRC
-	if table == "DST" {
-		side = opsdb.SideDST
-	}
-	st, _, err := db.opsStore.GetStatus(side, nodeID)
-	if err != nil {
-		return err
-	}
-	apply(&st)
-	return db.opsStore.PutStatus(side, nodeID, st)
-}

@@ -14,6 +14,11 @@ type SubtreeCopyMutationResult struct {
 	Folders      int64
 	Files        int64
 	PendingBytes int64
+	// RestoredFailed counts unexcluded nodes returned to copy failed instead
+	// of copy pending (excluded from a retry-marked failure).
+	RestoredFailed int64
+	// RetryExcluded counts retry-marked pending nodes moved to excluded.
+	RetryExcluded int64
 }
 
 // SubtreeDeleteMutationResult aggregates delete-phase cascade subtree writes.

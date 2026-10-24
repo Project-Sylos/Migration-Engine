@@ -96,23 +96,26 @@ func (s *migrationStore) persistReviewDeltas(deltas map[string]int64) error {
 
 func mergedRowToDiffItem(r review.MergedReviewRow) DiffItem {
 	item := DiffItem{
-		Path:               r.Path,
-		Name:               r.Name,
-		Depth:              r.Depth,
-		Type:               r.Type,
-		SrcNodeID:          r.SrcNodeID,
-		DstNodeID:          r.DstNodeID,
-		SrcTraversalStatus: r.SrcTraversalStatus,
-		DstTraversalStatus: r.DstTraversalStatus,
-		CopyStatus:         db.CopyStatusForDisplay(r.CopyStatus),
-		DeleteStatus:       r.DeleteStatus,
-		Excluded:           r.Excluded,
-		Size:               r.Size,
-		DstSize:            r.DstSize,
-		HasDstSize:         r.HasDstSize,
-		MissingOnSource:    r.SrcNodeID == "",
-		MissingOnDest:      r.DstNodeID == "",
-		ResolvedDstName:    strings.TrimSpace(r.ResolvedDstName),
+		Path:                   r.Path,
+		Name:                   r.Name,
+		Depth:                  r.Depth,
+		Type:                   r.Type,
+		SrcNodeID:              r.SrcNodeID,
+		DstNodeID:              r.DstNodeID,
+		SrcTraversalStatus:     r.SrcTraversalStatus,
+		DstTraversalStatus:     r.DstTraversalStatus,
+		CopyStatus:             db.CopyStatusForDisplay(r.CopyStatus),
+		DeleteStatus:           r.DeleteStatus,
+		Excluded:               r.Excluded,
+		CopyRetryMarked:        r.CopyRetryMarked,
+		CopyExcludedFromFailed: r.CopyExcludedFromFailed,
+		CopyForceReplaceMarked: r.CopyForceReplaceMarked,
+		Size:                   r.Size,
+		DstSize:                r.DstSize,
+		HasDstSize:             r.HasDstSize,
+		MissingOnSource:        r.SrcNodeID == "",
+		MissingOnDest:          r.DstNodeID == "",
+		ResolvedDstName:        strings.TrimSpace(r.ResolvedDstName),
 	}
 	if item.MissingOnSource {
 		item.CopyStatus = ""
@@ -335,6 +338,7 @@ func (s *migrationStore) setNodeExcluded(nodeID string, excluded bool) (int64, m
 	}
 	subMut := subtree.SubtreeCopyMutationResult{
 		Affected: mut.Affected, Folders: mut.Folders, Files: mut.Files, PendingBytes: mut.PendingBytes,
+		RestoredFailed: mut.RestoredFailed, RetryExcluded: mut.RetryExcluded,
 	}
 	deltas, err := s.persistCopyExclusionMutation(subMut, excluded)
 	if err != nil {
@@ -416,6 +420,51 @@ func (s *migrationStore) setNodeCopyStatus(nodeID, status string) (int64, map[st
 		addReviewDelta(deltas, DeltaCopyPending, -n)
 		addReviewDelta(deltas, DeltaCopyPendingRetry, -n)
 		addReviewDelta(deltas, DeltaCopyFailed, n)
+		addReviewDelta(deltas, DeltaFolders, -mut.Folders)
+		addReviewDelta(deltas, DeltaFiles, -mut.Files)
+		addReviewDelta(deltas, DeltaSizeSelected, -mut.PendingBytes)
+	}
+	if err := s.persistReviewDeltas(deltas); err != nil {
+		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+	}
+	return mut.Affected, deltas, nil
+}
+
+// setNodeCopyForceReplace prefers source (already_existed → pending) or undoes it.
+func (s *migrationStore) setNodeCopyForceReplace(nodeID string, mark bool) (int64, map[string]int64, error) {
+	node, err := pull.GetNodeByID(s.db, "SRC", nodeID)
+	if err != nil {
+		return 0, nil, err
+	}
+	if node == nil {
+		return 0, nil, fmt.Errorf("node %s not found in SRC", nodeID)
+	}
+	var opsMut opsdb.SubtreeMutationResult
+	if node.Type == db.NodeTypeFolder {
+		opsMut, err = s.db.Ops().ApplySubtreeCopyForceReplace(node.Path, mark)
+	} else {
+		opsMut, err = s.db.Ops().ApplyNodeCopyForceReplace(nodeID, mark)
+	}
+	if err != nil {
+		return 0, nil, err
+	}
+	mut := db.CopyMutationResult{
+		Affected: opsMut.Affected, Folders: opsMut.Folders, Files: opsMut.Files, PendingBytes: opsMut.SelectedBytes,
+	}
+	if mut.Affected == 0 {
+		return 0, nil, nil
+	}
+	deltas := make(map[string]int64)
+	n := mut.Affected
+	if mark {
+		addReviewDelta(deltas, DeltaCopySuccessful, -n)
+		addReviewDelta(deltas, DeltaCopyPending, n)
+		addReviewDelta(deltas, DeltaFolders, mut.Folders)
+		addReviewDelta(deltas, DeltaFiles, mut.Files)
+		addReviewDelta(deltas, DeltaSizeSelected, mut.PendingBytes)
+	} else {
+		addReviewDelta(deltas, DeltaCopyPending, -n)
+		addReviewDelta(deltas, DeltaCopySuccessful, n)
 		addReviewDelta(deltas, DeltaFolders, -mut.Folders)
 		addReviewDelta(deltas, DeltaFiles, -mut.Files)
 		addReviewDelta(deltas, DeltaSizeSelected, -mut.PendingBytes)
@@ -764,6 +813,7 @@ func (s *migrationStore) setNodeExcludedWithPropagation(nodeID string, excluded 
 	}
 	subMut := subtree.SubtreeCopyMutationResult{
 		Affected: mut.Affected, Folders: mut.Folders, Files: mut.Files, PendingBytes: mut.PendingBytes,
+		RestoredFailed: mut.RestoredFailed, RetryExcluded: mut.RetryExcluded,
 	}
 	deltas, err := s.persistCopyExclusionMutation(subMut, excluded)
 	if err != nil {
@@ -788,6 +838,7 @@ func (s *migrationStore) applySearchExclusion(
 	}
 	subMut := subtree.SubtreeCopyMutationResult{
 		Affected: mut.Affected, Folders: mut.Folders, Files: mut.Files, PendingBytes: mut.PendingBytes,
+		RestoredFailed: mut.RestoredFailed, RetryExcluded: mut.RetryExcluded,
 	}
 	deltas, err := s.persistCopyExclusionMutation(subMut, true)
 	if err != nil {
@@ -810,6 +861,7 @@ func (s *migrationStore) applySearchUnexclusion(
 	}
 	subMut := subtree.SubtreeCopyMutationResult{
 		Affected: mut.Affected, Folders: mut.Folders, Files: mut.Files, PendingBytes: mut.PendingBytes,
+		RestoredFailed: mut.RestoredFailed, RetryExcluded: mut.RetryExcluded,
 	}
 	deltas, err := s.persistCopyExclusionMutation(subMut, false)
 	if err != nil {
@@ -826,6 +878,13 @@ func (s *migrationStore) persistCopyExclusionMutation(mut subtree.SubtreeCopyMut
 	}
 	addReviewDelta(deltas, DeltaExcluded, -sign*mut.Affected)
 	addReviewDelta(deltas, DeltaCopyPending, sign*mut.Affected)
+	if excluded {
+		addReviewDelta(deltas, DeltaCopyPendingRetry, -mut.RetryExcluded)
+	} else if mut.RestoredFailed > 0 {
+		// Unexcluded nodes restored to failed never re-enter the pending count.
+		addReviewDelta(deltas, DeltaCopyPending, -mut.RestoredFailed)
+		addReviewDelta(deltas, DeltaCopyFailed, mut.RestoredFailed)
+	}
 	addReviewDelta(deltas, DeltaSizeSelected, sign*mut.PendingBytes)
 	addReviewDelta(deltas, DeltaFolders, sign*mut.Folders)
 	addReviewDelta(deltas, DeltaFiles, sign*mut.Files)

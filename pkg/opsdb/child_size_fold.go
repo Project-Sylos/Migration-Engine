@@ -384,12 +384,6 @@ func (s *Store) commitFoldDepth(side string, depth int, parents []string, writes
 	})
 }
 
-func (s *Store) writeSealedDepth(side string, depth int) error {
-	return s.update(func(txn *badger.Txn) error {
-		return txn.Set(foldSealedDepthKey(side), fmt.Appendf(nil, "%d", depth))
-	})
-}
-
 func (s *Store) readSealedDepth(side string) (int, bool, error) {
 	var n int64
 	found := false

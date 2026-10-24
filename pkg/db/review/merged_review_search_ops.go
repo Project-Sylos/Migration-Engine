@@ -288,17 +288,21 @@ func hydrateSRCReviewRows(
 		}
 		n := nodes[id]
 		st := stMap[id]
+		marked, excludedFromFailed := copyRetryFlags(st)
 		r := MergedReviewRow{
-			SrcNodeID:          id,
-			Path:               n.Path,
-			Name:               n.Name,
-			Depth:              n.Depth,
-			Type:               n.Type,
-			Size:               opsdb.DisplayBytes(n.Type, n.Size, st.ChildSize),
-			SrcTraversalStatus: st.TraversalStatus,
-			CopyStatus:         st.CopyStatus,
-			DeleteStatus:       st.DeleteStatus,
-			Excluded:           st.CopyStatus == db.CopyStatusExcludedExplicit || st.CopyStatus == db.CopyStatusExcludedInherited,
+			SrcNodeID:              id,
+			Path:                   n.Path,
+			Name:                   n.Name,
+			Depth:                  n.Depth,
+			Type:                   n.Type,
+			Size:                   opsdb.DisplayBytes(n.Type, n.Size, st.ChildSize),
+			SrcTraversalStatus:     st.TraversalStatus,
+			CopyStatus:             st.CopyStatus,
+			DeleteStatus:           st.DeleteStatus,
+			Excluded:               st.CopyStatus == db.CopyStatusExcludedExplicit || st.CopyStatus == db.CopyStatusExcludedInherited,
+			CopyRetryMarked:        marked,
+			CopyExcludedFromFailed: excludedFromFailed,
+			CopyForceReplaceMarked: copyForceReplaceMarked(st),
 		}
 		if dstID := dstBySrc[id]; dstID != "" {
 			r.DstNodeID = dstID
@@ -498,17 +502,21 @@ func nodeRecordMatchesPostFilter(n opsdb.NodeRecord, f ReviewFilter) bool {
 }
 
 func mergedRowFromOps(id string, n opsdb.NodeRecord, st opsdb.StatusRecord) MergedReviewRow {
+	marked, excludedFromFailed := copyRetryFlags(st)
 	r := MergedReviewRow{
-		SrcNodeID:          id,
-		Path:               n.Path,
-		Name:               n.Name,
-		Depth:              n.Depth,
-		Type:               n.Type,
-		Size:               opsdb.DisplayBytes(n.Type, n.Size, st.ChildSize),
-		SrcTraversalStatus: st.TraversalStatus,
-		CopyStatus:         st.CopyStatus,
-		DeleteStatus:       st.DeleteStatus,
-		Excluded:           st.CopyStatus == db.CopyStatusExcludedExplicit || st.CopyStatus == db.CopyStatusExcludedInherited,
+		SrcNodeID:              id,
+		Path:                   n.Path,
+		Name:                   n.Name,
+		Depth:                  n.Depth,
+		Type:                   n.Type,
+		Size:                   opsdb.DisplayBytes(n.Type, n.Size, st.ChildSize),
+		SrcTraversalStatus:     st.TraversalStatus,
+		CopyStatus:             st.CopyStatus,
+		DeleteStatus:           st.DeleteStatus,
+		Excluded:               st.CopyStatus == db.CopyStatusExcludedExplicit || st.CopyStatus == db.CopyStatusExcludedInherited,
+		CopyRetryMarked:        marked,
+		CopyExcludedFromFailed: excludedFromFailed,
+		CopyForceReplaceMarked: copyForceReplaceMarked(st),
 	}
 	if r.Name == "" {
 		r.Name = id

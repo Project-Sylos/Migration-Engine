@@ -19,6 +19,12 @@ const (
 	ExclusionRetryParkCopy = "retry_park_copy_pending"
 	// ExclusionRetryMarkCopy marks a copy-failed node the user queued for copy retry.
 	ExclusionRetryMarkCopy = "retry_mark_copy"
+	// ExclusionRetryExcludedFromFailed marks a copy-excluded node whose pending
+	// state came from a retry-marked failure, so unexcluding restores failed
+	// instead of pending.
+	ExclusionRetryExcludedFromFailed = "retry_excluded_from_failed"
+	// ExclusionForceReplaceCopy marks already_existed → pending (prefer source overwrite).
+	ExclusionForceReplaceCopy = "force_replace_copy"
 )
 
 // IsDiscoveryRetryMark reports whether ExclusionSource is a live discovery-retry mark.
@@ -29,6 +35,17 @@ func IsDiscoveryRetryMark(src string) bool {
 // IsCopyRetryMark reports whether ExclusionSource is a live copy-retry mark.
 func IsCopyRetryMark(src string) bool {
 	return src == ExclusionRetryMarkCopy
+}
+
+// IsForceReplaceMark reports whether ExclusionSource is a prefer-source force mark.
+func IsForceReplaceMark(src string) bool {
+	return src == ExclusionForceReplaceCopy
+}
+
+// IsCopyExcludedFromFailed reports whether ExclusionSource marks a copy
+// exclusion that originated from a retry-marked failure.
+func IsCopyExcludedFromFailed(src string) bool {
+	return src == ExclusionRetryExcludedFromFailed
 }
 
 // TraversalRetryResult summarizes a live mark/unmark for discovery retry.

@@ -27,6 +27,12 @@ type SubtreeMutationResult struct {
 	Folders       int64
 	Files         int64
 	SelectedBytes int64
+	// RestoredFailed counts unexcluded nodes returned to copy failed (their
+	// exclusion came from a retry-marked failure) instead of copy pending.
+	// They are counted in Affected but not in Folders/Files/SelectedBytes.
+	RestoredFailed int64
+	// RetryExcluded counts retry-marked pending nodes moved to excluded.
+	RetryExcluded int64
 }
 
 func copyStatusIsPending(s string) bool {
@@ -234,6 +240,8 @@ func (s *Store) applyCopyExclusionChunk(rootPath string, excluded bool, skip fun
 		}
 		prev := chunk.Status[id]
 		var nextCopy string
+		nextExcl := ""
+		restoredFailed := false
 		if excluded {
 			if !copyStatusIsPending(prev.CopyStatus) {
 				continue
@@ -242,11 +250,19 @@ func (s *Store) applyCopyExclusionChunk(rootPath string, excluded bool, skip fun
 			if NormalizeIndexPath(n.Path) == rootPath {
 				nextCopy = copyStatusExcludedExplicit
 			}
+			if IsCopyRetryMark(prev.ExclusionSource) {
+				nextExcl = ExclusionRetryExcludedFromFailed
+				out.RetryExcluded++
+			}
 		} else {
 			if !copyStatusIsExcludedValue(prev.CopyStatus) {
 				continue
 			}
 			nextCopy = copyStatusPending
+			if IsCopyExcludedFromFailed(prev.ExclusionSource) {
+				nextCopy = copyStatusFailed
+				restoredFailed = true
+			}
 		}
 		nt := nodeTypeNT(n.Type)
 		prevCopy := prev.CopyStatus
@@ -261,6 +277,7 @@ func (s *Store) applyCopyExclusionChunk(rootPath string, excluded bool, skip fun
 				CopyStatus:             nextCopy,
 				DeleteStatus:           prev.DeleteStatus,
 				SkippedDescendantCount: prev.SkippedDescendantCount,
+				ExclusionSource:        nextExcl,
 			},
 			PrevStatus: prev,
 			Depth:      n.Depth,
@@ -279,7 +296,12 @@ func (s *Store) applyCopyExclusionChunk(rootPath string, excluded bool, skip fun
 				DepthCounterDelta{Side: SideSRC, Depth: n.Depth, Key: copyFileBytesStatKey(nextCopy), Delta: n.Size},
 			)
 		}
-		s.noteMutation(out, n)
+		if restoredFailed {
+			out.Affected++
+			out.RestoredFailed++
+		} else {
+			s.noteMutation(out, n)
+		}
 	}
 	if len(writes) == 0 {
 		return nil

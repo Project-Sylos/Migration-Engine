@@ -29,6 +29,9 @@ func TestIsThrottleError(t *testing.T) {
 	if !IsThrottleError(errString("429 Too Many Requests")) {
 		t.Fatal("429 message should be throttle")
 	}
+	if !IsThrottleError(errString("dropbox: path/too_many_write_operations")) {
+		t.Fatal("Dropbox write contention should be throttle")
+	}
 }
 
 type errString string

@@ -231,3 +231,106 @@ func TestApplySubtreeCopyExclusionPendingOnly(t *testing.T) {
 		t.Fatalf("file pend after unexclude %+v err=%v", ids, err)
 	}
 }
+
+func TestCopyExclusionCycleRestoresFailedOrigin(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	writes := []SealNodeWrite{
+		{
+			Side: SideSRC, Node: NodeRecord{ID: "p", Path: "/p", Name: "p", Type: NodeTypeFolder, Depth: 1},
+			Status: StatusRecord{TraversalStatus: "successful", CopyStatus: copyStatusPending}, Depth: 1, InsertOnly: true,
+		},
+		{
+			Side: SideSRC, Node: NodeRecord{ID: "f", Path: "/p/f", Name: "f", Type: NodeTypeFile, ParentID: "p", Size: 9, Depth: 2},
+			Status: StatusRecord{TraversalStatus: "successful", CopyStatus: copyStatusFailed}, Depth: 2, InsertOnly: true,
+		},
+		{
+			Side: SideSRC, Node: NodeRecord{ID: "b", Path: "/p/b", Name: "b", Type: NodeTypeFile, ParentID: "p", Size: 4, Depth: 2},
+			Status: StatusRecord{TraversalStatus: "successful", CopyStatus: copyStatusPending}, Depth: 2, InsertOnly: true,
+		},
+	}
+	if _, err := s.WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Born-pending has no failure to return to: unmarking is a no-op.
+	mut, err := s.ApplyNodeCopyRetry("b", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mut.Affected != 0 {
+		t.Fatalf("unmark born-pending affected=%d want 0", mut.Affected)
+	}
+
+	// Failed -> retry-marked pending.
+	mut, err = s.ApplyNodeCopyRetry("f", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mut.Affected != 1 {
+		t.Fatalf("mark affected=%d want 1", mut.Affected)
+	}
+	st, ok, err := s.GetStatus(SideSRC, "f")
+	if err != nil || !ok || st.CopyStatus != copyStatusPending || !IsCopyRetryMark(st.ExclusionSource) {
+		t.Fatalf("marked status %+v ok=%v err=%v", st, ok, err)
+	}
+
+	// Marked pending -> excluded keeps the failed origin under the hood.
+	mut, err = s.ApplySubtreeCopyExclusion("/p", true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mut.Affected != 3 || mut.RetryExcluded != 1 || mut.RestoredFailed != 0 {
+		t.Fatalf("exclude mut=%+v want affected 3 retryExcluded 1", mut)
+	}
+	st, ok, err = s.GetStatus(SideSRC, "f")
+	if err != nil || !ok || st.CopyStatus != copyStatusExcludedInherited || !IsCopyExcludedFromFailed(st.ExclusionSource) {
+		t.Fatalf("excluded marked status %+v ok=%v err=%v", st, ok, err)
+	}
+	st, ok, err = s.GetStatus(SideSRC, "b")
+	if err != nil || !ok || st.CopyStatus != copyStatusExcludedInherited || st.ExclusionSource != "" {
+		t.Fatalf("excluded born-pending status %+v ok=%v err=%v", st, ok, err)
+	}
+
+	// Excluded -> failed origin restores failed; the rest return to pending.
+	mut, err = s.ApplySubtreeCopyExclusion("/p", false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mut.Affected != 3 || mut.RestoredFailed != 1 {
+		t.Fatalf("unexclude mut=%+v want affected 3 restoredFailed 1", mut)
+	}
+	st, ok, err = s.GetStatus(SideSRC, "f")
+	if err != nil || !ok || st.CopyStatus != copyStatusFailed || st.ExclusionSource != "" {
+		t.Fatalf("restored status %+v ok=%v err=%v", st, ok, err)
+	}
+	st, ok, err = s.GetStatus(SideSRC, "b")
+	if err != nil || !ok || st.CopyStatus != copyStatusPending {
+		t.Fatalf("born-pending after unexclude %+v ok=%v err=%v", st, ok, err)
+	}
+	st, ok, err = s.GetStatus(SideSRC, "p")
+	if err != nil || !ok || st.CopyStatus != copyStatusPending {
+		t.Fatalf("folder after unexclude %+v ok=%v err=%v", st, ok, err)
+	}
+
+	// Marked pending can still be sent back to failed directly (mark failed).
+	if _, err := s.ApplyNodeCopyRetry("f", true); err != nil {
+		t.Fatal(err)
+	}
+	mut, err = s.ApplyNodeCopyRetry("f", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mut.Affected != 1 {
+		t.Fatalf("unmark affected=%d want 1", mut.Affected)
+	}
+	st, ok, err = s.GetStatus(SideSRC, "f")
+	if err != nil || !ok || st.CopyStatus != copyStatusFailed || st.ExclusionSource != "" {
+		t.Fatalf("after unmark %+v ok=%v err=%v", st, ok, err)
+	}
+}
