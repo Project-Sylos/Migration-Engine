@@ -28,11 +28,11 @@ Coordinator gating (DST trailing SRC by two rounds) is **out of scope** for scal
 
 ## Scope and ownership
 
-**The autoscaler is an engine concern.** It runs inside the Migration Engine process, reads telemetry from queues / backend groups / DuckDB, and adjusts throughput knobs within profile bounds. It does not expose a control API for scaling decisions.
+**The autoscaler is an engine concern.** It runs inside the Migration Engine process, reads telemetry from queues / backend groups / the Badger ops store, and adjusts throughput knobs within profile bounds. It does not expose a control API for scaling decisions.
 
 **Sylos API (host) role:**
 
-- **Observability** — logs, `queue_stats`, migration status, metrics the API surfaces to operators.
+- **Observability** — logs, `qstat:*` history, migration status, metrics the API surfaces to operators.
 - **Lifecycle** — pause, stop, soft suspend, resume, phase transitions the product already supports.
 - **Not in scope** — telling the autoscaler what worker count, batch size, or profile to use; the API does not drive those decisions.
 
@@ -156,7 +156,7 @@ Priority (first match wins):
 
 **Separate from classifier:** `HardCapHitsSinceLastPoll > 0` on seal telemetry triggers batch/seal step-down on the same tick (labeled `SEAL_BACKPRESSURE` on events). `HWMSinceLastPoll` is collected for diagnostics but does not classify pressure today.
 
-**Explicitly not a trigger:** `SealIOWaitActive()` (slow DuckDB flush). SealBuffer already blocks producers on hard cap; we act on hard-cap **hit events**, not flush wait state alone.
+**Explicitly not a trigger:** `SealIOWaitActive()` (slow Badger seal flush). SealBuffer already blocks producers on hard cap; we act on hard-cap **hit events**, not flush wait state alone.
 
 **Batch/seal scale-up gate:** `ScaleUpAllowed()` requires host RAM use **below 80%** (yellow zone at 80–90% blocks lease/refill/seal increases only). Worker AIMD is not gated on host memory. Process RSS is sampled but does not trigger memory pressure when the host still has headroom.
 
@@ -384,12 +384,12 @@ Work flows through two coupled stages. Think of them as sequential pub/sub, thou
 ### Stage A — Frontier consumption (DB → workers)
 
 ```
-DuckDB  ──pull──►  pendingBuff  ──lease──►  worker  ──►  FS adapter (ListChildren / copy I/O)
-                      ▲
-                      └── refill when pending ≤ PullLowWM (25% of lease batch)
+Badger (pend:*)  ──pull──►  pendingBuff  ──lease──►  worker  ──►  FS adapter (ListChildren / copy I/O)
+                                ▲
+                                └── refill when pending ≤ PullLowWM (25% of lease batch)
 ```
 
-- The queue **pulls** pending tasks from DuckDB in batches (keyset pagination) into `pendingBuff`.
+- The queue **pulls** pending tasks from Badger in batches (keyset / list APIs) into `pendingBuff`.
 - Workers **lease** one task at a time and call the Sylos-FS adapter.
 - Only one pull runs at a time per queue (`getPulling` / `setPulling`).
 - **SRC** is the primary throughput driver; refill and worker count on SRC matter most for discovery rate.
@@ -400,7 +400,7 @@ DuckDB  ──pull──►  pendingBuff  ──lease──►  worker  ──�
 |--------|----------------|
 | `pendingBuff` often empty, workers idle | Under-feed: pull too slow, refill batch too small, or workers too few |
 | High `InProgress`, low completion rate | FS latency, FS throttle, or stage B back-pressure (workers blocked on seal) |
-| Pull loop slow, workers starved | DB read pressure (`pullKeysetWindowSize`, query cost) |
+| Pull loop slow, workers starved | Ops-store read pressure (`pullKeysetWindowSize`, scan cost) |
 
 ### Stage B — Completion fan-out (workers → DB buffer)
 
@@ -413,7 +413,7 @@ On traversal success (`CompleteTraversalTask`):
 Copy tasks follow a similar shape (status events; fewer discovery writes). See [algorithms.md](./algorithms.md).
 
 ```
-worker completes task  ──►  AppendStatusEvent / AppendDiscoveredNodes  ──►  SealBuffer  ──flush──►  DuckDB
+worker completes task  ──►  AppendStatusEvent / AppendDiscoveredNodes  ──►  SealBuffer  ──flush──►  Badger (opsdb)
 ```
 
 **Existing back-pressure (stage B)**
@@ -497,9 +497,8 @@ Each knob should have **Min**, **Default**, **Max**, and **Current** (runtime). 
 | `SealBuffer.HardCap` | `SealBufferOptions` | 100,000 rows | 5,000 | 100,000 | Producer back-pressure tripwire (not AIMD'd) |
 | `SealBuffer.RowThreshold` | `SealBufferOptions` | 50,000 | 1,000 | 50,000 | Soft flush/drain; autoscaler must not raise this to HardCap |
 | `SealBuffer.FlushInterval` | `SealBufferOptions` | 10s | 1s | 30s | Background flush cadence |
-| `SealBuffer.CheckpointEveryRows` | `SealBufferOptions` | 100,000 | — | — | Periodic checkpoint; DuckDB `checkpoint_threshold` is 2GB so auto-fold does not beat this |
-| DuckDB `memory_limit` | `db.Open` / Settings → Advanced → Performance | auto 4–12 GB from free RAM (override up to 64 GB) | — | host-dependent | Install `duckdb_memory_limit_gb` |
-| DuckDB `threads` | `db.Open` PRAGMA | 4 | 1 | 8 | Hardcoded today |
+| `SealBuffer.CheckpointEveryRows` | `SealBufferOptions` | 100,000 | — | — | Periodic seal checkpoint cadence |
+| Host memory hint | `db.Open` / `MemoryLimitGB` | auto from free RAM when unset | — | host-dependent | Caps Badger-related memory pressure heuristics |
 | `ObserverPollInterval` | `MigrationConfig` | 200ms | 100ms | 2s | Observer EMA / internal metrics sampling (separate from autoscaler tick) |
 | `Autoscaler.Interval` | `AutoscalerConfig` | 3s | 1s | 30s | Decision + actuation tick; probe cooldown = 2× this value |
 | `ProgressTick` | `migration.Config` | 1s | — | — | Console progress only |
@@ -508,10 +507,10 @@ Each knob should have **Min**, **Default**, **Max**, and **Current** (runtime). 
 
 | Constant | Value | Package | Role |
 |----------|-------|---------|------|
-| `pullKeysetWindowSize` | 50,000 | `pkg/db` | SRC/copy/delete/GPL SQL scan window per pull round-trip |
-| `dstPullScanWindow` | 1k–5k (≈2× refill limit) | `pkg/db` | DST traversal keyset subsection; status IN then late id_map/children |
+| `pullKeysetWindowSize` | 50,000 | `pkg/db` | SRC/copy/delete/GPL Badger scan window per pull round-trip |
+| `dstPullScanWindow` | 1k–5k (≈2× refill limit) | `pkg/db` | DST traversal keyset subsection; status then map/children hydrate |
 | `defaultCopyBufferSize` | 64 KiB | `pkg/queue` | Per-worker file copy stream buffer |
-| Log buffer batch | 50,000 / 3s | `pkg/logservice` | Secondary DB write load |
+| Log buffer batch | 50,000 / 3s | `pkg/logservice` | Secondary ops-store write load (`log:*`) |
 
 ---
 
@@ -639,7 +638,7 @@ BackendGroup "s3-prod"              BackendGroup "gcs-dest"
 **Same `BackendGroupID`** → one shared budget, shared FS signals, one throttle narrative.  
 **Different IDs** → independent budgets and autoscaler lanes for FS knobs.
 
-Seal / DuckDB pressure remains **migration-wide** (one DB per run), regardless of backend grouping.
+Seal / Badger ops pressure remains **migration-wide** (one ops store per run), regardless of backend grouping.
 
 ### Resolving the group ID
 
@@ -648,7 +647,7 @@ Two sides share a budget **iff** they resolve to the same `BackendGroupID`. Sugg
 | Source | Use |
 |--------|-----|
 | Explicit `BackendGroupID` on `migration.Service` (host-set) | Preferred — unambiguous |
-| `ConnectionID` from `fs_credential_binding` | Same stored connection → same group |
+| `ConnectionID` from `fsbind:` credential binding | Same stored connection → same group |
 | Provider hints (e.g. Spectra `shared_instance: true`) | Auto-assign one group for both sides |
 | *(fallback)* | Each queue gets its own implicit group (per-adapter / per-side) |
 
@@ -729,7 +728,7 @@ See [Backend grouping](#backend-grouping) for combined vs per-backend budgets.
 
 ## Observer and telemetry
 
-`QueueObserver` (`pkg/queue/observe`) polls **queue memory only** on `ObserverPollInterval` (default **200ms**) and maintains the live API/autoscaler snapshot. It never runs node/status queries on the polling path. Copy/delete denominators are loaded once during phase setup. For historical audit, the observer appends a snapshot to `queue_stats` every **30s** and once at shutdown; live API reads never depend on that table.
+`QueueObserver` (`pkg/queue/observe`) polls **queue memory only** on `ObserverPollInterval` (default **200ms**) and maintains the live API/autoscaler snapshot. It never runs node/status queries on the polling path. Copy/delete denominators are loaded once during phase setup. For historical audit, the observer appends a snapshot under Badger `qstat:*` every **30s** and once at shutdown; live API reads never depend on that history.
 
 ### Published (external) metrics
 
@@ -764,7 +763,7 @@ During seal I/O wait (`SealIOWaitActive`), discovery EMA is held only when no ne
 Also used by watchdogs (not autoscaler triggers):
 
 - `database.SealIOWaitActive()` — progress/stall detection during flush
-- Task errors in `task_errors` (future classification per [fs_error_classification.md](./fs_error_classification.md))
+- Task errors in `taskerr:*` (future classification per [fs_error_classification.md](./fs_error_classification.md))
 
 ### Knob ↔ signal matrix
 

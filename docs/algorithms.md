@@ -7,7 +7,7 @@ For traversal, retry, and copy phases, the engine uses a **Breadth-First Search 
 BFS was chosen because the engine relies on a semi-coupled source–destination traversal model. Level-synchronized processing simplifies:
 
 * Parent/child alignment between source and destination
-* **DB-backed frontier** (batched pulls from DuckDB) with bounded in-memory **lease buffers**, rather than unbounded deep stacks
+* **Badger-backed frontier** (batched pulls from `pend:*`) with bounded in-memory **lease buffers**, rather than unbounded deep stacks
 * Deterministic phase progression
 * Level-based copy execution (folders first, then files)
 
@@ -26,17 +26,17 @@ Both operate in BFS rounds (levels).
 
 ### Root seeding and optional round-0 injection
 
-At **Start discovery** (`AddRoots`), the engine always writes SRC/DST root rows into DuckDB (not earlier). Classic seeding inserts each root as `traversal_status = pending` so workers run **round 0** (`ListChildren` on the root).
+At **Start discovery** (`AddRoots`), the engine always writes SRC/DST root rows into Badger (not earlier). Classic seeding inserts each root with `traversal_status = pending` so workers run **round 0** (`ListChildren` on the root).
 
 When the UI has already reviewed root children (root-pick review), `RootPreparation` is passed into `AddRoots`:
 
-* Prepared side: root is seeded as `traversal_status = successful`, reviewed children are inserted as a **sparse forest** (nested `Children` when the UI visited deeper folders). Included folders without nested children stay `pending` (unrestricted subtree). Partial parents get `src_nodes.include_only` (JSON child service IDs); unchecked siblings are **omitted** (silent), not counted `excluded`.
+* Prepared side: root is seeded as `traversal_status = successful`, reviewed children are inserted as a **sparse forest** (nested `Children` when the UI visited deeper folders). Included folders without nested children stay `pending` (unrestricted subtree). Partial parents get `include_only` on the SRC node record (child service IDs); unchecked siblings are **omitted** (silent), not counted `excluded`.
 * Queues start at `ComputeSourceStartRound` (minimum depth of still-pending included folders), typically 1 for classic depth-1 prep.
 * Unprepared side (for example destination-first with no child review): classic pending root and **round 0**.
 * Destination never excludes; dst-only children get `traversal_status = not_on_src`.
 * Traversal workers honor `include_only` after `ListChildren` (drop non-members before seal).
 
-The `filters-set` phase (between `AddRoots` and `StartTraversal`) remains available for binding a ruleset snapshot. Filter **evaluation** runs after discovery in path review (SQL over DuckDB), not during BFS. Full-tree counted excludes happen in awaiting-traversal-review via exclude-by-search / manual exclude.
+The `filters-set` phase (between `AddRoots` and `StartTraversal`) remains available for binding a ruleset snapshot. Filter **evaluation** runs after discovery in path review (Go matchers over Badger indexes / status walks), not during BFS. Full-tree counted excludes happen in awaiting-traversal-review via exclude-by-search / manual exclude.
 
 ---
 

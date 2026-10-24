@@ -1,8 +1,8 @@
 # Migration Engine integration tests
 
-Heavy **scenario** tests (Spectra, real queues, DuckDB on disk). They are **`package main`** runners under **`pkg/tests/traversal/`** and **`pkg/tests/copy/`**, not `go test` packages—run them with **`go run`** or the shell/PowerShell scripts next to each scenario.
+Heavy **scenario** tests (Spectra, real queues, Badger ops dirs on disk). They are **`package main`** runners under **`pkg/tests/traversal/`** and **`pkg/tests/copy/`**, not `go test` packages—run them with **`go run`** or the shell/PowerShell scripts next to each scenario.
 
-Scenario databases use **plaintext** DuckDB files (`EncryptionKey == nil` in `db.Open`) and plaintext `oauth_credentials` rows (`tokenEncryptionKey == nil` in `GetMigration`). Production API opens pass a per-migration token key to encrypt OAuth credentials at rest inside each migration DB.
+Scenario ops stores use **unencrypted** Badger dirs (`EncryptionKey` unused for Badger open) and plaintext `oauth:` rows when `tokenEncryptionKey == nil` in `GetMigration`. Production API opens pass a per-migration token key to encrypt OAuth credentials at rest inside each migration ops store.
 
 Do **not** rely on `go test ./...` for these; use the scripts when you want full validation.
 
@@ -51,7 +51,7 @@ Point Sylos SRC at `~/sylos_dual_tree_test/A` and DST at `~/sylos_dual_tree_test
 ## Shared utilities (`traversal/shared`, `copy/shared`)
 
 - Build **`migration.Config`** with Spectra adapters, worker counts, log address, verification options.
-- **`SetupTest`**-style helpers control whether to wipe Spectra DB and migration DuckDB before a run (see each `setup.go`).
+- **`SetupTest`**-style helpers control whether to wipe Spectra state and the migration **ops dir** (`{id}.ops/`) before a run (see each `setup.go`).
 
 ---
 
@@ -64,8 +64,8 @@ Point Sylos SRC at `~/sylos_dual_tree_test/A` and DST at `~/sylos_dual_tree_test
 | **`traversal/autoscaler_throttle`** | Ephemeral Spectra with chaos rate limits **and auth tokens**; asserts autoscaler worker step-down under throttle. Run: `./pkg/tests/traversal/autoscaler_throttle/run.sh` |
 | **`traversal/local`** | Local-oriented entry (see `main.go`). |
 | **`traversal/resumption`** | **`StartMigration`**, interrupt, then **`LetsMigrate`** again with `-resume` (see script + `main.go`). |
-| **`traversal/retry_sweep`** | Full migration, then mark-for-retry / subtree / **`RunRetrySweep`** (engine retry sweep)—uses **DuckDB** tables and status events. |
-| **`copy/normal`**, **`copy/local`** | Copy-phase exercises after a traversal DB exists. |
+| **`traversal/retry_sweep`** | Full migration, then mark-for-retry / subtree / **`RunRetrySweep`** (engine retry sweep)—uses Badger status overlay + frontier. |
+| **`copy/normal`**, **`copy/local`** | Copy-phase exercises after a traversal ops store exists. |
 | **`copy/scale_down_resume`** | Spectra chaos 429s + AIMD scale-down during copy; asserts no duplicate copy success events and no `already_existed` on attempt-marked nodes. Run: `./pkg/tests/copy/scale_down_resume/run.sh` |
 | **`delete/local`** | Full pipeline traversal → copy → delete; asserts source tree empty. |
 
@@ -88,11 +88,11 @@ Windows: use the matching **`.ps1`** files in the same folders.
 ## Troubleshooting
 
 - Ensure **`pkg/configs/spectra.json`** (or ephemeral variant under `traversal/shared/`) matches your Spectra instance.
-- Remove stale **`*.db` / `*.yaml`** artifacts under `pkg/tests` if a scenario expects a clean start (see per-test cleanup scripts).
+- Remove stale **`*.ops/`**, **`*.db`**, or **`*.yaml`** artifacts under `pkg/tests` if a scenario expects a clean start (see per-test cleanup scripts).
 - If resumption does not suspend, adjust timing in **`run_resumption_test.ps1`** so SIGINT arrives before traversal finishes.
 
 ---
 
 ## Outdated terminology
 
-Older docs sometimes referred to “level-sharded” buckets and join tables **outside** DuckDB. The engine stores state in **DuckDB** (`src_nodes`, `dst_nodes`, **`src_status_events`**, **`dst_status_events`**, stats tables). When reading older notes, map them to these tables and **`pkg/db/README.md`**.
+Older notes may mention DuckDB tables (`src_nodes`, `src_status_events`, …) or “level-sharded” buckets outside the DB. Current SoT is **Badger** under `{id}.ops/` (`node:`, `st:`, `pend:`, `idx:`, …). Map old table names to **`pkg/db/README.md`** / **`pkg/opsdb`**.

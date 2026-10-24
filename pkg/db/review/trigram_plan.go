@@ -91,16 +91,39 @@ func bestContainsNeedle(needles []string) string {
 }
 
 func planTrigramContains(ops *opsdb.Store, side string, f ReviewFilter, scanLimit int) (plannerPlan, bool, error) {
-	needle := bestContainsNeedle(containsNeedlesFromFilter(f))
-	if needle == "" {
+	needles := containsNeedlesFromFilter(f)
+	if len(needles) == 0 {
 		return plannerPlan{}, false, nil
 	}
-	if len(opsdb.ExtractTrigrams(needle)) == 0 {
-		return plannerPlan{}, false, nil
+	// Union posting lists across every name-contains needle. Picking only the
+	// longest needle drops OR arms (e.g. file || directory misses depth-1 files
+	// whose display path never mentions "directory"). CompiledFilter / Query
+	// still decide the boolean result after verify.
+	seen := map[string]struct{}{}
+	var ids []string
+	anyNeedle := false
+	for _, needle := range needles {
+		if len(opsdb.ExtractTrigrams(needle)) == 0 {
+			continue
+		}
+		anyNeedle = true
+		hit, err := ops.ScanTrigramIntersect(side, needle, scanLimit)
+		if err != nil {
+			return plannerPlan{}, false, err
+		}
+		for _, id := range hit {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+			if len(ids) >= scanLimit {
+				return plannerPlan{kind: "tri", ids: ids, est: int64(len(ids)), reason: "trigram_contains"}, true, nil
+			}
+		}
 	}
-	ids, err := ops.ScanTrigramIntersect(side, needle, scanLimit)
-	if err != nil {
-		return plannerPlan{}, false, err
+	if !anyNeedle {
+		return plannerPlan{}, false, nil
 	}
 	if len(ids) == 0 {
 		return plannerPlan{kind: "tri", ids: nil, est: 0, reason: "trigram_empty"}, true, nil
@@ -108,17 +131,26 @@ func planTrigramContains(ops *opsdb.Store, side string, f ReviewFilter, scanLimi
 	return plannerPlan{kind: "tri", ids: ids, est: int64(len(ids)), reason: "trigram_contains"}, true, nil
 }
 
-// nodePassesTrigramVerify rejects false positives from the planning needle's intersect.
+// nodePassesTrigramVerify rejects false positives from trigram candidate generation.
+// A node passes when name or display path contains any planned needle (OR of arms).
 func nodePassesTrigramVerify(n opsdb.NodeRecord, f ReviewFilter) bool {
-	needle := bestContainsNeedle(containsNeedlesFromFilter(f))
-	if needle == "" {
+	needles := containsNeedlesFromFilter(f)
+	if len(needles) == 0 {
 		return true
 	}
-	needle = strings.ToLower(strings.TrimSpace(needle))
 	name := strings.ToLower(n.Name)
 	path := strings.ToLower(n.DisplayPath)
 	if path == "" {
 		path = strings.ToLower(n.Path)
 	}
-	return strings.Contains(name, needle) || strings.Contains(path, needle)
+	for _, needle := range needles {
+		needle = strings.ToLower(strings.TrimSpace(needle))
+		if needle == "" {
+			continue
+		}
+		if strings.Contains(name, needle) || strings.Contains(path, needle) {
+			return true
+		}
+	}
+	return false
 }

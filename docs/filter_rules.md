@@ -4,16 +4,16 @@ Composable exclusion predicates over the **discovered** SRC inventory. Rules do 
 
 See also: [item_statuses.md](./item_statuses.md), [algorithms.md](./algorithms.md), [search_indexes.md](./search_indexes.md), [pkg/db/README.md](../pkg/db/README.md). Search path rules are not boolean path contains; they are lifted into ordered path segments.
 
-Prep-time root include uses `src_nodes.include_only` allowlists and omits unchecked siblings (not counted in excluded stats). Local FS adapters also omit `.DS_Store` and `Thumbs.db` at `ListChildren` (never enter DuckDB).
+Prep-time root include uses SRC node `include_only` allowlists and omits unchecked siblings (not counted in excluded stats). Local FS adapters also omit `.DS_Store` and `Thumbs.db` at `ListChildren` (never enter the ops store).
 
 ## Phase and wiring
 
 1. Traversal discovers the full SRC tree (display paths stamped at seal time).
 2. In awaiting-traversal-review, the user searches with optional flat conditions and/or a ruleset predicate.
-3. Preview uses the same SQL as apply. Apply is `POST .../exclude` with `{ search: <SearchRequest>, except: [] }` (flat conditions and/or ruleset). Unexclude-by-search uses the same body on `POST .../unexclude`.
+3. Preview uses the same Go evaluation path as apply (Badger indexes + status walks). Apply is `POST .../exclude` with `{ search: <SearchRequest>, except: [] }` (flat conditions and/or ruleset). Unexclude-by-search uses the same body on `POST .../unexclude`.
 4. Nothing auto-applies at `SetRoot` or traversal start.
 
-Implementation: `pkg/filter/` (`Compile`, `EvaluateDetermining`), `pkg/db/filterapply/` (bulk exclude mutation), Sylos-API exclude-by-search.
+Implementation: `pkg/filter/` (`Compile`, `EvaluateDetermining`), `pkg/db/filterapply/` / review ops (bulk exclude mutation), Sylos-API exclude-by-search.
 
 ## Ruleset schema (v1)
 
@@ -24,7 +24,7 @@ Unchanged structurally: `Ruleset` → `root_group` (`AND`/`OR`, optional `negate
 | Field | Notes |
 |-------|--------|
 | `size` | Bytes (files) |
-| `mtime` | `TRY_CAST` in SQL; unparseable node mtime does not match |
+| `mtime` | Parsed in Go; unparseable node mtime does not match |
 | `name` / `path` | Basename / `display_path` |
 | `extension` / `mimetype_category` | Derived from name; category CASE generated from `extensionCategory` |
 | `depth` | Under migration root |
@@ -44,7 +44,7 @@ Strings: `glob`, `regex`, `contains`.
 
 Rulesets are **exclusion** predicates: when the root group **Passes**, the node matches (would be / is excluded on apply). Compile with `filter.Compile` and evaluate in Go (`EvaluateDetermining`). Three-valued leaves (pass / fail / skip) combine with AND/OR/negate the same way the former Go evaluator did.
 
-`POST /api/rulesets/evaluate` seeds an ephemeral DuckDB and runs the annotation SELECT so browse / examples / preview share one compiler with apply.
+`POST /api/rulesets/evaluate` compiles the ruleset and evaluates sample nodes in Go so browse / examples / preview share one compiler with apply.
 
 ## display_path
 
@@ -63,11 +63,11 @@ Traversal status is unchanged. Folders stay discovered.
 
 ## Provenance
 
-- `filter_applications`: criteria JSON, applied_at, matched/excluded counts
-- `src_status_events` / `src_current`: `exclusion_source`, `determining_rule_id`
+- `filtapp:{id}`: criteria JSON, applied_at, matched/excluded counts
+- Status overlay (`st:*`): `exclusion_source`, `determining_rule_id`
 - Manual excludes use `exclusion_source = manual`
 
-Path review enriches nodes with `ruleExclusion` from these columns (not `rule_evaluation_events`).
+Path review enriches nodes with `ruleExclusion` from these fields (not a separate evaluation-events table).
 
 ## Manual exclude vs filter exclude vs root pick
 

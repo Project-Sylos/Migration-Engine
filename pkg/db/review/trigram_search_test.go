@@ -93,3 +93,96 @@ func TestTrigramPlanRulesetContains(t *testing.T) {
 		t.Fatalf("rows=%+v", rows)
 	}
 }
+
+
+func TestTrigramPlanORNameContainsUnionsNeedles(t *testing.T) {
+	dir := t.TempDir()
+	database, err := db.Open(db.Options{Path: filepath.Join(dir, "m.db"), OpsDir: filepath.Join(dir, "m.ops")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ops := database.Ops()
+
+	writes := []opsdb.SealNodeWrite{
+		{
+			Side: opsdb.SideSRC,
+			Node: opsdb.NodeRecord{
+				ID: "depth1-file", Path: "/id-file1", DisplayPath: "/file_1.txt",
+				Name: "file_1.txt", Type: opsdb.NodeTypeFile, Size: 1, Depth: 1,
+			},
+			Status:     opsdb.StatusRecord{TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending},
+			InsertOnly: true,
+		},
+		{
+			Side: opsdb.SideSRC,
+			Node: opsdb.NodeRecord{
+				ID: "dir1", Path: "/id-dir1", DisplayPath: "/Example Directory 1",
+				Name: "Example Directory 1", Type: opsdb.NodeTypeFolder, Size: 0, Depth: 1,
+			},
+			Status:     opsdb.StatusRecord{TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending},
+			InsertOnly: true,
+		},
+		{
+			Side: opsdb.SideSRC,
+			Node: opsdb.NodeRecord{
+				ID: "nested-file", Path: "/id-dir1/id-nf", DisplayPath: "/Example Directory 1/file_2.txt",
+				Name: "file_2.txt", Type: opsdb.NodeTypeFile, Size: 1, Depth: 2,
+			},
+			Status:     opsdb.StatusRecord{TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending},
+			InsertOnly: true,
+		},
+	}
+	if _, err := ops.WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	rs := filter.Ruleset{
+		SchemaVersion: filter.SchemaVersion,
+		RootGroup: filter.Group{Op: filter.OpOR, Children: []filter.Child{
+			{Condition: &filter.Condition{
+				ID: "a", Field: filter.FieldName, Operator: filter.OpContains, Value: []any{"file"},
+				AppliesTo: filter.AppliesBoth,
+			}},
+			{Condition: &filter.Condition{
+				ID: "b", Field: filter.FieldName, Operator: filter.OpContains, Value: []any{"directory"},
+				AppliesTo: filter.AppliesBoth,
+			}},
+		}},
+	}
+	compiled, err := filter.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := ReviewFilter{CompiledFilter: compiled, ExcludeRoot: true}
+	plan, err := planReviewCandidateIDs(ops, opsdb.SideSRC, f, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.kind != "tri" {
+		t.Fatalf("want trigram plan, got %+v", plan)
+	}
+	got := map[string]bool{}
+	for _, id := range plan.ids {
+		got[id] = true
+	}
+	for _, id := range []string{"depth1-file", "dir1", "nested-file"} {
+		if !got[id] {
+			t.Fatalf("OR trigram plan missing %s; ids=%v", id, plan.ids)
+		}
+	}
+
+	rows, _, err := ListMergedReviewDiffsPage(database, f, "path ASC", 20, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]bool{}
+	for _, r := range rows {
+		byID[r.SrcNodeID] = true
+	}
+	for _, id := range []string{"depth1-file", "dir1", "nested-file"} {
+		if !byID[id] {
+			t.Fatalf("OR search missing %s; rows=%+v", id, rows)
+		}
+	}
+}

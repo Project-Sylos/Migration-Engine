@@ -53,6 +53,10 @@ func Open(opts Options) (*Store, error) {
 		return nil, fmt.Errorf("opsdb open: %w", err)
 	}
 	s := &Store{dir: opts.Dir, db: db}
+	if err := s.EnsureSchemaVersion(); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
 	if err := s.EnsureTriIndexV1(); err != nil {
 		_ = s.Close()
 		return nil, fmt.Errorf("opsdb trigram index: %w", err)

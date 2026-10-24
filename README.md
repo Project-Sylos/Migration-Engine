@@ -22,7 +22,7 @@ Each traversal operation is isolated into discrete, non-recursive **tasks** so t
    This keeps each task stateless and lightweight.
 
 3. **Record Results**
-   Children that pass filtering are written through the database layer: the queue **pulls pending work from DuckDB** in batches (keyset by depth/status), workers lease from an in-memory buffer, and **seal** persists completed levels in bulk. The database (including append-only **status events**) is the source of truth for resume.
+   Children that pass filtering are written through the Badger ops store (`pkg/opsdb` via `pkg/db`): the queue **pulls pending work from Badger** (`pend:*` + status) in batches into an in-memory **`pendingBuff`**, workers lease from that buffer, and **seal** persists completed work in bulk. Badger is the source of truth for resume (frontier, status overlay, tree, stats, telemetry).
 
 ---
 
@@ -30,7 +30,7 @@ Each traversal operation is isolated into discrete, non-recursive **tasks** so t
 
 Depth-First Search (DFS) is memory-efficient, but it's less suited to managing two trees in parallel.
 BFS, while it requires storing all nodes at the current level, provides better control, checkpointing, and fault recovery.
-The Migration Engine serializes traversal data to the database at each round boundary (seal: bulk append of the completed level and stats snapshot), keeping memory use bounded while preserving full traversal context.
+The Migration Engine serializes traversal data to the ops store at each round boundary (seal: bulk status/frontier updates and stats), keeping memory use bounded while preserving full traversal context.
 
 ### Two Possible Strategies
 
@@ -48,11 +48,11 @@ The Migration Engine serializes traversal data to the database at each round bou
 * Source and destination are traversed **in rounds**.
 * **Round 0**: traverse the source root and list its children.
 * **Round 1**: traverse those children; destination traversal remains coordinated behind the source.
-* The destination queue is gated by the `QueueCoordinator`: it may start round *N* only after the source has completed rounds *N* and *N+1* (or source traversal is finished). The source queue has no coordinator pacing cap; frontier work is streamed to the database in batches, so the source can advance as fast as workers allow.
+* The destination queue is gated by the `QueueCoordinator`: it may start round *N* only after the source has completed rounds *N* and *N+1* (or source traversal is finished). The source queue has no coordinator pacing cap; frontier work is streamed to Badger in batches, so the source can advance as fast as workers allow.
 * When the destination processes its corresponding level, it compares existing nodes against the expected list from the source.
 * Extra items in the destination are logged but not traversed further.
 * The destination runs as fast as the gate allows; the source is not artificially held back to match destination speed.
-* Because each round is sealed to the database (nodes and per-depth stats), the system can resume after a crash; on resume, queues restore round/cursors and **pull** pending work from the DB again.
+* Because each round is sealed to Badger (nodes, status, per-depth stats), the system can resume after a crash; on resume, queues restore round/cursors and **pull** pending work from the ops store again.
 * This maximizes both safety and throughput.
 
 ---
@@ -70,9 +70,9 @@ This design gives users complete visibility and control before any data movement
 
 ## Migration state and YAML
 
-**This repository’s `migration` package does not expose YAML save/load helpers** (no `SaveMigrationConfig` / `LoadMigrationConfigFromYAML` in the current API).  
+**This repository’s `migration` package does not expose YAML save/load helpers** (no `SaveMigrationConfig` / `LoadMigrationConfigFromYAML` in the current API).
 
-- **Resume** is driven by **DuckDB** contents (nodes, status events, stats) plus how the host calls **`LetsMigrate`**, **`MigrationManager`**, and domain methods (`StartTraversal`, retry sweep, copy, …).  
+- **Resume** is driven by the **Badger ops store** (nodes, status overlay, frontier, stats, meta) plus how the host calls **`LetsMigrate`**, **`MigrationManager`**, and domain methods (`StartTraversal`, retry sweep, copy, …).
 - A **Sylos API** or other host may persist its own runtime fields (`startedAt`, `completedAt`, etc.); that is outside this module.
 
 See **`pkg/migration/README.md`** for the real entry points and manager lifecycle.
@@ -81,37 +81,41 @@ See **`pkg/migration/README.md`** for the real entry points and manager lifecycl
 
 ## Database architecture
 
-The engine uses **DuckDB**. Each migration has its own file at `{migrationDir}/{id}.db`. Standalone runs (`LetsMigrate`, tests) pass `DatabaseConfig.Path` pointing at that file; the engine derives folder and id from the path.
+The engine uses **Badger** for per-migration operational state. On disk:
 
-Implementation: **`pkg/db`**. Queue and migration share the same **`*db.DB`** for a given run.
+| Path | Role |
+|------|------|
+| `{migrationDir}/{id}.ops/` | Badger ops directory (source of truth) |
+| `{migrationDir}/{id}.db` | Logical path / optional marker (historical name; not a DuckDB catalog) |
 
-### Tables and roles
+Standalone runs (`LetsMigrate`, tests) pass `DatabaseConfig.Path` as the logical `{dir}/{id}.db` path; the engine opens Badger at `MigrationOpsPath(Path)` (`{id}.ops/`). Implementation: **`pkg/db`** + **`pkg/opsdb`**. Queue and migration share the same **`*db.DB`** (Badger handle) for a given run.
 
-- **Node tables** (`src_nodes`, `dst_nodes`) – Metadata (path, depth, type, size, `name`, …). **Current traversal/copy status** comes from append-only **`src_status_events`** / **`dst_status_events`** (latest event per node), not from long-lived columns on the node row. SRC also stores `xfer_*` checkpoint columns and `gpl_state`.
-- **Stats** – `src_stats` / `dst_stats` per depth; global **`stats`** table for canonical review counters and similar key/value aggregates.
-- **`gpl_issues`** – Sparse path-review / GPL issue queue (status, proposed name, optional `dst_action`).
-- **`id_map`** – Append-only SRC↔DST identity mappings.
-- **`migrations`** – Lifecycle row (id, name, **phase**, JSON metadata) when using **`MigrationManager`**.
-- **`fs_credential_binding`** – Up to two rows (`source` / `destination`): stable **connection id**, optional **relative path** to a creds/config file under the migration directory (e.g. `spectra-config.json`), **service id**, and **serialized root folder** JSON so adapters can be rebuilt after restart.
-- **`oauth_credentials`** – OAuth refresh material keyed by connection id (plaintext in tests; `enc:v1:` when a token key is set).
-- **Other** – `logs`, `queue_stats`, `task_errors`.
+### Key families (see `pkg/db/README.md`)
 
-**Security:** Treat migration DuckDB files and backups as sensitive. Hosts such as Sylos-API typically encrypt the file at rest with a per-migration key; optional field-level sealing of `oauth_credentials` uses a 32-byte token key passed into the manager.
+- **Catalog** – `node:src|dst:{id}`, tree edges (`child:`, `kids:`), SRC↔DST maps (`map:`).
+- **Status overlay** – phase-split `st:trav|copy|del:src|dst:{id}` (hot path); legacy `st:{side}:{id}` read fallback.
+- **Frontier** – `pend:src|dst:{trav|copy|del}:{depth}:{type}:{id}` plus schedule counts.
+- **Secondary indexes** – `idx:path`, `idx:name`, `idx:size`, `idx:mtime`, `idx:seg`, `idx:tri` for review search.
+- **Meta** – `meta:schema_version` (permanent layout version, currently `0.1`), `meta:tri_index_v1`, `mig:`, `oauth:`, `fsbind:`.
+- **Review / GPL** – `gpl:`, `filtapp:`, review counters under `stat:`.
+- **Telemetry** – `log:`, `op:`, `qstat:`, `taskerr:`.
 
-The queue **pulls** pending tasks via SQL (keyset pagination); **seal** (`SealLevel`, optionally via **SealBuffer**) bulk-writes completed levels. **Retry** mode uses DST cleanup paths documented in **`pkg/queue/README.md`** (and `AddNodeDeletions` where applicable).
+**Security:** Treat migration ops directories and backups as sensitive. Hosts such as Sylos-API may encrypt or restrict access; optional field-level sealing of OAuth payloads uses a 32-byte token key passed into the manager when configured.
 
-All reads and writes use a **single SQL connection** per open `*db.DB`.
+The queue **pulls** pending tasks via Badger keyset/list APIs; **seal** (`WriteSealBatchTrusted` via `SealBuffer`) bulk-writes completions. **Retry** mode uses DST cleanup paths documented in **`pkg/queue/README.md`**.
 
-See **`pkg/db/README.md`** for schema and APIs.
+There is **no per-migration DuckDB catalog** and no per-task SQL on the hot path.
+
+See **`pkg/db/README.md`** and **`docs/search_indexes.md`** for layout and APIs.
 
 ---
 
 ## Lifecycle and database ownership
 
-- **`LetsMigrate`** builds a **`MigrationManager`**, **`CreateMigration`**, optionally seeds roots, runs **`StartTraversal`**, then verification. It opens/closes DBs through the manager for that call path.
+- **`LetsMigrate`** builds a **`MigrationManager`**, **`CreateMigration`**, optionally seeds roots, runs **`StartTraversal`**, then verification. It opens/closes ops stores through the manager for that call path.
 - **`SetupDatabase`**, **`GetMigration`**, and domain **`Migration`** methods are used when the host keeps long-lived migrations (e.g. API with per-migration folders).
 - **`MigrationController`** (`StartMigration`) only provides **`Shutdown`**, **`Done`**, and **`Wait`**—there is no **`GetDB()`** on the controller in this package.
-- **Checkpointing** is handled inside **`pkg/db`** (serialized with the single connection).
+- **Checkpointing / seal flush** is handled inside **`pkg/db`** / **`pkg/opsdb`**.
 
 See **`pkg/migration/README.md`** for **`PreparePhase`** (`PreparePhaseRetrySweep` / `PreparePhaseCopyRetry` / `PreparePhaseDeleteRetry`) when enqueueing background retry work so phase flips **before** HTTP **202**.
 
@@ -121,12 +125,13 @@ See **`pkg/migration/README.md`** for **`PreparePhase`** (`PreparePhaseRetrySwee
 
 | Package       | Role |
 |---------------|------|
-| **pkg/db**    | Database layer: open/close, schema (node/stats/logs tables), seal (bulk append + stats), read queries. Single DuckDB file and connection. |
-| **pkg/queue** | Queue layer: BFS rounds, **DB-backed pull** into `pendingBuff`, seal via `SealLevel`, coordinator, observer. Uses `*db.DB` for pulls, seal, and resume. |
+| **pkg/db**    | Persistence facade: open/close Badger ops (`OpsDir`), seal buffer, review/search, subtree mutations. |
+| **pkg/opsdb** | Badger key layout, pull/list/seal primitives, schema version, indexes. |
+| **pkg/queue** | Queue layer: BFS rounds, **Badger-backed pull** into `pendingBuff`, seal via seal buffer, coordinator, observer. |
 | **pkg/scaling** | Autoscaler: AIMD actuation from observer metrics; `QueueActuator` implemented by `*queue.Queue` (queue does not import scaling). |
 | **pkg/migration** | Orchestration: **`MigrationManager`**, domain **`Migration`**, root seeding, traversal/copy/retry APIs, verification. No YAML helpers in-tree. |
 | **pkg/configs**   | JSON config loaders: buffer config, log service (UDP), Spectra. |
-| **pkg/logservice** | Dual-channel logging: UDP (level-filtered) and persistence to the main DB’s `logs` table via `db.LogBuffer`. |
+| **pkg/logservice** | Dual-channel logging: UDP (level-filtered) and persistence to Badger `log:*` via `db.LogBuffer`. |
 
 ---
 
@@ -134,16 +139,19 @@ See **`pkg/migration/README.md`** for **`PreparePhase`** (`PreparePhaseRetrySwee
 
 ### Design docs (`docs/`)
 
+- **[docs/ops_store_overview.md](./docs/ops_store_overview.md)** – Intro: how Badger is used in write-heavy vs review/search/filter phases.
 - **[docs/algorithms.md](./docs/algorithms.md)** – BFS traversal/copy/delete algorithms, streaming copy contract.
 - **[docs/autoscaler.md](./docs/autoscaler.md)** – Observer → AIMD loop, profiles, knobs, stall vs throttle.
 - **[docs/item_statuses.md](./docs/item_statuses.md)** – Traversal / copy / delete status semantics.
 - **[docs/fs_error_classification.md](./docs/fs_error_classification.md)** – Retry vs throttle axes, ambiguous errors.
+- **[docs/search_indexes.md](./docs/search_indexes.md)** – Path-segment and trigram review indexes.
+- **[docs/filter_rules.md](./docs/filter_rules.md)** – Ruleset exclude predicates over discovered SRC inventory.
 
 ### Package READMEs
 
 - **[pkg/migration/README.md](./pkg/migration/README.md)** – Entry points, manager lifecycle, retry sweep.
 - **[pkg/queue/README.md](./pkg/queue/README.md)** – Pull / lease / seal, coordinator, watchdogs, checkpoints.
-- **[pkg/db/README.md](./pkg/db/README.md)** – Schema, SealBuffer, status events, Writer.
+- **[pkg/db/README.md](./pkg/db/README.md)** – Badger key layout, SealBuffer, open/schema version.
 - **[pkg/scaling/README.md](./pkg/scaling/README.md)** – Autoscaler, AIMD, operation profiles, QueueActuator.
 - **[pkg/configs/README.md](./pkg/configs/README.md)** – JSON loaders (buffer, log service, Spectra).
 - **[pkg/logservice/README.md](./pkg/logservice/README.md)** – UDP and DB logging.
@@ -156,10 +164,8 @@ See **`pkg/migration/README.md`** for **`PreparePhase`** (`PreparePhaseRetrySwee
 **Package tests** (when present):
 
 ```bash
-go test ./pkg/db ./pkg/migration ./pkg/queue
+go test ./pkg/db ./pkg/opsdb ./pkg/migration ./pkg/queue
 ```
-
-These packages may compile with **no `_test.go` files** in some checkouts; the command still verifies the modules build. Add focused tests here when you extend the engine.
 
 **Heavy E2E / integration tests** (run only when doing full validation; they are resource-heavy and can stress the system):
 

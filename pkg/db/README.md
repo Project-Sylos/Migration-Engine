@@ -1,6 +1,8 @@
 # db Package
 
-The **db** package is the persistence layer for the Migration Engine. The per-migration store is **Badger-only** (`{migration-id}.ops/`, package **`pkg/opsdb`**). Sylos-API uses a separate Badger store (`sylos.api/`) for users/auth/install config.
+The **db** package is the persistence layer for the Migration Engine. The per-migration store is **Badger-only** (`{migrationDir}/{id}.ops/`, package **`pkg/opsdb`**). The logical path `{id}.db` is a historical marker name only (not a DuckDB file). Sylos-API uses a separate Badger store (`sylos.api/`) for users/auth/install config.
+
+**New here?** Start with the intro tour: [docs/ops_store_overview.md](../../docs/ops_store_overview.md) (write-heavy phases vs review/search/filters, seal buffer, light schema map).
 
 Seal writes go to Badger via **`badger_seal.go`**. Node catalog metadata, frontier, status, secondary indexes, GPL issues, filter provenance, and migration/oauth/FS-binding rows all live in Badger. Path-review mutations (exclude, delete skip/unskip, mark-for-retry) write sealed `st:*` + `pend:*` via `idx:path` prefix scans; there is no overlay staging table. Review search uses a small cardinality-based planner over `idx:*` keys plus Go post-filters (`pkg/db/review/planner.go`, `filter_eval.go`).
 
@@ -24,6 +26,7 @@ Seal writes go to Badger via **`badger_seal.go`**. Node catalog metadata, fronti
 | `idx:mtime:{side}:{u64be}\x00{id}` | MTime index |
 | `idx:seg:{side}:{token}\x00{id}` | Path/name segment postings (whole token) |
 | `idx:tri:{side}:{gram}\x00{id}` | Trigram postings for name contains (per segment + name; written on SRC/DST insert). Path search uses `idx:seg` instead. See [docs/search_indexes.md](../../docs/search_indexes.md). |
+| `meta:schema_version` | Permanent ops layout version (`0.1` until post-launch bumps); stamped on open if missing, reject unknown |
 | `meta:tri_index_v1` | Flag that trigram indexes exist (backfill on open if missing) |
 | `gpl:{src_id}`, `gplst:{status}:{src_id}` | Sparse GPL issues |
 | `filtapp:{id}` | Filter application provenance |
@@ -37,7 +40,7 @@ Seal writes go to Badger via **`badger_seal.go`**. Node catalog metadata, fronti
 
 ## Open / phases
 
-- **`Open`** opens Badger at `OpsDir` (default `MigrationOpsPath(Path)`), then ensures `meta:tri_index_v1` (one-shot rebuild of secondary indexes for older stores).
+- **`Open`** opens Badger at `OpsDir` (default `MigrationOpsPath(Path)`), ensures `meta:schema_version` (stamp `0.1` if missing; fail on unsupported), then ensures `meta:tri_index_v1` (one-shot rebuild of secondary indexes for older stores).
 - **`BeginTraversalPhase` / `EndTraversalPhase`** flush the seal buffer only. Secondary indexes are written on catalog node insert (SRC traversal and DST copy), not at round/phase end.
 
 ### Seal flush (trusted batch)

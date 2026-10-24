@@ -121,7 +121,9 @@ func TestFoldAssignNotAddOnReplay(t *testing.T) {
 	if err := s.AddPending(SideSRC, PhaseTrav, 1, NodeTypeFolder, "a"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.writeSealedDepth(SideSRC, 2); err != nil {
+	if err := s.update(func(txn *badger.Txn) error {
+		return txn.Set(foldSealedDepthKey(SideSRC), []byte("2"))
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.FoldChildSizes(SideSRC, FoldKindTrav, FoldHooks{}); err != nil {
@@ -153,7 +155,9 @@ func TestFoldResumeUsesPersistedNext(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.writeSealedDepth(SideSRC, 1); err != nil {
+	if err := s.update(func(txn *badger.Txn) error {
+		return txn.Set(foldSealedDepthKey(SideSRC), []byte("1"))
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.FoldChildSizes(SideSRC, FoldKindTrav, FoldHooks{}); err != nil {

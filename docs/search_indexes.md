@@ -54,13 +54,13 @@ If the first part cannot use the segment index, the planner may still use a trig
 
 **What is stored.** Overlapping 3-character slices of the node name and of each path part, lowercased, unique. Slices do not cross `/`, so a gram never straddles a folder boundary. Strings shorter than 3 characters are padded with spaces on the edges so they still have one gram. Display path is used when it is set, otherwise the storage path.
 
-**What a search asks for.** A name substring: the basic name query, or a ruleset name `contains` / `eq` leaf. The longest such needle is the one that is planned. Path rules are not trigram needles. Wildcards are skipped. A needle with no grams is not planned this way.
+**What a search asks for.** A name substring: the basic name query, or ruleset name `contains` / `eq` leaves. Every such needle is planned; candidate ids are the union of each needle's trigram intersect. Path rules are not trigram needles. Wildcards are skipped. A needle with no grams is skipped. Verify accepts a node when name or display path contains any planned needle; the compiled ruleset (or simple Query) still applies after that.
 
 **How a hit is found.**
 
 1. Split the needle into the same kind of grams the index stores.
 2. Load each gram's posting list. Intersect them smallest-list-first. If any gram has no posts, the answer is empty. An id must appear under every gram to survive.
-3. Do not trust the intersect. Grams can all be present without forming the contiguous needle (they may even come from different path parts). Survivors are checked with a case-insensitive contains on the name or the display path. That verify is what makes a trigram hit a real match.
+3. Do not trust the intersect. Grams can all be present without forming the contiguous needle (they may even come from different path parts). Survivors are checked with a case-insensitive contains on the name or the display path against any planned needle. That verify is what makes a trigram hit a real match before the full filter runs.
 
 Trigrams are a candidate generator for "this name contains …", not a path-layout index. A needle of length 1 or 2 still works because of the padding, but it is a wide posting list and a weak plan compared with a longer needle.
 

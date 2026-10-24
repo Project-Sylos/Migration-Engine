@@ -2,13 +2,13 @@
 
 The queue layer drives **source** and **destination** traversal and **copy** using **`pkg/db`**. Two queues (`src` and `dst`, plus `copy` in copy mode) perform breadth-first work in **rounds** (depth). The destination is gated by **`QueueCoordinator`**.  
 
-**Frontier today is database-backed:** pending work is **pulled from DuckDB** in batches (~10k rows, ID keyset pagination) into an in-memory **`pendingBuff`**; workers **lease** tasks from that buffer. Completed work is flushed via **`db.SealLevel`** (optionally through **`SealBuffer`** for async seal). There is **no** separate `NodeCache` / `LevelCache` source file—the model is “DB + pending buffer + seal,” not a pure memory-first level cache.
+**Frontier today is Badger-backed:** pending work is **pulled from `pend:*` (+ batched status/node prefetch)** into an in-memory **`pendingBuff`**; workers **lease** tasks from that buffer. Completed work is flushed via the seal buffer (`WriteSealBatchTrusted` / `opsdb`). There is **no** separate `NodeCache` / `LevelCache` source file—the model is “ops store + pending buffer + seal,” not a pure memory-first level cache.
 
 ---
 
 ## High-level flow
 
-1. **Pull** – `PullTraversalTasks` / `PullRetryTasks` / `PullCopyTasks` refill `pendingBuff` from SQL (`ListNodesByDepthKeyset`, `ListDstBatchWithSrcChildren`, copy keysets, etc.). Only one pull runs at a time (`getPulling` / `setPulling`). Pull watermarks use **pendingBuff length only** (in-progress leases are not treated as available depth). When workers are idle and pending is below the live pool size, a **starve nudge** raises the effective WM so underfed pools refill sooner.
+1. **Pull** – `PullTraversalTasks` / `PullRetryTasks` / `PullCopyTasks` refill `pendingBuff` from Badger list/keyset APIs (pending by depth/type, DST batches with SRC children, copy keysets, etc.). Only one pull runs at a time (`getPulling` / `setPulling`). Pull watermarks use **pendingBuff length only** (in-progress leases are not treated as available depth). When workers are idle and pending is below the live pool size, a **starve nudge** raises the effective WM so underfed pools refill sooner.
 2. **Lease** – Workers take tasks from `pendingBuff` into `inProgress`. Multi-task batch turns (folder create, file upload, delete) use **`LeaseGroupBudget`**: live AIMD pool size (`len(pool.handles)`) drives a fair **count ceiling** (`ceil(pending/workers)`) and, for files, a soft **byte budget** (`sum(pending sizes)/workers` with one-item overflow). This prevents one worker from hoovering the whole adapter max batch.
 3. **Complete** – `ReportTaskResult` updates state and enqueues **seal** work (nodes + per-depth stats) through the DB layer.
 4. **Coordinator** – DST may start round *N* only when SRC has completed rounds *N* and *N+1* (or SRC traversal is done). SRC is not round-gated against DST; work is pulled and sealed to Badger in batches, so SRC can advance as fast as workers allow.
@@ -21,7 +21,7 @@ Bulk subtree mutations (`PropagateCopyFailureUnderPath`, `CascadeDeleteUnderPath
 
 ### Transfer checkpoint / stop-resume (file copy)
 
-Mid-transfer progress is stored on **`src_nodes`** (`xfer_offset`, `xfer_src_size`, `xfer_src_mtime`, `xfer_dst_ref`, `xfer_resume_token`); **`copy_status` stays `pending`**. `xfer_dst_ref` is the **attempt marker** (written at `OpenWrite`, cleared only on successful copy). `xfer_resume_token` holds an opaque provider resume handle (e.g. Graph `uploadUrl`).
+Mid-transfer progress is stored on the SRC **`opsdb.NodeRecord`** (`xfer_offset`, `xfer_src_size`, `xfer_src_mtime`, `xfer_dst_ref`, `xfer_resume_token`); **copy status stays `pending`**. `xfer_dst_ref` is the **attempt marker** (written at `OpenWrite`, cleared only on successful copy). `xfer_resume_token` holds an opaque provider resume handle (e.g. Graph `uploadUrl`).
 
 Resume/attempt state is consulted **before** any DST existence precheck. When the destination’s **`FSTransferRestartPolicy`** supports resumable transfer and the fingerprint matches, the next worker resumes (Graph: `OpenWriteFromResumeToken` with authoritative `nextExpectedRanges`). Otherwise, if an attempt marker exists, ME deletes that DST ref and restarts. Blind “exists → already_exists” is unreachable for a task this migration already attempted.
 
@@ -84,12 +84,12 @@ Autoscaler worker Min/Default/Max are resolved **per FS operation** from `pkg/sc
 
 ---
 
-## Relationship with `pkg/db`
+## Relationship with `pkg/db` / `pkg/opsdb`
 
-- **Reads:** Keyset lists, joins (`ListDstBatchWithSrcChildren`), stats helpers for completion / observer.
-- **Writes:** **`SealLevel`** (bulk node append + per-depth stats snapshot), plus transactional writers for status events, review, deletes, etc. (`RunWrite` / `Writer`).
+- **Reads:** Pending keyset lists, DST batches with SRC children, stats helpers for completion / observer. Prefetch status/node fields onto tasks in **batched** pull APIs (no per-task Badger gets on the hot path).
+- **Writes:** Seal buffer → **`WriteSealBatchTrusted`** (nodes, status, kids packs, frontier deltas, counters).
 
-See **`pkg/db/README.md`** for schema (**`src_status_events`**, **`dst_status_events`**, node tables, `stats`, `migrations`, …).
+See **`pkg/db/README.md`** for Badger key layout (`node:`, `st:`, `pend:`, `idx:`, `mig:`, …).
 
 ---
 
@@ -97,7 +97,7 @@ See **`pkg/db/README.md`** for schema (**`src_status_events`**, **`dst_status_ev
 
 First start / root-prep uses `initializeQueues` in `pkg/migration/run.go` (seed roots, starting rounds). Soft-stop **Resume** does not go through that path: it reloads **`runtime_state_json.suspend_v1`** (last rounds plus src/dst/copy keyset cursors) and continues the same queue mode. Retry sweep is separate and still starts at round 0.
 
-**Soft suspend** (`Pause`, clear **`pendingBuff`**, drain **`inProgress`**, flush/checkpoint at the migration layer) does **not** persist leased or pending task IDs; after **`traversal-suspended`** / **`copy-suspended`**, **`pkg/migration`** restores **`suspend_v1`** (worker count, retries, optional **`QueueSizing`** lease/refill batches, observer/progress tick hints, max depth, last rounds, keyset cursors) and continues pulls from DuckDB.
+**Soft suspend** (`Pause`, clear **`pendingBuff`**, drain **`inProgress`**, flush/checkpoint at the migration layer) does **not** persist leased or pending task IDs; after **`traversal-suspended`** / **`copy-suspended`**, **`pkg/migration`** restores **`suspend_v1`** (worker count, retries, optional **`QueueSizing`** lease/refill batches, observer/progress tick hints, max depth, last rounds, keyset cursors) and continues pulls from Badger.
 
 **`QueueSizing`** (optional last argument to **`NewQueue`**) overrides default lease and traversal refill batch sizes so suspend/resume can reproduce the same pull behavior.
 

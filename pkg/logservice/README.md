@@ -1,6 +1,6 @@
 # Log Service Package
 
-The **Log Service** package provides dual-channel logging for the Migration Engine: **real-time UDP** for live monitoring and optional **persistence to the main database’s `logs` table** via a buffered writer (`db.LogBuffer`).
+The **Log Service** package provides dual-channel logging for the Migration Engine: **real-time UDP** for live monitoring and optional **persistence to the migration Badger ops store (`log:*`)** via a buffered writer (`db.LogBuffer`).
 
 ---
 
@@ -9,7 +9,7 @@ The **Log Service** package provides dual-channel logging for the Migration Engi
 Two channels:
 
 1. **UDP** – Level-filtered network logging for monitoring tools.
-2. **Database** – When a main DB handle is provided, logs are batched in `db.LogBuffer` and flushed to that DB’s **`logs`** table (see `pkg/db`). The sender does not open or close the DB; it only writes through the buffer.
+2. **Ops store** – When a main DB handle is provided, logs are batched in `db.LogBuffer` and flushed to Badger **`log:*`** keys (see `pkg/db` / `pkg/opsdb`). The sender does not open or close the DB; it only writes through the buffer.
 
 **Benefits**:
 - Non-blocking: buffered DB writes and best-effort UDP.
@@ -25,12 +25,12 @@ Application
     ↓ Log(…)
 Sender
     ├─→ UDP socket (level ≥ threshold)
-    └─→ db.LogBuffer (if mainDB != nil) → main DB logs table
+    └─→ db.LogBuffer (if mainDB != nil) → Badger log:* keys
 ```
 
 **Components**:
 - **Sender** (`sender.go`): Holds a `*db.DB` reference and a `*db.LogBuffer`. Routes each log to UDP (when level ≥ threshold) and to `logBuffer.Add(…)` when the buffer is present. Does not own the DB; `Close()` stops the buffer and closes the UDP connection only.
-- **db.LogBuffer** (`pkg/db`): Batches `db.LogEntry` and flushes to the main DB’s `logs` table. **`NewSender`** uses batch size **`defaultBatchSize` (50,000)** and flush interval **3s** (`db.NewLogBuffer(logDB, defaultBatchSize, 3 * time.Second)`).
+- **db.LogBuffer** (`pkg/db`): Batches log entries and flushes via `opsdb.AppendLogs`. **`NewSender`** uses batch size **`defaultBatchSize` (50,000)** and flush interval **3s** (`db.NewLogBuffer(logDB, defaultBatchSize, 3 * time.Second)`).
 - **Listener** (`listener.go`): UDP receive loop; parses `LogPacket` JSON, prints `timestamp [level] message [queue]`, and clears the console when the message is `<<CLEAR_SCREEN>>`.
 
 ---
@@ -51,7 +51,7 @@ logservice.LS.Log("info", "Migration started", "migration", "main", "src")
 ```
 
 **Parameters**:
-- **mainDB** – `*db.DB`. If non-nil, logs are written to its `logs` table via `db.LogBuffer`. If nil, no DB writes (UDP only).
+- **mainDB** – `*db.DB`. If non-nil, logs are written to Badger `log:*` via `db.LogBuffer`. If nil, no ops-store writes (UDP only).
 - **addr** – UDP address, e.g. `"host:port"`.
 - **minLevel** – Minimum level for UDP: `"trace"`, `"debug"`, `"info"`, `"warning"`, `"error"`, `"critical"`.
 
@@ -101,7 +101,7 @@ logservice.LS.Log("debug", "Processing task", "worker", "worker-1", "src")
 - **Flush interval**: **3 seconds** (see `sender.go` + `db.NewLogBuffer`).
 - **Shutdown**: `Close()` calls `logBuffer.Stop()` (stops flush loop and flushes) and closes the UDP connection.
 
-Persistence is to the main database’s `logs` table; schema and `Writer.InsertLog` are in `pkg/db`. Query logs with SQL against that table.
+Persistence is to the migration ops store under **`log:*`** keys via `db.LogBuffer` / `opsdb.AppendLogs`. See **`pkg/db/README.md`**.
 
 ---
 
@@ -187,7 +187,7 @@ pkg/logservice/
 
 ## Summary
 
-- **Dual channel**: UDP (level-filtered) and optional DB persistence via `db.LogBuffer` to the main DB’s `logs` table.
+- **Dual channel**: UDP (level-filtered) and optional ops-store persistence via `db.LogBuffer` to Badger `log:*`.
 - **Sender** holds a reference to `*db.DB` and creates a `db.LogBuffer` when the DB is non-nil; it does not own or close the DB.
 - **Buffer**: 50k batch size, 3s flush interval; `Close()` stops and flushes.
 - **Listener**: `StartListener` spawns a terminal running the listener; `RunListener` runs the loop in-process; `<<CLEAR_SCREEN>>` clears the console.

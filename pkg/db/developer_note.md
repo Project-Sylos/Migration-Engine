@@ -1,9 +1,7 @@
 ## Note
-Please keep in mind that limit offset usage in duckDB will result in O(n) scans to get to the next offset. Same thing for mongoDB as well if we ever used that.
-Same for SQLite and likely many other DB technologies. What I mean is, say you have 10K items, you set a limit of 1000, offset 0 for first query.
-Then you make the next offset query to get the next 1000 items from 1000-1999, then SQL has to O(n) scan from 0-1000 to get to your offset item. 
-This will scale linearly and sucks when your DB sizes get absurdly large and you require very fast timing between queries. 
 
-I would recommend considering implementing an ID OFFSET method for O(1) skips throughout the queries. But this requires stateful tracking and some updating of how the queries actually work. Still, worth thinking about in some places. 
+Offset/limit pagination that walks from the start of a result set on every page is O(n) in many stores (classic SQL `OFFSET`, naive Mongo skips, etc.). Example: page size 1000, page 10 forces the engine to skip ~9000 already-seen rows before returning the next page. That cost grows with dataset size and is a poor fit for huge inventories with tight page-turn latency.
 
-In practice, our queries are generally pretty contained. The only place I'd consider this really is for something like an empty search if the user (god forbid) is trying to flip through 10M items page by page with an empty search (returning everything) lol. But this is unlikely to come up or reflect real user behavior beyond this hypothetical. Still I wanted to write this somewhere so that someone knows, if they ever find this. 
+Prefer **keyset / cursor** pagination (continue after the last seen id, path, or composite key) so each page is O(page size) rather than O(offset). The Migration Engine’s Badger pulls and review walks follow that pattern (`pend:*` keysets, `after` cursors on status/index scans). Keep new list APIs cursor-based unless there is a strong reason not to.
+
+In practice, most engine queries are already bounded. The main place a naive empty-search “show everything, page forever” UI could still hurt is path review over tens of millions of nodes; that is uncommon real usage, but worth remembering when adding browse/search endpoints.

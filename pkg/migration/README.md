@@ -1,6 +1,6 @@
 # Migration Package
 
-Orchestrates migrations: **`MigrationManager`**, domain type **`Migration`**, DuckDB (**`pkg/db`**), and queues (**`pkg/queue`**).
+Orchestrates migrations: **`MigrationManager`**, domain type **`Migration`**, Badger ops store (**`pkg/db`** / **`pkg/opsdb`**), and queues (**`pkg/queue`**).
 
 Higher-level **API / HTTP integration** (routes, background tasks, runtime cache) lives in the Sylos application that imports this module; this package is the **engine** surface.
 
@@ -37,7 +37,7 @@ Autoscaler runs by default on traversal, copy, delete, and retry unless **`Autos
 Used by **`LetsMigrate`** / **`StartMigration`**:
 
 - **`Database`** – **`DatabaseConfig`** (`Path`, `RemoveExisting`, `RequireOpen`).  
-  - **`Path`:** DuckDB file for this migration (`{dir}/{id}.db`). Standalone runs set this directly; the HTTP API passes **`MigrationDir`** / **`migrationDir`** into **`CreateMigration`** / **`GetMigration`** instead.
+  - **`Path`:** logical migration path (`{dir}/{id}.db`); Badger ops live beside it at `{dir}/{id}.ops/`. Standalone runs set this directly; the HTTP API passes **`MigrationDir`** / **`migrationDir`** into **`CreateMigration`** / **`GetMigration`** instead.
 - **`Source`**, **`Destination`** – **`Service`** with **`types.FSAdapter`** and **`types.Folder`**. **Adapters must be non-nil**; the engine does not construct or close them.
 - **`SeedRoots`**, **`WorkerCount`**, **`MaxRetries`**, **`CoordinatorLead`**, **`LogAddress`**, **`LogLevel`**, **`SkipListener`**, **`StartupDelay`**, **`ProgressTick`**, **`Verification`**, **`ShutdownContext`**.
 
@@ -65,7 +65,7 @@ There is **no** `GetDB()` / `Result()` / `Error()` on the controller in the curr
 
 ## `MigrationManager` (`manager.go`)
 
-- **`NewMigrationManager()`** – Returns a manager that opens **`{migrationDir}/{id}.db`** per migration.
+- **`NewMigrationManager()`** – Returns a manager that opens **`{migrationDir}/{id}.ops/`** (via logical `{id}.db` path) per migration.
 - **`CreateMigration`**, **`GetMigration`**, **`ListMigrations`**, **`GetMigrationDetails`**, **`DeleteMigration`**, **`Close`**.
 
 **`GetMigrationDetails` / `ListMigrations`** merge **`Live`** and **`Phase`** from an in-memory **`Migration`** when this process has loaded it (so `live` matches `running`); otherwise phase comes from the DB row.
@@ -78,7 +78,7 @@ There is **no** `GetDB()` / `Result()` / `Error()` on the controller in the curr
 
 Examples: **`roots-set`**, **`filters-set`**, **`traversal-in-progress`**, **`traversal-suspended`**, **`awaiting-traversal-review`**, **`copy-in-progress`**, **`copy-suspended`**, **`awaiting-copy-review`**, **`delete-in-progress`**, **`delete-suspended`**, **`aborted`** (`phase.go`).
 
-**Soft suspend:** While phase is **`traversal-in-progress`**, **`copy-in-progress`**, or **`delete-in-progress`**, **`Stop()`** requests a **coordinated suspend**: set soft flag, publish **`StopProgress`** (checklist for API/UI), **immediately pause** registered queues (no new pulls/leases), clear non-leased pending buffers, then drain in-flight tasks, flush seal/appender buffers, checkpoint, and persist **`runtime_state_json.suspend_v1`**. Secondary indexes are **not** rebuilt on soft stop (that is end-of-mode **`*-finalizing`**); resume calls **`BeginTraversalPhase`** again and continues without them until finalize. The phase becomes **`traversal-suspended`**, **`copy-suspended`**, or **`delete-suspended`**. Soft suspend remains resumable. There is **no automatic grace Abort**; only an explicit **`Abort()`** / force-stop hard-kills.
+**Soft suspend:** While phase is **`traversal-in-progress`**, **`copy-in-progress`**, or **`delete-in-progress`**, **`Stop()`** requests a **coordinated suspend**: set soft flag, publish **`StopProgress`** (checklist for API/UI), **immediately pause** registered queues (no new pulls/leases), clear non-leased pending buffers, then drain in-flight tasks, flush seal buffers, checkpoint, and persist **`runtime_state_json.suspend_v1`**. Secondary indexes are **not** rebuilt on soft stop (that is end-of-mode **`*-finalizing`**); resume calls **`BeginTraversalPhase`** again and continues without them until finalize. The phase becomes **`traversal-suspended`**, **`copy-suspended`**, or **`delete-suspended`**. Soft suspend remains resumable. There is **no automatic grace Abort**; only an explicit **`Abort()`** / force-stop hard-kills.
 
 **Force stop / abort:** **`ForceStop()`** cancels the run context and abandons in-flight queue work. **`Abort()`** does that and transitions to terminal **`aborted`** (no Resume). Prefer soft stop; use abort only when stuck.
 
@@ -100,8 +100,8 @@ Examples: **`roots-set`**, **`filters-set`**, **`traversal-in-progress`**, **`tr
 
 **`InspectMigrationStatus(database *db.DB)`** (`status.go`):
 
-- Totals from node tables.
-- **Pending / failed** from materialized **`src_current` / `dst_current`** (updated per sealed depth and status-event insert), not from full event-log replay.
+- Totals from Badger node/status/counter keys.
+- **Pending / failed** from the status overlay and review/depth counters (updated on seal), not from replaying a SQL event log.
 
 ---
 
@@ -117,12 +117,12 @@ Engine retry sweep re-processes pending/failed traversal work (**`pkg/queue`** r
 
 ```go
 database, wasFresh, err := migration.SetupDatabase(migration.DatabaseConfig{
-    Path:           "migration.duckdb",
+    Path:           filepath.Join(migrationDir, id+".db"), // logical path; ops at id.ops/
     RemoveExisting: false,
 })
 ```
 
-Opens DuckDB with default seal-buffer options and ensures node + status-event indexes. Caller closes the DB when appropriate.
+Opens Badger at `MigrationOpsPath(Path)` with default seal-buffer options, stamps **`meta:schema_version`**, and ensures secondary indexes (`meta:tri_index_v1`). Caller closes the DB when appropriate.
 
 ---
 
@@ -136,7 +136,7 @@ Opens DuckDB with default seal-buffer options and ensures node + status-event in
 
 1. **Own adapters** in the host process; keep them open for the duration of a run.
 2. **Async retry sweep / copy retry:** **`Prepare*`** then background **`Run*`** (see above).
-3. **Per-migration DBs:** pass consistent **`migrationDir`** when loading details/listing so the manager can open the right file.
+3. **Per-migration ops stores:** pass consistent **`migrationDir`** when loading details/listing so the manager can open the right `{id}.ops/` directory.
 
 ---
 

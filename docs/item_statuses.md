@@ -1,10 +1,10 @@
 ## Purpose of this doc
 The purpose of this doc is to explain the various item statuses and schema.
 
-**Implementation note:** In DuckDB, the **current** traversal/copy values for a node come from the latest row in **`src_status_events`** / **`dst_status_events`** (append-only, `arg_max` by `id`). The `src_nodes` / `dst_nodes` tables hold path/metadata; queries join events for live status. See **`pkg/db/README.md`**.
+**Implementation note:** In Badger, the **current** traversal/copy/delete values for a node live on the status overlay keys **`st:trav|copy|del:src|dst:{id}`** (hot path; legacy **`st:{side}:{id}`** is a read fallback). Catalog metadata is under **`node:src|dst:{id}`**. Seal batches update status + frontier together. See **`pkg/db/README.md`**.
 
 ### The main status fields
-Sylos SRC nodes track three lifecycle status fields (all event-derived from `src_status_events`):
+Sylos SRC nodes track three lifecycle status fields (on the SRC status overlay):
 
 * **Traversal status** — discovery phase
 * **Copy status** — copy phase (SRC only)
@@ -37,7 +37,7 @@ Progress, delete eligibility, and UI "exists on both" treat `successful` and `al
 Mainly because it doesn't make sense to double store it, we only care about items that are ONLY on the src that haven't been copied over yet. So we only need to store it there.
 
 ### Possible Delete Status Values
-(SRC only; stored in `src_status_events`, same append-only model as traversal/copy)
+(SRC only; stored on `st:del:src:{id}`, same overlay model as traversal/copy)
 
 * **pending** — selected for source removal during cleanup planning (`PrepareSourceCleanup` after copy review). The delete phase will attempt to remove this node from the source filesystem.
 * **deleted** — successfully removed from the source (or recorded as such after a successful `DeleteNode` worker result).
