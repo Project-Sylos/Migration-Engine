@@ -242,12 +242,10 @@ func TestRunCopyPhase_flatLayoutPass1FoldersBeforePass2(t *testing.T) {
 	src.fileData["src-"+flatCopyFile] = []byte("hello sample")
 
 	_, err = RunCopyPhase(CopyPhaseConfig{
-		DuckDB:       database,
+		PhaseRuntime: PhaseRuntime{WorkerCount: 2, MaxRetries: 1, SkipListener: true},
+		DB:           database,
 		SrcAdapter:   src,
 		DstAdapter:   dst,
-		WorkerCount:  2,
-		MaxRetries:   1,
-		SkipListener: true,
 	})
 	if err != nil {
 		t.Fatalf("RunCopyPhase: %v", err)

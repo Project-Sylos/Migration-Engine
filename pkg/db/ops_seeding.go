@@ -178,7 +178,7 @@ func (db *DB) ApplyReviewStatsDeltas(deltas []ReviewStatsDelta) error {
 	if db.Ops() == nil {
 		return fmt.Errorf("ops store required")
 	}
-	return db.incrOpsReviewDeltas(deltas)
+	return db.applyOpsHotpathStats(deltas, nil)
 }
 
 // SeedDiscoveredNodes writes a discovery batch to Badger.

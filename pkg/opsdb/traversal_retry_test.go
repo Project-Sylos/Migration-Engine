@@ -40,11 +40,11 @@ func TestApplyTraversalRetryMarkEnrollsFolderFrontier(t *testing.T) {
 			InsertOnly: true,
 		},
 	}
-	if _, err := s.WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := s.WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
-	res, err := s.ApplyTraversalRetryMark(folderID, "")
+	res, err := s.ApplyTraversalRetry(folderID, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestApplyTraversalRetryMarkEnrollsFolderFrontier(t *testing.T) {
 		t.Fatal("expected child folder on pend:trav after path-prefix mark")
 	}
 
-	ures, err := s.ApplyTraversalRetryUnmark(folderID, "")
+	ures, err := s.ApplyTraversalRetry(folderID, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -18,7 +18,7 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
-// PullTraversalTasks refills the queue from DuckDB for the current round (ID-offset pagination, ~10K batch).
+// PullTraversalTasks refills the queue from DB for the current round (ID-offset pagination, ~10K batch).
 // SRC: ListNodesPendingAtDepthKeyset (folders from *_current); DST: ListDstBatchWithSrcChildren.
 func PullTraversalTasks(q *queue.Queue, force bool) queue.PullResult {
 	database := q.Database()
@@ -75,10 +75,7 @@ func PullTraversalTasks(q *queue.Queue, force bool) queue.PullResult {
 			if q.GetRound() != currentRound {
 				return queue.PullResult{Round: currentRound, QueriedDB: true, Status: queue.PullStaleRound}
 			}
-			q.SetLastPullWasPartial(true)
-			q.RecordPull(currentRound, 0, true)
-			q.SetFirstPullForRound(false)
-			return queue.PullResult{Round: currentRound, Yield: 0, Partial: true, QueriedDB: true, Status: queue.PullOK}
+			return finishPull(q, currentRound, 0, true)
 		}
 		if q.GetRound() != currentRound {
 			return queue.PullResult{Round: currentRound, QueriedDB: true, Status: queue.PullStaleRound}
@@ -113,11 +110,7 @@ func PullTraversalTasks(q *queue.Queue, force bool) queue.PullResult {
 		} else if processLimit > 0 {
 			q.SetKeysetCursor(dstBatch[processLimit-1].Key)
 		}
-		partial := exhausted && len(dstBatch) <= batchSize
-		q.SetLastPullWasPartial(partial)
-		q.RecordPull(currentRound, count, partial)
-		q.SetFirstPullForRound(false)
-		return queue.PullResult{Round: currentRound, Yield: count, Partial: partial, QueriedDB: true, Status: queue.PullOK}
+		return finishPull(q, currentRound, count, exhausted && len(dstBatch) <= batchSize)
 	} else {
 		requestLimit := batchSize + 1
 		afterID := q.GetKeysetCursor()
@@ -131,10 +124,7 @@ func PullTraversalTasks(q *queue.Queue, force bool) queue.PullResult {
 			if q.GetRound() != currentRound {
 				return queue.PullResult{Round: currentRound, QueriedDB: true, Status: queue.PullStaleRound}
 			}
-			q.SetLastPullWasPartial(true)
-			q.RecordPull(currentRound, 0, true)
-			q.SetFirstPullForRound(false)
-			return queue.PullResult{Round: currentRound, Yield: 0, Partial: true, QueriedDB: true, Status: queue.PullOK}
+			return finishPull(q, currentRound, 0, true)
 		}
 		if q.GetRound() != currentRound {
 			return queue.PullResult{Round: currentRound, QueriedDB: true, Status: queue.PullStaleRound}
@@ -161,11 +151,7 @@ func PullTraversalTasks(q *queue.Queue, force bool) queue.PullResult {
 			}
 			q.SetKeysetCursor(results[cursorIdx].Key)
 		}
-		partial := len(results) <= batchSize
-		q.SetLastPullWasPartial(partial)
-		q.RecordPull(currentRound, count, partial)
-		q.SetFirstPullForRound(false)
-		return queue.PullResult{Round: currentRound, Yield: count, Partial: partial, QueriedDB: true, Status: queue.PullOK}
+		return finishPull(q, currentRound, count, len(results) <= batchSize)
 	}
 }
 
@@ -205,6 +191,7 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 	database := q.Database()
 	if database == nil {
 		markTraversalComplete()
+		q.ReleaseTaskInFlightWeight(task)
 		q.RemoveInProgress(nodeID)
 		return
 	}
@@ -274,6 +261,7 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 			srcID         string
 			status        string
 			srcCopyStatus string
+			dstCopyStatus string
 		}
 		var childFolders []dstChildFolder
 		for _, child := range task.DiscoveredChildren {
@@ -285,6 +273,7 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 					srcID:         child.SrcID,
 					status:        child.Status,
 					srcCopyStatus: child.SrcCopyStatus,
+					dstCopyStatus: child.DstCopyStatus,
 				})
 			}
 		}
@@ -309,6 +298,7 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 				MTime:           child.folder.LastUpdated,
 				Depth:           nextRound,
 				TraversalStatus: child.status,
+				CopyStatus:      child.dstCopyStatus,
 			}
 			if child.srcID != "" {
 				taskState.SrcID = child.srcID
@@ -342,7 +332,7 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 			if logservice.LS != nil {
 				logErr := logservice.LS.Log("error",
 					fmt.Sprintf("discovery persist failed for %s (id=%s children=%d): %v",
-						task.LocationPath(), nodeID, len(childNodesToInsert), err),
+						task.DisplayPath, nodeID, len(childNodesToInsert), err),
 					"queue", q.Name(), q.Name())
 				if logErr != nil {
 					fmt.Println("error logging", logErr)
@@ -398,41 +388,59 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 	}, fromRetry)
 
 	// DST comparison: persist SRC copy status for each matched child so path review
-	// and the copy frontier (pend:copy) stay aligned with copy_status.
+	// and the copy frontier (pend:copy) stay aligned with copy_status. Also seal DST
+	// bookkeeping copy status (destination_only / already_existed / needs_overwrite).
 	if q.Name() == "dst" {
 		eventTime := time.Now().UnixNano()
 		for _, child := range task.DiscoveredChildren {
-			if child.SrcID == "" || child.SrcCopyStatus == "" {
-				continue
+			if child.SrcID != "" && child.SrcCopyStatus != "" {
+				meta := task.ExpectedSrcNodeMeta[child.SrcID]
+				copyChanged := child.SrcCopyStatus != meta.CopyStatus
+				if copyChanged || db.CopyStatusIsComplete(child.SrcCopyStatus) {
+					var size int64
+					nodeType := db.NodeTypeFolder
+					if child.IsFile {
+						size = child.File.Size
+						nodeType = db.NodeTypeFile
+					}
+					deleteStatus := ""
+					if copyChanged && db.CopyStatusIsComplete(child.SrcCopyStatus) {
+						deleteStatus = db.DeleteStatusAfterCopyComplete(task.SrcParentDeleteStatus, meta.DeleteStatus)
+					}
+					// Leave TraversalStatus empty so Badger status merge keeps the live value
+					// (pull-time ExpectedSrcNodeMeta may still say pending after SRC completed).
+					database.AppendStatusEvent("SRC", db.StatusEvent{
+						ID:               child.SrcID,
+						CopyStatus:       child.SrcCopyStatus,
+						DeleteStatus:     deleteStatus,
+						EventTime:        eventTime,
+						Depth:            nextRound,
+						PrevCopyStatus:   meta.CopyStatus,
+						PrevDeleteStatus: meta.DeleteStatus,
+						Size:             size,
+						NodeType:         nodeType,
+						ExclusionSource:  child.ExclusionSource,
+					}, false)
+				}
 			}
-			meta := task.ExpectedSrcNodeMeta[child.SrcID]
-			copyChanged := child.SrcCopyStatus != meta.CopyStatus
-			if !copyChanged && !db.CopyStatusIsComplete(child.SrcCopyStatus) {
-				continue
+			if child.DstCopyStatus != "" {
+				var dstName string
+				nodeType := db.NodeTypeFolder
+				if child.IsFile {
+					dstName = child.File.DisplayName
+					nodeType = db.NodeTypeFile
+				} else {
+					dstName = child.Folder.DisplayName
+				}
+				dstID := db.MintNodeID("DST", nodeID, nodeType, dstName)
+				database.AppendStatusEvent("DST", db.StatusEvent{
+					ID:         dstID,
+					CopyStatus: child.DstCopyStatus,
+					EventTime:  eventTime,
+					Depth:      nextRound,
+					NodeType:   nodeType,
+				}, false)
 			}
-			var size int64
-			nodeType := db.NodeTypeFolder
-			if child.IsFile {
-				size = child.File.Size
-				nodeType = db.NodeTypeFile
-			}
-			deleteStatus := ""
-			if copyChanged && db.CopyStatusIsComplete(child.SrcCopyStatus) {
-				deleteStatus = db.DeleteStatusAfterCopyComplete(task.SrcParentDeleteStatus, meta.DeleteStatus)
-			}
-			// Leave TraversalStatus empty so Badger status merge keeps the live value
-			// (pull-time ExpectedSrcNodeMeta may still say pending after SRC completed).
-			database.AppendStatusEvent("SRC", db.StatusEvent{
-				ID:               child.SrcID,
-				CopyStatus:       child.SrcCopyStatus,
-				DeleteStatus:     deleteStatus,
-				EventTime:        eventTime,
-				Depth:            nextRound,
-				PrevCopyStatus:   meta.CopyStatus,
-				PrevDeleteStatus: meta.DeleteStatus,
-				Size:             size,
-				NodeType:         nodeType,
-			}, false)
 		}
 		gpl.AppendDSTSiblingCollisionIssues(database, q, task)
 	}
@@ -457,6 +465,7 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 		}
 	}
 
+	q.ReleaseTaskInFlightWeight(task)
 	q.RemoveInProgress(nodeID)
 }
 
@@ -472,7 +481,7 @@ func FailTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta time
 	if logservice.LS != nil {
 		err := logservice.LS.Log("debug",
 			fmt.Sprintf("Failing task: id=%s path=%s round=%d type=%s currentAttempts=%d maxRetries=%d",
-				nodeID, task.LocationPath(), currentRound, task.Type, task.Attempts, maxRetries),
+				nodeID, task.DisplayPath, currentRound, task.Type, task.Attempts, maxRetries),
 			"queue", q.Name(), q.Name())
 		if err != nil {
 			fmt.Println("error logging", err)
@@ -493,14 +502,14 @@ func FailTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta time
 		if !q.Add(task) {
 			if logservice.LS != nil {
 				_ = logservice.LS.Log("error",
-					fmt.Sprintf("retry re-enqueue rejected for %s (id=%s) - task lost", task.LocationPath(), nodeID),
+					fmt.Sprintf("retry re-enqueue rejected for %s (id=%s) - task lost", task.DisplayPath, nodeID),
 					"queue", q.Name(), q.Name())
 			}
 		}
 		if logservice.LS != nil {
 			err := logservice.LS.Log("debug",
 				fmt.Sprintf("Retrying task: id=%s path=%s round=%d attempt=%d/%d",
-					nodeID, task.LocationPath(), currentRound, task.Attempts, maxRetries),
+					nodeID, task.DisplayPath, currentRound, task.Attempts, maxRetries),
 				"queue", q.Name(), q.Name())
 			if err != nil {
 				fmt.Println("error logging", err)
@@ -520,7 +529,7 @@ func FailTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta time
 	if logservice.LS != nil {
 		err := logservice.LS.Log("error",
 			fmt.Sprintf("Failed to traverse folder %s (id=%s) after %d attempts (max retries exceeded) round=%d",
-				task.LocationPath(), nodeID, task.Attempts, currentRound),
+				task.DisplayPath, nodeID, task.Attempts, currentRound),
 			"queue", q.Name(), q.Name())
 		if err != nil {
 			fmt.Println("error logging", err)
@@ -537,7 +546,7 @@ func FailTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta time
 
 	// Record task error if present
 	if task.LastError != "" {
-		database.AppendTaskError(queueType, "traversal", nodeID, task.LastError, task.Attempts, task.LocationPath())
+		database.AppendTaskError(queueType, "traversal", nodeID, task.LastError, task.Attempts, task.DisplayPath)
 	}
 
 	if nodeID != "" {
@@ -557,7 +566,7 @@ func FailTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta time
 			PrevTraversalStatus: prevTrav,
 			NodeType:            nodeType,
 		}
-		failurelog.AttachTaskFailureLog(&ev, "traversal", q.Name(), nodeID, task.LocationPath(), task.Attempts, task.LastError)
+		failurelog.AttachTaskFailureLog(&ev, "traversal", q.Name(), nodeID, task.DisplayPath, task.Attempts, task.LastError)
 		ev.ExclusionSource = task.ExclusionSource
 		database.AppendStatusEvent(queueType, ev, opsdb.IsDiscoveryRetryMark(task.ExclusionSource))
 	}
@@ -638,7 +647,7 @@ func AdvanceTraversalRound(q *queue.Queue) {
 	// Reset lastPullWasPartial since we're advancing to a new round
 	q.SetLastPullWasPartial(false)
 	// firstPullForRound is set to true in SetRound (above) so the new round gets "first pull" semantics for completion.
-	// This queue's keyset cursor is reset in setRound / advanceToNextRound (resetThisQueueKeysetCursor).
+	// This queue's keyset cursor is reset in setRound / advanceToNextRound (ResetKeysetCursorForShed).
 	// Mid-round cursor updates only advance (never rewind) so concurrent pulls cannot re-lease earlier IDs.
 	// Initialize RoundInfo for the new round (will be created on first pull)
 	q.EnsureRoundInfo(newRound) // Ensure it exists

@@ -13,7 +13,7 @@ const (
 )
 
 // StatsKey returns the src_stats/dst_stats key for the given kind and status.
-// Traversal valid statuses: pending, successful, failed, not_on_src (DST only).
+// Traversal valid statuses: pending, successful, failed; legacy not_on_src (DST only).
 // Copy valid statuses: pending, successful, failed (src only).
 func StatsKey(kind StatsKind, status string) string {
 	return string(kind) + "/" + status
@@ -179,14 +179,6 @@ func (c PhaseProgressCounts) Eligible() int64 {
 	return c.Pending + c.Completed()
 }
 
-// CompletedForMode returns the numerator used by DeterministicProgressPercent.
-func (c PhaseProgressCounts) CompletedForMode(retryMode bool) int64 {
-	if retryMode {
-		return c.Successful
-	}
-	return c.Successful + c.Failed
-}
-
 // BytesProgressPercent returns 0–100 from bytes done vs a fixed migration-wide total.
 // When total is 0, returns 100 (nothing to transfer). Done is capped at 100%.
 func BytesProgressPercent(done, total int64) float64 {
@@ -345,4 +337,18 @@ func DeterministicProgressPercent(pending, successful, failed int64, retryMode b
 		return 100
 	}
 	return pct
+}
+
+// ReviewStatsDelta is one incremental update to a review counter key.
+type ReviewStatsDelta struct {
+	Key   string
+	Delta int64
+}
+
+// DepthStatsDelta is one incremental update to a per-depth counter key.
+type DepthStatsDelta struct {
+	Table string
+	Depth int
+	Key   string
+	Delta int64
 }

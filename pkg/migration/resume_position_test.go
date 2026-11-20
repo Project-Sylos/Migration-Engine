@@ -25,7 +25,7 @@ func TestApplyTraversalResumeRestoresRoundAndCursor(t *testing.T) {
 		LastRoundDst:    6,
 		SrcKeysetCursor: "src-mid",
 		DstKeysetCursor: "dst-mid",
-	}, src, dst, coord)
+	}, src, dst, coord, false)
 	if src.GetMode() != queue.QueueModeTraversal || dst.GetMode() != queue.QueueModeTraversal {
 		t.Fatalf("mode src=%s dst=%s want traversal", src.GetMode(), dst.GetMode())
 	}
@@ -57,7 +57,7 @@ func TestApplyTraversalResumeEmptyCursorStartsAtFirstPending(t *testing.T) {
 		Kind:         "traversal",
 		LastRoundSrc: 7,
 		LastRoundDst: 7,
-	}, src, dst, nil)
+	}, src, dst, nil, false)
 	if src.GetMode() != queue.QueueModeTraversal {
 		t.Fatalf("mode=%s want traversal (not retry)", src.GetMode())
 	}
@@ -93,7 +93,7 @@ func TestApplyTraversalResumeIgnoresStaleRoundZero(t *testing.T) {
 		Kind:         "traversal",
 		LastRoundSrc: 0,
 		LastRoundDst: 0,
-	}, src, dst, nil)
+	}, src, dst, nil, false)
 	if src.GetRound() != 7 {
 		t.Fatalf("round=%d want 7 (skip stale depth-0 pending when deeper work exists)", src.GetRound())
 	}
@@ -110,7 +110,7 @@ func TestApplyTraversalResumeFallbackMinPendingDepth(t *testing.T) {
 
 	src := queue.NewQueue("src", 3, 1, nil, nil)
 	dst := queue.NewQueue("dst", 3, 1, nil, nil)
-	applyTraversalResume(database, &RuntimeSuspendV1{Version: 1, Kind: "traversal"}, src, dst, nil)
+	applyTraversalResume(database, &RuntimeSuspendV1{Version: 1, Kind: "traversal"}, src, dst, nil, false)
 	if src.GetMode() != queue.QueueModeTraversal {
 		t.Fatalf("mode=%s want traversal", src.GetMode())
 	}

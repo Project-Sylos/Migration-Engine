@@ -4,6 +4,7 @@
 package review
 
 import (
+	"context"
 	"testing"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
@@ -57,7 +58,7 @@ func TestPathSegmentsOrderedContains(t *testing.T) {
 	database, ids := seedPathSegmentTree(t)
 	defer database.Close()
 
-	page, _, err := ListMergedReviewDiffsPage(database, ReviewFilter{
+	page, _, err := ListMergedReviewDiffsPageCtx(context.Background(), database, ReviewFilter{
 		PathSegments: []string{"Reports", "Q1"},
 		ExcludeRoot:  true,
 	}, "path ASC", 50, 0)
@@ -83,7 +84,7 @@ func TestPathSegmentsSingleNameContains(t *testing.T) {
 	database, ids := seedPathSegmentTree(t)
 	defer database.Close()
 
-	page, _, err := ListMergedReviewDiffsPage(database, ReviewFilter{
+	page, _, err := ListMergedReviewDiffsPageCtx(context.Background(), database, ReviewFilter{
 		PathSegments: []string{"summ"},
 		ExcludeRoot:  true,
 	}, "path ASC", 50, 0)
@@ -106,7 +107,7 @@ func TestPathSegmentsNameModeUnchanged(t *testing.T) {
 	database, ids := seedPathSegmentTree(t)
 	defer database.Close()
 
-	page, _, err := ListMergedReviewDiffsPage(database, ReviewFilter{
+	page, _, err := ListMergedReviewDiffsPageCtx(context.Background(), database, ReviewFilter{
 		Query: "summary.txt", QueryField: "name", ExcludeRoot: true,
 	}, "path ASC", 50, 0)
 	if err != nil {

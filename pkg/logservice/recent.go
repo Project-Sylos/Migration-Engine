@@ -12,10 +12,15 @@ const recentLogCap = 1000
 
 // RecentLog is one in-memory log line for live UI polling.
 type RecentLog struct {
-	ID      string
-	At      time.Time
-	Level   string
-	Message string
+	ID       string
+	At       time.Time
+	Level    string
+	Message  string
+	Entity   string
+	EntityID string
+	Queue    string
+	Action   string
+	NodeID   string
 }
 
 type recentRing struct {

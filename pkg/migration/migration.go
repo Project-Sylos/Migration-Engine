@@ -29,12 +29,15 @@ type persistedRunConfig struct {
 	DestProviderID    string        `json:"destinationProviderId,omitempty"`
 	PathCheckTarget   string        `json:"pathCheckTarget,omitempty"`
 	WindowsCompat     bool          `json:"windowsCompat,omitempty"`
+	OverwritePolicy   string        `json:"overwritePolicy,omitempty"`
+	HashVerify        bool          `json:"hashVerify,omitempty"`
 	SeedRoots         bool          `json:"seedRoots"`
 	WorkerCount       int           `json:"workerCount"`
 	MaxRetries        int           `json:"maxRetries"`
 	CoordinatorLead   int           `json:"coordinatorLead"`
 	LogAddress        string        `json:"logAddress"`
 	LogLevel          string        `json:"logLevel"`
+	PersistLogLevel   string        `json:"persistLogLevel,omitempty"`
 	SkipListener      bool          `json:"skipListener"`
 	StartupDelayNanos int64         `json:"startupDelayNanos"`
 	ProgressTickNanos int64         `json:"progressTickNanos"`
@@ -57,12 +60,15 @@ func persistedRunConfigFrom(cfg Config) persistedRunConfig {
 		DestProviderID:    cfg.Destination.ProviderID,
 		PathCheckTarget:   cfg.PathCheckTarget,
 		WindowsCompat:     cfg.WindowsCompat,
+		OverwritePolicy:   cfg.OverwritePolicy,
+		HashVerify:        cfg.HashVerify,
 		SeedRoots:         cfg.SeedRoots,
 		WorkerCount:       cfg.WorkerCount,
 		MaxRetries:        cfg.MaxRetries,
 		CoordinatorLead:   cfg.CoordinatorLead,
 		LogAddress:        cfg.LogAddress,
 		LogLevel:          cfg.LogLevel,
+		PersistLogLevel:   cfg.PersistLogLevel,
 		SkipListener:      cfg.SkipListener,
 		StartupDelayNanos: cfg.StartupDelay.Nanoseconds(),
 		ProgressTickNanos: cfg.ProgressTick.Nanoseconds(),
@@ -92,11 +98,12 @@ type Config struct {
 	MaxRetries      int
 	CoordinatorLead int
 
-	LogAddress   string
-	LogLevel     string
-	SkipListener bool
-	StartupDelay time.Duration
-	ProgressTick time.Duration
+	LogAddress      string
+	LogLevel        string // UDP / listener threshold
+	PersistLogLevel string // disk persist threshold; default trace
+	SkipListener    bool
+	StartupDelay    time.Duration
+	ProgressTick    time.Duration
 
 	Verification VerifyOptions
 
@@ -106,6 +113,12 @@ type Config struct {
 	// WindowsCompat enables Windows desktop-sync overlays on soft cloud destinations
 	// (Dropbox, Box, Egnyte, ShareFile). Default false.
 	WindowsCompat bool
+	// OverwritePolicy selects exists-on-both file pairing: newest_mtime (default),
+	// decide (mark all for review), or source_wins (always prefer source).
+	OverwritePolicy string
+	// HashVerify streams SHA-256 of both SRC and DST for name-matched files during
+	// DST compare. Expensive; off by default.
+	HashVerify bool
 
 	// ShutdownContext is an optional context for force shutdown control.
 	ShutdownContext context.Context

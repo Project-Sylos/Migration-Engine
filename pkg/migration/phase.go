@@ -10,24 +10,24 @@ import (
 
 // Phase is the migration lifecycle state, stored as the canonical status string (lowercase-with-hyphens).
 const (
-	PhaseCreated              string = "roots-set"                 // Initial state; after user sets roots. TODO: when filter creation module lands, transition to filters-set before traversal.
-	PhaseFiltersSet           string = "filters-set"               // Ready for traversal
-	PhaseTraversing           string = "traversal-in-progress"     // Traversal running
-	PhaseTraversalSuspended   string = "traversal-suspended"       // Traversal stopped via soft suspend; resume with StartTraversal
-	PhaseTraversalFinalizing  string = "traversal-finalizing"      // Queues done; seal stop, indexes, checkpoint in progress
+	PhaseCreated                 string = "roots-set"                 // Initial state; after user sets roots. TODO: when filter creation module lands, transition to filters-set before traversal.
+	PhaseFiltersSet              string = "filters-set"               // Ready for traversal
+	PhaseTraversing              string = "traversal-in-progress"     // Traversal running
+	PhaseTraversalSuspended      string = "traversal-suspended"       // Traversal stopped via soft suspend; resume with StartTraversal
+	PhaseTraversalFinalizing     string = "traversal-finalizing"      // Queues done; seal stop, folder-size fold, checkpoint in progress
 	PhaseTraversalFinalizeFailed string = "traversal-finalize-failed" // Durable teardown failed; retry without re-running workers
-	PhaseTraversalReview      string = "awaiting-traversal-review" // Traversal done, user can review; can retry traversal or start copy
-	PhaseCopying              string = "copy-in-progress"          // Copy phase running
-	PhaseCopySuspended        string = "copy-suspended"            // Copy stopped via soft suspend; resume with StartCopy
-	PhaseCopyFinalizing       string = "copy-finalizing"
-	PhaseCopyFinalizeFailed   string = "copy-finalize-failed"
-	PhaseCopyReview           string = "awaiting-copy-review" // Copy done, user can review; can retry copy
-	PhaseDeleting             string = "delete-in-progress"   // Delete phase running
-	PhaseDeleteSuspended      string = "delete-suspended"     // Delete stopped via soft suspend
-	PhaseDeleteFinalizing     string = "delete-finalizing"
-	PhaseDeleteFinalizeFailed string = "delete-finalize-failed"
-	PhaseDeleteReview         string = "awaiting-delete-review" // Delete done, user can review; can retry delete
-	PhaseAborted              string = "aborted"               // Force-stopped; not resumable
+	PhaseTraversalReview         string = "awaiting-traversal-review" // Traversal done, user can review; can retry traversal or start copy
+	PhaseCopying                 string = "copy-in-progress"          // Copy phase running
+	PhaseCopySuspended           string = "copy-suspended"            // Copy stopped via soft suspend; resume with StartCopy
+	PhaseCopyFinalizing          string = "copy-finalizing"
+	PhaseCopyFinalizeFailed      string = "copy-finalize-failed"
+	PhaseCopyReview              string = "awaiting-copy-review" // Copy done, user can review; can retry copy
+	PhaseDeleting                string = "delete-in-progress"   // Delete phase running
+	PhaseDeleteSuspended         string = "delete-suspended"     // Delete stopped via soft suspend
+	PhaseDeleteFinalizing        string = "delete-finalizing"
+	PhaseDeleteFinalizeFailed    string = "delete-finalize-failed"
+	PhaseDeleteReview            string = "awaiting-delete-review" // Delete done, user can review; can retry delete
+	PhaseAborted                 string = "aborted" // Legacy hard-stop terminal; healed to *-suspended + unclean on resume/startup
 )
 
 // ParsePhase parses a canonical phase string from the DB (lowercase-with-hyphens).
@@ -114,7 +114,8 @@ func canTransition(from, to string) bool {
 	case PhaseDeleteReview:
 		return to == PhaseDeleting
 	case PhaseAborted:
-		return false
+		// Recoverable hard-stop: heal into the matching suspended phase for Resume.
+		return to == PhaseTraversalSuspended || to == PhaseCopySuspended || to == PhaseDeleteSuspended
 	default:
 		return false
 	}

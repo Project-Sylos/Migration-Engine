@@ -2,7 +2,7 @@
 # Copy Phase Test Runner
 # Copyright 2025 Sylos contributors
 # SPDX-License-Identifier: LGPL-2.1-or-later
-# Test DB is DuckDB at pkg/tests/copy/shared/main_test.db. If missing, it is generated (traversal from Spectra roots).
+# Test DB is at pkg/tests/copy/shared/main_test.db. If missing, it is generated (traversal from Spectra roots).
 
 set -e
 clear
@@ -15,9 +15,9 @@ destDB="pkg/tests/copy/shared/main_test.db"
 # Refresh test DB from seeded template when available.
 bash pkg/tests/copy/shared/setup.sh
 
-# Fallback: generate DuckDB if still missing (schema + roots only).
+# Fallback: generate DB if still missing (schema + roots only).
 if [ ! -f "$destDB" ]; then
-    echo "Test DB not found. Generating DuckDB (traversal from Spectra roots)..."
+    echo "Test DB not found. Generating DB (traversal from Spectra roots)..."
     go run ./cmd/gen_copy_test_db
     echo ""
 fi

@@ -10,24 +10,6 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
-func TestDstPullScanWindow(t *testing.T) {
-	cases := []struct {
-		limit int
-		want  int
-	}{
-		{1, db.DstPullScanWindowMin},
-		{500, 1000},
-		{501, 1002},
-		{3000, db.DstPullScanWindowMax},
-		{10000, db.DstPullScanWindowMax},
-	}
-	for _, tc := range cases {
-		if got := db.DstPullScanWindow(tc.limit); got != tc.want {
-			t.Errorf("dstPullScanWindow(%d)=%d want %d", tc.limit, got, tc.want)
-		}
-	}
-}
-
 func TestListDstBatchWithSrcChildren_lateJoinAndCursor(t *testing.T) {
 	database := db.TestOpen(t, "dst-pull")
 

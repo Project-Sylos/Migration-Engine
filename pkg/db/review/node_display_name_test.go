@@ -27,6 +27,7 @@ func TestMergedReviewNameComesFromStoredColumn(t *testing.T) {
 		ID:   db.DeterministicNodeID("DST", db.NodeTypeFile, "/Leftover*.txt"),
 		Path: "/Leftover*.txt", ParentPath: "/", Name: "LeftoverClean.txt",
 		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful,
+		CopyStatus: db.CopyStatusDestinationOnly,
 	}
 	seedReviewTree(t, database, []*db.NodeState{src}, []*db.NodeState{dstOnly}, nil)
 

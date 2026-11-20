@@ -54,6 +54,10 @@ You do not need every key prefix memorized. These families matter day to day:
 
 Status and catalog are **separate on purpose**: discovery can stamp many nodes; later phases rewrite status (and sometimes frontier) without rewriting the whole catalog row every time.
 
+**Finalize fold:** after traversal (and similar phase seals), `ChildSize` and `ChildCount` are folded up the tree into folder status rows. Rename / Accept progress uses those folded `ChildCount` totals — it does not live-count subtrees during the rename. See `pkg/opsdb` fold helpers.
+
+**GPL after Accept rename:** pending `gpl_status` revalidation walks the renamed subtree via `idx:path` under the new root (`Migration.RunGPLSweep`), not a global depth×ID pending hunt.
+
 For the full key table, see [pkg/db/README.md](../pkg/db/README.md). For status value meanings, see [item_statuses.md](./item_statuses.md).
 
 ---

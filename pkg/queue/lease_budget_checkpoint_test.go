@@ -13,6 +13,15 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
+func setRoundStatsCounts(q *Queue, round, expected, completed, failed int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	stats := q.getOrCreateRoundStatsUnlocked(round)
+	stats.Expected = expected
+	stats.Completed = completed
+	stats.Failed = failed
+}
+
 func fileTask(id string, size int64) *TaskBase {
 	return &TaskBase{
 		ID:   id,
@@ -370,7 +379,7 @@ func TestForceCheckoutDeferredOnly(t *testing.T) {
 
 func TestStaleLeaseEpochDropsCompletion(t *testing.T) {
 	q := NewQueue("copy", 3, 1, nil, nil)
-	q.SetRoundStatsCounts(1, 1, 0, 0)
+	setRoundStatsCounts(q, 1, 1, 0, 0)
 
 	task1 := fileTask("n-epoch", 10)
 	task1.Round = 1
@@ -446,7 +455,7 @@ func TestAttemptMarkerPersistsAtOffsetZero(t *testing.T) {
 func TestCompletedNeverExceedsExpectedAfterStaleDrop(t *testing.T) {
 	// Characterization: Completed must stay <= Expected when stale leases report success.
 	q := NewQueue("copy", 3, 1, nil, nil)
-	q.SetRoundStatsCounts(2, 2, 0, 0)
+	setRoundStatsCounts(q, 2, 2, 0, 0)
 
 	for i := 0; i < 5; i++ {
 		task := fileTask("n-bounds", 1)

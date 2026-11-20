@@ -128,9 +128,9 @@ See **`pkg/migration/README.md`** for **`PreparePhase`** (`PreparePhaseRetrySwee
 | **pkg/db**    | Persistence facade: open/close Badger ops (`OpsDir`), seal buffer, review/search, subtree mutations. |
 | **pkg/opsdb** | Badger key layout, pull/list/seal primitives, schema version, indexes. |
 | **pkg/queue** | Queue layer: BFS rounds, **Badger-backed pull** into `pendingBuff`, seal via seal buffer, coordinator, observer. |
-| **pkg/scaling** | Autoscaler: AIMD actuation from observer metrics; `QueueActuator` implemented by `*queue.Queue` (queue does not import scaling). |
+| **pkg/scaling** | Autoscaler: soft-cap actuation from observer metrics; `QueueActuator` implemented by `*queue.Queue` (queue does not import scaling). |
 | **pkg/migration** | Orchestration: **`MigrationManager`**, domain **`Migration`**, root seeding, traversal/copy/retry APIs, verification. No YAML helpers in-tree. |
-| **pkg/configs**   | JSON config loaders: buffer config, log service (UDP), Spectra. |
+| **pkg/configs**   | Path asset only: default `spectra.json` (no Go code). |
 | **pkg/logservice** | Dual-channel logging: UDP (level-filtered) and persistence to Badger `log:*` via `db.LogBuffer`. |
 
 ---
@@ -141,7 +141,7 @@ See **`pkg/migration/README.md`** for **`PreparePhase`** (`PreparePhaseRetrySwee
 
 - **[docs/ops_store_overview.md](./docs/ops_store_overview.md)** – Intro: how Badger is used in write-heavy vs review/search/filter phases.
 - **[docs/algorithms.md](./docs/algorithms.md)** – BFS traversal/copy/delete algorithms, streaming copy contract.
-- **[docs/autoscaler.md](./docs/autoscaler.md)** – Observer → AIMD loop, profiles, knobs, stall vs throttle.
+- **[docs/autoscaler.md](./docs/autoscaler.md)** – Observer → autoscaler loop, profiles, knobs, stall vs throttle.
 - **[docs/item_statuses.md](./docs/item_statuses.md)** – Traversal / copy / delete status semantics.
 - **[docs/fs_error_classification.md](./docs/fs_error_classification.md)** – Retry vs throttle axes, ambiguous errors.
 - **[docs/search_indexes.md](./docs/search_indexes.md)** – Path-segment and trigram review indexes.
@@ -152,8 +152,8 @@ See **`pkg/migration/README.md`** for **`PreparePhase`** (`PreparePhaseRetrySwee
 - **[pkg/migration/README.md](./pkg/migration/README.md)** – Entry points, manager lifecycle, retry sweep.
 - **[pkg/queue/README.md](./pkg/queue/README.md)** – Pull / lease / seal, coordinator, watchdogs, checkpoints.
 - **[pkg/db/README.md](./pkg/db/README.md)** – Badger key layout, SealBuffer, open/schema version.
-- **[pkg/scaling/README.md](./pkg/scaling/README.md)** – Autoscaler, AIMD, operation profiles, QueueActuator.
-- **[pkg/configs/README.md](./pkg/configs/README.md)** – JSON loaders (buffer, log service, Spectra).
+- **[pkg/scaling/README.md](./pkg/scaling/README.md)** – Autoscaler, soft-cap policy, operation profiles, QueueActuator.
+- **[pkg/configs/README.md](./pkg/configs/README.md)** – `spectra.json` path asset (no loaders).
 - **[pkg/logservice/README.md](./pkg/logservice/README.md)** – UDP and DB logging.
 - **[pkg/tests/README.md](./pkg/tests/README.md)** – Integration runners layout.
 

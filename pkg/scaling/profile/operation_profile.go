@@ -19,8 +19,8 @@ type FSPerformanceProfile struct {
 	ListPageStep                                          int // additive bump when doubling would not advance
 	PreferLargePages                                      bool
 
-	DefaultLeaseBatch, MaxLeaseBatch int
-	MinLeaseBatch                    int
+	DefaultLeaseBatch, MaxLeaseBatch   int
+	MinLeaseBatch                      int
 	DefaultRefillBatch, MaxRefillBatch int
 	MinRefillBatch                     int
 
@@ -43,14 +43,6 @@ func ClampInt(v, min, max int) int {
 		return max
 	}
 	return v
-}
-
-// EffectiveWorkers returns worker count from cfg or profile default.
-func EffectiveWorkers(cfgWorkers int, profile FSPerformanceProfile) int {
-	if cfgWorkers > 0 {
-		return ClampInt(cfgWorkers, profile.MinWorkers, profile.MaxWorkers)
-	}
-	return profile.DefaultWorkers
 }
 
 // QueueBatchSizing holds initial lease/refill batch sizes derived from a profile.
@@ -182,7 +174,7 @@ const (
 // UnboundedMaxWorkers is the autoscaler ceiling when an operation profile sets MaxWorkers=0.
 const UnboundedMaxWorkers = 32
 
-// DefaultWorkersForUnbounded is the startup worker count when DefaultWorkers=0 (AIMD probes up).
+// DefaultWorkersForUnbounded is the startup worker count when DefaultWorkers=0 (the autoscaler probes up).
 const DefaultWorkersForUnbounded = 2
 
 // DefaultMaxInterOpDelay is used when MaxInterOpDelay=0 in an operation profile.
@@ -190,8 +182,8 @@ const DefaultMaxInterOpDelay = 5 * time.Second
 
 // OperationProfile holds autoscaler bounds for one provider operation.
 type OperationProfile struct {
-	MinWorkers, DefaultWorkers, MaxWorkers int
-	MaxInterOpDelay                        time.Duration
+	MinWorkers, DefaultWorkers, MaxWorkers                int
+	MaxInterOpDelay                                       time.Duration
 	MinListPageSize, DefaultListPageSize, MaxListPageSize int
 	ListPageStep                                          int
 	PreferLargePages                                      bool
@@ -310,7 +302,7 @@ func buildSpectraOperationProfiles() ProviderOperationProfiles {
 }
 
 // spectraHighThroughputOp is for the synthetic FS: high concurrency by default.
-// Chaos rate limits (when enabled) still drive soft-cap AIMD downward.
+// Chaos rate limits (when enabled) still drive soft-cap scaling downward.
 func spectraHighThroughputOp() OperationProfile {
 	return OperationProfile{
 		MinWorkers:       1,

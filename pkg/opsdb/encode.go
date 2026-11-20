@@ -5,10 +5,6 @@ package opsdb
 
 import "encoding/json"
 
-func encode(v any) ([]byte, error) {
-	return json.Marshal(v)
-}
-
 func decodeNode(b []byte) (NodeRecord, error) {
 	var n NodeRecord
 	err := json.Unmarshal(b, &n)
@@ -49,8 +45,4 @@ func decodeDBOp(b []byte) (DBOpRecord, error) {
 	var rec DBOpRecord
 	err := json.Unmarshal(b, &rec)
 	return rec, err
-}
-
-func decodeInto(b []byte, v any) error {
-	return json.Unmarshal(b, v)
 }

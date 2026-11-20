@@ -31,7 +31,7 @@ func TestLiveBytesTransferredOverlay(t *testing.T) {
 	if got := q.GetLiveBytesTransferredTotal(); got != 1200 {
 		t.Fatalf("live mid-flight = %d, want 1200", got)
 	}
-	if got := q.GetBytesTransferredTotal(); got != 1000 {
+	if got := q.bytesTransferredTotal; got != 1000 {
 		t.Fatalf("completed total should stay 1000, got %d", got)
 	}
 
@@ -40,7 +40,7 @@ func TestLiveBytesTransferredOverlay(t *testing.T) {
 	if got := q.GetLiveBytesTransferredTotal(); got != 1200 {
 		t.Fatalf("live after complete = %d, want 1200 (continuous)", got)
 	}
-	if got := q.GetBytesTransferredTotal(); got != 1200 {
+	if got := q.bytesTransferredTotal; got != 1200 {
 		t.Fatalf("completed total after complete = %d, want 1200", got)
 	}
 }
@@ -73,7 +73,7 @@ func TestLiveBytesRemainderOnCompleteWithoutStream(t *testing.T) {
 	if got := q.GetLiveBytesTransferredTotal(); got != 500 {
 		t.Fatalf("live remainder=%d want 500", got)
 	}
-	if got := q.GetBytesTransferredTotal(); got != 500 {
+	if got := q.bytesTransferredTotal; got != 500 {
 		t.Fatalf("completed=%d want 500", got)
 	}
 }

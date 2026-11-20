@@ -50,7 +50,7 @@ func TestRehydrateCountersFromMetricsJSON(t *testing.T) {
 	if got := copyQ.GetFilesCreatedTotal(); got != 9 {
 		t.Fatalf("files created = %d, want 9", got)
 	}
-	if got := copyQ.GetBytesTransferredTotal(); got != 1024 {
+	if got := copyQ.GetLiveBytesTransferredTotal(); got != 1024 {
 		t.Fatalf("bytes = %d, want 1024", got)
 	}
 }

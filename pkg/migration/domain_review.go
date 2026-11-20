@@ -14,17 +14,32 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/review"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
+
+// reviewOrLaterPhase reports phases where diff listing, search, and stats are available.
+func reviewOrLaterPhase(phase string) bool {
+	switch phase {
+	case PhaseTraversalReview, PhaseCopying, PhaseCopyReview, PhaseDeleting, PhaseDeleteSuspended, PhaseDeleteReview:
+		return true
+	}
+	return false
+}
 
 // QueryNodes provides review-phase node search/filter without exposing SQL to API.
 func (m *Migration) QueryNodes(filter NodeQueryFilter) ([]db.NodeState, error) {
 	phase := m.Phase()
-	if phase != PhaseTraversalReview && phase != PhaseTraversalSuspended &&
-		phase != PhaseCopying && phase != PhaseCopySuspended && phase != PhaseCopyReview &&
-		phase != PhaseDeleting && phase != PhaseDeleteSuspended && phase != PhaseDeleteReview {
+	if !reviewOrLaterPhase(phase) && phase != PhaseTraversalSuspended && phase != PhaseCopySuspended {
 		return nil, fmt.Errorf("query nodes is only available after traversal reaches review phase")
 	}
 	return m.store.queryNodes(filter)
+}
+
+// mergeDeltas adds src into dst.
+func mergeDeltas(dst, src map[string]int64) {
+	for k, d := range src {
+		dst[k] += d
+	}
 }
 
 func pathReviewResult(affected int64, deltas map[string]int64) PathReviewActionResult {
@@ -36,46 +51,6 @@ func pathReviewResult(affected int64, deltas map[string]int64) PathReviewActionR
 
 func copyExclusionPhase(phase string) bool {
 	return phase == PhaseTraversalReview || phase == PhaseCopyReview
-}
-
-// SetNodeExcluded mutates review exclusions in engine-owned store.
-func (m *Migration) SetNodeExcluded(queueType, nodeID string, excluded bool) (PathReviewActionResult, error) {
-	if !copyExclusionPhase(m.Phase()) {
-		return PathReviewActionResult{}, fmt.Errorf("set node excluded requires awaiting-traversal-review or awaiting-copy-review phase")
-	}
-	return m.withPathMutation(nodeID, func() (PathReviewActionResult, error) {
-		n, deltas, err := m.store.setNodeExcluded(nodeID, excluded)
-		if err != nil {
-			return PathReviewActionResult{}, fmt.Errorf("set node excluded: %w", err)
-		}
-		return pathReviewResult(n, deltas), nil
-	})
-}
-
-// BulkExclude applies exclusion over a query slice.
-func (m *Migration) BulkExclude(filter NodeQueryFilter, excluded bool) (PathReviewActionResult, error) {
-	return m.withBulkMutation(func() (PathReviewActionResult, error) {
-		nodes, err := m.QueryNodes(filter)
-		if err != nil {
-			return PathReviewActionResult{}, err
-		}
-		var total int64
-		merged := make(map[string]int64)
-		for i := range nodes {
-			if nodes[i].Excluded == excluded {
-				continue
-			}
-			n, deltas, err := m.store.setNodeExcluded(nodes[i].ID, excluded)
-			if err != nil {
-				return pathReviewResult(total, merged), fmt.Errorf("bulk exclude %s: %w", nodes[i].ID, err)
-			}
-			total += n
-			for k, d := range deltas {
-				merged[k] += d
-			}
-		}
-		return pathReviewResult(total, merged), nil
-	})
 }
 
 // GetPathReviewStatsForView projects stats for a specific review UI.
@@ -243,18 +218,13 @@ const (
 	RetryMutationDiscovery RetryMutationKind = "discovery"
 	RetryMutationCopy      RetryMutationKind = "copy"
 	RetryMutationDelete    RetryMutationKind = "delete"
+	// RetryMutationForceReplace prefers source for exists-on-both (mark=true) or undoes it.
+	// Folders cascade to already_existed descendants; the folder container stays matched.
+	RetryMutationForceReplace RetryMutationKind = "force_replace"
+	// RetryMutationTraversalAck marks failed discovery nodes as intentionally ignored (mark=true,
+	// traversal_status = excluded) or restores acknowledged-from-failed nodes to failed. Does not enroll the discovery frontier.
+	RetryMutationTraversalAck RetryMutationKind = "traversal_ack"
 )
-
-// SetNodeCopyForceReplace prefers source for exists-on-both (mark=true) or undoes it.
-// Folders cascade to already_existed descendants; the folder container stays matched.
-func (m *Migration) SetNodeCopyForceReplace(nodeID string, mark bool) (PathReviewActionResult, error) {
-	return m.mutatePathReviewRetry(nodeID,
-		[]string{PhaseTraversalReview, PhaseCopying, PhaseCopyReview},
-		"force-replace requires traversal review, copying, or copy review phase",
-		func(id string) (int64, map[string]int64, error) {
-			return m.store.setNodeCopyForceReplace(id, mark)
-		})
-}
 
 // SetNodeRetryMark marks (mark=true) or clears (mark=false) a retry of the given kind.
 func (m *Migration) SetNodeRetryMark(kind RetryMutationKind, nodeID string, mark bool) (PathReviewActionResult, error) {
@@ -281,6 +251,19 @@ func (m *Migration) SetNodeRetryMark(kind RetryMutationKind, nodeID string, mark
 			func(id string) (int64, map[string]int64, error) {
 				return m.store.setNodeDeleteStatus(id, status)
 			})
+	case RetryMutationForceReplace:
+		return m.mutatePathReviewRetry(nodeID,
+			[]string{PhaseTraversalReview, PhaseCopying, PhaseCopyReview},
+			"force-replace requires traversal review, copying, or copy review phase",
+			func(id string) (int64, map[string]int64, error) {
+				return m.store.setNodeCopyForceReplace(id, mark)
+			})
+	case RetryMutationTraversalAck:
+		return m.mutatePathReviewRetry(nodeID, []string{PhaseTraversalReview},
+			"traversal acknowledge requires awaiting-traversal-review",
+			func(id string) (int64, map[string]int64, error) {
+				return m.store.setTraversalFailedAcknowledged(id, mark)
+			})
 	case RetryMutationDiscovery:
 		op := m.store.unmarkNodeForRetryDiscovery
 		if mark {
@@ -293,54 +276,34 @@ func (m *Migration) SetNodeRetryMark(kind RetryMutationKind, nodeID string, mark
 	}
 }
 
-// SkipNodeDelete opts a successfully copied SRC node out of source removal during cleanup planning.
-func (m *Migration) SkipNodeDelete(nodeID string) (PathReviewActionResult, error) {
-	if m.Phase() != PhaseCopyReview {
-		return PathReviewActionResult{}, fmt.Errorf("skip delete requires awaiting-copy-review phase")
+// SetNodeDeleteSkipped opts a SRC node out of source removal (skipped=true: plan pending, or
+// acknowledge failed on delete results) or re-includes it during cleanup planning (skipped=false).
+func (m *Migration) SetNodeDeleteSkipped(nodeID string, skipped bool) (PathReviewActionResult, error) {
+	allowed := []string{PhaseCopyReview, PhaseDeleteReview}
+	verb := "skip delete"
+	errMsg := "skip delete requires awaiting-copy-review or awaiting-delete-review"
+	target := db.DeleteStatusSkipped
+	if !skipped {
+		allowed = []string{PhaseCopyReview}
+		verb = "unskip delete"
+		errMsg = "unskip delete requires awaiting-copy-review phase"
+		target = db.DeleteStatusPendingExplicit
 	}
-	return m.withPathMutation(nodeID, func() (PathReviewActionResult, error) {
-		node, err := pull.GetNodeByID(m.DB, "SRC", nodeID)
+	return m.mutatePathReviewRetry(nodeID, allowed, errMsg, func(id string) (int64, map[string]int64, error) {
+		node, err := pull.GetNodeByID(m.DB, "SRC", id)
 		if err != nil {
-			return PathReviewActionResult{}, err
+			return 0, nil, err
 		}
 		if node == nil {
-			return PathReviewActionResult{}, fmt.Errorf("node %s not found in SRC", nodeID)
+			return 0, nil, fmt.Errorf("node %s not found in SRC", id)
 		}
 		if !db.CopyStatusIsComplete(node.CopyStatus) {
-			return PathReviewActionResult{}, fmt.Errorf("skip delete requires copy complete (successful or already_existed)")
+			return 0, nil, fmt.Errorf("%s requires copy complete (successful or already_existed)", verb)
 		}
-		n, deltas, err := m.store.setNodeDeleteStatusWithPropagation(nodeID, db.DeleteStatusSkipped)
-		if err != nil {
-			return PathReviewActionResult{}, err
+		if !skipped && node.DeleteStatus == db.DeleteStatusDeleted {
+			return 0, nil, fmt.Errorf("cannot unskip already deleted node")
 		}
-		return pathReviewResult(n, deltas), nil
-	})
-}
-
-// UnskipNodeDelete re-includes a SRC node in source removal during cleanup planning.
-func (m *Migration) UnskipNodeDelete(nodeID string) (PathReviewActionResult, error) {
-	if m.Phase() != PhaseCopyReview {
-		return PathReviewActionResult{}, fmt.Errorf("unskip delete requires awaiting-copy-review phase")
-	}
-	return m.withPathMutation(nodeID, func() (PathReviewActionResult, error) {
-		node, err := pull.GetNodeByID(m.DB, "SRC", nodeID)
-		if err != nil {
-			return PathReviewActionResult{}, err
-		}
-		if node == nil {
-			return PathReviewActionResult{}, fmt.Errorf("node %s not found in SRC", nodeID)
-		}
-		if !db.CopyStatusIsComplete(node.CopyStatus) {
-			return PathReviewActionResult{}, fmt.Errorf("unskip delete requires copy complete (successful or already_existed)")
-		}
-		if node.DeleteStatus == db.DeleteStatusDeleted {
-			return PathReviewActionResult{}, fmt.Errorf("cannot unskip already deleted node")
-		}
-		n, deltas, err := m.store.setNodeDeleteStatusWithPropagation(nodeID, db.DeleteStatusPendingExplicit)
-		if err != nil {
-			return PathReviewActionResult{}, err
-		}
-		return pathReviewResult(n, deltas), nil
+		return m.store.setNodeDeleteStatusWithPropagation(id, target)
 	})
 }
 
@@ -382,7 +345,9 @@ func (m *Migration) PrepareSourceCleanup(keepNodeIDs, deselectedNodeIDs []string
 				addReviewDelta(deltas, DeltaSizeDeleteSelected, seeded.SelectedBytes)
 				addReviewDelta(deltas, DeltaSizeSelected, seeded.SelectedBytes)
 			}
-			_ = m.store.persistReviewDeltas(deltas)
+			if err := m.store.persistReviewDeltas(deltas); err != nil {
+				return PathReviewActionResult{}, fmt.Errorf("persist review deltas: %w", err)
+			}
 		}
 		return pathReviewResult(seeded.Affected, deltas), nil
 	}
@@ -440,69 +405,61 @@ func (m *Migration) PrepareSourceCleanup(keepNodeIDs, deselectedNodeIDs []string
 				return pathReviewResult(total, merged), err
 			}
 			total += n
-			for k, v := range deltas {
-				merged[k] += v
-			}
+			mergeDeltas(merged, deltas)
 		}
 		if len(nodes) < pageSize {
 			break
 		}
 		offset += pageSize
 	}
-	_ = m.DB.NormalizeDeleteForestOps()
+	if err := m.DB.NormalizeDeleteForestOps(); err != nil {
+		return pathReviewResult(total, merged), fmt.Errorf("normalize delete forest: %w", err)
+	}
 	return pathReviewResult(total, merged), nil
 }
 
-func (m *Migration) RetryAllFailed() (PathReviewActionResult, error) {
-	if m.Phase() != PhaseTraversalReview {
-		return PathReviewActionResult{}, fmt.Errorf("retry all failed requires awaiting-traversal-review phase")
-	}
-	srcFailed, err := m.store.queryNodes(NodeQueryFilter{Queue: "SRC", Status: db.StatusFailed, Limit: 100000})
+// excludeNodePhaseAware picks traversal-ack, delete-skip, or copy-exclusion by phase/status.
+func (m *Migration) excludeNodePhaseAware(nodeID string, excluded bool) (int64, map[string]int64, error) {
+	phase := m.Phase()
+	node, err := pull.GetNodeByID(m.DB, "SRC", nodeID)
 	if err != nil {
-		return PathReviewActionResult{}, err
+		return 0, nil, err
 	}
-	var total int64
-	merged := make(map[string]int64)
-	for i := range srcFailed {
-		n, deltas, err := m.store.markNodeForRetryDiscovery(srcFailed[i].ID)
-		if err != nil {
-			return pathReviewResult(total, merged), err
-		}
-		total += n
-		for k, v := range deltas {
-			merged[k] += v
-		}
+	if node == nil {
+		return 0, nil, fmt.Errorf("node %s not found in SRC", nodeID)
 	}
-	dstFailed, err := m.store.queryNodes(NodeQueryFilter{Queue: "DST", Status: db.StatusFailed, Limit: 100000})
-	if err != nil {
-		return pathReviewResult(total, merged), err
-	}
-	for i := range dstFailed {
-		src, _, err := m.store.reviewPairFromID(dstFailed[i].ID)
-		if err != nil {
-			return pathReviewResult(total, merged), err
+	if phase == PhaseTraversalReview {
+		if excluded && node.TraversalStatus == db.StatusFailed {
+			return m.store.setTraversalFailedAcknowledged(nodeID, true)
 		}
-		if src != nil {
-			continue
-		}
-		n, deltas, err := m.store.markNodeForRetryDiscovery(dstFailed[i].ID)
-		if err != nil {
-			return pathReviewResult(total, merged), err
-		}
-		total += n
-		for k, v := range deltas {
-			merged[k] += v
+		if !excluded && opsdb.IsTraversalAckFromFailed(node.ExclusionSource) {
+			return m.store.setTraversalFailedAcknowledged(nodeID, false)
 		}
 	}
-	return pathReviewResult(total, merged), nil
+	if phase == PhaseDeleteReview {
+		if excluded && node.DeleteStatus == db.DeleteStatusFailed {
+			return m.store.setNodeDeleteStatusWithPropagation(nodeID, db.DeleteStatusSkipped)
+		}
+		if !excluded && node.DeleteStatus == db.DeleteStatusSkipped {
+			return m.store.setNodeDeleteStatusWithPropagation(nodeID, db.DeleteStatusPendingExplicit)
+		}
+		return 0, nil, nil
+	}
+	// Post-copy review: re-including an ordinary exclusion queues it as
+	// retry-marked pending so the retry CTA and copyPendingRetry update.
+	if phase == PhaseCopyReview && !excluded {
+		return m.store.setNodeExcludedAsRetry(nodeID)
+	}
+	return m.store.setNodeExcluded(nodeID, excluded)
 }
 
 func (m *Migration) SetNodeExcludedWithPropagation(queueType, nodeID string, excluded bool) (PathReviewActionResult, error) {
-	if !copyExclusionPhase(m.Phase()) {
-		return PathReviewActionResult{}, fmt.Errorf("exclusion propagation requires awaiting-traversal-review or awaiting-copy-review phase")
+	phase := m.Phase()
+	if phase != PhaseTraversalReview && phase != PhaseCopyReview && phase != PhaseDeleteReview {
+		return PathReviewActionResult{}, fmt.Errorf("exclusion propagation requires a review phase")
 	}
 	return m.withPathMutation(nodeID, func() (PathReviewActionResult, error) {
-		n, deltas, err := m.store.setNodeExcludedWithPropagation(nodeID, excluded)
+		n, deltas, err := m.excludeNodePhaseAware(nodeID, excluded)
 		if err != nil {
 			return PathReviewActionResult{}, err
 		}
@@ -511,6 +468,10 @@ func (m *Migration) SetNodeExcludedWithPropagation(queueType, nodeID string, exc
 }
 
 func (m *Migration) BulkExcludeWithPropagation(filter NodeQueryFilter, excluded bool) (PathReviewActionResult, error) {
+	phase := m.Phase()
+	if phase != PhaseTraversalReview && phase != PhaseCopyReview && phase != PhaseDeleteReview {
+		return PathReviewActionResult{}, fmt.Errorf("bulk exclusion requires a review phase")
+	}
 	return m.withBulkMutation(func() (PathReviewActionResult, error) {
 		nodes, err := m.QueryNodes(filter)
 		if err != nil {
@@ -519,26 +480,29 @@ func (m *Migration) BulkExcludeWithPropagation(filter NodeQueryFilter, excluded 
 		var total int64
 		merged := make(map[string]int64)
 		for i := range nodes {
-			n, deltas, err := m.store.setNodeExcludedWithPropagation(nodes[i].ID, excluded)
+			n, deltas, err := m.excludeNodePhaseAware(nodes[i].ID, excluded)
 			if err != nil {
 				return pathReviewResult(total, merged), err
 			}
 			total += n
-			for k, d := range deltas {
-				merged[k] += d
-			}
+			mergeDeltas(merged, deltas)
 		}
 		return pathReviewResult(total, merged), nil
 	})
 }
 
-// ApplySearchExclusion excludes pending SRC nodes matching the same predicate as
-// path-review search (flat conditions and/or ruleset), minus exceptIDs.
-func (m *Migration) ApplySearchExclusion(req SearchRequest, exceptIDs []string, applicationID string) (PathReviewActionResult, error) {
-	if !copyExclusionPhase(m.Phase()) {
-		return PathReviewActionResult{}, fmt.Errorf("search exclusion requires awaiting-traversal-review or awaiting-copy-review phase")
+// ApplySearchExclusion excludes (excluded=true) pending SRC nodes matching the same predicate as
+// path-review search (flat conditions and/or ruleset), minus exceptIDs, or restores pending for
+// excluded matches (excluded=false). applicationID is required when excluding and ignored otherwise.
+func (m *Migration) ApplySearchExclusion(req SearchRequest, excluded bool, exceptIDs []string, applicationID string) (PathReviewActionResult, error) {
+	verb := "unexclusion"
+	if excluded {
+		verb = "exclusion"
 	}
-	if applicationID == "" {
+	if !copyExclusionPhase(m.Phase()) {
+		return PathReviewActionResult{}, fmt.Errorf("search %s requires awaiting-traversal-review or awaiting-copy-review phase", verb)
+	}
+	if excluded && applicationID == "" {
 		return PathReviewActionResult{}, fmt.Errorf("filter application id required")
 	}
 	return m.withBulkMutation(func() (PathReviewActionResult, error) {
@@ -553,9 +517,8 @@ func (m *Migration) ApplySearchExclusion(req SearchRequest, exceptIDs []string, 
 		if err != nil {
 			return PathReviewActionResult{}, fmt.Errorf("marshal search criteria: %w", err)
 		}
-		now := time.Now().UTC()
 		n, deltas, err := m.store.applySearchExclusion(
-			f, string(criteriaJSON), exceptIDs, applicationID, now.UnixNano(),
+			excluded, f, string(criteriaJSON), exceptIDs, applicationID, time.Now().UTC().UnixNano(),
 		)
 		if err != nil {
 			return PathReviewActionResult{}, err
@@ -564,50 +527,19 @@ func (m *Migration) ApplySearchExclusion(req SearchRequest, exceptIDs []string, 
 	})
 }
 
-// ApplySearchUnexclusion restores pending for excluded SRC nodes matching the
-// same predicate as path-review search, minus exceptIDs.
-func (m *Migration) ApplySearchUnexclusion(req SearchRequest, exceptIDs []string) (PathReviewActionResult, error) {
-	if !copyExclusionPhase(m.Phase()) {
-		return PathReviewActionResult{}, fmt.Errorf("search unexclusion requires awaiting-traversal-review or awaiting-copy-review phase")
-	}
-	return m.withBulkMutation(func() (PathReviewActionResult, error) {
-		f, err := searchRequestToReviewFilter(req)
-		if err != nil {
-			return PathReviewActionResult{}, err
-		}
-		if !review.ReviewFilterHasSearchPredicate(f) {
-			return PathReviewActionResult{}, fmt.Errorf("search predicate required")
-		}
-		now := time.Now().UTC()
-		n, deltas, err := m.store.applySearchUnexclusion(f, exceptIDs, now.UnixNano())
-		if err != nil {
-			return PathReviewActionResult{}, err
-		}
-		return pathReviewResult(n, deltas), nil
-	})
-}
-
 func (m *Migration) ListChildrenDiffs(req ListChildrenDiffsRequest) (ListChildrenDiffsResult, error) {
-	phase := m.Phase()
-	if phase != PhaseTraversalReview && phase != PhaseCopying && phase != PhaseCopyReview &&
-		phase != PhaseDeleting && phase != PhaseDeleteSuspended && phase != PhaseDeleteReview {
+	if !reviewOrLaterPhase(m.Phase()) {
 		return ListChildrenDiffsResult{}, fmt.Errorf("diff listing requires review or later phase")
 	}
 	return m.store.listChildrenDiffs(req)
 }
 
 func (m *Migration) SearchPathReviewItems(ctx context.Context, req SearchRequest) (SearchResult, error) {
-	phase := m.Phase()
-	if phase != PhaseTraversalReview && phase != PhaseCopying && phase != PhaseCopyReview &&
-		phase != PhaseDeleting && phase != PhaseDeleteSuspended && phase != PhaseDeleteReview {
+	if !reviewOrLaterPhase(m.Phase()) {
 		return SearchResult{}, fmt.Errorf("search requires review or later phase")
 	}
-	f, err := searchRequestToReviewFilter(req)
-	if err != nil {
+	if _, err := searchRequestToReviewFilter(req); err != nil {
 		return SearchResult{}, err
-	}
-	if !review.ReviewFilterHasSearchPredicate(f) {
-		return SearchResult{}, ErrSearchRequiresFilter
 	}
 	readCtx, cancel := m.BeginInteractiveRead(ctx)
 	defer cancel()
@@ -615,9 +547,7 @@ func (m *Migration) SearchPathReviewItems(ctx context.Context, req SearchRequest
 }
 
 func (m *Migration) GetChildrenDiffsStats(path string, foldersOnly bool, includeDestinationOnly *bool) (DiffsStats, error) {
-	phase := m.Phase()
-	if phase != PhaseTraversalReview && phase != PhaseCopying && phase != PhaseCopyReview &&
-		phase != PhaseDeleting && phase != PhaseDeleteSuspended && phase != PhaseDeleteReview {
+	if !reviewOrLaterPhase(m.Phase()) {
 		return DiffsStats{}, fmt.Errorf("diff stats requires review or later phase")
 	}
 	return m.store.getChildrenDiffsStats(path, foldersOnly, includeDestinationOnly)
@@ -625,9 +555,7 @@ func (m *Migration) GetChildrenDiffsStats(path string, foldersOnly bool, include
 
 // GetSearchStats returns aggregate counts for the same filter as SearchPathReviewItems (query, path, status, foldersOnly).
 func (m *Migration) GetSearchStats(ctx context.Context, req SearchRequest) (DiffsStats, error) {
-	phase := m.Phase()
-	if phase != PhaseTraversalReview && phase != PhaseCopying && phase != PhaseCopyReview &&
-		phase != PhaseDeleting && phase != PhaseDeleteSuspended && phase != PhaseDeleteReview {
+	if !reviewOrLaterPhase(m.Phase()) {
 		return DiffsStats{}, fmt.Errorf("search stats requires review or later phase")
 	}
 	readCtx, cancel := m.BeginInteractiveRead(ctx)
@@ -641,7 +569,7 @@ func (m *Migration) GetQueueMetrics() (QueueMetricsSnapshot, error) {
 			return queueMetricsSnapshotFromRawJSON(raw), nil
 		}
 		// A live observer exists but has not produced its first memory snapshot yet.
-		// Never fall back to DuckDB on a live API request.
+		// Never fall back to DB on a live API request.
 		return QueueMetricsSnapshot{Queues: make(map[string]map[string]any)}, nil
 	}
 	if m.IsLive() {
@@ -704,13 +632,22 @@ func (m *Migration) GetRecentLogs(limit int) ([]LogEntry, error) {
 	return m.store.listRecentLogs(limit)
 }
 
+// SearchLogs queries the logs sidecar (exact text, time range, action, node).
+func (m *Migration) SearchLogs(q opsdb.LogSearchQuery) ([]LogEntry, error) {
+	return m.store.searchLogs(q)
+}
+
 func (m *Migration) liveRecentLogs(limit int) []LogEntry {
 	var out []LogEntry
 	if logservice.LS != nil {
 		live := logservice.LS.Recent(limit)
 		out = make([]LogEntry, 0, len(live))
 		for _, e := range live {
-			out = append(out, LogEntry{ID: e.ID, Timestamp: e.At, Level: e.Level, Message: e.Message})
+			out = append(out, LogEntry{
+				ID: e.ID, Timestamp: e.At, Level: e.Level, Message: e.Message,
+				Entity: e.Entity, EntityID: e.EntityID, Queue: e.Queue,
+				Action: e.Action, NodeID: e.NodeID,
+			})
 		}
 	}
 	m.mu.RLock()

@@ -92,7 +92,7 @@ func runTest() error {
 		ProgressTick:      time.Second,
 	}
 	autoscaler := migration.DefaultAutoscalerConfig()
-	autoscaler.DebugAIMD = true
+	autoscaler.DebugAutoscaler = true
 	autoscaler.OnEvent = logScalingEvent
 	localOpts.Autoscaler = autoscaler
 	fmt.Println("  autoscaler: enabled (default)")

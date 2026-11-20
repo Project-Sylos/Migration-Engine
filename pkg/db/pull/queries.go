@@ -27,6 +27,7 @@ func nodeFromOps(rec opsdb.NodeRecord, st opsdb.StatusRecord) *db.NodeState {
 		Path:            rec.Path,
 		ParentPath:      rec.ParentPath,
 		Name:            rec.Name,
+		Extension:       rec.Extension,
 		DisplayPath:     rec.DisplayPath,
 		Type:            rec.Type,
 		Size:            rec.Size,
@@ -37,25 +38,6 @@ func nodeFromOps(rec opsdb.NodeRecord, st opsdb.StatusRecord) *db.NodeState {
 	}
 	db.HydrateNodeFromOps(n, st)
 	return n
-}
-
-func nodeFromKid(k opsdb.KidRecord) *db.NodeState {
-	return nodeFromOps(opsdb.NodeRecord{
-		ID:              k.ID,
-		ServiceID:       k.ServiceID,
-		ParentServiceID: k.ParentServiceID,
-		Path:            k.Path,
-		ParentPath:      k.ParentPath,
-		Name:            k.Name,
-		Type:            k.Type,
-		Size:            k.Size,
-		MTime:           k.MTime,
-		Depth:           k.Depth,
-	}, opsdb.StatusRecord{
-		TraversalStatus: k.TraversalStatus,
-		CopyStatus:      k.CopyStatus,
-		DeleteStatus:    k.DeleteStatus,
-	})
 }
 
 func loadNodes(d *db.DB, side string, ids []string) ([]*db.NodeState, error) {
@@ -185,11 +167,6 @@ func GetChildrenByParentID(d *db.DB, table, parentID string, limit int) ([]*db.N
 	return loadNodes(d, opsSide(table), ids)
 }
 
-// GetChildrenIDsByParentID returns child ids for the given parent_id (up to limit).
-func GetChildrenIDsByParentID(d *db.DB, table, parentID string, limit int) ([]string, error) {
-	return d.Ops().ListChildren(opsSide(table), parentID, "", limit)
-}
-
 // ListNodesPendingAtDepthKeyset returns traversal frontier nodes at depth from Badger.
 func ListNodesPendingAtDepthKeyset(d *db.DB, table string, depth int, afterID string, limit int, nodeType string) ([]db.FetchResult, error) {
 	if limit <= 0 {
@@ -202,46 +179,6 @@ func ListNodesPendingAtDepthKeyset(d *db.DB, table string, depth int, afterID st
 	}
 	d.RecordOp(db.OpBadgerPull, "ListNodesPendingAtDepthKeyset", int64(len(results)), time.Since(start), nil)
 	return results, nil
-}
-
-// ListNodesByDepthKeyset returns nodes at depth ordered by id after afterID.
-func ListNodesByDepthKeyset(d *db.DB, table string, depth int, afterID, statusFilter string, limit int) ([]db.FetchResult, error) {
-	if limit <= 0 {
-		return nil, nil
-	}
-	side := opsSide(table)
-	cursor := afterID
-	out := make([]db.FetchResult, 0, limit)
-	for len(out) < limit {
-		ids, err := d.Ops().ListNodeIDs(side, cursor, db.PullKeysetWindowSize)
-		if err != nil {
-			return nil, err
-		}
-		if len(ids) == 0 {
-			break
-		}
-		nodes, err := loadNodes(d, side, ids)
-		if err != nil {
-			return nil, err
-		}
-		for _, n := range nodes {
-			if n == nil || n.Depth != depth {
-				continue
-			}
-			if statusFilter != "" && n.TraversalStatus != statusFilter {
-				continue
-			}
-			out = append(out, db.FetchResult{Key: n.ID, State: n})
-			if len(out) >= limit {
-				return out, nil
-			}
-		}
-		cursor = ids[len(ids)-1]
-		if len(ids) < db.PullKeysetWindowSize {
-			break
-		}
-	}
-	return out, nil
 }
 
 func listSrcPhaseKeyset(d *db.DB, phase string, depth int, nodeType, afterID string, limit int) ([]db.FetchResult, error) {
@@ -549,7 +486,22 @@ func hydrateSrcChildrenForDstBatch(d *db.DB, results []db.FetchResult) (map[stri
 		if kids := packs[m.SrcID]; len(kids) > 0 {
 			children := make([]*db.NodeState, 0, len(kids))
 			for _, k := range kids {
-				children = append(children, nodeFromKid(k))
+				children = append(children, nodeFromOps(opsdb.NodeRecord{
+					ID:              k.ID,
+					ServiceID:       k.ServiceID,
+					ParentServiceID: k.ParentServiceID,
+					Path:            k.Path,
+					ParentPath:      k.ParentPath,
+					Name:            k.Name,
+					Type:            k.Type,
+					Size:            k.Size,
+					MTime:           k.MTime,
+					Depth:           k.Depth,
+				}, opsdb.StatusRecord{
+					TraversalStatus: k.TraversalStatus,
+					CopyStatus:      k.CopyStatus,
+					DeleteStatus:    k.DeleteStatus,
+				}))
 			}
 			childrenByParent[fr.State.ID] = children
 			continue
@@ -586,19 +538,6 @@ func GetSrcChildrenGroupedByParentPath(d *db.DB, parentPaths []string) (map[stri
 	return out, nil
 }
 
-// GetDstIDToSrcPath returns for each DST id the path (SRC join key).
-func GetDstIDToSrcPath(d *db.DB, dstIDs []string) (map[string]string, error) {
-	out := make(map[string]string)
-	for _, id := range dstIDs {
-		n, err := GetNodeByID(d, "DST", id)
-		if err != nil || n == nil {
-			continue
-		}
-		out[id] = n.Path
-	}
-	return out, nil
-}
-
 // GetDstIDFromSrcID returns the DST node id mapped to the given SRC node id.
 func GetDstIDFromSrcID(d *db.DB, srcParentID string) (string, error) {
 	m, ok, err := d.Ops().GetMapBySrc(srcParentID)
@@ -625,22 +564,6 @@ func BatchGetDstIDsFromSrcIDs(d *db.DB, srcIDs []string) (map[string]string, err
 		if m.DstID != "" {
 			out[srcID] = m.DstID
 		}
-	}
-	return out, nil
-}
-
-// BatchGetNodesByID returns nodes by id for the given table.
-func BatchGetNodesByID(d *db.DB, table string, ids []string) (map[string]*db.NodeState, error) {
-	out := make(map[string]*db.NodeState)
-	if len(ids) == 0 {
-		return out, nil
-	}
-	nodes, err := loadNodes(d, opsSide(table), ids)
-	if err != nil {
-		return nil, err
-	}
-	for _, n := range nodes {
-		out[n.ID] = n
 	}
 	return out, nil
 }

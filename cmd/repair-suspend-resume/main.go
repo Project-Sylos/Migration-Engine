@@ -3,7 +3,7 @@
 
 // repair-suspend-resume patches runtime_state_json.suspend_v1 so ProgressMonitor Resume
 // continues the unfinished traversal round instead of a retry sweep from 0.
-// Stop Sylos (or soft-stop the migration) first; DuckDB is single-writer.
+// Stop Sylos (or soft-stop the migration) first; DB is single-writer.
 //
 //	go run ./cmd/repair-suspend-resume -db /path/to/migration.db
 //	go run ./cmd/repair-suspend-resume -db /path/to/migration.db -src-fallback 7 -id migration-...
@@ -19,10 +19,10 @@ import (
 )
 
 func main() {
-	dbPath := flag.String("db", "", "path to migration DuckDB file")
+	dbPath := flag.String("db", "", "path to migration DB file")
 	srcFallback := flag.Int("src-fallback", 7, "SRC last_round when suspend_v1 has no last_round_src")
 	migrationID := flag.String("id", "", "migration_id if the db has more than one migrations row")
-	memoryGB := flag.Int("memory-gb", 12, "DuckDB PRAGMA memory_limit in GB")
+	memoryGB := flag.Int("memory-gb", 12, "DB memory limit in GB")
 	flag.Parse()
 	if *dbPath == "" {
 		fmt.Fprintln(os.Stderr, "usage: repair-suspend-resume -db /path/to/migration.db [-src-fallback 7] [-id ID]")

@@ -18,7 +18,6 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/review"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
-	"codeberg.org/Sylos/Migration-Engine/pkg/db/subtree"
 	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
 	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
@@ -102,6 +101,8 @@ func mergedRowToDiffItem(r review.MergedReviewRow) DiffItem {
 		Type:                   r.Type,
 		SrcNodeID:              r.SrcNodeID,
 		DstNodeID:              r.DstNodeID,
+		SrcPath:                strings.TrimSpace(r.SrcPath),
+		DstPath:                strings.TrimSpace(r.DstPath),
 		SrcTraversalStatus:     r.SrcTraversalStatus,
 		DstTraversalStatus:     r.DstTraversalStatus,
 		CopyStatus:             db.CopyStatusForDisplay(r.CopyStatus),
@@ -110,12 +111,14 @@ func mergedRowToDiffItem(r review.MergedReviewRow) DiffItem {
 		CopyRetryMarked:        r.CopyRetryMarked,
 		CopyExcludedFromFailed: r.CopyExcludedFromFailed,
 		CopyForceReplaceMarked: r.CopyForceReplaceMarked,
+		TraversalAckFromFailed: r.TraversalAckFromFailed,
 		Size:                   r.Size,
 		DstSize:                r.DstSize,
 		HasDstSize:             r.HasDstSize,
 		MissingOnSource:        r.SrcNodeID == "",
 		MissingOnDest:          r.DstNodeID == "",
 		ResolvedDstName:        strings.TrimSpace(r.ResolvedDstName),
+		PathDstAction:          strings.TrimSpace(r.PathDstAction),
 	}
 	if item.MissingOnSource {
 		item.CopyStatus = ""
@@ -274,84 +277,15 @@ func addPendingTypeCountDelta(deltas map[string]int64, nodeType string, sign int
 	}
 }
 
-func copyStatusIsComplete(status string) bool {
-	switch status {
-	case db.CopyStatusSuccessful, db.CopyStatusAlreadyExisted:
-		return true
-	default:
-		return false
-	}
-}
-
-// addDeleteSelectedSizeDelta adjusts source-cleanup Selected bytes when a copy-complete
-// file enters/leaves delete_status=pending. Persists size_delete_selected (not copy size_selected).
-// Also emits optimistic folders/files deltas (same selected-set semantics as Selected).
-// API still exposes the byte value as sizeSelected for the Path Review footer.
-func addDeleteSelectedSizeDelta(deltas map[string]int64, node *db.NodeState, from, to string) {
-	if node == nil || !copyStatusIsComplete(node.CopyStatus) {
-		return
-	}
-	wasPending := statusCountsAsPending(from, db.DeleteStatusPendingExplicit)
-	nowPending := statusCountsAsPending(to, db.DeleteStatusPendingExplicit)
-	var sign int64
-	switch {
-	case wasPending && !nowPending:
-		sign = -1
-	case !wasPending && nowPending:
-		sign = 1
-	default:
-		return
-	}
-	addPendingTypeCountDelta(deltas, node.Type, sign)
-	if node.Type != db.NodeTypeFile || node.Size == 0 {
-		return
-	}
-	addReviewDelta(deltas, DeltaSizeDeleteSelected, sign*node.Size)
-	// Mirror into sizeSelected so existing UI optimistic applyStatsDeltas keeps working.
-	addReviewDelta(deltas, DeltaSizeSelected, sign*node.Size)
-}
-
-func (s *migrationStore) setNodeExcluded(nodeID string, excluded bool) (int64, map[string]int64, error) {
-	// Exclude/unexclude is SRC-only. Pending/empty ↔ excluded only.
-	node, err := pull.GetNodeByID(s.db, "SRC", nodeID)
-	if err != nil {
-		return 0, nil, err
-	}
-	if node == nil {
-		return 0, nil, fmt.Errorf("node %s not found in SRC", nodeID)
-	}
-	if excluded {
-		if node.Excluded || !statusCountsAsPending(node.CopyStatus, db.CopyStatusPending) {
-			return 0, nil, nil
-		}
-	} else {
-		if !node.Excluded {
-			return 0, nil, nil
-		}
-	}
-	mut, err := s.db.ApplyNodeCopyExclusion(nodeID, excluded)
-	if err != nil {
-		return 0, nil, err
-	}
-	if mut.Affected == 0 {
-		return 0, nil, nil
-	}
-	subMut := subtree.SubtreeCopyMutationResult{
-		Affected: mut.Affected, Folders: mut.Folders, Files: mut.Files, PendingBytes: mut.PendingBytes,
-		RestoredFailed: mut.RestoredFailed, RetryExcluded: mut.RetryExcluded,
-	}
-	deltas, err := s.persistCopyExclusionMutation(subMut, excluded)
-	if err != nil {
-		return 0, nil, err
-	}
-	return mut.Affected, deltas, nil
-}
-
 func (s *migrationStore) listRecentLogs(limit int) ([]LogEntry, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	recs, err := s.db.Ops().ListRecentLogs(limit)
+	store := s.db.Logs()
+	if store == nil {
+		return nil, fmt.Errorf("logs sidecar not open")
+	}
+	recs, err := store.ListRecentLogs(limit)
 	if err != nil {
 		return nil, fmt.Errorf("get recent logs: %w", err)
 	}
@@ -366,6 +300,35 @@ func (s *migrationStore) listRecentLogs(limit int) ([]LogEntry, error) {
 			Timestamp: ts,
 			Level:     rec.Level,
 			Message:   rec.Message,
+			Entity:    rec.Entity,
+			EntityID:  rec.EntityID,
+			Queue:     rec.Queue,
+			Action:    rec.Action,
+			NodeID:    rec.NodeID,
+		})
+	}
+	return out, nil
+}
+
+func (s *migrationStore) searchLogs(q opsdb.LogSearchQuery) ([]LogEntry, error) {
+	store := s.db.Logs()
+	if store == nil {
+		return nil, fmt.Errorf("logs sidecar not open")
+	}
+	recs, err := store.SearchLogs(q)
+	if err != nil {
+		return nil, fmt.Errorf("search logs: %w", err)
+	}
+	out := make([]LogEntry, 0, len(recs))
+	for _, rec := range recs {
+		ts := rec.At
+		if ts.IsZero() {
+			ts = time.Now()
+		}
+		out = append(out, LogEntry{
+			ID: rec.ID, Timestamp: ts, Level: rec.Level, Message: rec.Message,
+			Entity: rec.Entity, EntityID: rec.EntityID, Queue: rec.Queue,
+			Action: rec.Action, NodeID: rec.NodeID,
 		})
 	}
 	return out, nil
@@ -394,9 +357,9 @@ func (s *migrationStore) setNodeCopyStatus(nodeID, status string) (int64, map[st
 	mark := status == db.CopyStatusPending
 	var opsMut opsdb.SubtreeMutationResult
 	if node.Type == db.NodeTypeFolder {
-		opsMut, err = s.db.Ops().ApplySubtreeCopyRetry(node.Path, mark)
+		opsMut, err = opsdb.ApplySubtreeRetry(s.db.Ops(), opsdb.SideSRC, node.Path, mark, s.db.Ops().ApplyCopyRetryChunk)
 	} else {
-		opsMut, err = s.db.Ops().ApplyNodeCopyRetry(nodeID, mark)
+		opsMut, err = opsdb.ApplyNodeRetry(s.db.Ops(), opsdb.SideSRC, nodeID, mark, s.db.Ops().ApplyCopyRetryChunk)
 	}
 	if err != nil {
 		return 0, nil, err
@@ -441,9 +404,9 @@ func (s *migrationStore) setNodeCopyForceReplace(nodeID string, mark bool) (int6
 	}
 	var opsMut opsdb.SubtreeMutationResult
 	if node.Type == db.NodeTypeFolder {
-		opsMut, err = s.db.Ops().ApplySubtreeCopyForceReplace(node.Path, mark)
+		opsMut, err = opsdb.ApplySubtreeRetry(s.db.Ops(), opsdb.SideSRC, node.Path, mark, s.db.Ops().ApplyCopyForceReplaceChunk)
 	} else {
-		opsMut, err = s.db.Ops().ApplyNodeCopyForceReplace(nodeID, mark)
+		opsMut, err = opsdb.ApplyNodeRetry(s.db.Ops(), opsdb.SideSRC, nodeID, mark, s.db.Ops().ApplyCopyForceReplaceChunk)
 	}
 	if err != nil {
 		return 0, nil, err
@@ -499,7 +462,8 @@ func (s *migrationStore) setNodeDeleteStatus(nodeID, status string) (int64, map[
 			return 0, nil, nil
 		}
 	case db.DeleteStatusSkipped:
-		if !db.DeleteStatusIsPending(oldDelete) && oldDelete != "" {
+		// Pending (plan) or failed (results acknowledge) may become skipped.
+		if !db.DeleteStatusIsPending(oldDelete) && oldDelete != "" && oldDelete != db.DeleteStatusFailed {
 			return 0, nil, nil
 		}
 	}
@@ -507,38 +471,38 @@ func (s *migrationStore) setNodeDeleteStatus(nodeID, status string) (int64, map[
 	if node.Type == db.NodeTypeFolder {
 		switch {
 		case db.DeleteStatusIsPending(status):
-			opsMut, aerr := s.db.Ops().ApplySubtreeDeleteRetry(node.Path, true)
+			opsMut, aerr := opsdb.ApplySubtreeRetry(s.db.Ops(), opsdb.SideSRC, node.Path, true, s.db.Ops().ApplyDeleteRetryChunk)
 			err = aerr
 			mut = db.DeleteMutationResult{
 				Affected: opsMut.Affected, Folders: opsMut.Folders, Files: opsMut.Files, SelectedBytes: opsMut.SelectedBytes,
 			}
 		case status == db.DeleteStatusFailed:
-			opsMut, aerr := s.db.Ops().ApplySubtreeDeleteRetry(node.Path, false)
+			opsMut, aerr := opsdb.ApplySubtreeRetry(s.db.Ops(), opsdb.SideSRC, node.Path, false, s.db.Ops().ApplyDeleteRetryChunk)
 			err = aerr
 			mut = db.DeleteMutationResult{
 				Affected: opsMut.Affected, Folders: opsMut.Folders, Files: opsMut.Files, SelectedBytes: opsMut.SelectedBytes,
 			}
 		case status == db.DeleteStatusSkipped:
-			mut, err = s.db.ApplyDeleteForestSkip(node.Path)
+			mut, err = s.db.ApplyDeleteForestMutation(node.Path, true)
 		}
 	} else {
 		switch {
 		case db.DeleteStatusIsPending(status) && oldDelete == db.DeleteStatusSkipped:
-			mut, err = s.db.ApplyDeleteForestUnskip(node.Path)
+			mut, err = s.db.ApplyDeleteForestMutation(node.Path, false)
 		case db.DeleteStatusIsPending(status):
-			opsMut, aerr := s.db.Ops().ApplyNodeDeleteRetry(nodeID, true)
+			opsMut, aerr := opsdb.ApplyNodeRetry(s.db.Ops(), opsdb.SideSRC, nodeID, true, s.db.Ops().ApplyDeleteRetryChunk)
 			err = aerr
 			mut = db.DeleteMutationResult{
 				Affected: opsMut.Affected, Folders: opsMut.Folders, Files: opsMut.Files, SelectedBytes: opsMut.SelectedBytes,
 			}
 		case status == db.DeleteStatusFailed:
-			opsMut, aerr := s.db.Ops().ApplyNodeDeleteRetry(nodeID, false)
+			opsMut, aerr := opsdb.ApplyNodeRetry(s.db.Ops(), opsdb.SideSRC, nodeID, false, s.db.Ops().ApplyDeleteRetryChunk)
 			err = aerr
 			mut = db.DeleteMutationResult{
 				Affected: opsMut.Affected, Folders: opsMut.Folders, Files: opsMut.Files, SelectedBytes: opsMut.SelectedBytes,
 			}
 		case status == db.DeleteStatusSkipped:
-			mut, err = s.db.ApplyDeleteForestSkip(node.Path)
+			mut, err = s.db.ApplyDeleteForestMutation(node.Path, true)
 		}
 	}
 	if err != nil {
@@ -585,9 +549,9 @@ func (s *migrationStore) setNodeDeleteStatusWithPropagation(nodeID, targetStatus
 	rootPath := node.Path
 	var mut db.DeleteMutationResult
 	if targetStatus == db.DeleteStatusSkipped {
-		mut, err = s.db.ApplyDeleteForestSkip(rootPath)
+		mut, err = s.db.ApplyDeleteForestMutation(rootPath, true)
 	} else {
-		mut, err = s.db.ApplyDeleteForestUnskip(rootPath)
+		mut, err = s.db.ApplyDeleteForestMutation(rootPath, false)
 	}
 	if err != nil {
 		return 0, nil, fmt.Errorf("set delete status with propagation: %w", err)
@@ -702,7 +666,7 @@ func (s *migrationStore) markNodeForRetryDiscovery(nodeID string) (int64, map[st
 		if dstNode != nil {
 			dstID = dstNode.ID
 		}
-		res, err := s.db.Ops().ApplyTraversalRetryMark(srcNode.ID, dstID)
+		res, err := s.db.Ops().ApplyTraversalRetry(srcNode.ID, dstID, true)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -731,7 +695,7 @@ func (s *migrationStore) markNodeForRetryDiscovery(nodeID string) (int64, map[st
 		}
 		return res.Affected, deltas, nil
 	}
-	res, err := s.db.Ops().ApplyDSTTraversalRetry(dstNode.ID, true)
+	res, err := opsdb.ApplyRetryAtID(s.db.Ops(), opsdb.SideDST, dstNode.ID, true, s.db.Ops().ApplyTraversalRetryChunk)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -753,7 +717,7 @@ func (s *migrationStore) unmarkNodeForRetryDiscovery(nodeID string) (int64, map[
 		if dstNode != nil {
 			dstID = dstNode.ID
 		}
-		res, err := s.db.Ops().ApplyTraversalRetryUnmark(srcNode.ID, dstID)
+		res, err := s.db.Ops().ApplyTraversalRetry(srcNode.ID, dstID, false)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -779,7 +743,7 @@ func (s *migrationStore) unmarkNodeForRetryDiscovery(nodeID string) (int64, map[
 	if dstNode == nil || dstNode.TraversalStatus != db.StatusPending {
 		return 0, nil, nil
 	}
-	res, err := s.db.Ops().ApplyDSTTraversalRetry(dstNode.ID, false)
+	res, err := opsdb.ApplyRetryAtID(s.db.Ops(), opsdb.SideDST, dstNode.ID, false, s.db.Ops().ApplyTraversalRetryChunk)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -789,7 +753,50 @@ func (s *migrationStore) unmarkNodeForRetryDiscovery(nodeID string) (int64, map[
 	return res.Affected, nil, nil
 }
 
-func (s *migrationStore) setNodeExcludedWithPropagation(nodeID string, excluded bool) (int64, map[string]int64, error) {
+// setTraversalFailedAcknowledged sets failed → traversal excluded (intentional ignore), or restores
+// acknowledged-from-failed excluded → failed.
+func (s *migrationStore) setTraversalFailedAcknowledged(nodeID string, acknowledged bool) (int64, map[string]int64, error) {
+	srcNode, _, err := s.reviewPairFromID(nodeID)
+	if err != nil {
+		return 0, nil, err
+	}
+	if srcNode == nil {
+		return 0, nil, fmt.Errorf("node %s not found in SRC", nodeID)
+	}
+	if acknowledged && srcNode.TraversalStatus != db.StatusFailed {
+		return 0, nil, nil
+	}
+	res, err := opsdb.ApplyRetryAtID(s.db.Ops(), opsdb.SideSRC, srcNode.ID, acknowledged, s.db.Ops().ApplyTraversalAckChunk)
+	if err != nil {
+		return 0, nil, err
+	}
+	if res.Affected == 0 {
+		return 0, nil, nil
+	}
+	sign := int64(1)
+	if !acknowledged {
+		sign = -1
+	}
+	deltas := make(map[string]int64)
+	addReviewDelta(deltas, DeltaTraversalFailed, -sign*res.Affected)
+	addReviewDelta(deltas, DeltaExcluded, sign*res.Affected)
+	if err := s.persistReviewDeltas(deltas); err != nil {
+		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
+	}
+	return res.Affected, deltas, nil
+}
+
+func (s *migrationStore) setNodeExcluded(nodeID string, excluded bool) (int64, map[string]int64, error) {
+	return s.setNodeExcludedOpt(nodeID, excluded, false)
+}
+
+// setNodeExcludedAsRetry unexcludes during copy review as retry-marked pending so
+// copyPendingRetry and the retry CTA update for previously excluded items.
+func (s *migrationStore) setNodeExcludedAsRetry(nodeID string) (int64, map[string]int64, error) {
+	return s.setNodeExcludedOpt(nodeID, false, true)
+}
+
+func (s *migrationStore) setNodeExcludedOpt(nodeID string, excluded, asRetry bool) (int64, map[string]int64, error) {
 	node, err := pull.GetNodeByID(s.db, "SRC", nodeID)
 	if err != nil {
 		return 0, nil, err
@@ -798,79 +805,56 @@ func (s *migrationStore) setNodeExcludedWithPropagation(nodeID string, excluded 
 		return 0, nil, fmt.Errorf("node %s not found in SRC", nodeID)
 	}
 	if excluded {
-		if node.Excluded || !statusCountsAsPending(node.CopyStatus, db.CopyStatusPending) {
+		// Pending (incl. retry-marked) or failed may be excluded / acknowledged.
+		fromFailed := node.CopyStatus == db.CopyStatusFailed
+		if node.Excluded ||
+			(!statusCountsAsPending(node.CopyStatus, db.CopyStatusPending) && !fromFailed) {
 			return 0, nil, nil
 		}
 	} else if !node.Excluded {
 		return 0, nil, nil
 	}
-	mut, err := s.db.ApplySubtreeCopyExclusion(node.Path, excluded, nil)
+	var mut db.CopyMutationResult
+	if asRetry {
+		mut, err = s.db.ApplySubtreeCopyExclusionAsRetry(node.Path, nil)
+	} else {
+		mut, err = s.db.ApplySubtreeCopyExclusion(node.Path, excluded, nil)
+	}
 	if err != nil {
 		return 0, nil, fmt.Errorf("set exclusion with propagation: %w", err)
 	}
-	if mut.Affected == 0 {
-		return 0, nil, nil
-	}
-	subMut := subtree.SubtreeCopyMutationResult{
-		Affected: mut.Affected, Folders: mut.Folders, Files: mut.Files, PendingBytes: mut.PendingBytes,
-		RestoredFailed: mut.RestoredFailed, RetryExcluded: mut.RetryExcluded,
-	}
-	deltas, err := s.persistCopyExclusionMutation(subMut, excluded)
-	if err != nil {
-		return 0, nil, err
-	}
-	return mut.Affected, deltas, nil
+	return s.persistCopyExclusionMutation(mut, excluded)
 }
 
+// applySearchExclusion applies (excluded=true) or reverses (excluded=false) the search exclusion.
+// criteriaJSON and applicationID are used only when excluding.
 func (s *migrationStore) applySearchExclusion(
+	excluded bool,
 	f review.ReviewFilter,
 	criteriaJSON string,
 	exceptIDs []string,
 	applicationID string,
 	eventTime int64,
 ) (int64, map[string]int64, error) {
-	mut, err := filterapply.ApplySearchExclusionOps(s.db, f, criteriaJSON, exceptIDs, applicationID, eventTime)
-	if err != nil {
-		return 0, nil, fmt.Errorf("apply search exclusion: %w", err)
+	var mut db.CopyMutationResult
+	var err error
+	if excluded {
+		mut, err = filterapply.ApplySearchExclusionOpsCtx(context.Background(), s.db, f, criteriaJSON, exceptIDs, applicationID, eventTime)
+	} else {
+		mut, err = filterapply.ApplySearchUnexclusionOpsCtx(context.Background(), s.db, f, exceptIDs, eventTime)
 	}
+	if err != nil {
+		return 0, nil, fmt.Errorf("apply search exclusion (excluded=%t): %w", excluded, err)
+	}
+	return s.persistCopyExclusionMutation(mut, excluded)
+}
+
+// persistCopyExclusionMutation records the review deltas and copy-work adjustment for a copy exclude/unexclude
+// and returns (affected, deltas); a zero-affected mutation is a no-op.
+func (s *migrationStore) persistCopyExclusionMutation(mut db.CopyMutationResult, excluded bool) (int64, map[string]int64, error) {
 	if mut.Affected == 0 {
 		return 0, nil, nil
 	}
-	subMut := subtree.SubtreeCopyMutationResult{
-		Affected: mut.Affected, Folders: mut.Folders, Files: mut.Files, PendingBytes: mut.PendingBytes,
-		RestoredFailed: mut.RestoredFailed, RetryExcluded: mut.RetryExcluded,
-	}
-	deltas, err := s.persistCopyExclusionMutation(subMut, true)
-	if err != nil {
-		return 0, nil, err
-	}
-	return mut.Affected, deltas, nil
-}
-
-func (s *migrationStore) applySearchUnexclusion(
-	f review.ReviewFilter,
-	exceptIDs []string,
-	eventTime int64,
-) (int64, map[string]int64, error) {
-	mut, err := filterapply.ApplySearchUnexclusionOps(s.db, f, exceptIDs, eventTime)
-	if err != nil {
-		return 0, nil, fmt.Errorf("apply search unexclusion: %w", err)
-	}
-	if mut.Affected == 0 {
-		return 0, nil, nil
-	}
-	subMut := subtree.SubtreeCopyMutationResult{
-		Affected: mut.Affected, Folders: mut.Folders, Files: mut.Files, PendingBytes: mut.PendingBytes,
-		RestoredFailed: mut.RestoredFailed, RetryExcluded: mut.RetryExcluded,
-	}
-	deltas, err := s.persistCopyExclusionMutation(subMut, false)
-	if err != nil {
-		return 0, nil, err
-	}
-	return mut.Affected, deltas, nil
-}
-
-func (s *migrationStore) persistCopyExclusionMutation(mut subtree.SubtreeCopyMutationResult, excluded bool) (map[string]int64, error) {
 	deltas := make(map[string]int64)
 	sign := int64(1)
 	if excluded {
@@ -885,6 +869,9 @@ func (s *migrationStore) persistCopyExclusionMutation(mut subtree.SubtreeCopyMut
 		addReviewDelta(deltas, DeltaCopyPending, -mut.RestoredFailed)
 		addReviewDelta(deltas, DeltaCopyFailed, mut.RestoredFailed)
 	}
+	if !excluded && mut.RetryMarked > 0 {
+		addReviewDelta(deltas, DeltaCopyPendingRetry, mut.RetryMarked)
+	}
 	addReviewDelta(deltas, DeltaSizeSelected, sign*mut.PendingBytes)
 	addReviewDelta(deltas, DeltaFolders, sign*mut.Folders)
 	addReviewDelta(deltas, DeltaFiles, sign*mut.Files)
@@ -894,12 +881,12 @@ func (s *migrationStore) persistCopyExclusionMutation(mut subtree.SubtreeCopyMut
 		reason = db.CopyWorkReasonReviewExclude
 	}
 	if err := stats.AdjustCopyWorkForReview(s.db, cw, reason); err != nil {
-		return nil, fmt.Errorf("adjust copy work: %w", err)
+		return 0, nil, fmt.Errorf("adjust copy work: %w", err)
 	}
 	if err := s.persistReviewDeltas(deltas); err != nil {
-		return nil, fmt.Errorf("persist review deltas: %w", err)
+		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
 	}
-	return deltas, nil
+	return mut.Affected, deltas, nil
 }
 
 func conditionStringValue(v any) (string, bool) {
@@ -982,6 +969,7 @@ func searchRequestToReviewFilter(req SearchRequest) (review.ReviewFilter, error)
 		CopyStatus:             strings.TrimSpace(req.CopyStatus),
 		DeleteStatus:           strings.TrimSpace(req.DeleteStatus),
 		ExcludeDestinationOnly: excludeDestinationOnly(req.IncludeDestinationOnly),
+		Side:                   strings.TrimSpace(req.Side),
 		AfterPath:              strings.TrimSpace(req.AfterPath),
 		AfterID:                strings.TrimSpace(req.AfterID),
 	}
@@ -1250,6 +1238,7 @@ func (s *migrationStore) listChildrenDiffs(req ListChildrenDiffsRequest) (ListCh
 		TraversalStatus:        strings.TrimSpace(req.TraversalStatus),
 		CopyStatus:             strings.TrimSpace(req.CopyStatus),
 		ExcludeDestinationOnly: excludeDestinationOnly(req.IncludeDestinationOnly),
+		Side:                   strings.TrimSpace(req.Side),
 		AfterPath:              strings.TrimSpace(req.AfterPath),
 		AfterID:                strings.TrimSpace(req.AfterID),
 	}
@@ -1293,9 +1282,6 @@ func (s *migrationStore) searchPathReviewItems(ctx context.Context, req SearchRe
 	if err != nil {
 		return SearchResult{}, err
 	}
-	if !review.ReviewFilterHasSearchPredicate(f) {
-		return SearchResult{}, ErrSearchRequiresFilter
-	}
 	if review.StatusDrivenSearch(f) {
 		// Status pages by id; ignore path sort so we do not join nodes before LIMIT.
 		orderBy = "id ASC"
@@ -1332,7 +1318,7 @@ func (s *migrationStore) getChildrenDiffsStats(path string, foldersOnly bool, in
 		FoldersOnly:            foldersOnly,
 		ExcludeDestinationOnly: excludeDestinationOnly(includeDestinationOnly),
 	}
-	stats, err := review.GetMergedReviewStats(s.db, f)
+	stats, err := review.GetMergedReviewStatsCtx(context.Background(), s.db, f)
 	if err != nil {
 		return DiffsStats{}, err
 	}
@@ -1350,9 +1336,6 @@ func (s *migrationStore) getSearchStats(ctx context.Context, req SearchRequest) 
 	f, err := searchRequestToReviewFilter(req)
 	if err != nil {
 		return DiffsStats{}, err
-	}
-	if !review.ReviewFilterHasSearchPredicate(f) {
-		return DiffsStats{}, ErrSearchRequiresFilter
 	}
 	stats, err := review.GetMergedReviewStatsCtx(ctx, s.db, f)
 	if err != nil {

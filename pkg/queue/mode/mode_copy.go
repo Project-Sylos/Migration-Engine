@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	"codeberg.org/Sylos/Migration-Engine/pkg/db/failurelog"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/subtree"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
@@ -20,181 +19,68 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
-// CheckCopyCompletion checks if the copy phase should switch passes or complete.
-// Only called when we're past maxKnownDepth - the pass has exhausted itself round-by-round.
-// Trust the per-round logic; no re-checking of pending/inProgress/wasFirstPull.
-func CheckCopyCompletion(q *queue.Queue, currentRound int) bool {
-	database := q.Database()
-	if database == nil {
-		return false
-	}
-
-	copyPass := q.GetCopyPass()
-	maxKnownDepth := q.GetMaxKnownDepth()
-
-	// Only consider pass switch/phase complete when we've exhausted all rounds for this pass
-	if maxKnownDepth >= 0 && currentRound < maxKnownDepth {
-		return false
-	}
-
-	// if any in progress or pending in the current queue
-	// just to be safe.
-	if q.InProgressCount() > 0 || q.GetPendingCount() > 0 {
-		return false
-	}
-
-	// Run() polls CheckFinalCompletion every tick, including before the first pull.
-	// Do not switch passes / complete until this round has actually pulled (same gate as
-	// round completion). Otherwise pass 1 is skipped when maxKnownDepth == start round.
-	info := q.RoundInfoReadOnly(currentRound)
-	if info == nil || info.PullCount == 0 {
-		return false
-	}
-	if !q.GetLastPullWasPartial() {
-		return false
-	}
-
-	if copyPass == 1 {
-		// Pass 1 (folders) done - switch to pass 2 (files); find starting round
-		q.SetCopyPass(2)
-		q.ResetRoundStatsCompleted()
-
-		q.SetRound(1)
-		q.SetExpectedFromStatsBucket(1)
-		q.SetLastPullWasPartial(false)
-
-		return false
-	}
-
-	// Pass 2 (files) complete
-	return q.MarkComplete("Copy phase complete - both passes finished")
-}
-
-// AdvanceCopyRound handles copy-specific round advancement logic.
-// Round completion is determined by lastPullWasPartial (memory/keyset only); we never query the DB for in-round advancement.
-// When called, the current round has just completed - we always advance to currentRound+1.
-func AdvanceCopyRound(q *queue.Queue) {
-	q.NoteCopyResumeDstExistenceLeavingAnchorRound()
-
-	currentRound := q.GetRound()
-	copyPass := q.GetCopyPass()
-	maxKnownDepth := q.GetMaxKnownDepth()
-
-	// We just completed currentRound (lastPullWasPartial, pending empty, inProgress empty).
-	// Advance sequentially - no DB queries for "does this round have pending?" (DB is stale during round).
-	newRound := currentRound + 1
-
-	if maxKnownDepth >= 0 && newRound > maxKnownDepth {
-		// Past maxKnownDepth - check for pass switch or phase complete.
-		// DB can be used here: we're at phase boundary, flush has run, deciding phase-level completion.
-		if logservice.LS != nil {
-			err := logservice.LS.Log("info", fmt.Sprintf("Pass %d exhausted rounds (past maxKnownDepth %d), checking for completion", copyPass, maxKnownDepth), "queue", q.Name(), q.Name())
-			if err != nil {
-				fmt.Println("error logging", err)
-			}
-		}
-		completed := q.CheckCompletion(currentRound, queue.CompletionCheckOptions{
-			CheckFinalCompletion: true,
-		})
-		if completed {
-			return
-		}
-		q.PullWithRetryIfNeeded(true)
-		return
-	}
-
-	q.SetRound(newRound)
-	q.SetExpectedFromStatsBucket(newRound)
-	q.SetLastPullWasPartial(false)
-
-	passName := "folders"
-	if copyPass == 2 {
-		passName = "files"
-	}
-
-	if logservice.LS != nil {
-		err := logservice.LS.Log("info", fmt.Sprintf("Advanced to round %d (pass %d: %s)", newRound, copyPass, passName), "queue", q.Name(), q.Name())
-		if err != nil {
-			fmt.Println("error logging", err)
-		}
-	}
-
-	// Pull tasks for the new round
-	q.PullWithRetryIfNeeded(true)
-}
-
-// PullCopyTasks pulls copy tasks from DuckDB for the current round.
+// PullCopyTasks pulls copy tasks from DB for the current round.
 // Pulls from SRC copy status buckets, filters by pass (folders vs files), and skips round 0.
 // Uses getter/setter methods - no direct mutex access.
 func PullCopyTasks(q *queue.Queue, force bool) queue.PullResult {
-	database := q.Database()
-	if database == nil {
-		return queue.PullResult{Status: queue.PullAborted}
+	ps, early, ok := beginPull(q, force, pullGate{skipRoundZero: true})
+	if !ok {
+		return early
 	}
-	if !q.TryBeginPulling() {
-		return queue.PullResult{Round: q.GetRound(), Status: queue.PullSkipped}
-	}
-	defer q.SetPulling(false)
-	if q.State() == queue.QueueStateCompleted {
-		return queue.PullResult{Status: queue.PullAborted}
-	}
-
-	snapshot := q.StateSnapshot()
-	if snapshot.State == queue.QueueStatePaused {
-		return queue.PullResult{Round: snapshot.Round, Status: queue.PullAborted}
-	}
-	if !force && snapshot.PendingCount > snapshot.PullLowWM {
-		return queue.PullResult{Round: snapshot.Round, Status: queue.PullSkipped}
-	}
-
-	currentRound := snapshot.Round
-	if currentRound == 0 {
-		return queue.PullResult{Round: 0, Status: queue.PullSkipped}
-	}
-
+	defer ps.end()
+	database, currentRound := ps.Database, ps.Round
 	copyPass := q.GetCopyPass()
 	nodeType := db.NodeTypeFolder
 	if copyPass == 2 {
 		nodeType = db.NodeTypeFile
 	}
+	page, early, ok := pullKeysetPage(q, currentRound, "ListNodesCopyKeyset", func(limit int) ([]db.FetchResult, error) {
+		return pull.ListNodesCopyKeyset(database, currentRound, nodeType, q.GetKeysetCursor(), limit, db.CopyStatusPending)
+	})
+	if !ok {
+		return early
+	}
+	matchedBatch := page.Matched
 
-	batchSize := q.EffectiveLeaseBatchSize()
-	copyStatusFilter := db.CopyStatusPending
-	if q.GetMode() == queue.QueueModeCopyRetry {
-		// Marks convert failed→pending; retry pulls those pending marks (and any leftover pending).
-		copyStatusFilter = db.CopyStatusPending
-	}
-	// Request limit+1 to detect keyspace exhaustion: if we get <= limit, we're done; else more exists.
-	requestLimit := batchSize + 1
-	q.BeginDBPull()
-	defer q.ReleaseDBPull()
-	pullStart := time.Now()
-	results, err := pull.ListNodesCopyKeyset(database, currentRound, nodeType, q.GetKeysetCursor(), requestLimit, copyStatusFilter)
-	q.RecordDBPull(len(results), time.Since(pullStart))
-	if err != nil {
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("ListNodesCopyKeyset failed: %v", err), "queue", q.Name(), q.Name())
+	// Prefetch SRC→DST map + DST peer copy status / service id (batched).
+	srcIDs := make([]string, 0, len(matchedBatch))
+	for _, item := range matchedBatch {
+		if item.State != nil && item.State.ID != "" {
+			srcIDs = append(srcIDs, item.State.ID)
 		}
-		return queue.PullResult{Round: currentRound, Status: queue.PullSkipped}
 	}
-	if q.GetRound() != currentRound {
-		return queue.PullResult{Round: currentRound, QueriedDB: true, Status: queue.PullStaleRound}
-	}
-	// Process at most batchSize items this pull; the extra (+1) is only for exhaustion detection
-	processLimit := min(batchSize, len(results))
-	var matchedBatch []db.FetchResult
-	for _, r := range results[:processLimit] {
-		if r.State == nil {
-			continue
+	peerBySrc := map[string]struct {
+		dstID     string
+		copySt    string
+		serviceID string
+	}{}
+	if ops := database.Ops(); ops != nil && len(srcIDs) > 0 {
+		maps, mapErr := ops.BatchGetMap(srcIDs, false)
+		if mapErr == nil {
+			dstIDs := make([]string, 0, len(maps))
+			for _, m := range maps {
+				if m.DstID != "" {
+					dstIDs = append(dstIDs, m.DstID)
+				}
+			}
+			dstSt, _ := ops.BatchGetStatus(opsdb.SideDST, dstIDs)
+			dstNodes, _ := ops.BatchGetNode(opsdb.SideDST, dstIDs)
+			for srcID, m := range maps {
+				if m.DstID == "" {
+					continue
+				}
+				peerBySrc[srcID] = struct {
+					dstID     string
+					copySt    string
+					serviceID string
+				}{
+					dstID:     m.DstID,
+					copySt:    dstSt[m.DstID].CopyStatus,
+					serviceID: dstNodes[m.DstID].ServiceID,
+				}
+			}
 		}
-		matchedBatch = append(matchedBatch, r)
 	}
-	// Cursor = last item we consumed. lastPullWasPartial = keyspace exhausted (got <= batchSize from DB).
-	if len(results) > 0 {
-		cursorIdx := max(0, processLimit-1)
-		q.SetKeysetCursor(results[cursorIdx].Key)
-	}
-	q.SetLastPullWasPartial(len(results) <= batchSize)
 
 	// Move tasks to in-progress status and create tasks
 	enqueueSuccessCount := 0
@@ -214,7 +100,7 @@ func PullCopyTasks(q *queue.Queue, force bool) queue.PullResult {
 		}
 		if item.State.Type != expectedType {
 			if logservice.LS != nil {
-				err := logservice.LS.Log("error", fmt.Sprintf("Type mismatch for %s - pass=%d expects %s but node has %s - skipping", item.State.Path, copyPass, expectedType, item.State.Type), "queue", q.Name(), q.Name())
+				err := logservice.LS.Log("error", fmt.Sprintf("Type mismatch for %s - pass=%d expects %s but node has %s - skipping", item.State.DisplayPath, copyPass, expectedType, item.State.Type), "queue", q.Name(), q.Name())
 				if err != nil {
 					fmt.Println("error logging", err)
 				}
@@ -231,7 +117,7 @@ func PullCopyTasks(q *queue.Queue, force bool) queue.PullResult {
 		}
 
 		if item.State.ParentID == "" && logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("Item at round %d has empty ParentID (path=%s)", item.State.Depth, item.State.Path), "queue", q.Name(), q.Name())
+			_ = logservice.LS.Log("error", fmt.Sprintf("Item at round %d has empty ParentID (path=%s)", item.State.Depth, item.State.DisplayPath), "queue", q.Name(), q.Name())
 		}
 		dstParentServiceID := item.DstParentServiceID
 		if dstParentServiceID == "" {
@@ -243,7 +129,7 @@ func PullCopyTasks(q *queue.Queue, force bool) queue.PullResult {
 			}
 		}
 		if dstParentServiceID == "" && logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("No DST parent for %s (parent_path=%s parent_id=%s); enqueueing so copy still claims the task", item.State.Path, item.State.ParentPath, item.State.ParentID), "queue", q.Name(), q.Name())
+			_ = logservice.LS.Log("error", fmt.Sprintf("No DST parent for %s (parent_path=%s parent_id=%s); enqueueing so copy still claims the task", item.State.DisplayPath, item.State.ParentPath, item.State.ParentID), "queue", q.Name(), q.Name())
 		}
 		task.DstParentID = dstParentServiceID
 		task.DstParentNodeID = item.DstParentNodeID
@@ -252,6 +138,11 @@ func PullCopyTasks(q *queue.Queue, force bool) queue.PullResult {
 		}
 		task.ResolvedDstName = item.ResolvedDstPath
 		task.SrcParentDeleteStatus = item.SrcParentDeleteStatus
+		if peer, ok := peerBySrc[task.ID]; ok {
+			task.DstPeerID = peer.dstID
+			task.DstPeerCopyStatus = peer.copySt
+			task.DstPeerServiceID = peer.serviceID
+		}
 
 		if q.Add(task) {
 			enqueueSuccessCount++
@@ -259,11 +150,7 @@ func PullCopyTasks(q *queue.Queue, force bool) queue.PullResult {
 
 	}
 
-	partial := len(results) <= batchSize
-	q.SetLastPullWasPartial(partial)
-	q.RecordPull(currentRound, enqueueSuccessCount, partial)
-	q.SetFirstPullForRound(false)
-	return queue.PullResult{Round: currentRound, Yield: enqueueSuccessCount, Partial: partial, QueriedDB: true, Status: queue.PullOK}
+	return finishPull(q, currentRound, enqueueSuccessCount, page.Partial)
 }
 
 // nodeStateToCopyTask converts a NodeState to a copy queue.TaskBase.
@@ -282,11 +169,7 @@ func nodeStateToCopyTask(state *db.NodeState, taskType string, copyPass int) *qu
 		Type:                 taskType,
 		Round:                state.Depth,
 		CopyPass:             copyPass,
-		Attempts:             0,
-		Status:               "",
-		Locked:               false,
 		LeaseTime:            time.Now(),
-		DstParentID:          "",
 		CopyStatus:           state.CopyStatus,
 		DeleteStatus:         state.DeleteStatus,
 		SrcLogicalPath:       logicalPath,
@@ -294,58 +177,21 @@ func nodeStateToCopyTask(state *db.NodeState, taskType string, copyPass int) *qu
 		SrcTraversalStatus:   state.TraversalStatus,
 		ExclusionSource:      state.ExclusionSource,
 	}
-
-	// Populate folder or file based on node type
-	if state.Type == types.NodeTypeFolder {
-		task.Folder = types.Folder{
-			ServiceID:    state.ServiceID,
-			ParentId:     state.ParentServiceID,
-			ParentPath:   state.ParentPath,
-			DisplayName:  state.Name,
-			LocationPath: state.Path,
-			LastUpdated:  state.MTime,
-			DepthLevel:   state.Depth,
-			Type:         state.Type,
-		}
-	} else {
-		task.File = types.File{
-			ServiceID:    state.ServiceID,
-			ParentId:     state.ParentServiceID,
-			ParentPath:   state.ParentPath,
-			DisplayName:  state.Name,
-			LocationPath: state.Path,
-			LastUpdated:  state.MTime,
-			Size:         state.Size,
-			DepthLevel:   state.Depth,
-			Type:         state.Type,
-		}
-	}
-
+	task.AttachNodeState(state)
 	return task
 }
 
 // CompleteCopyTask handles successful completion of copy tasks.
 // Updates copy status, creates DST node entry, and updates join-lookup mapping.
 func CompleteCopyTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.Duration) {
-	q.RecordExecutionTime(executionDelta)
-
+	database := beginTerminalSuccess(q, task, executionDelta)
+	if database == nil {
+		return
+	}
 	currentRound := task.Round
 	nodeID := task.ID
 
-	database := q.Database()
-	if database == nil {
-		q.RemoveInProgress(nodeID)
-		return
-	}
-
-	task.Locked = false
-	task.Status = "successful"
-
-	q.IncrementRoundStatsCompleted(currentRound)
-	q.IncrementTasksCompletedTotal()
-
 	_ = q.ClearTransferCheckpoint(context.Background(), task)
-	q.RecordTaskCompletion(currentRound, true)
 
 	taskType := types.NodeTypeFile
 	taskPath := worker.CopyTaskLogicalPath(task)
@@ -390,6 +236,9 @@ func CompleteCopyTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.
 		createName = db.NormalizeNodeBasename(task.ResolvedDstName)
 	}
 	dstNodeID := db.MintNodeID("DST", dstParentID, taskType, createName)
+	if task.DstPeerID != "" {
+		dstNodeID = task.DstPeerID
+	}
 	var dstServiceID string
 	if task.IsFolder() {
 		dstServiceID = task.Folder.ServiceID
@@ -417,7 +266,7 @@ func CompleteCopyTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.
 		if logservice.LS != nil {
 			logErr := logservice.LS.Log("error",
 				fmt.Sprintf("DST node persist failed after copy for %s (id=%s dst=%s): %v",
-					task.LocationPath(), nodeID, dstNodeID, err),
+					task.DisplayPath, nodeID, dstNodeID, err),
 				"queue", q.Name(), q.Name())
 			if logErr != nil {
 				fmt.Println("error logging", logErr)
@@ -442,16 +291,26 @@ func CompleteCopyTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.
 		Source:        db.IDMapSourceDSTCompare,
 		Status:        db.IDMapStatusActive,
 	})
-
-	if !accepted {
-		q.RemoveInProgress(nodeID)
-		return
+	dstCopyStatus := db.CopyStatusSuccessful
+	if task.ProgressAlreadyExists {
+		dstCopyStatus = db.CopyStatusAlreadyExisted
 	}
+	database.AppendStatusEvent("DST", db.StatusEvent{
+		ID:             dstNodeID,
+		CopyStatus:     dstCopyStatus,
+		PrevCopyStatus: task.DstPeerCopyStatus,
+		EventTime:      time.Now().UnixNano(),
+		Depth:          currentRound,
+		Size:           taskSize,
+		NodeType:       taskType,
+	}, false)
+
 	outcome := queue.TerminalProgressCopied
 	if task.ProgressAlreadyExists {
 		outcome = queue.TerminalProgressAlreadyExists
 	}
-	q.RecordTerminalProgress(outcome, nodeID, task.IsFolder(), task.IsFile(), task.BytesTransferred)
+	q.ReleaseTaskInFlightWeight(task)
+	recordTerminal(q, task, accepted, outcome, task.BytesTransferred)
 }
 
 // FailCopyTask handles failure of copy tasks.
@@ -464,74 +323,30 @@ func FailCopyTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.Dura
 	nodeID := task.ID
 	maxRetries := q.MaxRetries()
 
-	if logservice.LS != nil {
-		err := logservice.LS.Log("debug",
-			fmt.Sprintf("Failing copy task: id=%s path=%s round=%d pass=%d attempts=%d maxRetries=%d",
-				nodeID, task.LocationPath(), currentRound, task.CopyPass, task.Attempts, maxRetries),
-			"queue", q.Name(), q.Name())
-		if err != nil {
-			fmt.Println("error logging", err)
-		}
-	}
+	logQueue(q, "debug", fmt.Sprintf("Failing copy task: id=%s path=%s round=%d pass=%d attempts=%d maxRetries=%d",
+		nodeID, task.DisplayPath, currentRound, task.CopyPass, task.Attempts, maxRetries))
 
 	task.Attempts++
 
-	// Permanent FS errors should not retry — they block round completion and waste API quota.
+	// Permanent FS errors should not retry; they block round completion and waste API quota.
 	if queue.IsNonRetryableCopyError(task.LastError) {
 		task.Attempts = maxRetries
 	}
 
-	// Check if we should retry
+	// Retry: re-enqueue to memory, DON'T write to DB (stays as in-progress)
 	if task.Attempts < maxRetries {
-		// Retry: re-enqueue to memory, DON'T write to DuckDB (stays as in-progress)
-		task.Locked = false
-		q.RemoveInProgress(nodeID)
-		if !q.Add(task) {
-			if logservice.LS != nil {
-				_ = logservice.LS.Log("error",
-					fmt.Sprintf("retry re-enqueue rejected for %s (id=%s) - task lost", task.LocationPath(), nodeID),
-					"queue", q.Name(), q.Name())
-			}
+		if !requeueForRetry(q, task) {
+			logQueue(q, "error", fmt.Sprintf("retry re-enqueue rejected for %s (id=%s) - task lost", task.DisplayPath, nodeID))
 		}
-
-		if logservice.LS != nil {
-			err := logservice.LS.Log("debug",
-				fmt.Sprintf("Copy task will retry: path=%s attempts=%d", task.LocationPath(), task.Attempts),
-				"queue", q.Name(), q.Name())
-			if err != nil {
-				fmt.Println("error logging", err)
-			}
-		}
+		logQueue(q, "debug", fmt.Sprintf("Copy task will retry: path=%s attempts=%d", task.DisplayPath, task.Attempts))
 		return
 	}
 
 	// Max retries exceeded - permanent failure
-	task.Locked = false
-	task.Status = "failed"
-
-	q.IncrementRoundStatsCompleted(currentRound)
-	q.IncrementRoundStatsFailed(currentRound)
-	q.IncrementTasksCompletedTotal()
-	q.RecordTaskCompletion(currentRound, false)
-
-	if logservice.LS != nil {
-		err := logservice.LS.Log("error",
-			fmt.Sprintf("Copy task failed (max retries): path=%s", task.LocationPath()),
-			"queue", q.Name(), q.Name())
-		if err != nil {
-			fmt.Println("error logging", err)
-		}
-	}
-
-	database := q.Database()
+	logQueue(q, "error", fmt.Sprintf("Copy task failed (max retries): path=%s", task.DisplayPath))
+	database := beginTerminalFailure(q, task)
 	if database == nil {
-		q.RemoveInProgress(nodeID)
 		return
-	}
-
-	// Record task error if present
-	if task.LastError != "" {
-		database.AppendTaskError("SRC", "copy", nodeID, task.LastError, task.Attempts, task.LocationPath())
 	}
 
 	failType := types.NodeTypeFile
@@ -540,7 +355,7 @@ func FailCopyTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.Dura
 		failType = types.NodeTypeFolder
 		failSize = 0
 	}
-	copyEv := db.StatusEvent{
+	accepted := appendFailureEvent(q, task, database, "copy", db.StatusEvent{
 		ID:              nodeID,
 		CopyStatus:      db.CopyStatusFailed,
 		PrevCopyStatus:  task.CopyStatus,
@@ -549,9 +364,7 @@ func FailCopyTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.Dura
 		Size:            failSize,
 		NodeType:        failType,
 		ExclusionSource: task.ExclusionSource,
-	}
-	failurelog.AttachTaskFailureLog(&copyEv, "copy", q.Name(), nodeID, task.LocationPath(), task.Attempts, task.LastError)
-	accepted := database.AppendStatusEvent("SRC", copyEv, false)
+	})
 
 	// Folder failure cascades: mark pending descendants failed in the same write pass
 	// that accumulates SelectedBytes (no separate recount scan for progress).
@@ -563,9 +376,5 @@ func FailCopyTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.Dura
 			}
 		}
 	}
-	if !accepted {
-		q.RemoveInProgress(nodeID)
-		return
-	}
-	q.RecordTerminalProgress(queue.TerminalProgressFailed, nodeID, task.IsFolder(), task.IsFile(), failSize)
+	recordTerminal(q, task, accepted, queue.TerminalProgressFailed, failSize)
 }

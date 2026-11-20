@@ -5,11 +5,10 @@ package worker
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync/atomic"
-	"time"
 
+	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
 
@@ -18,13 +17,8 @@ import (
 
 // DeleteWorker removes SRC nodes via FS DeleteNode during the delete phase.
 type DeleteWorker struct {
-	id          string
-	queue       *queue.Queue
-	srcAdapter  types.FSAdapter
-	shutdownCtx context.Context
-	workerCtx   context.Context
-	idle        *atomic.Bool
-	retire      *atomic.Bool
+	workerBase
+	srcAdapter types.FSAdapter
 }
 
 func NewDeleteWorker(
@@ -34,76 +28,17 @@ func NewDeleteWorker(
 	shutdownCtx, workerCtx context.Context,
 	idle, retire *atomic.Bool,
 ) *DeleteWorker {
-	return &DeleteWorker{
-		id:          id,
-		queue:       q,
-		srcAdapter:  srcAdapter,
-		shutdownCtx: shutdownCtx,
-		workerCtx:   workerCtx,
-		idle:        idle,
-		retire:      retire,
+	w := &DeleteWorker{
+		workerBase: newWorkerBase(id, q, shutdownCtx, workerCtx, idle, retire),
+		srcAdapter: srcAdapter,
 	}
-}
-
-func (w *DeleteWorker) shouldRetire() bool {
-	return w.retire != nil && w.retire.Load()
-}
-
-func (w *DeleteWorker) Run() {
-	defer w.queue.NotifyWorkerExit(w.id)
-	for {
-		select {
-		case <-w.workerCtx.Done():
-			return
-		case <-w.shutdownCtx.Done():
-			return
-		default:
-		}
-		if w.shouldRetire() {
-			return
-		}
-		if w.useDeleteBatchLease() {
-			w.runDeleteBatchTurn()
-			if w.shouldRetire() {
-				return
-			}
-			continue
-		}
-
-		task := w.queue.Lease()
-		if task == nil {
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-		w.queue.BindLeaseOwner(task, w.id)
-		setWorkerBusy(w.idle)
-		err := w.execute(task)
-		markWorkerIdle(w.queue, w.id, w.idle)
-		if errors.Is(err, errTransferAbandoned) {
-			if w.queue.HasInProgress(task.ID) {
-				task.Locked = false
-				w.queue.RemoveInProgress(task.ID)
-				if !w.queue.Spin.AbandonDBOnly.Load() {
-					_ = w.queue.Add(task)
-				}
-			}
-			if w.shouldRetire() {
-				return
-			}
-			continue
-		}
-		if err != nil {
-			task.LastError = err.Error()
-			task.WorkerResult = "error"
-			w.queue.ReportTaskResult(task, queue.TaskExecutionResultFailed)
-		} else {
-			task.WorkerResult = "success"
-			w.queue.ReportTaskResult(task, queue.TaskExecutionResultSuccessful)
-		}
-		if w.shouldRetire() {
-			return
-		}
+	w.loop = loopSpec{
+		label:     "Delete worker",
+		queueName: "delete",
+		execute:   w.execute,
+		batchTurn: w.deleteBatchTurn,
 	}
+	return w
 }
 
 func (w *DeleteWorker) execute(task *queue.TaskBase) error {
@@ -119,11 +54,17 @@ func (w *DeleteWorker) execute(task *queue.TaskBase) error {
 		nodeType = types.NodeTypeFolder
 	}
 	if serviceID == "" {
-		return fmt.Errorf("empty service id for delete task %s", task.LocationPath())
+		return fmt.Errorf("empty service id for delete task %s", task.DisplayPath)
+	}
+	if logservice.LS != nil {
+		_ = logservice.LS.LogStructured("trace",
+			fmt.Sprintf("delete start: path=%s", task.DisplayPath),
+			"worker", w.id,
+			logservice.LogFields{Action: "delete", NodeID: task.ID, Queue: "delete"})
 	}
 
 	// DeleteNode often ignores cancel; run async so the progress watchdog can still abort.
-	err := awaitErr(ctx, parent, deleteStallTimeout, "delete", task.LocationPath(), func() error {
+	err := awaitErr(w.queue, ctx, parent, deleteStallTimeout, "delete", task.DisplayPath, func() error {
 		return w.srcAdapter.DeleteNode(ctx, serviceID, nodeType)
 	})
 	if isForceCheckoutAbort(err, w.shouldRetire(), w.queue.ForceCheckoutWorker(w.id)) {

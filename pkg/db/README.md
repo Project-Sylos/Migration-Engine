@@ -1,6 +1,6 @@
 # db Package
 
-The **db** package is the persistence layer for the Migration Engine. The per-migration store is **Badger-only** (`{migrationDir}/{id}.ops/`, package **`pkg/opsdb`**). The logical path `{id}.db` is a historical marker name only (not a DuckDB file). Sylos-API uses a separate Badger store (`sylos.api/`) for users/auth/install config.
+The **db** package is the persistence layer for the Migration Engine. The per-migration store is **Badger-only**: ops in `{migrationDir}/{id}.ops/` and worker/API-facing migration logs in `{migrationDir}/{id}.logs/` (both via package **`pkg/opsdb`**). The logical path `{id}.db` is a historical marker name only (not a DuckDB file). Sylos-API uses a separate Badger store (`sylos.api/`) for users/auth/install config and process logs.
 
 **New here?** Start with the intro tour: [docs/ops_store_overview.md](../../docs/ops_store_overview.md) (write-heavy phases vs review/search/filters, seal buffer, light schema map).
 
@@ -34,13 +34,22 @@ Seal writes go to Badger via **`badger_seal.go`**. Node catalog metadata, fronti
 | `oauth:{connection_id}` | OAuth credential payload |
 | `fsbind:{role}` | FS credential binding (`source` / `destination`) |
 | `stat:review:*`, `stat:idx:*` | Review and index cardinality counters |
-| `log:*`, `op:*`, `qstat:*`, `taskerr:*` | Telemetry |
+| `op:*`, `qstat:*`, `taskerr:*` | Ops telemetry (not migration log lines) |
+
+### Logs sidecar (`{id}.logs/`)
+
+Same Badger layout helpers as ops, but only for append-only log rows. Opened via `Options.LogsDir` (default `MigrationLogsPath(Path)`). All `AppendLogs` / `SearchLogs` / failure-log reads go here; seal flushes status into ops and log rows into the sidecar.
+
+| Prefix | Content |
+|--------|---------|
+| `log:*` | Structured log records |
+| `idx:log:action:*`, `idx:log:node:*` | Log search indexes |
 
 ---
 
 ## Open / phases
 
-- **`Open`** opens Badger at `OpsDir` (default `MigrationOpsPath(Path)`), ensures `meta:schema_version` (stamp `0.1` if missing; fail on unsupported), then ensures `meta:tri_index_v1` (one-shot rebuild of secondary indexes for older stores).
+- **`Open`** opens Badger at `OpsDir` (default `MigrationOpsPath(Path)`) and the logs sidecar at `LogsDir` (default `MigrationLogsPath(Path)`), ensures `meta:schema_version` (stamp `0.1` if missing; fail on unsupported), then ensures `meta:tri_index_v1` (one-shot rebuild of secondary indexes for older stores).
 - **`BeginTraversalPhase` / `EndTraversalPhase`** flush the seal buffer only. Secondary indexes are written on catalog node insert (SRC traversal and DST copy), not at round/phase end.
 
 ### Seal flush (trusted batch)

@@ -9,9 +9,9 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
 	"codeberg.org/Sylos/Migration-Engine/pkg/scaling"
-	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/aimd"
 	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/backend"
 	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/profile"
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/softcap"
 )
 
 type scaleUpTrigger int
@@ -77,12 +77,12 @@ func (a *Autoscaler) stepUpWorkers(internal map[string]observe.InternalMetricsSn
 }
 
 func (a *Autoscaler) groupCanCalmProbe(groupID string, queues []string, internal map[string]observe.InternalMetricsSnapshot, now time.Time) bool {
-	st := a.queueState(backend.GroupAIMDKey(groupID))
-	rateLimitedUntil := aimd.MaxRateLimitedUntilForQueues(internal, queues)
-	if aimd.ScaleUpBlockedByRateLimit(now, rateLimitedUntil) {
+	st := a.queueState(backend.GroupStateKey(groupID))
+	rateLimitedUntil := softcap.MaxRateLimitedUntilForQueues(internal, queues)
+	if softcap.ScaleUpBlockedByRateLimit(now, rateLimitedUntil) {
 		return false
 	}
-	if aimd.FSThrottleActuationBlocked(st, now, rateLimitedUntil) {
+	if softcap.FSThrottleActuationBlocked(st, now, rateLimitedUntil) {
 		return false
 	}
 	minPer := 1
@@ -102,7 +102,7 @@ func (a *Autoscaler) groupCanCalmProbe(groupID string, queues []string, internal
 		}
 	}
 	if maxInterOp > 0 {
-		return aimd.InterOpDecreaseAllowed(st, now, rateLimitedUntil, a.aimd.ProbeCooldown)
+		return softcap.InterOpDecreaseAllowed(st, now, rateLimitedUntil, a.softCap.ProbeCooldown)
 	}
 	maxTotal := a.registry.GroupMaxWorkers(groupID)
 	if maxTotal <= 0 {
@@ -111,21 +111,21 @@ func (a *Autoscaler) groupCanCalmProbe(groupID string, queues []string, internal
 	if totalCur >= maxTotal {
 		return false
 	}
-	_, ok := a.aimd.IncreaseTarget(totalCur, minPer*len(queues), maxTotal, st, now)
+	_, ok := a.softCap.IncreaseTarget(totalCur, minPer*len(queues), maxTotal, st, now)
 	return ok
 }
 
 func (a *Autoscaler) queueCanCalmProbe(name string, q scaling.QueueActuator, internal map[string]observe.InternalMetricsSnapshot, now time.Time) bool {
 	st := a.queueState(name)
-	rateLimitedUntil := aimd.MaxRateLimitedUntil(internal, name)
-	if aimd.ScaleUpBlockedByRateLimit(now, rateLimitedUntil) {
+	rateLimitedUntil := softcap.MaxRateLimitedUntil(internal, name)
+	if softcap.ScaleUpBlockedByRateLimit(now, rateLimitedUntil) {
 		return false
 	}
-	if aimd.FSThrottleActuationBlocked(st, now, rateLimitedUntil) {
+	if softcap.FSThrottleActuationBlocked(st, now, rateLimitedUntil) {
 		return false
 	}
 	if q.GetInterOpDelay() > 0 {
-		return aimd.InterOpDecreaseAllowed(st, now, rateLimitedUntil, a.aimd.ProbeCooldown)
+		return softcap.InterOpDecreaseAllowed(st, now, rateLimitedUntil, a.softCap.ProbeCooldown)
 	}
 	prof := a.profiles[name]
 	maxWorkers := prof.MaxWorkers
@@ -140,7 +140,7 @@ func (a *Autoscaler) queueCanCalmProbe(name string, q scaling.QueueActuator, int
 	if minWorkers <= 0 {
 		minWorkers = 1
 	}
-	_, ok := a.aimd.IncreaseTarget(cur, minWorkers, maxWorkers, st, now)
+	_, ok := a.softCap.IncreaseTarget(cur, minWorkers, maxWorkers, st, now)
 	return ok
 }
 
@@ -185,17 +185,17 @@ func (a *Autoscaler) stepDownSharedGroup(groupID string, queues []string, intern
 		maxTotal = totalCur
 	}
 	minTotal := minPer * len(queues)
-	st := a.queueState(backend.GroupAIMDKey(groupID))
-	rateLimitedUntil := aimd.MaxRateLimitedUntilForQueues(internal, queues)
-	if a.lastClass == scaling.PressureFSThrottle && aimd.FSThrottleActuationBlocked(st, now, rateLimitedUntil) {
+	st := a.queueState(backend.GroupStateKey(groupID))
+	rateLimitedUntil := softcap.MaxRateLimitedUntilForQueues(internal, queues)
+	if a.lastClass == scaling.PressureFSThrottle && softcap.FSThrottleActuationBlocked(st, now, rateLimitedUntil) {
 		a.debugFSBackoffBlocked("group:"+groupID, st, now, rateLimitedUntil)
 		return
 	}
 	var targetTotal int
 	if a.lastClass == scaling.PressureFSThrottle {
-		targetTotal = aimd.SoftCapDecreaseTarget(totalCur, minTotal, maxTotal, st, now)
+		targetTotal = softcap.SoftCapDecreaseTarget(totalCur, minTotal, maxTotal, st, now)
 	} else {
-		targetTotal = a.aimd.DecreaseTarget(totalCur, minTotal, maxTotal, st, now)
+		targetTotal = a.softCap.DecreaseTarget(totalCur, minTotal, maxTotal, st, now)
 	}
 	if targetTotal < totalCur {
 		cause := "PRESSURE"
@@ -204,15 +204,15 @@ func (a *Autoscaler) stepDownSharedGroup(groupID string, queues []string, intern
 			cause = "FS_THROTTLE"
 			a.noteSoftCapThrottle(st, now, rateLimitedUntil)
 			a.abortGroupEfficiencyProbeOnPressure(st, targetTotal, now)
-			st.NoteFSBackoff(now, rateLimitedUntil, a.aimd.ProbeCooldown)
+			st.NoteFSBackoff(now, rateLimitedUntil, a.softCap.ProbeCooldown)
 		case scaling.PressureMemory:
 			cause = "MEMORY_PRESSURE"
 		}
 		fmt.Printf("  SCALE_DOWN cause=%s scope=group:%s workers %d->%d (pressure=%s)\n",
 			cause, groupID, totalCur, targetTotal, a.lastClass)
-		a.debugAIMDPrint(fmt.Sprintf("  aimd decrease [group:%s]: total workers %d->%d", groupID, totalCur, targetTotal))
-		if a.debugAIMD {
-			a.debugAIMDPrint(aimd.FormatProbeCooldownLine("group:"+groupID, st, a.aimd.ProbeCooldown, now))
+		a.debugAutoscalerPrint(fmt.Sprintf("  autoscaler decrease [group:%s]: total workers %d->%d", groupID, totalCur, targetTotal))
+		if a.debugAutoscaler {
+			a.debugAutoscalerPrint(softcap.FormatProbeCooldownLine("group:"+groupID, st, a.softCap.ProbeCooldown, now))
 		}
 		split := backend.SplitWorkersTotal(targetTotal, queues, minPer)
 		for name, target := range split {
@@ -227,8 +227,8 @@ func (a *Autoscaler) stepDownSharedGroup(groupID string, queues []string, intern
 			if err := q.SetTargetWorkerCount(target); err != nil {
 				continue
 			}
-			if a.debugAIMD {
-				a.debugAIMDPrint(fmt.Sprintf("  aimd decrease [%s]: workers %d->%d (group split)", name, cur, target))
+			if a.debugAutoscaler {
+				a.debugAutoscalerPrint(fmt.Sprintf("  autoscaler decrease [%s]: workers %d->%d (group split)", name, cur, target))
 			}
 			a.emit(scaling.ScalingEvent{Queue: name, Knob: "WorkerCount", OldValue: cur, NewValue: target, Pressure: a.lastClass, At: now})
 			if target > minPer {
@@ -238,7 +238,7 @@ func (a *Autoscaler) stepDownSharedGroup(groupID string, queues []string, intern
 		}
 		return
 	}
-	if a.lastClass == scaling.PressureFSThrottle && aimd.FSThrottleActuationBlocked(st, now, rateLimitedUntil) {
+	if a.lastClass == scaling.PressureFSThrottle && softcap.FSThrottleActuationBlocked(st, now, rateLimitedUntil) {
 		a.debugFSBackoffBlocked("group:"+groupID, st, now, rateLimitedUntil)
 		return
 	}
@@ -253,9 +253,9 @@ func (a *Autoscaler) stepDownSharedGroup(groupID string, queues []string, intern
 }
 
 func (a *Autoscaler) stepDownSharedInterOpDelay(groupID string, queues []string, internal map[string]observe.InternalMetricsSnapshot, now time.Time) {
-	st := a.queueState(backend.GroupAIMDKey(groupID))
-	rateLimitedUntil := aimd.MaxRateLimitedUntilForQueues(internal, queues)
-	if !aimd.InterOpIncreaseAllowed(st, now, rateLimitedUntil) {
+	st := a.queueState(backend.GroupStateKey(groupID))
+	rateLimitedUntil := softcap.MaxRateLimitedUntilForQueues(internal, queues)
+	if !softcap.InterOpIncreaseAllowed(st, now, rateLimitedUntil) {
 		a.debugFSBackoffBlocked("group:"+groupID, st, now, rateLimitedUntil)
 		return
 	}
@@ -272,13 +272,13 @@ func (a *Autoscaler) stepDownSharedInterOpDelay(groupID string, queues []string,
 			}
 		}
 	}
-	target := a.aimd.IncreaseInterOpDelay(cur, maxDelay, a.maxInterOpSeedRate(queues), st, now)
+	target := a.softCap.IncreaseInterOpDelay(cur, maxDelay, a.maxInterOpSeedRate(queues), st, now)
 	if target <= cur {
 		return
 	}
 	if a.lastClass == scaling.PressureFSThrottle {
 		a.noteSoftCapThrottle(st, now, rateLimitedUntil)
-		st.NoteFSBackoff(now, rateLimitedUntil, a.aimd.ProbeCooldown)
+		st.NoteFSBackoff(now, rateLimitedUntil, a.softCap.ProbeCooldown)
 	}
 	for _, name := range queues {
 		q := a.queues[name]
@@ -302,16 +302,16 @@ func (a *Autoscaler) stepDownIndependentQueue(name string, q scaling.QueueActuat
 	prof := a.profiles[name]
 	cur := q.GetWorkerCount()
 	st := a.queueState(name)
-	rateLimitedUntil := aimd.MaxRateLimitedUntil(internal, name)
-	if a.lastClass == scaling.PressureFSThrottle && aimd.FSThrottleActuationBlocked(st, now, rateLimitedUntil) {
+	rateLimitedUntil := softcap.MaxRateLimitedUntil(internal, name)
+	if a.lastClass == scaling.PressureFSThrottle && softcap.FSThrottleActuationBlocked(st, now, rateLimitedUntil) {
 		a.debugFSBackoffBlocked(name, st, now, rateLimitedUntil)
 		return
 	}
 	var target int
 	if a.lastClass == scaling.PressureFSThrottle {
-		target = aimd.SoftCapDecreaseTarget(cur, prof.MinWorkers, prof.MaxWorkers, st, now)
+		target = softcap.SoftCapDecreaseTarget(cur, prof.MinWorkers, prof.MaxWorkers, st, now)
 	} else {
-		target = a.aimd.DecreaseTarget(cur, prof.MinWorkers, prof.MaxWorkers, st, now)
+		target = a.softCap.DecreaseTarget(cur, prof.MinWorkers, prof.MaxWorkers, st, now)
 	}
 	if target < cur {
 		if err := q.SetTargetWorkerCount(target); err != nil {
@@ -323,9 +323,9 @@ func (a *Autoscaler) stepDownIndependentQueue(name string, q scaling.QueueActuat
 			cause = "FS_THROTTLE"
 			a.noteSoftCapThrottle(st, now, rateLimitedUntil)
 			if a.efficiency.Enabled && st.ProbePending {
-				st.AbortEfficiencyProbeThrottled(target, a.aimd.ProbeCooldown, a.efficiency.MaxProbeCooldown, now)
+				st.AbortEfficiencyProbeThrottled(target, a.softCap.ProbeCooldown, a.efficiency.MaxProbeCooldown, now)
 			}
-			st.NoteFSBackoff(now, rateLimitedUntil, a.aimd.ProbeCooldown)
+			st.NoteFSBackoff(now, rateLimitedUntil, a.softCap.ProbeCooldown)
 		case scaling.PressureMemory:
 			cause = "MEMORY_PRESSURE"
 		}
@@ -339,7 +339,7 @@ func (a *Autoscaler) stepDownIndependentQueue(name string, q scaling.QueueActuat
 		a.maybeIncreaseListPage(name, q, prof, now)
 		return
 	}
-	if a.lastClass == scaling.PressureFSThrottle && aimd.FSThrottleActuationBlocked(st, now, rateLimitedUntil) {
+	if a.lastClass == scaling.PressureFSThrottle && softcap.FSThrottleActuationBlocked(st, now, rateLimitedUntil) {
 		a.debugFSBackoffBlocked(name, st, now, rateLimitedUntil)
 		return
 	}
@@ -350,9 +350,9 @@ func (a *Autoscaler) stepUpSharedGroup(groupID string, queues []string, internal
 	if reason != "" {
 		a.debugWorkerScaleUpAttempt("group:"+groupID, reason)
 	}
-	rateLimitedUntil := aimd.MaxRateLimitedUntilForQueues(internal, queues)
-	if aimd.ScaleUpBlockedByRateLimit(now, rateLimitedUntil) {
-		if a.debugAIMD {
+	rateLimitedUntil := softcap.MaxRateLimitedUntilForQueues(internal, queues)
+	if softcap.ScaleUpBlockedByRateLimit(now, rateLimitedUntil) {
+		if a.debugAutoscaler {
 			a.debugScaleUpBlocked("group:"+groupID, fmt.Sprintf("fs_retry_after remaining=%s", rateLimitedUntil.Sub(now).Round(time.Millisecond)))
 		}
 		return
@@ -361,7 +361,7 @@ func (a *Autoscaler) stepUpSharedGroup(groupID string, queues []string, internal
 	if p, ok := a.profiles[queues[0]]; ok && p.MinWorkers > 0 {
 		minPer = p.MinWorkers
 	}
-	st := a.queueState(backend.GroupAIMDKey(groupID))
+	st := a.queueState(backend.GroupStateKey(groupID))
 	maxTotal := a.registry.GroupMaxWorkers(groupID)
 	a.prepareScaleUpState(st, maxTotal, now)
 	if !a.applyGroupEfficiencyProbeBeforeScaleUp(groupID, queues, internal, st, minPer, now) {
@@ -380,10 +380,10 @@ func (a *Autoscaler) stepUpSharedGroup(groupID string, queues []string, internal
 		maxTotal = totalCur + 1
 	}
 	rateBefore := a.groupProbeThroughputRate(queues, internal)
-	targetTotal, ok := a.aimd.IncreaseTarget(totalCur, minPer*len(queues), maxTotal, st, now)
+	targetTotal, ok := a.softCap.IncreaseTarget(totalCur, minPer*len(queues), maxTotal, st, now)
 	if !ok || targetTotal <= totalCur {
-		if a.debugAIMD {
-			blockReason := aimd.IncreaseTargetBlockReason(totalCur, maxTotal, st, a.aimd, now)
+		if a.debugAutoscaler {
+			blockReason := softcap.IncreaseTargetBlockReason(totalCur, maxTotal, st, a.softCap, now)
 			a.debugScaleUpBlocked("group:"+groupID, blockReason)
 		}
 		return
@@ -412,7 +412,7 @@ func (a *Autoscaler) stepUpSharedGroup(groupID string, queues []string, internal
 	}
 }
 
-func (a *Autoscaler) tryRecoverSharedInterOpDelay(groupID string, queues []string, internal map[string]observe.InternalMetricsSnapshot, st *aimd.State, now time.Time) (cleared bool) {
+func (a *Autoscaler) tryRecoverSharedInterOpDelay(groupID string, queues []string, internal map[string]observe.InternalMetricsSnapshot, st *softcap.State, now time.Time) (cleared bool) {
 	cur := time.Duration(0)
 	for _, name := range queues {
 		if q := a.queues[name]; q != nil {
@@ -424,12 +424,12 @@ func (a *Autoscaler) tryRecoverSharedInterOpDelay(groupID string, queues []strin
 	if cur <= 0 {
 		return true
 	}
-	rateLimitedUntil := aimd.MaxRateLimitedUntilForQueues(internal, queues)
-	if !aimd.InterOpDecreaseAllowed(st, now, rateLimitedUntil, a.aimd.ProbeCooldown) {
-		if a.debugAIMD {
+	rateLimitedUntil := softcap.MaxRateLimitedUntilForQueues(internal, queues)
+	if !softcap.InterOpDecreaseAllowed(st, now, rateLimitedUntil, a.softCap.ProbeCooldown) {
+		if a.debugAutoscaler {
 			remaining := time.Duration(0)
 			if !st.DelayLastIncrease.IsZero() {
-				until := st.DelayLastIncrease.Add(st.ProbeCooldownDuration(a.aimd.ProbeCooldown))
+				until := st.DelayLastIncrease.Add(st.ProbeCooldownDuration(a.softCap.ProbeCooldown))
 				if now.Before(until) {
 					remaining = until.Sub(now)
 				}
@@ -438,9 +438,9 @@ func (a *Autoscaler) tryRecoverSharedInterOpDelay(groupID string, queues []strin
 		}
 		return false
 	}
-	target, ok := a.aimd.DecreaseInterOpDelay(cur, st, now)
+	target, ok := a.softCap.DecreaseInterOpDelay(cur, st, now)
 	if !ok {
-		if a.debugAIMD {
+		if a.debugAutoscaler {
 			a.debugScaleUpBlocked("group:"+groupID, "inter_op_delay_unchanged")
 		}
 		return false
@@ -461,8 +461,8 @@ func (a *Autoscaler) tryRecoverSharedInterOpDelay(groupID string, queues []strin
 			At:       now,
 		})
 	}
-	if a.debugAIMD {
-		a.debugAIMDPrint(fmt.Sprintf("  aimd [group:%s]: inter-op delay %s->%s (recovery)", groupID, cur.Round(time.Microsecond), target.Round(time.Microsecond)))
+	if a.debugAutoscaler {
+		a.debugAutoscalerPrint(fmt.Sprintf("  autoscaler [group:%s]: inter-op delay %s->%s (recovery)", groupID, cur.Round(time.Microsecond), target.Round(time.Microsecond)))
 	}
 	return target <= 0
 }
@@ -471,9 +471,9 @@ func (a *Autoscaler) stepUpIndependentQueue(name string, q scaling.QueueActuator
 	if reason != "" {
 		a.debugWorkerScaleUpAttempt(name, reason)
 	}
-	rateLimitedUntil := aimd.MaxRateLimitedUntil(internal, name)
-	if aimd.ScaleUpBlockedByRateLimit(now, rateLimitedUntil) {
-		if a.debugAIMD {
+	rateLimitedUntil := softcap.MaxRateLimitedUntil(internal, name)
+	if softcap.ScaleUpBlockedByRateLimit(now, rateLimitedUntil) {
+		if a.debugAutoscaler {
 			a.debugScaleUpBlocked(name, fmt.Sprintf("fs_retry_after remaining=%s", rateLimitedUntil.Sub(now).Round(time.Millisecond)))
 		}
 		return
@@ -491,10 +491,10 @@ func (a *Autoscaler) stepUpIndependentQueue(name string, q scaling.QueueActuator
 	}
 	cur := q.GetWorkerCount()
 	rateBefore := a.throughputRate(name)
-	target, ok := a.aimd.IncreaseTarget(cur, prof.MinWorkers, prof.MaxWorkers, st, now)
+	target, ok := a.softCap.IncreaseTarget(cur, prof.MinWorkers, prof.MaxWorkers, st, now)
 	if !ok || target <= cur {
-		if a.debugAIMD {
-			a.debugScaleUpBlocked(name, aimd.IncreaseTargetBlockReason(cur, prof.MaxWorkers, st, a.aimd, now))
+		if a.debugAutoscaler {
+			a.debugScaleUpBlocked(name, softcap.IncreaseTargetBlockReason(cur, prof.MaxWorkers, st, a.softCap, now))
 		}
 		return
 	}

@@ -12,6 +12,7 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
+	"codeberg.org/Sylos/Migration-Engine/pkg/memweight"
 	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
@@ -49,13 +50,13 @@ func (q *Queue) IsPulling() bool {
 	return q.pulling
 }
 
-// IsWaitingOnDB reports whether this queue is waiting on the shared pull ticket or a DuckDB pull.
+// IsWaitingOnDB reports whether this queue is waiting on the shared pull ticket or a DB pull.
 func (q *Queue) IsWaitingOnDB() bool {
 	return q != nil && q.waitingOnDB.Load()
 }
 
 // BeginDBPull waits for the shared DB pull ticket (Beats the stall watchdog while waiting).
-// Pair with ReleaseDBPull (typically via defer) around the DuckDB query only.
+// Pair with ReleaseDBPull (typically via defer) around the frontier pull query only.
 func (q *Queue) BeginDBPull() {
 	if q == nil {
 		return
@@ -63,6 +64,7 @@ func (q *Queue) BeginDBPull() {
 	q.waitingOnDB.Store(true)
 	if d := q.Database(); d != nil {
 		d.AcquirePull(q.BeatWatchdog)
+		d.Busy(db.BusyDBWork).Enter()
 	}
 }
 
@@ -72,6 +74,7 @@ func (q *Queue) ReleaseDBPull() {
 		return
 	}
 	if d := q.Database(); d != nil {
+		d.Busy(db.BusyDBWork).Leave()
 		d.ReleasePull()
 	}
 	q.waitingOnDB.Store(false)
@@ -123,7 +126,7 @@ func (q *Queue) SetCopyPass(pass int) {
 // already-present folders are filtered via per-parent ListChildren before the batch RPC.
 // File transfer keeps the single-task path while the window is active (byte-checkpoint resume).
 // Only for normal copy mode (not copy-retry); call from RunCopyPhase when resuming a partially
-// completed copy (Successful>0 and Pending>0 in status events).
+// completed copy, or unclean resume with Pending>0.
 func (q *Queue) SetCopyResumeDstExistenceWindow(anchorPass, anchorRound int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -133,6 +136,31 @@ func (q *Queue) SetCopyResumeDstExistenceWindow(anchorPass, anchorRound int) {
 	q.copyResumeDstExistenceActive = true
 	q.copyResumeDstExistenceAnchorPass = anchorPass
 	q.copyResumeDstExistenceAnchorRound = anchorRound
+}
+
+// SetCopyResumeRecoveryHashVerify enables dual-read SHA-256 on name-matched files during
+// the unclean recovery existence window only.
+func (q *Queue) SetCopyResumeRecoveryHashVerify(enabled bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.copyResumeRecoveryHashVerify = enabled
+}
+
+// ShouldCopyResumeRecoveryHashVerify reports whether recovery HashVerify is active.
+func (q *Queue) ShouldCopyResumeRecoveryHashVerify() bool {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.copyResumeRecoveryHashVerify && q.copyResumeDstExistenceActive &&
+		q.mode == QueueModeCopy &&
+		q.passNumber == q.copyResumeDstExistenceAnchorPass &&
+		q.round == q.copyResumeDstExistenceAnchorRound
+}
+
+// SetOnLeaveCopyResumeWindow registers a callback when the existence window clears.
+func (q *Queue) SetOnLeaveCopyResumeWindow(fn func()) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.onLeaveCopyResumeWindow = fn
 }
 
 func (q *Queue) ShouldApplyCopyDstResumeExistenceCheck() bool {
@@ -148,20 +176,18 @@ func (q *Queue) ShouldApplyCopyDstResumeExistenceCheck() bool {
 // (first AdvanceCopyRound call while still positioned on that pass+round).
 func (q *Queue) NoteCopyResumeDstExistenceLeavingAnchorRound() {
 	q.mu.Lock()
-	defer q.mu.Unlock()
-	if !q.copyResumeDstExistenceActive {
-		return
-	}
-	if q.passNumber == q.copyResumeDstExistenceAnchorPass && q.round == q.copyResumeDstExistenceAnchorRound {
+	var cb func()
+	if q.copyResumeDstExistenceActive &&
+		q.passNumber == q.copyResumeDstExistenceAnchorPass &&
+		q.round == q.copyResumeDstExistenceAnchorRound {
 		q.copyResumeDstExistenceActive = false
+		q.copyResumeRecoveryHashVerify = false
+		cb = q.onLeaveCopyResumeWindow
 	}
-}
-
-// SetWorkers sets the workers associated with this queue.
-func (q *Queue) SetWorkers(workers []Worker) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.workers = workers
+	q.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
 }
 
 func (q *Queue) Coordinator() *QueueCoordinator {
@@ -240,17 +266,12 @@ func (q *Queue) EffectiveLeaseBatchSize() int {
 	return n
 }
 
+// EffectiveRefillBatchSize is how many tasks to pull from Badger when pending is
+// low. Derived as 25% of the queue task limit (lease batch), matching PullLowWM.
 func (q *Queue) EffectiveRefillBatchSize() int {
-	q.mu.RLock()
-	n := q.refillBatchSize
-	name := q.name
-	mode := q.mode
-	q.mu.RUnlock()
-	if n <= 0 {
-		if name == "dst" && (mode == QueueModeTraversal || mode == "") {
-			return refillFromDBBatchSizeDst
-		}
-		return refillFromDBBatchSize
+	n := q.EffectiveLeaseBatchSize() / 4
+	if n < 1 {
+		return 1
 	}
 	return n
 }
@@ -276,7 +297,7 @@ func (q *Queue) EffectiveDstPullChildQuota(taskQuota int) int {
 	return taskQuota * q.EffectiveDstPullChildMultiplier()
 }
 
-// EffectivePullLowWM returns the low watermark for pulling more work from DuckDB into pendingBuff.
+// EffectivePullLowWM returns the low watermark for pulling more work from DB into pendingBuff.
 // Base WM is 25% of lease batch size (minimum 1). Pull decisions use pendingBuff length only —
 // in-progress leases are not treated as available queue depth.
 // Starve nudge: when any worker is idle and pendingCount < live activeWorkers, raise the
@@ -356,8 +377,9 @@ func (q *Queue) clearKeysetCursorLocked() {
 	}
 }
 
-// resetThisQueueKeysetCursor clears only this queue's keyset cursor. Call when this queue's round advances (setRound) or mode changes (setMode). Other queues' cursors are untouched—each queue has its own batching and runtime.
-func (q *Queue) resetThisQueueKeysetCursor() {
+// ResetKeysetCursorForShed clears only this queue's keyset cursor. Call when this queue's round advances (setRound) or mode changes (setMode),
+// and after ClearPendingBufferForSuspend so Badger pend:* rows that lived only in pendingBuff can be re-pulled. Other queues' cursors are untouched.
+func (q *Queue) ResetKeysetCursorForShed() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.clearKeysetCursorLocked()
@@ -434,14 +456,6 @@ func (q *Queue) GetFoldersDiscoveredTotal() int64 {
 // GetTotalDiscovered returns the total number of items discovered (files + folders).
 func (q *Queue) GetTotalDiscovered() int64 {
 	return q.GetFilesDiscoveredTotal() + q.GetFoldersDiscoveredTotal()
-}
-
-// GetBytesTransferredTotal returns the total bytes transferred during copy phase
-// for completed tasks only (excludes in-flight leased progress).
-func (q *Queue) GetBytesTransferredTotal() int64 {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	return q.bytesTransferredTotal
 }
 
 // ReportTaskBytesTransferred records absolute mid-flight bytes on a leased task.
@@ -549,21 +563,7 @@ func (q *Queue) GetFilesFailedTotal() int64 {
 	return q.filesFailedTotal
 }
 
-// GetTotalFailed returns the total number of failed tasks across all rounds.
-func (q *Queue) GetTotalFailed() int {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-
-	total := 0
-	for _, roundInfo := range q.roundInfoMap {
-		if roundInfo != nil {
-			total += roundInfo.TasksFailed
-		}
-	}
-	return total
-}
-
-// MemoryStatusTotals returns live pending/failed totals without touching DuckDB.
+// MemoryStatusTotals returns live pending/failed totals without touching DB.
 // RoundStats is the queue's authoritative live accounting during an active run.
 func (q *Queue) MemoryStatusTotals() (pending, failed int) {
 	q.mu.RLock()
@@ -612,13 +612,6 @@ func (q *Queue) getStatsTick() *time.Ticker {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.statsTick
-}
-
-// GetAverageExecutionTime returns the current average task execution time.
-func (q *Queue) GetAverageExecutionTime() time.Duration {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	return q.avgExecutionTime
 }
 
 // GetExecutionTimeDeltas returns a copy of the execution time deltas buffer.
@@ -755,7 +748,7 @@ func (q *Queue) RecordPull(round int, itemsYielded int, wasPartial bool) {
 	}
 }
 
-// RecordDBPull stores the last DuckDB frontier pull size and wall time for queue_stats.
+// RecordDBPull stores the last frontier pull size and wall time for queue_stats.
 // rows is the raw result count from the query (before enqueue filtering).
 func (q *Queue) RecordDBPull(rows int, d time.Duration) {
 	if q == nil {
@@ -764,14 +757,16 @@ func (q *Queue) RecordDBPull(rows int, d time.Duration) {
 	if d < 0 {
 		d = 0
 	}
+	ns := d.Nanoseconds()
 	atomic.StoreInt64(&q.dbPullLastRows, int64(rows))
-	atomic.StoreInt64(&q.dbPullLastDurationNs, d.Nanoseconds())
+	atomic.StoreInt64(&q.dbPullLastDurationNs, ns)
+	atomic.AddInt64(&q.dbPullAccumDurationNs, ns)
 	if q.database != nil {
 		q.database.RecordOp(db.OpFrontierPull, q.name, int64(rows), d, nil)
 	}
 }
 
-// DBPullStats returns the last recorded DuckDB pull gauges (rows, duration ms, rows/sec).
+// DBPullStats returns the last recorded frontier pull gauges (rows, duration ms, rows/sec).
 func (q *Queue) DBPullStats() (rows int64, durationMs, rowsPerSec float64) {
 	if q == nil {
 		return 0, 0, 0
@@ -787,6 +782,14 @@ func (q *Queue) DBPullStats() (rows int64, durationMs, rowsPerSec float64) {
 		rowsPerSec = float64(rows) / sec
 	}
 	return rows, durationMs, rowsPerSec
+}
+
+// TakeDBPullDurationNs returns and clears accumulated frontier-pull wall time.
+func (q *Queue) TakeDBPullDurationNs() int64 {
+	if q == nil {
+		return 0
+	}
+	return atomic.SwapInt64(&q.dbPullAccumDurationNs, 0)
 }
 
 // RecordTaskCompletion records a completed task for the current round.
@@ -914,6 +917,12 @@ func (q *Queue) RemoveInProgress(nodeID string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if f, ok := q.inProgress[nodeID]; ok {
+		// Drop any remaining attempt weight (complete paths release to seal first).
+		if f.task != nil && f.task.MemWeight > 0 && q.memWeight != nil {
+			w := f.task.MemWeight
+			f.task.MemWeight = 0
+			q.memWeight.Release(memweight.InFlight, w)
+		}
 		q.markLiveBytesDone(f.task)
 		delete(q.inProgress, nodeID)
 	}
@@ -971,16 +980,6 @@ func (q *Queue) IncrementRoundStatsFailed(round int) {
 	defer q.mu.Unlock()
 	stats := q.getOrCreateRoundStatsUnlocked(round)
 	stats.Failed++
-}
-
-// SetRoundStatsCounts sets Expected/Completed/Failed for a round (tests and resume bookkeeping).
-func (q *Queue) SetRoundStatsCounts(round, expected, completed, failed int) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	stats := q.getOrCreateRoundStatsUnlocked(round)
-	stats.Expected = expected
-	stats.Completed = completed
-	stats.Failed = failed
 }
 
 // getOrCreateRoundStatsUnlocked is a helper used internally by other locked methods
@@ -1251,6 +1250,7 @@ func (q *Queue) Add(task *TaskBase) bool {
 		return false
 	}
 
+	q.notePendingAdmit(task)
 	q.pendingBuff = append(q.pendingBuff, task)
 	return true
 }

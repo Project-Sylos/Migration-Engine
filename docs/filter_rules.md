@@ -48,7 +48,7 @@ Rulesets are **exclusion** predicates: when the root group **Passes**, the node 
 
 ## display_path
 
-`path` conditions use write-once **display_path** (root-relative names). Set by `queue.StampDisplayPath` during discovery; not updated on rename.
+`path` conditions use **display_path** (root-relative names). Set by `queue.StampDisplayPath` during discovery and rewritten on GPL rename (`ApplyNodeRename`) for the node and descendants so `idx:tri` / filter paths stay consistent. `Path` (id_path) is never rewritten on rename.
 
 ## Status effects on apply
 

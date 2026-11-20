@@ -10,23 +10,17 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
 )
 
-// RetrySweepOptions are manager-level knobs for retry sweep runs.
-type RetrySweepOptions struct {
-	WorkerCount   int
-	MaxRetries    int
-	LogAddress    string
-	LogLevel      string
-	SkipListener  bool
-	MaxKnownDepth int
-}
-
-// CopyPhaseOptions are optional overrides for copy phase / copy retry runs. Zero values use last run config.
-type CopyPhaseOptions struct {
-	WorkerCount  int
-	MaxRetries   int
-	LogAddress   string
-	LogLevel     string
+// RunOverrides are optional per-run overrides applied over Config for retry sweeps, copy retry, and delete retry.
+// Zero values use the last run config.
+type RunOverrides struct {
+	WorkerCount     int
+	MaxRetries      int
+	LogAddress      string
+	LogLevel        string
+	PersistLogLevel string
 	SkipListener bool
+	// MaxKnownDepth is used by retry sweeps only; 0 means auto-detect.
+	MaxKnownDepth int
 }
 
 // StopResult reports stop/suspend state after a stop request.
@@ -62,6 +56,8 @@ type DiffItem struct {
 	CopyExcludedFromFailed bool
 	// CopyForceReplaceMarked reports pending prefer-source overwrite.
 	CopyForceReplaceMarked bool
+	// TraversalAckFromFailed reports traversal excluded from acknowledging a failure.
+	TraversalAckFromFailed bool
 	MissingOnSource        bool
 	MissingOnDest          bool
 	Size                   int64
@@ -74,10 +70,16 @@ type DiffItem struct {
 	// ResolvedDstName is the accepted/committed destination basename from path_events.
 	// Empty when no remap was applied. Review identity (Path/Name) stays SRC-original.
 	ResolvedDstName string
+	// PathDstAction is gpl dst_action when accepted (rename).
+	PathDstAction string
 	// DisplayPath is the user-facing name path (e.g. /Reports/a.txt). Path stays id_path for nav.
 	DisplayPath string
 	// DstDisplayPath is the destination-side friendly path when it differs (rename leaf).
 	DstDisplayPath string
+	// SrcPath is SRC id_path when Path is DST-native (side=dst). Empty when Path is already SRC.
+	SrcPath string
+	// DstPath is DST id_path when a destination node is present.
+	DstPath string
 }
 
 type ListChildrenDiffsRequest struct {
@@ -94,6 +96,8 @@ type ListChildrenDiffsRequest struct {
 	AfterID   string
 	// IncludeDestinationOnly when false hides destination-only rows. Nil means include.
 	IncludeDestinationOnly *bool
+	// Side: ""|"both" merged, "src", "dst" for dual-tree panes.
+	Side string
 }
 
 type ListChildrenDiffsResult struct {
@@ -133,6 +137,8 @@ type SearchRequest struct {
 	DeleteStatus     string                      `json:"deleteStatus,omitempty"`
 	// IncludeDestinationOnly when false hides destination-only rows. Nil means include.
 	IncludeDestinationOnly *bool `json:"includeDestinationOnly,omitempty"`
+	// Side: ""|"both" merged, "src", "dst" for dual-list search.
+	Side string `json:"side,omitempty"`
 	// Ruleset is an optional filter-rules predicate compiled into SRC search SQL.
 	Ruleset *filter.Ruleset `json:"ruleset,omitempty"`
 }
@@ -146,7 +152,8 @@ type SearchResult struct {
 	Offset  int  `json:"offset"`
 }
 
-// ErrSearchRequiresFilter is returned when SearchPathReviewItems is called with no narrowing predicates.
+// ErrSearchRequiresFilter is retained for API compatibility; list search no longer
+// rejects empty filters. Bulk exclude/unexclude still require a real predicate.
 var ErrSearchRequiresFilter = errors.New("search requires at least one filter")
 
 type DiffsStats struct {

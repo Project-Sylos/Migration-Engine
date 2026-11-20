@@ -25,29 +25,6 @@ type MigrationStatus struct {
 	MinPendingDepthDst *int
 }
 
-// IsEmpty returns true if no nodes have been discovered yet.
-func (s MigrationStatus) IsEmpty() bool {
-	return s.SrcTotal == 0 && s.DstTotal == 0
-}
-
-// HasPending returns true if any src or dst nodes are still pending.
-func (s MigrationStatus) HasPending() bool {
-	return s.SrcPending > 0 || s.DstPending > 0
-}
-
-// HasFailures returns true if any src or dst nodes failed traversal.
-func (s MigrationStatus) HasFailures() bool {
-	return s.SrcFailed > 0 || s.DstFailed > 0
-}
-
-// IsComplete returns true when there are nodes and no pending or failed work.
-func (s MigrationStatus) IsComplete() bool {
-	if s.IsEmpty() {
-		return false
-	}
-	return !s.HasPending()
-}
-
 // InspectMigrationStatus reads delta-maintained traversal counters from src_stats/dst_stats.
 func InspectMigrationStatus(database *db.DB) (MigrationStatus, error) {
 	if database == nil {
@@ -56,7 +33,7 @@ func InspectMigrationStatus(database *db.DB) (MigrationStatus, error) {
 
 	status := MigrationStatus{}
 
-	srcCounts, err := stats.GetTraversalStatusCounts(database, "SRC", true)
+	srcCounts, err := stats.GetTraversalStatusCounts(database, "SRC")
 	if err != nil {
 		return MigrationStatus{}, fmt.Errorf("failed to get SRC traversal counts: %w", err)
 	}
@@ -64,7 +41,7 @@ func InspectMigrationStatus(database *db.DB) (MigrationStatus, error) {
 	status.SrcFailed = int(srcCounts.Failed)
 	status.SrcTotal = int(srcCounts.Pending + srcCounts.Successful + srcCounts.Failed + srcCounts.NotOnSrc + srcCounts.Excluded)
 
-	dstCounts, err := stats.GetTraversalStatusCounts(database, "DST", true)
+	dstCounts, err := stats.GetTraversalStatusCounts(database, "DST")
 	if err != nil {
 		return MigrationStatus{}, fmt.Errorf("failed to get DST traversal counts: %w", err)
 	}

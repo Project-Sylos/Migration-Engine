@@ -30,14 +30,24 @@ func copyForceReplaceMarked(st opsdb.StatusRecord) bool {
 		opsdb.IsForceReplaceMark(st.ExclusionSource)
 }
 
+// traversalAckFromFailed reports a traversal-excluded node acknowledged from failed.
+func traversalAckFromFailed(st opsdb.StatusRecord) bool {
+	return st.TraversalStatus == db.StatusExcluded &&
+		opsdb.IsTraversalAckFromFailed(st.ExclusionSource)
+}
+
 // MergedReviewRow is one row from the merged review view (SRC+DST joined via id_map/path, status from events).
 type MergedReviewRow struct {
-	Path               string
-	Name               string
-	Depth              int
-	Type               string
-	SrcNodeID          string
-	DstNodeID          string
+	Path      string
+	Name      string
+	Depth     int
+	Type      string
+	SrcNodeID string
+	DstNodeID string
+	// SrcPath is the source id_path when Path is DST-native (side=dst browse).
+	SrcPath string
+	// DstPath is the destination id_path when a DST node is present (native DST browse).
+	DstPath            string
 	SrcTraversalStatus string
 	DstTraversalStatus string
 	CopyStatus         string
@@ -51,12 +61,16 @@ type MergedReviewRow struct {
 	CopyExcludedFromFailed bool
 	// CopyForceReplaceMarked reports pending prefer-source overwrite.
 	CopyForceReplaceMarked bool
+	// TraversalAckFromFailed reports traversal excluded from acknowledging a failure.
+	TraversalAckFromFailed bool
 	Size                   int64
 	// DstSize is the destination folder's identity child size when HasDstSize is set.
 	DstSize    int64
 	HasDstSize bool
 	// ResolvedDstName is the accepted/committed destination basename from path_events (empty if none).
 	ResolvedDstName string
+	// PathDstAction is gpl dst_action when accepted (rename).
+	PathDstAction string
 }
 
 // ReviewFilter narrows merged review rows for listing, search, and counts.
@@ -93,6 +107,9 @@ type ReviewFilter struct {
 	SizeValue     *int64
 
 	ExcludeDestinationOnly bool
+
+	// Side scopes folder browse / search: ""|"both" = merged (default), "src", "dst".
+	Side string
 
 	// AfterPath / AfterID are keyset pagination cursors (path ASC, id ASC). When set, OFFSET is ignored.
 	AfterPath string
@@ -185,32 +202,18 @@ func ReviewFilterHasSearchPredicate(f ReviewFilter) bool {
 	return false
 }
 
-// QueryNodesForReview returns nodes from the given table (SRC or DST) with optional depth, status, excluded, pathLike filters. Status from events. Used by review API.
-func QueryNodesForReview(d *db.DB, table string, depth *int, status string, excluded *bool, pathLike string, orderByPath bool, limit, offset int) ([]db.NodeState, error) {
-	return queryNodesForReview(d, table, depth, status, excluded, pathLike, orderByPath, limit, offset)
-}
-
 // ListMergedReviewDiffs returns merged review rows and total count matching the filter, ordered and paginated.
 // Use for tree diffs and any caller that needs an exact total. Search uses ListMergedReviewDiffsPage instead.
 func ListMergedReviewDiffs(d *db.DB, f ReviewFilter, orderBy string, limit, offset int) ([]MergedReviewRow, int, error) {
-	page, _, err := ListMergedReviewDiffsPage(d, f, orderBy, limit, offset)
+	page, _, err := ListMergedReviewDiffsPageCtx(context.Background(), d, f, orderBy, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
-	stats, err := GetMergedReviewStats(d, f)
+	stats, err := GetMergedReviewStatsCtx(context.Background(), d, f)
 	if err != nil {
 		return nil, 0, err
 	}
 	return page, stats.Total, nil
-}
-
-// CountMergedReviewRows returns the number of merged rows matching the filter.
-func CountMergedReviewRows(d *db.DB, f ReviewFilter) (int, error) {
-	stats, err := getMergedReviewStats(d, f)
-	if err != nil {
-		return 0, err
-	}
-	return stats.Total, nil
 }
 
 // MergedReviewStats holds aggregate counts over merged review rows (one row per path; same filter semantics as list/count).
@@ -226,14 +229,4 @@ type MergedReviewStats struct {
 	SizeSelected    int64 // sum of SRC file sizes with copy_status pending (selected to copy)
 	// Truncated is true when counting stopped early (e.g. query deadline), not when the true total is known.
 	Truncated bool
-}
-
-// GetMergedReviewStats returns aggregate counts for rows matching the filter. Counts are unique by path (merged view = one row per path).
-func GetMergedReviewStats(d *db.DB, f ReviewFilter) (MergedReviewStats, error) {
-	return getMergedReviewStats(d, f)
-}
-
-// GetMergedReviewStatsCtx is GetMergedReviewStats with a parent context (interactive-read cancel / deadline).
-func GetMergedReviewStatsCtx(parent context.Context, d *db.DB, f ReviewFilter) (MergedReviewStats, error) {
-	return getMergedReviewStatsCtx(parent, d, f)
 }

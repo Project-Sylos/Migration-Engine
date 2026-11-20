@@ -34,6 +34,11 @@ type LogEntry struct {
 	Timestamp time.Time
 	Level     string
 	Message   string
+	Entity    string
+	EntityID  string
+	Queue     string
+	Action    string
+	NodeID    string
 }
 
 type logRing struct {
@@ -132,6 +137,8 @@ type Migration struct {
 	pathCheckDstProvider string
 	pathCheckProfile     string
 	windowsCompatFlag    bool
+	overwritePolicy      string
+	hashVerifyFlag       bool
 	filterRuleset        *filter.CompiledRuleset
 	runCancel            context.CancelFunc
 	running              bool
@@ -140,15 +147,18 @@ type Migration struct {
 	stopGraceTimer       *time.Timer
 	stopProgressMu       sync.Mutex
 	stopProgress         StopProgress
-	// persistRecord holds the last known migrations row (refreshed on DB sync); used to avoid DuckDB reads on hot API paths while Live.
+	// persistRecord holds the last known migrations row (refreshed on DB sync); used to avoid DB reads on hot API paths while Live.
 	persistRecord atomic.Value // migrationRecord
 	// activeQueueObs is set for the duration of traversal/copy/retry runs so queue metrics APIs can read memory instead of queue_stats.
 	activeQueueObs atomic.Pointer[observe.QueueObserver]
 	// activeAutoscaler is set while a phase autoscaler is running (for live MaxWorkers overrides).
 	activeAutoscaler   atomic.Pointer[loop.Autoscaler]
 	workerCapOverrides atomic.Value // profile.WorkerCapOverrides
-	finalizeError      string       // last durable-teardown failure (also in runtime_state JSON)
-	reviewOps          reviewOpGate // path-review mutation / interactive-read gate
+	// autoscalerPrefs holds durable Advanced-panel overlays + last knob views (*autoscalerPrefsState).
+	autoscalerPrefs atomic.Value
+	finalizeError   string       // last durable-teardown failure (also in runtime_state JSON)
+	reviewOps       reviewOpGate // path-review mutation / interactive-read gate
+	pathRenameJob   *pathRenameJob
 }
 
 func newMigration(manager *MigrationManager, record migrationRecord, database *db.DB, tokenKey []byte) *Migration {
@@ -165,6 +175,9 @@ func newMigration(manager *MigrationManager, record migrationRecord, database *d
 		reviewOps:          newReviewOpGate(),
 	}
 	m.persistRecord.Store(record)
+	if database != nil {
+		m.ensureAutoscalerPrefsLoaded()
+	}
 	return m
 }
 
@@ -192,6 +205,51 @@ func (m *Migration) SetWorkerCapOverrides(o profile.WorkerCapOverrides) {
 	}
 }
 
+// AutoscalerSnapshot returns the live autoscaler operator view, or the last
+// in-memory / flushed Advanced-panel knobs when no phase autoscaler is running.
+func (m *Migration) AutoscalerSnapshot() loop.LiveSnapshot {
+	if m == nil {
+		return loop.LiveSnapshot{Rates: map[string][]loop.RateSample{}}
+	}
+	if a := m.activeAutoscaler.Load(); a != nil {
+		snap := a.LiveSnapshot()
+		// Memory only: autoscaler self-tuning must not flush Badger on the poll path.
+		m.rememberAutoscalerViews(snap.Knobs)
+		return snap
+	}
+	return m.pausedAutoscalerSnapshot()
+}
+
+// ApplyAutoscalerOverrides merges manual Advanced-panel overlays in memory and
+// applies them to a live autoscaler when present. Disk flush is async so Apply
+// never blocks on Badger writeMu. Warnings report absolute-cap clamps (e.g. seal
+// buffer size over 250k).
+func (m *Migration) ApplyAutoscalerOverrides(overrides []loop.KnobOverride) (warnings []string, err error) {
+	if m == nil {
+		return nil, fmt.Errorf("migration is nil")
+	}
+	for i := range overrides {
+		if w := loop.ClampSealRowOverride(&overrides[i]); w != "" {
+			warnings = append(warnings, w)
+		}
+	}
+	if err := m.mergeKnobOverrides(overrides); err != nil {
+		return warnings, err
+	}
+	if a := m.activeAutoscaler.Load(); a != nil {
+		liveWarn, err := a.ApplyKnobOverrides(overrides)
+		warnings = append(warnings, liveWarn...)
+		if err != nil {
+			return warnings, err
+		}
+		m.rememberAutoscalerViews(a.LiveSnapshot().Knobs)
+	} else {
+		m.refreshPausedViewsFromOverrides()
+	}
+	m.flushAutoscalerPrefsAsync()
+	return warnings, nil
+}
+
 // WorkerCapOverrides returns the current MaxWorkers overlays (session + last Set).
 func (m *Migration) WorkerCapOverrides() profile.WorkerCapOverrides {
 	if m == nil {
@@ -209,11 +267,21 @@ func (m *Migration) bindAutoscaler(a *loop.Autoscaler) {
 	if m == nil {
 		return
 	}
-	m.activeAutoscaler.Store(a)
 	if a == nil {
+		// Phase stop: snapshot in memory, then async offload (do not block teardown on Badger).
+		if prev := m.activeAutoscaler.Load(); prev != nil {
+			m.rememberAutoscalerViews(prev.LiveSnapshot().Knobs)
+			m.flushAutoscalerPrefsAsync()
+		}
+		m.activeAutoscaler.Store(nil)
 		return
 	}
+	// Resume / phase start: load from disk into memory (if needed) and reapply; no write.
+	m.activeAutoscaler.Store(a)
 	a.SetWorkerCapOverrides(m.WorkerCapOverrides())
+	if ovs := m.listKnobOverrides(); len(ovs) > 0 {
+		_, _ = a.ApplyKnobOverrides(ovs)
+	}
 }
 
 // resolveAutoscalerConfig merges Config.Autoscaler with any session WorkerCapOverrides on m.
@@ -248,7 +316,7 @@ func (m *Migration) syncRecord(record migrationRecord) {
 	m.persistRecord.Store(record)
 }
 
-// cachedMigrationDetailsForLiveAPI returns details from the last persisted migration row without querying DuckDB.
+// cachedMigrationDetailsForLiveAPI returns details from the last persisted migration row without querying DB.
 func (m *Migration) cachedMigrationDetailsForLiveAPI() (*MigrationDetails, bool) {
 	v := m.persistRecord.Load()
 	if v == nil {
@@ -281,6 +349,8 @@ func (m *Migration) setLastRunConfig(cfg Config) {
 	m.pathCheckDstProvider = c.Destination.ProviderID
 	m.pathCheckProfile = c.PathCheckTarget
 	m.windowsCompatFlag = c.WindowsCompat
+	m.overwritePolicy = NormalizeOverwritePolicy(c.OverwritePolicy)
+	m.hashVerifyFlag = c.HashVerify
 	if c.FilterRuleset != nil {
 		m.filterRuleset = c.FilterRuleset
 	}
@@ -347,10 +417,37 @@ func (m *Migration) WindowsCompat() bool {
 	return m.windowsCompatFlag
 }
 
+// OverwritePolicy reports the exists-on-both file pairing policy.
+func (m *Migration) OverwritePolicy() string {
+	if m == nil {
+		return OverwriteNewestMTime
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return NormalizeOverwritePolicy(m.overwritePolicy)
+}
+
+// HashVerify reports whether dual-stream content hash compare is enabled.
+func (m *Migration) HashVerify() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.hashVerifyFlag
+}
+
 // bindDB attaches the database to a migration that was created without one (pending). Called by the manager when the API passes the migration folder path.
 func (m *Migration) bindDB(database *db.DB) {
 	m.DB = database
 	m.store = newMigrationStore(database, m.tokenEncryptionKey)
+	// Allow a fresh load of Advanced-panel prefs from the newly attached ops store.
+	if st := m.prefsState(); st != nil {
+		st.mu.Lock()
+		st.loaded = false
+		st.mu.Unlock()
+	}
+	m.ensureAutoscalerPrefsLoaded()
 }
 
 func (m *Migration) setTokenEncryptionKey(tokenKey []byte) {
@@ -396,24 +493,44 @@ func (m *Migration) IsLive() bool {
 // NormalizeDeadInProgressToSuspended moves a non-live *-in-progress phase to the matching
 // *-suspended phase so resume can restart. No-op when live or when not in an in-progress phase.
 // Dead *-finalizing becomes *-finalize-failed so the UI can retry durable teardown.
+// PhaseAborted heals to the unclean kind's suspended phase (or traversal-suspended as fallback).
+// Crash/force-stop heals also set unclean_interrupt for recovery-mode resume.
 func (m *Migration) NormalizeDeadInProgressToSuspended() (bool, error) {
 	if m.IsLive() {
 		return false, nil
 	}
+	phase := m.Phase()
 	var target string
-	switch m.Phase() {
+	uncleanKind := ""
+	switch phase {
 	case PhaseTraversing:
 		target = PhaseTraversalSuspended
+		uncleanKind = "traversal"
 	case PhaseCopying:
 		target = PhaseCopySuspended
+		uncleanKind = "copy"
 	case PhaseDeleting:
 		target = PhaseDeleteSuspended
+		uncleanKind = "delete"
 	case PhaseTraversalFinalizing:
 		target = PhaseTraversalFinalizeFailed
+		uncleanKind = "traversal"
 	case PhaseCopyFinalizing:
 		target = PhaseCopyFinalizeFailed
+		uncleanKind = "copy"
 	case PhaseDeleteFinalizing:
 		target = PhaseDeleteFinalizeFailed
+		uncleanKind = "delete"
+	case PhaseAborted:
+		uncleanKind = m.UncleanInterruptKind()
+		if uncleanKind == "" {
+			uncleanKind = "traversal"
+		}
+		target = suspendedPhaseForKind(uncleanKind)
+		if target == "" {
+			target = PhaseTraversalSuspended
+			uncleanKind = "traversal"
+		}
 	default:
 		return false, nil
 	}
@@ -422,6 +539,9 @@ func (m *Migration) NormalizeDeadInProgressToSuspended() (bool, error) {
 	}
 	if IsFinalizeFailedPhase(target) && m.FinalizeError() == "" {
 		m.setFinalizeError(fmt.Errorf("durable teardown interrupted (process stopped during finalizing)"))
+	}
+	if uncleanKind != "" {
+		_ = m.SetUncleanInterrupt(uncleanKind)
 	}
 	return true, nil
 }

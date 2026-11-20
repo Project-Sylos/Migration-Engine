@@ -38,6 +38,12 @@ type PathIssueRow struct {
 	Messages     []PathIssueMessage
 	// Ignored is true when the node's current gpl_status is ignored (warning dismissed).
 	Ignored bool
+	// DstAction is set on accepted rows (rename); empty for open issues.
+	DstAction string
+	// CollisionSibling is the colliding DST basename from IssuesJSON Detail when present.
+	CollisionSibling string
+	// SuggestedUniqueName is a free sibling basename (base (1), …) when a collision is open.
+	SuggestedUniqueName string
 }
 
 // ValidatePathProposalResult is a dry-run GPL check for a proposed basename.
@@ -114,15 +120,17 @@ func (m *Migration) ListPathIssues(limit int) ([]PathIssueRow, error) {
 		}
 		n := nodes[id]
 		r := PathIssueRow{
-			NodeID:       id,
-			Path:         n.Path,
-			Name:         n.Name,
-			ProposedPath: rec.ProposedName,
-			Status:       rec.Status,
-			Category:     "gpl_clean",
-			GPLIssues:    rec.IssuesJSON,
-			EventTime:    rec.UpdatedAt,
-			Ignored:      stMap[id].GPLStatus == db.GPLStatusIgnored,
+			NodeID:           id,
+			Path:             n.Path,
+			Name:             n.Name,
+			ProposedPath:     rec.ProposedName,
+			Status:           rec.Status,
+			Category:         "gpl_clean",
+			GPLIssues:        rec.IssuesJSON,
+			EventTime:        rec.UpdatedAt,
+			Ignored:          stMap[id].GPLStatus == db.GPLStatusIgnored,
+			DstAction:        rec.DstAction,
+			CollisionSibling: PathCollisionSibling(rec.IssuesJSON),
 		}
 		if r.Name == "" {
 			r.Name = db.NormalizeNodeBasename(r.Path)
@@ -131,12 +139,26 @@ func (m *Migration) ListPathIssues(limit int) ([]PathIssueRow, error) {
 			r.Path = display
 		}
 		r.Messages = PathIssueMessagesFromGPLJSON(r.GPLIssues)
+		if r.CollisionSibling != "" || pathIssueHasSiblingCollision(r.Messages) {
+			if name, err := m.PreviewUniquePathName(id); err == nil && name != "" {
+				r.SuggestedUniqueName = name
+			}
+		}
 		out = append(out, r)
 		if len(out) >= limit {
 			break
 		}
 	}
 	return out, nil
+}
+
+func pathIssueHasSiblingCollision(msgs []PathIssueMessage) bool {
+	for _, m := range msgs {
+		if m.Category == string(issue.CategorySiblingCollision) {
+			return true
+		}
+	}
+	return false
 }
 
 // ActivePathIssues returns the subset of ListPathIssues that are not ignored.
@@ -185,8 +207,10 @@ func (m *Migration) AcceptPathChange(nodeID, proposedPath string, forceSkipValid
 	return m.acceptPathChange(nodeID, proposedPath, forceSkipValidation)
 }
 
-// ResetPathRemap clears an accepted destination name override, restores gpl_status=pending
-// on the node (and descendants), and re-runs the GPL sweep so warnings can reappear.
+// ResetPathRemap undoes an accepted destination rename / unique name.
+// Reversible while copy is still pending or already_existed. If the destination
+// was already FS-renamed, it is renamed back to the source basename first.
+// Source is never mutated.
 func (m *Migration) ResetPathRemap(nodeID string) error {
 	if m == nil || m.DB == nil {
 		return fmt.Errorf("migration db not open")
@@ -201,6 +225,29 @@ func (m *Migration) ResetPathRemap(nodeID string) error {
 	if node == nil {
 		return fmt.Errorf("node %s not found", nodeID)
 	}
+	gplRec, ok, err := m.DB.Ops().GetGPL(nodeID)
+	if err != nil {
+		return err
+	}
+	if !ok || gplRec.Status != db.GPLIssueStatusAccepted {
+		return fmt.Errorf("node does not have an accepted destination rename")
+	}
+	if gplRec.DstAction != "" && gplRec.DstAction != db.DstActionRename {
+		return fmt.Errorf("cannot reset dst_action %q: folder merge is deferred and unavailable", gplRec.DstAction)
+	}
+	copySt := node.CopyStatus
+	if copySt == "" {
+		copySt = db.CopyStatusPending
+	}
+	switch copySt {
+	case db.CopyStatusPending, db.CopyStatusAlreadyExisted:
+		// Reversible while copy has not successfully written this node.
+	default:
+		return fmt.Errorf("cannot reset rename: copy status %q", copySt)
+	}
+	if err := m.revertAcceptedDSTRename(nodeID, node, gplRec.ProposedName); err != nil {
+		return err
+	}
 	if err := m.DB.DeleteGPLIssue(nodeID); err != nil {
 		return err
 	}
@@ -210,7 +257,7 @@ func (m *Migration) ResetPathRemap(nodeID string) error {
 	if err := m.DB.SetSubtreeGPLStatus("dst", node.Path, db.GPLStatusPending, true); err != nil {
 		return err
 	}
-	return m.RunGPLSweep()
+	return m.RunGPLSweep(node.Path)
 }
 
 // AcceptAllPathProposals accepts every active pending proposal's proposed_path.
@@ -263,7 +310,13 @@ func (m *Migration) applyGPLSubtreeStatus(nodeID, gplStatus string) error {
 }
 
 // SetGPLSubtreeIgnored marks nodeID and descendants ignored or restores prior gpl_status when ignored is false.
+// Ignoring a manual_review issue is refused (must rename / merge / unique).
 func (m *Migration) SetGPLSubtreeIgnored(nodeID string, ignored bool) error {
+	if ignored {
+		if err := m.ensurePathIssueIgnorable(nodeID); err != nil {
+			return err
+		}
+	}
 	status := db.GPLStatusPending
 	if ignored {
 		status = db.GPLStatusIgnored
@@ -271,7 +324,21 @@ func (m *Migration) SetGPLSubtreeIgnored(nodeID string, ignored bool) error {
 	return m.applyGPLSubtreeStatus(nodeID, status)
 }
 
-// IgnoreAllPathIssues marks every active (non-ignored) path-issue node's subtree as ignored.
+func (m *Migration) ensurePathIssueIgnorable(nodeID string) error {
+	if m == nil || m.DB == nil || nodeID == "" {
+		return fmt.Errorf("migration db not open")
+	}
+	rec, ok, err := m.DB.Ops().GetGPL(nodeID)
+	if err != nil {
+		return err
+	}
+	if ok && rec.Status == db.GPLIssueStatusManualReview {
+		return fmt.Errorf("this naming issue requires a fix and cannot be dismissed")
+	}
+	return nil
+}
+
+// IgnoreAllPathIssues marks every active soft (non-manual_review) path-issue node's subtree as ignored.
 func (m *Migration) IgnoreAllPathIssues() (int, error) {
 	if !m.PathChecksEnabled() {
 		return 0, nil
@@ -283,6 +350,9 @@ func (m *Migration) IgnoreAllPathIssues() (int, error) {
 	seen := make(map[string]struct{}, len(issues))
 	n := 0
 	for _, row := range ActivePathIssues(issues) {
+		if row.Status == db.GPLIssueStatusManualReview {
+			continue
+		}
 		if _, ok := seen[row.NodeID]; ok {
 			continue
 		}
@@ -328,6 +398,26 @@ func (m *Migration) acceptPathChange(nodeID, proposedPath string, forceSkipValid
 	if node == nil {
 		return fmt.Errorf("load node: %s not found", nodeID)
 	}
+	copySt := node.CopyStatus
+	if copySt == "" {
+		copySt = db.CopyStatusPending
+	}
+	var alreadyMapped bool
+	switch copySt {
+	case db.CopyStatusPending:
+		// Planned create: store destination basename in GPL only (source stays untouched).
+	case db.CopyStatusAlreadyExisted:
+		mapped, ok, mapErr := m.DB.Ops().GetMapBySrc(nodeID)
+		if mapErr != nil {
+			return mapErr
+		}
+		if !ok || mapped.Status != db.IDMapStatusActive {
+			return fmt.Errorf("cannot rename: destination item is not mapped")
+		}
+		alreadyMapped = true
+	default:
+		return fmt.Errorf("cannot rename: copy status %q (only pending or already-existed)", copySt)
+	}
 	parentPathLen := queuegpl.LoadParentPathLen(m.DB, node.ParentID, "")
 	siblings, err := m.listSRCSiblingBasenames(node.ParentID, nodeID)
 	if err != nil {
@@ -365,10 +455,8 @@ func (m *Migration) acceptPathChange(nodeID, proposedPath string, forceSkipValid
 
 	gplJSON, _ := json.Marshal(payload)
 	dstAction := ""
-	if node.CopyStatus == db.CopyStatusAlreadyExisted {
-		if mapped, ok, _ := m.DB.Ops().GetMapBySrc(nodeID); ok && mapped.Status == db.IDMapStatusActive {
-			dstAction = db.DstActionRename
-		}
+	if alreadyMapped {
+		dstAction = db.DstActionRename
 	}
 	now := time.Now().UnixNano()
 	if err := m.DB.PutGPLIssue(nodeID, db.GPLIssueStatusAccepted, proposedPath, string(issuesJSON), dstAction, now); err != nil {
@@ -392,16 +480,11 @@ func (m *Migration) acceptPathChange(nodeID, proposedPath string, forceSkipValid
 	if err := m.DB.SetSubtreeGPLStatus("dst", node.Path, gplStatus, includeRoot); err != nil {
 		return err
 	}
-	if m.sourceAdapter() != nil {
-		if renameErr := m.ApplySRCRename(nodeID, proposedPath); renameErr != nil {
-			return fmt.Errorf("accepted proposal but source rename failed: %w", renameErr)
-		}
-	} else if err := m.DB.UpdateSrcNodeName(nodeID, proposedPath); err != nil {
-		return fmt.Errorf("accepted proposal but source name update failed: %w", err)
-	}
+	// Destination basename is bookkeeping only (GPL ProposedName / ResolvedDstName).
+	// Never rename or rewrite the source FS or SRC node name/DisplayPath.
 	if dstAction == db.DstActionRename {
-		// Best-effort immediate rename when the DST adapter is available; otherwise
-		// dst_action stays set for RunDSTRenameSweep (e.g. Accept-all / pre-copy).
+		// Already-mapped destination: rename the existing DST item when the adapter is live.
+		// Otherwise dst_action stays set for RunDSTRenameSweep (e.g. Accept-all / pre-copy).
 		if m.destinationAdapter() != nil {
 			if renameErr := m.ApplyDSTRename(nodeID); renameErr != nil {
 				return fmt.Errorf("accepted proposal but destination rename failed: %w", renameErr)
@@ -560,14 +643,17 @@ func validateProposedPart(target gpl.Target, parentPathLen int, proposed string,
 			payload.Part.Collision = true
 		}
 	}
-	// Sibling collision is Clean-time in GPL; accept uses exact basename match against peers.
+	// Sibling collision is Clean-time in GPL; accept also checks basename against peers
+	// with the same Windows-aware equality as go-path-linter.
+	fold := gpl.CaseInsensitiveSiblingTarget(target) || windowsCompat
 	for _, sib := range siblings {
-		if sib != "" && sib == proposed {
+		if sib != "" && gpl.SiblingNamesEqual(sib, proposed, fold) {
 			payload.Part.Collision = true
 			partCats = append(partCats, string(issue.CategorySiblingCollision))
 			l.Log.AddIssue(issue.Issue{
 				Category: issue.CategorySiblingCollision,
 				Part:     proposed,
+				Detail:   sib,
 				Message:  "proposed name collides with sibling",
 			})
 			break

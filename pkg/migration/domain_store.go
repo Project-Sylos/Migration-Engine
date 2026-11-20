@@ -7,7 +7,7 @@ import (
 	"fmt"
 )
 
-// Store is the migration persistence layer for one DuckDB file.
+// Store is the migration persistence layer for one migration ops store.
 type Store = migrationStore
 
 // RunStore executes fn against the migration store.
@@ -16,6 +16,14 @@ func (m *Migration) RunStore(fn func(*Store) error) error {
 		return fmt.Errorf("migration has no database")
 	}
 	return fn(m.store)
+}
+
+// RemapLocalServiceIDs rewrites absolute LocalFS ServiceIDs for one side (src or dst).
+func (m *Migration) RemapLocalServiceIDs(side, oldRoot, newRoot string) (int, error) {
+	if m.DB == nil || m.DB.Ops() == nil {
+		return 0, fmt.Errorf("migration has no ops store")
+	}
+	return m.DB.Ops().RemapLocalServiceIDs(side, oldRoot, newRoot)
 }
 
 // GetFSCredentialBinding returns a binding by role ("source" or "destination"), or an error if missing.

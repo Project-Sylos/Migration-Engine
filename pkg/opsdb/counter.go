@@ -99,7 +99,7 @@ func (s *Store) ApplyReviewAndDepth(reviewKeys []string, reviewDeltas []int64, d
 		Side string
 		Key  string
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		for k, delta := range reviewSum {
 			if delta == 0 {
 				continue
@@ -147,7 +147,7 @@ func (s *Store) GetDepthStat(side string, depth int, key string) (int64, error) 
 		return 0, nil
 	}
 	var n int64
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		var err error
 		n, err = readInt64(txn, depthStatKey(side, depth, key))
 		return err
@@ -161,7 +161,7 @@ func (s *Store) GetDepthStatTotal(side, key string) (int64, error) {
 		return 0, nil
 	}
 	var n int64
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		var err error
 		n, err = readInt64(txn, depthTotKey(side, key))
 		return err
@@ -175,7 +175,7 @@ func (s *Store) GetDepthMax(side string) (int, error) {
 		return 0, nil
 	}
 	var n int64
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		var err error
 		n, err = readInt64(txn, depthMaxKey(side))
 		return err
@@ -190,7 +190,7 @@ func (s *Store) ListDepthStats() ([]DepthStatRow, error) {
 	}
 	prefix := []byte("stat:depth:")
 	var out []DepthStatRow
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer it.Close()
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {

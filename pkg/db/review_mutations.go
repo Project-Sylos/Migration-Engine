@@ -21,6 +21,8 @@ type CopyMutationResult struct {
 	RestoredFailed int64
 	// RetryExcluded counts retry-marked pending nodes moved to excluded.
 	RetryExcluded int64
+	// RetryMarked counts unexcluded nodes restored as retry-marked pending.
+	RetryMarked int64
 }
 
 // DeleteMutationResult aggregates live delete forest/retry writes.
@@ -38,11 +40,27 @@ func copyCompleteForDelete(st opsdb.StatusRecord) bool {
 
 // ApplySubtreeCopyExclusion writes live copy exclude/unexclude over a path prefix.
 func (db *DB) ApplySubtreeCopyExclusion(rootPath string, excluded bool, skip func(id, path, typ string) bool) (CopyMutationResult, error) {
+	return db.applySubtreeCopyExclusion(rootPath, excluded, false, skip)
+}
+
+// ApplySubtreeCopyExclusionAsRetry unexcludes a path prefix as retry-marked pending.
+func (db *DB) ApplySubtreeCopyExclusionAsRetry(rootPath string, skip func(id, path, typ string) bool) (CopyMutationResult, error) {
+	return db.applySubtreeCopyExclusion(rootPath, false, true, skip)
+}
+
+func (db *DB) applySubtreeCopyExclusion(rootPath string, excluded, asRetry bool, skip func(id, path, typ string) bool) (CopyMutationResult, error) {
 	var out CopyMutationResult
 	if db == nil || db.Ops() == nil {
 		return out, fmt.Errorf("ops store required")
 	}
-	mut, err := db.Ops().ApplySubtreeCopyExclusion(NormalizeSubtreeRootPathForPropagation(rootPath), excluded, skip)
+	root := NormalizeSubtreeRootPathForPropagation(rootPath)
+	var mut opsdb.SubtreeMutationResult
+	var err error
+	if asRetry {
+		mut, err = db.Ops().ApplySubtreeCopyExclusionAsRetry(root, skip)
+	} else {
+		mut, err = db.Ops().ApplySubtreeCopyExclusion(root, excluded, skip)
+	}
 	if err != nil {
 		return out, err
 	}
@@ -51,11 +69,26 @@ func (db *DB) ApplySubtreeCopyExclusion(rootPath string, excluded bool, skip fun
 
 // ApplyNodeCopyExclusion writes live copy exclude/unexclude for one SRC node.
 func (db *DB) ApplyNodeCopyExclusion(nodeID string, excluded bool) (CopyMutationResult, error) {
+	return db.applyNodeCopyExclusion(nodeID, excluded, false)
+}
+
+// ApplyNodeCopyExclusionAsRetry unexcludes one SRC node as retry-marked pending.
+func (db *DB) ApplyNodeCopyExclusionAsRetry(nodeID string) (CopyMutationResult, error) {
+	return db.applyNodeCopyExclusion(nodeID, false, true)
+}
+
+func (db *DB) applyNodeCopyExclusion(nodeID string, excluded, asRetry bool) (CopyMutationResult, error) {
 	var out CopyMutationResult
 	if db == nil || db.Ops() == nil || nodeID == "" {
 		return out, fmt.Errorf("ops store required")
 	}
-	mut, err := db.Ops().ApplyNodeCopyExclusion(nodeID, excluded)
+	var mut opsdb.SubtreeMutationResult
+	var err error
+	if asRetry {
+		mut, err = db.Ops().ApplyNodeCopyExclusionAsRetry(nodeID)
+	} else {
+		mut, err = db.Ops().ApplyNodeCopyExclusion(nodeID, excluded)
+	}
 	if err != nil {
 		return out, err
 	}
@@ -65,7 +98,7 @@ func (db *DB) ApplyNodeCopyExclusion(nodeID string, excluded bool) (CopyMutation
 func copyMutationFromOps(mut opsdb.SubtreeMutationResult) CopyMutationResult {
 	return CopyMutationResult{
 		Affected: mut.Affected, Folders: mut.Folders, Files: mut.Files, PendingBytes: mut.SelectedBytes,
-		RestoredFailed: mut.RestoredFailed, RetryExcluded: mut.RetryExcluded,
+		RestoredFailed: mut.RestoredFailed, RetryExcluded: mut.RetryExcluded, RetryMarked: mut.RetryMarked,
 	}
 }
 

@@ -80,7 +80,7 @@ func WorkerCapModeFromContext(ctx queue.ScalingContext) WorkerCapMode {
 }
 
 // ApplyWorkerCapOverride raises or lowers MaxWorkers when an override is set.
-// Soft-cap / AIMD still operate inside the resulting hard max.
+// Soft-cap scaling still operates inside the resulting hard max.
 func ApplyWorkerCapOverride(prof FSPerformanceProfile, overrides WorkerCapOverrides, mode WorkerCapMode) FSPerformanceProfile {
 	max := overrides.MaxFor(mode)
 	if max <= 0 {
@@ -103,7 +103,7 @@ type ModeWorkerCaps struct {
 
 // ProviderWorkerCaps is the shipped default caps for all modes of one provider.
 type ProviderWorkerCaps struct {
-	ProviderID string                     `json:"provider_id"`
+	ProviderID string                           `json:"provider_id"`
 	Modes      map[WorkerCapMode]ModeWorkerCaps `json:"modes"`
 }
 
@@ -117,11 +117,6 @@ func DefaultWorkerCaps(providerID string) ProviderWorkerCaps {
 		modes[mode] = defaultModeCaps(providerID, mode)
 	}
 	return ProviderWorkerCaps{ProviderID: providerID, Modes: modes}
-}
-
-// DefaultMaxWorkers returns shipped MaxWorkers for providerID + mode.
-func DefaultMaxWorkers(providerID string, mode WorkerCapMode) int {
-	return defaultModeCaps(providerID, mode).MaxWorkers
 }
 
 func defaultModeCaps(providerID string, mode WorkerCapMode) ModeWorkerCaps {

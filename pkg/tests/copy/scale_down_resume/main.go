@@ -1,7 +1,7 @@
 // Copyright 2025 Sylos contributors
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
-// Scale-down + resume chaos: Spectra rate limits force AIMD worker step-down during
+// Scale-down + resume chaos: Spectra rate limits force autoscaler worker step-down during
 // copy. Asserts no duplicate copy success events per node and no already_existed
 // on nodes that still carry an attempt marker.
 package main
@@ -44,7 +44,7 @@ func runTest() error {
 	fmt.Println("📋 Phase 1: Setup (Spectra chaos + autoscaler)")
 	cfg, err := shared.SetupEphemeralThrottleTest(true, initialWorkers, migration.AutoscalerConfig{
 		Interval:  2 * time.Second,
-		DebugAIMD: true,
+		DebugAutoscaler: true,
 		OnEvent:   onEvent,
 	})
 	if err != nil {
@@ -72,23 +72,25 @@ func runTest() error {
 
 	fmt.Println("🚀 Phase 3: Copy under throttle / scale-down")
 	_, err = migration.RunCopyPhase(migration.CopyPhaseConfig{
-		DuckDB:       database,
-		SrcAdapter:   cfg.Source.Adapter,
-		DstAdapter:   cfg.Destination.Adapter,
-		WorkerCount:  initialWorkers,
-		MaxRetries:   3,
-		SkipListener: true,
-		LogAddress:   "127.0.0.1:8081",
-		LogLevel:     "trace",
-		StartupDelay: 500 * time.Millisecond,
-		ProgressTick: time.Second,
-		SrcService:   cfg.Source,
-		DstService:   cfg.Destination,
-		Autoscaler: migration.AutoscalerConfig{
-			Interval:  2 * time.Second,
-			DebugAIMD: true,
-			OnEvent:   onEvent,
-		}.Resolve(),
+		PhaseRuntime: migration.PhaseRuntime{
+			WorkerCount:  initialWorkers,
+			MaxRetries:   3,
+			SkipListener: true,
+			LogAddress:   "127.0.0.1:8081",
+			LogLevel:     "trace",
+			StartupDelay: 500 * time.Millisecond,
+			ProgressTick: time.Second,
+			SrcService:   cfg.Source,
+			DstService:   cfg.Destination,
+			Autoscaler: migration.AutoscalerConfig{
+				Interval:  2 * time.Second,
+				DebugAutoscaler: true,
+				OnEvent:   onEvent,
+			}.Resolve(),
+		},
+		DB:         database,
+		SrcAdapter: cfg.Source.Adapter,
+		DstAdapter: cfg.Destination.Adapter,
 	})
 	if err != nil {
 		return fmt.Errorf("copy phase failed: %w", err)

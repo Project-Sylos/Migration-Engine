@@ -107,7 +107,7 @@ LocalFS refuses to list or open paths under `/proc`, `/sys`, `/dev`, `/run` (and
 
 ### Traversal stall (Migration-Engine)
 
-`ListChildren` no longer gets fake ProgressWatchdog heartbeats. If a list call makes no real progress for ~15s (except while seal flush or a rate-limit wait is active), the watchdog cancels the context and the task fails as non-retryable (`traversal stalled`) so the round can advance instead of wedging forever on hung kernel ops (classic: `Lstat` on `/proc/.../fd/N`). Delete uses the same seal-or-rate-limit suppress with a 60s kill timeout on `DeleteNode` / `DeleteBatch`.
+`ListChildren` gets one ProgressWatchdog Beat at start and no mid-list fake beats. Seal flush does **not** freeze the timer (that used to hide automount/NFS/FUSE blackholes). Active FS rate-limit windows still freeze it so provider backoff is not treated as a hang. After `traversalStallTimeout` (60s) of unsuppressed idle, the watchdog cancels the context and the task fails as non-retryable (`traversal stalled`) so the round can advance. Cancel frees the worker even if the adapter goroutine remains blocked in the syscall. Copy/delete still use seal-or-rate-limit suppress with their own kill timeouts (`DeleteNode` / `DeleteBatch` at 60s).
 
 ---
 
@@ -117,7 +117,7 @@ Backoff policy should be **pluggable per FS performance profile**, not one hardc
 
 | Profile posture | Behavior sketch |
 |-----------------|-----------------|
-| **Default / general** | Truncated exponential increase on retry, decay on success (shrink sleep when calls succeed), bounded by min/max sleep. “Recover on success” in the same primitive may complement discrete AIMD worker step-ups. |
+| **Default / general** | Truncated exponential increase on retry, decay on success (shrink sleep when calls succeed), bounded by min/max sleep. “Recover on success” in the same primitive may complement discrete worker step-ups. |
 | **Fragile / quota-heavy APIs** | Exponential backoff **with jitter** (`base × 2^n + random_ms`) to avoid synchronized retry collisions after a shared throttle event. |
 | **Assume-healthy object storage** | Near-zero delay on the happy path; backoff only on actual errors — a different default posture than quota-heavy drive APIs. |
 
@@ -193,7 +193,7 @@ Local-path adapters cannot see HTTP 429 underneath a mount. Validate empirically
 | Explicit 429 / retry-after | Spectra → `ClassifySpectraError` + `DoWithClassifiedRetry` → `FS_THROTTLE` | Wire on production cloud adapters |
 | Ambiguous local / FUSE errors | **LocalFS**: classify + behavioral promotion → `suspected_rate_limit` | Tune errno buckets from empirical runs |
 | Retry vs throttle axes | **`DoWithClassifiedRetry`** (LocalFS + SpectraFS) | Cloud adapters via `ClassifyError` |
-| Backoff shape per profile | AIMD on workers + inter-op delay; fixed retry sleep in FS layer | Pluggable backoff calculators per profile |
+| Backoff shape per profile | Soft-cap scaling on workers + inter-op delay; fixed retry sleep in FS layer | Pluggable backoff calculators per profile |
 | Backend group state | Workers + degradation hits + ambiguous tracker on `FSDegradationState` | Co-locate backoff calculator on `BackendGroup` |
 
 See [autoscaler.md — Remaining work](./autoscaler.md#remaining-work) for implementation ordering.

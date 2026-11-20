@@ -22,7 +22,7 @@ func TestSealBufferAppendsSparseGPLIssueOnce(t *testing.T) {
 		ProposedName: "clean.txt",
 		IssuesJSON:   `[{"category":"InvalidChar"}]`,
 	}
-	// Seal path is gated by GPLDisabled; write directly to ops.
+	// Write sparse issues directly (same shape seal AddGPLIssue uses).
 	if err := database.Ops().BatchPutGPL([]opsdb.GPLRecord{{
 		SrcID: issue.SrcID, Status: issue.Status, ProposedName: issue.ProposedName, IssuesJSON: issue.IssuesJSON,
 	}}); err != nil {

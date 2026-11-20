@@ -20,7 +20,7 @@ func TestScanSubtreeIDsChunked(t *testing.T) {
 		{Side: SideSRC, Node: NodeRecord{ID: "b", Path: "/a/b", Name: "b", Type: NodeTypeFile, Size: 3, ParentID: "a"}, InsertOnly: true},
 		{Side: SideSRC, Node: NodeRecord{ID: "c", Path: "/a/c", Name: "c", Type: NodeTypeFile, Size: 5, ParentID: "a"}, InsertOnly: true},
 	}
-	if _, err := s.WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := s.WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -54,7 +54,7 @@ func TestScanSubtreeIDsExcludeRoot(t *testing.T) {
 		{Side: SideSRC, Node: NodeRecord{ID: "root", Path: "/folder", Name: "folder", Type: NodeTypeFolder}, InsertOnly: true},
 		{Side: SideSRC, Node: NodeRecord{ID: "kid", Path: "/folder/kid", Name: "kid", Type: NodeTypeFile, ParentID: "root"}, InsertOnly: true},
 	}
-	if _, err := s.WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := s.WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	ids, _, done, err := s.ScanSubtreeIDs(SideSRC, "/folder", "", 10, SubtreeScanOpts{ExcludeRoot: true})
@@ -92,7 +92,7 @@ func TestPropagateCopyFailureUnderPath(t *testing.T) {
 		Depth:      2,
 		InsertOnly: true,
 	}
-	if _, err := s.WriteSealBatch([]SealNodeWrite{parent, child, done}, nil, nil, nil, nil); err != nil {
+	if _, err := s.WriteSealBatch([]SealNodeWrite{parent, child, done}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	mut, err := s.PropagateCopyFailureUnderPath("/p")
@@ -136,7 +136,7 @@ func TestCascadeDeleteUnderPath(t *testing.T) {
 			InsertOnly: true,
 		},
 	}
-	if _, err := s.WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := s.WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	mut, err := s.CascadeDeleteUnderPath("/p")
@@ -176,7 +176,7 @@ func TestApplySubtreeCopyExclusionPendingOnly(t *testing.T) {
 			Deltas: []PendingDelta{{Phase: PhaseCopy, NodeType: NodeTypeFile, Add: true}},
 		},
 	}
-	if _, err := s.WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := s.WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	mut, err := s.ApplySubtreeCopyExclusion("/p", true, nil)
@@ -232,6 +232,51 @@ func TestApplySubtreeCopyExclusionPendingOnly(t *testing.T) {
 	}
 }
 
+func TestCopyExclusionDirectFromFailed(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	writes := []SealNodeWrite{{
+		Side: SideSRC,
+		Node: NodeRecord{ID: "f", Path: "/f", Name: "f", Type: NodeTypeFile, Depth: 1, Size: 3},
+		Status: StatusRecord{
+			TraversalStatus: "successful",
+			CopyStatus:      copyStatusFailed,
+		},
+		Depth:      1,
+		InsertOnly: true,
+	}}
+	if _, err := s.WriteSealBatch(writes, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	mut, err := s.ApplyNodeCopyExclusion("f", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mut.Affected != 1 || mut.RetryExcluded != 1 {
+		t.Fatalf("direct exclude from failed mut=%+v", mut)
+	}
+	st, ok, err := s.GetStatus(SideSRC, "f")
+	if err != nil || !ok || st.CopyStatus != copyStatusExcludedExplicit || !IsCopyExcludedFromFailed(st.ExclusionSource) {
+		t.Fatalf("status %+v", st)
+	}
+	mut, err = s.ApplyNodeCopyExclusion("f", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mut.RestoredFailed != 1 {
+		t.Fatalf("restore mut=%+v", mut)
+	}
+	st, _, _ = s.GetStatus(SideSRC, "f")
+	if st.CopyStatus != copyStatusFailed {
+		t.Fatalf("restored=%q", st.CopyStatus)
+	}
+}
+
 func TestCopyExclusionCycleRestoresFailedOrigin(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(Options{Dir: dir})
@@ -254,12 +299,12 @@ func TestCopyExclusionCycleRestoresFailedOrigin(t *testing.T) {
 			Status: StatusRecord{TraversalStatus: "successful", CopyStatus: copyStatusPending}, Depth: 2, InsertOnly: true,
 		},
 	}
-	if _, err := s.WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := s.WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
 	// Born-pending has no failure to return to: unmarking is a no-op.
-	mut, err := s.ApplyNodeCopyRetry("b", false)
+	mut, err := ApplyNodeRetry(s, SideSRC, "b", false, s.ApplyCopyRetryChunk)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +313,7 @@ func TestCopyExclusionCycleRestoresFailedOrigin(t *testing.T) {
 	}
 
 	// Failed -> retry-marked pending.
-	mut, err = s.ApplyNodeCopyRetry("f", true)
+	mut, err = ApplyNodeRetry(s, SideSRC, "f", true, s.ApplyCopyRetryChunk)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,10 +364,10 @@ func TestCopyExclusionCycleRestoresFailedOrigin(t *testing.T) {
 	}
 
 	// Marked pending can still be sent back to failed directly (mark failed).
-	if _, err := s.ApplyNodeCopyRetry("f", true); err != nil {
+	if _, err := ApplyNodeRetry(s, SideSRC, "f", true, s.ApplyCopyRetryChunk); err != nil {
 		t.Fatal(err)
 	}
-	mut, err = s.ApplyNodeCopyRetry("f", false)
+	mut, err = ApplyNodeRetry(s, SideSRC, "f", false, s.ApplyCopyRetryChunk)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,5 +377,38 @@ func TestCopyExclusionCycleRestoresFailedOrigin(t *testing.T) {
 	st, ok, err = s.GetStatus(SideSRC, "f")
 	if err != nil || !ok || st.CopyStatus != copyStatusFailed || st.ExclusionSource != "" {
 		t.Fatalf("after unmark %+v ok=%v err=%v", st, ok, err)
+	}
+}
+
+func TestUnexcludeAsRetryMarksPending(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	writes := []SealNodeWrite{
+		{Side: SideSRC, Node: NodeRecord{ID: "f", Path: "/f", Name: "f", Type: NodeTypeFile, Size: 4}, InsertOnly: true},
+	}
+	sts := []SealStatusWrite{
+		{Side: SideSRC, ID: "f", Status: StatusRecord{CopyStatus: copyStatusPending}, Depth: 1, Deltas: []PendingDelta{{Phase: PhaseCopy, NodeType: NodeTypeFile, Add: true}}},
+	}
+	if _, err := s.WriteSealBatch(writes, sts, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ApplyNodeCopyExclusion("f", true); err != nil {
+		t.Fatal(err)
+	}
+	mut, err := s.ApplyNodeCopyExclusionAsRetry("f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mut.Affected != 1 || mut.RetryMarked != 1 || mut.RestoredFailed != 0 {
+		t.Fatalf("asRetry mut=%+v want affected 1 retryMarked 1", mut)
+	}
+	st, ok, err := s.GetStatus(SideSRC, "f")
+	if err != nil || !ok || st.CopyStatus != copyStatusPending || !IsCopyRetryMark(st.ExclusionSource) {
+		t.Fatalf("asRetry status %+v ok=%v err=%v", st, ok, err)
 	}
 }

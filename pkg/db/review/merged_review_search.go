@@ -4,26 +4,27 @@
 package review
 
 import (
-	"context"
 	"strings"
-
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
-// ListMergedReviewDiffsPage returns a page of merged review rows without COUNT(*).
-func ListMergedReviewDiffsPage(d *db.DB, f ReviewFilter, orderBy string, limit, offset int) (page []MergedReviewRow, hasMore bool, err error) {
-	return ListMergedReviewDiffsPageCtx(context.Background(), d, f, orderBy, limit, offset)
-}
-
-// ListMergedReviewDiffsPageCtx is ListMergedReviewDiffsPage with a parent context
-// (ReviewQueryContext deadline / cancel). Prefer this for multi-page count and exclude loops.
-func ListMergedReviewDiffsPageCtx(parent context.Context, d *db.DB, f ReviewFilter, orderBy string, limit, offset int) (page []MergedReviewRow, hasMore bool, err error) {
-	return listMergedReviewDiffsPageCtx(parent, d, f, orderBy, limit, offset)
+// NormalizeReviewSide returns "src", "dst", or "both" (default for empty / unknown).
+func NormalizeReviewSide(side string) string {
+	switch strings.ToLower(strings.TrimSpace(side)) {
+	case "src", "source":
+		return "src"
+	case "dst", "dest", "destination":
+		return "dst"
+	default:
+		return "both"
+	}
 }
 
 // reviewSearchIncludeDSTOnly reports whether the DST-only scan can contribute rows.
 // Path-issue / copy / delete filters are SRC-native; not_on_src is DST-only (still included).
 func reviewSearchIncludeDSTOnly(f ReviewFilter) bool {
+	if NormalizeReviewSide(f.Side) == "src" {
+		return false
+	}
 	if f.ExcludeDestinationOnly {
 		return false
 	}
@@ -46,6 +47,9 @@ func reviewSearchIncludeDSTOnly(f ReviewFilter) bool {
 }
 
 func reviewSearchSRCImpossible(f ReviewFilter) bool {
+	if NormalizeReviewSide(f.Side) == "dst" {
+		return true
+	}
 	trav := strings.TrimSpace(f.TraversalStatus)
 	if trav == "" {
 		return false

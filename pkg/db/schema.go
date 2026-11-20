@@ -10,7 +10,6 @@ const (
 	TableDstStatusEvents      = "dst_status_events"
 	TableGPLIssues            = "gpl_issues"
 	TableIDMap                = "id_map"
-	TableSrcCurrent           = "src_current"
 	TableDstCurrent           = "dst_current"
 	TableSrcCurrentDelta      = "src_current_delta"
 	TableDstCurrentDelta      = "dst_current_delta"
@@ -30,12 +29,9 @@ const (
 	TableFilterApplications   = "filter_applications"
 	// TableStatusEventWatermarks stores per-side seal-flush high water (event_time nanos).
 	TableStatusEventWatermarks = "status_event_watermarks"
-	// TableDBOps is named DuckDB operation timings on the logs sidecar.
-	TableDBOps = "db_ops"
 )
 
-// Transfer checkpoint columns are nullable; copy_status stays pending while a checkpoint exists.
-// ensureSrcTransferCheckpointColumns ALTERs older DBs that were created before these columns existed.
+// Transfer checkpoint field names on status overlays (copy_status stays pending while a checkpoint exists).
 const (
 	ColXferOffset      = "xfer_offset"
 	ColXferSrcSize     = "xfer_src_size"
@@ -43,5 +39,3 @@ const (
 	ColXferDstRef      = "xfer_dst_ref"
 	ColXferResumeToken = "xfer_resume_token"
 )
-
-

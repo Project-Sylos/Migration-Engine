@@ -46,7 +46,7 @@ func (r VerificationReport) Success(opts VerifyOptions) bool {
 	return true
 }
 
-// VerifyMigration inspects the DuckDB node tables and stats for pending, failed, or missing nodes and returns a report.
+// VerifyMigration inspects the DB node tables and stats for pending, failed, or missing nodes and returns a report.
 func VerifyMigration(database *db.DB, opts VerifyOptions) (VerificationReport, error) {
 	if database == nil {
 		return VerificationReport{}, fmt.Errorf("database cannot be nil")
@@ -71,7 +71,7 @@ func VerifyMigration(database *db.DB, opts VerifyOptions) (VerificationReport, e
 	}
 
 	// Status totals from status_events (COUNT by current traversal_status per node)
-	srcCounts, err := stats.GetTraversalStatusCounts(database, "SRC", false)
+	srcCounts, err := stats.GetTraversalStatusCounts(database, "SRC")
 	if err != nil {
 		return VerificationReport{}, fmt.Errorf("failed to get SRC status counts from events: %w", err)
 	}
@@ -79,7 +79,7 @@ func VerifyMigration(database *db.DB, opts VerifyOptions) (VerificationReport, e
 	report.SrcSuccessful = int(srcCounts.Successful)
 	report.SrcFailed = int(srcCounts.Failed)
 
-	dstCounts, err := stats.GetTraversalStatusCounts(database, "DST", false)
+	dstCounts, err := stats.GetTraversalStatusCounts(database, "DST")
 	if err != nil {
 		return VerificationReport{}, fmt.Errorf("failed to get DST status counts from events: %w", err)
 	}

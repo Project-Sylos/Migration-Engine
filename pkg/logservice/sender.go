@@ -24,8 +24,14 @@ var LS *Sender
 
 // InitGlobalLogger initializes the global LS instance.
 // Logs are persisted to logDB (typically the migration logs sidecar) when non-nil.
+// UDP threshold defaults to level; persist threshold defaults to "trace".
 func InitGlobalLogger(logDB *db.DB, addr, level string) error {
-	sender, err := NewSender(logDB, addr, level)
+	return InitGlobalLoggerPersist(logDB, addr, level, "trace")
+}
+
+// InitGlobalLoggerPersist is InitGlobalLogger with an explicit persist_log_level.
+func InitGlobalLoggerPersist(logDB *db.DB, addr, udpLevel, persistLevel string) error {
+	sender, err := NewSenderPersist(logDB, addr, udpLevel, persistLevel)
 	if err != nil {
 		return fmt.Errorf("failed to initialize global logger: %w", err)
 	}
@@ -41,22 +47,23 @@ func InitGlobalLogger(logDB *db.DB, addr, level string) error {
 	return nil
 }
 
-// Sender transmits logs over UDP and optionally writes them to the main DB's logs table.
+// Sender transmits logs over UDP and optionally writes them to the logs sidecar.
 type Sender struct {
-	logDB      *db.DB        // main DB for log persistence (not owned; do not close)
-	logBuffer  *logbuf.LogBuffer // buffered log writer (nil if logDB is nil)
-	Addr       string        // e.g. "127.0.0.1:1997"
-	Level      string        // threshold for UDP output
-	conn       net.Conn
-	minLevelIx int
-	mu         sync.Mutex // guards buffer/encoder
-	buf        *bytes.Buffer
-	enc        *json.Encoder
-	tmp        LogPacket // reusable scratch struct
-	recent     *recentRing
+	logDB         *db.DB
+	logBuffer     *logbuf.LogBuffer
+	Addr          string
+	Level         string // UDP threshold
+	PersistLevel  string // disk threshold (live ring always receives all emits)
+	conn          net.Conn
+	minLevelIx    int
+	minPersistIx  int
+	mu            sync.Mutex
+	buf           *bytes.Buffer
+	enc           *json.Encoder
+	tmp           LogPacket
+	recent        *recentRing
 }
 
-// getLevelIndex assigns numeric priority to levels.
 func getLevelIndex(level string) int {
 	switch level {
 	case "trace":
@@ -76,34 +83,47 @@ func getLevelIndex(level string) int {
 	}
 }
 
-// NewSender initializes a new dual-channel sender.
-// If logDB is non-nil, logs are persisted to it (dedicated log file). If nil, only UDP is used.
+// NewSender initializes a sender with persist threshold "trace".
 func NewSender(logDB *db.DB, addr, level string) (*Sender, error) {
+	return NewSenderPersist(logDB, addr, level, "trace")
+}
+
+// NewSenderPersist initializes a dual-channel sender with separate UDP and persist thresholds.
+func NewSenderPersist(logDB *db.DB, addr, udpLevel, persistLevel string) (*Sender, error) {
 	conn, err := net.Dial("udp", addr)
 	if err != nil {
 		return nil, err
 	}
-	minIx := getLevelIndex(level)
+	minIx := getLevelIndex(udpLevel)
 	if minIx == -1 {
-		return nil, fmt.Errorf("invalid threshold level: %s", level)
+		return nil, fmt.Errorf("invalid threshold level: %s", udpLevel)
+	}
+	if persistLevel == "" {
+		persistLevel = "trace"
+	}
+	persistIx := getLevelIndex(persistLevel)
+	if persistIx == -1 {
+		return nil, fmt.Errorf("invalid persist level: %s", persistLevel)
 	}
 	buf := new(bytes.Buffer)
 
 	var logBuffer *logbuf.LogBuffer
 	if logDB != nil {
-		logBuffer = logbuf.NewLogBuffer(logDB, defaultBatchSize, 3 * time.Second)
+		logBuffer = logbuf.NewLogBuffer(logDB, defaultBatchSize, 3*time.Second)
 	}
 
 	return &Sender{
-		logDB:      logDB,
-		logBuffer:  logBuffer,
-		Addr:       addr,
-		Level:      level,
-		conn:       conn,
-		minLevelIx: minIx,
-		buf:        buf,
-		enc:        json.NewEncoder(buf),
-		recent:     newRecentRing(recentLogCap),
+		logDB:        logDB,
+		logBuffer:    logBuffer,
+		Addr:         addr,
+		Level:        udpLevel,
+		PersistLevel: persistLevel,
+		conn:         conn,
+		minLevelIx:   minIx,
+		minPersistIx: persistIx,
+		buf:          buf,
+		enc:          json.NewEncoder(buf),
+		recent:       newRecentRing(recentLogCap),
 	}, nil
 }
 
@@ -115,19 +135,40 @@ func (s *Sender) Recent(limit int) []RecentLog {
 	return s.recent.recent(limit)
 }
 
-// Log sends the message via UDP (if level >= threshold) and optionally to the log DB via the buffer.
-// Safe for concurrent use.
-func (s *Sender) Log(level, message, entity, entityID string, queues ...string) error {
-	timestamp := time.Now()
+// LogFields carries optional structured fields for one emit.
+type LogFields struct {
+	Action string
+	NodeID string
+	Queue  string
+}
 
+// Log sends the message via UDP (if level >= UDP threshold) and optionally to the log DB.
+// The in-memory recent ring always receives the line. Safe for concurrent use.
+func (s *Sender) Log(level, message, entity, entityID string, queues ...string) error {
 	queue := ""
 	if len(queues) > 0 {
 		queue = queues[0]
 	}
+	return s.LogStructured(level, message, entity, entityID, LogFields{Queue: queue})
+}
 
+// LogStructured emits a log with action/node/queue metadata.
+func (s *Sender) LogStructured(level, message, entity, entityID string, fields LogFields) error {
+	if s == nil {
+		return nil
+	}
+	timestamp := time.Now()
 	id := uuid.New().String()
-	s.recent.add(RecentLog{ID: id, At: timestamp, Level: level, Message: message})
-	if s.logBuffer != nil {
+	s.recent.add(RecentLog{
+		ID: id, At: timestamp, Level: level, Message: message,
+		Entity: entity, EntityID: entityID, Queue: fields.Queue,
+		Action: fields.Action, NodeID: fields.NodeID,
+	})
+	levelIx := getLevelIndex(level)
+	if levelIx == -1 {
+		return fmt.Errorf("invalid level: %s", level)
+	}
+	if s.logBuffer != nil && levelIx >= s.minPersistIx {
 		s.logBuffer.Add(logbuf.LogEntry{
 			ID:        id,
 			Timestamp: timestamp.Format(time.RFC3339Nano),
@@ -135,23 +176,19 @@ func (s *Sender) Log(level, message, entity, entityID string, queues ...string) 
 			Entity:    entity,
 			EntityID:  entityID,
 			Message:   message,
-			Queue:     queue,
+			Queue:     fields.Queue,
+			Action:    fields.Action,
+			NodeID:    fields.NodeID,
 		})
 	}
 
-	// --- UDP send (conditional) ---
-	levelIx := getLevelIndex(level)
-	if levelIx == -1 {
-		return fmt.Errorf("invalid level: %s", level)
-	}
 	if levelIx < s.minLevelIx {
-		return nil // below UDP threshold
+		return nil
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Conn may be nil if Close() was already called (e.g. migration finished, workers still exiting).
 	if s.conn == nil {
 		return nil
 	}
@@ -161,7 +198,7 @@ func (s *Sender) Log(level, message, entity, entityID string, queues ...string) 
 	s.tmp.Message = message
 	s.tmp.Entity = entity
 	s.tmp.EntityID = entityID
-	s.tmp.Queue = queue
+	s.tmp.Queue = fields.Queue
 
 	s.buf.Reset()
 	if err := s.enc.Encode(&s.tmp); err != nil {
@@ -182,7 +219,6 @@ func (s *Sender) ClearConsole() error {
 		return nil
 	}
 
-	// Build special log packet (with only what the listener expects).
 	s.tmp.Timestamp = time.Now()
 	s.tmp.Level = "info"
 	s.tmp.Message = "<<CLEAR_SCREEN>>"
@@ -200,7 +236,6 @@ func (s *Sender) ClearConsole() error {
 }
 
 // Close terminates the UDP connection and stops the log buffer. Does not close the main DB.
-// Sets conn to nil under mu so any Log() after Close() no-ops instead of writing to a closed connection.
 func (s *Sender) Close() error {
 	if s.logBuffer != nil {
 		s.logBuffer.Stop()

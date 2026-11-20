@@ -6,8 +6,8 @@ package profile
 import (
 	"testing"
 
-	spectrafs "codeberg.org/Sylos/Sylos-FS/pkg/fs/spectra"
 	localfs "codeberg.org/Sylos/Sylos-FS/pkg/fs/local"
+	spectrafs "codeberg.org/Sylos/Sylos-FS/pkg/fs/spectra"
 	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 

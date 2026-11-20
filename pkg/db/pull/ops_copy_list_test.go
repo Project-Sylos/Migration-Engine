@@ -22,7 +22,7 @@ func TestListSrcNodesByCopyStatusOpsSealedOnly(t *testing.T) {
 		{Side: opsdb.SideSRC, Node: opsdb.NodeRecord{ID: "done", Path: "/done.txt", Name: "done.txt", Type: opsdb.NodeTypeFile}, Status: opsdb.StatusRecord{TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusSuccessful}, Depth: 1, InsertOnly: true},
 		{Side: opsdb.SideSRC, Node: opsdb.NodeRecord{ID: "pend", Path: "/pend.txt", Name: "pend.txt", Type: opsdb.NodeTypeFile}, Status: opsdb.StatusRecord{TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending}, Depth: 1, InsertOnly: true},
 	}
-	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 

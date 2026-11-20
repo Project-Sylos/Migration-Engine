@@ -12,12 +12,12 @@ import (
 
 func TestChildResultToNodeStateLeavesDeleteUnsetUntilCopyComplete(t *testing.T) {
 	tests := []struct {
-		name      string
-		queueType string
-		child     ChildResult
-		depth     int
+		name       string
+		queueType  string
+		child      ChildResult
+		depth      int
 		parentPath string
-		wantCopy  string
+		wantCopy   string
 	}{
 		{
 			name:      "src file",
@@ -48,7 +48,7 @@ func TestChildResultToNodeStateLeavesDeleteUnsetUntilCopyComplete(t *testing.T) 
 			queueType: "DST",
 			child: ChildResult{
 				File:   types.File{DisplayName: "dst-only.txt"},
-				Status: db.StatusNotOnSrc,
+				Status: db.StatusSuccessful,
 				IsFile: true,
 			},
 			depth:      1,

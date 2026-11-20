@@ -9,7 +9,7 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
 
-func TestGetRemainingSourceSizeAfterDelete(t *testing.T) {
+func TestRemainingSourceSizeCounter(t *testing.T) {
 	database, err := db.Open(db.Options{Path: t.TempDir() + "/remaining-src-size.db"})
 	if err != nil {
 		t.Fatal(err)
@@ -21,7 +21,7 @@ func TestGetRemainingSourceSizeAfterDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := GetRemainingSourceSizeAfterDelete(database)
+	got, err := readStatsKeyCount(database, db.ReviewKeySizeSrc)
 	if err != nil {
 		t.Fatal(err)
 	}

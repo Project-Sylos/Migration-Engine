@@ -50,3 +50,34 @@ func TestEvaluateGPLAddPart_DSTSiblingCollisionManual(t *testing.T) {
 		t.Fatalf("collision must require manual review, got %#v", issue)
 	}
 }
+
+func TestEvaluateGPLAddPart_WindowsCaseInsensitiveSibling(t *testing.T) {
+	payload, issue := evaluateGPLAddPart(
+		pathgpl.OneDrive,
+		0,
+		"Extra space",
+		[]string{"Extra Space"},
+		false,
+		false,
+	)
+	if !payload.Part.Collision {
+		t.Fatalf("OneDrive must case-fold sibling collision: %#v %#v", payload, issue)
+	}
+	if issue == nil || issue.Status != db.GPLIssueStatusManualReview {
+		t.Fatalf("expected manual_review, got %#v", issue)
+	}
+}
+
+func TestEvaluateGPLAddPart_LinuxCaseSensitiveSibling(t *testing.T) {
+	payload, issue := evaluateGPLAddPart(
+		pathgpl.Linux,
+		0,
+		"Extra space",
+		[]string{"Extra Space"},
+		false,
+		false,
+	)
+	if payload.Part.Collision {
+		t.Fatalf("Linux must keep case-sensitive siblings unique: %#v %#v", payload, issue)
+	}
+}

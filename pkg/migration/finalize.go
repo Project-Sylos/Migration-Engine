@@ -12,27 +12,22 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
-// FinalizeOverrides tunes legacy Duck teardown knobs (ignored on Badger).
-// Zero values mean defaults.
-type FinalizeOverrides struct {
-	Threads       int // 0 = default 1; max 4
-	MemoryLimitGB int // 0 = default 2 for index build
+// FinalizeOptions controls durable finalize / retry behavior.
+type FinalizeOptions struct {
+	// Refold clears the fold cursor and recomputes child_size for all folders
+	// (no re-traversal). Ignored for delete finalize (no size fold).
+	Refold bool
 }
 
 // finishBulkPhaseDurable flushes the seal buffer, folds folder sizes, and checkpoints Badger.
-func finishBulkPhaseDurable(database *db.DB, opts FinalizeOverrides, foldKind string) error {
+func finishBulkPhaseDurable(database *db.DB, foldKind string, opts FinalizeOptions) error {
 	if database == nil {
 		return nil
 	}
-	if database.HardAborted() {
-		return fmt.Errorf("durable teardown aborted")
-	}
+	database.ClearHardAbort()
 	database.SetActivity("Preparing a clean resume…")
 	defer database.SetActivity("")
-	if err := database.EndTraversalPhaseWithIndexOptions(db.IndexBuildOptions{
-		Threads:       opts.Threads,
-		MemoryLimitGB: opts.MemoryLimitGB,
-	}); err != nil {
+	if err := database.EndTraversalPhase(); err != nil {
 		return fmt.Errorf("end bulk phase: %w", err)
 	}
 	if database.HardAborted() {
@@ -40,7 +35,13 @@ func finishBulkPhaseDurable(database *db.DB, opts FinalizeOverrides, foldKind st
 	}
 	if foldKind != "" {
 		database.SetActivity("Calculating folder sizes…")
-		if err := foldChildSizes(database, foldKind); err != nil {
+		var err error
+		if opts.Refold {
+			err = foldChildSizesRefold(database, foldKind)
+		} else {
+			err = foldChildSizes(database, foldKind)
+		}
+		if err != nil {
 			return fmt.Errorf("folder size fold: %w", err)
 		}
 	}
@@ -87,6 +88,31 @@ func foldChildSizes(database *db.DB, kind string) error {
 	}
 }
 
+// foldChildSizesRefold recomputes folder sizes from the catalog (no pend tickets).
+// Trav: SRC then DST. Copy: DST only.
+func foldChildSizesRefold(database *db.DB, originalKind string) error {
+	if database == nil || database.Ops() == nil || originalKind == "" {
+		return nil
+	}
+	hooks := opsdb.FoldHooks{
+		Activity:   database.SetActivity,
+		Aborted:    database.HardAborted,
+		QStatPhase: originalKind, // API polls size-fold/{trav|copy}, not "refold"
+	}
+	ops := database.Ops()
+	switch originalKind {
+	case opsdb.FoldKindTrav:
+		if err := ops.FoldChildSizes(opsdb.SideSRC, opsdb.FoldKindRefold, hooks); err != nil {
+			return err
+		}
+		return ops.FoldChildSizes(opsdb.SideDST, opsdb.FoldKindRefold, hooks)
+	case opsdb.FoldKindCopy:
+		return ops.FoldChildSizes(opsdb.SideDST, opsdb.FoldKindRefold, hooks)
+	default:
+		return nil
+	}
+}
+
 type finalizeErrorRuntime struct {
 	FinalizeError string `json:"finalize_error,omitempty"`
 }
@@ -122,12 +148,12 @@ func (m *Migration) FinalizeError() string {
 	return m.finalizeError
 }
 
-func (m *Migration) completeDurableFinalize(finalizing, failed, review string, opts FinalizeOverrides) error {
+func (m *Migration) completeDurableFinalize(finalizing, failed, review string, opts FinalizeOptions) error {
 	if err := m.transitionTo(finalizing); err != nil {
 		return err
 	}
 	m.setFinalizeError(nil)
-	if err := finishBulkPhaseDurable(m.DB, opts, foldKindForPhase(finalizing)); err != nil {
+	if err := finishBulkPhaseDurable(m.DB, foldKindForPhase(finalizing), opts); err != nil {
 		fmt.Printf("\n[migration] durable finalize failed: %v\n", err)
 		m.setFinalizeError(err)
 		if e2 := m.transitionTo(failed); e2 != nil {
@@ -143,9 +169,9 @@ func (m *Migration) completeDurableFinalize(finalizing, failed, review string, o
 	return nil
 }
 
-// RetryFinalize retries seal stop / indexes / checkpoint after *-finalize-failed.
+// RetryFinalize retries seal flush / folder-size fold / checkpoint after *-finalize-failed.
 // Does not re-run traversal, copy, or delete workers.
-func (m *Migration) RetryFinalize(opts FinalizeOverrides) error {
+func (m *Migration) RetryFinalize(opts FinalizeOptions) error {
 	if m == nil {
 		return fmt.Errorf("nil migration")
 	}

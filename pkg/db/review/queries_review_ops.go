@@ -11,8 +11,8 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
-// queryNodesForReview lists nodes using Badger catalog + sealed status.
-func queryNodesForReview(d *db.DB, table string, depth *int, status string, excluded *bool, pathLike string, orderByPath bool, limit, offset int) ([]db.NodeState, error) {
+// QueryNodesForReview lists nodes from the given table (SRC or DST) using Badger catalog + sealed status with optional depth, status, excluded, pathLike filters. Used by review API.
+func QueryNodesForReview(d *db.DB, table string, depth *int, status string, excluded *bool, pathLike string, orderByPath bool, limit, offset int) ([]db.NodeState, error) {
 	side := opsdb.SideSRC
 	if table == "DST" {
 		side = opsdb.SideDST

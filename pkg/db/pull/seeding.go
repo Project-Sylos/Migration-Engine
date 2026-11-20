@@ -19,8 +19,3 @@ func InsertRootNode(d *db.DB, table string, state *db.NodeState) error {
 	}
 	return fmt.Errorf("ops store required")
 }
-
-// BatchInsertNodes inserts nodes via the writer.
-func BatchInsertNodes(d *db.DB, ops []db.InsertOperation) error {
-	return d.SeedDiscoveredNodes(ops)
-}

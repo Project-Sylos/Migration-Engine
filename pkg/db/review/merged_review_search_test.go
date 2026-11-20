@@ -4,6 +4,7 @@
 package review
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"testing"
@@ -28,13 +29,13 @@ func TestListMergedReviewDiffsPageZipperIncludesDSTOnly(t *testing.T) {
 	}
 	dstOnly := &db.NodeState{
 		ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/orphan.txt"), Path: "/orphan.txt", ParentPath: "/", Name: "orphan.txt",
-		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful,
+		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusDestinationOnly,
 	}
 	seedReviewTree(t, database, []*db.NodeState{src}, []*db.NodeState{dstMapped, dstOnly}, []db.IDMapEvent{{
 		SrcInternalID: src.ID, DstInternalID: dstMapped.ID, Status: db.IDMapStatusActive,
 	}})
 
-	page, hasMore, err := ListMergedReviewDiffsPage(database, ReviewFilter{
+	page, hasMore, err := ListMergedReviewDiffsPageCtx(context.Background(), database, ReviewFilter{
 		Query: "txt", QueryField: "name", ExcludeRoot: true,
 	}, "path ASC", 10, 0)
 	if err != nil {
@@ -66,13 +67,13 @@ func TestListMergedReviewDiffsPageZipperHasMoreAndOffset(t *testing.T) {
 		{ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/c.txt"), Path: "/c.txt", ParentPath: "/", Name: "c.txt", Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusFailed, CopyStatus: db.CopyStatusPending},
 	}
 	dstOnly := []*db.NodeState{
-		{ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/b.txt"), Path: "/b.txt", ParentPath: "/", Name: "b.txt", Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusFailed},
-		{ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/d.txt"), Path: "/d.txt", ParentPath: "/", Name: "d.txt", Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusFailed},
+		{ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/b.txt"), Path: "/b.txt", ParentPath: "/", Name: "b.txt", Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusFailed, CopyStatus: db.CopyStatusDestinationOnly},
+		{ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/d.txt"), Path: "/d.txt", ParentPath: "/", Name: "d.txt", Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusFailed, CopyStatus: db.CopyStatusDestinationOnly},
 	}
 	seedReviewTree(t, database, srcNodes, dstOnly, nil)
 
 	f := ReviewFilter{TraversalStatus: db.StatusFailed, StatusSearchType: "traversal", ExcludeRoot: true}
-	page, hasMore, err := ListMergedReviewDiffsPage(database, f, "id ASC", 2, 0)
+	page, hasMore, err := ListMergedReviewDiffsPageCtx(context.Background(), database, f, "id ASC", 2, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,11 +105,11 @@ func TestListMergedReviewDiffsPageSkipsDSTOnlyForCopyFilter(t *testing.T) {
 	}
 	dstOnly := &db.NodeState{
 		ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/ghost.txt"), Path: "/ghost.txt", ParentPath: "/", Name: "ghost.txt",
-		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful,
+		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusDestinationOnly,
 	}
 	seedReviewTree(t, database, []*db.NodeState{src}, []*db.NodeState{dstOnly}, nil)
 
-	page, _, err := ListMergedReviewDiffsPage(database, ReviewFilter{
+	page, _, err := ListMergedReviewDiffsPageCtx(context.Background(), database, ReviewFilter{
 		CopyStatus: db.CopyStatusPending, StatusSearchType: "copy", ExcludeRoot: true,
 	}, "path ASC", 10, 0)
 	if err != nil {
@@ -176,8 +177,8 @@ func TestListMergedReviewDiffsPageSortsAcrossSides(t *testing.T) {
 		{ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/s_d.txt"), Path: "/s_d.txt", ParentPath: "/", Name: "d.txt", Type: db.NodeTypeFile, Depth: 1, Size: 10, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending},
 	}
 	dstNodes := []*db.NodeState{
-		{ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/d_a.txt"), Path: "/d_a.txt", ParentPath: "/", Name: "a.txt", Type: db.NodeTypeFile, Depth: 1, Size: 20, TraversalStatus: db.StatusSuccessful},
-		{ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/d_c.txt"), Path: "/d_c.txt", ParentPath: "/", Name: "c.txt", Type: db.NodeTypeFile, Depth: 1, Size: 10, TraversalStatus: db.StatusSuccessful},
+		{ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/d_a.txt"), Path: "/d_a.txt", ParentPath: "/", Name: "a.txt", Type: db.NodeTypeFile, Depth: 1, Size: 20, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusDestinationOnly},
+		{ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/d_c.txt"), Path: "/d_c.txt", ParentPath: "/", Name: "c.txt", Type: db.NodeTypeFile, Depth: 1, Size: 10, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusDestinationOnly},
 	}
 	seedReviewTree(t, database, srcNodes, dstNodes, nil)
 
@@ -194,7 +195,7 @@ func TestListMergedReviewDiffsPageSortsAcrossSides(t *testing.T) {
 		{"path DESC", []string{"/s_d.txt", "/s_b.txt", "/d_c.txt", "/d_a.txt"}},
 	}
 	for _, tc := range cases {
-		page, _, err := ListMergedReviewDiffsPage(database, f, tc.orderBy, 10, 0)
+		page, _, err := ListMergedReviewDiffsPageCtx(context.Background(), database, f, tc.orderBy, 10, 0)
 		if err != nil {
 			t.Fatalf("%s: %v", tc.orderBy, err)
 		}
@@ -230,7 +231,7 @@ func TestListMergedReviewDiffsPageSortedPagingIsConsistent(t *testing.T) {
 		dstNodes = append(dstNodes, &db.NodeState{
 			ID: db.DeterministicNodeID("DST", db.NodeTypeFile, dp), Path: dp, ParentPath: "/",
 			Name: "d" + strconv.Itoa(i) + ".txt", Type: db.NodeTypeFile, Depth: 1, Size: int64(i*2 + 1),
-			TraversalStatus: db.StatusSuccessful,
+			TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusDestinationOnly,
 		})
 	}
 	seedReviewTree(t, database, srcNodes, dstNodes, nil)
@@ -238,7 +239,7 @@ func TestListMergedReviewDiffsPageSortedPagingIsConsistent(t *testing.T) {
 	f := ReviewFilter{Query: "txt", QueryField: "name", ExcludeRoot: true}
 	const orderBy = "size DESC, path ASC"
 
-	full, _, err := ListMergedReviewDiffsPage(database, f, orderBy, 100, 0)
+	full, _, err := ListMergedReviewDiffsPageCtx(context.Background(), database, f, orderBy, 100, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +254,7 @@ func TestListMergedReviewDiffsPageSortedPagingIsConsistent(t *testing.T) {
 
 	var paged []MergedReviewRow
 	for offset := 0; ; offset += 5 {
-		page, hasMore, err := ListMergedReviewDiffsPage(database, f, orderBy, 5, offset)
+		page, hasMore, err := ListMergedReviewDiffsPageCtx(context.Background(), database, f, orderBy, 5, offset)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -285,7 +286,7 @@ func TestListMergedReviewSearchRecordsSQL(t *testing.T) {
 	}
 	seedReviewTree(t, database, []*db.NodeState{src}, nil, nil)
 
-	page, hasMore, err := ListMergedReviewDiffsPage(database, ReviewFilter{
+	page, hasMore, err := ListMergedReviewDiffsPageCtx(context.Background(), database, ReviewFilter{
 		Query: "txt", QueryField: "name", ExcludeRoot: true,
 	}, "path ASC", 10, 0)
 	if err != nil {
@@ -331,7 +332,7 @@ func TestListMergedReviewDiffsPageCopyStatusAndSizeFilter(t *testing.T) {
 		t.Fatal("status+size should use planner path, not status overlay")
 	}
 
-	page, _, err := ListMergedReviewDiffsPage(database, f, "path ASC", 10, 0)
+	page, _, err := ListMergedReviewDiffsPageCtx(context.Background(), database, f, "path ASC", 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +340,7 @@ func TestListMergedReviewDiffsPageCopyStatusAndSizeFilter(t *testing.T) {
 		t.Fatalf("want only large pending file, got %+v", pathsOf(page))
 	}
 
-	stats, err := GetMergedReviewStats(database, f)
+	stats, err := GetMergedReviewStatsCtx(context.Background(), database, f)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -384,7 +385,7 @@ func TestListMergedReviewDiffsPagePathSegmentDotCursorBeyondScanCap(t *testing.T
 	}
 	seedReviewTree(t, database, nodes, nil, nil)
 
-	page, _, err := ListMergedReviewDiffsPage(database, ReviewFilter{
+	page, _, err := ListMergedReviewDiffsPageCtx(context.Background(), database, ReviewFilter{
 		PathSegments: []string{".cursor"},
 		ExcludeRoot:  true,
 	}, "path ASC", 50, 0)

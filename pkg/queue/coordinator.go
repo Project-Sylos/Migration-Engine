@@ -4,11 +4,9 @@
 package queue
 
 import (
-	"context"
 	"fmt"
 	"sync"
 
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 )
 
@@ -103,21 +101,6 @@ func (c *QueueCoordinator) IsCompleted(queueType string) bool {
 	default:
 		return false
 	}
-}
-
-// WaitSealBackpressure ensures the seal buffer has flushed through the given round before the caller drops that level from node cache.
-// Call after enqueueing the round's seal data and before dropping the level. Prevents the DB flush buffer from growing unbounded.
-// Returns false if flushing fails; callers should fail closed (do not drop level or advance round).
-func (c *QueueCoordinator) WaitSealBackpressure(_ string, round int, database *db.DB) bool {
-	if database == nil || round < 0 {
-		return true
-	}
-	if err := database.Flush(context.Background()); err != nil {
-		fmt.Println("error flushing seal buffer", err)
-		return false
-	}
-	database.WaitUntilFlushedThrough(round)
-	return true
 }
 
 // CanDstStartRound returns true if DST can start processing the specified round.

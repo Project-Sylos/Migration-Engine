@@ -4,6 +4,7 @@
 package opsdb
 
 import (
+	"encoding/json"
 	"fmt"
 
 	badger "github.com/dgraph-io/badger/v4"
@@ -38,11 +39,11 @@ func (s *Store) PutMigrationMeta(rec MigrationMetaRecord) error {
 	if s == nil || rec.MigrationID == "" {
 		return fmt.Errorf("opsdb PutMigrationMeta: empty id")
 	}
-	b, err := encode(rec)
+	b, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set(migrationMetaKey(rec.MigrationID), b)
 	})
 }
@@ -53,7 +54,7 @@ func (s *Store) GetMigrationMeta(id string) (MigrationMetaRecord, bool, error) {
 	if s == nil || id == "" {
 		return rec, false, nil
 	}
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(migrationMetaKey(id))
 		if err == badger.ErrKeyNotFound {
 			return nil
@@ -62,7 +63,7 @@ func (s *Store) GetMigrationMeta(id string) (MigrationMetaRecord, bool, error) {
 			return err
 		}
 		return item.Value(func(val []byte) error {
-			return decodeInto(val, &rec)
+			return json.Unmarshal(val, &rec)
 		})
 	})
 	return rec, rec.MigrationID != "", err
@@ -75,14 +76,14 @@ func (s *Store) ListMigrationMeta() ([]MigrationMetaRecord, error) {
 		return out, nil
 	}
 	prefix := []byte("mig:")
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		it := txn.NewIterator(opts)
 		defer it.Close()
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 			var rec MigrationMetaRecord
 			if err := it.Item().Value(func(val []byte) error {
-				return decodeInto(val, &rec)
+				return json.Unmarshal(val, &rec)
 			}); err != nil {
 				return err
 			}
@@ -98,7 +99,7 @@ func (s *Store) PutOAuthCred(connectionID, payload string) error {
 	if s == nil || connectionID == "" {
 		return nil
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set(oauthCredKey(connectionID), []byte(payload))
 	})
 }
@@ -109,7 +110,7 @@ func (s *Store) GetOAuthCred(connectionID string) (string, bool, error) {
 		return "", false, nil
 	}
 	var payload string
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(oauthCredKey(connectionID))
 		if err == badger.ErrKeyNotFound {
 			return nil
@@ -130,7 +131,7 @@ func (s *Store) DeleteOAuthCred(connectionID string) error {
 	if s == nil || connectionID == "" {
 		return nil
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		err := txn.Delete(oauthCredKey(connectionID))
 		if err == badger.ErrKeyNotFound {
 			return nil
@@ -153,11 +154,11 @@ func (s *Store) PutFSBinding(rec FSBindingRecord) error {
 	if s == nil || rec.Side == "" {
 		return nil
 	}
-	b, err := encode(rec)
+	b, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set(fsBindingKey(rec.Side), b)
 	})
 }
@@ -168,7 +169,7 @@ func (s *Store) GetFSBinding(side string) (FSBindingRecord, bool, error) {
 	if s == nil || side == "" {
 		return rec, false, nil
 	}
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(fsBindingKey(side))
 		if err == badger.ErrKeyNotFound {
 			return nil
@@ -177,24 +178,10 @@ func (s *Store) GetFSBinding(side string) (FSBindingRecord, bool, error) {
 			return err
 		}
 		return item.Value(func(val []byte) error {
-			return decodeInto(val, &rec)
+			return json.Unmarshal(val, &rec)
 		})
 	})
 	return rec, rec.Side != "", err
-}
-
-// DeleteMigrationMeta removes migration metadata.
-func (s *Store) DeleteMigrationMeta(id string) error {
-	if s == nil || id == "" {
-		return nil
-	}
-	return s.update(func(txn *badger.Txn) error {
-		err := txn.Delete(migrationMetaKey(id))
-		if err == badger.ErrKeyNotFound {
-			return nil
-		}
-		return err
-	})
 }
 
 // ListFSBindings returns both FS bindings if present.

@@ -39,8 +39,8 @@ func TestClassifyUnderfeed(t *testing.T) {
 		Internal: map[string]observe.InternalMetricsSnapshot{
 			"src": {TimeWaitingOnQueue: time.Second},
 		},
-		InProgress: map[string]int{"src": 0},
-		Pending:    map[string]int{"src": 10},
+		InProgress:  map[string]int{"src": 0},
+		Pending:     map[string]int{"src": 10},
 		MemoryLevel: memory.MemoryGreen,
 	})
 	if p != PressureUnderfeed {
@@ -53,8 +53,8 @@ func TestClassifyUnderfeedWithBusyWorkers(t *testing.T) {
 		Internal: map[string]observe.InternalMetricsSnapshot{
 			"copy": {TimeWaitingOnQueue: time.Second},
 		},
-		InProgress: map[string]int{"copy": 4},
-		Pending:    map[string]int{"copy": 100},
+		InProgress:  map[string]int{"copy": 4},
+		Pending:     map[string]int{"copy": 100},
 		MemoryLevel: memory.MemoryGreen,
 	})
 	if p != PressureUnderfeed {

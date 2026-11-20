@@ -361,10 +361,17 @@ func (c *CompiledRuleset) matchCondition(cond Condition, node NodeInput, now tim
 			return false, fmt.Errorf("is_empty: unsupported operator %q", cond.Operator)
 		}
 	case FieldExtension:
-		ext := ExtensionOf(node.Name)
+		ext := node.Extension
+		if ext == "" {
+			ext = ExtensionOf(node.Name)
+		}
 		return matchStringList(ext, cond.Operator, cond.Value, true)
 	case FieldMimetypeCategory:
-		cat := CategoryForExtension(ExtensionOf(node.Name))
+		ext := node.Extension
+		if ext == "" {
+			ext = ExtensionOf(node.Name)
+		}
+		cat := CategoryForExtension(ext)
 		return matchStringList(cat, cond.Operator, cond.Value, true)
 	case FieldName:
 		return c.matchPattern(cond, node.Name)

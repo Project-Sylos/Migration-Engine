@@ -33,7 +33,7 @@ When the UI has already reviewed root children (root-pick review), `RootPreparat
 * Prepared side: root is seeded as `traversal_status = successful`, reviewed children are inserted as a **sparse forest** (nested `Children` when the UI visited deeper folders). Included folders without nested children stay `pending` (unrestricted subtree). Partial parents get `include_only` on the SRC node record (child service IDs); unchecked siblings are **omitted** (silent), not counted `excluded`.
 * Queues start at `ComputeSourceStartRound` (minimum depth of still-pending included folders), typically 1 for classic depth-1 prep.
 * Unprepared side (for example destination-first with no child review): classic pending root and **round 0**.
-* Destination never excludes; dst-only children get `traversal_status = not_on_src`.
+* Destination never excludes; dst-only folders seed as `pending` (walked) and dst-only files as `successful`.
 * Traversal workers honor `include_only` after `ListChildren` (drop non-members before seal).
 
 The `filters-set` phase (between `AddRoots` and `StartTraversal`) remains available for binding a ruleset snapshot. Filter **evaluation** runs after discovery in path review (Go matchers over Badger indexes / status walks), not during BFS. Full-tree counted excludes happen in awaiting-traversal-review via exclude-by-search / manual exclude.
@@ -69,25 +69,28 @@ When preparing a destination traversal task:
 
 #### Comparison Rules
 
-For each item under a destination parent:
+For each item under a destination parent, write SRC and DST copy statuses together (SRC owns the copy frontier; DST is bookkeeping + review search):
 
 1. **Exists only on source**
-   → `copy_status = pending`
+   → SRC `copy_status = pending` (no DST peer)
 
 2. **Exists on both source and destination**
 
-   * If folder → `copy_status = already_existed`
-   * If file:
-
-     * If source timestamp > destination timestamp → `copy_status = pending`
-     * Otherwise → `copy_status = already_existed`
+   * If folder → SRC `already_existed`; DST child copy `already_existed`; DST trav `pending`
+   * If file: pairing follows **OverwritePolicy** (set at Start discovery Advanced):
+     * `newest_mtime` (default): newest `LastUpdated` wins (DST ≥ SRC → keep; SRC newer → replace). Unparseable mtimes with same positive size → keep.
+     * `decide`: always SRC `pending` + DST `needs_overwrite` (review Keep destination / Replace with source before copy).
+     * `source_wins`: always replace and stamp `force_replace_copy` so copy resume cannot soft-skip.
+   * Optional **HashVerify**: for name-matched files, stream SHA-256 of both sides (bytes discarded). Under `newest_mtime`, equal hashes keep and unequal hashes replace (mtime ignored once both hashes succeed); hash failure falls back to the selected overwrite policy. Under `decide` / `source_wins`, policy still decides enrollment; hashes are logged. Expensive (extra OpenRead per side per matched file).
+   * File keep → SRC `already_existed`; DST `already_existed`; DST trav `successful`
+   * File replace → SRC `pending`; DST `needs_overwrite`; DST trav `successful`
 
 3. **Exists only on destination**
-   → No `copy_status` assigned (ignored in one-way sync model)
+   → No SRC map; DST copy `destination_only`. Folders get trav `pending` (walked); files get terminal trav `successful`. Indexed as `idx:copy:dst:destination_only:{id}` for Destination-only list search.
 
-The SRC root is seeded with `copy_status = already_existed` (never a copy task). Only the copy phase writes `copy_status = successful` when it actually creates/updates an item.
+The SRC root is seeded with `copy_status = already_existed` (never a copy task). Only the copy phase writes SRC (and paired DST) `copy_status = successful` when it actually creates/updates an item. When DST is `needs_overwrite`, the copy worker deletes the peer then creates.
 
-The engine intentionally ignores destination-only subtrees to avoid traversing potentially large, irrelevant structures. The tradeoff is reduced visibility during review for items that exist exclusively on the destination.
+DST-only subtrees are discovered so Path Review and the unique/remap cascade preview can see destination peers. They remain unpaired (no SRC node) and are never copied.
 
 ---
 
@@ -101,7 +104,7 @@ The engine intentionally ignores destination-only subtrees to avoid traversing p
 
 **Destination Traversal**
 
-* Only traverses items that exist on both source and destination.
+* Traverses matched folders and DST-only folders; DST-only files are terminal.
 * Cannot advance to a BFS level until the source traversal is at least **two levels deeper** than the destination’s current level.
 
 This ensures the necessary source parent nodes and children are already discovered and cached before destination comparison tasks are constructed.
@@ -252,5 +255,13 @@ Delete retry reuses the same forward-BFS and two-pass structure. It only pulls n
 | Depth direction | 1 → maxKnownDepth | 1 → maxKnownDepth |
 | Pull filter | `copy_status = pending` | `delete_status = pending_explicit` |
 | Root (depth 0) | Never copied (`already_existed`) | Never deleted (null delete_status) |
+
+---
+
+## Soft stop vs unclean recovery (crash / hard stop)
+
+Canonical onboarding write-up (overview + per-mode steps): [crash_recovery.md](./crash_recovery.md).
+
+Short form: soft stop writes a trusted `suspend_v1` checkpoint; crash / hard stop set `unclean_interrupt` and Resume runs a recovery sweep (traversal cursor reconstruct; copy existence window + HashVerify on name-matched files). Soft-stop resume does not force HashVerify.
 
 ---

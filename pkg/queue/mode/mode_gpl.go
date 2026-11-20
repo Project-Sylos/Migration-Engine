@@ -18,36 +18,18 @@ func PullGPLTasks(q *queue.Queue, force bool) queue.PullResult {
 	if db.GPLDisabled {
 		return queue.PullResult{Round: q.GetRound(), Status: queue.PullSkipped}
 	}
-	database := q.Database()
-	if database == nil {
-		return queue.PullResult{Status: queue.PullAborted}
+	ps, early, ok := beginPull(q, force, pullGate{runningOnly: true})
+	if !ok {
+		return early
 	}
-	if !q.TryBeginPulling() {
-		return queue.PullResult{Round: q.GetRound(), Status: queue.PullSkipped}
-	}
-	defer q.SetPulling(false)
-	if q.State() == queue.QueueStateCompleted {
-		return queue.PullResult{Status: queue.PullAborted}
-	}
-
-	snapshot := q.StateSnapshot()
-	if !force {
-		if snapshot.State != queue.QueueStateRunning || snapshot.PendingCount > snapshot.PullLowWM {
-			return queue.PullResult{Round: snapshot.Round, Status: queue.PullSkipped}
-		}
-	} else if snapshot.State == queue.QueueStatePaused {
-		return queue.PullResult{Round: snapshot.Round, Status: queue.PullAborted}
-	}
-
-	currentRound := snapshot.Round
+	defer ps.end()
+	database, currentRound := ps.Database, ps.Round
 	queueType := queue.GetQueueType(q.Name())
 	batchSize := q.EffectiveLeaseBatchSize()
 	requestLimit := batchSize + 1
 
 	cursor := q.GetKeysetCursor()
 
-	q.BeginDBPull()
-	defer q.ReleaseDBPull()
 	pullStart := time.Now()
 	results, err := pull.ListNodesGPLKeyset(database, queueType, currentRound, cursor, db.GPLStatusPending, requestLimit)
 	q.RecordDBPull(len(results), time.Since(pullStart))
@@ -66,13 +48,9 @@ func PullGPLTasks(q *queue.Queue, force bool) queue.PullResult {
 		return queue.PullResult{Round: currentRound, Yield: 0, Partial: true, QueriedDB: true, Status: queue.PullOK}
 	}
 
-	processLimit := batchSize
-	if len(results) <= batchSize {
-		processLimit = len(results)
-	}
+	processLimit := min(batchSize, len(results))
 	count := 0
-	for i := 0; i < processLimit; i++ {
-		fr := results[i]
+	for _, fr := range results[:processLimit] {
 		task := gplFetchToTask(fr, currentRound)
 		if task == nil {
 			continue
@@ -81,8 +59,7 @@ func PullGPLTasks(q *queue.Queue, force bool) queue.PullResult {
 			count++
 		}
 	}
-	lastKey := results[processLimit-1].Key
-	q.SetKeysetCursor(lastKey)
+	q.SetKeysetCursor(results[processLimit-1].Key)
 	partial := len(results) <= batchSize
 	q.SetLastPullWasPartial(partial)
 	q.RecordPull(currentRound, count, partial)
@@ -140,6 +117,7 @@ func CompleteGPLTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.D
 
 	database := q.Database()
 	if database == nil {
+		q.ReleaseTaskInFlightWeight(task)
 		q.RemoveInProgress(nodeID)
 		return
 	}
@@ -161,6 +139,7 @@ func CompleteGPLTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.D
 		PrevGPLStatus: db.GPLStatusPending,
 		NodeType:      nodeType,
 	}, false)
+	q.ReleaseTaskInFlightWeight(task)
 	q.RemoveInProgress(nodeID)
 }
 

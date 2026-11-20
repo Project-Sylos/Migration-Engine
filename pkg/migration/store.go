@@ -110,16 +110,6 @@ func (s *migrationStore) getMigration(database *db.DB, id string) (*migrationRec
 	return migrationFromOps(rec)
 }
 
-func (s *migrationStore) deleteMigration(database *db.DB, id string) error {
-	if database == nil || database.Ops() == nil {
-		return fmt.Errorf("database required")
-	}
-	if err := database.Ops().DeleteMigrationMeta(id); err != nil {
-		return fmt.Errorf("delete migration %s: %w", id, err)
-	}
-	return nil
-}
-
 func (s *migrationStore) updateMigrationField(id, column, value string, op string) error {
 	ops := s.ops()
 	if ops == nil {

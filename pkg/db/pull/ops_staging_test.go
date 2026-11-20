@@ -28,7 +28,7 @@ func TestGetNodeByIDReflectsCopyExclusion(t *testing.T) {
 		Depth:  2,
 		Deltas: []opsdb.PendingDelta{{Phase: opsdb.PhaseCopy, NodeType: opsdb.NodeTypeFile, Add: true}},
 	}}
-	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 

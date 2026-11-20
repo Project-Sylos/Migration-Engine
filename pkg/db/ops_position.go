@@ -50,34 +50,10 @@ func (db *DB) SaveCopyQueuePosition(round int, cursor string) error {
 	return db.Ops().PutQueuePosition("copy", queuePosPhaseCopy, opsdb.QueuePosition{Round: round, Cursor: cursor})
 }
 
-// LoadCopyQueuePosition reads copy queue position from Badger ops.
-func (db *DB) LoadCopyQueuePosition() (round int, cursor string, ok bool) {
-	if db == nil || db.Ops() == nil {
-		return 0, "", false
-	}
-	pos, found, err := db.Ops().GetQueuePosition("copy", queuePosPhaseCopy)
-	if err != nil || !found {
-		return 0, "", false
-	}
-	return pos.Round, pos.Cursor, true
-}
-
 // SaveDeleteQueuePosition persists delete queue round and cursor in Badger ops.
 func (db *DB) SaveDeleteQueuePosition(round int, cursor string) error {
 	if db == nil || db.Ops() == nil {
 		return nil
 	}
 	return db.Ops().PutQueuePosition("delete", queuePosPhaseDelete, opsdb.QueuePosition{Round: round, Cursor: cursor})
-}
-
-// LoadDeleteQueuePosition reads delete queue position from Badger ops.
-func (db *DB) LoadDeleteQueuePosition() (round int, cursor string, ok bool) {
-	if db == nil || db.Ops() == nil {
-		return 0, "", false
-	}
-	pos, found, err := db.Ops().GetQueuePosition("delete", queuePosPhaseDelete)
-	if err != nil || !found {
-		return 0, "", false
-	}
-	return pos.Round, pos.Cursor, true
 }

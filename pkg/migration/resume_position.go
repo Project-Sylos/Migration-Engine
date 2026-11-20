@@ -113,7 +113,11 @@ func listFolderIDsAtDepthOps(database *db.DB, side string, depth int) ([]string,
 	return out, nil
 }
 
-func restoreOrReconstructKeysetCursor(database *db.DB, side string, depth int, saved string) string {
+func restoreOrReconstructKeysetCursor(database *db.DB, side string, depth int, saved string, unclean bool) string {
+	if unclean {
+		// Recovery: always start before the first pending item at this depth.
+		return keysetCursorBeforeFirstPendingFolder(database, side, depth)
+	}
 	if saved != "" {
 		return saved
 	}
@@ -131,7 +135,7 @@ func restoreOrReconstructKeysetCursor(database *db.DB, side string, depth int, s
 	return keysetCursorBeforeFirstPendingFolder(database, side, depth)
 }
 
-func applyTraversalResume(database *db.DB, resume *RuntimeSuspendV1, srcQueue, dstQueue *queue.Queue, coordinator *queue.QueueCoordinator) {
+func applyTraversalResume(database *db.DB, resume *RuntimeSuspendV1, srcQueue, dstQueue *queue.Queue, coordinator *queue.QueueCoordinator, unclean bool) {
 	if resume == nil || srcQueue == nil || dstQueue == nil {
 		return
 	}
@@ -139,7 +143,7 @@ func applyTraversalResume(database *db.DB, resume *RuntimeSuspendV1, srcQueue, d
 	dstQueue.SetMode(queue.QueueModeTraversal)
 	srcRound := resumeRoundForSide(database, "SRC", resume.LastRoundSrc)
 	dstRound := resumeRoundForSide(database, "DST", resume.LastRoundDst)
-	if database != nil && database.Ops() != nil {
+	if !unclean && database != nil && database.Ops() != nil {
 		if sr, _, dr, _, ok := database.LoadTraversalQueuePositions(); ok {
 			if resume.LastRoundSrc == 0 && sr > 0 {
 				srcRound = resumeRoundForSide(database, "SRC", sr)
@@ -149,12 +153,21 @@ func applyTraversalResume(database *db.DB, resume *RuntimeSuspendV1, srcQueue, d
 			}
 		}
 	}
+	if unclean {
+		// Jump to the earliest pending depth so the recovery round finds what exists.
+		if jumped := minPendingTraversalFolderDepth(database, "SRC"); jumped > 0 || firstPendingTraversalFolderID(database, "SRC", 0) != "" {
+			srcRound = resumeRoundForSide(database, "SRC", jumped)
+		}
+		if jumped := minPendingTraversalFolderDepth(database, "DST"); jumped > 0 || firstPendingTraversalFolderID(database, "DST", 0) != "" {
+			dstRound = resumeRoundForSide(database, "DST", jumped)
+		}
+	}
 	srcQueue.SetRound(srcRound)
 	dstQueue.SetRound(dstRound)
-	if cur := restoreOrReconstructKeysetCursor(database, "SRC", srcRound, resume.SrcKeysetCursor); cur != "" {
+	if cur := restoreOrReconstructKeysetCursor(database, "SRC", srcRound, resume.SrcKeysetCursor, unclean); cur != "" {
 		srcQueue.SetKeysetCursor(cur)
 	}
-	if cur := restoreOrReconstructKeysetCursor(database, "DST", dstRound, resume.DstKeysetCursor); cur != "" {
+	if cur := restoreOrReconstructKeysetCursor(database, "DST", dstRound, resume.DstKeysetCursor, unclean); cur != "" {
 		dstQueue.SetKeysetCursor(cur)
 	}
 	if coordinator != nil {

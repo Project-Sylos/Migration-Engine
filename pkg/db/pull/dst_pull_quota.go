@@ -33,10 +33,6 @@ func DstPullChildQuota(taskQuota, multiplier int) int {
 // frontier is exhausted after this pull (round may advance once buffers drain). lastID is the
 // last enqueued folder id (cursor for the next pull).
 func ListDstBatchWithSrcChildrenQuota(d *db.DB, depth int, afterID string, quota DstPullQuota, traversalStatus string) ([]db.FetchResult, map[string][]*db.NodeState, map[string]string, string, bool, error) {
-	return listDstBatchWithSrcChildrenQuotaOps(d, depth, afterID, quota, traversalStatus)
-}
-
-func listDstBatchWithSrcChildrenQuotaOps(d *db.DB, depth int, afterID string, quota DstPullQuota, traversalStatus string) ([]db.FetchResult, map[string][]*db.NodeState, map[string]string, string, bool, error) {
 	if traversalStatus == "" {
 		traversalStatus = db.StatusPending
 	}

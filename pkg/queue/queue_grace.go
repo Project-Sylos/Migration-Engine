@@ -33,7 +33,7 @@ type SpinDownState struct {
 	deferredRetire map[string]*deferredRetiree
 }
 
-// EnterProvisionalFreeze gates scale actuation for d (default 15s). AIMD counters keep accumulating.
+// EnterProvisionalFreeze gates scale actuation for d (default 15s). Autoscaler counters keep accumulating.
 // After grace, force-checkouts deferred busy retirees (smallest lease first), then lifts the freeze.
 // When abandonDBOnly is set (stop/soft-suspend), also cancels busy workers' contexts so blocking
 // RPCs (folder batch, list, delete) abort.

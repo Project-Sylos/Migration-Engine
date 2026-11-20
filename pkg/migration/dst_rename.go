@@ -69,7 +69,7 @@ func (m *Migration) ApplyDSTRename(srcID string) error {
 	if newName == "" {
 		newName = proposed
 	}
-	if err := m.DB.ApplyNodeRename("dst", dstNode.ID, newName, dstNode.ServiceID, newServiceID); err != nil {
+	if err := m.DB.ApplyNodeRenameWithHooks("dst", dstNode.ID, newName, dstNode.ServiceID, newServiceID, db.NodeRenameHooks{}); err != nil {
 		return err
 	}
 	return m.DB.ClearGPLIssueDstAction(srcID)
@@ -95,10 +95,14 @@ func (m *Migration) RunDSTRenameSweep() error {
 		}
 	}
 	ids = filtered
-	for _, id := range ids {
+	total := int64(len(ids))
+	m.PathRenameBeginPhase(PathRenamePhaseDSTRename, "Applying destination renames…", total)
+	m.PathRenameSetProgress(0, total)
+	for i, id := range ids {
 		if err := m.ApplyDSTRename(id); err != nil {
 			return err
 		}
+		m.PathRenameSetProgress(int64(i+1), total)
 	}
 	return nil
 }
@@ -113,4 +117,62 @@ func (m *Migration) destinationAdapter() fstypes.FSAdapter {
 		return m.lastRunConfig.Destination.Adapter
 	}
 	return nil
+}
+
+// revertAcceptedDSTRename renames a mapped destination item back to the source
+// basename when an accepted rename had already been applied on DST.
+func (m *Migration) revertAcceptedDSTRename(srcID string, srcNode *db.NodeState, proposedName string) error {
+	if m == nil || m.DB == nil || srcNode == nil {
+		return nil
+	}
+	mapped, ok, err := m.DB.Ops().GetMapBySrc(srcID)
+	if err != nil {
+		return err
+	}
+	if !ok || mapped.DstID == "" || mapped.Status != db.IDMapStatusActive {
+		return nil
+	}
+	dstNode, err := pull.GetNodeByID(m.DB, "DST", mapped.DstID)
+	if err != nil {
+		return err
+	}
+	if dstNode == nil {
+		return nil
+	}
+	srcName := db.NormalizeNodeBasename(srcNode.Name)
+	proposed := db.NormalizeNodeBasename(proposedName)
+	dstName := db.NormalizeNodeBasename(dstNode.Name)
+	if srcName == "" || dstName == "" || dstName == srcName {
+		return nil
+	}
+	// Only revert when DST still reflects the accepted proposal (or differs from SRC).
+	if proposed != "" && dstName != proposed && dstName != srcName {
+		return nil
+	}
+	adapter := m.destinationAdapter()
+	if adapter == nil {
+		// Bookkeeping-only: rewrite DST Badger name back to SRC basename.
+		return m.DB.ApplyNodeRenameWithHooks("dst", dstNode.ID, srcName, dstNode.ServiceID, dstNode.ServiceID, db.NodeRenameHooks{})
+	}
+	renamer, ok := fstypes.RenameFrom(adapter)
+	if !ok {
+		return fstypes.ErrRenameUnsupported
+	}
+	if dstNode.ServiceID == "" {
+		return fmt.Errorf("dst service_id empty for %s", mapped.DstID)
+	}
+	ctx := context.Background()
+	res, err := renamer.RenameNode(ctx, dstNode.ParentServiceID, dstNode.ServiceID, srcName, srcNode.Type)
+	if err != nil {
+		return err
+	}
+	newServiceID := res.ServiceID
+	if newServiceID == "" {
+		newServiceID = dstNode.ServiceID
+	}
+	newName := res.DisplayName
+	if newName == "" {
+		newName = srcName
+	}
+	return m.DB.ApplyNodeRenameWithHooks("dst", dstNode.ID, newName, dstNode.ServiceID, newServiceID, db.NodeRenameHooks{})
 }

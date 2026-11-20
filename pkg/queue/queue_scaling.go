@@ -52,51 +52,62 @@ type managedWorker struct {
 
 // workerPool holds dynamic worker lifecycle state.
 type workerPool struct {
-	mu              sync.Mutex
-	handles         []*managedWorker
-	nextID          int
-	traversalAdapter types.FSAdapter
-	copySrcAdapter   types.FSAdapter
-	copyDstAdapter   types.FSAdapter
-	deleteSrcAdapter types.FSAdapter
-	isCopy            bool
-	isDelete          bool
-	listPageSize      atomic.Int64
-	interOpDelay      atomic.Int64 // nanoseconds; autoscaler pacing fallback at worker floor
-	rateLimitSources  []RateLimitTelemetry
+	mu               sync.Mutex
+	handles          []*managedWorker
+	nextID           int
+	traversalAdapter     types.FSAdapter
+	traversalPeerAdapter types.FSAdapter // optional peer (SRC) for DST hash-verify
+	copySrcAdapter       types.FSAdapter
+	copyDstAdapter       types.FSAdapter
+	deleteSrcAdapter     types.FSAdapter
+	kind             PoolKind
+	listPageSize     atomic.Int64
+	interOpDelay     atomic.Int64 // nanoseconds; autoscaler pacing fallback at worker floor
+	rateLimitSources []RateLimitTelemetry
 }
 
-func (q *Queue) initWorkerPool(traversalAdapter types.FSAdapter) {
+// PoolKind selects which phase worker pool a queue runs.
+type PoolKind int
+
+const (
+	PoolTraversal PoolKind = iota
+	PoolCopy
+	PoolDelete
+)
+
+func (k PoolKind) logLabel() string {
+	switch k {
+	case PoolCopy:
+		return "copy "
+	case PoolDelete:
+		return "delete "
+	}
+	return ""
+}
+
+func (q *Queue) initWorkerPool(kind PoolKind, src, dst types.FSAdapter) {
 	q.pool.mu.Lock()
-	q.pool.traversalAdapter = traversalAdapter
-	q.pool.isCopy = false
-	q.pool.isDelete = false
-	if q.pool.listPageSize.Load() == 0 {
+	q.pool.kind = kind
+	switch kind {
+	case PoolTraversal:
+		q.pool.traversalAdapter = src
+		q.pool.traversalPeerAdapter = dst
+	case PoolCopy:
+		q.pool.copySrcAdapter = src
+		q.pool.copyDstAdapter = dst
+	case PoolDelete:
+		q.pool.deleteSrcAdapter = src
+	}
+	if kind != PoolCopy && q.pool.listPageSize.Load() == 0 {
 		q.pool.listPageSize.Store(100)
 	}
 	q.pool.mu.Unlock()
-	q.syncAdapterWorkerHint()
-}
-
-func (q *Queue) initDeleteWorkerPool(src types.FSAdapter) {
-	q.pool.mu.Lock()
-	q.pool.deleteSrcAdapter = src
-	q.pool.isCopy = false
-	q.pool.isDelete = true
-	if q.pool.listPageSize.Load() == 0 {
-		q.pool.listPageSize.Store(100)
+	switch kind {
+	case PoolTraversal:
+		q.syncAdapterWorkerHint()
+	case PoolCopy:
+		q.syncCopyAdapterWorkerHints()
 	}
-	q.pool.mu.Unlock()
-}
-
-func (q *Queue) initCopyWorkerPool(src, dst types.FSAdapter) {
-	q.pool.mu.Lock()
-	q.pool.copySrcAdapter = src
-	q.pool.copyDstAdapter = dst
-	q.pool.isCopy = true
-	q.pool.isDelete = false
-	q.pool.mu.Unlock()
-	q.syncCopyAdapterWorkerHints()
 }
 
 func (q *Queue) syncAdapterWorkerHint() {
@@ -106,9 +117,9 @@ func (q *Queue) syncAdapterWorkerHint() {
 	q.pool.mu.Lock()
 	n := len(q.pool.handles)
 	adapter := q.pool.traversalAdapter
-	isCopy := q.pool.isCopy
+	kind := q.pool.kind
 	q.pool.mu.Unlock()
-	if isCopy {
+	if kind != PoolTraversal {
 		return
 	}
 	if h, ok := adapter.(types.FSConcurrencyHint); ok {
@@ -179,7 +190,7 @@ func (q *Queue) WaitInterOp(ctx context.Context) {
 }
 
 // SetTargetWorkerCount scales worker goroutines up or down safely.
-// While provisional freeze is active (spin-down grace), this is a no-op so AIMD
+// While provisional freeze is active (spin-down grace), this is a no-op so the autoscaler
 // classifiers keep accumulating but pool size does not change.
 func (q *Queue) SetTargetWorkerCount(target int) error {
 	if target < 1 {
@@ -207,21 +218,22 @@ func (q *Queue) SetTargetWorkerCount(target int) error {
 			h := &managedWorker{id: workerID, cancel: cancel}
 			h.idle.Store(true)
 			q.pool.handles = append(q.pool.handles, h)
-			if q.pool.isCopy {
+			switch q.pool.kind {
+			case PoolCopy:
 				if workerHooks.NewCopyWorker == nil {
 					return fmt.Errorf("copy worker factory not registered: import codeberg.org/Sylos/Migration-Engine/pkg/queue/worker")
 				}
 				w := workerHooks.NewCopyWorker(workerID, q, q.pool.copySrcAdapter, q.pool.copyDstAdapter, shutdownCtx, workerCtx, &h.idle, &h.retire)
 				q.workers = append(q.workers, w)
 				go w.Run()
-			} else if q.pool.isDelete {
+			case PoolDelete:
 				if workerHooks.NewDeleteWorker == nil {
 					return fmt.Errorf("delete worker factory not registered: import codeberg.org/Sylos/Migration-Engine/pkg/queue/worker")
 				}
 				w := workerHooks.NewDeleteWorker(workerID, q, q.pool.deleteSrcAdapter, shutdownCtx, workerCtx, &h.idle, &h.retire)
 				q.workers = append(q.workers, w)
 				go w.Run()
-			} else {
+			case PoolTraversal:
 				if workerHooks.NewTraversalWorker == nil {
 					return fmt.Errorf("traversal worker factory not registered: import codeberg.org/Sylos/Migration-Engine/pkg/queue/worker")
 				}
@@ -310,7 +322,7 @@ func (q *Queue) SetTargetWorkerCount(target int) error {
 // applyWorkerHintLocked updates FS adapter concurrency hints. Caller must hold q.pool.mu.
 func (q *Queue) applyWorkerHintLocked() {
 	n := len(q.pool.handles)
-	if q.pool.isCopy {
+	if q.pool.kind == PoolCopy {
 		if h, ok := q.pool.copySrcAdapter.(types.FSConcurrencyHint); ok {
 			h.SetActiveWorkers(n)
 		}
@@ -319,7 +331,7 @@ func (q *Queue) applyWorkerHintLocked() {
 		}
 		return
 	}
-	if q.pool.isDelete {
+	if q.pool.kind == PoolDelete {
 		if h, ok := q.pool.deleteSrcAdapter.(types.FSConcurrencyHint); ok {
 			h.SetActiveWorkers(n)
 		}
@@ -345,14 +357,18 @@ func (q *Queue) SetLeaseBatchSize(n int) {
 	q.mu.Unlock()
 }
 
-// SetRefillBatchSize updates traversal DB refill batch size.
+// SetRefillBatchSize is kept for API compatibility. Refill is derived as 25% of
+// lease (queue task limit); setting refill raises lease to 4× so the derived
+// refill matches n.
 func (q *Queue) SetRefillBatchSize(n int) {
 	if n <= 0 {
 		return
 	}
-	q.mu.Lock()
-	q.refillBatchSize = n
-	q.mu.Unlock()
+	lease := n * 4
+	if lease < n {
+		lease = n
+	}
+	q.SetLeaseBatchSize(lease)
 }
 
 // SetDstPullChildMultiplier sets the DST expected-children quota multiplier (taskQuota * multiplier).
@@ -389,13 +405,6 @@ func (q *Queue) PullLowWM() int {
 		return 0
 	}
 	return lease / 4
-}
-
-// AvgExecutionTime returns the rolling average task execution time.
-func (q *Queue) AvgExecutionTime() time.Duration {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	return q.avgExecutionTime
 }
 
 func (q *Queue) ConfigureScalingContext(srcProvider, dstProvider, srcGroupID, dstGroupID, pathCheckProfile string, windowsCompat bool) {
@@ -437,7 +446,7 @@ func (q *Queue) ScalingAdapter(srcSide bool) types.FSAdapter {
 	}
 	q.pool.mu.Lock()
 	defer q.pool.mu.Unlock()
-	if q.pool.isCopy {
+	if q.pool.kind == PoolCopy {
 		if srcSide {
 			return q.pool.copySrcAdapter
 		}
@@ -450,4 +459,19 @@ func (q *Queue) ScalingAdapter(srcSide bool) types.FSAdapter {
 		return q.pool.traversalAdapter
 	}
 	return nil
+}
+
+// EnsureLeaseBatchSizeAtLeast raises the DB→pendingBuff pull size when below n
+// (used when the active FS adapter supports batch mutations).
+func (q *Queue) EnsureLeaseBatchSizeAtLeast(n int) {
+	if q == nil || n <= 0 {
+		return
+	}
+	if q.EffectiveLeaseBatchSize() >= n {
+		return
+	}
+	if n > maxLeaseBatchSize {
+		n = maxLeaseBatchSize
+	}
+	q.SetLeaseBatchSize(n)
 }

@@ -4,6 +4,7 @@
 package scaling
 
 import (
+	"context"
 	"time"
 
 	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
@@ -13,12 +14,12 @@ import (
 
 // ScalingEvent describes one knob change for tests and logs.
 type ScalingEvent struct {
-	Queue    string
-	Knob     string
-	OldValue int
-	NewValue int
-	Pressure PressureClass
-	At       time.Time
+	Queue    string        `json:"queue"`
+	Knob     string        `json:"knob"`
+	OldValue int           `json:"oldValue"`
+	NewValue int           `json:"newValue"`
+	Pressure PressureClass `json:"pressure"`
+	At       time.Time     `json:"at"`
 }
 
 // QueueActuator applies knob changes to a queue.
@@ -41,4 +42,16 @@ type QueueActuator interface {
 	InProgressCount() int
 	ScalingContext() queue.ScalingContext
 	ScalingAdapter(srcSide bool) fstypes.FSAdapter
+}
+
+// MemoryShedding is optional on QueueActuator: pause pulls/leases, drop the
+// in-memory pendingBuff, drain in-flight work, then rewind the keyset cursor so
+// Badger pend:* rows can be re-pulled after a host MEMORY_PRESSURE shed.
+type MemoryShedding interface {
+	BeginMemoryShed() (resumeState queue.QueueState)
+	FinishMemoryShed(resumeState queue.QueueState)
+	ClearPendingBufferForSuspend()
+	ResetKeysetCursorForShed()
+	WaitInProgressZeroFunc(ctx context.Context, every time.Duration, onTick func(inProgress int)) error
+	SetLastPullWasPartial(value bool)
 }

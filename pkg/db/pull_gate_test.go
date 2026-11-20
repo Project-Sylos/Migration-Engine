@@ -13,10 +13,10 @@ func TestPullGateSerializesAndBeatsWhileWaiting(t *testing.T) {
 	g := newPullGate()
 	var beats atomic.Int64
 
-	g.Acquire(nil)
+	g.Acquire(nil, nil, nil)
 	done := make(chan struct{})
 	go func() {
-		g.Acquire(func() { beats.Add(1) })
+		g.Acquire(func() { beats.Add(1) }, nil, nil)
 		close(done)
 	}()
 
@@ -40,11 +40,11 @@ func TestPullGateExtraReleaseIgnored(t *testing.T) {
 	g.Release()
 	acquired := make(chan struct{}, 2)
 	go func() {
-		g.Acquire(nil)
+		g.Acquire(nil, nil, nil)
 		acquired <- struct{}{}
 	}()
 	go func() {
-		g.Acquire(nil)
+		g.Acquire(nil, nil, nil)
 		acquired <- struct{}{}
 	}()
 	select {

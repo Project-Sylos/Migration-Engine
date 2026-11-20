@@ -5,13 +5,14 @@ package review
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
 	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
-// containsNeedlesFromFilter returns name contains needles for trigram planning.
-// Path search uses ordered PathSegments (idx:seg), not open path contains.
+// containsNeedlesFromFilter returns text needles for trigram planning: name/path
+// Query, path-segment bar parts, and ruleset name contains/eq leaves.
 func containsNeedlesFromFilter(f ReviewFilter) (needles []string) {
 	add := func(s string) {
 		s = strings.TrimSpace(s)
@@ -25,6 +26,9 @@ func containsNeedlesFromFilter(f ReviewFilter) (needles []string) {
 		if field == "" || field == "name" || field == "path" {
 			add(q)
 		}
+	}
+	for _, seg := range pathSegmentsForFilter(f) {
+		add(seg)
 	}
 	if f.CompiledFilter != nil {
 		walkRulesetContains(f.CompiledFilter.Ruleset.RootGroup, &needles)
@@ -95,19 +99,17 @@ func planTrigramContains(ops *opsdb.Store, side string, f ReviewFilter, scanLimi
 	if len(needles) == 0 {
 		return plannerPlan{}, false, nil
 	}
-	// Union posting lists across every name-contains needle. Picking only the
-	// longest needle drops OR arms (e.g. file || directory misses depth-1 files
-	// whose display path never mentions "directory"). CompiledFilter / Query
-	// still decide the boolean result after verify.
+	// Union ranked posting lists across every needle. Score is gram-overlap count
+	// (partial match); callers soft-verify then apply compiled filters.
 	seen := map[string]struct{}{}
 	var ids []string
 	anyNeedle := false
 	for _, needle := range needles {
-		if len(opsdb.ExtractTrigrams(needle)) == 0 {
+		if len(opsdb.ExtractTrigrams(opsdb.TrigramSourceText(needle))) == 0 {
 			continue
 		}
 		anyNeedle = true
-		hit, err := ops.ScanTrigramIntersect(side, needle, scanLimit)
+		hit, err := ops.ScanTrigramRanked(side, needle, scanLimit)
 		if err != nil {
 			return plannerPlan{}, false, err
 		}
@@ -118,7 +120,7 @@ func planTrigramContains(ops *opsdb.Store, side string, f ReviewFilter, scanLimi
 			seen[id] = struct{}{}
 			ids = append(ids, id)
 			if len(ids) >= scanLimit {
-				return plannerPlan{kind: "tri", ids: ids, est: int64(len(ids)), reason: "trigram_contains"}, true, nil
+				return plannerPlan{kind: "tri", ids: ids, est: int64(len(ids)), reason: "trigram_ranked"}, true, nil
 			}
 		}
 	}
@@ -128,29 +130,218 @@ func planTrigramContains(ops *opsdb.Store, side string, f ReviewFilter, scanLimi
 	if len(ids) == 0 {
 		return plannerPlan{kind: "tri", ids: nil, est: 0, reason: "trigram_empty"}, true, nil
 	}
-	return plannerPlan{kind: "tri", ids: ids, est: int64(len(ids)), reason: "trigram_contains"}, true, nil
+	return plannerPlan{kind: "tri", ids: ids, est: int64(len(ids)), reason: "trigram_ranked"}, true, nil
 }
 
-// nodePassesTrigramVerify rejects false positives from trigram candidate generation.
-// A node passes when name or display path contains any planned needle (OR of arms).
+// nodePassesTrigramVerify keeps candidates that fuzzy-match any planned needle
+// (substring, small edit distance, or shared trigrams). Compiled ruleset contains
+// still enforces exact contains when present.
 func nodePassesTrigramVerify(n opsdb.NodeRecord, f ReviewFilter) bool {
 	needles := containsNeedlesFromFilter(f)
 	if len(needles) == 0 {
 		return true
 	}
-	name := strings.ToLower(n.Name)
-	path := strings.ToLower(n.DisplayPath)
+	name := n.Name
+	path := n.DisplayPath
 	if path == "" {
-		path = strings.ToLower(n.Path)
+		path = n.Path
 	}
 	for _, needle := range needles {
-		needle = strings.ToLower(strings.TrimSpace(needle))
-		if needle == "" {
-			continue
-		}
-		if strings.Contains(name, needle) || strings.Contains(path, needle) {
+		if fuzzyNeedleMatch(name, needle) || fuzzyNeedleMatch(path, needle) {
 			return true
 		}
 	}
 	return false
+}
+
+// fuzzyNeedleMatch reports whether haystack is a useful hit for needle: exact
+// substring, edit distance 1 (or 2 for longer needles) on the whole string or a
+// path part, or enough shared trigrams for partial weight.
+func fuzzyNeedleMatch(haystack, needle string) bool {
+	needle = strings.ToLower(strings.TrimSpace(needle))
+	haystack = strings.ToLower(strings.TrimSpace(haystack))
+	if needle == "" {
+		return true
+	}
+	if haystack == "" {
+		return false
+	}
+	if strings.Contains(haystack, needle) {
+		return true
+	}
+	maxDist := 1
+	if utf8.RuneCountInString(needle) >= 6 {
+		maxDist = 2
+	}
+	if editDistanceAtMost(haystack, needle, maxDist) {
+		return true
+	}
+	for _, part := range strings.Split(haystack, "/") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		base := opsdb.TrigramSourceText(part)
+		if strings.Contains(part, needle) || strings.Contains(base, needle) {
+			return true
+		}
+		if editDistanceAtMost(part, needle, maxDist) || editDistanceAtMost(base, needle, maxDist) {
+			return true
+		}
+		if trigramOverlapOK(part, needle) || trigramOverlapOK(base, needle) {
+			return true
+		}
+	}
+	return trigramOverlapOK(haystack, needle)
+}
+
+func trigramOverlapOK(haystack, needle string) bool {
+	ng := opsdb.ExtractTrigrams(opsdb.TrigramSourceText(needle))
+	if len(ng) == 0 {
+		return false
+	}
+	hg := opsdb.ExtractTrigrams(opsdb.TrigramSourceText(haystack))
+	if len(hg) == 0 {
+		hg = opsdb.ExtractTrigrams(haystack)
+	}
+	if len(hg) == 0 {
+		return false
+	}
+	hset := make(map[string]struct{}, len(hg))
+	for _, g := range hg {
+		hset[g] = struct{}{}
+	}
+	for _, g := range ng {
+		if _, ok := hset[g]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// needleRelevanceScore ranks a haystack against needles (higher is better).
+func needleRelevanceScore(haystack string, needles []string) int {
+	best := 0
+	for _, needle := range needles {
+		if s := singleNeedleScore(haystack, needle); s > best {
+			best = s
+		}
+	}
+	return best
+}
+
+func singleNeedleScore(haystack, needle string) int {
+	needle = strings.ToLower(strings.TrimSpace(needle))
+	haystack = strings.ToLower(strings.TrimSpace(haystack))
+	if needle == "" || haystack == "" {
+		return 0
+	}
+	if strings.Contains(haystack, needle) {
+		return 1000 + utf8.RuneCountInString(needle)
+	}
+	best := 0
+	scorePart := func(part string) {
+		if part == "" {
+			return
+		}
+		if strings.Contains(part, needle) {
+			if s := 1000 + utf8.RuneCountInString(needle); s > best {
+				best = s
+			}
+			return
+		}
+		if editDistanceAtMost(part, needle, 1) {
+			if best < 500 {
+				best = 500
+			}
+			return
+		}
+		if editDistanceAtMost(part, needle, 2) && utf8.RuneCountInString(needle) >= 6 {
+			if best < 400 {
+				best = 400
+			}
+			return
+		}
+		ng := opsdb.ExtractTrigrams(opsdb.TrigramSourceText(needle))
+		hg := opsdb.ExtractTrigrams(part)
+		if len(ng) == 0 || len(hg) == 0 {
+			return
+		}
+		hset := make(map[string]struct{}, len(hg))
+		for _, g := range hg {
+			hset[g] = struct{}{}
+		}
+		shared := 0
+		for _, g := range ng {
+			if _, ok := hset[g]; ok {
+				shared++
+			}
+		}
+		if s := shared * 10; s > best {
+			best = s
+		}
+	}
+	scorePart(haystack)
+	for _, part := range strings.Split(haystack, "/") {
+		scorePart(strings.TrimSpace(part))
+	}
+	return best
+}
+
+func editDistanceAtMost(a, b string, maxDist int) bool {
+	if maxDist < 0 {
+		return false
+	}
+	ar, br := []rune(a), []rune(b)
+	la, lb := len(ar), len(br)
+	if absInt(la-lb) > maxDist {
+		return false
+	}
+	if la == 0 {
+		return lb <= maxDist
+	}
+	if lb == 0 {
+		return la <= maxDist
+	}
+	// Two-row DP; abort when every cell exceeds maxDist.
+	prev := make([]int, lb+1)
+	cur := make([]int, lb+1)
+	for j := 0; j <= lb; j++ {
+		prev[j] = j
+	}
+	for i := 1; i <= la; i++ {
+		cur[0] = i
+		rowMin := cur[0]
+		for j := 1; j <= lb; j++ {
+			cost := 1
+			if ar[i-1] == br[j-1] {
+				cost = 0
+			}
+			ins := cur[j-1] + 1
+			del := prev[j] + 1
+			sub := prev[j-1] + cost
+			cur[j] = ins
+			if del < cur[j] {
+				cur[j] = del
+			}
+			if sub < cur[j] {
+				cur[j] = sub
+			}
+			if cur[j] < rowMin {
+				rowMin = cur[j]
+			}
+		}
+		if rowMin > maxDist {
+			return false
+		}
+		prev, cur = cur, prev
+	}
+	return prev[lb] <= maxDist
+}
+
+func absInt(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
 }

@@ -4,6 +4,7 @@
 package review
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -44,7 +45,7 @@ func TestStatusDrivenSearchPagesByIDHydrate(t *testing.T) {
 		t.Fatal("expected StatusDrivenSearch")
 	}
 
-	page, hasMore, err := ListMergedReviewDiffsPage(database, f, "id ASC", 1, 0)
+	page, hasMore, err := ListMergedReviewDiffsPageCtx(context.Background(), database, f, "id ASC", 1, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +62,7 @@ func TestStatusDrivenSearchPagesByIDHydrate(t *testing.T) {
 		t.Fatalf("copy_status=%q", page[0].CopyStatus)
 	}
 
-	page2, hasMore2, err := ListMergedReviewDiffsPage(database, f, "id ASC", 1, 1)
+	page2, hasMore2, err := ListMergedReviewDiffsPageCtx(context.Background(), database, f, "id ASC", 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +83,7 @@ func TestStatusDrivenSearchPagesByIDHydrate(t *testing.T) {
 	if n != 2 {
 		t.Fatalf("count=%d want 2", n)
 	}
-	stats, err := GetMergedReviewStats(database, f)
+	stats, err := GetMergedReviewStatsCtx(context.Background(), database, f)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +133,7 @@ func TestStatusDrivenSearchUsesOverlayNotWindow(t *testing.T) {
 	if !StatusDrivenSearch(f) {
 		t.Fatal("expected StatusDrivenSearch for traversal overlay")
 	}
-	page, hasMore, err := ListMergedReviewDiffsPage(database, f, "id ASC", 10, 0)
+	page, hasMore, err := ListMergedReviewDiffsPageCtx(context.Background(), database, f, "id ASC", 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +143,7 @@ func TestStatusDrivenSearchUsesOverlayNotWindow(t *testing.T) {
 	if len(page) != 3 {
 		t.Fatalf("pending rows=%d want 3", len(page))
 	}
-	stats, err := GetMergedReviewStats(database, f)
+	stats, err := GetMergedReviewStatsCtx(context.Background(), database, f)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +188,7 @@ func TestStatusDrivenSearchCopyPendingMatchesEmptyCopyStatus(t *testing.T) {
 	}
 
 	f := ReviewFilter{CopyStatus: db.CopyStatusPending, StatusSearchType: "copy", ExcludeRoot: true}
-	page, _, err := ListMergedReviewDiffsPage(database, f, "id ASC", 10, 0)
+	page, _, err := ListMergedReviewDiffsPageCtx(context.Background(), database, f, "id ASC", 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +222,7 @@ func TestStatusDrivenSearchDeletePendingMatchesInherited(t *testing.T) {
 	}
 
 	f := ReviewFilter{DeleteStatus: "pending", StatusSearchType: "delete", ExcludeRoot: true}
-	page, _, err := ListMergedReviewDiffsPage(database, f, "id ASC", 10, 0)
+	page, _, err := ListMergedReviewDiffsPageCtx(context.Background(), database, f, "id ASC", 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +248,7 @@ func TestStatusDrivenSearchCopyExcludedMatchesTraversalExcludedFolder(t *testing
 	}
 
 	f := ReviewFilter{CopyStatus: db.CopyStatusExcluded, StatusSearchType: "copy", ExcludeRoot: true}
-	page, _, err := ListMergedReviewDiffsPage(database, f, "id ASC", 10, 0)
+	page, _, err := ListMergedReviewDiffsPageCtx(context.Background(), database, f, "id ASC", 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

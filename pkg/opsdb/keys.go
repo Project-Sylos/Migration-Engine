@@ -70,6 +70,16 @@ func statusCopyKey(side, id string) []byte {
 	return []byte("st:copy:" + side + ":" + id)
 }
 
+// copyStatusIndexKey indexes nodes by copy_status value for selective review search.
+// Format: idx:copy:{side}:{status}:{id}
+func copyStatusIndexKey(side, status, id string) []byte {
+	return []byte("idx:copy:" + side + ":" + status + ":" + id)
+}
+
+func copyStatusIndexPrefix(side, status string) []byte {
+	return []byte("idx:copy:" + side + ":" + status + ":")
+}
+
 func statusDelKey(side, id string) []byte {
 	return []byte("st:del:" + side + ":" + id)
 }
@@ -167,6 +177,22 @@ func logKey(unixNano int64, id string) []byte {
 
 func logIDKey(id string) []byte {
 	return []byte("logid:" + id)
+}
+
+func logActionIndexKey(action string, unixNano int64, id string) []byte {
+	return fmt.Appendf(nil, "idx:log:action:%s:%020d:%s", action, unixNano, id)
+}
+
+func logActionIndexPrefix(action string) []byte {
+	return []byte("idx:log:action:" + action + ":")
+}
+
+func logNodeIndexKey(nodeID string, unixNano int64, id string) []byte {
+	return fmt.Appendf(nil, "idx:log:node:%s:%020d:%s", nodeID, unixNano, id)
+}
+
+func logNodeIndexPrefix(nodeID string) []byte {
+	return []byte("idx:log:node:" + nodeID + ":")
 }
 
 func opKey(unixNano int64, seq uint64) []byte {

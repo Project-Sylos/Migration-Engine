@@ -6,6 +6,7 @@ package opsdb
 import (
 	"bytes"
 	"fmt"
+	"sort"
 	"strings"
 
 	badger "github.com/dgraph-io/badger/v4"
@@ -62,17 +63,17 @@ func applyNodeIndexes(side string, n NodeRecord, set func([]byte, []byte) error,
 		name = pathBase(n.Path)
 	}
 	keys := [][]byte{
-		SizeIndexKey(side, n.Size, n.ID),
-		MTimeIndexKey(side, ParseMTimeUnixNano(n.MTime), n.ID),
+		indexKey(indexSizePrefix, side, u64BE(n.Size), n.ID),
+		indexKey(indexMTimePrefix, side, u64BE(ParseMTimeUnixNano(n.MTime)), n.ID),
 	}
 	if name != "" {
-		keys = append(keys, NameIndexKey(side, name, n.ID))
+		keys = append(keys, indexKey(indexNamePrefix, side, strings.ToLower(name), n.ID))
 	}
 	for _, tok := range PathSegments(n.Path, name) {
-		keys = append(keys, SegIndexKey(side, tok, n.ID))
+		keys = append(keys, indexKey(indexSegPrefix, side, tok, n.ID))
 	}
-	for _, g := range NodeTrigrams(n.Path, n.DisplayPath, name) {
-		keys = append(keys, TriIndexKey(side, g, n.ID))
+	for _, g := range NodeTrigrams(n.Path, n.DisplayPath, name, n.Type, n.Extension) {
+		keys = append(keys, indexKey(indexTriPrefix, side, g, n.ID))
 	}
 	if set != nil {
 		if err := set(pathKey, []byte(n.ID)); err != nil {
@@ -123,7 +124,7 @@ func (s *Store) GetNodeIDByPath(side, p string) (string, error) {
 		return "", nil
 	}
 	var id string
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(PathIndexKey(side, p))
 		if err == badger.ErrKeyNotFound {
 			return nil
@@ -179,7 +180,7 @@ func (s *Store) ScanSubtreeIDs(side, root, afterPath string, limit int, opts Sub
 	}
 	rootNorm := NormalizeIndexPath(root)
 	sidePrefix := []byte(indexPathPrefix + side + ":")
-	err = s.view(func(txn *badger.Txn) error {
+	err = s.db.View(func(txn *badger.Txn) error {
 		itOpts := badger.DefaultIteratorOptions
 		itOpts.PrefetchValues = true
 		it := txn.NewIterator(itOpts)
@@ -262,12 +263,7 @@ func pathUnderRoot(p, root string) bool {
 
 // ScanSizeRange returns ids with size in [lo, hi] (inclusive).
 func (s *Store) ScanSizeRange(side string, lo, hi int64, limit int) ([]string, error) {
-	return s.scanU64Index(SizeIndexSidePrefix(side), SizeIndexBound(side, lo), SizeIndexBound(side, hi+1), limit)
-}
-
-// ScanMTimeRange returns ids with mtime nanos in [lo, hi] (inclusive).
-func (s *Store) ScanMTimeRange(side string, lo, hi int64, limit int) ([]string, error) {
-	return s.scanU64Index(MTimeIndexSidePrefix(side), MTimeIndexBound(side, lo), MTimeIndexBound(side, hi+1), limit)
+	return s.scanU64Index(indexKey(indexSizePrefix, side), indexKey(indexSizePrefix, side, u64BE(lo)), indexKey(indexSizePrefix, side, u64BE(hi+1)), limit)
 }
 
 func (s *Store) scanU64Index(sidePrefix, start, endExclusive []byte, limit int) ([]string, error) {
@@ -275,7 +271,7 @@ func (s *Store) scanU64Index(sidePrefix, start, endExclusive []byte, limit int) 
 		limit = 100_000
 	}
 	var ids []string
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
@@ -307,9 +303,9 @@ func (s *Store) ScanNamePrefix(side, namePrefix string, limit int) ([]string, er
 	if limit <= 0 {
 		limit = 100_000
 	}
-	prefix := NameIndexPrefix(side, namePrefix)
+	prefix := indexKey(indexNamePrefix, side, strings.ToLower(namePrefix))
 	var ids []string
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
@@ -334,9 +330,9 @@ func (s *Store) ScanSegToken(side, token string, limit int) ([]string, error) {
 	if limit <= 0 {
 		limit = 100_000
 	}
-	prefix := SegIndexPrefix(side, token)
+	prefix := indexKey(indexSegPrefix, side, strings.ToLower(token))
 	var ids []string
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
@@ -356,8 +352,9 @@ func (s *Store) ScanSegToken(side, token string, limit int) ([]string, error) {
 	return ids, err
 }
 
-// ScanTrigramIntersect returns ids that post under every trigram of needle (smallest-list-first intersect).
-// Callers must exact-verify contains on name/path. Empty needle or no grams → nil, nil.
+// ScanTrigramIntersect returns ids that post under every trigram of needle
+// (smallest-list-first intersect). Prefer ScanTrigramRanked for search-bar
+// partial / typo matches. Empty needle or no grams → nil, nil.
 func (s *Store) ScanTrigramIntersect(side, needle string, limit int) ([]string, error) {
 	if s == nil || s.db == nil {
 		return nil, nil
@@ -365,7 +362,7 @@ func (s *Store) ScanTrigramIntersect(side, needle string, limit int) ([]string, 
 	if limit <= 0 {
 		limit = 100_000
 	}
-	grams := ExtractTrigrams(needle)
+	grams := ExtractTrigrams(TrigramSourceText(needle))
 	if len(grams) == 0 {
 		return nil, nil
 	}
@@ -418,10 +415,68 @@ func (s *Store) ScanTrigramIntersect(side, needle string, limit int) ([]string, 
 	return out, nil
 }
 
+// ScanTrigramRanked returns ids ranked by how many needle trigrams they post
+// under (partial match). Higher overlap first. Each gram's posting list is
+// capped; results are truncated to limit. Empty needle or no grams → nil, nil.
+func (s *Store) ScanTrigramRanked(side, needle string, limit int) ([]string, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 100_000
+	}
+	grams := ExtractTrigrams(TrigramSourceText(needle))
+	if len(grams) == 0 {
+		return nil, nil
+	}
+	perGram := limit * 8
+	if perGram < 5000 {
+		perGram = 5000
+	}
+	if perGram > 100_000 {
+		perGram = 100_000
+	}
+	scores := make(map[string]int, limit)
+	for _, g := range grams {
+		ids, err := s.scanTriGram(side, g, perGram)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range ids {
+			scores[id]++
+		}
+	}
+	if len(scores) == 0 {
+		return nil, nil
+	}
+	type scored struct {
+		id string
+		n  int
+	}
+	list := make([]scored, 0, len(scores))
+	for id, n := range scores {
+		list = append(list, scored{id: id, n: n})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].n != list[j].n {
+			return list[i].n > list[j].n
+		}
+		return list[i].id < list[j].id
+	})
+	if len(list) > limit {
+		list = list[:limit]
+	}
+	out := make([]string, len(list))
+	for i := range list {
+		out[i] = list[i].id
+	}
+	return out, nil
+}
+
 func (s *Store) scanTriGram(side, gram string, limit int) ([]string, error) {
-	prefix := TriIndexPrefix(side, gram)
+	prefix := indexKey(indexTriPrefix, side, gram)
 	var ids []string
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
@@ -451,24 +506,6 @@ func (s *Store) EstimateSizeBucketSum(side string, lo, hi int64) (int64, error) 
 	var sum int64
 	for b := loB; b <= hiB; b++ {
 		n, err := s.GetStat(fmt.Sprintf("idx:size:%s:%d", side, b))
-		if err != nil {
-			return 0, err
-		}
-		sum += n
-	}
-	return sum, nil
-}
-
-// EstimateMTimeBucketSum estimates nodes in mtime month buckets overlapping [lo, hi] nanos.
-func (s *Store) EstimateMTimeBucketSum(side string, lo, hi int64) (int64, error) {
-	loM := mtimeMonthBucket(lo)
-	hiM := mtimeMonthBucket(hi)
-	if hiM < loM {
-		loM, hiM = hiM, loM
-	}
-	var sum int64
-	for m := loM; m <= hiM; m++ {
-		n, err := s.GetStat(fmt.Sprintf("idx:mtime:%s:%d", side, m))
 		if err != nil {
 			return 0, err
 		}

@@ -70,3 +70,12 @@ func NormalizeNodeBasename(name string) string {
 	}
 	return base
 }
+
+// DeterministicNodeID mints a stable node id for fixtures from side, type, and full path.
+// Depth-0 roots and depth-1 children under "/" are supported.
+func DeterministicNodeID(side, nodeType, fullPath string) string {
+	if fullPath == "/" {
+		return MintNodeID(side, "", NodeTypeFolder, "/")
+	}
+	return MintNodeID(side, MintNodeID(side, "", NodeTypeFolder, "/"), nodeType, NormalizeNodeBasename(fullPath))
+}

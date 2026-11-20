@@ -12,6 +12,8 @@ const (
 	copyStatusFailed             = "failed"
 	copyStatusSuccessful         = "successful"
 	copyStatusAlreadyExisted     = "already_existed"
+	copyStatusNeedsOverwrite     = "needs_overwrite"
+	copyStatusDestinationOnly    = "destination_only"
 	copyStatusExcludedExplicit   = "excluded_explicit"
 	copyStatusExcludedInherited  = "excluded_inherited"
 	deleteStatusDeleted          = "deleted"
@@ -33,6 +35,9 @@ type SubtreeMutationResult struct {
 	RestoredFailed int64
 	// RetryExcluded counts retry-marked pending nodes moved to excluded.
 	RetryExcluded int64
+	// RetryMarked counts unexcluded nodes restored to pending with
+	// retry_mark_copy provenance (post-copy review include-as-retry).
+	RetryMarked int64
 }
 
 func copyStatusIsPending(s string) bool {
@@ -123,7 +128,7 @@ func (s *Store) PropagateCopyFailureUnderPath(parentPath string) (SubtreeMutatio
 		if len(writes) == 0 {
 			return nil
 		}
-		if _, err := s.WriteSealBatch(nil, writes, nil, nil, nil); err != nil {
+		if _, err := s.WriteSealBatch(nil, writes, nil, nil); err != nil {
 			return err
 		}
 		return nil
@@ -170,7 +175,7 @@ func (s *Store) CascadeDeleteUnderPath(rootPath string) (SubtreeMutationResult, 
 		if len(writes) == 0 {
 			return nil
 		}
-		if _, err := s.WriteSealBatch(nil, writes, nil, nil, nil); err != nil {
+		if _, err := s.WriteSealBatch(nil, writes, nil, nil); err != nil {
 			return err
 		}
 		return nil
@@ -181,7 +186,17 @@ func (s *Store) CascadeDeleteUnderPath(rootPath string) (SubtreeMutationResult, 
 // ApplySubtreeCopyExclusion writes copy exclude/unexclude on sealed status and pend:copy
 // over the path prefix. Root becomes excluded_explicit; descendants excluded_inherited.
 // skip, if set, leaves a node unchanged (search except list).
+// asRetry (unexclude only) restores ordinary exclusions to pending with retry_mark_copy.
 func (s *Store) ApplySubtreeCopyExclusion(rootPath string, excluded bool, skip func(id, path, typ string) bool) (SubtreeMutationResult, error) {
+	return s.applySubtreeCopyExclusion(rootPath, excluded, false, skip)
+}
+
+// ApplySubtreeCopyExclusionAsRetry unexcludes a path prefix as retry-marked pending.
+func (s *Store) ApplySubtreeCopyExclusionAsRetry(rootPath string, skip func(id, path, typ string) bool) (SubtreeMutationResult, error) {
+	return s.applySubtreeCopyExclusion(rootPath, false, true, skip)
+}
+
+func (s *Store) applySubtreeCopyExclusion(rootPath string, excluded, asRetry bool, skip func(id, path, typ string) bool) (SubtreeMutationResult, error) {
 	var out SubtreeMutationResult
 	if s == nil {
 		return out, fmt.Errorf("opsdb: nil store")
@@ -191,13 +206,22 @@ func (s *Store) ApplySubtreeCopyExclusion(rootPath string, excluded bool, skip f
 		return out, nil
 	}
 	err := s.ApplySubtreeScan(SideSRC, rootPath, SubtreeScanOpts{}, 0, func(chunk SubtreeChunk) error {
-		return s.applyCopyExclusionChunk(rootPath, excluded, skip, chunk, &out)
+		return s.applyCopyExclusionChunk(rootPath, excluded, asRetry, skip, chunk, &out)
 	})
 	return out, err
 }
 
 // ApplyNodeCopyExclusion writes copy exclude/unexclude for one SRC node (no descendants).
 func (s *Store) ApplyNodeCopyExclusion(id string, excluded bool) (SubtreeMutationResult, error) {
+	return s.applyNodeCopyExclusion(id, excluded, false)
+}
+
+// ApplyNodeCopyExclusionAsRetry unexcludes one SRC node as retry-marked pending.
+func (s *Store) ApplyNodeCopyExclusionAsRetry(id string) (SubtreeMutationResult, error) {
+	return s.applyNodeCopyExclusion(id, false, true)
+}
+
+func (s *Store) applyNodeCopyExclusion(id string, excluded, asRetry bool) (SubtreeMutationResult, error) {
 	var out SubtreeMutationResult
 	if s == nil {
 		return out, fmt.Errorf("opsdb: nil store")
@@ -223,11 +247,11 @@ func (s *Store) ApplyNodeCopyExclusion(id string, excluded bool) (SubtreeMutatio
 		Status: sts,
 		Paths:  map[string]string{id: n.Path},
 	}
-	err = s.applyCopyExclusionChunk(NormalizeIndexPath(n.Path), excluded, nil, chunk, &out)
+	err = s.applyCopyExclusionChunk(NormalizeIndexPath(n.Path), excluded, asRetry, nil, chunk, &out)
 	return out, err
 }
 
-func (s *Store) applyCopyExclusionChunk(rootPath string, excluded bool, skip func(id, path, typ string) bool, chunk SubtreeChunk, out *SubtreeMutationResult) error {
+func (s *Store) applyCopyExclusionChunk(rootPath string, excluded, asRetry bool, skip func(id, path, typ string) bool, chunk SubtreeChunk, out *SubtreeMutationResult) error {
 	writes := make([]SealStatusWrite, 0, len(chunk.IDs))
 	depth := make([]DepthCounterDelta, 0, len(chunk.IDs)*2)
 	for _, id := range chunk.IDs {
@@ -243,14 +267,15 @@ func (s *Store) applyCopyExclusionChunk(rootPath string, excluded bool, skip fun
 		nextExcl := ""
 		restoredFailed := false
 		if excluded {
-			if !copyStatusIsPending(prev.CopyStatus) {
+			fromFailed := prev.CopyStatus == copyStatusFailed
+			if !copyStatusIsPending(prev.CopyStatus) && !fromFailed {
 				continue
 			}
 			nextCopy = copyStatusExcludedInherited
 			if NormalizeIndexPath(n.Path) == rootPath {
 				nextCopy = copyStatusExcludedExplicit
 			}
-			if IsCopyRetryMark(prev.ExclusionSource) {
+			if fromFailed || IsCopyRetryMark(prev.ExclusionSource) {
 				nextExcl = ExclusionRetryExcludedFromFailed
 				out.RetryExcluded++
 			}
@@ -262,6 +287,9 @@ func (s *Store) applyCopyExclusionChunk(rootPath string, excluded bool, skip fun
 			if IsCopyExcludedFromFailed(prev.ExclusionSource) {
 				nextCopy = copyStatusFailed
 				restoredFailed = true
+			} else if asRetry {
+				nextExcl = ExclusionRetryMarkCopy
+				out.RetryMarked++
 			}
 		}
 		nt := nodeTypeNT(n.Type)
@@ -306,7 +334,7 @@ func (s *Store) applyCopyExclusionChunk(rootPath string, excluded bool, skip fun
 	if len(writes) == 0 {
 		return nil
 	}
-	sched, err := s.WriteSealBatch(nil, writes, nil, nil, nil)
+	sched, err := s.WriteSealBatch(nil, writes, nil, nil)
 	if err != nil {
 		return err
 	}

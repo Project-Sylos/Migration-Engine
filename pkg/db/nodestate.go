@@ -42,21 +42,11 @@ func NormalizeSubtreeRootPathForPropagation(path string) string {
 	return p
 }
 
-// IDPathSubtreePredicateSQL is a SQL fragment matching root id_path and descendants.
-// Use with starts_with so UUID segments are not LIKE-wildcarded. rootCol is typically "n.path".
-// For root "/", use path LIKE '/%' (or path <> '/' for strict descendants).
-func IDPathSubtreePredicateSQL(rootCol string, includeRoot bool, rootEqParam, rootPrefixParam string) string {
-	if includeRoot {
-		return `(` + rootCol + ` = ` + rootEqParam + ` OR starts_with(` + rootCol + `, ` + rootPrefixParam + `))`
-	}
-	return `starts_with(` + rootCol + `, ` + rootPrefixParam + `)`
-}
-
 // NodeState is the in-memory representation of a row in src_nodes or dst_nodes.
 // ID is a UUID v5 (MintNodeID). SRC↔DST pairing uses id_map; parent/child uses parent_id.
 // Path/parent_path store immutable id ancestry chains (id/id/id), not display names.
 // Name is the mutable basename used for UI, GPL leaf checks, and FS create/rename.
-// DisplayPath is the write-once root-relative name path for filter rules (/ → /name → /a/b).
+// DisplayPath is the root-relative name path for filter rules and trigram indexing.
 type NodeState struct {
 	ID              string // UUID v5 internal id (MintNodeID)
 	ServiceID       string // FS handle (cloud native id, or local path)
@@ -64,13 +54,16 @@ type NodeState struct {
 	ParentServiceID string
 	Path            string // Immutable id_path ancestry key
 	ParentPath      string // Parent id_path
-	Name            string // Mutable display basename
-	DisplayPath     string // Write-once discovery display path (filter rules); never updated on rename
+	Name            string // Mutable display basename (full FS name, including extension)
+	DisplayPath     string // Root-relative source display path; stamped at discovery (destination names live in GPL)
 	Type            string // "folder" or "file"
+	// Extension is the real file extension without a leading dot (files only).
+	// Prefer provider metadata; used only for trigram indexing, not FS names.
+	Extension       string
 	Size            int64
 	MTime           string
 	Depth           int
-	TraversalStatus string // pending, successful, failed, not_on_src (dst)
+	TraversalStatus string // pending, successful, failed; legacy not_on_src (dst)
 	CopyStatus      string // pending, in_progress, successful, failed (src)
 	DeleteStatus    string // pending, deleted, failed (src)
 	GPLStatus       string // pending, successful, failed (path-scoped cascade)
@@ -84,17 +77,6 @@ type NodeState struct {
 	IncludeOnly string
 	// ExclusionSource is sealed provenance (manual / filter id / discovery-retry marks).
 	ExclusionSource string
-}
-
-// RuleEvaluationEvent is one append-only row for rule_evaluation_events.
-type RuleEvaluationEvent struct {
-	NodeID      string
-	RulesetID   string
-	RuleID      string
-	Result      string // passed | excluded | engine_error
-	EvalPhase   string // pre | post
-	Label       string
-	EvaluatedAt int64
 }
 
 // NodeMeta is a subset of NodeState for batch lookups.
@@ -194,18 +176,6 @@ func discoveryDepthStatsDeltas(table string, nodes []*NodeState) []DepthStatsDel
 		}
 	}
 	return out
-}
-
-// NodeInsertName returns the display basename to store in the name column.
-// Providers sometimes report a full path (or nothing) as the display name, so the
-// stored value is always reduced to the leaf segment, falling back to the node path.
-func NodeInsertName(name, path string) string {
-	if base := NormalizeNodeBasename(name); base != "" && base != "/" {
-		return base
-	}
-	// path is an id_path; do not treat UUID segments as display names.
-	_ = path
-	return ""
 }
 
 // NodeInsertPathFields returns normalized path columns for node table inserts.

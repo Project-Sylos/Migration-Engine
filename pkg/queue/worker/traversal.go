@@ -5,7 +5,6 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -20,23 +19,18 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
-// TraversalWorker executes traversal tasks by listing children and recording them to DuckDB.
+// TraversalWorker executes traversal tasks by listing children and recording them to DB.
 // Each worker runs independently in its own goroutine, continuously polling the queue for work.
 type TraversalWorker struct {
-	id          string
-	queue       *queue.Queue
-	fsAdapter   types.FSAdapter
-	queueName   string
-	isDst       bool
-	shutdownCtx context.Context
-	workerCtx   context.Context
-	idle        *atomic.Bool
-	retire      *atomic.Bool
+	workerBase
+	fsAdapter types.FSAdapter
+	queueName string
+	isDst     bool
 }
 
 func NewTraversalWorker(
 	id string,
-	queue *queue.Queue,
+	q *queue.Queue,
 	adapter types.FSAdapter,
 	queueName string,
 	shutdownCtx context.Context,
@@ -44,153 +38,21 @@ func NewTraversalWorker(
 	idle *atomic.Bool,
 	retire *atomic.Bool,
 ) *TraversalWorker {
-	if workerCtx == nil {
-		workerCtx = shutdownCtx
+	w := &TraversalWorker{
+		workerBase: newWorkerBase(id, q, shutdownCtx, workerCtx, idle, retire),
+		fsAdapter:  adapter,
+		queueName:  queueName,
+		isDst:      queueName == "dst",
 	}
-	return &TraversalWorker{
-		id:          id,
-		queue:       queue,
-		fsAdapter:   adapter,
-		queueName:   queueName,
-		isDst:       queueName == "dst",
-		shutdownCtx: shutdownCtx,
-		workerCtx:   workerCtx,
-		idle:        idle,
-		retire:      retire,
+	w.loop = loopSpec{
+		label:     "queue.Worker",
+		queueName: queueName,
+		execute:   w.execute,
+		logFailure: func(task *queue.TaskBase, err error) {
+			w.logError(task, err, task.Attempts < w.queue.MaxRetries() && !queue.IsNonRetryableTraversalError(err.Error()))
+		},
 	}
-}
-
-func (w *TraversalWorker) shouldRetire() bool {
-	return w.retire != nil && w.retire.Load()
-}
-
-// Run is the main worker loop. It continuously polls the queue for tasks.
-// When a task is found, it leases it, executes it, and reports the result.
-// When no work is available or queue is paused, it briefly sleeps before polling again.
-// When queue is exhausted, the worker exits.
-func (w *TraversalWorker) Run() {
-	defer w.queue.NotifyWorkerExit(w.id)
-	if logservice.LS != nil {
-		err := logservice.LS.Log("info", "queue.Worker started", "worker", w.id, w.queueName)
-		if err != nil {
-			fmt.Println("error logging", err)
-		}
-	}
-
-	for {
-		// Check for shutdown first (force exit)
-		if w.shutdownCtx != nil {
-			select {
-			case <-w.shutdownCtx.Done():
-				if logservice.LS != nil {
-					err := logservice.LS.Log("info", "queue.Worker exiting - shutdown requested", "worker", w.id, w.queueName)
-					if err != nil {
-						fmt.Println("error logging", err)
-					}
-				}
-				return
-			default:
-			}
-		}
-		if w.workerCtx != nil {
-			select {
-			case <-w.workerCtx.Done():
-				if logservice.LS != nil {
-					err := logservice.LS.Log("info", "queue.Worker exiting - scale down", "worker", w.id, w.queueName)
-					if err != nil {
-						fmt.Println("error logging", err)
-					}
-				}
-				return
-			default:
-			}
-		}
-
-		if w.shouldRetire() {
-			if logservice.LS != nil {
-				_ = logservice.LS.Log("info", "queue.Worker exiting - scale down retire", "worker", w.id, w.queueName)
-			}
-			return
-		}
-
-		// Check lifecycle state
-		if w.queue.IsPaused() {
-			// queue.Queue is paused, sleep and continue polling
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		// Check if queue is exhausted (traversal complete) - exit worker
-		if w.queue.IsExhausted() {
-			if logservice.LS != nil {
-				err := logservice.LS.Log("info", "queue.Worker exiting - queue exhausted", "worker", w.id, w.queueName)
-				if err != nil {
-					fmt.Println("error logging", err)
-				}
-			}
-			return
-		}
-
-		if wait := w.queue.RateLimitedWaitDuration(); wait > 0 {
-			waitCtx := w.workerCtx
-			if waitCtx == nil {
-				waitCtx = w.shutdownCtx
-			}
-			if err := w.queue.WaitRateLimited(waitCtx, wait); err != nil {
-				return
-			}
-			continue
-		}
-
-		// Try to lease a task from the queue
-		task := w.queue.Lease()
-		if task == nil {
-			// No work available, sleep briefly before checking again
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-		w.queue.BindLeaseOwner(task, w.id)
-
-		setWorkerBusy(w.idle)
-		// Execute the task (check for shutdown during execution if needed)
-		err := w.execute(task)
-		markWorkerIdle(w.queue, w.id, w.idle)
-		if errors.Is(err, errTransferAbandoned) {
-			// Scale-down abandon requeues via AbandonTransferCheckpoint / cooperative force-checkout;
-			// if still in-progress, yield without failure.
-			if w.queue.HasInProgress(task.ID) {
-				task.Locked = false
-				w.queue.RemoveInProgress(task.ID)
-				_ = w.queue.Add(task)
-			}
-			if w.shouldRetire() {
-				return
-			}
-			continue
-		}
-		if err != nil {
-			task.LastError = err.Error()
-			if queue.IsThrottleError(err) {
-				task.WorkerResult = "rate_limited"
-				w.queue.ReportTaskResult(task, queue.TaskExecutionResultRateLimited)
-			} else {
-				task.WorkerResult = "error"
-				w.queue.ReportTaskResult(task, queue.TaskExecutionResultFailed)
-				willRetry := task.Attempts < w.queue.MaxRetries() && !queue.IsNonRetryableTraversalError(err.Error())
-				w.logError(task, err, willRetry)
-			}
-		} else {
-			// Mark worker result BEFORE calling ReportTaskResult (for stall diagnostics)
-			task.WorkerResult = "success"
-			w.queue.ReportTaskResult(task, queue.TaskExecutionResultSuccessful)
-		}
-		if w.shouldRetire() {
-			if logservice.LS != nil {
-				_ = logservice.LS.Log("info", "queue.Worker exiting - scale down retire", "worker", w.id, w.queueName)
-			}
-			return
-		}
-	}
+	return w
 }
 
 // execute performs the actual traversal work.
@@ -205,9 +67,10 @@ func (w *TraversalWorker) execute(task *queue.TaskBase) error {
 
 	// Prefer workerCtx so scale-down / stop force-checkout aborts mid-ListChildren; fall back to shutdown.
 	parent := fsOpContext(w.workerCtx, w.shutdownCtx)
-	// Suppress while seal flush or rate-limit wait; never fake heartbeats.
-	// Hung ListChildren must cancel (15s) so the task can fail instead of wedging the round forever.
-	wd, ctx := observe.NewProgressWatchdog(parent, traversalStallTimeout, progressStallSuppress(w.queue))
+	// One Beat at watchdog creation, then a hard wall-clock cancel. No mid-list fake
+	// beats and no seal suppress (seal must not hide kernel blackholes). Rate-limit
+	// windows still freeze the timer so provider backoff is not treated as a hang.
+	wd, ctx := observe.NewProgressWatchdog(parent, traversalStallTimeout, progressRateLimitSuppress(w.queue))
 	defer wd.Stop()
 
 	w.queue.SetActiveLeaseSize(w.id, 0)
@@ -216,8 +79,14 @@ func (w *TraversalWorker) execute(task *queue.TaskBase) error {
 	w.queue.WaitInterOp(w.workerCtx)
 
 	folder := task.Folder
+	if logservice.LS != nil {
+		_ = logservice.LS.LogStructured("trace",
+			fmt.Sprintf("traversal list: path=%s", task.DisplayPath),
+			"worker", w.id,
+			logservice.LogFields{Action: "traversal", NodeID: task.ID, Queue: w.queueName})
+	}
 	depth := folder.DepthLevel
-	out, ok := awaitCancellable(ctx, func() fsOut[types.ListResult] {
+	out, ok := awaitCancellable(w.queue, ctx, func() fsOut[types.ListResult] {
 		d := depth
 		r, err := w.fsAdapter.ListChildren(ctx, folder.ServiceID, &d, folder.LocationPath)
 		return fsOut[types.ListResult]{Val: r, Err: err}
@@ -226,7 +95,7 @@ func (w *TraversalWorker) execute(task *queue.TaskBase) error {
 		if parent.Err() != nil || (w.shutdownCtx != nil && w.shutdownCtx.Err() != nil) {
 			return errTransferAbandoned
 		}
-		return fmt.Errorf("%w: list children of %s stalled after %s", errTraversalStalled, folder.LocationPath, traversalStallTimeout)
+		return fmt.Errorf("%w: list children of %s stalled after %s", errTraversalStalled, task.DisplayPath, traversalStallTimeout)
 	}
 	if out.Err != nil {
 		err := out.Err
@@ -234,15 +103,15 @@ func (w *TraversalWorker) execute(task *queue.TaskBase) error {
 			if parent.Err() != nil || (w.shutdownCtx != nil && w.shutdownCtx.Err() != nil) {
 				return errTransferAbandoned
 			}
-			return fmt.Errorf("%w: list children of %s stalled after %s", errTraversalStalled, folder.LocationPath, traversalStallTimeout)
+			return fmt.Errorf("%w: list children of %s stalled after %s", errTraversalStalled, task.DisplayPath, traversalStallTimeout)
 		}
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("error",
 				fmt.Sprintf("Failed to list children: path=%s folderId=%s error=%v",
-					folder.LocationPath, folder.ServiceID, err),
+					task.DisplayPath, folder.ServiceID, err),
 				"worker", w.id, w.queueName)
 		}
-		return fmt.Errorf("failed to list children of %s: %w", folder.LocationPath, err)
+		return fmt.Errorf("failed to list children of %s: %w", task.DisplayPath, err)
 	}
 	result := out.Val
 	wd.Beat()
@@ -301,6 +170,7 @@ func (w *TraversalWorker) execute(task *queue.TaskBase) error {
 		}
 	}
 
+	w.queue.NoteDiscoveredChildren(task, len(task.DiscoveredChildren))
 	return nil
 }
 
@@ -363,8 +233,9 @@ func (w *TraversalWorker) executeDstComparison(task *queue.TaskBase, actualResul
 				IsFile:        false,
 				SrcID:         srcID,
 				SrcCopyStatus: db.CopyStatusAlreadyExisted,
+				DstCopyStatus: db.CopyStatusAlreadyExisted,
 			})
-		} 
+		}
 	}
 
 	// Rematch: cleaned/proposed SRC basename → unmatched DST sibling (already_existed + id_map).
@@ -377,45 +248,66 @@ func (w *TraversalWorker) executeDstComparison(task *queue.TaskBase, actualResul
 			if rematchedDSTKey(task, matchKey) {
 				continue
 			}
-			// Folder exists on dst but not src: mark as "NotOnSrc"
+			// Folder exists on dst but not src: still walk so nested DST-only kids are visible.
 			task.DiscoveredChildren = append(task.DiscoveredChildren, queue.ChildResult{
-				Folder: actualFolder,
-				Status: db.StatusNotOnSrc,
-				IsFile: false,
-				SrcID:  "", // No SRC node for items not on src
+				Folder:        actualFolder,
+				Status:        db.StatusPending,
+				IsFile:        false,
+				SrcID:         "", // No SRC node; no copy enrollment
+				DstCopyStatus: db.CopyStatusDestinationOnly,
 			})
 		}
 	}
 
 	// Compare files by canonical Type:Name key.
+	policy := w.queue.OverwritePolicy()
+	hashVerify := w.queue.HashVerify()
+	peerSrc := w.queue.TraversalPeerAdapter()
+	parent := fsOpContext(w.workerCtx, w.shutdownCtx)
 	for _, expectedFile := range expectedFiles {
 		matchKey := queue.DstChildMatchKey(expectedFile.Type, expectedFile.DisplayName, expectedFile.LocationPath)
 		if actualFile, exists := actualFileMap[matchKey]; exists {
-			// Get SRC node ID from map
 			srcID := srcIDMap[matchKey]
+			outcome := resolveFileOverwrite(policy, expectedFile, actualFile)
 
-			// Compare timestamps to determine copy status for SRC node.
-			// If DST is newer or equal: already on DST (already_existed).
-			// If SRC is newer: copy needed (pending).
-			srcCopyStatus := db.CopyStatusPending
-			switch compareTimestamps(expectedFile.LastUpdated, actualFile.LastUpdated) {
-			case "Successful":
-				srcCopyStatus = db.CopyStatusAlreadyExisted
-			case "Unparseable":
-				// Provider mtimes missing or non-RFC3339: same-size match on both sides is treated as in sync.
-				if expectedFile.Size > 0 && expectedFile.Size == actualFile.Size {
-					srcCopyStatus = db.CopyStatusAlreadyExisted
+			if hashVerify && peerSrc != nil && expectedFile.ServiceID != "" && actualFile.ServiceID != "" {
+				display := expectedFile.DisplayName
+				if display == "" {
+					display = actualFile.DisplayName
+				}
+				equal, _, _, herr := hashVerifyPair(
+					parent, peerSrc, w.fsAdapter, expectedFile, actualFile, display, srcID, wd, w.queue,
+				)
+				if herr != nil {
+					if logservice.LS != nil {
+						_ = logservice.LS.LogStructured("warning",
+							fmt.Sprintf("hash verify failed path=%s: %v; falling back to overwrite policy", display, herr),
+							"worker", w.id,
+							logservice.LogFields{Action: "hash_verify", NodeID: srcID, Queue: w.queueName})
+					}
+				} else if queue.NormalizeOverwritePolicy(policy) == queue.OverwriteNewestMTime {
+					if equal {
+						outcome.SrcCopyStatus = db.CopyStatusAlreadyExisted
+						outcome.DstCopyStatus = db.CopyStatusAlreadyExisted
+						outcome.ExclusionSource = ""
+					} else {
+						outcome.SrcCopyStatus = db.CopyStatusPending
+						outcome.DstCopyStatus = db.CopyStatusNeedsOverwrite
+						outcome.ExclusionSource = ""
+					}
 				}
 			}
 
 			task.DiscoveredChildren = append(task.DiscoveredChildren, queue.ChildResult{
-				File:          actualFile,
-				Status:        db.StatusSuccessful, // File exists on dst, no traversal needed
-				IsFile:        true,
-				SrcID:         srcID,
-				SrcCopyStatus: srcCopyStatus,
+				File:            actualFile,
+				Status:          db.StatusSuccessful, // File exists on dst, no traversal needed
+				IsFile:          true,
+				SrcID:           srcID,
+				SrcCopyStatus:   outcome.SrcCopyStatus,
+				DstCopyStatus:   outcome.DstCopyStatus,
+				ExclusionSource: outcome.ExclusionSource,
 			})
-		} 
+		}
 	}
 
 	// Rematch cleaned SRC file basenames onto unmatched DST siblings.
@@ -428,16 +320,18 @@ func (w *TraversalWorker) executeDstComparison(task *queue.TaskBase, actualResul
 			if rematchedDSTKey(task, matchKey) {
 				continue
 			}
-			// File exists on dst but not src: mark as "not_on_src"
+			// File exists on dst but not src: terminal successful; no SRC / no copy.
 			task.DiscoveredChildren = append(task.DiscoveredChildren, queue.ChildResult{
-				File:   actualFile,
-				Status: db.StatusNotOnSrc,
-				IsFile: true,
-				SrcID:  "", // No SRC node for items not on src
+				File:          actualFile,
+				Status:        db.StatusSuccessful,
+				IsFile:        true,
+				SrcID:         "", // No SRC node; no copy enrollment
+				DstCopyStatus: db.CopyStatusDestinationOnly,
 			})
 		}
 	}
 
+	w.queue.NoteDiscoveredChildren(task, len(task.DiscoveredChildren))
 	return nil
 }
 
@@ -462,138 +356,15 @@ func rematchedDSTKey(task *queue.TaskBase, matchKey string) bool {
 	return false
 }
 
+// rematchDSTChildren previously auto-paired cleaned-name hits against DST siblings.
+// That silent rematch is disabled: collisions become manual_review via
+// AppendDSTSiblingCollisionIssues (merge / unique / rename). Exact basename
+// pairing still happens in the first DST compare pass.
 func rematchDSTChildren(task *queue.TaskBase, expectedFolders []types.Folder, actualFolderMap map[string]types.Folder, expectedFolderMap map[string]types.Folder, srcIDMap map[string]string) {
-	if task == nil || len(expectedFolders) == 0 || len(actualFolderMap) == 0 {
-		return
-	}
-	matchedSrc := make(map[string]struct{})
-	usedDST := make(map[string]struct{})
-	for _, c := range task.DiscoveredChildren {
-		if c.SrcID != "" {
-			matchedSrc[c.SrcID] = struct{}{}
-		}
-		if !c.IsFile {
-			usedDST[queue.DstChildMatchKey(c.Folder.Type, c.Folder.DisplayName, c.Folder.LocationPath)] = struct{}{}
-		}
-	}
-	for _, expectedFolder := range expectedFolders {
-		exactKey := queue.DstChildMatchKey(expectedFolder.Type, expectedFolder.DisplayName, expectedFolder.LocationPath)
-		srcID := srcIDMap[exactKey]
-		if srcID == "" {
-			continue
-		}
-		if _, ok := matchedSrc[srcID]; ok {
-			continue
-		}
-		if _, exists := actualFolderMap[exactKey]; exists {
-			continue
-		}
-		clean := proposedCleanForSRC(task, srcID, queue.DstChildMatchName(expectedFolder.DisplayName, expectedFolder.LocationPath))
-		if clean == "" || clean == queue.DstChildMatchName(expectedFolder.DisplayName, expectedFolder.LocationPath) {
-			continue
-		}
-		rematchKey := queue.DstChildMatchKey(expectedFolder.Type, clean, "")
-		if _, taken := expectedFolderMap[rematchKey]; taken {
-			continue
-		}
-		if _, used := usedDST[rematchKey]; used {
-			continue
-		}
-		actual, ok := actualFolderMap[rematchKey]
-		if !ok {
-			continue
-		}
-		task.DiscoveredChildren = append(task.DiscoveredChildren, queue.ChildResult{
-			Folder:        actual,
-			Status:        db.StatusPending,
-			IsFile:        false,
-			SrcID:         srcID,
-			SrcCopyStatus: db.CopyStatusAlreadyExisted,
-		})
-		matchedSrc[srcID] = struct{}{}
-		usedDST[rematchKey] = struct{}{}
-	}
 }
 
+// rematchDSTChildrenFiles: cleaned-name auto-pair disabled (see rematchDSTChildren).
 func rematchDSTChildrenFiles(task *queue.TaskBase, expectedFiles []types.File, actualFileMap map[string]types.File, expectedFileMap map[string]types.File, srcIDMap map[string]string) {
-	if task == nil || len(expectedFiles) == 0 || len(actualFileMap) == 0 {
-		return
-	}
-	matchedSrc := make(map[string]struct{})
-	usedDST := make(map[string]struct{})
-	for _, c := range task.DiscoveredChildren {
-		if c.SrcID != "" {
-			matchedSrc[c.SrcID] = struct{}{}
-		}
-		if c.IsFile {
-			usedDST[queue.DstChildMatchKey(c.File.Type, c.File.DisplayName, c.File.LocationPath)] = struct{}{}
-		}
-	}
-	for _, expectedFile := range expectedFiles {
-		exactKey := queue.DstChildMatchKey(expectedFile.Type, expectedFile.DisplayName, expectedFile.LocationPath)
-		srcID := srcIDMap[exactKey]
-		if srcID == "" {
-			continue
-		}
-		if _, ok := matchedSrc[srcID]; ok {
-			continue
-		}
-		if _, exists := actualFileMap[exactKey]; exists {
-			continue
-		}
-		clean := proposedCleanForSRC(task, srcID, queue.DstChildMatchName(expectedFile.DisplayName, expectedFile.LocationPath))
-		if clean == "" || clean == queue.DstChildMatchName(expectedFile.DisplayName, expectedFile.LocationPath) {
-			continue
-		}
-		rematchKey := queue.DstChildMatchKey(expectedFile.Type, clean, "")
-		if _, taken := expectedFileMap[rematchKey]; taken {
-			continue
-		}
-		if _, used := usedDST[rematchKey]; used {
-			continue
-		}
-		actual, ok := actualFileMap[rematchKey]
-		if !ok {
-			continue
-		}
-		srcCopyStatus := db.CopyStatusPending
-		switch compareTimestamps(expectedFile.LastUpdated, actual.LastUpdated) {
-		case "Successful":
-			srcCopyStatus = db.CopyStatusAlreadyExisted
-		case "Unparseable":
-			if expectedFile.Size > 0 && expectedFile.Size == actual.Size {
-				srcCopyStatus = db.CopyStatusAlreadyExisted
-			}
-		}
-		task.DiscoveredChildren = append(task.DiscoveredChildren, queue.ChildResult{
-			File:          actual,
-			Status:        db.StatusSuccessful,
-			IsFile:        true,
-			SrcID:         srcID,
-			SrcCopyStatus: srcCopyStatus,
-		})
-		matchedSrc[srcID] = struct{}{}
-		usedDST[rematchKey] = struct{}{}
-	}
-}
-
-func proposedCleanForSRC(task *queue.TaskBase, srcID, basename string) string {
-	if task == nil || srcID == "" {
-		return ""
-	}
-	meta, ok := task.ExpectedSrcNodeMeta[srcID]
-	if !ok || meta.GPLState == "" {
-		return ""
-	}
-	var payload db.GPLStatePayload
-	if err := json.Unmarshal([]byte(meta.GPLState), &payload); err != nil {
-		return ""
-	}
-	if clean := payload.Part.ProposedClean; clean != "" {
-		return clean
-	}
-	_ = basename
-	return ""
 }
 
 // compareTimestamps compares src and dst timestamps for copy skip decisions.
@@ -641,7 +412,7 @@ func (w *TraversalWorker) logError(task *queue.TaskBase, paramErr error, willRet
 	if logservice.LS == nil {
 		return // Logger not initialized
 	}
-	path := task.LocationPath()
+	path := task.DisplayPath
 	retryMsg := "will retry"
 	if !willRetry {
 		retryMsg = "max retries exceeded"
@@ -675,8 +446,9 @@ func (w *TraversalWorker) executeGPL(task *queue.TaskBase) error {
 	database := w.queue.Database()
 	checkTarget := gpl.ResolvePathCheckTarget(w.queue.ScalingSrcProvider(), w.queue.ScalingDstProvider(), w.queue.PathCheckProfile())
 	target := gpl.GPLTargetFromProvider(checkTarget)
-	err := awaitErr(ctx, parent, gplStallTimeout, "gpl revalidate", task.LocationPath(), func() error {
-		return gpl.ProcessGPLTaskSRC(database, target, task, w.queue.WindowsCompat())
+	err := awaitErr(nil, ctx, parent, gplStallTimeout, "gpl revalidate", task.DisplayPath, func() error {
+		_, err := gpl.ProcessGPLTaskSRC(database, target, task, w.queue.WindowsCompat())
+		return err
 	})
 	if err == nil {
 		wd.Beat()

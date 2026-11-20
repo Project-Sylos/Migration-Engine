@@ -39,17 +39,18 @@ func runTest() error {
 	fmt.Println("======================")
 	// Run copy phase
 	stats, err := migration.RunCopyPhase(migration.CopyPhaseConfig{
-		DuckDB:          database,
-		SrcAdapter:      srcAdapter,
-		DstAdapter:      dstAdapter,
-		WorkerCount:     10,
-		MaxRetries:      3,
-		LogAddress:      "127.0.0.1:8081",
-		LogLevel:        "trace",
-		SkipListener:    false,
-		StartupDelay:    3 * time.Second,
-		ProgressTick:    2 * time.Second,
-		ShutdownContext: nil,
+		PhaseRuntime: migration.PhaseRuntime{
+			WorkerCount:  10,
+			MaxRetries:   3,
+			LogAddress:   "127.0.0.1:8081",
+			LogLevel:     "trace",
+			SkipListener: false,
+			StartupDelay: 3 * time.Second,
+			ProgressTick: 2 * time.Second,
+		},
+		DB:         database,
+		SrcAdapter: srcAdapter,
+		DstAdapter: dstAdapter,
 	})
 	if err != nil {
 		return fmt.Errorf("copy phase failed: %w", err)

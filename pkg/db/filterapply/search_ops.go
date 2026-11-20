@@ -30,19 +30,8 @@ type searchFileMatch struct {
 // mid-apply. Callers must treat this as failure (not partial success).
 var ErrSearchApplyTimedOut = errors.New("search apply timed out before all matches were processed")
 
-// ApplySearchExclusionOps writes live copy exclude for search matches (explicit root + inherited descendants).
-func ApplySearchExclusionOps(
-	database *db.DB,
-	f review.ReviewFilter,
-	criteriaJSON string,
-	exceptIDs []string,
-	applicationID string,
-	eventTime int64,
-) (db.CopyMutationResult, error) {
-	return ApplySearchExclusionOpsCtx(context.Background(), database, f, criteriaJSON, exceptIDs, applicationID, eventTime)
-}
-
-// ApplySearchExclusionOpsCtx is ApplySearchExclusionOps with a parent context for deadline/cancel.
+// ApplySearchExclusionOpsCtx writes live copy exclude for search matches (explicit root + inherited descendants).
+// parent carries the deadline/cancel.
 func ApplySearchExclusionOpsCtx(
 	parent context.Context,
 	database *db.DB,
@@ -153,17 +142,8 @@ func ApplySearchExclusionOpsCtx(
 	return out, nil
 }
 
-// ApplySearchUnexclusionOps restores pending copy status and pend:copy for excluded search matches.
-func ApplySearchUnexclusionOps(
-	database *db.DB,
-	f review.ReviewFilter,
-	exceptIDs []string,
-	eventTime int64,
-) (db.CopyMutationResult, error) {
-	return ApplySearchUnexclusionOpsCtx(context.Background(), database, f, exceptIDs, eventTime)
-}
-
-// ApplySearchUnexclusionOpsCtx is ApplySearchUnexclusionOps with a parent context for deadline/cancel.
+// ApplySearchUnexclusionOpsCtx restores pending copy status and pend:copy for excluded search matches.
+// parent carries the deadline/cancel.
 func ApplySearchUnexclusionOpsCtx(
 	parent context.Context,
 	database *db.DB,

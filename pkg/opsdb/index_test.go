@@ -31,7 +31,7 @@ func TestPathIndexTrailingSlashDoesNotMatchSibling(t *testing.T) {
 		Node:       NodeRecord{ID: "id-child", Path: "/foo/bar", Name: "bar", Type: NodeTypeFile, Size: 10, ParentID: "id-foo"},
 		InsertOnly: true,
 	}
-	if _, err := s.WriteSealBatch([]SealNodeWrite{foo, foobar, child}, nil, nil, nil, nil); err != nil {
+	if _, err := s.WriteSealBatch([]SealNodeWrite{foo, foobar, child}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -67,7 +67,7 @@ func TestIndexRenameUpdatesPathKey(t *testing.T) {
 		Side:       SideSRC,
 		Node:       NodeRecord{ID: "n1", Path: "/old", Name: "old", Type: NodeTypeFile, Size: 5},
 		InsertOnly: true,
-	}}, nil, nil, nil, nil); err != nil {
+	}}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	prev := NodeRecord{ID: "n1", Path: "/old", Name: "old", Type: NodeTypeFile, Size: 5}
@@ -75,7 +75,7 @@ func TestIndexRenameUpdatesPathKey(t *testing.T) {
 		Side:     SideSRC,
 		Node:     NodeRecord{ID: "n1", Path: "/new", Name: "new", Type: NodeTypeFile, Size: 5},
 		PrevNode: &prev,
-	}}, nil, nil, nil, nil); err != nil {
+	}}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if id, err := s.GetNodeIDByPath(SideSRC, "/old"); err != nil || id != "" {
@@ -99,7 +99,7 @@ func TestSizeAndNameIndexScan(t *testing.T) {
 		{Side: SideSRC, Node: NodeRecord{ID: "b", Path: "/b", Name: "beta", Type: NodeTypeFile, Size: 200}, InsertOnly: true},
 		{Side: SideSRC, Node: NodeRecord{ID: "c", Path: "/c", Name: "gamma", Type: NodeTypeFile, Size: 50}, InsertOnly: true},
 	}
-	if _, err := s.WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := s.WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	ids, err := s.ScanSizeRange(SideSRC, 100, 200, 10)

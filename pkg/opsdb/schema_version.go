@@ -26,7 +26,7 @@ func (s *Store) EnsureSchemaVersion() error {
 	}
 	var existing string
 	var found bool
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get([]byte(metaSchemaVersionKey))
 		if err == badger.ErrKeyNotFound {
 			return nil
@@ -44,7 +44,7 @@ func (s *Store) EnsureSchemaVersion() error {
 		return err
 	}
 	if !found {
-		return s.update(func(txn *badger.Txn) error {
+		return s.db.Update(func(txn *badger.Txn) error {
 			return txn.Set([]byte(metaSchemaVersionKey), []byte(SchemaVersion))
 		})
 	}
@@ -64,7 +64,7 @@ func (s *Store) SchemaVersionValue() (string, error) {
 		return "", nil
 	}
 	var out string
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get([]byte(metaSchemaVersionKey))
 		if err == badger.ErrKeyNotFound {
 			return nil

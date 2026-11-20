@@ -13,7 +13,9 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
-func listMergedReviewDiffsPageCtx(parent context.Context, d *db.DB, f ReviewFilter, orderBy string, limit, offset int) (page []MergedReviewRow, hasMore bool, err error) {
+// ListMergedReviewDiffsPageCtx returns a page of merged review rows without COUNT(*).
+// parent carries the ReviewQueryContext deadline / cancel; prefer it for multi-page count and exclude loops.
+func ListMergedReviewDiffsPageCtx(parent context.Context, d *db.DB, f ReviewFilter, orderBy string, limit, offset int) (page []MergedReviewRow, hasMore bool, err error) {
 	start := time.Now()
 	defer func() { d.RecordOp(db.OpReviewSearchPage, "", int64(len(page)), time.Since(start), err) }()
 	if limit <= 0 {
@@ -33,6 +35,23 @@ func listMergedReviewDiffsPageCtx(parent context.Context, d *db.DB, f ReviewFilt
 	}
 	ctx, cancel := d.ReviewQueryContext(parent)
 	defer cancel()
+
+	side := NormalizeReviewSide(f.Side)
+
+	if side == "dst" {
+		// Destination-scoped search: all DST nodes (mapped + unmapped). Ignore SRC-only filters.
+		fDST := f
+		fDST.CopyStatus = ""
+		fDST.DeleteStatus = ""
+		fDST.PathIssueFilter = ""
+		fDST.PathIssueCategory = ""
+		fDST.ExcludeDestinationOnly = false
+		dstRows, err := queryReviewSearchDSTAllOps(ctx, d, fDST, sortCol, sortDesc, fetch)
+		if err != nil {
+			return nil, false, err
+		}
+		return sliceMergedPage(dstRows, limit, offset, useKeyset)
+	}
 
 	if StatusDrivenSearch(f) {
 		if err := ctx.Err(); err != nil {
@@ -149,7 +168,7 @@ func queryReviewSearchSRCOps(ctx context.Context, d *db.DB, f ReviewFilter, sort
 		}
 		filtered = append(filtered, id)
 	}
-	sortCandidateIDsByPath(nodes, filtered, sortCol, sortDesc)
+	sortCandidateIDsByRelevance(nodes, filtered, f, sortCol, sortDesc)
 	if len(filtered) > overFetch {
 		filtered = filtered[:overFetch]
 	}
@@ -303,6 +322,7 @@ func hydrateSRCReviewRows(
 			CopyRetryMarked:        marked,
 			CopyExcludedFromFailed: excludedFromFailed,
 			CopyForceReplaceMarked: copyForceReplaceMarked(st),
+			TraversalAckFromFailed: traversalAckFromFailed(st),
 		}
 		if dstID := dstBySrc[id]; dstID != "" {
 			r.DstNodeID = dstID
@@ -337,6 +357,7 @@ func hydrateSRCReviewRows(
 		}
 		if gpl, ok, _ := ops.GetGPL(id); ok && gpl.Status == db.GPLIssueStatusAccepted {
 			r.ResolvedDstName = gpl.ProposedName
+			r.PathDstAction = gpl.DstAction
 		}
 		out = append(out, r)
 		if len(out) >= limit {
@@ -346,6 +367,108 @@ func hydrateSRCReviewRows(
 	if err := attachPairedDSTTraversal(d, out); err != nil {
 		return nil, err
 	}
+	return out, nil
+}
+
+// queryReviewSearchDSTAllOps searches all DST nodes (including mapped), attaching SRC peers.
+func queryReviewSearchDSTAllOps(ctx context.Context, d *db.DB, f ReviewFilter, sortCol string, sortDesc bool, limit int) ([]MergedReviewRow, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ops := d.Ops()
+	if ops == nil {
+		return nil, fmt.Errorf("review search DST: ops store required")
+	}
+	overFetch := limit * 2
+	if overFetch < limit+50 {
+		overFetch = limit + 50
+	}
+	plan, err := planReviewCandidateIDs(ops, opsdb.SideDST, f, overFetch)
+	if err != nil {
+		return nil, err
+	}
+	ids := plan.ids
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	nodes, err := ops.BatchGetNode(opsdb.SideDST, ids)
+	if err != nil {
+		return nil, err
+	}
+	filtered := make([]string, 0, len(ids))
+	for _, id := range ids {
+		n, ok := nodes[id]
+		if !ok || !nodeMatchesMetaFilter(ops, opsdb.SideDST, n, f) {
+			continue
+		}
+		filtered = append(filtered, id)
+	}
+	sortCandidateIDsByRelevance(nodes, filtered, f, sortCol, sortDesc)
+	dstTrav, err := effectiveDSTTraversalByID(d, filtered)
+	if err != nil {
+		return nil, err
+	}
+	stMap, err := ops.BatchGetStatus(opsdb.SideDST, filtered)
+	if err != nil {
+		return nil, err
+	}
+	srcIDs := make([]string, 0, len(filtered))
+	srcByDst := make(map[string]string, len(filtered))
+	for _, id := range filtered {
+		if m, ok, _ := ops.GetMapByDst(id); ok && idMapBrowseActive(m.Status) && m.SrcID != "" {
+			srcByDst[id] = m.SrcID
+			srcIDs = append(srcIDs, m.SrcID)
+		}
+	}
+	srcNodes, err := ops.BatchGetNode(opsdb.SideSRC, srcIDs)
+	if err != nil {
+		return nil, err
+	}
+	srcSt, err := ops.BatchGetStatus(opsdb.SideSRC, srcIDs)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]MergedReviewRow, 0, limit)
+	for _, id := range filtered {
+		n := nodes[id]
+		r := MergedReviewRow{
+			DstNodeID:          id,
+			Path:               n.Path,
+			DstPath:            n.Path,
+			Name:               n.Name,
+			Depth:              n.Depth,
+			Type:               n.Type,
+			Size:               opsdb.DisplayBytes(n.Type, n.Size, stMap[id].ChildSize),
+			DstTraversalStatus: dstTrav[id],
+		}
+		if srcID := srcByDst[id]; srcID != "" {
+			r.SrcNodeID = srcID
+			if srcRec, ok := srcNodes[srcID]; ok {
+				r.SrcPath = srcRec.Path
+				r.Name = srcRec.Name
+				if st, has := srcSt[srcID]; has {
+					r.SrcTraversalStatus = st.TraversalStatus
+					r.CopyStatus = st.CopyStatus
+					r.DeleteStatus = st.DeleteStatus
+					r.Excluded = st.CopyStatus == db.CopyStatusExcludedExplicit || st.CopyStatus == db.CopyStatusExcludedInherited
+					marked, excludedFromFailed := copyRetryFlags(st)
+					r.CopyRetryMarked = marked
+					r.CopyExcludedFromFailed = excludedFromFailed
+					r.CopyForceReplaceMarked = copyForceReplaceMarked(st)
+					r.TraversalAckFromFailed = traversalAckFromFailed(st)
+					r.Size = opsdb.DisplayBytes(srcRec.Type, srcRec.Size, st.ChildSize)
+				}
+			}
+		}
+		if !rowMatchesDSTStatusFilter(r, f) {
+			continue
+		}
+		out = append(out, r)
+		if len(out) >= limit {
+			break
+		}
+	}
+	attachAcceptedGPL(d, out)
 	return out, nil
 }
 
@@ -364,11 +487,10 @@ func queryReviewSearchDSTOnlyOps(ctx context.Context, d *db.DB, f ReviewFilter, 
 	if overFetch < limit+50 {
 		overFetch = limit + 50
 	}
-	plan, err := planReviewCandidateIDs(ops, opsdb.SideDST, f, overFetch)
+	ids, err := destinationOnlyCandidateIDs(ops, f, overFetch)
 	if err != nil {
 		return nil, err
 	}
-	ids := plan.ids
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -376,22 +498,15 @@ func queryReviewSearchDSTOnlyOps(ctx context.Context, d *db.DB, f ReviewFilter, 
 	if err != nil {
 		return nil, err
 	}
-	maps, err := ops.BatchGetMap(ids, true)
-	if err != nil {
-		return nil, err
-	}
 	filtered := make([]string, 0, len(ids))
 	for _, id := range ids {
-		if _, mapped := maps[id]; mapped {
-			continue // has SRC mapping
-		}
 		n, ok := nodes[id]
 		if !ok || !nodeMatchesMetaFilter(ops, opsdb.SideDST, n, f) {
 			continue
 		}
 		filtered = append(filtered, id)
 	}
-	sortCandidateIDsByPath(nodes, filtered, sortCol, sortDesc)
+	sortCandidateIDsByRelevance(nodes, filtered, f, sortCol, sortDesc)
 	dstTrav, err := effectiveDSTTraversalByID(d, filtered)
 	if err != nil {
 		return nil, err
@@ -411,6 +526,7 @@ func queryReviewSearchDSTOnlyOps(ctx context.Context, d *db.DB, f ReviewFilter, 
 			Type:               n.Type,
 			Size:               opsdb.DisplayBytes(n.Type, n.Size, stMap[id].ChildSize),
 			DstTraversalStatus: dstTrav[id],
+			CopyStatus:         stMap[id].CopyStatus,
 		}
 		if !rowMatchesDSTStatusFilter(r, f) {
 			continue
@@ -421,6 +537,46 @@ func queryReviewSearchDSTOnlyOps(ctx context.Context, d *db.DB, f ReviewFilter, 
 		}
 	}
 	return out, nil
+}
+
+// destinationOnlyCandidateIDs lists unpaired DEST via idx:copy:dst:destination_only.
+// Path/name predicates plan candidates first, then keep destination_only copy status.
+func destinationOnlyCandidateIDs(ops *opsdb.Store, f ReviewFilter, limit int) ([]string, error) {
+	if destinationOnlyUsesCopyIndex(f) {
+		return ops.ListIDsByCopyStatus(opsdb.SideDST, db.CopyStatusDestinationOnly, limit)
+	}
+	plan, err := planReviewCandidateIDs(ops, opsdb.SideDST, f, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(plan.ids) == 0 {
+		return nil, nil
+	}
+	stMap, err := ops.BatchGetStatus(opsdb.SideDST, plan.ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(plan.ids))
+	for _, id := range plan.ids {
+		if stMap[id].CopyStatus != db.CopyStatusDestinationOnly {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out, nil
+}
+
+func destinationOnlyUsesCopyIndex(f ReviewFilter) bool {
+	if strings.TrimSpace(f.ParentPath) != "" || normalizeUnderPath(f.UnderPath) != "" {
+		return false
+	}
+	if len(pathSegmentsForFilter(f)) > 0 || strings.TrimSpace(f.Query) != "" {
+		return false
+	}
+	if strings.TrimSpace(f.FilterMatchedExpr) != "" {
+		return false
+	}
+	return true
 }
 
 func queryReviewSearchSRCByStatusOps(ctx context.Context, d *db.DB, f ReviewFilter, limit int, idDesc bool) ([]MergedReviewRow, error) {
@@ -477,7 +633,7 @@ func queryReviewSearchSRCByStatusOps(ctx context.Context, d *db.DB, f ReviewFilt
 		if !ok {
 			continue
 		}
-		if !nodeRecordMatchesPostFilter(n, f) {
+		if !nodeMatchesPostFilter(srcNodeMeta{path: n.Path, name: n.Name, typ: n.Type, depth: n.Depth, size: n.Size}, f) {
 			continue
 		}
 		r := mergedRowFromOps(h.id, n, h.st)
@@ -493,12 +649,6 @@ func queryReviewSearchSRCByStatusOps(ctx context.Context, d *db.DB, f ReviewFilt
 		return nil, err
 	}
 	return out, nil
-}
-
-func nodeRecordMatchesPostFilter(n opsdb.NodeRecord, f ReviewFilter) bool {
-	return nodeMatchesPostFilter(srcNodeMeta{
-		path: n.Path, name: n.Name, typ: n.Type, depth: n.Depth, size: n.Size,
-	}, f)
 }
 
 func mergedRowFromOps(id string, n opsdb.NodeRecord, st opsdb.StatusRecord) MergedReviewRow {
@@ -517,6 +667,7 @@ func mergedRowFromOps(id string, n opsdb.NodeRecord, st opsdb.StatusRecord) Merg
 		CopyRetryMarked:        marked,
 		CopyExcludedFromFailed: excludedFromFailed,
 		CopyForceReplaceMarked: copyForceReplaceMarked(st),
+		TraversalAckFromFailed: traversalAckFromFailed(st),
 	}
 	if r.Name == "" {
 		r.Name = id
@@ -626,6 +777,16 @@ func rowMatchesDSTStatusFilter(r MergedReviewRow, f ReviewFilter) bool {
 	if st != "" && st != "traversal" && st != "both" {
 		return true
 	}
+	// "Destination only" (UI not_on_src) → DST copy destination_only (indexed).
+	if strings.EqualFold(trav, db.StatusNotOnSrc) || strings.EqualFold(trav, "not_on_src") {
+		if r.DstNodeID == "" || r.SrcNodeID != "" {
+			return false
+		}
+		if r.CopyStatus != "" {
+			return r.CopyStatus == db.CopyStatusDestinationOnly
+		}
+		return true
+	}
 	return traversalStatusMatches(r.DstTraversalStatus, trav)
 }
 
@@ -686,11 +847,9 @@ func reviewSearchSRCNeedsDSTBeforeLimit(f ReviewFilter) bool {
 	return st == "" || st == "traversal" || st == "both"
 }
 
-func getMergedReviewStats(d *db.DB, f ReviewFilter) (MergedReviewStats, error) {
-	return getMergedReviewStatsCtx(context.Background(), d, f)
-}
-
-func getMergedReviewStatsCtx(parent context.Context, d *db.DB, f ReviewFilter) (MergedReviewStats, error) {
+// GetMergedReviewStatsCtx returns aggregate counts for rows matching the filter. Counts are unique by path (merged view = one row per path).
+// parent carries the interactive-read cancel / deadline.
+func GetMergedReviewStatsCtx(parent context.Context, d *db.DB, f ReviewFilter) (MergedReviewStats, error) {
 	// Unfiltered footer/stats must stay O(1) ++/-- counters. Never fall back to a
 	// full merged-row scan when the tree is empty or counters happen to be zero.
 	if reviewFilterUnfiltered(f) {
@@ -714,7 +873,7 @@ func getMergedReviewStatsCtx(parent context.Context, d *db.DB, f ReviewFilter) (
 		pageFilter := f
 		pageFilter.AfterPath = afterPath
 		pageFilter.AfterID = afterID
-		rows, hasMore, err := listMergedReviewDiffsPageCtx(ctx, d, pageFilter, "path ASC", pageSize, 0)
+		rows, hasMore, err := ListMergedReviewDiffsPageCtx(ctx, d, pageFilter, "path ASC", pageSize, 0)
 		if err != nil {
 			if ctx.Err() != nil {
 				s.Truncated = true
@@ -777,7 +936,7 @@ func statsFromOpsStatusOverlay(d *db.DB, f ReviewFilter) (MergedReviewStats, err
 		for i, id := range ids {
 			st := sts[i]
 			n := nodes[id]
-			if !nodeRecordMatchesPostFilter(n, f) {
+			if !nodeMatchesPostFilter(srcNodeMeta{path: n.Path, name: n.Name, typ: n.Type, depth: n.Depth, size: n.Size}, f) {
 				continue
 			}
 			s.Total++

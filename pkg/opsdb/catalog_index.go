@@ -22,7 +22,7 @@ func (s *Store) PutCatalogCursor(kind, side, id string) error {
 	if s == nil || s.db == nil || id == "" {
 		return nil
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set(catalogCursorKey(kind, side), []byte(id))
 	})
 }
@@ -33,7 +33,7 @@ func (s *Store) GetCatalogCursor(kind, side string) (string, error) {
 		return "", nil
 	}
 	var id string
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(catalogCursorKey(kind, side))
 		if err == badger.ErrKeyNotFound {
 			return nil
@@ -65,28 +65,12 @@ func (s *Store) ListNodeIDs(side, afterID string, limit int) ([]string, error) {
 	})
 }
 
-// ListMapSrcIDs pages map:src ids in key order after afterID (no deletes).
-func (s *Store) ListMapSrcIDs(afterID string, limit int) ([]string, error) {
-	prefix := []byte("map:src:")
-	var start []byte
-	if afterID != "" {
-		start = mapSrcKey(afterID)
-	}
-	return s.listPrefixIDs(prefix, start, limit, func(key []byte) (string, bool) {
-		if !bytes.HasPrefix(key, prefix) {
-			return "", false
-		}
-		id := string(key[len(prefix):])
-		return id, id != ""
-	})
-}
-
 func (s *Store) listPrefixIDs(prefix, start []byte, limit int, parse func([]byte) (string, bool)) ([]string, error) {
 	if limit <= 0 {
 		limit = 10_000
 	}
 	var ids []string
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)

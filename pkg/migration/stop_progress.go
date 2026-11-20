@@ -127,7 +127,7 @@ func (m *Migration) beginForceStopProgress() {
 		Step:   StopStepAborted,
 		Label:  "Force stopping migration",
 		Steps: []StopStep{
-			{ID: StopStepAborted, Label: "Force stopping (may not resume)", Status: StopStatusActive},
+			{ID: StopStepAborted, Label: "Hard stop (Resume uses recovery sweep)", Status: StopStatusActive},
 		},
 	}
 }

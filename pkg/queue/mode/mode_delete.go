@@ -4,158 +4,42 @@
 package mode
 
 import (
-	"fmt"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
-	"codeberg.org/Sylos/Migration-Engine/pkg/db/failurelog"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/pull"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/subtree"
-	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
-// CheckDeleteCompletion checks if the delete phase should switch passes or complete.
-// Only called when pass 1 has swept all depths up to maxKnownDepth (forward BFS), mirroring copy.
-// Pass 1 = folders, pass 2 = files. Trust per-round exhaustion; no global DB pending re-check.
-func CheckDeleteCompletion(q *queue.Queue, currentRound int) bool {
-	maxKnownDepth := q.GetMaxKnownDepth()
-
-	if maxKnownDepth >= 0 && currentRound < maxKnownDepth {
-		return false
-	}
-	if q.InProgressCount() > 0 || q.GetPendingCount() > 0 {
-		return false
-	}
-
-	info := q.RoundInfoReadOnly(currentRound)
-	if info == nil || info.PullCount == 0 {
-		return false
-	}
-	if !q.GetLastPullWasPartial() {
-		return false
-	}
-
-	deletePass := q.GetCopyPass()
-	if deletePass == 1 {
-		q.SetCopyPass(2)
-		q.ResetRoundStatsCompleted()
-		q.SetRound(1)
-		q.SetExpectedFromStatsBucket(1)
-		q.SetLastPullWasPartial(false)
-		return false
-	}
-
-	return q.MarkComplete("Delete phase complete - both passes finished")
-}
-
-// AdvanceDeleteRound handles delete-specific round advancement (forward BFS).
-// Round completion is determined by lastPullWasPartial (memory/keyset only); we never query the DB for in-round advancement.
-// When called, the current depth has just completed — increment depth within the same pass until maxKnownDepth, then check pass switch or phase complete.
-func AdvanceDeleteRound(q *queue.Queue) {
-	currentRound := q.GetRound()
-	deletePass := q.GetCopyPass()
-	maxKnownDepth := q.GetMaxKnownDepth()
-
-	newRound := currentRound + 1
-	if maxKnownDepth >= 0 && newRound > maxKnownDepth {
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("info", fmt.Sprintf("Pass %d exhausted depths (past maxKnownDepth %d), checking for completion", deletePass, maxKnownDepth), "queue", q.Name(), q.Name())
-		}
-		completed := q.CheckCompletion(currentRound, queue.CompletionCheckOptions{CheckFinalCompletion: true})
-		if completed {
-			return
-		}
-		q.PullWithRetryIfNeeded(true)
-		return
-	}
-
-	q.SetRound(newRound)
-	q.SetExpectedFromStatsBucket(newRound)
-	q.SetLastPullWasPartial(false)
-
-	passName := "folders"
-	if deletePass == 2 {
-		passName = "files"
-	}
-	if logservice.LS != nil {
-		_ = logservice.LS.Log("info", fmt.Sprintf("Advanced delete to depth %d (pass %d: %s)", newRound, deletePass, passName), "queue", q.Name(), q.Name())
-	}
-	q.PullWithRetryIfNeeded(true)
-}
-
-// PullDeleteTasks pulls delete tasks from DuckDB for the current forward-BFS round.
+// PullDeleteTasks pulls delete tasks from DB for the current forward-BFS round.
 // Only pending_explicit (or failed in retry) nodes are pulled; pending_inherited are covered by ancestor recursive deletes.
 func PullDeleteTasks(q *queue.Queue, force bool) queue.PullResult {
-	database := q.Database()
-	if database == nil {
-		return queue.PullResult{Status: queue.PullAborted}
+	ps, early, ok := beginPull(q, force, pullGate{skipRoundZero: true})
+	if !ok {
+		return early
 	}
-	if !q.TryBeginPulling() {
-		return queue.PullResult{Round: q.GetRound(), Status: queue.PullSkipped}
-	}
-	defer q.SetPulling(false)
-	if q.State() == queue.QueueStateCompleted {
-		return queue.PullResult{Status: queue.PullAborted}
-	}
-
-	snapshot := q.StateSnapshot()
-	if snapshot.State == queue.QueueStatePaused {
-		return queue.PullResult{Round: snapshot.Round, Status: queue.PullAborted}
-	}
-	if !force && snapshot.PendingCount > snapshot.PullLowWM {
-		return queue.PullResult{Round: snapshot.Round, Status: queue.PullSkipped}
-	}
-
-	currentRound := snapshot.Round
-	if currentRound == 0 {
-		return queue.PullResult{Round: 0, Status: queue.PullSkipped}
-	}
-
+	defer ps.end()
+	database, currentRound := ps.Database, ps.Round
 	deletePass := q.GetCopyPass()
 	nodeType := db.NodeTypeFolder
 	if deletePass == 2 {
 		nodeType = db.NodeTypeFile
 	}
-
-	batchSize := q.EffectiveLeaseBatchSize()
 	statusFilter := db.DeleteStatusPendingExplicit
 	if q.GetMode() == queue.QueueModeDeleteRetry {
 		statusFilter = db.DeleteStatusFailed
 	}
-	requestLimit := batchSize + 1
-	q.BeginDBPull()
-	defer q.ReleaseDBPull()
-	pullStart := time.Now()
-	results, err := pull.ListNodesDeleteKeyset(database, currentRound, nodeType, q.GetKeysetCursor(), requestLimit, statusFilter)
-	q.RecordDBPull(len(results), time.Since(pullStart))
-	if err != nil {
-		if logservice.LS != nil {
-			_ = logservice.LS.Log("error", fmt.Sprintf("ListNodesDeleteKeyset failed: %v", err), "queue", q.Name(), q.Name())
-		}
-		return queue.PullResult{Round: currentRound, Status: queue.PullSkipped}
+	page, early, ok := pullKeysetPage(q, currentRound, "ListNodesDeleteKeyset", func(limit int) ([]db.FetchResult, error) {
+		return pull.ListNodesDeleteKeyset(database, currentRound, nodeType, q.GetKeysetCursor(), limit, statusFilter)
+	})
+	if !ok {
+		return early
 	}
-	if q.GetRound() != currentRound {
-		return queue.PullResult{Round: currentRound, QueriedDB: true, Status: queue.PullStaleRound}
-	}
-
-	processLimit := min(batchSize, len(results))
-	var matchedBatch []db.FetchResult
-	for _, r := range results[:processLimit] {
-		if r.State == nil {
-			continue
-		}
-		matchedBatch = append(matchedBatch, r)
-	}
-	if len(results) > 0 {
-		cursorIdx := max(0, processLimit-1)
-		q.SetKeysetCursor(results[cursorIdx].Key)
-	}
-	q.SetLastPullWasPartial(len(results) <= batchSize)
 
 	enqueueSuccessCount := 0
-	for _, item := range matchedBatch {
+	for _, item := range page.Matched {
 		taskType := queue.TaskTypeDeleteFolder
 		expectedType := types.NodeTypeFolder
 		if deletePass == 2 {
@@ -174,12 +58,7 @@ func PullDeleteTasks(q *queue.Queue, force bool) queue.PullResult {
 			enqueueSuccessCount++
 		}
 	}
-
-	partial := len(results) <= batchSize
-	q.SetLastPullWasPartial(partial)
-	q.RecordPull(currentRound, enqueueSuccessCount, partial)
-	q.SetFirstPullForRound(false)
-	return queue.PullResult{Round: currentRound, Yield: enqueueSuccessCount, Partial: partial, QueriedDB: true, Status: queue.PullOK}
+	return finishPull(q, currentRound, enqueueSuccessCount, page.Partial)
 }
 
 func nodeStateToDeleteTask(state *db.NodeState, taskType string, deletePass int) *queue.TaskBase {
@@ -191,56 +70,23 @@ func nodeStateToDeleteTask(state *db.NodeState, taskType string, deletePass int)
 		Type:               taskType,
 		Round:              state.Depth,
 		CopyPass:           deletePass,
-		Attempts:           0,
 		CopyStatus:         state.CopyStatus,
 		DeleteStatus:       state.DeleteStatus,
 		SrcTraversalStatus: state.TraversalStatus,
 		LeaseTime:          time.Now(),
 	}
-	if state.Type == types.NodeTypeFolder {
-		task.Folder = types.Folder{
-			ServiceID:    state.ServiceID,
-			ParentId:     state.ParentServiceID,
-			ParentPath:   state.ParentPath,
-			DisplayName:  state.Name,
-			LocationPath: state.Path,
-			LastUpdated:  state.MTime,
-			DepthLevel:   state.Depth,
-			Type:         state.Type,
-		}
-	} else {
-		task.File = types.File{
-			ServiceID:    state.ServiceID,
-			ParentId:     state.ParentServiceID,
-			ParentPath:   state.ParentPath,
-			DisplayName:  state.Name,
-			LocationPath: state.Path,
-			LastUpdated:  state.MTime,
-			Size:         state.Size,
-			DepthLevel:   state.Depth,
-			Type:         state.Type,
-		}
-	}
+	task.AttachNodeState(state)
 	return task
 }
 
 // CompleteDeleteTask marks a delete task successful and cascades deleted to pending* under the path.
 func CompleteDeleteTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.Duration) {
-	q.RecordExecutionTime(executionDelta)
-	currentRound := task.Round
-	nodeID := task.ID
-
-	database := q.Database()
+	database := beginTerminalSuccess(q, task, executionDelta)
 	if database == nil {
-		q.RemoveInProgress(nodeID)
 		return
 	}
-
-	task.Locked = false
-	task.Status = "successful"
-	q.IncrementRoundStatsCompleted(currentRound)
-	q.IncrementTasksCompletedTotal()
-	q.RecordTaskCompletion(currentRound, true)
+	currentRound := task.Round
+	nodeID := task.ID
 
 	bytes := int64(0)
 	if task.IsFile() && task.File.Size > 0 {
@@ -271,67 +117,43 @@ func CompleteDeleteTask(q *queue.Queue, task *queue.TaskBase, executionDelta tim
 		}
 	}
 
-	if !accepted {
-		q.RemoveInProgress(nodeID)
-		return
+	q.ReleaseTaskInFlightWeight(task)
+	if recordTerminal(q, task, accepted, queue.TerminalProgressDeleted, bytes) {
+		q.RecordCascadeDeletedProgress(cascadeFolders, cascadeFiles, cascadeBytes)
 	}
-	q.RecordTerminalProgress(queue.TerminalProgressDeleted, nodeID, task.IsFolder(), task.IsFile(), bytes)
-	q.RecordCascadeDeletedProgress(cascadeFolders, cascadeFiles, cascadeBytes)
 }
 
 // FailDeleteTask handles delete task failure with retries.
 func FailDeleteTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.Duration) {
 	q.RecordExecutionTime(executionDelta)
-	currentRound := task.Round
-	nodeID := task.ID
-	maxRetries := q.MaxRetries()
 	task.Attempts++
 
-	if task.Attempts < maxRetries {
-		task.Locked = false
-		q.RemoveInProgress(nodeID)
-		_ = q.Add(task)
+	if task.Attempts < q.MaxRetries() {
+		requeueForRetry(q, task)
 		return
 	}
 
-	task.Locked = false
-	task.Status = "failed"
-	q.IncrementRoundStatsCompleted(currentRound)
-	q.IncrementRoundStatsFailed(currentRound)
-	q.IncrementTasksCompletedTotal()
-	q.RecordTaskCompletion(currentRound, false)
-
-	database := q.Database()
+	database := beginTerminalFailure(q, task)
 	if database == nil {
-		q.RemoveInProgress(nodeID)
 		return
-	}
-
-	if task.LastError != "" {
-		database.AppendTaskError("SRC", "delete", nodeID, task.LastError, task.Attempts, task.LocationPath())
 	}
 
 	delEv := db.StatusEvent{
-		ID:               nodeID,
+		ID:               task.ID,
 		DeleteStatus:     db.DeleteStatusFailed,
 		PrevDeleteStatus: task.DeleteStatus,
 		EventTime:        time.Now().UnixNano(),
-		Depth:            currentRound,
+		Depth:            task.Round,
 		Size:             task.File.Size,
 		NodeType:         db.NodeTypeFile,
 	}
 	if task.IsFolder() {
 		delEv.NodeType = db.NodeTypeFolder
 	}
-	failurelog.AttachTaskFailureLog(&delEv, "delete", q.Name(), nodeID, task.LocationPath(), task.Attempts, task.LastError)
-	accepted := database.AppendStatusEvent("SRC", delEv, false)
-	if !accepted {
-		q.RemoveInProgress(nodeID)
-		return
-	}
+	accepted := appendFailureEvent(q, task, database, "delete", delEv)
 	failBytes := int64(0)
 	if task.IsFile() {
 		failBytes = task.File.Size
 	}
-	q.RecordTerminalProgress(queue.TerminalProgressFailed, nodeID, task.IsFolder(), task.IsFile(), failBytes)
+	recordTerminal(q, task, accepted, queue.TerminalProgressFailed, failBytes)
 }
