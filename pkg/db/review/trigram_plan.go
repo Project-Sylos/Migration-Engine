@@ -11,8 +11,10 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
-// containsNeedlesFromFilter returns text needles for trigram planning: name/path
-// Query, path-segment bar parts, and ruleset name contains/eq leaves.
+// containsNeedlesFromFilter returns text needles for name/path Query and ruleset
+// name contains/eq leaves. Path-segment bar parts are not included: those are
+// ordered ancestry predicates (pathSegmentsMatchAncestry), not leaf substring
+// needles. planTrigramContains adds segments only when falling back to idx:tri.
 func containsNeedlesFromFilter(f ReviewFilter) (needles []string) {
 	add := func(s string) {
 		s = strings.TrimSpace(s)
@@ -26,9 +28,6 @@ func containsNeedlesFromFilter(f ReviewFilter) (needles []string) {
 		if field == "" || field == "name" || field == "path" {
 			add(q)
 		}
-	}
-	for _, seg := range pathSegmentsForFilter(f) {
-		add(seg)
 	}
 	if f.CompiledFilter != nil {
 		walkRulesetContains(f.CompiledFilter.Ruleset.RootGroup, &needles)
@@ -96,6 +95,13 @@ func bestContainsNeedle(needles []string) string {
 
 func planTrigramContains(ops *opsdb.Store, side string, f ReviewFilter, scanLimit int) (plannerPlan, bool, error) {
 	needles := containsNeedlesFromFilter(f)
+	for _, seg := range pathSegmentsForFilter(f) {
+		s := strings.TrimSpace(seg)
+		if s == "" || strings.ContainsAny(s, "*%") {
+			continue
+		}
+		needles = append(needles, s)
+	}
 	if len(needles) == 0 {
 		return plannerPlan{}, false, nil
 	}
@@ -133,9 +139,10 @@ func planTrigramContains(ops *opsdb.Store, side string, f ReviewFilter, scanLimi
 	return plannerPlan{kind: "tri", ids: ids, est: int64(len(ids)), reason: "trigram_ranked"}, true, nil
 }
 
-// nodePassesTrigramVerify keeps candidates that fuzzy-match any planned needle
-// (substring, small edit distance, or shared trigrams). Compiled ruleset contains
-// still enforces exact contains when present.
+// nodePassesTrigramVerify soft-checks name/path Query and ruleset name needles
+// (substring, small edit distance, or shared trigrams). Path segments are not
+// checked here; pathSegmentsMatchAncestry already required them on the chain.
+// Compiled ruleset contains still enforces exact contains when present.
 func nodePassesTrigramVerify(n opsdb.NodeRecord, f ReviewFilter) bool {
 	needles := containsNeedlesFromFilter(f)
 	if len(needles) == 0 {
