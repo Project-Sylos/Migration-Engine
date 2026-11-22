@@ -5,6 +5,7 @@ package opsdb
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -58,16 +59,17 @@ type SealMapWrite struct {
 }
 
 // WriteSealBatch writes a seal drain using trusted caller context (no Badger probes).
-func (s *Store) WriteSealBatch(nodes []SealNodeWrite, status []SealStatusWrite, maps []SealMapWrite, logs []LogRecord, errs []TaskErrorRecord) ([]SchedCountDelta, error) {
-	return s.WriteSealBatchTrusted(nodes, status, nil, maps, logs, errs)
+func (s *Store) WriteSealBatch(nodes []SealNodeWrite, status []SealStatusWrite, maps []SealMapWrite, errs []TaskErrorRecord) ([]SchedCountDelta, error) {
+	return s.WriteSealBatchTrusted(nodes, status, nil, maps, errs)
 }
 
 // WriteSealBatchTrusted writes a seal drain without existence or prev-state probes.
-func (s *Store) WriteSealBatchTrusted(nodes []SealNodeWrite, status []SealStatusWrite, kidsReplace []SealKidsReplace, maps []SealMapWrite, logs []LogRecord, errs []TaskErrorRecord) ([]SchedCountDelta, error) {
+// Log rows are not sealed here; callers persist them via AppendLogs on the logs sidecar.
+func (s *Store) WriteSealBatchTrusted(nodes []SealNodeWrite, status []SealStatusWrite, kidsReplace []SealKidsReplace, maps []SealMapWrite, errs []TaskErrorRecord) ([]SchedCountDelta, error) {
 	if s == nil || s.db == nil {
 		return nil, nil
 	}
-	if len(nodes) == 0 && len(status) == 0 && len(kidsReplace) == 0 && len(maps) == 0 && len(logs) == 0 && len(errs) == 0 {
+	if len(nodes) == 0 && len(status) == 0 && len(kidsReplace) == 0 && len(maps) == 0 && len(errs) == 0 {
 		return nil, nil
 	}
 	if err := s.preserveSkippedDescendantCounts(status); err != nil {
@@ -110,11 +112,6 @@ func (s *Store) WriteSealBatchTrusted(nodes []SealNodeWrite, status []SealStatus
 			return nil, fmt.Errorf("write seal map: %w", err)
 		}
 	}
-	for i := range logs {
-		if err := writeSealLog(wb, &logs[i]); err != nil {
-			return nil, fmt.Errorf("write seal log: %w", err)
-		}
-	}
 	for i := range errs {
 		if err := writeSealTaskErr(wb, &errs[i]); err != nil {
 			return nil, fmt.Errorf("write seal task error: %w", err)
@@ -146,7 +143,8 @@ func (s *Store) preserveSkippedDescendantCounts(status []SealStatusWrite) error 
 	for i := range status {
 		w := &status[i]
 		if w.Status.SkippedDescendantCount != w.PrevStatus.SkippedDescendantCount &&
-			w.Status.ChildSize != w.PrevStatus.ChildSize {
+			w.Status.ChildSize != w.PrevStatus.ChildSize &&
+			w.Status.ChildCount != w.PrevStatus.ChildCount {
 			continue
 		}
 		bySide[w.Side] = append(bySide[w.Side], w.ID)
@@ -177,6 +175,9 @@ func (s *Store) preserveSkippedDescendantCounts(status []SealStatusWrite) error 
 		if w.Status.ChildSize == w.PrevStatus.ChildSize {
 			w.Status.ChildSize = cur.ChildSize
 		}
+		if w.Status.ChildCount == w.PrevStatus.ChildCount {
+			w.Status.ChildCount = cur.ChildCount
+		}
 	}
 	return nil
 }
@@ -185,7 +186,7 @@ func writeSealNodeTrusted(wb *badger.WriteBatch, w *SealNodeWrite) ([]SchedCount
 	if w.Node.ID == "" {
 		return nil, fmt.Errorf("opsdb WriteSealBatch: empty node id")
 	}
-	nb, err := encode(w.Node)
+	nb, err := json.Marshal(w.Node)
 	if err != nil {
 		return nil, err
 	}
@@ -197,7 +198,7 @@ func writeSealNodeTrusted(wb *badger.WriteBatch, w *SealNodeWrite) ([]SchedCount
 			return nil, err
 		}
 	}
-	if err := writePhaseStatusBatch(wb, w.Side, w.Node.ID, w.Status); err != nil {
+	if err := writePhaseStatusBatch(wb, w.Side, w.Node.ID, w.Status, w.PrevStatus.CopyStatus); err != nil {
 		return nil, err
 	}
 	var prev *NodeRecord
@@ -231,7 +232,7 @@ func writeSealStatusTrusted(wb *badger.WriteBatch, w *SealStatusWrite) ([]SchedC
 	if w.ID == "" {
 		return nil, fmt.Errorf("opsdb WriteSealBatch: empty status id")
 	}
-	if err := writePhaseStatusBatch(wb, w.Side, w.ID, w.Status); err != nil {
+	if err := writePhaseStatusBatch(wb, w.Side, w.ID, w.Status, w.PrevStatus.CopyStatus); err != nil {
 		return nil, err
 	}
 	return applyPendingBatchTrusted(wb, w.Side, w.ID, w.Depth, w.Deltas)
@@ -272,7 +273,7 @@ func writeKidsReplace(wb *badger.WriteBatch, r *SealKidsReplace) error {
 	if r == nil || r.ParentID == "" {
 		return nil
 	}
-	b, err := encode(r.Kids)
+	b, err := json.Marshal(r.Kids)
 	if err != nil {
 		return err
 	}
@@ -382,11 +383,11 @@ func (s *Store) AssignChildSize(side, id string, size int64) (bool, error) {
 		return false, nil
 	}
 	st.ChildSize = size
-	b, err := encode(statusTravRecord(st))
+	b, err := json.Marshal(statusTravRecord(st))
 	if err != nil {
 		return false, err
 	}
-	err = s.update(func(txn *badger.Txn) error {
+	err = s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set(statusTravKey(side, id), b)
 	})
 	return err == nil, err
@@ -396,7 +397,7 @@ func writeSealMap(wb *badger.WriteBatch, w *SealMapWrite) error {
 	if w.Map.SrcID == "" || w.Map.DstID == "" {
 		return fmt.Errorf("opsdb WriteSealBatch: empty map ids")
 	}
-	b, err := encode(w.Map)
+	b, err := json.Marshal(w.Map)
 	if err != nil {
 		return err
 	}
@@ -416,14 +417,28 @@ func writeSealLog(wb *badger.WriteBatch, rec *LogRecord) error {
 	if rec.ID == "" {
 		rec.ID = fmt.Sprintf("%d", rec.At.UnixNano())
 	}
-	b, err := encode(*rec)
+	b, err := json.Marshal(*rec)
 	if err != nil {
 		return err
 	}
-	if err := wb.Set(logKey(rec.At.UnixNano(), rec.ID), b); err != nil {
+	nano := rec.At.UnixNano()
+	if err := wb.Set(logKey(nano, rec.ID), b); err != nil {
 		return err
 	}
-	return wb.Set(logIDKey(rec.ID), b)
+	if err := wb.Set(logIDKey(rec.ID), b); err != nil {
+		return err
+	}
+	if rec.Action != "" {
+		if err := wb.Set(logActionIndexKey(rec.Action, nano, rec.ID), nil); err != nil {
+			return err
+		}
+	}
+	if rec.NodeID != "" {
+		if err := wb.Set(logNodeIndexKey(rec.NodeID, nano, rec.ID), nil); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func writeSealTaskErr(wb *badger.WriteBatch, rec *TaskErrorRecord) error {
@@ -434,7 +449,7 @@ func writeSealTaskErr(wb *badger.WriteBatch, rec *TaskErrorRecord) error {
 	if id == "" {
 		id = fmt.Sprintf("%d", rec.At.UnixNano())
 	}
-	b, err := encode(*rec)
+	b, err := json.Marshal(*rec)
 	if err != nil {
 		return err
 	}
@@ -447,7 +462,7 @@ func (s *Store) WalkStatusPhase(side, phase, afterID string, reverse bool, fn fu
 		return nil
 	}
 	prefix := statusPhasePrefix(side, phase)
-	return s.view(func(txn *badger.Txn) error {
+	return s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.Reverse = reverse
 		it := txn.NewIterator(opts)

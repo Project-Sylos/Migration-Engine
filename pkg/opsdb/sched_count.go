@@ -55,7 +55,7 @@ func (s *Store) GetSchedCountAtDepth(side, phase string, depth int, nodeType str
 	}
 	nodeType = pendingNodeType(nodeType)
 	var n int64
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		var err error
 		n, err = readSchedCount(txn, side, phase, depth, nodeType)
 		return err
@@ -82,7 +82,7 @@ func (s *Store) ApplySchedCountDeltas(deltas []SchedCountDelta) error {
 	if len(coalesced) == 0 {
 		return nil
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		for k, delta := range coalesced {
 			if delta == 0 {
 				continue

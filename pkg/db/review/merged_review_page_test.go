@@ -4,6 +4,7 @@
 package review
 
 import (
+	"context"
 	"testing"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
@@ -66,7 +67,7 @@ func TestListMergedReviewDiffsPageHasMoreNoCount(t *testing.T) {
 	seedReviewTree(t, database, nodes, nil, nil)
 
 	f := ReviewFilter{TraversalStatus: db.StatusFailed, StatusSearchType: "traversal", ExcludeRoot: true}
-	page, hasMore, err := ListMergedReviewDiffsPage(database, f, "id ASC", 2, 0)
+	page, hasMore, err := ListMergedReviewDiffsPageCtx(context.Background(), database, f, "id ASC", 2, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +85,7 @@ func TestListMergedReviewDiffsPageHasMoreNoCount(t *testing.T) {
 		}
 	}
 
-	last, hasMoreLast, err := ListMergedReviewDiffsPage(database, f, "id ASC", 2, 2)
+	last, hasMoreLast, err := ListMergedReviewDiffsPageCtx(context.Background(), database, f, "id ASC", 2, 2)
 	if err != nil {
 		t.Fatal(err)
 	}

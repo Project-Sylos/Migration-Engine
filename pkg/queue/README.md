@@ -9,7 +9,7 @@ The queue layer drives **source** and **destination** traversal and **copy** usi
 ## High-level flow
 
 1. **Pull** – `PullTraversalTasks` / `PullRetryTasks` / `PullCopyTasks` refill `pendingBuff` from Badger list/keyset APIs (pending by depth/type, DST batches with SRC children, copy keysets, etc.). Only one pull runs at a time (`getPulling` / `setPulling`). Pull watermarks use **pendingBuff length only** (in-progress leases are not treated as available depth). When workers are idle and pending is below the live pool size, a **starve nudge** raises the effective WM so underfed pools refill sooner.
-2. **Lease** – Workers take tasks from `pendingBuff` into `inProgress`. Multi-task batch turns (folder create, file upload, delete) use **`LeaseGroupBudget`**: live AIMD pool size (`len(pool.handles)`) drives a fair **count ceiling** (`ceil(pending/workers)`) and, for files, a soft **byte budget** (`sum(pending sizes)/workers` with one-item overflow). This prevents one worker from hoovering the whole adapter max batch.
+2. **Lease** – Workers take tasks from `pendingBuff` into `inProgress`. Multi-task batch turns (folder create, file upload, delete) use **`LeaseGroupBudget`**: live pool size (`len(pool.handles)`) drives a fair **count ceiling** (`ceil(pending/workers)`) and, for files, a soft **byte budget** (`sum(pending sizes)/workers` with one-item overflow). This prevents one worker from hoovering the whole adapter max batch.
 3. **Complete** – `ReportTaskResult` updates state and enqueues **seal** work (nodes + per-depth stats) through the DB layer.
 4. **Coordinator** – DST may start round *N* only when SRC has completed rounds *N* and *N+1* (or SRC traversal is done). SRC is not round-gated against DST; work is pulled and sealed to Badger in batches, so SRC can advance as fast as workers allow.
 
@@ -53,7 +53,7 @@ Wiring: `RegisterModeHooks` / `RegisterWorkerHooks` / `RegisterObserveHooks`. `p
 
 | File | Responsibility |
 |------|----------------|
-| `queue.go` | `Queue`, `Run`, round advancement, seal handoff, `Lease`, `ReportTaskResult`, `InitializeWithContext` |
+| `queue.go` | `Queue`, `Run`, round advancement, seal handoff, `Lease`, `ReportTaskResult`, `Initialize` |
 | `queue_accessors.go` | Thread-safe getters/setters, keyset cursors, traversal “cache loaded” flags |
 | `queue_scaling.go` | **`ScalingContext`**, dynamic worker pool, `SetTargetWorkerCount`, lease/refill/list-page knobs for autoscaler |
 | `queue_batch.go` | `BuildExpectedMapsFromDstWithChildren`, batch expected children for DST |

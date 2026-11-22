@@ -211,18 +211,20 @@ func runTest() error {
 
 	// Run retry sweep
 	sweepConfig := migration.SweepConfig{
-		DuckDB:          database,
-		SrcAdapter:      srcAdapter,
-		DstAdapter:      dstAdapter,
-		WorkerCount:     10,
-		MaxRetries:      3,
-		LogAddress:      "127.0.0.1:8082",
-		LogLevel:        "info",
-		SkipListener:    true,
-		StartupDelay:    3 * time.Second,
-		ProgressTick:    2 * time.Second,
-		MaxKnownDepth:   -1, // Auto-detect
-		ShutdownContext: context.Background(),
+		PhaseRuntime: migration.PhaseRuntime{
+			WorkerCount:     10,
+			MaxRetries:      3,
+			LogAddress:      "127.0.0.1:8082",
+			LogLevel:        "info",
+			SkipListener:    true,
+			StartupDelay:    3 * time.Second,
+			ProgressTick:    2 * time.Second,
+			ShutdownContext: context.Background(),
+		},
+		DB:            database,
+		SrcAdapter:    srcAdapter,
+		DstAdapter:    dstAdapter,
+		MaxKnownDepth: -1, // Auto-detect
 	}
 
 	stats, err := migration.RunRetrySweep(sweepConfig)

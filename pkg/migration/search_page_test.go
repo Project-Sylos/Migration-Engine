@@ -5,7 +5,6 @@ package migration
 
 import (
 	"context"
-	"errors"
 	"testing"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
@@ -29,7 +28,7 @@ func seedFailedSearchFixture(t *testing.T, database *db.DB, n int) {
 	}
 }
 
-func TestSearchPathReviewItemsRejectsEmptyFilter(t *testing.T) {
+func TestSearchPathReviewItemsAllowsEmptyFilter(t *testing.T) {
 	database, err := db.Open(db.Options{Path: t.TempDir() + "/search-empty.db"})
 	if err != nil {
 		t.Fatal(err)
@@ -37,14 +36,20 @@ func TestSearchPathReviewItemsRejectsEmptyFilter(t *testing.T) {
 	defer database.Close()
 	store := newMigrationStore(database, nil)
 
-	_, err = store.searchPathReviewItems(context.Background(), SearchRequest{Limit: 10})
-	if !errors.Is(err, ErrSearchRequiresFilter) {
-		t.Fatalf("err=%v want ErrSearchRequiresFilter", err)
+	page, err := store.searchPathReviewItems(context.Background(), SearchRequest{Limit: 10})
+	if err != nil {
+		t.Fatalf("empty search: %v", err)
+	}
+	if page.Items == nil {
+		t.Fatal("items nil")
 	}
 
-	_, err = store.searchPathReviewItems(context.Background(), SearchRequest{Path: "", Limit: 10})
-	if !errors.Is(err, ErrSearchRequiresFilter) {
-		t.Fatalf("global empty err=%v want ErrSearchRequiresFilter", err)
+	page, err = store.searchPathReviewItems(context.Background(), SearchRequest{Path: "", Limit: 10})
+	if err != nil {
+		t.Fatalf("global empty search: %v", err)
+	}
+	if page.Items == nil {
+		t.Fatal("items nil")
 	}
 }
 

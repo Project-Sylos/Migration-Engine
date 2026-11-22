@@ -98,17 +98,19 @@ func AppendDSTSiblingCollisionIssues(database *db.DB, q *queue.Queue, task *queu
 	target := GPLTargetFromProvider(checkTarget)
 	windowsCompat := q.WindowsCompat()
 
+	fold := pathgpl.CaseInsensitiveSiblingTarget(target) || windowsCompat
 	dstBases := make([]string, 0, len(task.DiscoveredChildren))
-	dstSet := make(map[string]struct{}, len(task.DiscoveredChildren))
+	dstByKey := make(map[string]string, len(task.DiscoveredChildren)) // compare key → display basename
 	for _, c := range task.DiscoveredChildren {
 		base := discoveredChildBasename(c)
 		if base == "" {
 			continue
 		}
-		if _, ok := dstSet[base]; ok {
+		key := siblingCompareKey(base, fold)
+		if _, ok := dstByKey[key]; ok {
 			continue
 		}
-		dstSet[base] = struct{}{}
+		dstByKey[key] = base
 		dstBases = append(dstBases, base)
 	}
 	if len(dstBases) == 0 {
@@ -117,7 +119,7 @@ func AppendDSTSiblingCollisionIssues(database *db.DB, q *queue.Queue, task *queu
 
 	parentLen := LoadParentPathLen(database, task.ID, task.GPLState)
 	seen := make(map[string]struct{})
-	// SRC nodes already paired via exact match or cleaned-name rematch.
+	// SRC nodes already paired via exact basename match (cleaned rematch is disabled).
 	mappedSRC := make(map[string]struct{})
 	for _, c := range task.DiscoveredChildren {
 		if c.SrcID != "" {
@@ -136,7 +138,7 @@ func AppendDSTSiblingCollisionIssues(database *db.DB, q *queue.Queue, task *queu
 		if _, ok := mappedSRC[srcID]; ok {
 			return
 		}
-		// Exclude this node's own basename from sibling set so AE self-match is not a collision.
+		// Exclude this node's own exact basename so AE self-match is not a collision.
 		siblings := make([]string, 0, len(dstBases))
 		for _, s := range dstBases {
 			if s == basename {
@@ -149,18 +151,37 @@ func AppendDSTSiblingCollisionIssues(database *db.DB, q *queue.Queue, task *queu
 		}
 		payload, pe := evaluateGPLAddPart(target, parentLen, basename, siblings, isFile, windowsCompat)
 		collides := payload.Part.Collision
-		if !collides && pe != nil && pe.ProposedName != "" {
-			if _, ok := dstSet[pe.ProposedName]; ok && pe.ProposedName != basename {
+		collisionDst := ""
+		if collides && pe != nil {
+			collisionDst = siblingCollisionDetail(pe.IssuesJSON)
+		}
+		// SRC GPL suggestion (gpl_state or sparse issue) → DST sibling match.
+		proposed := ""
+		if pe != nil {
+			proposed = pe.ProposedName
+		}
+		if proposed == "" && payload.Part.ProposedClean != "" {
+			proposed = payload.Part.ProposedClean
+		}
+		// Prefetched SRC gpl_state (no per-child GetGPL on the hot path).
+		if meta, ok := task.ExpectedSrcNodeMeta[srcID]; ok {
+			if clean := ParseGPLProposedClean(meta.GPLState); clean != "" {
+				proposed = firstNonEmpty(proposed, clean)
+			}
+		}
+		if proposed != "" {
+			if dstName, ok := dstByKey[siblingCompareKey(proposed, fold)]; ok && dstName != basename {
 				collides = true
+				collisionDst = dstName
 			}
 		}
 		if !collides {
 			return
 		}
-		issuesJSON := ""
-		if pe != nil {
-			issuesJSON = pe.IssuesJSON
+		if collisionDst == "" {
+			collisionDst = firstNonEmpty(proposed, siblingCollisionDetail(peIssuesJSON(pe)))
 		}
+		issuesJSON := ensureSiblingCollisionIssuesJSON(peIssuesJSON(pe), collisionDst)
 		database.AppendGPLIssue(db.GPLIssue{
 			SrcID:        srcID,
 			Status:       db.GPLIssueStatusManualReview,
@@ -192,6 +213,13 @@ func discoveredChildBasename(c queue.ChildResult) string {
 		return queue.DstChildMatchName(c.File.DisplayName, c.File.LocationPath)
 	}
 	return queue.DstChildMatchName(c.Folder.DisplayName, c.Folder.LocationPath)
+}
+
+func siblingCompareKey(name string, caseInsensitive bool) string {
+	if caseInsensitive {
+		return strings.ToLower(name)
+	}
+	return name
 }
 
 // ApplyGPLToSRCChildren runs destination-rule GPL on each SRC child via parent path_len + AddPart.
@@ -518,6 +546,81 @@ func firstNonEmpty(ss ...string) string {
 	return ""
 }
 
+func peIssuesJSON(pe *db.GPLIssue) string {
+	if pe == nil {
+		return ""
+	}
+	return pe.IssuesJSON
+}
+
+// ParseGPLProposedClean returns part.proposed_clean from a node's gpl_state JSON.
+func ParseGPLProposedClean(gplState string) string {
+	if gplState == "" {
+		return ""
+	}
+	var p db.GPLStatePayload
+	if err := json.Unmarshal([]byte(gplState), &p); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(p.Part.ProposedClean)
+}
+
+func siblingCollisionDetail(issuesJSON string) string {
+	if issuesJSON == "" {
+		return ""
+	}
+	var issues []issue.Issue
+	if err := json.Unmarshal([]byte(issuesJSON), &issues); err != nil {
+		return ""
+	}
+	for _, iss := range issues {
+		if iss.Category == issue.CategorySiblingCollision && iss.Detail != "" {
+			return iss.Detail
+		}
+	}
+	return ""
+}
+
+// ensureSiblingCollisionIssuesJSON guarantees a SiblingCollision finding with Detail=dstName
+// so review UI can offer Merge (collisionSibling). Preserves other findings.
+func ensureSiblingCollisionIssuesJSON(issuesJSON, dstName string) string {
+	dstName = strings.TrimSpace(dstName)
+	if dstName == "" {
+		return issuesJSON
+	}
+	var issues []issue.Issue
+	if issuesJSON != "" {
+		_ = json.Unmarshal([]byte(issuesJSON), &issues)
+	}
+	for i := range issues {
+		if issues[i].Category == issue.CategorySiblingCollision {
+			if issues[i].Detail == "" {
+				issues[i].Detail = dstName
+			}
+			if issues[i].Part == "" {
+				issues[i].Part = dstName
+			}
+			b, err := json.Marshal(issues)
+			if err != nil {
+				return issuesJSON
+			}
+			return string(b)
+		}
+	}
+	issues = append([]issue.Issue{{
+		Category:    issue.CategorySiblingCollision,
+		Part:        dstName,
+		Detail:      dstName,
+		Message:     fmt.Sprintf("collides with sibling %q", dstName),
+		UserMessage: "Name already used in this folder.",
+	}}, issues...)
+	b, err := json.Marshal(issues)
+	if err != nil {
+		return issuesJSON
+	}
+	return string(b)
+}
+
 // ParseGPLPathLen returns the migration-relative path length stored on a node's gpl_state.
 func ParseGPLPathLen(gplState string) int {
 	if gplState == "" {
@@ -531,9 +634,10 @@ func ParseGPLPathLen(gplState string) int {
 }
 
 // ProcessGPLTaskSRC revalidates path scope from parent path_len + leaf name and persists gpl_state.
-func ProcessGPLTaskSRC(database *db.DB, target pathgpl.Target, task *queue.TaskBase, windowsCompat bool) error {
+// Returns the merged gpl_state JSON written for the node (empty on failure).
+func ProcessGPLTaskSRC(database *db.DB, target pathgpl.Target, task *queue.TaskBase, windowsCompat bool) (string, error) {
 	if database == nil || task == nil {
-		return fmt.Errorf("nil database or task")
+		return "", fmt.Errorf("nil database or task")
 	}
 	parentLen := ParseGPLPathLen(task.ParentGPLState)
 	base := task.ResolvedDstName
@@ -549,13 +653,13 @@ func ProcessGPLTaskSRC(database *db.DB, target pathgpl.Target, task *queue.TaskB
 	}
 	merged, pathIssues, err := EvaluateGPLPathOnly(target, parentLen, base, task.GPLState, task.IsFile(), windowsCompat)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := database.UpdateNodeGPLState(task.ID, merged); err != nil {
-		return err
+		return "", err
 	}
 	if len(pathIssues) == 0 {
-		return nil
+		return merged, nil
 	}
 	issuesJSON, _ := json.Marshal(pathIssues)
 	database.AppendGPLIssue(db.GPLIssue{
@@ -564,5 +668,5 @@ func ProcessGPLTaskSRC(database *db.DB, target pathgpl.Target, task *queue.TaskB
 		Status:     db.GPLIssueStatusManualReview,
 		IssuesJSON: string(issuesJSON),
 	})
-	return nil
+	return merged, nil
 }

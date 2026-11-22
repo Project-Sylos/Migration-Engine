@@ -1,0 +1,195 @@
+// Copyright 2025 Sylos contributors
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+package softcap
+
+import (
+	"math"
+	"time"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/profile"
+)
+
+const softCapEMAAlpha = 0.5
+
+// SoftCapDecreaseTarget updates the soft-cap ceiling from an FS_THROTTLE at cur
+// workers and returns the resting SoftCap (not a multiplicative cliff).
+func SoftCapDecreaseTarget(cur, minWorkers, maxWorkers int, state *State, now time.Time) int {
+	if state == nil {
+		state = &State{}
+	}
+	if minWorkers <= 0 {
+		minWorkers = 1
+	}
+	state.ApplyThrottleCeiling(cur, minWorkers, maxWorkers)
+	state.LastDecrease = now
+	state.AbortSoftCapProbe()
+	return state.SoftCap
+}
+
+// ApplyThrottleCeiling records that worker count n just rate-limited.
+// SoftCap rests at n-1; CeilingSafe is the failing level n (next SoftCap+1 boundary).
+func (st *State) ApplyThrottleCeiling(n, minWorkers, maxWorkers int) {
+	if st == nil {
+		return
+	}
+	safeRest := n - 1
+	if safeRest < minWorkers {
+		safeRest = minWorkers
+	}
+	if maxWorkers > 0 && safeRest > maxWorkers {
+		safeRest = maxWorkers
+	}
+	// CeilingSafe tracks the next unknown boundary (SoftCap+1), matching RaiseCeilingFromSustainedProbe.
+	boundary := safeRest + 1
+	if maxWorkers > 0 && boundary > maxWorkers {
+		boundary = maxWorkers
+	}
+	if st.CeilingSafe <= 0 {
+		st.CeilingSafe = boundary
+	} else {
+		st.CeilingSafe = int(math.Round(softCapEMAAlpha*float64(boundary) + (1-softCapEMAAlpha)*float64(st.CeilingSafe)))
+		if st.CeilingSafe < minWorkers {
+			st.CeilingSafe = minWorkers
+		}
+		if maxWorkers > 0 && st.CeilingSafe > maxWorkers {
+			st.CeilingSafe = maxWorkers
+		}
+	}
+	st.RecomputeSoftCap(minWorkers, maxWorkers)
+	st.Ssthresh = st.SoftCap
+}
+
+// RecomputeSoftCap sets SoftCap = CeilingSafe-1 within [min, max]
+// (CeilingSafe is the next probe boundary; SoftCap is the resting worker count).
+func (st *State) RecomputeSoftCap(minWorkers, maxWorkers int) {
+	if st == nil {
+		return
+	}
+	if st.CeilingSafe <= 0 {
+		st.SoftCap = 0
+		return
+	}
+	if minWorkers <= 0 {
+		minWorkers = 1
+	}
+	sc := st.CeilingSafe - 1
+	if st.CeilingSafe <= minWorkers {
+		sc = minWorkers
+	}
+	st.SoftCap = profile.ClampInt(sc, minWorkers, maxWorkers)
+}
+
+// RaiseCeilingFromSustainedProbe marks probed workers as proven-safe resting state:
+// SoftCap = probed, CeilingSafe = probed+1 (next unknown boundary), clamped to max.
+func (st *State) RaiseCeilingFromSustainedProbe(probed, minWorkers, maxWorkers int) {
+	if st == nil || probed <= 0 {
+		return
+	}
+	if minWorkers <= 0 {
+		minWorkers = 1
+	}
+	st.SoftCap = profile.ClampInt(probed, minWorkers, maxWorkers)
+	nextCeiling := probed + 1
+	if maxWorkers > 0 && nextCeiling > maxWorkers {
+		nextCeiling = maxWorkers
+	}
+	if st.CeilingSafe <= 0 {
+		st.CeilingSafe = nextCeiling
+	} else {
+		st.CeilingSafe = int(math.Round(softCapEMAAlpha*float64(nextCeiling) + (1-softCapEMAAlpha)*float64(st.CeilingSafe)))
+		if st.CeilingSafe < nextCeiling {
+			st.CeilingSafe = nextCeiling
+		}
+		if maxWorkers > 0 && st.CeilingSafe > maxWorkers {
+			st.CeilingSafe = maxWorkers
+		}
+	}
+	// Keep SoftCap at proven probed level (not ceiling-1) so we rest where we sustained.
+	st.SoftCap = profile.ClampInt(probed, minWorkers, maxWorkers)
+	st.Ssthresh = st.SoftCap
+}
+
+func (st *State) AbortSoftCapProbe() {
+	if st == nil {
+		return
+	}
+	st.ProbeArmedAt = time.Time{}
+	st.ProbeLevel = 0
+}
+
+func (st *State) ArmSoftCapProbe(level int, now time.Time) {
+	if st == nil || level <= 0 {
+		return
+	}
+	st.ProbeLevel = level
+	st.ProbeArmedAt = now
+}
+
+func (st *State) SoftCapProbeActive() bool {
+	return st != nil && !st.ProbeArmedAt.IsZero() && st.ProbeLevel > 0
+}
+
+// ProbeBounceElapsed reports whether the FS soft-cap probe wait has cleared.
+func (st *State) ProbeBounceElapsed(now time.Time) bool {
+	if st == nil || st.ProbeBounce <= 0 {
+		return true
+	}
+	if st.LastProbeFail.IsZero() {
+		return true
+	}
+	return now.Sub(st.LastProbeFail) >= st.ProbeBounce
+}
+
+// SustainDurationForProbe is the wall time the probed level must hold without RL.
+func (st *State) SustainDurationForProbe() time.Duration {
+	if st == nil {
+		return 0
+	}
+	if st.LastProbeBounce > 0 {
+		return st.LastProbeBounce
+	}
+	return st.ProbeBounce
+}
+
+func (st *State) ClearProbeBounceOnSuccess() {
+	if st == nil {
+		return
+	}
+	st.ProbeBounce = 0
+	st.LastProbeBounce = 0
+	st.LastProbeFail = time.Time{}
+}
+
+// ClearSoftCapForHigherMax drops soft-cap / probe memory when the hard MaxWorkers
+// ceiling rises (user override or profile change) so the soft cap can rediscover under the new bound.
+func (st *State) ClearSoftCapForHigherMax(prevMax, newMax int) {
+	if st == nil || prevMax <= 0 || newMax <= prevMax {
+		return
+	}
+	st.CeilingSafe = 0
+	st.SoftCap = 0
+	st.AbortSoftCapProbe()
+	st.ClearProbeBounceOnSuccess()
+}
+
+// ClampSoftCapToBounds shrinks ceiling/SoftCap when profile max drops.
+func (st *State) ClampSoftCapToBounds(minWorkers, maxWorkers int) {
+	if st == nil || st.CeilingSafe <= 0 {
+		return
+	}
+	if minWorkers <= 0 {
+		minWorkers = 1
+	}
+	if maxWorkers > 0 && st.CeilingSafe > maxWorkers {
+		st.CeilingSafe = maxWorkers
+	}
+	if st.SoftCap > 0 {
+		st.SoftCap = profile.ClampInt(st.SoftCap, minWorkers, maxWorkers)
+	} else {
+		st.RecomputeSoftCap(minWorkers, maxWorkers)
+	}
+	if st.Ssthresh > maxWorkers && maxWorkers > 0 {
+		st.Ssthresh = maxWorkers
+	}
+}

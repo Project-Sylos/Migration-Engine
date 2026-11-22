@@ -21,10 +21,17 @@ func init() {
 		FailCopy:          FailCopyTask,
 		FailDelete:        FailDeleteTask,
 		CheckTraversal:    CheckTraversalCompletion,
-		CheckCopy:         CheckCopyCompletion,
-		CheckDelete:       CheckDeleteCompletion,
-		AdvanceTraversal:  AdvanceTraversalRound,
-		AdvanceCopy:       AdvanceCopyRound,
-		AdvanceDelete:     AdvanceDeleteRound,
+		CheckCopy: func(q *queue.Queue, currentRound int) bool {
+			return q.Database() != nil && CheckPassCompletion(q, currentRound, CopyPass)
+		},
+		CheckDelete: func(q *queue.Queue, currentRound int) bool {
+			return CheckPassCompletion(q, currentRound, DeletePass)
+		},
+		AdvanceTraversal: AdvanceTraversalRound,
+		AdvanceCopy: func(q *queue.Queue) {
+			q.NoteCopyResumeDstExistenceLeavingAnchorRound()
+			AdvancePassRound(q, CopyPass)
+		},
+		AdvanceDelete: func(q *queue.Queue) { AdvancePassRound(q, DeletePass) },
 	})
 }

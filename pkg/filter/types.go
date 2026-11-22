@@ -31,27 +31,27 @@ const (
 	FieldIsEmpty          = "is_empty"
 	FieldChildCount       = "child_count"
 	// Review-search-only fields (need events-derived current / gpl_issues joins).
-	FieldReviewStatus       = "review_status"
-	FieldPathIssueStatus    = "path_issue_status"
-	FieldPathIssueCategory  = "path_issue_category"
+	FieldReviewStatus      = "review_status"
+	FieldPathIssueStatus   = "path_issue_status"
+	FieldPathIssueCategory = "path_issue_category"
 )
 
 // Operators.
 const (
-	OpGT         = "gt"
-	OpLT         = "lt"
-	OpGTE        = "gte"
-	OpLTE        = "lte"
-	OpEQ         = "eq"
-	OpNEQ        = "neq"
-	OpIn         = "in"
-	OpOlderThan  = "older_than"
-	OpNewerThan  = "newer_than"
-	OpBefore     = "before"
-	OpAfter      = "after"
-	OpGlob       = "glob"
-	OpRegex      = "regex"
-	OpContains   = "contains"
+	OpGT        = "gt"
+	OpLT        = "lt"
+	OpGTE       = "gte"
+	OpLTE       = "lte"
+	OpEQ        = "eq"
+	OpNEQ       = "neq"
+	OpIn        = "in"
+	OpOlderThan = "older_than"
+	OpNewerThan = "newer_than"
+	OpBefore    = "before"
+	OpAfter     = "after"
+	OpGlob      = "glob"
+	OpRegex     = "regex"
+	OpContains  = "contains"
 )
 
 // EvalResult is the three-state condition/group outcome.
@@ -127,6 +127,9 @@ type NodeInput struct {
 	MTime       string // RFC3339 or provider timestamp string
 	Depth       int
 	NodeType    string // file | folder
+	// Extension is the stored file extension without a leading dot when known
+	// (from FS metadata). Empty → ExtensionOf(Name) is used for extension filters.
+	Extension string
 	// Post-node (optional; only when children have been enumerated).
 	ChildCount *int
 	IsEmpty    *bool
@@ -148,12 +151,12 @@ type MatchDetail struct {
 
 // EvalOutcome is the top-level result plus attribution for the determining condition.
 type EvalOutcome struct {
-	Result       EvalResult
-	Outcome      string // passed | excluded | engine_error
-	RuleID       string
-	Label        string
-	Message      string
-	Phase        string
-	EngineError  bool
-	AllMatches   []MatchDetail // filled only in EvaluateAllApplicable
+	Result      EvalResult
+	Outcome     string // passed | excluded | engine_error
+	RuleID      string
+	Label       string
+	Message     string
+	Phase       string
+	EngineError bool
+	AllMatches  []MatchDetail // filled only in EvaluateAllApplicable
 }

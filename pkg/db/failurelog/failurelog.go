@@ -105,21 +105,22 @@ func GetFailureLogsByIDs(ctx context.Context, d *db.DB, logIDs []string) (map[st
 		return out, nil
 	}
 
-	if d.Ops() != nil {
-		recs, err := d.Ops().GetLogsByIDs(unique)
-		if err != nil {
-			return nil, err
-		}
-		for id, rec := range recs {
-			out[id] = FailureLog{
-				ID:        rec.ID,
-				Level:     rec.Level,
-				Message:   rec.Message,
-				Detail:    rec.Detail,
-				Component: rec.Component,
-			}
-		}
+	store := d.Logs()
+	if store == nil {
 		return out, nil
+	}
+	recs, err := store.GetLogsByIDs(unique)
+	if err != nil {
+		return nil, err
+	}
+	for id, rec := range recs {
+		out[id] = FailureLog{
+			ID:        rec.ID,
+			Level:     rec.Level,
+			Message:   rec.Message,
+			Detail:    rec.Detail,
+			Component: rec.Component,
+		}
 	}
 	return out, nil
 }

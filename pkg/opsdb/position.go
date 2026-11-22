@@ -24,11 +24,11 @@ func (s *Store) PutQueuePosition(queueKey, phase string, pos QueuePosition) erro
 	if queueKey == "" || phase == "" {
 		return nil
 	}
-	b, err := encode(pos)
+	b, err := json.Marshal(pos)
 	if err != nil {
 		return err
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set(queuePosKey(queueKey, phase), b)
 	})
 }
@@ -37,7 +37,7 @@ func (s *Store) PutQueuePosition(queueKey, phase string, pos QueuePosition) erro
 func (s *Store) GetQueuePosition(queueKey, phase string) (QueuePosition, bool, error) {
 	var out QueuePosition
 	found := false
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(queuePosKey(queueKey, phase))
 		if err == badger.ErrKeyNotFound {
 			return nil

@@ -4,7 +4,6 @@
 package stats
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
@@ -37,10 +36,6 @@ func GetWorkCreditedAtDepth(database *db.DB, table string, depth int) (db.DepthW
 	if table == db.TableDeleteWorkRoundStats {
 		prefix = "delete"
 	}
-	return workCreditedAtDepthOps(database, depth, prefix)
-}
-
-func getCopyWorkCreditedAtDepthByReasonPrefix(database *db.DB, depth int, prefix string) (db.DepthWorkAbsolute, error) {
 	return workCreditedAtDepthOps(database, depth, prefix)
 }
 
@@ -106,16 +101,6 @@ func copyWorkAbsoluteFromSrcStats(database *db.DB, depth int, statuses []string)
 	return out, nil
 }
 
-// GetCopyDiscoveredAtDepth returns SRC nodes at depth that count as potential copy work.
-func GetCopyDiscoveredAtDepth(database *db.DB, depth int) (db.DepthWorkAbsolute, error) {
-	return copyWorkAbsoluteFromSrcStats(database, depth, copyDiscoveredStatuses)
-}
-
-// GetCopyAlreadyExistedAtDepth returns SRC nodes at depth with copy_status already_existed.
-func GetCopyAlreadyExistedAtDepth(database *db.DB, depth int) (db.DepthWorkAbsolute, error) {
-	return copyWorkAbsoluteFromSrcStats(database, depth, []string{db.CopyStatusAlreadyExisted})
-}
-
 func workRoundStatsTable(kind db.StatsKind) string {
 	if kind == db.StatsKindDelete {
 		return db.TableDeleteWorkRoundStats
@@ -174,11 +159,11 @@ func SealSrcCopyWorkDiscovered(database *db.DB, depth int, reason string) (db.De
 	if reason == "" || !strings.HasPrefix(reason, "src_discover") {
 		reason = db.CopyWorkReasonSrcDiscover
 	}
-	absolute, err := GetCopyDiscoveredAtDepth(database, depth)
+	absolute, err := copyWorkAbsoluteFromSrcStats(database, depth, copyDiscoveredStatuses)
 	if err != nil {
 		return db.DepthWorkAbsolute{}, err
 	}
-	credited, err := getCopyWorkCreditedAtDepthByReasonPrefix(database, depth, "src_discover")
+	credited, err := workCreditedAtDepthOps(database, depth, "src_discover")
 	if err != nil {
 		return db.DepthWorkAbsolute{}, err
 	}
@@ -198,11 +183,11 @@ func SealDstCopyWorkAlreadyExistedCorrection(database *db.DB, depth int, reason 
 	if reason == "" || !strings.HasPrefix(reason, "dst_ae_correction") {
 		reason = db.CopyWorkReasonDstAECorrection
 	}
-	ae, err := GetCopyAlreadyExistedAtDepth(database, depth)
+	ae, err := copyWorkAbsoluteFromSrcStats(database, depth, []string{db.CopyStatusAlreadyExisted})
 	if err != nil {
 		return db.DepthWorkAbsolute{}, err
 	}
-	currentCorr, err := getCopyWorkCreditedAtDepthByReasonPrefix(database, depth, "dst_ae_correction")
+	currentCorr, err := workCreditedAtDepthOps(database, depth, "dst_ae_correction")
 	if err != nil {
 		return db.DepthWorkAbsolute{}, err
 	}
@@ -349,11 +334,5 @@ func SnapshotDeleteWorkAtPhaseStart(database *db.DB) error {
 			return fmt.Errorf("finalize delete work depth %d: %w", d, err)
 		}
 	}
-	return nil
-}
-
-// RehydrateCopyWorkCumulativesFromRounds is a no-op; Badger maintains copy_work counters inline.
-func RehydrateCopyWorkCumulativesFromRounds(database *db.DB) error {
-	_ = context.Background()
 	return nil
 }

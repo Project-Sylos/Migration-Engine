@@ -103,7 +103,7 @@ func TestSchedTypePrefixesIsolated(t *testing.T) {
 	if err != nil || en != 1 {
 		t.Fatalf("file count=%d err=%v", en, err)
 	}
-	if err := s.DropPendingPrefix(SideSRC, PhaseCopy, 2, testNodeTypeFolder); err != nil {
+	if err := s.DropPendingPrefixAborted(SideSRC, PhaseCopy, 2, testNodeTypeFolder, nil); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := s.GetSchedCountAtDepth(SideSRC, PhaseCopy, 2, testNodeTypeFolder); err != nil || n != 0 {
@@ -233,7 +233,7 @@ func TestSchedCountZeroOnDropPrefix(t *testing.T) {
 	if n, err := s.GetSchedCountAtDepth(SideSRC, PhaseCopy, 4, testNodeTypeFolder); err != nil || n != 5 {
 		t.Fatalf("count=%d err=%v", n, err)
 	}
-	if err := s.DropPendingPrefix(SideSRC, PhaseCopy, 4, testNodeTypeFolder); err != nil {
+	if err := s.DropPendingPrefixAborted(SideSRC, PhaseCopy, 4, testNodeTypeFolder, nil); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := s.GetSchedCountAtDepth(SideSRC, PhaseCopy, 4, testNodeTypeFolder); err != nil || n != 0 {
@@ -450,7 +450,7 @@ func TestWriteSealBatch(t *testing.T) {
 			CopyStatus:      testStatusPending,
 		})
 	}
-	sched, err := s.WriteSealBatchTrusted(writes, nil, []SealKidsReplace{{ParentID: parent, Kids: kids}}, nil, nil, nil)
+	sched, err := s.WriteSealBatchTrusted(writes, nil, []SealKidsReplace{{ParentID: parent, Kids: kids}}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,7 +495,7 @@ func TestWriteSealBatch(t *testing.T) {
 
 	readd := writes[1]
 	readd.Deltas = []PendingDelta{{Phase: PhaseCopy, NodeType: testNodeTypeFile, Add: true, PendWasSet: true}}
-	sched2, err := s.WriteSealBatch([]SealNodeWrite{readd}, nil, nil, nil, nil)
+	sched2, err := s.WriteSealBatch([]SealNodeWrite{readd}, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,7 +510,7 @@ func TestWriteSealBatch(t *testing.T) {
 		Status: StatusRecord{TraversalStatus: "successful", CopyStatus: "successful"},
 		Depth:  1,
 		Deltas: []PendingDelta{{Phase: PhaseCopy, NodeType: testNodeTypeFile, Add: false, PendWasSet: true}},
-	}}, nil, nil, nil)
+	}}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -533,7 +533,7 @@ func TestWriteSealBatch(t *testing.T) {
 		}
 	}
 
-	if _, err := s.WriteSealBatch([]SealNodeWrite{{Side: SideSRC, Node: NodeRecord{}}}, nil, nil, nil, nil); err == nil {
+	if _, err := s.WriteSealBatch([]SealNodeWrite{{Side: SideSRC, Node: NodeRecord{}}}, nil, nil, nil); err == nil {
 		t.Fatal("empty node id should fail")
 	}
 }
@@ -554,7 +554,7 @@ func TestWriteSealBatchTrustedDropPendingIgnoresStalePendWasSet(t *testing.T) {
 		Depth:      5,
 		InsertOnly: true,
 		Deltas:     []PendingDelta{{Phase: PhaseCopy, NodeType: testNodeTypeFolder, Add: true, PendWasSet: false}},
-	}}, nil, nil, nil, nil, nil); err != nil {
+	}}, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -564,7 +564,7 @@ func TestWriteSealBatchTrustedDropPendingIgnoresStalePendWasSet(t *testing.T) {
 		Status: StatusRecord{CopyStatus: "already_existed"},
 		Depth:  5,
 		Deltas: []PendingDelta{{Phase: PhaseCopy, NodeType: testNodeTypeFolder, Add: false, PendWasSet: false}},
-	}}, nil, nil, nil, nil)
+	}}, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -599,7 +599,7 @@ func TestWriteSealBatchAddThenDeleteSameDrain(t *testing.T) {
 		Status: StatusRecord{TraversalStatus: "successful", CopyStatus: testStatusPending},
 		Depth:  2,
 		Deltas: []PendingDelta{{Phase: PhaseTrav, NodeType: testNodeTypeFolder, Add: false, PendWasSet: true}},
-	}}, nil, nil, nil)
+	}}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -635,7 +635,7 @@ func TestBatchGetMap(t *testing.T) {
 	if _, err := s.WriteSealBatch(nil, nil, []SealMapWrite{{
 		Map:   IDMapRecord{SrcID: src, DstID: dst, Status: "active"},
 		Depth: 1,
-	}}, nil, nil); err != nil {
+	}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.BatchGetMap([]string{dst, "missing"}, true)
@@ -676,13 +676,13 @@ func TestKidsPackMergesAcrossDrains(t *testing.T) {
 		Status:     StatusRecord{TraversalStatus: "successful", CopyStatus: testStatusPending},
 		Depth:      1,
 		InsertOnly: true,
-	}}, nil, nil, nil, nil); err != nil {
+	}}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.WriteSealBatchTrusted(nil, nil, []SealKidsReplace{{
 		ParentID: parent,
 		Kids:     []KidRecord{{ID: first, Path: "/p/a", Name: "a", Type: testNodeTypeFile, Depth: 1, TraversalStatus: "successful", CopyStatus: testStatusPending}},
-	}}, nil, nil, nil); err != nil {
+	}}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.WriteSealBatch([]SealNodeWrite{{
@@ -691,7 +691,7 @@ func TestKidsPackMergesAcrossDrains(t *testing.T) {
 		Status:     StatusRecord{TraversalStatus: "successful", CopyStatus: testStatusPending},
 		Depth:      1,
 		InsertOnly: true,
-	}}, nil, nil, nil, nil); err != nil {
+	}}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.WriteSealBatchTrusted(nil, nil, []SealKidsReplace{{
@@ -700,7 +700,7 @@ func TestKidsPackMergesAcrossDrains(t *testing.T) {
 			{ID: first, Path: "/p/a", Name: "a", Type: testNodeTypeFile, Depth: 1, TraversalStatus: "successful", CopyStatus: testStatusPending},
 			{ID: second, Path: "/p/b", Name: "b", Type: testNodeTypeFile, Depth: 1, TraversalStatus: "successful", CopyStatus: testStatusPending},
 		},
-	}}, nil, nil, nil); err != nil {
+	}}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	packs, err := s.BatchGetKids(SideSRC, []string{parent})
@@ -738,7 +738,7 @@ func TestListNodeIDsPagesFromCursor(t *testing.T) {
 			InsertOnly: true,
 		}
 	}
-	if _, err := s.WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := s.WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	first, err := s.ListNodeIDs(SideSRC, "", 2)
@@ -785,7 +785,7 @@ func TestWriteSealBatchStatusMergePreservesTraversal(t *testing.T) {
 		Status:     StatusRecord{TraversalStatus: "successful", CopyStatus: testStatusPending},
 		Depth:      1,
 		InsertOnly: true,
-	}}, nil, nil, nil, nil); err != nil {
+	}}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -795,7 +795,7 @@ func TestWriteSealBatchStatusMergePreservesTraversal(t *testing.T) {
 		ID:     id,
 		Status: StatusRecord{CopyStatus: "already_existed", DeleteStatus: "pending_explicit"},
 		Depth:  1,
-	}}, nil, nil, nil); err != nil {
+	}}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 

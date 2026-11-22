@@ -4,46 +4,18 @@
 package migration
 
 import (
+	"cmp"
+
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
-	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/backend"
 	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/profile"
 )
 
-func scalingContextForTraversal(queueName string, srcService, dstService Service, mode queue.QueueMode) queue.ScalingContext {
-	scalingMode := string(mode)
-	if scalingMode == "" {
-		scalingMode = queue.ScalingModeTraversal
-	}
+// newScalingContext builds the queue scaling context; an empty mode uses defaultMode.
+func newScalingContext(queueName, defaultMode string, mode queue.QueueMode, copyPass int, srcService, dstService Service) queue.ScalingContext {
 	return queue.ScalingContext{
 		QueueName:   queueName,
-		Mode:        scalingMode,
-		SrcProvider: srcService.ProviderID,
-		DstProvider: dstService.ProviderID,
-	}
-}
-
-func scalingContextForCopy(srcService, dstService Service, copyPass int, mode queue.QueueMode) queue.ScalingContext {
-	scalingMode := string(mode)
-	if scalingMode == "" {
-		scalingMode = queue.ScalingModeCopy
-	}
-	return queue.ScalingContext{
-		QueueName:   "copy",
-		Mode:        scalingMode,
+		Mode:        cmp.Or(string(mode), defaultMode),
 		CopyPass:    copyPass,
-		SrcProvider: srcService.ProviderID,
-		DstProvider: dstService.ProviderID,
-	}
-}
-
-func scalingContextForDelete(srcService, dstService Service, mode queue.QueueMode) queue.ScalingContext {
-	scalingMode := string(mode)
-	if scalingMode == "" {
-		scalingMode = queue.ScalingModeDelete
-	}
-	return queue.ScalingContext{
-		QueueName:   "delete",
-		Mode:        scalingMode,
 		SrcProvider: srcService.ProviderID,
 		DstProvider: dstService.ProviderID,
 	}
@@ -80,30 +52,4 @@ func queueSizingForScalingContext(ctx queue.ScalingContext, suspend *RuntimeSusp
 		}
 	}
 	return nil
-}
-
-func wireQueueScalingContext(srcQ, dstQ, copyQ *queue.Queue, srcService, dstService Service, sameBackend bool, pathCheckProfile string, windowsCompat bool) {
-	srcGroup := backend.ResolveGroupID(srcService.BackendGroupID, "", "src")
-	dstGroup := backend.ResolveGroupID(dstService.BackendGroupID, "", "dst")
-	if sameBackend {
-		dstGroup = srcGroup
-	}
-	srcProv := srcService.ProviderID
-	dstProv := dstService.ProviderID
-	if srcQ != nil {
-		srcQ.ConfigureScalingContext(srcProv, dstProv, srcGroup, dstGroup, pathCheckProfile, windowsCompat)
-	}
-	if dstQ != nil {
-		dstQ.ConfigureScalingContext(srcProv, dstProv, srcGroup, dstGroup, pathCheckProfile, windowsCompat)
-	}
-	if copyQ != nil {
-		copyQ.ConfigureScalingContext(srcProv, dstProv, "queue:copy", "queue:copy", pathCheckProfile, windowsCompat)
-	}
-}
-
-func wireDeleteQueueScalingContext(deleteQ *queue.Queue, srcService, dstService Service, pathCheckProfile string, windowsCompat bool) {
-	if deleteQ == nil {
-		return
-	}
-	deleteQ.ConfigureScalingContext(srcService.ProviderID, dstService.ProviderID, "queue:delete", "queue:delete", pathCheckProfile, windowsCompat)
 }

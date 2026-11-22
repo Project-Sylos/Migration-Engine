@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/aimd"
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/softcap"
 )
 
 func (a *Autoscaler) bounceMaxCooldown() time.Duration {
@@ -22,13 +22,13 @@ func (a *Autoscaler) bounceMaxCooldown() time.Duration {
 
 // noteSoftCapThrottle updates soft-cap ceiling memory and ratchets FS probe bounce
 // after a real FS_THROTTLE worker drop (or inter-op increase at floor).
-func (a *Autoscaler) noteSoftCapThrottle(st *aimd.State, now time.Time, rateLimitedUntil time.Time) {
+func (a *Autoscaler) noteSoftCapThrottle(st *softcap.State, now time.Time, rateLimitedUntil time.Time) {
 	if a == nil || st == nil {
 		return
 	}
-	st.RatchetProbeBounce(a.aimd.ProbeCooldown, a.bounceMaxCooldown(), now, rateLimitedUntil)
-	if a.debugAIMD {
-		a.debugAIMDPrint(fmt.Sprintf("  soft-cap probe bounce: wait=%s ceiling=%d softCap=%d",
+	st.RatchetProbeBounce(a.softCap.ProbeCooldown, a.bounceMaxCooldown(), now, rateLimitedUntil)
+	if a.debugAutoscaler {
+		a.debugAutoscalerPrint(fmt.Sprintf("  soft-cap probe bounce: wait=%s ceiling=%d softCap=%d",
 			st.ProbeBounce.Round(time.Millisecond), st.CeilingSafe, st.SoftCap))
 	}
 }

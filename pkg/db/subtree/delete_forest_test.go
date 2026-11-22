@@ -64,7 +64,7 @@ func TestNormalizeDeleteForestOps(t *testing.T) {
 			InsertOnly: true,
 		},
 	}
-	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 

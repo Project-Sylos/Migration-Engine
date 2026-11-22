@@ -174,7 +174,7 @@ func SetupCopyTest(cleanSpectraDB bool, removeMigrationDB bool) (*db.DB, types.F
 }
 
 // SetupCopyTestConfig returns a full migration.Config for the copy test (Spectra roots, DB at copy/shared/main_test.db).
-// Use with migration.LetsMigrate to run traversal and produce a DuckDB ready for copy-phase tests.
+// Use with migration.LetsMigrate to run traversal and produce a DB ready for copy-phase tests.
 // cleanSpectraDB: false to keep existing Spectra DB. removeMigrationDB: true to create a fresh migration DB.
 func SetupCopyTestConfig(cleanSpectraDB bool, removeMigrationDB bool) (migration.Config, error) {
 	fmt.Println("Loading Spectra configuration...")
@@ -243,7 +243,7 @@ func SetupCopyTestConfig(cleanSpectraDB bool, removeMigrationDB bool) (migration
 // SetupLocalCopyTest sets up the database and adapters for local filesystem copy phase testing.
 // srcPath and dstPath are absolute paths to the source and destination directories.
 // removeMigrationDB controls whether to remove the migration database (use true for fresh test).
-// Returns the DuckDB instance, source adapter, destination adapter, and error.
+// Returns the DB instance, source adapter, destination adapter, and error.
 func SetupLocalCopyTest(srcPath, dstPath string, removeMigrationDB bool) (*db.DB, types.FSAdapter, types.FSAdapter, error) {
 	fmt.Printf("Setting up local filesystem copy test...\n")
 	fmt.Printf("  Source: %s\n", srcPath)

@@ -3,18 +3,26 @@
 
 package db
 
+import (
+	"path/filepath"
+	"strings"
+)
+
 // Traversal status values (event-derived). Stats keys use: pending, successful, failed, not_on_src (DST only), excluded (SRC).
 const (
 	StatusPending            = "pending"
 	StatusSuccessful         = "successful"
 	StatusFailed             = "failed"
-	StatusNotOnSrc           = "not_on_src"          // DST only: exists only on destination; do not traverse subtree
+	StatusNotOnSrc           = "not_on_src"          // Legacy DST-only marker; new discovery uses pending/successful and walks DST-only folders
 	StatusExcluded           = "excluded"            // SRC only: user excluded; do not traverse subtree (counts as 1 item)
 	StatusExclusionInherited = "exclusion_inherited" // SRC only: excluded because an ancestor was excluded
 	StatusSilentExcluded     = "silent_excluded"     // SRC only: off-path / prep allowlist skip; not counted in stats
 )
 
-// Copy status values (src_nodes only). Stats keys use: pending, successful, failed (no in_progress in stats).
+// Copy status values.
+// SRC: hot-path copy queue / progress (pending, successful, already_existed, failed, excluded_*).
+// DST: bookkeeping + review search only (destination_only, already_existed, needs_overwrite, successful).
+// Stats keys use SRC: pending, successful, failed (no in_progress in stats).
 const (
 	CopyStatusPending           = "pending"
 	CopyStatusInProgress        = "in_progress" // transient; not stored in stats
@@ -25,6 +33,10 @@ const (
 	CopyStatusExcludedExplicit  = "excluded_explicit"  // user excluded this node from copy
 	CopyStatusExcludedInherited = "excluded_inherited" // excluded by parent folder
 	CopyStatusExcluded          = "excluded"           // display value for UI (both explicit and inherited)
+
+	// DST-only bookkeeping (st:copy:dst). Not used on the SRC copy frontier.
+	CopyStatusDestinationOnly = "destination_only" // unpaired DEST; never copied
+	CopyStatusNeedsOverwrite  = "needs_overwrite"  // paired; SRC will replace this DEST object
 )
 
 // SQLCopyStatusCompleteIN is the SQL IN-list for copy-complete statuses (progress / delete eligibility).
@@ -60,11 +72,6 @@ func CopyStatusIsPending(s string) bool {
 	return s == "" || s == CopyStatusPending
 }
 
-// CopyStatusIsActualCopy reports whether this migration's copy phase wrote the item.
-func CopyStatusIsActualCopy(s string) bool {
-	return s == CopyStatusSuccessful
-}
-
 // Delete status values (src_status_events only).
 // Planning uses pending_explicit (execute recursive/single delete) and pending_inherited
 // (covered by an ancestor explicit; not pulled as a task). Outcomes: deleted / failed / skipped.
@@ -82,11 +89,6 @@ const SQLDeleteStatusPendingIN = `('pending_explicit','pending_inherited')`
 // DeleteStatusIsPending reports whether delete_status means scheduled for source removal.
 func DeleteStatusIsPending(s string) bool {
 	return s == DeleteStatusPendingExplicit || s == DeleteStatusPendingInherited
-}
-
-// DeleteStatusIsExplicit reports whether this node is a delete-forest root to execute.
-func DeleteStatusIsExplicit(s string) bool {
-	return s == DeleteStatusPendingExplicit
 }
 
 // DeleteStatusOnFrontier reports whether delete_status belongs on pend:del
@@ -133,3 +135,30 @@ const (
 	GPLStatusFailed     = "failed"
 	GPLStatusIgnored    = "ignored" // user dismissed warnings for this node + subtree
 )
+
+// GPLDisabled gates path verifier / GPL queue. False = enabled for new migrations.
+const GPLDisabled = false
+
+// MigrationOpsPath returns the Badger ops directory for a migration DB file path.
+func MigrationOpsPath(dbPath string) string {
+	if dbPath == ":memory:" {
+		return ""
+	}
+	base := strings.TrimSuffix(filepath.Base(dbPath), ".db")
+	dir := filepath.Dir(dbPath)
+	return filepath.Join(dir, base+".ops")
+}
+
+// MigrationLogsPath returns the Badger logs sidecar directory for a migration DB file path.
+func MigrationLogsPath(dbPath string) string {
+	if dbPath == ":memory:" {
+		return ""
+	}
+	base := strings.TrimSuffix(filepath.Base(dbPath), ".db")
+	dir := filepath.Dir(dbPath)
+	return filepath.Join(dir, base+".logs")
+}
+
+// PullKeysetWindowSize is how many node rows we scan per round-trip when filtering pulls by event-derived status
+// (SRC depth keyset, copy/delete/GPL pulls).
+const PullKeysetWindowSize = 50000

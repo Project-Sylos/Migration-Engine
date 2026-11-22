@@ -22,6 +22,8 @@ type LogEntry struct {
 	EntityID  string
 	Message   string
 	Queue     string
+	Action    string
+	NodeID    string
 }
 
 // LogBuffer buffers log entries and flushes them to the DB logs table.
@@ -87,17 +89,25 @@ func (lb *LogBuffer) setFlushingDone() {
 }
 
 func (lb *LogBuffer) writeBatch(batch []LogEntry) error {
-	if lb.database == nil || lb.database.Ops() == nil {
-		return fmt.Errorf("ops store not open")
+	if lb.database == nil || lb.database.Logs() == nil {
+		return fmt.Errorf("logs sidecar not open")
 	}
+	store := lb.database.Logs()
 	recs := make([]opsdb.LogRecord, len(batch))
 	for i, e := range batch {
+		at := time.Time{}
+		if e.Timestamp != "" {
+			if parsed, err := time.Parse(time.RFC3339Nano, e.Timestamp); err == nil {
+				at = parsed
+			}
+		}
 		recs[i] = opsdb.LogRecord{
 			ID: e.ID, Level: e.Level, Message: e.Message,
 			Component: e.Entity, Entity: e.Entity, EntityID: e.EntityID, Queue: e.Queue,
+			Action: e.Action, NodeID: e.NodeID, At: at,
 		}
 	}
-	return lb.database.Ops().AppendLogs(recs)
+	return store.AppendLogs(recs)
 }
 
 // drainAll writes the entire buffer in batches until empty. Call when at backpressure (caller must set draining so Add() blocks).

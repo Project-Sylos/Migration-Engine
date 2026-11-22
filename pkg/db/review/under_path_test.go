@@ -4,6 +4,7 @@
 package review
 
 import (
+	"context"
 	"testing"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
@@ -67,7 +68,7 @@ func TestUnderPathScopesSubtree(t *testing.T) {
 		t.Fatal("UnderPath must disable status-driven fast path")
 	}
 
-	page, _, err := ListMergedReviewDiffsPage(database, ReviewFilter{UnderPath: reportsPath}, "path ASC", 100, 0)
+	page, _, err := ListMergedReviewDiffsPageCtx(context.Background(), database, ReviewFilter{UnderPath: reportsPath}, "path ASC", 100, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +82,7 @@ func TestUnderPathScopesSubtree(t *testing.T) {
 		}
 	}
 
-	named, _, err := ListMergedReviewDiffsPage(database, ReviewFilter{
+	named, _, err := ListMergedReviewDiffsPageCtx(context.Background(), database, ReviewFilter{
 		UnderPath: reportsPath, Query: "summary", QueryField: "name",
 	}, "path ASC", 100, 0)
 	if err != nil {

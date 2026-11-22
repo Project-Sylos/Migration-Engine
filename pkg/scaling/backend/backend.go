@@ -32,8 +32,8 @@ func (g *BackendGroup) SetProfile(prof profile.FSPerformanceProfile) {
 
 // BackendRegistry resolves queue → backend group budgets.
 type BackendRegistry struct {
-	mu     sync.RWMutex
-	groups map[string]*BackendGroup
+	mu           sync.RWMutex
+	groups       map[string]*BackendGroup
 	queueToGroup map[string]string
 }
 
@@ -168,7 +168,7 @@ func (r *BackendRegistry) groupByID(groupID string) *BackendGroup {
 	return r.groups[groupID]
 }
 
-func GroupAIMDKey(groupID string) string {
+func GroupStateKey(groupID string) string {
 	return "group:" + groupID
 }
 
@@ -203,4 +203,3 @@ func (b RateLimitBridge) RateLimitedUntil() time.Time {
 	}
 	return time.Time{}
 }
-

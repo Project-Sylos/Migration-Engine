@@ -12,9 +12,6 @@ import (
 )
 
 func TestApplyGPLToSRCChildren_setsStateAndCollision(t *testing.T) {
-	if db.GPLDisabled {
-		t.Skip("GPL gated off (db.GPLDisabled)")
-	}
 	root := db.MintNodeID("SRC", "", db.NodeTypeFolder, "/")
 	a := &db.NodeState{
 		ID: db.MintNodeID("SRC", root, db.NodeTypeFile, "a*b.txt"), Name: "a*b.txt", Type: db.NodeTypeFile, Depth: 1,
@@ -75,9 +72,6 @@ func TestPathChecksRequired(t *testing.T) {
 }
 
 func TestApplyGPLToSRCChildren_skipChecks_passthroughNoEvents(t *testing.T) {
-	if db.GPLDisabled {
-		t.Skip("GPL gated off (db.GPLDisabled)")
-	}
 	root := db.MintNodeID("SRC", "", db.NodeTypeFolder, "/")
 	child := &db.NodeState{
 		ID: db.MintNodeID("SRC", root, db.NodeTypeFile, "ok.txt"), Name: "ok.txt", Type: db.NodeTypeFile, Depth: 1,
@@ -89,9 +83,6 @@ func TestApplyGPLToSRCChildren_skipChecks_passthroughNoEvents(t *testing.T) {
 }
 
 func TestApplyGPLToSRCChildren_windowsTrailingSpace(t *testing.T) {
-	if db.GPLDisabled {
-		t.Skip("GPL gated off (db.GPLDisabled)")
-	}
 	root := db.MintNodeID("SRC", "", db.NodeTypeFolder, "/")
 	child := &db.NodeState{
 		ID: db.MintNodeID("SRC", root, db.NodeTypeFolder, "name "), Name: "name ", Type: db.NodeTypeFolder, Depth: 1,

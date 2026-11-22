@@ -40,7 +40,7 @@ func TestExcludeSubtreeReviewDeltasScaleWithWriteScan(t *testing.T) {
 	}
 
 	store := newMigrationStore(database, nil)
-	affected, deltas, err := store.setNodeExcludedWithPropagation(folderID, true)
+	affected, deltas, err := store.setNodeExcluded(folderID, true)
 	if err != nil {
 		t.Fatal(err)
 	}

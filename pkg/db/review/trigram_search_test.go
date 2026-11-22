@@ -4,6 +4,7 @@
 package review
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -45,7 +46,7 @@ func TestTrigramPlanRulesetContains(t *testing.T) {
 		Status:     opsdb.StatusRecord{TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending},
 		InsertOnly: true,
 	})
-	if _, err := ops.WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := ops.WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -81,11 +82,11 @@ func TestTrigramPlanRulesetContains(t *testing.T) {
 	if plan.kind != "tri" {
 		t.Fatalf("want trigram plan, got %+v", plan)
 	}
-	if len(plan.ids) == 0 || len(plan.ids) > 5 {
-		t.Fatalf("trigram candidates should be tiny, got %d (%+v)", len(plan.ids), plan.ids)
+	if len(plan.ids) == 0 {
+		t.Fatalf("trigram candidates empty (%+v)", plan)
 	}
 
-	rows, _, err := ListMergedReviewDiffsPage(database, f, "path ASC", 20, 0)
+	rows, _, err := ListMergedReviewDiffsPageCtx(context.Background(), database, f, "path ASC", 20, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +94,6 @@ func TestTrigramPlanRulesetContains(t *testing.T) {
 		t.Fatalf("rows=%+v", rows)
 	}
 }
-
 
 func TestTrigramPlanORNameContainsUnionsNeedles(t *testing.T) {
 	dir := t.TempDir()
@@ -133,7 +133,7 @@ func TestTrigramPlanORNameContainsUnionsNeedles(t *testing.T) {
 			InsertOnly: true,
 		},
 	}
-	if _, err := ops.WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := ops.WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -172,7 +172,7 @@ func TestTrigramPlanORNameContainsUnionsNeedles(t *testing.T) {
 		}
 	}
 
-	rows, _, err := ListMergedReviewDiffsPage(database, f, "path ASC", 20, 0)
+	rows, _, err := ListMergedReviewDiffsPageCtx(context.Background(), database, f, "path ASC", 20, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,5 +184,64 @@ func TestTrigramPlanORNameContainsUnionsNeedles(t *testing.T) {
 		if !byID[id] {
 			t.Fatalf("OR search missing %s; rows=%+v", id, rows)
 		}
+	}
+}
+
+func TestFuzzyNameQueryTypoFindsSylos(t *testing.T) {
+	dir := t.TempDir()
+	database, err := db.Open(db.Options{Path: filepath.Join(dir, "m.db"), OpsDir: filepath.Join(dir, "m.ops")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ops := database.Ops()
+
+	writes := []opsdb.SealNodeWrite{
+		{
+			Side: opsdb.SideSRC,
+			Node: opsdb.NodeRecord{
+				ID: "sylos", Path: "/id-sylos", DisplayPath: "/docs/sylos-readme.txt",
+				Name: "sylos-readme.txt", Type: opsdb.NodeTypeFile, Extension: "txt", Size: 1, Depth: 2,
+			},
+			Status:     opsdb.StatusRecord{TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending},
+			InsertOnly: true,
+		},
+		{
+			Side: opsdb.SideSRC,
+			Node: opsdb.NodeRecord{
+				ID: "other", Path: "/id-other", DisplayPath: "/docs/readme.txt",
+				Name: "readme.txt", Type: opsdb.NodeTypeFile, Extension: "txt", Size: 1, Depth: 2,
+			},
+			Status:     opsdb.StatusRecord{TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending},
+			InsertOnly: true,
+		},
+	}
+	if _, err := ops.WriteSealBatch(writes, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	f := ReviewFilter{Query: "sylis", QueryField: "name", ExcludeRoot: true}
+	rows, _, err := ListMergedReviewDiffsPageCtx(context.Background(), database, f, "path ASC", 20, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range rows {
+		if r.SrcNodeID == "sylos" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected sylos hit for typo sylis; rows=%+v", rows)
+	}
+}
+
+func TestFuzzyNeedleMatchSylisSylos(t *testing.T) {
+	if !fuzzyNeedleMatch("sylos-readme.txt", "sylis") {
+		t.Fatal("expected sylis to fuzzy-match sylos-readme.txt")
+	}
+	if fuzzyNeedleMatch("readme.txt", "sylis") {
+		t.Fatal("readme should not match sylis")
 	}
 }

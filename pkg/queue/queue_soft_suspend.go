@@ -21,9 +21,32 @@ func (q *Queue) StopWatchdog() {
 // ClearPendingBufferForSuspend drops non-leased pending tasks; in-progress tasks are unchanged.
 func (q *Queue) ClearPendingBufferForSuspend() {
 	q.mu.Lock()
+	q.releasePendingBufferWeightLocked()
 	capacity := pendingBuffCapFromLeaseSizing(q.leaseBatchSize)
 	q.pendingBuff = make([]*TaskBase, 0, capacity)
 	q.mu.Unlock()
+}
+
+// BeginMemoryShed pauses the queue so pulls/leases stop. Returns the prior state
+// for FinishMemoryShed. In-flight leased work is left alone until drained.
+func (q *Queue) BeginMemoryShed() (resumeState QueueState) {
+	resumeState = q.State()
+	q.SetState(QueueStatePaused)
+	q.StopWatchdog()
+	return resumeState
+}
+
+// FinishMemoryShed restores queue state after a memory shed drain+flush.
+// Waiting is preserved when that was the prior state (DST coordinator gate).
+func (q *Queue) FinishMemoryShed(resumeState QueueState) {
+	switch resumeState {
+	case QueueStatePaused, QueueStateCompleted, QueueStateStopped:
+		q.SetState(resumeState)
+	case QueueStateWaiting:
+		q.SetState(QueueStateWaiting)
+	default:
+		q.SetState(QueueStateRunning)
+	}
 }
 
 // WaitInProgressZeroFunc blocks until InProgressCount is zero or ctx is canceled.

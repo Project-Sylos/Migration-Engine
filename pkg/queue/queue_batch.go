@@ -69,88 +69,6 @@ func BuildExpectedMapsFromDstWithChildren(dstBatch []db.FetchResult, childrenByD
 	return expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta
 }
 
-// BatchLoadExpectedChildrenByDSTIDs loads SRC children for the given DST folder IDs by joining on parent_path = dst.path.
-// Prefer ListDstBatchWithSrcChildren + BuildExpectedMapsFromDstWithChildren for keyset-based DST pull (no IN query).
-// Returns expectedFoldersMap, expectedFilesMap (keyed by DST task ID), srcIDMap (Type+DisplayName -> SRC node ID per DST ID), and srcIDToMeta (SRC ID -> meta).
-func BatchLoadExpectedChildrenByDSTIDs(database *db.DB, dstParentIDs []string, dstIDToPath map[string]string) (
-	expectedFoldersMap map[string][]types.Folder,
-	expectedFilesMap map[string][]types.File,
-	srcIDMap map[string]map[string]string,
-	srcIDToMeta map[string]SrcNodeMeta,
-	err error,
-) {
-	expectedFoldersMap = make(map[string][]types.Folder)
-	expectedFilesMap = make(map[string][]types.File)
-	srcIDMap = make(map[string]map[string]string)
-	srcIDToMeta = make(map[string]SrcNodeMeta)
-	if len(dstIDToPath) == 0 {
-		return expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta, nil
-	}
-	paths := make([]string, 0, len(dstIDToPath))
-	pathToDstID := make(map[string]string)
-	for _, id := range dstParentIDs {
-		path, ok := dstIDToPath[id]
-		if !ok {
-			continue
-		}
-		paths = append(paths, path)
-		pathToDstID[path] = id
-	}
-	if len(paths) == 0 {
-		return expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta, nil
-	}
-	byPath, err := pull.GetSrcChildrenGroupedByParentPath(database, paths)
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-	for path, nodes := range byPath {
-		dstID := pathToDstID[path]
-		if dstID == "" {
-			continue
-		}
-		var folders []types.Folder
-		var files []types.File
-		idMap := make(map[string]string)
-		for _, n := range nodes {
-			displayName := DstChildMatchName(n.Name, n.Path)
-			if displayName == "" && n.Name != "" {
-				displayName = n.Name
-			}
-			matchKey := DstChildMatchKey(n.Type, displayName, n.Path)
-			idMap[matchKey] = n.ID
-			srcIDToMeta[n.ID] = SrcNodeMeta{Depth: n.Depth, TraversalStatus: n.TraversalStatus, CopyStatus: n.CopyStatus, DeleteStatus: n.DeleteStatus, GPLState: n.GPLState}
-			if n.Type == types.NodeTypeFolder {
-				folders = append(folders, types.Folder{
-					ServiceID:    n.ServiceID,
-					ParentId:     n.ParentServiceID,
-					ParentPath:   n.ParentPath,
-					DisplayName:  displayName,
-					LocationPath: n.Path,
-					LastUpdated:  n.MTime,
-					DepthLevel:   n.Depth,
-					Type:         n.Type,
-				})
-			} else {
-				files = append(files, types.File{
-					ServiceID:    n.ServiceID,
-					ParentId:     n.ParentServiceID,
-					ParentPath:   n.ParentPath,
-					DisplayName:  displayName,
-					LocationPath: n.Path,
-					LastUpdated:  n.MTime,
-					Size:         n.Size,
-					DepthLevel:   n.Depth,
-					Type:         n.Type,
-				})
-			}
-		}
-		expectedFoldersMap[dstID] = folders
-		expectedFilesMap[dstID] = files
-		srcIDMap[dstID] = idMap
-	}
-	return expectedFoldersMap, expectedFilesMap, srcIDMap, srcIDToMeta, nil
-}
-
 // BatchLoadRetryDstCleanup loads DST counterpart and children meta for each SRC folder ID (for retry mode DST cleanup).
 func BatchLoadRetryDstCleanup(database *db.DB, srcFolderIDs []string) (map[string]*RetryDstCleanup, error) {
 	out := make(map[string]*RetryDstCleanup)
@@ -214,10 +132,10 @@ func BatchLoadRetryDstCleanup(database *db.DB, srcFolderIDs []string) (map[strin
 			oldStatus = db.StatusSuccessful
 		}
 		out[srcID] = &RetryDstCleanup{
-			DstID:       dstID,
-			DstDepth:    meta.Depth,
+			DstID:        dstID,
+			DstDepth:     meta.Depth,
 			DstOldStatus: oldStatus,
-			Children:    children,
+			Children:     children,
 		}
 	}
 	return out, nil

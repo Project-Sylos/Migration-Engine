@@ -4,8 +4,49 @@
 package opsdb
 
 import (
+	"encoding/json"
+	"strings"
+
 	badger "github.com/dgraph-io/badger/v4"
 )
+
+func syncCopyStatusIndexTxn(txn *badger.Txn, side, id, prevCopy, nextCopy string) error {
+	prevCopy = strings.TrimSpace(prevCopy)
+	nextCopy = strings.TrimSpace(nextCopy)
+	if prevCopy == nextCopy {
+		return nil
+	}
+	if prevCopy != "" {
+		if err := txn.Delete(copyStatusIndexKey(side, prevCopy, id)); err != nil && err != badger.ErrKeyNotFound {
+			return err
+		}
+	}
+	if nextCopy != "" {
+		if err := txn.Set(copyStatusIndexKey(side, nextCopy, id), []byte{1}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func syncCopyStatusIndexBatch(wb *badger.WriteBatch, side, id, prevCopy, nextCopy string) error {
+	prevCopy = strings.TrimSpace(prevCopy)
+	nextCopy = strings.TrimSpace(nextCopy)
+	if prevCopy == nextCopy {
+		return nil
+	}
+	if prevCopy != "" {
+		if err := wb.Delete(copyStatusIndexKey(side, prevCopy, id)); err != nil {
+			return err
+		}
+	}
+	if nextCopy != "" {
+		if err := wb.Set(copyStatusIndexKey(side, nextCopy, id), []byte{1}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func statusTravRecord(st StatusRecord) StatusRecord {
 	return StatusRecord{
@@ -16,6 +57,7 @@ func statusTravRecord(st StatusRecord) StatusRecord {
 		DeterminingRuleID: st.DeterminingRuleID,
 		ErrorLogID:        st.ErrorLogID,
 		ChildSize:         st.ChildSize,
+		ChildCount:        st.ChildCount,
 	}
 }
 
@@ -40,7 +82,7 @@ func statusDelRecord(st StatusRecord) StatusRecord {
 func travPhaseNonempty(st StatusRecord) bool {
 	return st.TraversalStatus != "" || st.GPLStatus != "" || st.IncludeOnly != "" ||
 		st.ExclusionSource != "" || st.DeterminingRuleID != "" || st.ErrorLogID != "" ||
-		st.ChildSize != 0
+		st.ChildSize != 0 || st.ChildCount != 0
 }
 
 func copyPhaseNonempty(st StatusRecord) bool {
@@ -72,9 +114,10 @@ func mergeStatusPhases(trav, copy, del, legacy StatusRecord, travPresent bool) S
 	if trav.ErrorLogID != "" {
 		out.ErrorLogID = trav.ErrorLogID
 	}
-	// Trav-phase key is authoritative for identity child_size (including zero).
+	// Trav-phase key is authoritative for identity child_size/count (including zero).
 	if travPresent {
 		out.ChildSize = trav.ChildSize
+		out.ChildCount = trav.ChildCount
 	}
 	if copy.CopyStatus != "" {
 		out.CopyStatus = copy.CopyStatus
@@ -151,7 +194,7 @@ func writePhaseStatusTxn(txn *badger.Txn, side, id string, st StatusRecord) erro
 		return nil
 	}
 	if travPhaseNonempty(st) {
-		b, err := encode(statusTravRecord(st))
+		b, err := json.Marshal(statusTravRecord(st))
 		if err != nil {
 			return err
 		}
@@ -160,16 +203,31 @@ func writePhaseStatusTxn(txn *badger.Txn, side, id string, st StatusRecord) erro
 		}
 	}
 	if copyPhaseNonempty(st) {
-		b, err := encode(statusCopyRecord(st))
+		prevCopy, _, err := readStatusValue(txn, statusCopyKey(side, id))
+		if err != nil {
+			return err
+		}
+		if prevCopy.CopyStatus == "" {
+			// Legacy combined key may still hold copy status.
+			if legacy, ok, lerr := readStatusValue(txn, statusKey(side, id)); lerr != nil {
+				return lerr
+			} else if ok {
+				prevCopy.CopyStatus = legacy.CopyStatus
+			}
+		}
+		b, err := json.Marshal(statusCopyRecord(st))
 		if err != nil {
 			return err
 		}
 		if err := txn.Set(statusCopyKey(side, id), b); err != nil {
 			return err
 		}
+		if err := syncCopyStatusIndexTxn(txn, side, id, prevCopy.CopyStatus, st.CopyStatus); err != nil {
+			return err
+		}
 	}
 	if delPhaseNonempty(st) {
-		b, err := encode(statusDelRecord(st))
+		b, err := json.Marshal(statusDelRecord(st))
 		if err != nil {
 			return err
 		}
@@ -180,12 +238,14 @@ func writePhaseStatusTxn(txn *badger.Txn, side, id string, st StatusRecord) erro
 	return nil
 }
 
-func writePhaseStatusBatch(wb *badger.WriteBatch, side, id string, st StatusRecord) error {
+// writePhaseStatusBatch writes phase overlays. prevCopy is used to maintain idx:copy
+// when CopyStatus is being set (trusted seal path already knows the previous value).
+func writePhaseStatusBatch(wb *badger.WriteBatch, side, id string, st StatusRecord, prevCopy string) error {
 	if id == "" {
 		return nil
 	}
 	if travPhaseNonempty(st) {
-		b, err := encode(statusTravRecord(st))
+		b, err := json.Marshal(statusTravRecord(st))
 		if err != nil {
 			return err
 		}
@@ -194,16 +254,19 @@ func writePhaseStatusBatch(wb *badger.WriteBatch, side, id string, st StatusReco
 		}
 	}
 	if copyPhaseNonempty(st) {
-		b, err := encode(statusCopyRecord(st))
+		b, err := json.Marshal(statusCopyRecord(st))
 		if err != nil {
 			return err
 		}
 		if err := wb.Set(statusCopyKey(side, id), b); err != nil {
 			return err
 		}
+		if err := syncCopyStatusIndexBatch(wb, side, id, prevCopy, st.CopyStatus); err != nil {
+			return err
+		}
 	}
 	if delPhaseNonempty(st) {
-		b, err := encode(statusDelRecord(st))
+		b, err := json.Marshal(statusDelRecord(st))
 		if err != nil {
 			return err
 		}
@@ -215,6 +278,15 @@ func writePhaseStatusBatch(wb *badger.WriteBatch, side, id string, st StatusReco
 }
 
 func deletePhaseStatusTxn(txn *badger.Txn, side, id string) error {
+	prev, ok, err := mergedStatusTxn(txn, side, id)
+	if err != nil {
+		return err
+	}
+	if ok && prev.CopyStatus != "" {
+		if err := syncCopyStatusIndexTxn(txn, side, id, prev.CopyStatus, ""); err != nil {
+			return err
+		}
+	}
 	if err := txn.Delete(statusTravKey(side, id)); err != nil && err != badger.ErrKeyNotFound {
 		return err
 	}

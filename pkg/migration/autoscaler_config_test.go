@@ -31,7 +31,7 @@ func TestAutoscalerConfig_Resolve_preservesCallbacks(t *testing.T) {
 	called := false
 	got := AutoscalerConfig{
 		OnEvent:   func(scaling.ScalingEvent) { called = true },
-		DebugAIMD: true,
+		DebugAutoscaler: true,
 		Interval:  5 * time.Second,
 	}.Resolve()
 	if !got.Enabled() {
@@ -47,7 +47,7 @@ func TestAutoscalerConfig_Resolve_preservesCallbacks(t *testing.T) {
 	if !called {
 		t.Fatal("expected OnEvent to run")
 	}
-	if !got.DebugAIMD {
-		t.Fatal("expected DebugAIMD preserved")
+	if !got.DebugAutoscaler {
+		t.Fatal("expected DebugAutoscaler preserved")
 	}
 }

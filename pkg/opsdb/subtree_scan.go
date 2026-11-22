@@ -87,20 +87,3 @@ func StrictAncestorPaths(childPath string) []string {
 	}
 	return out
 }
-
-// LookupAncestorIDs resolves strict ancestor paths to node ids (missing omitted).
-func (s *Store) LookupAncestorIDs(side, childPath string) (ids []string, pathByID map[string]string, err error) {
-	pathByID = make(map[string]string)
-	for _, p := range StrictAncestorPaths(childPath) {
-		id, err := s.GetNodeIDByPath(side, p)
-		if err != nil {
-			return nil, nil, err
-		}
-		if id == "" {
-			continue
-		}
-		ids = append(ids, id)
-		pathByID[id] = p
-	}
-	return ids, pathByID, nil
-}

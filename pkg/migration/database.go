@@ -21,12 +21,10 @@ type DatabaseConfig struct {
 	Path string
 	// EncryptionKey is unused for Badger ops (kept for API compatibility).
 	EncryptionKey []byte
-	// RemoveExisting deletes legacy *.db marker and ops dir when set before creating a new migration.
+	// RemoveExisting deletes the logical *.db marker, ops dir, and logs sidecar before open.
 	RemoveExisting bool
 	// RequireOpen determines whether the DB instance must already be open (true) or can be auto-opened (false).
 	RequireOpen bool
-	// MemoryLimitGB is a host memory hint (GB). 0 = auto from free RAM.
-	MemoryLimitGB int
 }
 
 // MigrationDirAndIDFromDBPath splits a migration DB file path into its folder and migration id.
@@ -43,7 +41,7 @@ func MigrationDBPath(migrationDir, migrationID string) string {
 	return filepath.Join(migrationDir, migrationID+".db")
 }
 
-// MigrationStorageExists reports whether a migration has on-disk state (*.db marker or *.ops dir).
+// MigrationStorageExists reports whether a migration has on-disk state (*.db marker, *.ops, or *.logs).
 func MigrationStorageExists(migrationDir, migrationID string) bool {
 	absDir, err := filepath.Abs(migrationDir)
 	if err != nil {
@@ -55,6 +53,10 @@ func MigrationStorageExists(migrationDir, migrationID string) bool {
 	}
 	opsPath := db.MigrationOpsPath(dbPath)
 	if info, err := os.Stat(opsPath); err == nil && info.IsDir() {
+		return true
+	}
+	logsPath := db.MigrationLogsPath(dbPath)
+	if info, err := os.Stat(logsPath); err == nil && info.IsDir() {
 		return true
 	}
 	return false
@@ -75,6 +77,10 @@ func SetupDatabase(cfg DatabaseConfig) (*db.DB, bool, error) {
 		if err := os.RemoveAll(opsDir); err != nil {
 			return nil, false, fmt.Errorf("failed to remove ops dir %s: %w", opsDir, err)
 		}
+		logsDir := db.MigrationLogsPath(cfg.Path)
+		if err := os.RemoveAll(logsDir); err != nil {
+			return nil, false, fmt.Errorf("failed to remove logs dir %s: %w", logsDir, err)
+		}
 		wasFresh = true
 	} else {
 		opsDir := db.MigrationOpsPath(cfg.Path)
@@ -86,8 +92,8 @@ func SetupDatabase(cfg DatabaseConfig) (*db.DB, bool, error) {
 	opts := db.DefaultOptions()
 	opts.Path = cfg.Path
 	opts.OpsDir = db.MigrationOpsPath(cfg.Path)
+	opts.LogsDir = db.MigrationLogsPath(cfg.Path)
 	opts.EncryptionKey = cfg.EncryptionKey
-	opts.MemoryLimitGB = cfg.MemoryLimitGB
 	opts.SealBuffer = &db.SealBufferOptions{}
 	database, err := db.Open(opts)
 	if err != nil {

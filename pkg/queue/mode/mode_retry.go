@@ -82,10 +82,7 @@ func PullRetryTasks(q *queue.Queue, force bool) queue.PullResult {
 		expected = q.RoundExpected(currentRound)
 	}
 	if expected == 0 {
-		q.SetLastPullWasPartial(true)
-		q.RecordPull(currentRound, 0, true)
-		q.SetFirstPullForRound(false)
-		return queue.PullResult{Round: currentRound, Yield: 0, Partial: true, QueriedDB: true, Status: queue.PullOK}
+		return finishPull(q, currentRound, 0, true)
 	}
 
 	queueType := queue.GetQueueType(q.Name())
@@ -227,8 +224,5 @@ func PullRetryTasks(q *queue.Queue, force bool) queue.PullResult {
 	if q.Name() == "dst" {
 		partial = dstPullPartial
 	}
-	q.SetLastPullWasPartial(partial)
-	q.RecordPull(currentRound, enqueuedCount, partial)
-	q.SetFirstPullForRound(false)
-	return queue.PullResult{Round: currentRound, Yield: enqueuedCount, Partial: partial, QueriedDB: true, Status: queue.PullOK}
+	return finishPull(q, currentRound, enqueuedCount, partial)
 }

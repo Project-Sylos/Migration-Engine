@@ -32,7 +32,7 @@ func runTest() error {
 	fmt.Println("================")
 	cfg, err := shared.SetupEphemeralThrottleTest(true, initialWorkers, migration.AutoscalerConfig{
 		Interval:  3 * time.Second,
-		DebugAIMD: true,
+		DebugAutoscaler: true,
 		OnEvent: func(ev scaling.ScalingEvent) {
 			mu.Lock()
 			events = append(events, ev)

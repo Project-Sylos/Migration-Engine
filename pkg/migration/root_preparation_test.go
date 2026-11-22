@@ -194,8 +194,8 @@ func TestSeedRootTasksWithPreparation_bothPreparedDstOnly(t *testing.T) {
 	if err != nil || only == nil {
 		t.Fatalf("dst-only: %v", err)
 	}
-	if only.TraversalStatus != db.StatusNotOnSrc {
-		t.Fatalf("dst-only trav=%s want not_on_src", only.TraversalStatus)
+	if only.TraversalStatus != db.StatusPending {
+		t.Fatalf("dst-only trav=%s want pending", only.TraversalStatus)
 	}
 
 	sharedID := db.MintNodeID("DST", dstRootID, types.NodeTypeFolder, "shared")
@@ -342,10 +342,6 @@ func TestSeedRootTasksWithPreparation_preservesTrailingSpaceName(t *testing.T) {
 	if node.Name != "Extra Space " {
 		t.Fatalf("name=%q want trailing space preserved", node.Name)
 	}
-}
-
-func TestSeedRootTasksWithPreparation_appliesWindowsGPL(t *testing.T) {
-	t.Skip("GPL gated off on Badger branch (db.GPLDisabled)")
 }
 
 func TestComputeSourceStartRound(t *testing.T) {

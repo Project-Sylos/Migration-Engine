@@ -4,10 +4,7 @@
 package review
 
 import (
-	"context"
-	"fmt"
 	"testing"
-	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 )
@@ -73,8 +70,8 @@ func TestListFolderChildrenPageHasMoreNoCount(t *testing.T) {
 	}
 }
 
-func TestListFolderChildrenRecordsOpsWithoutBlocking(t *testing.T) {
-	database, err := db.Open(db.Options{Path: t.TempDir() + "/folder-ops-core.db"})
+func TestListFolderChildrenPage_MergedFolderShowsDSTOnlyPeers(t *testing.T) {
+	database, err := db.Open(db.Options{Path: t.TempDir() + "/merged-folder-children.db"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,39 +81,161 @@ func TestListFolderChildrenRecordsOpsWithoutBlocking(t *testing.T) {
 		ID: db.DeterministicNodeID("SRC", db.NodeTypeFolder, "/"), Path: "/", Name: "/",
 		Type: db.NodeTypeFolder, Depth: 0, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusAlreadyExisted,
 	}
-	n := &db.NodeState{
-		ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/a.txt"), Path: "/a.txt", ParentPath: "/", ParentID: srcRoot.ID, Name: "a.txt",
-		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
+	dstRoot := &db.NodeState{
+		ID: db.DeterministicNodeID("DST", db.NodeTypeFolder, "/"), Path: "/", Name: "/",
+		Type: db.NodeTypeFolder, Depth: 0, TraversalStatus: db.StatusSuccessful,
 	}
-	seedReviewTree(t, database, []*db.NodeState{srcRoot, n}, nil, nil)
+	srcFolder := &db.NodeState{
+		ID: db.DeterministicNodeID("SRC", db.NodeTypeFolder, "/Extra space "), Path: "/src-extra", ParentPath: "/", ParentID: srcRoot.ID,
+		Name: "Extra space ", Type: db.NodeTypeFolder, Depth: 1,
+		TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusAlreadyExisted,
+	}
+	dstFolder := &db.NodeState{
+		ID: db.DeterministicNodeID("DST", db.NodeTypeFolder, "/Extra Space"), Path: "/dst-extra", ParentPath: "/", ParentID: dstRoot.ID,
+		Name: "Extra Space", Type: db.NodeTypeFolder, Depth: 1, TraversalStatus: db.StatusSuccessful,
+	}
+	srcChild := &db.NodeState{
+		ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/Extra space /src-only.txt"), Path: "/src-extra/src-only.txt",
+		ParentPath: "/src-extra", ParentID: srcFolder.ID, Name: "src-only.txt",
+		Type: db.NodeTypeFile, Depth: 2, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
+	}
+	dstChild := &db.NodeState{
+		ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/Extra Space/dst-only.txt"), Path: "/dst-extra/dst-only.txt",
+		ParentPath: "/dst-extra", ParentID: dstFolder.ID, Name: "dst-only.txt",
+		Type: db.NodeTypeFile, Depth: 2, TraversalStatus: db.StatusSuccessful,
+		CopyStatus: db.CopyStatusDestinationOnly,
+	}
+	pairedSrc := &db.NodeState{
+		ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/Extra space /shared.txt"), Path: "/src-extra/shared.txt",
+		ParentPath: "/src-extra", ParentID: srcFolder.ID, Name: "shared.txt",
+		Type: db.NodeTypeFile, Depth: 2, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusAlreadyExisted,
+	}
+	pairedDst := &db.NodeState{
+		ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/Extra Space/shared.txt"), Path: "/dst-extra/shared.txt",
+		ParentPath: "/dst-extra", ParentID: dstFolder.ID, Name: "shared.txt",
+		Type: db.NodeTypeFile, Depth: 2, TraversalStatus: db.StatusSuccessful,
+	}
 
-	held := make(chan struct{})
-	release := make(chan struct{})
-	go func() {
-		_ = database.RunWrite(context.Background(), func() error {
-			close(held)
-			<-release
-			return nil
-		})
-	}()
-	<-held
-	listDone := make(chan error, 1)
-	go func() {
-		page, _, err := ListFolderChildrenPage(database, ReviewFilter{ParentPath: "/"}, "path ASC", 10, 0)
-		if err == nil && len(page) != 1 {
-			err = fmt.Errorf("folder page len=%d want 1", len(page))
-		}
-		listDone <- err
-	}()
-	select {
-	case err := <-listDone:
-		if err != nil {
-			close(release)
-			t.Fatal(err)
-		}
-	case <-time.After(5 * time.Second):
-		close(release)
-		t.Fatal("folder page blocked on db write lock")
+	seedReviewTree(t, database,
+		[]*db.NodeState{srcRoot, srcFolder, srcChild, pairedSrc},
+		[]*db.NodeState{dstRoot, dstFolder, dstChild, pairedDst},
+		[]db.IDMapEvent{
+			{SrcInternalID: srcFolder.ID, DstInternalID: dstFolder.ID, Status: db.IDMapStatusActive},
+			{SrcInternalID: pairedSrc.ID, DstInternalID: pairedDst.ID, Status: db.IDMapStatusActive},
+		},
+	)
+
+	page, _, err := ListFolderChildrenPage(database, ReviewFilter{ParentPath: "/src-extra"}, "path ASC", 20, 0)
+	if err != nil {
+		t.Fatal(err)
 	}
-	close(release)
+	var sawSrcOnly, sawDstOnly, sawPaired bool
+	for _, row := range page {
+		switch {
+		case row.SrcNodeID == srcChild.ID && row.DstNodeID == "":
+			sawSrcOnly = true
+		case row.SrcNodeID == "" && row.DstNodeID == dstChild.ID:
+			sawDstOnly = true
+		case row.SrcNodeID == pairedSrc.ID && row.DstNodeID == pairedDst.ID:
+			sawPaired = true
+		}
+	}
+	if !sawSrcOnly || !sawDstOnly || !sawPaired {
+		t.Fatalf("merged browse want src-only+dst-only+paired; got paths=%v srcOnly=%v dstOnly=%v paired=%v",
+			pathsOf(page), sawSrcOnly, sawDstOnly, sawPaired)
+	}
+}
+
+func TestListFolderChildrenPage_SideSrcAndDst(t *testing.T) {
+	database, err := db.Open(db.Options{Path: t.TempDir() + "/side-folder-children.db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	srcRoot := &db.NodeState{
+		ID: db.DeterministicNodeID("SRC", db.NodeTypeFolder, "/"), Path: "/", Name: "/",
+		Type: db.NodeTypeFolder, Depth: 0, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusAlreadyExisted,
+	}
+	dstRoot := &db.NodeState{
+		ID: db.DeterministicNodeID("DST", db.NodeTypeFolder, "/"), Path: "/", Name: "/",
+		Type: db.NodeTypeFolder, Depth: 0, TraversalStatus: db.StatusSuccessful,
+	}
+	srcFolder := &db.NodeState{
+		ID: db.DeterministicNodeID("SRC", db.NodeTypeFolder, "/A"), Path: "/src-a", ParentPath: "/", ParentID: srcRoot.ID,
+		Name: "A", Type: db.NodeTypeFolder, Depth: 1,
+		TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusAlreadyExisted,
+	}
+	dstFolder := &db.NodeState{
+		ID: db.DeterministicNodeID("DST", db.NodeTypeFolder, "/A"), Path: "/dst-a", ParentPath: "/", ParentID: dstRoot.ID,
+		Name: "A", Type: db.NodeTypeFolder, Depth: 1, TraversalStatus: db.StatusSuccessful,
+	}
+	srcOnly := &db.NodeState{
+		ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/A/s.txt"), Path: "/src-a/s.txt",
+		ParentPath: "/src-a", ParentID: srcFolder.ID, Name: "s.txt",
+		Type: db.NodeTypeFile, Depth: 2, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusPending,
+	}
+	dstOnly := &db.NodeState{
+		ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/A/d.txt"), Path: "/dst-a/d.txt",
+		ParentPath: "/dst-a", ParentID: dstFolder.ID, Name: "d.txt",
+		Type: db.NodeTypeFile, Depth: 2, TraversalStatus: db.StatusSuccessful,
+		CopyStatus: db.CopyStatusDestinationOnly,
+	}
+	pairedSrc := &db.NodeState{
+		ID: db.DeterministicNodeID("SRC", db.NodeTypeFile, "/A/p.txt"), Path: "/src-a/p.txt",
+		ParentPath: "/src-a", ParentID: srcFolder.ID, Name: "p.txt",
+		Type: db.NodeTypeFile, Depth: 2, TraversalStatus: db.StatusSuccessful, CopyStatus: db.CopyStatusAlreadyExisted,
+	}
+	pairedDst := &db.NodeState{
+		ID: db.DeterministicNodeID("DST", db.NodeTypeFile, "/A/p.txt"), Path: "/dst-a/p.txt",
+		ParentPath: "/dst-a", ParentID: dstFolder.ID, Name: "p.txt",
+		Type: db.NodeTypeFile, Depth: 2, TraversalStatus: db.StatusSuccessful,
+	}
+	seedReviewTree(t, database,
+		[]*db.NodeState{srcRoot, srcFolder, srcOnly, pairedSrc},
+		[]*db.NodeState{dstRoot, dstFolder, dstOnly, pairedDst},
+		[]db.IDMapEvent{
+			{SrcInternalID: srcFolder.ID, DstInternalID: dstFolder.ID, Status: db.IDMapStatusActive},
+			{SrcInternalID: pairedSrc.ID, DstInternalID: pairedDst.ID, Status: db.IDMapStatusActive},
+		},
+	)
+
+	srcPage, _, err := ListFolderChildrenPage(database, ReviewFilter{ParentPath: "/src-a", Side: "src"}, "path ASC", 20, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(srcPage) != 2 {
+		t.Fatalf("side=src want 2 rows (no dst-only), got %d paths=%v", len(srcPage), pathsOf(srcPage))
+	}
+	for _, row := range srcPage {
+		if row.SrcNodeID == "" {
+			t.Fatalf("side=src unexpected dst-only row %#v", row)
+		}
+	}
+
+	dstPage, _, err := ListFolderChildrenPage(database, ReviewFilter{ParentPath: "/dst-a", Side: "dst"}, "path ASC", 20, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dstPage) != 2 {
+		t.Fatalf("side=dst want 2 rows (dst-only+paired), got %d paths=%v", len(dstPage), pathsOf(dstPage))
+	}
+	var sawDstOnly, sawPaired bool
+	for _, row := range dstPage {
+		if row.DstPath == "" {
+			t.Fatalf("side=dst missing DstPath %#v", row)
+		}
+		if row.DstNodeID == dstOnly.ID && row.SrcNodeID == "" {
+			sawDstOnly = true
+		}
+		if row.DstNodeID == pairedDst.ID && row.SrcNodeID == pairedSrc.ID {
+			sawPaired = true
+			if row.SrcPath != pairedSrc.Path {
+				t.Fatalf("paired SrcPath=%q want %q", row.SrcPath, pairedSrc.Path)
+			}
+		}
+	}
+	if !sawDstOnly || !sawPaired {
+		t.Fatalf("side=dst want dst-only+paired; dstOnly=%v paired=%v paths=%v", sawDstOnly, sawPaired, pathsOf(dstPage))
+	}
 }

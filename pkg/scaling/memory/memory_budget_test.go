@@ -5,17 +5,6 @@ package memory
 
 import "testing"
 
-func TestIncreaseTowardMax(t *testing.T) {
-	next, ok := IncreaseTowardMax(500, 100, 1000, 100)
-	if !ok || next != 1000 {
-		t.Fatalf("got (%d,%v) want (1000,true)", next, ok)
-	}
-	next, ok = IncreaseTowardMax(1000, 100, 1000, 100)
-	if ok {
-		t.Fatalf("at max should not increase")
-	}
-}
-
 func TestSystemUsedFraction(t *testing.T) {
 	s := MemorySample{MemTotalKB: 1000, MemAvailableKB: 100}
 	if got := SystemUsedFraction(s); got < 0.89 || got > 0.91 {

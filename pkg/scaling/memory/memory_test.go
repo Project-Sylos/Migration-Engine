@@ -33,6 +33,18 @@ func TestLevelFromSample(t *testing.T) {
 			MemoryRed,
 		},
 		{
+			"red via monitor-style cache-as-used",
+			MemorySample{
+				MemTotalKB:     32 * 1024 * 1024,
+				MemAvailableKB: 16 * 1024 * 1024, // avail-based still 50%
+				MemFreeKB:      1024 * 1024,
+				BuffersKB:      1024 * 1024,
+				CachedKB:       1024 * 1024, // monitor used = (32-1-1-1)/32 = 90.6%
+				RSSKB:          5 * 1024 * 1024,
+			},
+			MemoryRed,
+		},
+		{
 			"high rss plenty host stays green",
 			MemorySample{MemTotalKB: 32 * 1024 * 1024, MemAvailableKB: 16 * 1024 * 1024, RSSKB: 8 * 1024 * 1024},
 			MemoryGreen,

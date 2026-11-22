@@ -66,7 +66,7 @@ Point Sylos SRC at `~/sylos_dual_tree_test/A` and DST at `~/sylos_dual_tree_test
 | **`traversal/resumption`** | **`StartMigration`**, interrupt, then **`LetsMigrate`** again with `-resume` (see script + `main.go`). |
 | **`traversal/retry_sweep`** | Full migration, then mark-for-retry / subtree / **`RunRetrySweep`** (engine retry sweep)—uses Badger status overlay + frontier. |
 | **`copy/normal`**, **`copy/local`** | Copy-phase exercises after a traversal ops store exists. |
-| **`copy/scale_down_resume`** | Spectra chaos 429s + AIMD scale-down during copy; asserts no duplicate copy success events and no `already_existed` on attempt-marked nodes. Run: `./pkg/tests/copy/scale_down_resume/run.sh` |
+| **`copy/scale_down_resume`** | Spectra chaos 429s + autoscaler scale-down during copy; asserts no duplicate copy success events and no `already_existed` on attempt-marked nodes. Run: `./pkg/tests/copy/scale_down_resume/run.sh` |
 | **`delete/local`** | Full pipeline traversal → copy → delete; asserts source tree empty. |
 
 ---

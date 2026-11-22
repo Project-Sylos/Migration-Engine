@@ -28,6 +28,7 @@ func nodeToOps(n *NodeState) opsdb.NodeRecord {
 		Name:            n.Name,
 		DisplayPath:     n.DisplayPath,
 		Type:            n.Type,
+		Extension:       n.Extension,
 		Size:            n.Size,
 		MTime:           n.MTime,
 		Depth:           n.Depth,
@@ -107,5 +108,19 @@ func idMapToOps(e IDMapEvent) opsdb.IDMapRecord {
 		DstID:  e.DstInternalID,
 		Source: e.Source,
 		Status: e.Status,
+	}
+}
+
+// HydrateNodeFromOps applies Badger status onto a node state.
+func HydrateNodeFromOps(n *NodeState, st opsdb.StatusRecord) {
+	if n == nil {
+		return
+	}
+	applyStatusToNode(n, st)
+	switch st.CopyStatus {
+	case CopyStatusExcludedExplicit, CopyStatusExcludedInherited:
+		n.Excluded = true
+	default:
+		n.Excluded = false
 	}
 }

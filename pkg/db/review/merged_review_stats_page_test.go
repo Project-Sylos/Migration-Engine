@@ -42,11 +42,11 @@ func TestGetMergedReviewStatsPagesPastFormer100kCap(t *testing.T) {
 			Depth: 1, InsertOnly: true,
 		})
 	}
-	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
-	stats, err := GetMergedReviewStats(database, ReviewFilter{
+	stats, err := GetMergedReviewStatsCtx(context.Background(), database, ReviewFilter{
 		TypeFilter: "file",
 	})
 	if err != nil {
@@ -88,7 +88,7 @@ func TestGetMergedReviewStatsTruncatedOnDeadline(t *testing.T) {
 			Depth: 1, InsertOnly: true,
 		})
 	}
-	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -96,7 +96,7 @@ func TestGetMergedReviewStatsTruncatedOnDeadline(t *testing.T) {
 	defer cancel()
 	time.Sleep(2 * time.Millisecond)
 
-	stats, err := getMergedReviewStatsCtx(ctx, database, ReviewFilter{TypeFilter: "file"})
+	stats, err := GetMergedReviewStatsCtx(ctx, database, ReviewFilter{TypeFilter: "file"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func TestListMergedReviewDiffsPageCtxHonorsCancel(t *testing.T) {
 			Depth: 1, InsertOnly: true,
 		})
 	}
-	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 

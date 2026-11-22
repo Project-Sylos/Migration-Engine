@@ -53,7 +53,7 @@ bash pkg/tests/shared/dual_tree/cleanup.sh
 2. Sylos SRC=`.../A` DST=`.../B` -> start traversal (expect failures under A's children)
 3. `restore.sh`
 4. Mark failed for retry / retry sweep
-5. Confirm SRC discovers shared + src-only; DST-only stay `not_on_src` until relevant
+5. Confirm SRC discovers shared + src-only; DST-only folders walk as `pending`→`successful` (unpaired, no copy)
 
 ### Copy retry
 1. Trees built and traversable (no deny, or restore first)

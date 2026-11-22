@@ -5,6 +5,7 @@ package opsdb
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,7 +27,6 @@ type Store struct {
 	dir   string
 	db    *badger.DB
 	mu    sync.RWMutex
-	seq   atomic.Uint64
 	opSeq atomic.Uint64
 }
 
@@ -88,14 +88,6 @@ func (s *Store) Dir() string {
 	return s.dir
 }
 
-func (s *Store) update(fn func(txn *badger.Txn) error) error {
-	return s.db.Update(fn)
-}
-
-func (s *Store) view(fn func(txn *badger.Txn) error) error {
-	return s.db.View(fn)
-}
-
 func putNodeTxn(txn *badger.Txn, side string, n NodeRecord, payload []byte) error {
 	if err := txn.Set(nodeKey(side, n.ID), payload); err != nil {
 		return err
@@ -113,7 +105,7 @@ func (s *Store) PutNode(side string, n NodeRecord) error {
 	if n.ID == "" {
 		return fmt.Errorf("opsdb PutNode: empty id")
 	}
-	b, err := encode(n)
+	b, err := json.Marshal(n)
 	if err != nil {
 		return err
 	}
@@ -121,7 +113,7 @@ func (s *Store) PutNode(side string, n NodeRecord) error {
 	if err != nil {
 		return err
 	}
-	err = s.update(func(txn *badger.Txn) error {
+	err = s.db.Update(func(txn *badger.Txn) error {
 		if prev.ID != "" && !nodeIndexFieldsEqual(prev, n) {
 			if err := deleteNodeIndexesTxn(txn, side, prev); err != nil {
 				return err
@@ -146,7 +138,7 @@ func (s *Store) PutStatus(side, id string, st StatusRecord) error {
 	if id == "" {
 		return fmt.Errorf("opsdb PutStatus: empty id")
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		return writePhaseStatusTxn(txn, side, id, st)
 	})
 }
@@ -156,7 +148,7 @@ func (s *Store) BatchPutStatus(side string, puts map[string]StatusRecord) error 
 	if len(puts) == 0 {
 		return nil
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		for id, st := range puts {
 			if id == "" {
 				continue
@@ -174,11 +166,11 @@ func (s *Store) PutIDMap(m IDMapRecord) error {
 	if m.SrcID == "" || m.DstID == "" {
 		return fmt.Errorf("opsdb PutIDMap: empty ids")
 	}
-	b, err := encode(m)
+	b, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		if err := txn.Set(mapSrcKey(m.SrcID), b); err != nil {
 			return err
 		}
@@ -284,12 +276,12 @@ func (s *Store) PutNodeStatusPending(side string, n NodeRecord, st StatusRecord,
 	if n.ID == "" {
 		return nil, fmt.Errorf("opsdb PutNodeStatusPending: empty id")
 	}
-	nb, err := encode(n)
+	nb, err := json.Marshal(n)
 	if err != nil {
 		return nil, err
 	}
 	var sched []SchedCountDelta
-	err = s.update(func(txn *badger.Txn) error {
+	err = s.db.Update(func(txn *badger.Txn) error {
 		sched = nil
 		if err := putNodeTxn(txn, side, n, nb); err != nil {
 			return err
@@ -311,7 +303,7 @@ func (s *Store) PutStatusPendingKeys(side, id string, st StatusRecord, depth int
 		return nil, fmt.Errorf("opsdb PutStatusPendingKeys: empty id")
 	}
 	var sched []SchedCountDelta
-	err := s.update(func(txn *badger.Txn) error {
+	err := s.db.Update(func(txn *badger.Txn) error {
 		sched = nil
 		if err := writePhaseStatusTxn(txn, side, id, st); err != nil {
 			return err
@@ -328,7 +320,7 @@ func (s *Store) AddPending(side, phase string, depth int, nodeType, id string) e
 	if id == "" {
 		return nil
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		return addPendingTxn(txn, side, phase, depth, nodeType, id)
 	})
 }
@@ -338,7 +330,7 @@ func (s *Store) DeletePending(side, phase string, depth int, nodeType, id string
 	if id == "" {
 		return nil
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		return deletePendingTxn(txn, side, phase, depth, nodeType, id)
 	})
 }
@@ -369,18 +361,14 @@ func statusMatchesPendingPhase(st StatusRecord, phase, wantStatus string) bool {
 	}
 }
 
-// DropPendingPrefix removes all pending keys under side/phase/depth/type.
-func (s *Store) DropPendingPrefix(side, phase string, depth int, nodeType string) error {
+// DropPendingPrefixAborted removes all pending keys under side/phase/depth/type, with an optional abort check between delete batches.
+func (s *Store) DropPendingPrefixAborted(side, phase string, depth int, nodeType string, aborted func() bool) error {
 	nodeType = pendingNodeType(nodeType)
 	prefix := pendingPrefix(side, phase, depth, nodeType)
-	return s.update(func(txn *badger.Txn) error {
-		it := txn.NewIterator(badger.DefaultIteratorOptions)
-		defer it.Close()
-		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-			if err := txn.Delete(it.Item().KeyCopy(nil)); err != nil {
-				return err
-			}
-		}
+	if err := s.deletePrefixAborted(prefix, aborted); err != nil {
+		return err
+	}
+	return s.db.Update(func(txn *badger.Txn) error {
 		return writeSchedCount(txn, side, phase, depth, nodeType, 0)
 	})
 }
@@ -389,7 +377,7 @@ func (s *Store) DropPendingPrefix(side, phase string, depth int, nodeType string
 func (s *Store) GetNode(side, id string) (NodeRecord, bool, error) {
 	var out NodeRecord
 	found := false
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(nodeKey(side, id))
 		if err == badger.ErrKeyNotFound {
 			return nil
@@ -410,7 +398,7 @@ func (s *Store) GetNode(side, id string) (NodeRecord, bool, error) {
 func (s *Store) GetStatus(side, id string) (StatusRecord, bool, error) {
 	var out StatusRecord
 	found := false
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		st, ok, err := mergedStatusTxn(txn, side, id)
 		if err != nil {
 			return err
@@ -428,7 +416,7 @@ func (s *Store) GetStatus(side, id string) (StatusRecord, bool, error) {
 // BatchGetStatus returns status for each id (missing ids omitted).
 func (s *Store) BatchGetStatus(side string, ids []string) (map[string]StatusRecord, error) {
 	out := make(map[string]StatusRecord, len(ids))
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		for _, id := range ids {
 			if id == "" {
 				continue
@@ -450,7 +438,7 @@ func (s *Store) BatchGetStatus(side string, ids []string) (map[string]StatusReco
 // BatchGetNode returns catalog metadata for each id (missing ids omitted).
 func (s *Store) BatchGetNode(side string, ids []string) (map[string]NodeRecord, error) {
 	out := make(map[string]NodeRecord, len(ids))
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		for _, id := range ids {
 			if id == "" {
 				continue
@@ -480,7 +468,7 @@ func (s *Store) BatchGetNode(side string, ids []string) (map[string]NodeRecord, 
 func (s *Store) BatchGetNodeStatus(side string, ids []string) (map[string]NodeRecord, map[string]StatusRecord, error) {
 	nodes := make(map[string]NodeRecord, len(ids))
 	sts := make(map[string]StatusRecord, len(ids))
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		for _, id := range ids {
 			if id == "" {
 				continue
@@ -519,7 +507,7 @@ func (s *Store) WalkStatus(side, afterID string, reverse bool, fn func(id string
 	if s == nil || s.db == nil || fn == nil {
 		return nil
 	}
-	return s.view(func(txn *badger.Txn) error {
+	return s.db.View(func(txn *badger.Txn) error {
 		travPrefix := statusPhasePrefix(side, PhaseTrav)
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		it.Seek(travPrefix)
@@ -632,7 +620,7 @@ func walkLegacyStatusTxn(txn *badger.Txn, side, afterID string, reverse bool, fn
 func (s *Store) GetMapBySrc(srcID string) (IDMapRecord, bool, error) {
 	var out IDMapRecord
 	found := false
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(mapSrcKey(srcID))
 		if err == badger.ErrKeyNotFound {
 			return nil
@@ -653,7 +641,7 @@ func (s *Store) GetMapBySrc(srcID string) (IDMapRecord, bool, error) {
 func (s *Store) GetMapByDst(dstID string) (IDMapRecord, bool, error) {
 	var out IDMapRecord
 	found := false
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(mapDstKey(dstID))
 		if err == badger.ErrKeyNotFound {
 			return nil
@@ -673,7 +661,7 @@ func (s *Store) GetMapByDst(dstID string) (IDMapRecord, bool, error) {
 // BatchGetMap returns SRC↔DST maps for ids (missing omitted). dstKey true looks up map:dst, false map:src.
 func (s *Store) BatchGetMap(ids []string, dstKey bool) (map[string]IDMapRecord, error) {
 	out := make(map[string]IDMapRecord, len(ids))
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		for _, id := range ids {
 			if id == "" {
 				continue
@@ -706,7 +694,7 @@ func (s *Store) BatchGetMap(ids []string, dstKey bool) (map[string]IDMapRecord, 
 // BatchGetKids returns packed SRC/DST children for each parent id (missing omitted).
 func (s *Store) BatchGetKids(side string, parentIDs []string) (map[string][]KidRecord, error) {
 	out := make(map[string][]KidRecord, len(parentIDs))
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		for _, parentID := range parentIDs {
 			if parentID == "" {
 				continue
@@ -765,7 +753,7 @@ func (s *Store) ListChildren(side, parentID, afterID string, limit int) ([]strin
 		limit = 100
 	}
 	var ids []string
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
@@ -782,7 +770,7 @@ func (s *Store) ListChildrenMany(side string, parentIDs []string, limit int) (ma
 		limit = 10000
 	}
 	out := make(map[string][]string, len(parentIDs))
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
@@ -811,7 +799,7 @@ func (s *Store) ListRecentLogs(limit int) ([]LogRecord, error) {
 	}
 	prefix := []byte("log:")
 	var out []LogRecord
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.Reverse = true
 		it := txn.NewIterator(opts)
@@ -840,7 +828,7 @@ func (s *Store) ListPending(side, phase string, depth int, nodeType, afterID, wa
 	nodeType = pendingNodeType(nodeType)
 	prefix := pendingPrefix(side, phase, depth, nodeType)
 	var ids []string
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer it.Close()
 		startKey := prefix
@@ -877,20 +865,12 @@ func (s *Store) ListPending(side, phase string, depth int, nodeType, afterID, wa
 	return ids, err
 }
 
-// IncrStat adds delta to a review counter key.
-func (s *Store) IncrStat(key string, delta int64) error {
-	if key == "" || delta == 0 {
-		return nil
-	}
-	return s.ApplyReviewAndDepth([]string{key}, []int64{delta}, nil)
-}
-
 // SetStat sets an absolute review counter value.
 func (s *Store) SetStat(key string, value int64) error {
 	if s == nil || s.db == nil || key == "" {
 		return nil
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		return writeInt64(txn, statKey(key), value)
 	})
 }
@@ -898,7 +878,7 @@ func (s *Store) SetStat(key string, value int64) error {
 // GetStat reads a review counter.
 func (s *Store) GetStat(key string) (int64, error) {
 	var cur int64
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(statKey(key))
 		if err == badger.ErrKeyNotFound {
 			return nil
@@ -912,11 +892,6 @@ func (s *Store) GetStat(key string) (int64, error) {
 		})
 	})
 	return cur, err
-}
-
-// AppendLog appends one log record.
-func (s *Store) AppendLog(rec LogRecord) error {
-	return s.AppendLogs([]LogRecord{rec})
 }
 
 // AppendLogs appends many append-only log records in one Badger WriteBatch flush.
@@ -940,7 +915,7 @@ func (s *Store) GetLogsByIDs(ids []string) (map[string]LogRecord, error) {
 	if s == nil || s.db == nil || len(ids) == 0 {
 		return out, nil
 	}
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		for _, id := range ids {
 			id = strings.TrimSpace(id)
 			if id == "" {
@@ -973,12 +948,12 @@ func (s *Store) AppendDBOp(rec DBOpRecord) error {
 		rec.At = time.Now()
 	}
 	seq := s.opSeq.Add(1)
-	b, err := encode(rec)
+	b, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
 	k := opKey(rec.At.UnixNano(), seq)
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set(k, b)
 	})
 }
@@ -993,7 +968,7 @@ func (s *Store) ListDBOps(opFilter string, limit int) ([]DBOpRecord, error) {
 	}
 	prefix := []byte("op:")
 	var out []DBOpRecord
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.Reverse = true
 		it := txn.NewIterator(opts)
@@ -1022,11 +997,11 @@ func (s *Store) AppendQueueStats(rec QueueStatsRecord) error {
 	if rec.At.IsZero() {
 		rec.At = time.Now()
 	}
-	b, err := encode(rec)
+	b, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		if err := txn.Set(qstatKey(rec.QueueKey, rec.Phase, rec.At.UnixNano()), b); err != nil {
 			return err
 		}
@@ -1040,7 +1015,7 @@ func (s *Store) LatestQueueStats(queueKey, phase string) (*QueueStatsRecord, err
 		return nil, nil
 	}
 	var rec QueueStatsRecord
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(qstatLatestKey(queueKey, phase))
 		if err == badger.ErrKeyNotFound {
 			return nil
@@ -1070,7 +1045,7 @@ func (s *Store) AllLatestQueueStats() ([]QueueStatsRecord, error) {
 	}
 	prefix := []byte("qstat:latest:")
 	var out []QueueStatsRecord
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer it.Close()
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
@@ -1099,16 +1074,11 @@ func (s *Store) AppendTaskError(rec TaskErrorRecord) error {
 	if id == "" {
 		id = fmt.Sprintf("%d", rec.At.UnixNano())
 	}
-	b, err := encode(rec)
+	b, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set(taskErrKey(rec.At.UnixNano(), id), b)
 	})
-}
-
-// NextCatalogSeq returns a monotonic batch sequence number.
-func (s *Store) NextCatalogSeq() uint64 {
-	return s.seq.Add(1)
 }

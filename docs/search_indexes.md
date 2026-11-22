@@ -52,17 +52,17 @@ If the first part cannot use the segment index, the planner may still use a trig
 
 ## Trigrams (`idx:tri`)
 
-**What is stored.** Overlapping 3-character slices of the node name and of each path part, lowercased, unique. Slices do not cross `/`, so a gram never straddles a folder boundary. Strings shorter than 3 characters are padded with spaces on the edges so they still have one gram. Display path is used when it is set, otherwise the storage path.
+**What is stored.** Overlapping 3-character slices of the node name and of each path part, lowercased, unique. Slices do not cross `/`, so a gram never straddles a folder boundary. Strings shorter than 3 characters are padded with spaces on the edges so they still have one gram. Display path is used when it is set, otherwise the storage path. For **files** only, the stored `Extension` is stripped from each token before grams are taken, and only when that token actually ends with `.`+Extension (so `ILOVEYOU.txt.vbs` with Extension `vbs` indexes `ILOVEYOU.txt`, not a bare last-dot guess). Folders never strip. Name / segment / display path indexes keep the full strings; this strip is trigram-only. Query needles still drop a trailing extension heuristically so a search for `file.txt` can hit grams indexed as `file`.
 
-**What a search asks for.** A name substring: the basic name query, or ruleset name `contains` / `eq` leaves. Every such needle is planned; candidate ids are the union of each needle's trigram intersect. Path rules are not trigram needles. Wildcards are skipped. A needle with no grams is skipped. Verify accepts a node when name or display path contains any planned needle; the compiled ruleset (or simple Query) still applies after that.
+**What a search asks for.** Search-bar name/path text, path-segment parts, and ruleset name `contains` / `eq` leaves. Every such needle is planned; candidate ids are the **union of ranked** trigram postings (score = how many needle grams hit). Wildcards are skipped. A needle with no grams is skipped. Verify keeps substring hits, small edit-distance typos, or any shared trigram; results are ordered by relevance score then the UI sort column. Compiled ruleset `contains` still requires a real substring after that.
 
 **How a hit is found.**
 
 1. Split the needle into the same kind of grams the index stores.
-2. Load each gram's posting list. Intersect them smallest-list-first. If any gram has no posts, the answer is empty. An id must appear under every gram to survive.
-3. Do not trust the intersect. Grams can all be present without forming the contiguous needle (they may even come from different path parts). Survivors are checked with a case-insensitive contains on the name or the display path against any planned needle. That verify is what makes a trigram hit a real match before the full filter runs.
+2. Load each gram's posting list and **score** ids by overlap count (partial match). Higher scores first; lists are capped then truncated to the planner limit.
+3. Soft-verify each survivor (contains, edit distance, or shared grams). Exact `contains` in an advanced filter still runs as a boolean after candidates are chosen.
 
-Trigrams are a candidate generator for "this name contains …", not a path-layout index. A needle of length 1 or 2 still works because of the padding, but it is a wide posting list and a weak plan compared with a longer needle.
+Trigrams are a weighted partial-match index for the search bar, not only an exact-substring accelerator. A needle of length 1 or 2 still works because of the padding, but it is a wide posting list and a weak plan compared with a longer needle.
 
 ## Planner order
 
@@ -74,7 +74,7 @@ Roughly, first match wins:
 2. A size range, when one was given.
 3. A whole-token or prefix name via `idx:seg` or `idx:name`.
 4. Path-segment anchors (first part, then subtree expand).
-5. Trigram intersect, if a name-contains needle exists.
+5. Trigram ranked partial match, if a text needle exists.
 6. A capped full path scan.
 
 So a query that is both "name contains file" and "path parts Reports / Q1" prefers the path-segment anchor when the first part hits `idx:seg`. The name check still runs on those candidates. Trigrams are the fallback when the precise indexes miss, not the default for every text query.
@@ -83,5 +83,5 @@ So a query that is both "name contains file" and "path parts Reports / Q1" prefe
 
 - Not a scan of file contents.
 - Not an open path-contains search. That shape is not how the catalog search indexes work.
-- Not rebuilt at phase seal. If a node is inserted, its postings are written then. If a node is renamed or deleted, those postings are rewritten or removed with it.
+- Not rebuilt at phase seal. If a node is inserted, its postings are written then. If a node is renamed or deleted, those postings are rewritten or removed with it. GPL rename updates `Name` and `DisplayPath` (and descendant display paths under a renamed folder) so `idx:tri` / name tokens stay consistent; `Path` / `idx:path` stay on stable id_path.
 - Not two-way sync. SRC and DST are indexed separately because both trees are browsable, not because search copies both ways.

@@ -4,6 +4,7 @@
 package opsdb
 
 import (
+	"encoding/json"
 	"fmt"
 
 	badger "github.com/dgraph-io/badger/v4"
@@ -27,11 +28,11 @@ func (s *Store) PutFilterApplication(rec FilterApplicationRecord) error {
 	if s == nil || rec.ID == "" {
 		return nil
 	}
-	b, err := encode(rec)
+	b, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set(filterAppKey(rec.ID), b)
 	})
 }
@@ -42,13 +43,13 @@ func (s *Store) GetFilterApplication(id string) (FilterApplicationRecord, error)
 	if s == nil || id == "" {
 		return rec, badger.ErrKeyNotFound
 	}
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(filterAppKey(id))
 		if err != nil {
 			return err
 		}
 		return item.Value(func(val []byte) error {
-			return decodeInto(val, &rec)
+			return json.Unmarshal(val, &rec)
 		})
 	})
 	return rec, err
@@ -59,7 +60,7 @@ func (s *Store) UpdateFilterApplicationCounts(id string, matched, excluded int64
 	if s == nil || id == "" {
 		return nil
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		item, err := txn.Get(filterAppKey(id))
 		if err == badger.ErrKeyNotFound {
 			return fmt.Errorf("filter application %s not found", id)
@@ -69,13 +70,13 @@ func (s *Store) UpdateFilterApplicationCounts(id string, matched, excluded int64
 		}
 		var rec FilterApplicationRecord
 		if err := item.Value(func(val []byte) error {
-			return decodeInto(val, &rec)
+			return json.Unmarshal(val, &rec)
 		}); err != nil {
 			return err
 		}
 		rec.MatchedCount = matched
 		rec.ExcludedCount = excluded
-		b, err := encode(rec)
+		b, err := json.Marshal(rec)
 		if err != nil {
 			return err
 		}

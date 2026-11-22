@@ -4,8 +4,6 @@
 package worker
 
 import (
-	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
-	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -155,305 +156,314 @@ func adapterBatchMax[T any](adapter types.FSAdapter, from func(any) (T, bool), m
 	return b, n, true
 }
 
-func copyBatchLeaseEnabled(pass, requiredPass int, batchOK bool) bool {
-	return pass == requiredPass && batchOK
+// batchSpec sizes and times one batch lease turn.
+type batchSpec struct {
+	max          int
+	pullSize     int
+	byteBudget   bool
+	stallTimeout time.Duration
+	// interOp waits the inter-operation pacing delay before the batch runs.
+	interOp bool
 }
 
-func (w *CopyWorker) useFolderBatchLease() bool {
-	_, _, ok := adapterBatchMax(w.dstAdapter, types.CreateFolderBatchFrom, func(b types.FSCreateFolderBatch) int {
-		return b.CreateFolderBatchMax()
-	}, types.DefaultCreateFolderBatchMax)
-	return copyBatchLeaseEnabled(w.queue.GetCopyPass(), 1, ok)
+func fileLeaseBytes(group []*queue.TaskBase) int64 {
+	var n int64
+	for _, task := range group {
+		if task != nil && task.IsFile() {
+			n += task.File.Size
+		}
+	}
+	return n
 }
 
-func (w *CopyWorker) runFolderBatchTurn() {
+// leaseAndRunBatch leases one budgeted group and runs fn with the batch watchdog context.
+// The ProgressWatchdog only sees real progress: beatBatchWatchdogs beats the queue watchdog
+// alone, so a hung batch call still cancels after spec.stallTimeout.
+func (b *workerBase) leaseAndRunBatch(spec batchSpec, fn func(group []*queue.TaskBase, parent, ctx context.Context, wd *observe.ProgressWatchdog)) {
+	b.queue.EnsureLeaseBatchSizeAtLeast(spec.pullSize)
+
+	group := b.queue.LeaseGroupBudget(queue.LeaseBudgetOpts{MaxCount: spec.max, UseByteBudget: spec.byteBudget})
+	if len(group) == 0 {
+		time.Sleep(50 * time.Millisecond)
+		return
+	}
+	for _, t := range group {
+		b.queue.BindLeaseOwner(t, b.id)
+	}
+
+	setWorkerBusy(b.idle)
+	defer markWorkerIdle(b.queue, b.id, b.idle)
+	var leaseBytes int64
+	if spec.byteBudget {
+		leaseBytes = fileLeaseBytes(group)
+	}
+	b.queue.SetActiveLeaseSize(b.id, leaseBytes)
+	defer b.queue.ClearActiveLeaseSize(b.id)
+
+	parent := fsOpContext(b.workerCtx, b.shutdownCtx)
+	wd, ctx := observe.NewProgressWatchdog(parent, spec.stallTimeout, progressStallSuppress(b.queue))
+	defer wd.Stop()
+	stopBeat := beatBatchWatchdogs(ctx, b.queue, wd)
+	defer stopBeat()
+
+	if spec.interOp {
+		b.queue.WaitInterOp(b.workerCtx)
+	}
+	fn(group, parent, ctx, wd)
+}
+
+func reportGroupOutcome(q *queue.Queue, tasks []*queue.TaskBase, err error) {
+	for _, task := range tasks {
+		reportTaskOutcome(q, task, err)
+	}
+}
+
+// settleBatchError routes a failed batch call: yield on force checkout, rate-limit the
+// group on throttle, otherwise fail every task.
+func (b *workerBase) settleBatchError(err error, aligned []*queue.TaskBase) {
+	if isForceCheckoutAbort(err, b.shouldRetire(), b.queue.ForceCheckoutWorker(b.id)) {
+		abandonLeasedGroup(b.queue, aligned)
+		return
+	}
+	if queue.IsThrottleError(err) {
+		reportGroupRateLimited(b.queue, aligned, err)
+		return
+	}
+	reportGroupOutcome(b.queue, aligned, err)
+}
+
+// batchResultsMatch fails the whole group when the adapter returned the wrong result count.
+func (b *workerBase) batchResultsMatch(name string, got int, aligned []*queue.TaskBase) bool {
+	if got == len(aligned) {
+		return true
+	}
+	reportGroupOutcome(b.queue, aligned, fmt.Errorf("%s returned %d results for %d tasks", name, got, len(aligned)))
+	return false
+}
+
+func (w *CopyWorker) batchTurn() bool {
+	return w.folderBatchTurn() || w.fileBatchTurn()
+}
+
+func (w *CopyWorker) folderBatchTurn() bool {
+	if w.queue.GetCopyPass() != 1 {
+		return false
+	}
 	batch, maxN, ok := adapterBatchMax(w.dstAdapter, types.CreateFolderBatchFrom, func(b types.FSCreateFolderBatch) int {
 		return b.CreateFolderBatchMax()
 	}, types.DefaultCreateFolderBatchMax)
 	if !ok {
-		return
+		return false
 	}
-	w.queue.EnsureLeaseBatchSizeAtLeast(types.DefaultCreateFolderBatchPullSize)
-
-	group := w.queue.LeaseGroupBudget(queue.LeaseBudgetOpts{MaxCount: maxN})
-	if len(group) == 0 {
-		time.Sleep(50 * time.Millisecond)
-		return
-	}
-	for _, t := range group {
-		w.queue.BindLeaseOwner(t, w.id)
-	}
-
-	setWorkerBusy(w.idle)
-	defer markWorkerIdle(w.queue, w.id, w.idle)
-	w.queue.SetActiveLeaseSize(w.id, 0)
-	defer w.queue.ClearActiveLeaseSize(w.id)
-
-	parent := fsOpContext(w.workerCtx, w.shutdownCtx)
-	wd, ctx := observe.NewProgressWatchdog(parent, folderBatchStallTimeout, progressStallSuppress(w.queue))
-	defer wd.Stop()
-	stopBeat := beatBatchWatchdogs(ctx, w.queue, wd)
-	defer stopBeat()
-
-	w.queue.WaitInterOp(w.workerCtx)
-
-	if w.queue.ShouldApplyCopyDstResumeExistenceCheck() {
-		group = w.partitionFolderGroupForResumeExistence(ctx, wd, group)
-		if len(group) == 0 {
-			return
+	spec := batchSpec{max: maxN, pullSize: types.DefaultCreateFolderBatchPullSize, stallTimeout: folderBatchStallTimeout, interOp: true}
+	w.leaseAndRunBatch(spec, func(group []*queue.TaskBase, parent, ctx context.Context, wd *observe.ProgressWatchdog) {
+		if w.queue.ShouldApplyCopyDstResumeExistenceCheck() {
+			group = w.partitionFolderGroupForResumeExistence(ctx, wd, group)
+			if len(group) == 0 {
+				return
+			}
 		}
-	}
 
-	items := make([]types.CreateFolderBatchItem, 0, len(group))
-	aligned := make([]*queue.TaskBase, 0, len(group))
-	for _, task := range group {
-		if task.CopyPass != 1 || !task.IsFolder() {
-			reportTaskOutcome(w.queue, task, fmt.Errorf("folder batch leased non-folder or wrong pass task %s", task.LocationPath()))
-			continue
-		}
-		dstParent := task.DstParentID
-		if dstParent == "" {
-			reportTaskOutcome(w.queue, task, fmt.Errorf("task missing DstParentID for %s", task.LocationPath()))
-			continue
-		}
-		name := copyTaskCreateBasename(task)
-		if name == "" {
-			reportTaskOutcome(w.queue, task, fmt.Errorf("empty create basename for folder %s", task.LocationPath()))
-			continue
-		}
-		items = append(items, types.CreateFolderBatchItem{
-			ParentID: dstParent,
-			Name:     name,
-			Metadata: copyTaskCreateMetadata(task),
-		})
-		aligned = append(aligned, task)
-	}
-	if len(items) == 0 {
-		return
-	}
-
-	results, err := awaitResult(ctx, parent, folderBatchStallTimeout, "create folder batch", "", func() ([]types.CreateFolderBatchEntryResult, error) {
-		return batch.CreateFolderBatch(ctx, items)
-	})
-	if err != nil {
-		if isForceCheckoutAbort(err, w.shouldRetire(), w.queue.ForceCheckoutWorker(w.id)) {
-			abandonLeasedGroup(w.queue, aligned)
-			return
-		}
-		if queue.IsThrottleError(err) {
-			reportGroupRateLimited(w.queue, aligned, err)
-			return
-		}
-		for _, task := range aligned {
-			reportTaskOutcome(w.queue, task, err)
-		}
-		return
-	}
-	wd.Beat()
-	if len(results) != len(aligned) {
-		err := fmt.Errorf("create folder batch returned %d results for %d tasks", len(results), len(aligned))
-		for _, task := range aligned {
-			reportTaskOutcome(w.queue, task, err)
-		}
-		return
-	}
-
-	for i, task := range aligned {
-		res := results[i]
-		if res.Err != nil {
-			// Race: folder appeared between list filter and batch create; adopt existing.
-			if w.queue.ShouldApplyCopyDstResumeExistenceCheck() || isDstPathConflictError(res.Err) {
-				done, preErr := w.applyResumeCopyDstFolderPrecheck(task, ctx, wd)
-				if preErr == nil && done {
-					markCopyAlreadyExists(task)
-					reportTaskOutcome(w.queue, task, nil)
+		items := make([]types.CreateFolderBatchItem, 0, len(group))
+		aligned := make([]*queue.TaskBase, 0, len(group))
+		for _, task := range group {
+			if task.CopyPass != 1 || !task.IsFolder() {
+				reportTaskOutcome(w.queue, task, fmt.Errorf("folder batch leased non-folder or wrong pass task %s", task.DisplayPath))
+				continue
+			}
+			dstParent := task.DstParentID
+			if dstParent == "" {
+				reportTaskOutcome(w.queue, task, fmt.Errorf("task missing DstParentID for %s", task.DisplayPath))
+				continue
+			}
+			name := copyTaskCreateBasename(task)
+			if name == "" {
+				reportTaskOutcome(w.queue, task, fmt.Errorf("empty create basename for folder %s", task.DisplayPath))
+				continue
+			}
+			if task.DstPeerCopyStatus == db.CopyStatusNeedsOverwrite {
+				if err := w.deleteMappedDstPeer(task, ctx, parent, wd); err != nil {
+					reportTaskOutcome(w.queue, task, err)
 					continue
 				}
 			}
-			reportTaskOutcome(w.queue, task, res.Err)
-			continue
+			items = append(items, types.CreateFolderBatchItem{
+				ParentID: dstParent,
+				Name:     name,
+				Metadata: copyTaskCreateMetadata(task),
+			})
+			aligned = append(aligned, task)
 		}
-		applyCopyDstFolderFromAdapter(task, res.Folder)
-		reportTaskOutcome(w.queue, task, nil)
-	}
-}
+		if len(items) == 0 {
+			return
+		}
 
-func (w *CopyWorker) useFileBatchLease() bool {
-	_, _, ok := adapterBatchMax(w.dstAdapter, types.UploadFilesBatchFrom, func(b types.FSUploadFilesBatch) int {
-		return b.UploadFilesBatchMax()
-	}, types.DefaultUploadFilesBatchMax)
-	return copyBatchLeaseEnabled(w.queue.GetCopyPass(), 2, ok)
+		results, err := awaitResult(w.queue, ctx, parent, folderBatchStallTimeout, "create folder batch", "", func() ([]types.CreateFolderBatchEntryResult, error) {
+			return batch.CreateFolderBatch(ctx, items)
+		})
+		if err != nil {
+			w.settleBatchError(err, aligned)
+			return
+		}
+		wd.Beat()
+		if !w.batchResultsMatch("create folder batch", len(results), aligned) {
+			return
+		}
+
+		for i, task := range aligned {
+			res := results[i]
+			if res.Err != nil {
+				// Race: folder appeared between list filter and batch create; adopt existing.
+				if w.queue.ShouldApplyCopyDstResumeExistenceCheck() || isDstPathConflictError(res.Err) {
+					done, preErr := w.applyResumeCopyDstFolderPrecheck(task, ctx, wd)
+					if preErr == nil && done {
+						markCopyAlreadyExists(task)
+						reportTaskOutcome(w.queue, task, nil)
+						continue
+					}
+				}
+				reportTaskOutcome(w.queue, task, res.Err)
+				continue
+			}
+			applyCopyDstFolderFromAdapter(task, res.Folder)
+			reportTaskOutcome(w.queue, task, nil)
+		}
+	})
+	return true
 }
 
 const fileBatchStallTimeout = 30 * time.Minute
 
-func (w *CopyWorker) runFileBatchTurn() {
+func (w *CopyWorker) fileBatchTurn() bool {
+	if w.queue.GetCopyPass() != 2 {
+		return false
+	}
 	batch, maxN, ok := adapterBatchMax(w.dstAdapter, types.UploadFilesBatchFrom, func(b types.FSUploadFilesBatch) int {
 		return b.UploadFilesBatchMax()
 	}, types.DefaultUploadFilesBatchMax)
 	if !ok {
-		return
+		return false
 	}
-	w.queue.EnsureLeaseBatchSizeAtLeast(types.DefaultUploadFilesBatchPullSize)
-
-	group := w.queue.LeaseGroupBudget(queue.LeaseBudgetOpts{MaxCount: maxN, UseByteBudget: true})
-	if len(group) == 0 {
-		time.Sleep(50 * time.Millisecond)
-		return
-	}
-	for _, t := range group {
-		w.queue.BindLeaseOwner(t, w.id)
-	}
-
-	setWorkerBusy(w.idle)
-	defer markWorkerIdle(w.queue, w.id, w.idle)
-	var leaseBytes int64
-	for _, task := range group {
-		if task != nil && task.IsFile() {
-			leaseBytes += task.File.Size
-		}
-	}
-	w.queue.SetActiveLeaseSize(w.id, leaseBytes)
-	defer w.queue.ClearActiveLeaseSize(w.id)
-
-	parent := fsOpContext(w.workerCtx, w.shutdownCtx)
-	wd, ctx := observe.NewProgressWatchdog(parent, fileBatchStallTimeout, progressStallSuppress(w.queue))
-	defer wd.Stop()
-	stopBeat := beatBatchWatchdogs(ctx, w.queue, wd)
-	defer stopBeat()
-
-	w.queue.WaitInterOp(w.workerCtx)
-
-	if w.queue.ShouldApplyCopyDstResumeExistenceCheck() {
-		group = w.partitionFileGroupForResumeExistence(ctx, wd, group)
-		if len(group) == 0 {
-			return
-		}
-		// Recompute lease bytes after skipping already-present files.
-		leaseBytes = 0
-		for _, task := range group {
-			if task != nil && task.IsFile() {
-				leaseBytes += task.File.Size
-			}
-		}
-		w.queue.SetActiveLeaseSize(w.id, leaseBytes)
-	}
-
-	items := make([]types.UploadFilesBatchItem, 0, len(group))
-	aligned := make([]*queue.TaskBase, 0, len(group))
-	opened := make([]io.ReadCloser, 0, len(group))
-	defer func() {
-		// Close any readers not handed to UploadFilesBatch (e.g. early return after open).
-		for _, rc := range opened {
-			if rc != nil {
-				_ = rc.Close()
-			}
-		}
-	}()
-
-	for _, task := range group {
-		if task.CopyPass != 2 || !task.IsFile() {
-			reportTaskOutcome(w.queue, task, fmt.Errorf("file batch leased non-file or wrong pass task %s", task.LocationPath()))
-			continue
-		}
-		dstParent := task.DstParentID
-		if dstParent == "" {
-			reportTaskOutcome(w.queue, task, fmt.Errorf("task missing DstParentID for %s", task.LocationPath()))
-			continue
-		}
-		srcID := task.File.ServiceID
-		if srcID == "" {
-			reportTaskOutcome(w.queue, task, fmt.Errorf("task missing source ServiceID for %s", task.LocationPath()))
-			continue
-		}
-		plan, err := awaitResult(ctx, parent, fileBatchStallTimeout, "prepare resume", task.LocationPath(), func() (queue.FileTransferPlan, error) {
-			return queue.PrepareFileTransferResume(ctx, w.queue, w.dstAdapter, task)
-		})
-		if err != nil {
-			reportTaskOutcome(w.queue, task, fmt.Errorf("prepare transfer resume for %s: %w", task.LocationPath(), err))
-			continue
-		}
-		resumeOffset := plan.ResumeOffset
-		name := copyTaskCreateBasename(task)
-		if name == "" {
-			reportTaskOutcome(w.queue, task, fmt.Errorf("empty create basename for file %s", task.LocationPath()))
-			continue
-		}
-		rc, err := awaitResult(ctx, parent, fileBatchStallTimeout, "open source", task.LocationPath(), func() (io.ReadCloser, error) {
-			return w.srcAdapter.OpenRead(parent, srcID)
-		})
-		if err != nil {
-			if isForceCheckoutAbort(err, w.shouldRetire(), w.queue.ForceCheckoutWorker(w.id)) {
-				abandonLeasedGroup(w.queue, group)
+	spec := batchSpec{max: maxN, pullSize: types.DefaultUploadFilesBatchPullSize, byteBudget: true, stallTimeout: fileBatchStallTimeout, interOp: true}
+	w.leaseAndRunBatch(spec, func(group []*queue.TaskBase, parent, ctx context.Context, wd *observe.ProgressWatchdog) {
+		if w.queue.ShouldApplyCopyDstResumeExistenceCheck() {
+			group = w.partitionFileGroupForResumeExistence(ctx, wd, group)
+			if len(group) == 0 {
 				return
 			}
-			reportTaskOutcome(w.queue, task, fmt.Errorf("open source for batch upload %s: %w", task.LocationPath(), err))
-			continue
+			// Recompute lease bytes after skipping already-present files.
+			w.queue.SetActiveLeaseSize(w.id, fileLeaseBytes(group))
 		}
-		if resumeOffset > 0 {
-			if seekErr := awaitErr(ctx, parent, fileBatchStallTimeout, "seek source", task.LocationPath(), func() error {
-				return queue.SeekReaderTo(rc, resumeOffset)
-			}); seekErr != nil {
-				_ = rc.Close()
-				_ = w.queue.ClearResumeState(ctx, task)
-				reportTaskOutcome(w.queue, task, fmt.Errorf("seek source for batch resume %s: %w", task.LocationPath(), seekErr))
+
+		items := make([]types.UploadFilesBatchItem, 0, len(group))
+		aligned := make([]*queue.TaskBase, 0, len(group))
+		opened := make([]io.ReadCloser, 0, len(group))
+		defer func() {
+			// Close any readers not handed to UploadFilesBatch (e.g. early return after open).
+			for _, rc := range opened {
+				if rc != nil {
+					_ = rc.Close()
+				}
+			}
+		}()
+
+		for _, task := range group {
+			if task.CopyPass != 2 || !task.IsFile() {
+				reportTaskOutcome(w.queue, task, fmt.Errorf("file batch leased non-file or wrong pass task %s", task.DisplayPath))
 				continue
 			}
+			dstParent := task.DstParentID
+			if dstParent == "" {
+				reportTaskOutcome(w.queue, task, fmt.Errorf("task missing DstParentID for %s", task.DisplayPath))
+				continue
+			}
+			srcID := task.File.ServiceID
+			if srcID == "" {
+				reportTaskOutcome(w.queue, task, fmt.Errorf("task missing source ServiceID for %s", task.DisplayPath))
+				continue
+			}
+			if task.DstPeerCopyStatus == db.CopyStatusNeedsOverwrite {
+				if err := w.deleteMappedDstPeer(task, ctx, parent, wd); err != nil {
+					reportTaskOutcome(w.queue, task, err)
+					continue
+				}
+			}
+			plan, err := awaitResult(w.queue, ctx, parent, fileBatchStallTimeout, "prepare resume", task.DisplayPath, func() (queue.FileTransferPlan, error) {
+				return queue.PrepareFileTransferResume(ctx, w.queue, w.dstAdapter, task)
+			})
+			if err != nil {
+				reportTaskOutcome(w.queue, task, fmt.Errorf("prepare transfer resume for %s: %w", task.DisplayPath, err))
+				continue
+			}
+			resumeOffset := plan.ResumeOffset
+			name := copyTaskCreateBasename(task)
+			if name == "" {
+				reportTaskOutcome(w.queue, task, fmt.Errorf("empty create basename for file %s", task.DisplayPath))
+				continue
+			}
+			rc, err := awaitResult(w.queue, ctx, parent, fileBatchStallTimeout, "open source", task.DisplayPath, func() (io.ReadCloser, error) {
+				return w.srcAdapter.OpenRead(parent, srcID)
+			})
+			if err != nil {
+				if isForceCheckoutAbort(err, w.shouldRetire(), w.queue.ForceCheckoutWorker(w.id)) {
+					abandonLeasedGroup(w.queue, group)
+					return
+				}
+				reportTaskOutcome(w.queue, task, fmt.Errorf("open source for batch upload %s: %w", task.DisplayPath, err))
+				continue
+			}
+			if resumeOffset > 0 {
+				if seekErr := awaitErr(w.queue, ctx, parent, fileBatchStallTimeout, "seek source", task.DisplayPath, func() error {
+					return queue.SeekReaderTo(rc, resumeOffset)
+				}); seekErr != nil {
+					_ = rc.Close()
+					_ = w.queue.ClearResumeState(ctx, task)
+					reportTaskOutcome(w.queue, task, fmt.Errorf("seek source for batch resume %s: %w", task.DisplayPath, seekErr))
+					continue
+				}
+			}
+			opened = append(opened, rc)
+			body := newTransferProgressReader(w.queue, wd, task, rc, resumeOffset)
+			items = append(items, types.UploadFilesBatchItem{
+				ParentID: dstParent,
+				Name:     name,
+				Body:     body,
+				Metadata: copyTaskCreateMetadata(task),
+			})
+			aligned = append(aligned, task)
+			// Ownership transferred to batch; clear so defer does not double-close.
+			opened[len(opened)-1] = nil
 		}
-		opened = append(opened, rc)
-		body := newTransferProgressReader(w.queue, wd, task, rc, resumeOffset)
-		items = append(items, types.UploadFilesBatchItem{
-			ParentID: dstParent,
-			Name:     name,
-			Body:     body,
-			Metadata: copyTaskCreateMetadata(task),
+		if len(items) == 0 {
+			return
+		}
+
+		results, err := awaitResult(w.queue, ctx, parent, fileBatchStallTimeout, "upload files batch", "", func() ([]types.UploadFilesBatchEntryResult, error) {
+			return batch.UploadFilesBatch(ctx, items)
 		})
-		aligned = append(aligned, task)
-		// Ownership transferred to batch; clear so defer does not double-close.
-		opened[len(opened)-1] = nil
-	}
-	if len(items) == 0 {
-		return
-	}
+		if err != nil {
+			w.settleBatchError(err, aligned)
+			return
+		}
+		wd.Beat()
+		if !w.batchResultsMatch("upload files batch", len(results), aligned) {
+			return
+		}
 
-	results, err := awaitResult(ctx, parent, fileBatchStallTimeout, "upload files batch", "", func() ([]types.UploadFilesBatchEntryResult, error) {
-		return batch.UploadFilesBatch(ctx, items)
+		for i, task := range aligned {
+			res := results[i]
+			if res.Err != nil {
+				reportTaskOutcome(w.queue, task, res.Err)
+				continue
+			}
+			if task.BytesTransferred < task.File.Size {
+				w.queue.ReportTaskBytesTransferred(task, task.File.Size)
+			}
+			applyCopyDstFileFromAdapter(task, res.File)
+			reportTaskOutcome(w.queue, task, nil)
+		}
 	})
-	if err != nil {
-		if isForceCheckoutAbort(err, w.shouldRetire(), w.queue.ForceCheckoutWorker(w.id)) {
-			abandonLeasedGroup(w.queue, aligned)
-			return
-		}
-		if queue.IsThrottleError(err) {
-			reportGroupRateLimited(w.queue, aligned, err)
-			return
-		}
-		for _, task := range aligned {
-			reportTaskOutcome(w.queue, task, err)
-		}
-		return
-	}
-	wd.Beat()
-	if len(results) != len(aligned) {
-		err := fmt.Errorf("upload files batch returned %d results for %d tasks", len(results), len(aligned))
-		for _, task := range aligned {
-			reportTaskOutcome(w.queue, task, err)
-		}
-		return
-	}
-
-	for i, task := range aligned {
-		res := results[i]
-		if res.Err != nil {
-			reportTaskOutcome(w.queue, task, res.Err)
-			continue
-		}
-		if task.BytesTransferred < task.File.Size {
-			w.queue.ReportTaskBytesTransferred(task, task.File.Size)
-		}
-		applyCopyDstFileFromAdapter(task, res.File)
-		reportTaskOutcome(w.queue, task, nil)
-	}
+	return true
 }
 
 // transferProgressReader counts bytes read during batch upload and reports them onto the leased task
@@ -501,105 +511,59 @@ func (r *transferProgressReader) Close() error {
 	return r.inner.Close()
 }
 
-func (w *DeleteWorker) useDeleteBatchLease() bool {
-	_, _, ok := adapterBatchMax(w.srcAdapter, types.DeleteBatchFrom, func(b types.FSDeleteBatch) int {
-		return b.DeleteBatchMax()
-	}, types.DefaultDeleteBatchMax)
-	return ok
-}
-
-func (w *DeleteWorker) runDeleteBatchTurn() {
+func (w *DeleteWorker) deleteBatchTurn() bool {
 	batch, maxN, ok := adapterBatchMax(w.srcAdapter, types.DeleteBatchFrom, func(b types.FSDeleteBatch) int {
 		return b.DeleteBatchMax()
 	}, types.DefaultDeleteBatchMax)
 	if !ok {
-		return
+		return false
 	}
-	w.queue.EnsureLeaseBatchSizeAtLeast(types.DefaultDeleteBatchPullSize)
-
-	group := w.queue.LeaseGroupBudget(queue.LeaseBudgetOpts{MaxCount: maxN})
-	if len(group) == 0 {
-		time.Sleep(50 * time.Millisecond)
-		return
-	}
-	for _, t := range group {
-		w.queue.BindLeaseOwner(t, w.id)
-	}
-
-	setWorkerBusy(w.idle)
-	defer markWorkerIdle(w.queue, w.id, w.idle)
-	w.queue.SetActiveLeaseSize(w.id, 0)
-	defer w.queue.ClearActiveLeaseSize(w.id)
-
-	parent := fsOpContext(w.workerCtx, w.shutdownCtx)
-	wd, ctx := observe.NewProgressWatchdog(parent, deleteStallTimeout, progressStallSuppress(w.queue))
-	defer wd.Stop()
-	// Queue watchdog only: fake beats quiet STALL DETECTED during a slow batch.
-	// Do not fake ProgressWatchdog beats; hung DeleteBatch must cancel after deleteStallTimeout.
-	if w.queue.HasWatchdog() {
-		stopQ := beatWhile(ctx, queueWatchdogBeater{w.queue}, 5*time.Second)
-		defer stopQ()
-	}
-
-	items := make([]types.DeleteBatchItem, 0, len(group))
-	aligned := make([]*queue.TaskBase, 0, len(group))
-	for _, task := range group {
-		serviceID := task.Identifier()
-		if serviceID == "" {
-			reportTaskOutcome(w.queue, task, fmt.Errorf("empty service id for delete task %s", task.LocationPath()))
-			continue
+	spec := batchSpec{max: maxN, pullSize: types.DefaultDeleteBatchPullSize, stallTimeout: deleteStallTimeout}
+	w.leaseAndRunBatch(spec, func(group []*queue.TaskBase, parent, ctx context.Context, wd *observe.ProgressWatchdog) {
+		items := make([]types.DeleteBatchItem, 0, len(group))
+		aligned := make([]*queue.TaskBase, 0, len(group))
+		for _, task := range group {
+			serviceID := task.Identifier()
+			if serviceID == "" {
+				reportTaskOutcome(w.queue, task, fmt.Errorf("empty service id for delete task %s", task.DisplayPath))
+				continue
+			}
+			nodeType := types.NodeTypeFile
+			if task.IsFolder() {
+				nodeType = types.NodeTypeFolder
+			}
+			items = append(items, types.DeleteBatchItem{NodeID: serviceID, NodeType: nodeType})
+			aligned = append(aligned, task)
 		}
-		nodeType := types.NodeTypeFile
-		if task.IsFolder() {
-			nodeType = types.NodeTypeFolder
+		if len(items) == 0 {
+			return
 		}
-		items = append(items, types.DeleteBatchItem{NodeID: serviceID, NodeType: nodeType})
-		aligned = append(aligned, task)
-	}
-	if len(items) == 0 {
-		return
-	}
 
-	out, ok := awaitCancellable(ctx, func() fsOut[[]types.DeleteBatchEntryResult] {
-		r, e := batch.DeleteBatch(ctx, items)
-		return fsOut[[]types.DeleteBatchEntryResult]{Val: r, Err: e}
+		out, ok := awaitCancellable(w.queue, ctx, func() fsOut[[]types.DeleteBatchEntryResult] {
+			r, e := batch.DeleteBatch(ctx, items)
+			return fsOut[[]types.DeleteBatchEntryResult]{Val: r, Err: e}
+		})
+		if !ok {
+			if parent.Err() != nil || (w.shutdownCtx != nil && w.shutdownCtx.Err() != nil) {
+				abandonLeasedGroup(w.queue, aligned)
+				return
+			}
+			reportGroupOutcome(w.queue, aligned, fmt.Errorf("delete batch stalled after %s: %w", deleteStallTimeout, ctx.Err()))
+			return
+		}
+		results, err := out.Val, out.Err
+		if err != nil {
+			w.settleBatchError(err, aligned)
+			return
+		}
+		wd.Beat()
+		if !w.batchResultsMatch("delete batch", len(results), aligned) {
+			return
+		}
+
+		for i, task := range aligned {
+			reportTaskOutcome(w.queue, task, results[i].Err)
+		}
 	})
-	if !ok {
-		if parent.Err() != nil || (w.shutdownCtx != nil && w.shutdownCtx.Err() != nil) {
-			abandonLeasedGroup(w.queue, aligned)
-			return
-		}
-		stallErr := fmt.Errorf("delete batch stalled after %s: %w", deleteStallTimeout, ctx.Err())
-		for _, task := range aligned {
-			reportTaskOutcome(w.queue, task, stallErr)
-		}
-		return
-	}
-	results, err := out.Val, out.Err
-	if err != nil {
-		if isForceCheckoutAbort(err, w.shouldRetire(), w.queue.ForceCheckoutWorker(w.id)) {
-			abandonLeasedGroup(w.queue, aligned)
-			return
-		}
-		if queue.IsThrottleError(err) {
-			reportGroupRateLimited(w.queue, aligned, err)
-			return
-		}
-		for _, task := range aligned {
-			reportTaskOutcome(w.queue, task, err)
-		}
-		return
-	}
-	wd.Beat()
-	if len(results) != len(aligned) {
-		err := fmt.Errorf("delete batch returned %d results for %d tasks", len(results), len(aligned))
-		for _, task := range aligned {
-			reportTaskOutcome(w.queue, task, err)
-		}
-		return
-	}
-
-	for i, task := range aligned {
-		reportTaskOutcome(w.queue, task, results[i].Err)
-	}
+	return true
 }

@@ -4,7 +4,6 @@
 package db
 
 import (
-	"fmt"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
@@ -27,58 +26,20 @@ func taskFailureLog(e StatusEvent, defaultQueue string) (opsdb.LogRecord, bool) 
 		Entity:    defaultQueue,
 		EntityID:  e.ID,
 		Queue:     queue,
+		Action:    "task_failure",
+		NodeID:    e.ID,
 		At:        time.Now(),
 	}, true
 }
 
-// FlushFailureLogEvent writes one prepared failure log row to Badger.
+// FlushFailureLogEvent writes one prepared failure log row to the per-migration logs sidecar.
 func FlushFailureLogEvent(database *DB, e StatusEvent, defaultQueue string) error {
-	if database == nil || database.Ops() == nil {
+	if database == nil || database.Logs() == nil {
 		return nil
 	}
 	rec, ok := taskFailureLog(e, defaultQueue)
 	if !ok {
 		return nil
 	}
-	return database.Ops().AppendLogs([]opsdb.LogRecord{rec})
-}
-
-// FlushFailureLogsFromEvents writes prepared failure-log fields from status events into Badger.
-func FlushFailureLogsFromEvents(database *DB, events []StatusEvent, defaultQueue string) error {
-	if database == nil || database.Ops() == nil {
-		return nil
-	}
-	recs := make([]opsdb.LogRecord, 0, len(events))
-	for _, e := range events {
-		rec, ok := taskFailureLog(e, defaultQueue)
-		if !ok {
-			continue
-		}
-		recs = append(recs, rec)
-	}
-	if len(recs) == 0 {
-		return nil
-	}
-	return database.Ops().AppendLogs(recs)
-}
-
-// FlushFailureLogsToDB writes failure logs to the given DB in one batch.
-func FlushFailureLogsToDB(logsDB *DB, events []StatusEvent, defaultQueue string) error {
-	if logsDB == nil || len(events) == 0 {
-		return nil
-	}
-	has := false
-	for _, e := range events {
-		if e.ErrorLogID != "" && e.ErrorLogMessage != "" {
-			has = true
-			break
-		}
-	}
-	if !has {
-		return nil
-	}
-	if err := FlushFailureLogsFromEvents(logsDB, events, defaultQueue); err != nil {
-		return fmt.Errorf("flush failure logs: %w", err)
-	}
-	return nil
+	return database.Logs().AppendLogs([]opsdb.LogRecord{rec})
 }

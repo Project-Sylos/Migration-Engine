@@ -26,7 +26,7 @@ func (s *Store) DeleteNode(side, id string) error {
 			srcID, dstID = m.SrcID, m.DstID
 		}
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		if ok {
 			if err := deleteNodeIndexesTxn(txn, side, n); err != nil {
 				return err

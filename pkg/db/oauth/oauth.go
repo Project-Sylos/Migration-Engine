@@ -14,7 +14,7 @@ import (
 const oauthCredsEncryptedPrefix = "enc:v1:"
 
 // SealOAuthCredentials stores OAuth credential JSON. When tokenKey is nil, plaintext JSON is returned for tests.
-// Production passes the per-migration 32-byte key from sylos.duckdb.
+// Production passes the per-migration 32-byte key from sylos.api migkey:{id}.
 func SealOAuthCredentials(plaintextJSON []byte, tokenKey []byte) (string, error) {
 	if len(tokenKey) == 0 {
 		return string(plaintextJSON), nil

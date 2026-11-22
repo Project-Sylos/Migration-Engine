@@ -12,18 +12,18 @@ import (
 )
 
 const (
-	defaultQueueStallTimeout = 30 * time.Second
+	defaultQueueStallTimeout   = 30 * time.Second
 	queueWatchdogCheckInterval = 5 * time.Second
 )
 
 // ProgressWatchdog detects stalled tasks by requiring progress (Beat) within a timeout.
 // If no progress occurs, it cancels the context so adapter operations abort.
 type ProgressWatchdog struct {
-	ctx            context.Context
-	cancel         context.CancelFunc
-	timeout        time.Duration
-	stallSuppress  func() bool // when non-nil and true, stall timer is frozen (e.g. seal flush / backpressure)
-	lastBeat       atomic.Int64 // UnixNano (time.Now().UnixNano())
+	ctx           context.Context
+	cancel        context.CancelFunc
+	timeout       time.Duration
+	stallSuppress func() bool  // when non-nil and true, stall timer is frozen (e.g. seal flush / backpressure)
+	lastBeat      atomic.Int64 // UnixNano (time.Now().UnixNano())
 }
 
 // NewProgressWatchdog creates a watchdog and a child context. When no Beat() occurs
@@ -159,7 +159,7 @@ func (wd *QueueWatchdog) checkForStall() {
 		wd.possibleStall.Store(false)
 		return
 	}
-	// Shared pull-ticket wait or in-flight DuckDB pull: not a completion stall.
+	// Shared pull-ticket wait or in-flight DB pull: not a completion stall.
 	if wd.queue.IsWaitingOnDB() || wd.queue.IsPulling() {
 		wd.lastProgress.Store(time.Now().UnixNano())
 		wd.possibleStall.Store(false)

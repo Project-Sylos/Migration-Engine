@@ -7,6 +7,14 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 )
 
+func setRoundStatsCounts(q *queue.Queue, round, expected, completed, failed int) {
+	q.IncrementRoundStatsCompleted(round)
+	stats := q.GetRoundStats(round)
+	stats.Expected = expected
+	stats.Completed = completed
+	stats.Failed = failed
+}
+
 func TestSealedProgressPercent(t *testing.T) {
 	t.Parallel()
 	if got := sealedProgressPercent(4, 10); got != 40 {
@@ -22,8 +30,8 @@ func TestSealedProgressPercent(t *testing.T) {
 
 func TestMemoryStatusTotals(t *testing.T) {
 	q := queue.NewQueue("src", 3, 1, nil, nil)
-	q.SetRoundStatsCounts(1, 10, 7, 1)
-	q.SetRoundStatsCounts(2, 5, 2, 2)
+	setRoundStatsCounts(q, 1, 10, 7, 1)
+	setRoundStatsCounts(q, 2, 5, 2, 2)
 
 	pending, failed := q.MemoryStatusTotals()
 	if pending != 6 {
@@ -36,7 +44,7 @@ func TestMemoryStatusTotals(t *testing.T) {
 
 func TestPollQueueUsesMemoryWithoutDatabase(t *testing.T) {
 	q := queue.NewQueue("src", 3, 1, nil, nil)
-	q.SetRoundStatsCounts(3, 20, 8, 2)
+	setRoundStatsCounts(q, 3, 20, 8, 2)
 	q.SetRound(3)
 	o := NewQueueObserver(nil, time.Hour)
 	defer o.updateTicker.Stop()
@@ -55,7 +63,7 @@ func TestEnrichCopyDeleteUsesSealedTotalsNotRemaining(t *testing.T) {
 	q := queue.NewQueue("copy", 3, 1, nil, nil)
 	q.SetMode(queue.QueueModeCopy)
 	q.SetWorkTotals(queue.WorkTotals{Folders: 2, Files: 8, Bytes: 1000})
-	q.SetRoundStatsCounts(1, 10, 5, 1)
+	setRoundStatsCounts(q, 1, 10, 5, 1)
 	metric := &ExternalQueueMetrics{
 		Folders: 3, // successful creates so far
 		Files:   1,

@@ -28,9 +28,9 @@ func VerifySrcTreeEmpty(srcDir string) error {
 	return fmt.Errorf("src still has file: %s", e.Name())
 }
 
-// VerifyDeleteCounts checks universal stats for deleted count when duckDB is available.
-func VerifyDeleteCounts(duckDB *db.DB, minDeleted int64) error {
-	counts, err := stats.GetDeleteStatusCountsFromEvents(duckDB)
+// VerifyDeleteCounts checks universal stats for deleted count when database is available.
+func VerifyDeleteCounts(database *db.DB, minDeleted int64) error {
+	counts, err := stats.GetDeleteStatusCountsFromEvents(database)
 	if err != nil {
 		return err
 	}

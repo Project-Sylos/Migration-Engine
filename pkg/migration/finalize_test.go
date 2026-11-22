@@ -11,7 +11,7 @@ import (
 
 func TestRetryFinalizeRequiresFinalizeFailed(t *testing.T) {
 	m := &Migration{ID: "rf", phase: PhaseTraversing}
-	err := m.RetryFinalize(FinalizeOverrides{})
+	err := m.RetryFinalize(FinalizeOptions{})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -75,9 +75,42 @@ func TestCompleteDurableFinalizeSuccess(t *testing.T) {
 		PhaseTraversalFinalizing,
 		PhaseTraversalFinalizeFailed,
 		PhaseTraversalReview,
-		FinalizeOverrides{},
+		FinalizeOptions{},
 	); err != nil {
 		t.Fatal(err)
+	}
+	if mig.Phase() != PhaseTraversalReview {
+		t.Fatalf("phase=%s want review", mig.Phase())
+	}
+}
+
+func TestRetryFinalizeClearsHardAbort(t *testing.T) {
+	mgr := NewMigrationManager()
+	defer mgr.Close()
+
+	dir := t.TempDir()
+	mig, err := mgr.CreateMigration(CreateMigrationConfig{
+		MigrationID:  "finalize-abort-clear",
+		Name:         "finalize-abort-clear",
+		MigrationDir: dir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{PhaseFiltersSet, PhaseTraversing, PhaseTraversalFinalizing, PhaseTraversalFinalizeFailed} {
+		if err := mig.transitionTo(p); err != nil {
+			t.Fatalf("transition to %s: %v", p, err)
+		}
+	}
+	mig.DB.AbortTraversalPhase()
+	if !mig.DB.HardAborted() {
+		t.Fatal("expected hard abort before retry")
+	}
+	if err := mig.RetryFinalize(FinalizeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if mig.DB.HardAborted() {
+		t.Fatal("hard abort should clear for finalize retry")
 	}
 	if mig.Phase() != PhaseTraversalReview {
 		t.Fatalf("phase=%s want review", mig.Phase())
@@ -103,7 +136,7 @@ func TestRetryFinalizeAfterForcedFailure(t *testing.T) {
 		}
 	}
 	mig.setFinalizeError(errors.New("forced ensure failure"))
-	if err := mig.RetryFinalize(FinalizeOverrides{Threads: 2, MemoryLimitGB: 2}); err != nil {
+	if err := mig.RetryFinalize(FinalizeOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if mig.Phase() != PhaseTraversalReview {

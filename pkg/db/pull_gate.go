@@ -3,10 +3,12 @@
 
 package db
 
-import "time"
+import (
+	"time"
+)
 
 // PullGate serializes frontier pulls across queues so SRC/DST (and copy/delete)
-// share one DuckDB pull lane. Waiters may supply a beat callback for stall watchdogs.
+// share one Badger pull lane. Waiters may supply a beat callback for stall watchdogs.
 type PullGate struct {
 	ticket chan struct{}
 }
@@ -19,7 +21,8 @@ func newPullGate() *PullGate {
 
 // Acquire waits for the shared pull ticket. onWaitBeat is called about once per
 // second while blocked so queue watchdogs do not treat the wait as a stall.
-func (g *PullGate) Acquire(onWaitBeat func()) {
+// When blocked, dbWork and pullGate overlap clocks (if non-nil) Enter for the wait.
+func (g *PullGate) Acquire(onWaitBeat func(), dbWork, pullGate *OverlapClock) {
 	if g == nil {
 		return
 	}
@@ -28,11 +31,23 @@ func (g *PullGate) Acquire(onWaitBeat func()) {
 		return
 	default:
 	}
+	if dbWork != nil {
+		dbWork.Enter()
+	}
+	if pullGate != nil {
+		pullGate.Enter()
+	}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-g.ticket:
+			if pullGate != nil {
+				pullGate.Leave()
+			}
+			if dbWork != nil {
+				dbWork.Leave()
+			}
 			return
 		case <-ticker.C:
 			if onWaitBeat != nil {

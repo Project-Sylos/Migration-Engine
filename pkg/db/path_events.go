@@ -19,7 +19,8 @@ const (
 	IDMapSourceManualRemap = "manual_remap"
 	IDMapSourceRootSeed    = "root_seed"
 
-	IDMapStatusActive = "active"
+	IDMapStatusActive   = "active"
+	IDMapStatusInactive = "inactive"
 )
 
 // GPLIssue is the sparse current naming-issue shape.

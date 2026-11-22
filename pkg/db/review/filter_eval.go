@@ -29,6 +29,7 @@ func nodeInputFromRecord(n opsdb.NodeRecord, childCount *int) filter.NodeInput {
 		MTime:       n.MTime,
 		Depth:       n.Depth,
 		NodeType:    nt,
+		Extension:   n.Extension,
 		ChildCount:  childCount,
 	}
 	if in.DisplayPath == "" {

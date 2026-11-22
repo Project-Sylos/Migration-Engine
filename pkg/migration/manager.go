@@ -54,7 +54,7 @@ type MigrationDetails struct {
 }
 
 // MigrationManager owns migration lifecycle authority and persistence access.
-// Each migration has its own DuckDB file at {migrationDir}/{id}.db.
+// Each migration has its own Badger ops store at {migrationDir}/{id}.ops/ (logical {id}.db marker).
 type MigrationManager struct {
 	store          *migrationStore
 	migrations     map[string]*Migration
@@ -64,8 +64,6 @@ type MigrationManager struct {
 	openDBsMu      sync.Mutex
 	pendingMu      sync.Mutex
 	pendingLocks   map[string]*sync.Mutex
-	// duckDBMemoryLimitGB is passed to newly opened migration DBs. 0 = auto at open.
-	duckDBMemoryLimitGB int
 }
 
 var migrationIDCounter int64
@@ -76,7 +74,7 @@ func nextMigrationID() string {
 	return fmt.Sprintf("migration-%d-%d", now, seq)
 }
 
-// NewMigrationManager creates a manager that opens one DuckDB file per migration folder.
+// NewMigrationManager creates a manager that opens one Badger ops store per migration folder.
 func NewMigrationManager() *MigrationManager {
 	return &MigrationManager{
 		store:          &migrationStore{},
@@ -119,8 +117,7 @@ func (m *MigrationManager) ResetState() error {
 	return nil
 }
 
-// openDB opens (or returns cached) the plaintext DB for the given migration folder path and ID.
-// Also opens and links the sibling logs DuckDB for the life of the cache entry.
+// openDB opens (or returns cached) the Badger ops store for the given migration folder path and ID.
 func (m *MigrationManager) openDB(migrationDir, id string) (*db.DB, error) {
 	absDir, err := filepath.Abs(migrationDir)
 	if err != nil {
@@ -136,31 +133,13 @@ func (m *MigrationManager) openDB(migrationDir, id string) (*db.DB, error) {
 	if err := os.MkdirAll(absDir, 0755); err != nil {
 		return nil, fmt.Errorf("create migration dir: %w", err)
 	}
-	cfg := DatabaseConfig{Path: dbPath, MemoryLimitGB: m.duckDBMemoryLimitGB}
+	cfg := DatabaseConfig{Path: dbPath}
 	database, _, err := SetupDatabase(cfg)
 	if err != nil {
 		return nil, err
 	}
 	m.openDBs[cacheKey] = database
 	return database, nil
-}
-
-// SetDuckDBMemoryLimitGB sets the limit used for newly opened migration DBs and applies
-// it to all currently open handles. gb <= 0 means auto (DefaultMemoryLimitGB) at apply/open.
-func (m *MigrationManager) SetDuckDBMemoryLimitGB(gb int) {
-	m.openDBsMu.Lock()
-	defer m.openDBsMu.Unlock()
-	m.duckDBMemoryLimitGB = gb
-	for _, database := range m.openDBs {
-		_ = database.SetMemoryLimitGB(gb)
-	}
-}
-
-// DuckDBMemoryLimitGB returns the configured limit (0 = auto).
-func (m *MigrationManager) DuckDBMemoryLimitGB() int {
-	m.openDBsMu.Lock()
-	defer m.openDBsMu.Unlock()
-	return m.duckDBMemoryLimitGB
 }
 
 func (m *MigrationManager) applyTokenKey(mig *Migration, tokenKey []byte) {
@@ -231,7 +210,7 @@ func (m *MigrationManager) CreateMigration(cfg CreateMigrationConfig) (*Migratio
 	return instance, nil
 }
 
-// isDuplicateKey treats any error that looks like a duplicate/unique/primary-key violation as "already inserted", so callers can return the existing migration. Covers DuckDB and other drivers (e.g. "TransactionContext Error: ...").
+// isDuplicateKey treats any error that looks like a duplicate/unique/primary-key violation as "already inserted", so callers can return the existing migration. Covers DB and other drivers (e.g. "TransactionContext Error: ...").
 func isDuplicateKey(err error) bool {
 	if err == nil {
 		return false
@@ -246,7 +225,7 @@ func isDuplicateKey(err error) bool {
 
 // GetMigration loads or returns a cached migration.
 // tokenEncryptionKey encrypts oauth_credentials rows; pass nil for plaintext test DBs.
-// Migration DuckDB files are always opened plaintext.
+// Migration DB files are always opened plaintext.
 func (m *MigrationManager) GetMigration(id string, migrationDir string, tokenEncryptionKey []byte) (*Migration, error) {
 	snap := m.snapshotMigrationEntry(id)
 	if snap.Migration != nil {
@@ -489,7 +468,7 @@ func (m *MigrationManager) DeleteMigration(id string, migrationDir string, _ []b
 		delete(m.openDBs, dbPath)
 	}
 	m.openDBsMu.Unlock()
-	_ = os.Remove(filepath.Join(absDir, id+".logs.db"))
+	_ = os.RemoveAll(filepath.Join(absDir, id+".logs"))
 	return nil
 }
 

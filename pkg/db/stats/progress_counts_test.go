@@ -62,7 +62,7 @@ func TestGetDeleteProgressCountsEligibleOnly(t *testing.T) {
 		t.Fatalf("progress=%v want %v", got, (100.0*2)/3)
 	}
 
-	deleteCounts, err := GetEligibleDeleteStatusCounts(database)
+	deleteCounts, err := GetDeleteStatusCountsFromEvents(database)
 	if err != nil {
 		t.Fatal(err)
 	}

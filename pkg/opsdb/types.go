@@ -16,31 +16,37 @@ type NodeRecord struct {
 	Name            string `json:"name,omitempty"`
 	DisplayPath     string `json:"display_path,omitempty"`
 	Type            string `json:"type,omitempty"`
-	Size            int64  `json:"size,omitempty"`
-	MTime           string `json:"mtime,omitempty"`
-	Depth           int    `json:"depth,omitempty"`
-	IncludeOnly     string `json:"include_only,omitempty"`
-	GPLState        string `json:"gpl_state,omitempty"`
+	// Extension is the file extension without a leading dot (files only). Used by
+	// trigram indexing to omit ultra-common grams; DisplayName/Name stay full.
+	Extension   string `json:"extension,omitempty"`
+	Size        int64  `json:"size,omitempty"`
+	MTime       string `json:"mtime,omitempty"`
+	Depth       int    `json:"depth,omitempty"`
+	IncludeOnly string `json:"include_only,omitempty"`
+	GPLState    string `json:"gpl_state,omitempty"`
 }
 
 // StatusRecord is the hot mutable overlay for a node.
 type StatusRecord struct {
-	TraversalStatus          string `json:"traversal_status,omitempty"`
-	CopyStatus               string `json:"copy_status,omitempty"`
-	DeleteStatus             string `json:"delete_status,omitempty"`
-	SkippedDescendantCount   int64  `json:"skipped_descendant_count,omitempty"`
-	GPLStatus                string `json:"gpl_status,omitempty"`
-	IncludeOnly              string `json:"include_only,omitempty"`
-	ExclusionSource          string `json:"exclusion_source,omitempty"`
-	DeterminingRuleID        string `json:"determining_rule_id,omitempty"`
-	ErrorLogID               string `json:"error_log_id,omitempty"`
+	TraversalStatus        string `json:"traversal_status,omitempty"`
+	CopyStatus             string `json:"copy_status,omitempty"`
+	DeleteStatus           string `json:"delete_status,omitempty"`
+	SkippedDescendantCount int64  `json:"skipped_descendant_count,omitempty"`
+	GPLStatus              string `json:"gpl_status,omitempty"`
+	IncludeOnly            string `json:"include_only,omitempty"`
+	ExclusionSource        string `json:"exclusion_source,omitempty"`
+	DeterminingRuleID      string `json:"determining_rule_id,omitempty"`
+	ErrorLogID             string `json:"error_log_id,omitempty"`
 	// ChildSize is the sum of file bytes under this folder (identity, not selected).
-	ChildSize                int64  `json:"child_size,omitempty"`
-	XferOffset               int64  `json:"xfer_offset,omitempty"`
-	XferSrcSize              int64  `json:"xfer_src_size,omitempty"`
-	XferSrcMTime             string `json:"xfer_src_mtime,omitempty"`
-	XferDstRef               string `json:"xfer_dst_ref,omitempty"`
-	XferResumeToken          string `json:"xfer_resume_token,omitempty"`
+	ChildSize int64 `json:"child_size,omitempty"`
+	// ChildCount is the identity count of descendants under this folder (files + folders).
+	// Folded at finalize with ChildSize; used for rename-cascade progress (not counted live).
+	ChildCount      int64  `json:"child_count,omitempty"`
+	XferOffset      int64  `json:"xfer_offset,omitempty"`
+	XferSrcSize     int64  `json:"xfer_src_size,omitempty"`
+	XferSrcMTime    string `json:"xfer_src_mtime,omitempty"`
+	XferDstRef      string `json:"xfer_dst_ref,omitempty"`
+	XferResumeToken string `json:"xfer_resume_token,omitempty"`
 }
 
 // DisplayBytes is the size shown for a node. Folders use identity child_size; files use their own size.
@@ -87,6 +93,8 @@ type LogRecord struct {
 	Entity    string    `json:"entity,omitempty"`
 	EntityID  string    `json:"entity_id,omitempty"`
 	Queue     string    `json:"queue,omitempty"`
+	Action    string    `json:"action,omitempty"`
+	NodeID    string    `json:"node_id,omitempty"`
 	At        time.Time `json:"at"`
 }
 

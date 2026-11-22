@@ -76,15 +76,19 @@ type TaskBase struct {
 	SrcLogicalParentPath string // SRC parent path at pull time
 	SrcTraversalStatus   string // SRC node traversal_status at pull time (preserved when writing copy_status events)
 	// ExclusionSource is sealed at pull (discovery-retry marks / manual exclude provenance).
-	ExclusionSource string
-	BytesTransferred     int64  // Bytes transferred for file copy tasks (absolute offset; atomic in ReportTaskBytesTransferred)
-	bytesLivePublished   int64  // Bytes already added to Queue.bytesCopiedLive for this task
-	liveBytesDone        int32  // 1 after complete/fail/abandon; ReportTaskBytesTransferred becomes a no-op
-	DstParentID          string // Destination parent folder ServiceID for FS create
-	DstParentNodeID      string // Destination parent folder internal UUID (id_map)
-	ResolvedDstName      string // Basename/segment from accepted path_events (empty = use original name)
-	ParentGPLState       string // Parent gpl_state JSON (GPL cascade)
-	GPLState             string // This node's gpl_state JSON (GPL cascade)
+	ExclusionSource    string
+	BytesTransferred   int64  // Bytes transferred for file copy tasks (absolute offset; atomic in ReportTaskBytesTransferred)
+	bytesLivePublished int64  // Bytes already added to Queue.bytesCopiedLive for this task
+	liveBytesDone      int32  // 1 after complete/fail/abandon; ReportTaskBytesTransferred becomes a no-op
+	DstParentID        string // Destination parent folder ServiceID for FS create
+	DstParentNodeID    string // Destination parent folder internal UUID (id_map)
+	// Prefetched at copy pull for paired SRC→DST peers (no per-task Badger hits).
+	DstPeerID         string // Mapped DST node id
+	DstPeerCopyStatus string // DST bookkeeping copy status (needs_overwrite / already_existed / …)
+	DstPeerServiceID  string // Mapped DST FS service id (for delete-before-create)
+	ResolvedDstName   string // Basename/segment from accepted path_events (empty = use original name)
+	ParentGPLState    string // Parent gpl_state JSON (GPL cascade)
+	GPLState          string // This node's gpl_state JSON (GPL cascade)
 	// ProgressAlreadyExists: DST existence precheck found an up-to-date match; complete as
 	// successful but count under already-exists progress (not streamed copy bytes).
 	ProgressAlreadyExists bool
@@ -101,16 +105,20 @@ type TaskBase struct {
 	DisplayPath string
 	// IncludeOnlyJSON is JSON []child service IDs; empty = unrestricted ListChildren keep-all.
 	IncludeOnlyJSON string
+	// MemWeight is this attempt's running memory-weight total (pending/inFlight ledger).
+	MemWeight int64
 }
 
 // ChildResult represents a discovered child node with its traversal status.
 type ChildResult struct {
 	Folder        types.Folder // Folder info (if folder)
 	File          types.File   // File info (if file)
-	Status        string       // "pending", "successful", "missing", "not_on_src"
+	Status        string       // "pending", "successful", "missing"; legacy "not_on_src"
 	IsFile        bool         // true if this is a file, false if folder
 	SrcID         string       // ULID of corresponding SRC node (for DST nodes only, set during matching)
-	SrcCopyStatus string       // Copy status to update on SRC node (if SrcID is set and match found): "pending", "already_existed", empty if no update needed
+	SrcCopyStatus   string // Copy status to update on SRC node (if SrcID is set and match found): "pending", "already_existed", empty if no update needed
+	DstCopyStatus   string // DST bookkeeping copy status: destination_only / already_existed / needs_overwrite
+	ExclusionSource string // optional SRC exclusion provenance (e.g. force_replace_copy for source_wins)
 }
 
 func folderFirstString(folderVal, fileVal string) string {

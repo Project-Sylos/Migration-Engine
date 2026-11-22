@@ -14,6 +14,7 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
+	"codeberg.org/Sylos/Migration-Engine/pkg/memweight"
 	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
@@ -67,7 +68,7 @@ const (
 const (
 	defaultLeaseBatchSize    = 5000
 	maxLeaseBatchSize        = 20_000 // Upper bound for pull (lease) batch size (batch FS pull)
-	refillFromDBBatchSize    = 10_000 // Batch size when refilling queue from DuckDB (ID-offset pagination)
+	refillFromDBBatchSize    = 10_000 // Batch size when refilling queue from DB (ID-offset pagination)
 	refillFromDBBatchSizeDst = 1000   // Default DST traversal refill when unset (expected-children memory)
 
 	DefaultDstPullChildMultiplier = 10
@@ -105,41 +106,6 @@ func GetQueueType(queueName string) string {
 	}
 }
 
-// taskToNodeState converts a TaskBase to NodeState for DB writes (e.g. child inserts).
-func TaskToNodeState(task *TaskBase) *db.NodeState {
-	if task == nil {
-		return nil
-	}
-	path := task.LocationPath()
-	state := &db.NodeState{
-		ID:              task.ID,
-		Path:            path,
-		ParentPath:      "",
-		Depth:           task.Round,
-		TraversalStatus: db.StatusSuccessful,
-		Status:          db.StatusSuccessful,
-		CopyStatus:      task.CopyStatus,
-		Name:            "",
-	}
-	if task.IsFolder() {
-		state.Type = types.NodeTypeFolder
-		state.ServiceID = task.Folder.ServiceID
-		state.ParentServiceID = task.Folder.ParentId
-		state.ParentPath = task.Folder.ParentPath
-		state.MTime = task.Folder.LastUpdated
-		state.Name = task.Folder.DisplayName
-	} else {
-		state.Type = types.NodeTypeFile
-		state.ServiceID = task.File.ServiceID
-		state.ParentServiceID = task.File.ParentId
-		state.ParentPath = task.File.ParentPath
-		state.MTime = task.File.LastUpdated
-		state.Size = task.File.Size
-		state.Name = task.File.DisplayName
-	}
-	return state
-}
-
 // nodeStateToTask converts a NodeState to a traversal TaskBase (src-traversal or dst-traversal).
 func NodeStateToTask(state *db.NodeState, taskType string) *TaskBase {
 	if state == nil {
@@ -161,36 +127,41 @@ func NodeStateToTask(state *db.NodeState, taskType string) *TaskBase {
 		GPLState:           state.GPLState,
 		ExclusionSource:    state.ExclusionSource,
 	}
-	if state.Type == types.NodeTypeFolder {
-		task.Folder = types.Folder{
-			ServiceID:    state.ServiceID,
-			ParentId:     state.ParentServiceID,
-			ParentPath:   state.ParentPath,
-			DisplayName:  state.Name,
-			LocationPath: state.Path,
-			LastUpdated:  state.MTime,
-			DepthLevel:   state.Depth,
-			Type:         state.Type,
-		}
-	} else {
-		task.File = types.File{
-			ServiceID:    state.ServiceID,
-			ParentId:     state.ParentServiceID,
-			ParentPath:   state.ParentPath,
-			DisplayName:  state.Name,
-			LocationPath: state.Path,
-			LastUpdated:  state.MTime,
-			Size:         state.Size,
-			DepthLevel:   state.Depth,
-			Type:         state.Type,
-		}
-	}
+	task.AttachNodeState(state)
 	return task
+}
+
+// AttachNodeState fills the task's Folder or File from the node state.
+func (t *TaskBase) AttachNodeState(state *db.NodeState) {
+	if state.Type == types.NodeTypeFolder {
+		t.Folder = types.Folder{
+			ServiceID:    state.ServiceID,
+			ParentId:     state.ParentServiceID,
+			ParentPath:   state.ParentPath,
+			DisplayName:  state.Name,
+			LocationPath: state.Path,
+			LastUpdated:  state.MTime,
+			DepthLevel:   state.Depth,
+			Type:         state.Type,
+		}
+		return
+	}
+	t.File = types.File{
+		ServiceID:    state.ServiceID,
+		ParentId:     state.ParentServiceID,
+		ParentPath:   state.ParentPath,
+		DisplayName:  state.Name,
+		LocationPath: state.Path,
+		LastUpdated:  state.MTime,
+		Size:         state.Size,
+		DepthLevel:   state.Depth,
+		Type:         state.Type,
+	}
 }
 
 // Queue maintains round-based task queues for BFS traversal coordination.
 // It handles task leasing, retry logic, and cross-queue task propagation.
-// All operational state lives in DuckDB, flushed via per-queue buffers.
+// All operational state lives in DB, flushed via per-queue buffers.
 // inFlight is a leased task with ownership used to drop stale completions.
 type inFlight struct {
 	task  *TaskBase
@@ -205,9 +176,9 @@ type Queue struct {
 	state              QueueState          // Lifecycle state (running/paused/stopped/completed/waiting)
 	inProgress         map[string]inFlight // Tasks currently being executed (keyed by node ID)
 	leaseEpochSeq      uint64              // monotonic epoch counter for leases
-	pendingBuff        []*TaskBase         // Local task buffer fetched from DuckDB
+	pendingBuff        []*TaskBase         // Local task buffer fetched from DB
 	pulling            bool                // Indicates a pull operation is active
-	waitingOnDB        atomic.Bool         // Waiting for shared pull ticket or in DuckDB pull query
+	waitingOnDB        atomic.Bool         // Waiting for shared pull ticket or in DB pull query
 	lastPullWasPartial bool                // True if last pull returned fewer tasks than requested (partial batch)
 	firstPullForRound  bool                // True if we haven't done the first pull for the current round
 	maxRetries         int                 // Maximum retry attempts per task
@@ -239,6 +210,8 @@ type Queue struct {
 	copyResumeDstExistenceActive      bool
 	copyResumeDstExistenceAnchorPass  int
 	copyResumeDstExistenceAnchorRound int
+	copyResumeRecoveryHashVerify      bool // unclean resume: HashVerify name-matched files in the window
+	onLeaveCopyResumeWindow           func()
 	// Discovery tracking for metrics
 	filesDiscoveredTotal   int64 // Total files discovered (monotonic counter)
 	foldersDiscoveredTotal int64 // Total folders discovered (monotonic counter)
@@ -259,7 +232,7 @@ type Queue struct {
 	// Phase denominators are loaded once before workers start. Observer reads these
 	// in memory; it must never run status/event queries on its polling hot path.
 	workTotals WorkTotals
-	// Keyset cursors for pagination (id > cursor ORDER BY id LIMIT n). Strictly round-scoped per queue; see resetThisQueueKeysetCursor.
+	// Keyset cursors for pagination (id > cursor ORDER BY id LIMIT n). Strictly round-scoped per queue; see ResetKeysetCursorForShed.
 	srcKeysetCursor  string // SRC traversal/retry pull
 	dstKeysetCursor  string // DST traversal/retry pull
 	copyKeysetCursor string // Copy phase pull
@@ -271,11 +244,13 @@ type Queue struct {
 	leaseBatchSize         int
 	refillBatchSize        int
 	dstPullChildMultiplier int
-	// Last DuckDB pull timing (atomics; surfaced via observer → queue_stats).
+	// Last Badger frontier pull timing (atomics; surfaced via observer → queue_stats).
 	dbPullLastRows       int64
 	dbPullLastDurationNs int64
-	pool                 workerPool
-	listFill             listFillTracker
+	// Accumulated since last Take* (last-pull gauges / optional diagnostics).
+	dbPullAccumDurationNs int64
+	pool                  workerPool
+	listFill              listFillTracker
 	// Operation-based autoscaler context (provider IDs and backend groups).
 	scalingSrcProvider string
 	scalingDstProvider string
@@ -283,8 +258,12 @@ type Queue struct {
 	scalingDstGroupID  string
 	pathCheckProfile   string // "none" | "auto" | provider id (windows, dropbox, …)
 	windowsCompat      bool   // soft-cloud Windows desktop-sync overlays for GPL
+	overwritePolicy    string // newest_mtime | decide | source_wins
+	hashVerify         bool   // dual-stream SHA-256 during DST file compare
 	filterRuleset      *filter.CompiledRuleset
 	Spin               SpinDownState
+	// memWeight is the shared migration memory-weight ledger (nil when autoscaler off).
+	memWeight *memweight.Ledger
 }
 
 func pendingBuffCapFromLeaseSizing(leaseConfigured int) int {
@@ -326,42 +305,13 @@ func NewQueue(name string, maxRetries int, workerCount int, coordinator *QueueCo
 	}
 }
 
-// InitializeWithContext sets up the queue with DuckDB, context, and filesystem adapter references.
+// Initialize sets up the queue with DB, context, and filesystem adapters for its pool kind.
+// PoolTraversal uses src only, PoolCopy uses src and dst, PoolDelete uses src only.
 // Creates and starts workers immediately - they'll poll for tasks autonomously.
-func (q *Queue) InitializeWithContext(database *db.DB, adapter types.FSAdapter, shutdownCtx context.Context) {
+func (q *Queue) Initialize(kind PoolKind, database *db.DB, src, dst types.FSAdapter, shutdownCtx context.Context) {
 	q.SetDatabase(database)
 	q.SetShutdownContext(shutdownCtx)
-	q.initWorkerPool(adapter)
-
-	q.mu.RLock()
-	workerCount := cap(q.workers)
-	q.mu.RUnlock()
-
-	if workerCount <= 0 {
-		workerCount = 1
-	}
-	_ = q.SetTargetWorkerCount(workerCount)
-
-	// Start the queue's Run() method to coordinate pulling tasks and advancing rounds
-	go q.Run()
-
-	q.attachQueueWatchdog()
-
-	// Queues are initialized - tasks will be seeded externally or propagated through Complete()
-	if logservice.LS != nil {
-		err := logservice.LS.Log("info", fmt.Sprintf("%s queue initialized", strings.ToUpper(q.name)), "queue", q.name, q.name)
-		if err != nil {
-			fmt.Println("error logging", err)
-		}
-	}
-}
-
-// InitializeCopyWithContext sets up a copy queue with both source and destination adapters.
-// This is specifically for copy mode which requires both adapters.
-func (q *Queue) InitializeCopyWithContext(database *db.DB, srcAdapter, dstAdapter types.FSAdapter, shutdownCtx context.Context) {
-	q.SetDatabase(database)
-	q.SetShutdownContext(shutdownCtx)
-	q.initCopyWorkerPool(srcAdapter, dstAdapter)
+	q.initWorkerPool(kind, src, dst)
 
 	q.mu.RLock()
 	workerCount := cap(q.workers)
@@ -376,34 +326,13 @@ func (q *Queue) InitializeCopyWithContext(database *db.DB, srcAdapter, dstAdapte
 
 	q.attachQueueWatchdog()
 
-	// Queues are initialized - tasks will be pulled from copy status buckets
+	// Traversal tasks are seeded externally or propagated through Complete(); copy and
+	// delete tasks are pulled from their status buckets.
 	if logservice.LS != nil {
-		err := logservice.LS.Log("info", fmt.Sprintf("%s copy queue initialized", strings.ToUpper(q.name)), "queue", q.name, q.name)
+		err := logservice.LS.Log("info", fmt.Sprintf("%s %squeue initialized", strings.ToUpper(q.name), kind.logLabel()), "queue", q.name, q.name)
 		if err != nil {
 			fmt.Println("error logging", err)
 		}
-	}
-}
-
-// InitializeDeleteWithContext sets up a delete queue with the source adapter only.
-func (q *Queue) InitializeDeleteWithContext(database *db.DB, srcAdapter types.FSAdapter, shutdownCtx context.Context) {
-	q.SetDatabase(database)
-	q.SetShutdownContext(shutdownCtx)
-	q.initDeleteWorkerPool(srcAdapter)
-
-	q.mu.RLock()
-	workerCount := cap(q.workers)
-	q.mu.RUnlock()
-	if workerCount <= 0 {
-		workerCount = 1
-	}
-	_ = q.SetTargetWorkerCount(workerCount)
-
-	go q.Run()
-	q.attachQueueWatchdog()
-
-	if logservice.LS != nil {
-		_ = logservice.LS.Log("info", fmt.Sprintf("%s delete queue initialized", strings.ToUpper(q.name)), "queue", q.name, q.name)
 	}
 }
 
@@ -474,6 +403,11 @@ func (q *Queue) RecordTerminalProgress(outcome TerminalProgressOutcome, nodeID s
 		}
 	}
 	if nodeID != "" {
+		if f, ok := q.inProgress[nodeID]; ok && f.task != nil && f.task.MemWeight > 0 && q.memWeight != nil {
+			w := f.task.MemWeight
+			f.task.MemWeight = 0
+			q.memWeight.Release(memweight.InFlight, w)
+		}
 		delete(q.inProgress, nodeID)
 	}
 	q.mu.Unlock()
@@ -525,6 +459,47 @@ func (q *Queue) WindowsCompat() bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return q.windowsCompat
+}
+
+// ConfigureTraversalCompare sets exists-on-both overwrite policy and hash-verify.
+func (q *Queue) ConfigureTraversalCompare(overwritePolicy string, hashVerify bool) {
+	if q == nil {
+		return
+	}
+	q.applyQueueLocked(func() {
+		q.overwritePolicy = NormalizeOverwritePolicy(overwritePolicy)
+		q.hashVerify = hashVerify
+	})
+}
+
+// OverwritePolicy returns the exists-on-both file pairing policy.
+func (q *Queue) OverwritePolicy() string {
+	if q == nil {
+		return OverwriteNewestMTime
+	}
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return NormalizeOverwritePolicy(q.overwritePolicy)
+}
+
+// HashVerify reports whether dual-stream content hash compare is enabled.
+func (q *Queue) HashVerify() bool {
+	if q == nil {
+		return false
+	}
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.hashVerify
+}
+
+// TraversalPeerAdapter returns the optional peer FS for DST hash-verify (SRC adapter).
+func (q *Queue) TraversalPeerAdapter() types.FSAdapter {
+	if q == nil {
+		return nil
+	}
+	q.pool.mu.Lock()
+	defer q.pool.mu.Unlock()
+	return q.pool.traversalPeerAdapter
 }
 
 // SetFilterRuleset retains a compiled ruleset for compatibility; traversal does not evaluate it.
@@ -609,6 +584,7 @@ func (q *Queue) LeaseGroup(maxN int) []*TaskBase {
 			}
 			task.Locked = true
 			task.LeaseTime = time.Now()
+			q.noteLeaseMove(task)
 			q.AddInProgress(nodeID, task)
 			out = append(out, task)
 		}
@@ -633,7 +609,7 @@ type LeaseBudgetOpts struct {
 	UseByteBudget bool
 }
 
-// liveActiveWorkers returns the current AIMD pool size (len of pool handles),
+// liveActiveWorkers returns the current pool size (len of pool handles),
 // falling back to registered workers. Always at least 1.
 func (q *Queue) liveActiveWorkers() int {
 	q.pool.mu.Lock()
@@ -748,6 +724,7 @@ func (q *Queue) leaseBudgetOnce(opts LeaseBudgetOpts, remainingCap int) []*TaskB
 
 		task.Locked = true
 		task.LeaseTime = time.Now()
+		q.noteLeaseMove(task)
 		q.addInProgressLocked(task.ID, task, "")
 		out = append(out, task)
 		cumBytes += taskSize
@@ -1072,15 +1049,20 @@ func ChildResultToNodeState(child ChildResult, parentPath string, depth int, que
 
 	// All discovered SRC children start pending for copy. delete_status stays unset until
 	// copy-complete (CompleteCopyTask / already_existed), then pending_explicit or pending_inherited.
+	// DST children get bookkeeping copy status from comparison (destination_only / already_existed / needs_overwrite).
 	var copyStatus, deleteStatus string
 	if queueType == "SRC" {
 		copyStatus = db.CopyStatusPending
 	} else {
-		copyStatus = "" // DST nodes don't have copy or delete status
+		copyStatus = child.DstCopyStatus
 	}
 
 	if child.IsFile {
 		file := child.File
+		ext := file.Extension
+		if ext == "" {
+			ext = types.FileExtension(file.DisplayName)
+		}
 		return &db.NodeState{
 			ID:              nodeID,         // Deterministic ID for database keys
 			ServiceID:       file.ServiceID, // FS identifier
@@ -1090,6 +1072,7 @@ func ChildResultToNodeState(child ChildResult, parentPath string, depth int, que
 			Name:            file.DisplayName,
 			Path:            idPath, // Immutable id ancestry key
 			Type:            types.NodeTypeFile,
+			Extension:       types.NormalizeExtension(ext),
 			Size:            file.Size,
 			MTime:           file.LastUpdated,
 			Depth:           depth,
@@ -1153,7 +1136,7 @@ func (q *Queue) TotalTracked() int {
 	return q.GetPendingCount() + q.InProgressCount()
 }
 
-// Clear removes all tasks from DuckDB and resets in-progress tracking.
+// Clear removes all tasks from DB and resets in-progress tracking.
 // Note: This is a destructive operation - use with caution.
 func (q *Queue) Clear() {
 	q.mu.Lock()
@@ -1164,8 +1147,8 @@ func (q *Queue) Clear() {
 	q.pendingBuff = make([]*TaskBase, 0, q.EffectiveLeaseBatchSize())
 	q.pulling = false
 
-	// DuckDB clearing would require deleting all buckets - typically not needed
-	// (DuckDB-only: no ETL.)
+	// DB clearing would require deleting all buckets - typically not needed
+	// (DB-only: no ETL.)
 }
 
 // Shutdown gracefully shuts down the queue.
@@ -1190,7 +1173,7 @@ func (q *Queue) SetStatsChannel(ch chan QueueStats) {
 	}
 }
 
-// SetObserver registers this queue with an observer for DuckDB stats publishing.
+// SetObserver registers this queue with an observer for DB stats publishing.
 // The observer will poll this queue directly for statistics.
 func (q *Queue) SetObserver(observer QueueRegistrar) {
 	if observer != nil {
@@ -1285,14 +1268,6 @@ func (q *Queue) Stats() QueueStats {
 	}
 }
 
-// AddWorker registers a worker with this queue for reference.
-// Workers manage their own lifecycle - this is just for tracking/debugging.
-func (q *Queue) AddWorker(worker Worker) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.workers = append(q.workers, worker)
-}
-
 // Close stops the queue and cleans up resources: stats publishing loop, output buffer, and sets state to Stopped if not already Completed or Stopped.
 func (q *Queue) Close() {
 	state := q.State()
@@ -1342,20 +1317,6 @@ func (q *Queue) calculateAverage() {
 
 	// Clear buffer after calculating average
 	q.clearExecutionTimeDeltas()
-}
-
-// GetTotalCompleted returns the total number of completed tasks across all rounds.
-func (q *Queue) GetTotalCompleted() int {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-
-	total := 0
-	for _, roundStats := range q.roundStats {
-		if roundStats != nil {
-			total += roundStats.Completed
-		}
-	}
-	return total
 }
 
 // Run is the main queue coordination loop. It has an outer loop for rounds and an inner loop
@@ -1537,7 +1498,7 @@ func (q *Queue) advanceToNextRound() {
 		}
 		database.NotifyCatalogRoundSealed(side, phase, sealedRound)
 	}
-	q.resetThisQueueKeysetCursor()
+	q.ResetKeysetCursorForShed()
 
 	state := q.State()
 	if state == QueueStateWaiting {

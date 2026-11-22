@@ -4,6 +4,7 @@
 package opsdb
 
 import (
+	"encoding/json"
 	"strings"
 
 	badger "github.com/dgraph-io/badger/v4"
@@ -32,11 +33,20 @@ func (s *Store) PutGPL(rec GPLRecord) error {
 	if s == nil || rec.SrcID == "" {
 		return nil
 	}
-	b, err := encode(rec)
+	prev, ok, err := s.GetGPL(rec.SrcID)
 	if err != nil {
 		return err
 	}
-	return s.update(func(txn *badger.Txn) error {
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(txn *badger.Txn) error {
+		if ok && prev.Status != "" && prev.Status != rec.Status {
+			if err := txn.Delete(gplStatusKey(prev.Status, rec.SrcID)); err != nil && err != badger.ErrKeyNotFound {
+				return err
+			}
+		}
 		if err := txn.Set(gplKey(rec.SrcID), b); err != nil {
 			return err
 		}
@@ -52,6 +62,16 @@ func (s *Store) BatchPutGPL(recs []GPLRecord) error {
 	if s == nil || len(recs) == 0 {
 		return nil
 	}
+	ids := make([]string, 0, len(recs))
+	for i := range recs {
+		if recs[i].SrcID != "" {
+			ids = append(ids, recs[i].SrcID)
+		}
+	}
+	prevByID, err := s.BatchGetGPL(ids)
+	if err != nil {
+		return err
+	}
 	wb := s.db.NewWriteBatch()
 	defer wb.Cancel()
 	for i := range recs {
@@ -59,7 +79,12 @@ func (s *Store) BatchPutGPL(recs []GPLRecord) error {
 		if rec.SrcID == "" {
 			continue
 		}
-		b, err := encode(*rec)
+		if prev, ok := prevByID[rec.SrcID]; ok && prev.Status != "" && prev.Status != rec.Status {
+			if err := wb.Delete(gplStatusKey(prev.Status, rec.SrcID)); err != nil {
+				return err
+			}
+		}
+		b, err := json.Marshal(*rec)
 		if err != nil {
 			return err
 		}
@@ -81,7 +106,7 @@ func (s *Store) GetGPL(srcID string) (GPLRecord, bool, error) {
 	if s == nil || srcID == "" {
 		return rec, false, nil
 	}
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(gplKey(srcID))
 		if err == badger.ErrKeyNotFound {
 			return nil
@@ -90,7 +115,7 @@ func (s *Store) GetGPL(srcID string) (GPLRecord, bool, error) {
 			return err
 		}
 		return item.Value(func(val []byte) error {
-			return decodeInto(val, &rec)
+			return json.Unmarshal(val, &rec)
 		})
 	})
 	return rec, rec.SrcID != "", err
@@ -102,7 +127,7 @@ func (s *Store) BatchGetGPL(srcIDs []string) (map[string]GPLRecord, error) {
 	if s == nil || len(srcIDs) == 0 {
 		return out, nil
 	}
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		for _, id := range srcIDs {
 			if id == "" {
 				continue
@@ -116,7 +141,7 @@ func (s *Store) BatchGetGPL(srcIDs []string) (map[string]GPLRecord, error) {
 			}
 			var rec GPLRecord
 			if err := item.Value(func(val []byte) error {
-				return decodeInto(val, &rec)
+				return json.Unmarshal(val, &rec)
 			}); err != nil {
 				return err
 			}
@@ -136,7 +161,7 @@ func (s *Store) DeleteGPL(srcID string) error {
 	if err != nil {
 		return err
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		if err := txn.Delete(gplKey(srcID)); err != nil && err != badger.ErrKeyNotFound {
 			return err
 		}
@@ -156,7 +181,7 @@ func (s *Store) ListGPLByStatus(status string, limit int) ([]string, error) {
 	}
 	prefix := []byte("gplst:" + status + ":")
 	var ids []string
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)

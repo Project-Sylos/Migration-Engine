@@ -93,7 +93,7 @@ func TestDeleteForestSkipUnskipSiblingPromotion(t *testing.T) {
 		sealSRC(dID, "/A/B/D", bID, NodeTypeFile, 3, deleteStatusPendingInherited, 1),
 		sealSRC(eID, "/A/B/E", bID, NodeTypeFile, 3, deleteStatusPendingInherited, 1),
 	}
-	if _, err := s.WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := s.WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -190,7 +190,7 @@ func TestDeleteForestDisjointSkipKeepsAncestorPoisoned(t *testing.T) {
 		sealSRC(cID, "/A/C", aID, NodeTypeFile, 2, deleteStatusPendingInherited, 5),
 		sealSRC(dID, "/A/B/D", bID, NodeTypeFile, 3, deleteStatusPendingInherited, 1),
 	}
-	if _, err := s.WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := s.WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -239,7 +239,7 @@ func TestDeleteForestInheritedNotOnFrontier(t *testing.T) {
 		sealSRC(parentID, "/P", "", NodeTypeFolder, 1, deleteStatusPendingExplicit, 0),
 		sealSRC(childID, "/P/c.txt", parentID, NodeTypeFile, 2, deleteStatusPendingInherited, 3),
 	}
-	sched, err := s.WriteSealBatch(writes, nil, nil, nil, nil)
+	sched, err := s.WriteSealBatch(writes, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

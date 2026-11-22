@@ -14,7 +14,7 @@ Root is a thin contract; actuation lives under `loop`. Children import root type
 |---------|------|
 | **`pkg/scaling`** (root) | `QueueActuator`, `ScalingEvent`, `PressureClass` / `Classify`, `FormatScalingEvent` |
 | **`pkg/scaling/profile`** | `FSPerformanceProfile`, operation lookup/compose, list pagination apply, resolve from `queue.ScalingContext` |
-| **`pkg/scaling/aimd`** | `State`, `AIMDPolicy`, soft-cap / bounce / efficiency probe / FS backoff |
+| **`pkg/scaling/softcap`** | `State`, `Policy`, soft-cap / bounce / efficiency probe / FS backoff |
 | **`pkg/scaling/memory`** | Host/process sampling, budget estimates, green/yellow/red levels |
 | **`pkg/scaling/backend`** | `BackendRegistry`, group worker split, `RateLimitBridge` |
 | **`pkg/scaling/loop`** | `Autoscaler`, `Config`, `NewAutoscaler`, tick / actuate / memory knobs |
@@ -28,9 +28,9 @@ Root is a thin contract; actuation lives under `loop`. Children import root type
 Two loops, same process:
 
 1. **Observe (fast)** – **`pkg/queue/observe`** polls registered queues (~200ms), accumulates internal time buckets, updates EMA rates, persists **`qstat:*`** snapshots, and exposes **`InternalMetricsSnapshot`**.
-2. **Actuate (slow)** – **`loop.Autoscaler`** ticks on **`Config.Interval`** (default 3s from migration config). Each tick: classify pressure once (root **`Classify`**), then apply at most one AIMD step per queue (`aimd` + `loop` actuate).
+2. **Actuate (slow)** – **`loop.Autoscaler`** ticks on **`Config.Interval`** (default 3s from migration config). Each tick: classify pressure once (root **`Classify`**), then apply at most one scaling step per queue ((`softcap` + `loop` actuate)).
 
-AIMD shape: multiplicative decrease on **`FS_THROTTLE`**; batch/seal knobs shrink on memory / seal backpressure; slow-start then additive worker increase when calm; inter-op delay as a fallback lever at worker floor.
+Scaling shape: multiplicative decrease on **`FS_THROTTLE`**; batch/seal knobs shrink on memory / seal backpressure; slow-start then additive worker increase when calm; inter-op delay as a fallback lever at worker floor.
 
 ---
 

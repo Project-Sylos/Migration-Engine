@@ -10,6 +10,7 @@ import (
 
 // ParseIncludeOnlyJSON decodes a JSON array of child service IDs.
 // Empty / invalid input means unrestricted (nil set).
+// IDs are FS ServiceIDs: do not TrimSpace them (local paths may end in spaces).
 func ParseIncludeOnlyJSON(raw string) map[string]struct{} {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || raw == "null" {
@@ -21,7 +22,6 @@ func ParseIncludeOnlyJSON(raw string) map[string]struct{} {
 	}
 	out := make(map[string]struct{}, len(ids))
 	for _, id := range ids {
-		id = strings.TrimSpace(id)
 		if id == "" {
 			continue
 		}
@@ -37,7 +37,6 @@ func ParseIncludeOnlyJSON(raw string) map[string]struct{} {
 func EncodeIncludeOnlyJSON(ids []string) string {
 	cleaned := make([]string, 0, len(ids))
 	for _, id := range ids {
-		id = strings.TrimSpace(id)
 		if id == "" {
 			continue
 		}
@@ -59,6 +58,6 @@ func ChildAllowedByIncludeOnly(allow map[string]struct{}, serviceID string) bool
 	if allow == nil {
 		return true
 	}
-	_, ok := allow[strings.TrimSpace(serviceID)]
+	_, ok := allow[serviceID]
 	return ok
 }

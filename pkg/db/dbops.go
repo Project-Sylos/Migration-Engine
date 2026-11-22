@@ -4,7 +4,6 @@
 package db
 
 import (
-	"fmt"
 	"sync"
 	"time"
 
@@ -135,17 +134,6 @@ func (db *DB) RecordOp(op, sqlText string, rows int64, d time.Duration, err erro
 	}
 }
 
-// StartOp returns a callback that records elapsed time since this call.
-func (db *DB) StartOp(op, sqlText string) func(rows int64, err error) {
-	if db == nil || db.ops == nil {
-		return func(int64, error) {}
-	}
-	start := time.Now()
-	return func(rows int64, err error) {
-		db.RecordOp(op, sqlText, rows, time.Since(start), err)
-	}
-}
-
 // FlushRecordedOps writes buffered samples to Badger ops store.
 func (db *DB) FlushRecordedOps() {
 	if db == nil || db.HardAborted() {
@@ -208,12 +196,4 @@ func truncateSQLText(s string) string {
 		return s
 	}
 	return s[:dbOpsSQLMaxLen]
-}
-
-// CompactionSQLPrefix is the parseable side/depth header stored on rebuild_current samples.
-func CompactionSQLPrefix(side string, depth int) string {
-	if depth < 0 {
-		return "side=" + side + "\n"
-	}
-	return fmt.Sprintf("side=%s depth=%d\n", side, depth)
 }

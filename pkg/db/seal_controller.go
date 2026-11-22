@@ -11,11 +11,11 @@ import (
 
 // SealBufferOptions configures the seal buffer. Zero value uses defaults.
 type SealBufferOptions struct {
-	FlushInterval time.Duration
-	RowThreshold  int
-	HardCap       int
-	FlushTimeout  time.Duration
-	CheckpointEveryRows int
+	FlushInterval         time.Duration
+	RowThreshold          int
+	HardCap               int
+	FlushTimeout          time.Duration
+	CheckpointEveryRows   int
 	CheckpointMaxInterval time.Duration
 }
 
@@ -24,9 +24,26 @@ type SealBufferTelemetry struct {
 	CurrentRows              int64
 	HWMSinceLastPoll         int64
 	HardCapHitsSinceLastPoll int64
-	FlushCountSinceLastPoll  int64
-	LastFlushRows       int64
-	LastFlushDurationNs int64
+	// HardCapWaitNsSinceLastPoll is wall time producers spent blocked in
+	// waitBelowHardCapLocked since the last TelemetrySnapshot (swap-on-read).
+	HardCapWaitNsSinceLastPoll int64
+	FlushCountSinceLastPoll    int64
+	// FlushDurationNsSinceLastPoll sums wall time of every successful flush
+	// since the last TelemetrySnapshot (swap-on-read), including forced drains.
+	FlushDurationNsSinceLastPoll int64
+	LastFlushRows                int64
+	LastFlushDurationNs          int64
+	// Organic* count only soft-threshold and timer flushes (not round-advance /
+	// explicit Flush). Autoscaler seal-size efficiency probes use these.
+	OrganicFlushCountSinceLastPoll      int64
+	OrganicFlushDurationNsSinceLastPoll int64
+	LastOrganicFlushRows                int64
+	LastOrganicFlushDurationNs          int64
+	// Forced* are round-advance / explicit Flush drains. Operator
+	// backpressure wait includes this wall time; autoscaler underfeed / seal-size
+	// efficiency probes must not use it as organic throughput signal.
+	ForcedFlushCountSinceLastPoll      int64
+	ForcedFlushDurationNsSinceLastPoll int64
 }
 
 // SealFlushStats is a non-resetting snapshot of the last successful seal flush.
@@ -41,7 +58,6 @@ type SealController interface {
 	AddDiscoveryNodes(ops []InsertOperation) error
 	AddDiscoveryStatusEvent(table string, e StatusEvent, fromRetry bool)
 	AddTaskError(rec TaskErrorRecord)
-	AddFailedSubtreePath(parentPath string)
 	AddGPLIssue(e GPLIssue)
 	AddIDMapEvent(e IDMapEvent)
 	AddKidsPackReplace(side, parentID string, kids []opsdb.KidRecord)
@@ -53,21 +69,9 @@ type SealController interface {
 	LastFlushStats() SealFlushStats
 	UpdateOptions(opts SealBufferOptions)
 	StartPhase() error
-	StopPhase() error
 	AbortPhase()
 	HardAborted() bool
+	ClearHardAbort()
 	OnCheckpointOK()
 	Stop()
-}
-
-func (db *DB) AttachSeal(c SealController) {
-	db.sealBuffer = c
-}
-
-func (db *DB) LockWrites() {
-	db.writeMu.Lock()
-}
-
-func (db *DB) UnlockWrites() {
-	db.writeMu.Unlock()
 }

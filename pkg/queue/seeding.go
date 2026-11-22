@@ -16,7 +16,7 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
-// SeedRootTask inserts the initial root folder task into DuckDB to kickstart traversal.
+// SeedRootTask inserts the initial root folder task into DB to kickstart traversal.
 // traversalStatus is typically pending (classic round 0) or successful (UI-prepared round 0 done).
 // For src: sets copy_status='already_existed' (root is not a copy task).
 // rootNodeID should be db.MintNodeID(queueType, "", db.NodeTypeFolder, "/").
@@ -281,6 +281,10 @@ func SeedPreparedDepth1Children(database *db.DB, srcChildren, dstChildren []Prep
 				}
 			}
 			displayPath := filter.DisplayPathForChild(parentDisplayPath, depth-1, src.Name)
+			var ext string
+			if nodeType == types.NodeTypeFile {
+				ext = types.FileExtension(src.Name)
+			}
 			state := &db.NodeState{
 				ID:              id,
 				ServiceID:       src.ServiceID,
@@ -290,6 +294,7 @@ func SeedPreparedDepth1Children(database *db.DB, srcChildren, dstChildren []Prep
 				DisplayPath:     displayPath,
 				Path:            path,
 				Type:            nodeType,
+				Extension:       ext,
 				Size:            src.Size,
 				MTime:           src.MTime,
 				Depth:           depth,
@@ -319,9 +324,6 @@ func SeedPreparedDepth1Children(database *db.DB, srcChildren, dstChildren []Prep
 		if nodeType == types.NodeTypeFile {
 			trav = db.StatusSuccessful
 		}
-		if dst.DstOnly {
-			trav = db.StatusNotOnSrc
-		}
 		var srcID string
 		if src, ok := srcByName[key]; ok && !src.Excluded && !dst.DstOnly {
 			srcType := types.NodeTypeFolder
@@ -332,6 +334,10 @@ func SeedPreparedDepth1Children(database *db.DB, srcChildren, dstChildren []Prep
 				srcID = db.MintNodeID("SRC", srcRootID, srcType, src.Name)
 			}
 		}
+		var ext string
+		if nodeType == types.NodeTypeFile {
+			ext = types.FileExtension(dst.Name)
+		}
 		state := &db.NodeState{
 			ID:              id,
 			ServiceID:       dst.ServiceID,
@@ -340,6 +346,7 @@ func SeedPreparedDepth1Children(database *db.DB, srcChildren, dstChildren []Prep
 			Name:            dst.Name,
 			Path:            path,
 			Type:            nodeType,
+			Extension:       ext,
 			Size:            dst.Size,
 			MTime:           dst.MTime,
 			Depth:           1,
@@ -366,7 +373,7 @@ func SeedPreparedDepth1Children(database *db.DB, srcChildren, dstChildren []Prep
 		prepareSRC(srcStates)
 	}
 	if len(ops) > 0 {
-		if err := pull.BatchInsertNodes(database, ops); err != nil {
+		if err := database.SeedDiscoveredNodes(ops); err != nil {
 			return fmt.Errorf("seed prepared children: %w", err)
 		}
 	}
@@ -418,4 +425,13 @@ func includeOnlyJSONForKids(kids []PreparedChild) string {
 		return ""
 	}
 	return EncodeIncludeOnlyJSON(included)
+}
+
+// StampDisplayPath records the discovery-time display path used by filter
+// predicates and trigram indexing. GPL rename keeps it in sync via ApplyNodeRenameWithHooks.
+func StampDisplayPath(parentDisplayPath string, parentDepth int, state *db.NodeState) {
+	if state == nil {
+		return
+	}
+	state.DisplayPath = filter.DisplayPathForChild(parentDisplayPath, parentDepth, state.Name)
 }

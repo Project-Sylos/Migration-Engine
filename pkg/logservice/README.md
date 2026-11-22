@@ -101,7 +101,7 @@ logservice.LS.Log("debug", "Processing task", "worker", "worker-1", "src")
 - **Flush interval**: **3 seconds** (see `sender.go` + `db.NewLogBuffer`).
 - **Shutdown**: `Close()` calls `logBuffer.Stop()` (stops flush loop and flushes) and closes the UDP connection.
 
-Persistence is to the migration ops store under **`log:*`** keys via `db.LogBuffer` / `opsdb.AppendLogs`. See **`pkg/db/README.md`**.
+Persistence is to the per-migration **`{id}.logs/`** Badger sidecar under **`log:*`** keys via `db.LogBuffer` / `opsdb.AppendLogs` (not the ops store). See **`pkg/db/README.md`**.
 
 ---
 

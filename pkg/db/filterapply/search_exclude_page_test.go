@@ -47,12 +47,12 @@ func TestApplySearchExclusionOpsPagesPastPageSize(t *testing.T) {
 			Deltas: []opsdb.PendingDelta{{Phase: opsdb.PhaseCopy, NodeType: opsdb.NodeTypeFile, Add: true}},
 		})
 	}
-	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
 	f := review.ReviewFilter{TypeFilter: "file"}
-	mut, err := filterapply.ApplySearchExclusionOps(database, f, `{"type":"file"}`, nil, "app-pages", time.Now().UnixNano())
+	mut, err := filterapply.ApplySearchExclusionOpsCtx(context.Background(), database, f, `{"type":"file"}`, nil, "app-pages", time.Now().UnixNano())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestApplySearchExclusionOpsTimeoutMidApply(t *testing.T) {
 			Deltas: []opsdb.PendingDelta{{Phase: opsdb.PhaseCopy, NodeType: opsdb.NodeTypeFile, Add: true}},
 		})
 	}
-	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 

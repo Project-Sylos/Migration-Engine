@@ -37,6 +37,10 @@ func attachPairedDSTTraversal(d *db.DB, rows []MergedReviewRow) error {
 	if err != nil {
 		return err
 	}
+	nodes, err := d.Ops().BatchGetNode(opsdb.SideDST, ids)
+	if err != nil {
+		return err
+	}
 	for i := range rows {
 		id := rows[i].DstNodeID
 		if id == "" {
@@ -44,6 +48,9 @@ func attachPairedDSTTraversal(d *db.DB, rows []MergedReviewRow) error {
 		}
 		st := stMap[id]
 		rows[i].DstTraversalStatus = st.TraversalStatus
+		if n, ok := nodes[id]; ok {
+			rows[i].DstPath = n.Path
+		}
 		if rows[i].Type != db.NodeTypeFile {
 			rows[i].DstSize = st.ChildSize
 			rows[i].HasDstSize = true

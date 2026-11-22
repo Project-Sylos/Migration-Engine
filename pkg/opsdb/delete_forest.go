@@ -4,6 +4,7 @@
 package opsdb
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -73,8 +74,8 @@ func (s *Store) writeDeleteStatus(id string, n NodeRecord, prev, next StatusReco
 	nt := nodeTypeNT(n.Type)
 	deltas := delFrontierDelta(prev.DeleteStatus, next.DeleteStatus, nt)
 	var sched []SchedCountDelta
-	err := s.update(func(txn *badger.Txn) error {
-		b, err := encode(statusDelRecord(next))
+	err := s.db.Update(func(txn *badger.Txn) error {
+		b, err := json.Marshal(statusDelRecord(next))
 		if err != nil {
 			return err
 		}

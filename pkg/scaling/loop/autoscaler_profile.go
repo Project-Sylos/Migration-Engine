@@ -4,8 +4,8 @@
 package loop
 
 import (
-	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/profile"
 	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/backend"
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/profile"
 )
 
 func (a *Autoscaler) refreshProfiles() {
@@ -103,7 +103,7 @@ func (a *Autoscaler) reconcileProfileBounds() {
 			if p, ok := profiles[queues[0]]; ok && p.MinWorkers > 0 {
 				minPer = p.MinWorkers
 			}
-			key := backend.GroupAIMDKey(groupID)
+			key := backend.GroupStateKey(groupID)
 			if st := a.queueState(key); st != nil {
 				a.mu.Lock()
 				prev := a.lastMaxWorkers[key]

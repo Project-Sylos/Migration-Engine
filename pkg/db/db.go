@@ -7,10 +7,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
-	"time"
+	"testing"
 
+	"codeberg.org/Sylos/Migration-Engine/pkg/memweight"
 	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
@@ -18,9 +20,10 @@ import (
 type Options struct {
 	Path          string             // Logical migration path (historically *.db); OpsDir defaults from this
 	OpsDir        string             // Badger ops dir; default MigrationOpsPath(Path)
+	LogsDir       string             // Badger logs sidecar; default MigrationLogsPath(Path)
 	EncryptionKey []byte             // unused for Badger Open (kept for API compatibility)
 	SealBuffer    *SealBufferOptions // seal buffer knobs when attached
-	// MemoryLimitGB is a configured memory hint (GB). 0 = auto from host free RAM.
+	// MemoryLimitGB is an unused legacy host-memory hint (GB). Badger does not apply it.
 	MemoryLimitGB int
 }
 
@@ -40,14 +43,19 @@ type DB struct {
 	pullGate      *PullGate
 	memoryLimitGB int
 	opsStore      *opsdb.Store
+	logsStore     *opsdb.Store
 	ops           *dbOpRecorder
 
 	disableQueryTimeout int32
 	activity            atomic.Value // string
+	memWeight           *memweight.Ledger
+
+	// Bottleneck wall clocks (overlap-aware; parallel waiters count once).
+	busy [busyKindCount]OverlapClock
 }
 
 // Open opens the per-migration Badger ops store. Path is the logical migration
-// path (historically *.db); OpsDir defaults to MigrationOpsPath(Path). No DuckDB.
+// path (historically *.db); OpsDir defaults to MigrationOpsPath(Path). No DB.
 func Open(opts Options) (*DB, error) {
 	path := opts.Path
 	if path == "" {
@@ -64,19 +72,40 @@ func Open(opts Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db := &DB{path: path, pullGate: newPullGate(), opsStore: opsStore, memoryLimitGB: ResolveMemoryLimitGB(opts.MemoryLimitGB)}
+	logsDir := opts.LogsDir
+	if logsDir == "" {
+		logsDir = MigrationLogsPath(path)
+	}
+	if logsDir == "" {
+		_ = opsStore.Close()
+		return nil, fmt.Errorf("Badger logs sidecar dir required (set Options.LogsDir for :memory:)")
+	}
+	logsStore, err := opsdb.Open(opsdb.Options{Dir: logsDir})
+	if err != nil {
+		_ = opsStore.Close()
+		return nil, err
+	}
+	db := &DB{path: path, pullGate: newPullGate(), opsStore: opsStore, logsStore: logsStore, memoryLimitGB: ResolveMemoryLimitGB(opts.MemoryLimitGB)}
 	sealOpts := SealBufferOptions{}
 	if opts.SealBuffer != nil {
 		sealOpts = *opts.SealBuffer
 	}
-	db.AttachSeal(newBadgerSeal(db, opsStore, sealOpts))
+	db.sealBuffer = newBadgerSeal(db, opsStore, sealOpts)
 	db.startOpRecorder()
 	return db, nil
 }
 
-// LogsDBForWrite returns the DB handle used for log persistence (Badger ops store).
+// LogsDBForWrite returns the DB handle used for log persistence (same handle; logs go to Logs()).
 func (db *DB) LogsDBForWrite() *DB {
 	return db
+}
+
+// Logs returns the Badger logs sidecar store (may be nil).
+func (db *DB) Logs() *opsdb.Store {
+	if db == nil {
+		return nil
+	}
+	return db.logsStore
 }
 
 // Close closes the ops store after flushing the seal buffer and recorded ops.
@@ -91,6 +120,11 @@ func (db *DB) Close() error {
 	db.stopOpRecorder(db.HardAborted())
 	if db.opsStore != nil {
 		if err := db.opsStore.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if db.logsStore != nil {
+		if err := db.logsStore.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -110,12 +144,6 @@ func (db *DB) Ops() *opsdb.Store {
 	return db.opsStore
 }
 
-// WaitCatalogDrained is a legacy Duck catalog-ingest barrier; Badger seal is synchronous.
-func (db *DB) WaitCatalogDrained(ctx context.Context) error {
-	_ = ctx
-	return nil
-}
-
 // NotifyCatalogRoundSealed is a legacy Duck catalog-ingest hook; Badger indexes are written on node insert.
 func (db *DB) NotifyCatalogRoundSealed(string, string, int) {}
 
@@ -129,7 +157,7 @@ func (db *DB) DropPendingPrefix(side, phase string, depth int, nodeType string) 
 	if db == nil || db.opsStore == nil {
 		return nil
 	}
-	return db.opsStore.DropPendingPrefix(side, phase, depth, nodeType)
+	return db.opsStore.DropPendingPrefixAborted(side, phase, depth, nodeType, nil)
 }
 
 // GetSchedCountAtDepth returns the delta-maintained pending count at side/phase/depth/type (O(1)).
@@ -181,7 +209,7 @@ func (db *DB) AcquirePull(onWaitBeat func()) {
 	if db == nil {
 		return
 	}
-	db.pullGate.Acquire(onWaitBeat)
+	db.pullGate.Acquire(onWaitBeat, db.Busy(BusyDBWork), db.Busy(BusyPullGate))
 }
 
 // ReleasePull returns the shared frontier-pull ticket.
@@ -192,45 +220,36 @@ func (db *DB) ReleasePull() {
 	db.pullGate.Release()
 }
 
-// SealLevel persists a sealed level from memory cache to the DB (bulk append + stats snapshot). copyP/copyS/copyF are used for SRC copy stats when >= 0.
-// Payload is enqueued to the seal buffer, which flushes asynchronously. CHECKPOINT policy: periodic (rows + interval, see SealBufferOptions), phase end (migration runners), soft suspend, seeding, and Close.
-func (db *DB) SealLevel(table string, depth int, nodes []*NodeState, pending, successful, failed, completed int64, copyP, copyS, copyF int64) error {
-	if table != "SRC" && table != "DST" {
+// BusyKind selects one of the bottleneck wall clocks on DB.
+type BusyKind int
+
+const (
+	BusyFS           BusyKind = iota // any FS adapter await
+	BusyBackpressure                 // hard-cap waiters and/or forced flush
+	BusyHardCap                      // hard-cap only (breakdown)
+	BusyDBWork                       // organic flush and/or frontier pull (incl. gate)
+	BusyPullGate                     // pull-ticket wait only (breakdown)
+	busyKindCount
+)
+
+// Busy returns the overlap clock for kind. A nil DB returns a nil clock, whose Enter/Leave are no-ops.
+func (db *DB) Busy(kind BusyKind) *OverlapClock {
+	if db == nil {
 		return nil
 	}
-	return db.sealBuffer.Add(table, depth, nodes, pending, successful, failed, completed, copyP, copyS, copyF)
+	return &db.busy[kind]
 }
 
-// AddSealNodes writes a subset of nodes and their status events to the seal buffer (no level stats).
-// Use when removing nodes from cache after DST task completion or SRC early completion; only remove from cache if this returns nil.
-func (db *DB) AddSealNodes(table string, depth int, nodes []*NodeState) error {
-	if table != "SRC" && table != "DST" || len(nodes) == 0 {
-		return nil
+// TakeBottleneckWallNs returns and clears overlap wall clocks for the autoscaler panel.
+func (db *DB) TakeBottleneckWallNs() (fs, backpressure, hardCap, dbWork, pullGate int64) {
+	if db == nil {
+		return 0, 0, 0, 0, 0
 	}
-	return db.sealBuffer.Add(table, depth, nodes, 0, 0, 0, 0, 0, 0, 0)
-}
-
-// SealLevelDepth0 emits status events for depth-0 nodes through the Badger seal path.
-func (db *DB) SealLevelDepth0(table string, nodes []*NodeState) error {
-	if table != "SRC" && table != "DST" || len(nodes) == 0 {
-		return nil
-	}
-	eventTime := time.Now().UnixNano()
-	for _, nd := range nodes {
-		if nd == nil {
-			continue
-		}
-		trav := nd.TraversalStatus
-		if trav == "" {
-			trav = nd.Status
-		}
-		ev := StatusEvent{ID: nd.ID, TraversalStatus: trav, EventTime: eventTime, Depth: 0, NodeType: nd.Type}
-		if table == "SRC" {
-			ev.CopyStatus = nd.CopyStatus
-		}
-		db.AppendStatusEvent(table, ev, false)
-	}
-	return db.Flush(context.Background())
+	return db.busy[BusyFS].TakeNs(),
+		db.busy[BusyBackpressure].TakeNs(),
+		db.busy[BusyHardCap].TakeNs(),
+		db.busy[BusyDBWork].TakeNs(),
+		db.busy[BusyPullGate].TakeNs()
 }
 
 // Flush drains pending seal jobs to the DB. Honors ctx cancellation before starting.
@@ -321,15 +340,6 @@ func (db *DB) withSealBuffer(fn func(SealController)) {
 	}
 }
 
-// AppendFailedSubtree enqueues an SRC folder path for subtree failure propagation.
-// At the next flush, all pending descendants will be marked as copy_status='failed'.
-func (db *DB) AppendFailedSubtree(parentPath string) {
-	if db == nil || db.sealBuffer == nil {
-		return
-	}
-	db.sealBuffer.AddFailedSubtreePath(parentPath)
-}
-
 // AppendGPLIssue enqueues a sparse GPL review row for async seal flush.
 func (db *DB) AppendGPLIssue(e GPLIssue) {
 	if db == nil || db.sealBuffer == nil {
@@ -369,30 +379,6 @@ func (db *DB) AppendIDMapEvent(e IDMapEvent) {
 	db.sealBuffer.AddIDMapEvent(e)
 }
 
-// InsertRuleEvaluationEvents is unused on the Badger store.
-func (db *DB) InsertRuleEvaluationEvents(events []RuleEvaluationEvent) error {
-	if len(events) == 0 {
-		return nil
-	}
-	return fmt.Errorf("ops store required")
-}
-
-// RunWrite holds writeMu and runs fn. Serializes writers that share the migration DB handle.
-func (db *DB) RunWrite(ctx context.Context, fn func() error) error {
-	if db == nil {
-		return fmt.Errorf("nil database")
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	start := time.Now()
-	db.writeMu.Lock()
-	defer db.writeMu.Unlock()
-	err := fn()
-	db.RecordOp(OpRunWrite, "", 0, time.Since(start), err)
-	return err
-}
-
 // BeginTraversalPhase starts the seal buffer phase for traversal.
 func (db *DB) BeginTraversalPhase(ctx context.Context) error {
 	db.writeMu.Lock()
@@ -406,38 +392,6 @@ func (db *DB) EnsureBulkPhaseSecondaryIndexes() error {
 	return nil
 }
 
-// IndexBuildOptions is unused on Badger (kept for call-site compatibility).
-type IndexBuildOptions struct {
-	Threads       int
-	MemoryLimitGB int
-}
-
-// ClampIndexBuildThreads returns threads in [1, 4].
-func ClampIndexBuildThreads(n int) int {
-	if n <= 0 {
-		return 1
-	}
-	if n > 4 {
-		return 4
-	}
-	return n
-}
-
-// EnsureBulkPhaseSecondaryIndexesWithOptions is a legacy Duck index-build hook (no-op on Badger).
-func (db *DB) EnsureBulkPhaseSecondaryIndexesWithOptions(opts IndexBuildOptions) error {
-	_ = opts
-	return nil
-}
-
-// SetThreads is a no-op on Badger-only stores.
-func (db *DB) SetThreads(n int) error {
-	_ = n
-	if db == nil {
-		return fmt.Errorf("database not open")
-	}
-	return nil
-}
-
 // MemoryLimitGB returns the configured memory limit hint (GB).
 func (db *DB) MemoryLimitGB() int {
 	if db == nil || db.memoryLimitGB <= 0 {
@@ -446,26 +400,11 @@ func (db *DB) MemoryLimitGB() int {
 	return db.memoryLimitGB
 }
 
-// SetMemoryLimitGB records a memory limit hint for newly opened stores.
-func (db *DB) SetMemoryLimitGB(gb int) error {
-	if db == nil {
-		return fmt.Errorf("database not open")
-	}
-	db.memoryLimitGB = ResolveMemoryLimitGB(gb)
-	return nil
-}
-
 // EndTraversalPhase flushes remaining seal-buffer writes (catalog inserts already indexed inline).
 // CHECKPOINT is not run here: callers run it once after both traversal/retry/copy queues finish (see migration run/copy/sweeps), plus periodic seal policy, suspend, and Close.
 // No-ops after AbortTraversalPhase.
 // Prefer StopBulkPhaseSeal for soft suspend so Stop does not block on a full durable flush.
 func (db *DB) EndTraversalPhase() error {
-	return db.EndTraversalPhaseWithIndexOptions(IndexBuildOptions{})
-}
-
-// EndTraversalPhaseWithIndexOptions flushes the seal buffer. IndexBuildOptions are ignored on Badger.
-func (db *DB) EndTraversalPhaseWithIndexOptions(opts IndexBuildOptions) error {
-	_ = opts
 	if db.HardAborted() {
 		return nil
 	}
@@ -483,7 +422,7 @@ func (db *DB) StopBulkPhaseSeal() error {
 	if db.HardAborted() {
 		return nil
 	}
-	return db.sealBuffer.StopPhase()
+	return db.sealBuffer.Flush()
 }
 
 // AbortTraversalPhase drops in-memory seal phase state without Flush or CHECKPOINT.
@@ -496,7 +435,52 @@ func (db *DB) AbortTraversalPhase() {
 	db.sealBuffer.AbortPhase()
 }
 
-// HardAborted is true after AbortTraversalPhase until the next BeginTraversalPhase.
+// HardAborted is true after AbortTraversalPhase until ClearHardAbort or BeginTraversalPhase.
 func (db *DB) HardAborted() bool {
 	return db != nil && db.sealBuffer != nil && db.sealBuffer.HardAborted()
+}
+
+// ClearHardAbort resets the hard-abort flag so durable finalize / fold can run again after Stop.
+func (db *DB) ClearHardAbort() {
+	if db == nil || db.sealBuffer == nil {
+		return
+	}
+	db.sealBuffer.ClearHardAbort()
+}
+
+// SetActivity records a human-readable label for the current DB wait (soft stop UI / observer).
+// Pass empty to clear.
+func (db *DB) SetActivity(label string) {
+	if db == nil {
+		return
+	}
+	db.activity.Store(label)
+}
+
+// ActivityLabel returns the current DB activity label, or empty.
+func (db *DB) ActivityLabel() string {
+	if db == nil {
+		return ""
+	}
+	v := db.activity.Load()
+	if v == nil {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
+// TestOpen opens a file-backed DB with matching Badger ops and logs dirs for tests.
+func TestOpen(t *testing.T, name string) *DB {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, name+".db")
+	ops := filepath.Join(dir, name+".ops")
+	logs := filepath.Join(dir, name+".logs")
+	database, err := Open(Options{Path: path, OpsDir: ops, LogsDir: logs})
+	if err != nil {
+		t.Fatalf("TestOpen(%q): %v", name, err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	return database
 }

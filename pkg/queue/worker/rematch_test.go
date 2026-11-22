@@ -12,7 +12,7 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
-func TestRematchDSTChildrenFiles_mapsCleanedName(t *testing.T) {
+func TestRematchDSTChildrenFiles_noSilentCleanPair(t *testing.T) {
 	srcID := "src-bad"
 	payload := db.GPLStatePayload{
 		Valid: false,
@@ -40,14 +40,7 @@ func TestRematchDSTChildrenFiles_mapsCleanedName(t *testing.T) {
 	srcIDMap := map[string]string{"file:bad*.txt": srcID}
 
 	rematchDSTChildrenFiles(task, expected, actualMap, expectedMap, srcIDMap)
-	if len(task.DiscoveredChildren) != 1 {
-		t.Fatalf("want 1 rematch, got %d", len(task.DiscoveredChildren))
-	}
-	c := task.DiscoveredChildren[0]
-	if c.SrcID != srcID || !c.IsFile || c.File.DisplayName != "clean.txt" {
-		t.Fatalf("unexpected child %#v", c)
-	}
-	if c.SrcCopyStatus != db.CopyStatusAlreadyExisted {
-		t.Fatalf("copy status=%q", c.SrcCopyStatus)
+	if len(task.DiscoveredChildren) != 0 {
+		t.Fatalf("cleaned-name rematch must not auto-pair, got %d children", len(task.DiscoveredChildren))
 	}
 }

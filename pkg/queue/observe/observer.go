@@ -5,7 +5,7 @@
 //
 // The QueueObserver polls queues directly at regular intervals (default: 200ms) and keeps an
 // in-memory metrics snapshot for live API reads. Durable queue_stats rows are written
-// asynchronously so DuckDB write locks cannot stall progress-monitor freshness.
+// asynchronously so DB write locks cannot stall progress-monitor freshness.
 //
 // Usage:
 //   observer := observe.NewQueueObserver(database, 200*time.Millisecond)
@@ -14,13 +14,13 @@
 //   observer.Start()
 //   // Stats are published to /STATS/queue-stats bucket with keys like "src-traversal", "dst-traversal"
 //
-// Stats can be retrieved from DuckDB using:
+// Stats can be retrieved from DB using:
 //   statsJSON, err := database.GetLatestQueueStats("src-traversal", db.QueueStatsPhaseTraversal)
 //   allStats, err := database.GetAllQueueStats()
 //
 // For low-latency APIs while a run is active, use LastQueueMetricsForAPI(): same JSON shape as
 // queue_stats audit rows, refreshed every observer tick from memory. Durable queue_stats writes
-// run on a separate goroutine so DuckDB writeMu contention cannot stall live API metrics.
+// run on a separate goroutine so DB writeMu contention cannot stall live API metrics.
 
 package observe
 
@@ -36,7 +36,7 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 )
 
-// ExternalQueueMetrics contains user-facing metrics published to DuckDB for API access.
+// ExternalQueueMetrics contains user-facing metrics published to DB for API access.
 type ExternalQueueMetrics struct {
 	// Monotonic counters (traversal phase)
 	FilesDiscoveredTotal   int64 `json:"files_discovered_total"`
@@ -114,10 +114,13 @@ type ExternalQueueMetrics struct {
 	RateLimitedRemainingMsSrc int64 `json:"rate_limited_remaining_ms_src,omitempty"`
 	RateLimitedRemainingMsDst int64 `json:"rate_limited_remaining_ms_dst,omitempty"`
 
-	// AIMD inter-op pacing delay (ns→ms for API). Non-zero means workers are artificially slowed.
+	// Autoscaler inter-op pacing delay (ns→ms for API). Non-zero means workers are artificially slowed.
 	InterOpDelayMs int64 `json:"inter_op_delay_ms,omitempty"`
 
-	// Last DuckDB frontier pull (this queue). Surfaced via observer → queue_stats.
+	// ActiveTasks is a live-only leased-task snapshot (not written to durable queue_stats).
+	ActiveTasks []queue.InFlightTask `json:"activeTasks,omitempty"`
+
+	// Last DB frontier pull (this queue). Surfaced via observer → queue_stats.
 	DBPullDurationMs float64 `json:"db_pull_duration_ms,omitempty"`
 	DBPullRows       int64   `json:"db_pull_rows,omitempty"`
 	DBPullRowsPerSec float64 `json:"db_pull_rows_per_sec,omitempty"`
@@ -196,7 +199,7 @@ type QueueObserver struct {
 	// lastAPIMetrics: marshaled ExternalQueueMetrics per queue_stats key (e.g. src-traversal), for O(1) API reads.
 	lastAPIMetricsMu sync.RWMutex
 	lastAPIMetrics   map[string][]byte
-	// lastDBPersist tracks when an audit snapshot was last successfully written to DuckDB.
+	// lastDBPersist tracks when an audit snapshot was last successfully written to DB.
 	lastDBPersistMu sync.Mutex
 	lastDBPersist   time.Time
 	// Async queue_stats audit: observe loop never blocks on writeMu.
@@ -375,24 +378,6 @@ func (o *QueueObserver) AbandonRegisteredQueues() {
 		q.AbandonInProgressTasks()
 		q.ClearPendingBufferForSuspend()
 	}
-}
-
-// UnregisterQueue removes a queue from the observer.
-func (o *QueueObserver) UnregisterQueue(queueName string) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	delete(o.queues, queueName)
-	delete(o.internalMetrics, queueName)
-	delete(o.prevEMARates, queueName)
-	delete(o.prevEMARates, queueName+"-tasks")
-	delete(o.prevEMARates, queueName+"-items")
-	delete(o.prevEMARates, queueName+"-bytes")
-	delete(o.prevDiscoveryTotals, queueName)
-	delete(o.prevByteTotals, queueName)
-	delete(o.copyRateHistory, queueName)
-	delete(o.taskRateHistory, queueName)
-	delete(o.etaState, queueName)
 }
 
 // Start begins the observer loop (and async audit writer).
@@ -630,6 +615,7 @@ func buildAuditSnapshot(metrics map[string]ExternalQueueMetrics, queues map[stri
 		if q := queues[queueName]; q != nil {
 			phase = PhaseFamilyForMode(q.GetMode())
 		}
+		met.ActiveTasks = nil // durable audit must not store live task lists
 		b, err := json.Marshal(met)
 		if err != nil {
 			continue
@@ -699,7 +685,7 @@ func (o *QueueObserver) storeLastAPIMetrics(metrics map[string]ExternalQueueMetr
 }
 
 // LastQueueMetricsForAPI returns a copy of the latest marshaled metrics per queue_stats key.
-// Keys match DuckDB queue_stats.queue_key (e.g. "src-traversal"). False if no tick has run yet.
+// Keys match DB queue_stats.queue_key (e.g. "src-traversal"). False if no tick has run yet.
 func (o *QueueObserver) LastQueueMetricsForAPI() (map[string][]byte, bool) {
 	o.lastAPIMetricsMu.RLock()
 	defer o.lastAPIMetricsMu.RUnlock()
@@ -808,6 +794,7 @@ func (o *QueueObserver) pollQueue(queueName string, q *queue.Queue) *ExternalQue
 	if queueName == "copy" || queueName == "delete" {
 		metric.CopyPass = q.GetCopyPass()
 	}
+	metric.ActiveTasks = q.InFlightSnapshot(24)
 
 	srcUntil, dstUntil := q.RateLimitedUntilSides()
 	metric.RateLimitedUntilSrc, metric.RateLimitedRemainingMsSrc = formatActiveRateLimit(srcUntil, now)
@@ -853,7 +840,7 @@ func formatActiveRateLimit(until time.Time, now time.Time) (untilStr string, rem
 }
 
 // enrichCopyDeleteProgressFromMemory fills progress from phase totals loaded once
-// before workers start and live queue counters. It never touches DuckDB.
+// before workers start and live queue counters. It never touches DB.
 func enrichCopyDeleteProgressFromMemory(metric *ExternalQueueMetrics, q *queue.Queue, mode queue.QueueMode) {
 	if metric == nil || q == nil {
 		return
@@ -1306,7 +1293,7 @@ func (o *QueueObserver) updateRateLimitMetrics(queueName string, now time.Time) 
 		return
 	}
 	// Do NOT TakeRecentHits here — that is reserved for SnapshotInternalMetrics
-	// (autoscaler tick). Draining on every observer poll hid FS_THROTTLE from AIMD.
+	// (autoscaler tick). Draining on every observer poll hid FS_THROTTLE from the autoscaler.
 	until := src.RateLimitedUntil()
 	if until.After(now) {
 		o.mu.Lock()

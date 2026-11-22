@@ -8,20 +8,23 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/memweight"
 )
 
 const (
-	// MinMemoryLimitGB is the floor for auto and explicit DuckDB memory_limit.
+	// MinMemoryLimitGB is the floor for legacy host-memory hint helpers.
 	MinMemoryLimitGB = 4
-	// AutoMaxMemoryLimitGB caps host-derived defaults (UI may raise further).
+	// AutoMaxMemoryLimitGB caps host-derived defaults.
 	AutoMaxMemoryLimitGB = 12
-	// MaxMemoryLimitGB is the hard ceiling for PRAGMA memory_limit.
+	// MaxMemoryLimitGB is the hard ceiling for explicit host-memory hints.
 	MaxMemoryLimitGB = 64
 )
 
-// DefaultMemoryLimitGB picks a DuckDB memory_limit from host free RAM.
+// DefaultMemoryLimitGB picks a host-memory hint from free RAM.
 // Uses half of MemAvailable (Linux), clamped to [MinMemoryLimitGB, AutoMaxMemoryLimitGB].
-// Falls back to MinMemoryLimitGB when free memory cannot be read.
+// Falls back to MinMemoryLimitGB when free memory cannot be read. Kept for API compatibility;
+// Badger ops stores do not apply this as a PRAGMA.
 func DefaultMemoryLimitGB() int {
 	avail := memAvailableGB()
 	if avail <= 0 {
@@ -83,4 +86,15 @@ func memAvailableGB() int {
 		return 0
 	}
 	return 0
+}
+
+// SetMemWeightLedger attaches the shared ledger to the DB and its seal buffer (nil clears).
+func (db *DB) SetMemWeightLedger(l *memweight.Ledger) {
+	if db == nil {
+		return
+	}
+	db.memWeight = l
+	if b, ok := db.sealBuffer.(*badgerSeal); ok {
+		b.memWeight = l
+	}
 }

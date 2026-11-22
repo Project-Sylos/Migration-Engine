@@ -244,10 +244,6 @@ func eventDepthStatsDeltas(table string, e StatusEvent) []DepthStatsDelta {
 	return out
 }
 
-func (db *DB) incrOpsReviewDeltas(deltas []ReviewStatsDelta) error {
-	return db.applyOpsHotpathStats(deltas, nil)
-}
-
 func (db *DB) applyOpsHotpathStats(review []ReviewStatsDelta, depth []DepthStatsDelta) error {
 	if db == nil || db.Ops() == nil {
 		return nil

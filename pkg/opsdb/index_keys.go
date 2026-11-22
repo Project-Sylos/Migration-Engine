@@ -53,52 +53,16 @@ func PathIndexPrefix(side, root string) []byte {
 	return PathIndexKey(side, root)
 }
 
-func NameIndexKey(side, name, id string) []byte {
-	return append(append([]byte(indexNamePrefix+side+":"+strings.ToLower(name)), indexNul), id...)
-}
-
-func NameIndexPrefix(side, namePrefix string) []byte {
-	return []byte(indexNamePrefix + side + ":" + strings.ToLower(namePrefix))
-}
-
-func SizeIndexKey(side string, size int64, id string) []byte {
-	return append(append(append([]byte(indexSizePrefix+side+":"), encodeU64BE(uint64(size))...), indexNul), id...)
-}
-
-func SizeIndexBound(side string, size int64) []byte {
-	return append([]byte(indexSizePrefix+side+":"), encodeU64BE(uint64(size))...)
-}
-
-func SizeIndexSidePrefix(side string) []byte {
-	return []byte(indexSizePrefix + side + ":")
-}
-
-func MTimeIndexKey(side string, unixNano int64, id string) []byte {
-	return append(append(append([]byte(indexMTimePrefix+side+":"), encodeU64BE(uint64(unixNano))...), indexNul), id...)
-}
-
-func MTimeIndexBound(side string, unixNano int64) []byte {
-	return append([]byte(indexMTimePrefix+side+":"), encodeU64BE(uint64(unixNano))...)
-}
-
-func MTimeIndexSidePrefix(side string) []byte {
-	return []byte(indexMTimePrefix + side + ":")
-}
-
-func SegIndexKey(side, token, id string) []byte {
-	return append(append([]byte(indexSegPrefix+side+":"+strings.ToLower(token)), indexNul), id...)
-}
-
-func SegIndexPrefix(side, token string) []byte {
-	return []byte(indexSegPrefix + side + ":" + strings.ToLower(token))
-}
-
-func TriIndexKey(side, gram, id string) []byte {
-	return append(append([]byte(indexTriPrefix+side+":"+gram), indexNul), id...)
-}
-
-func TriIndexPrefix(side, gram string) []byte {
-	return []byte(indexTriPrefix + side + ":" + gram)
+// indexKey is prefix+side+":"+parts joined by NUL. Dropping the trailing part yields the seek prefix.
+func indexKey(prefix, side string, parts ...string) []byte {
+	b := append([]byte(prefix+side), ':')
+	for i, p := range parts {
+		if i > 0 {
+			b = append(b, indexNul)
+		}
+		b = append(b, p...)
+	}
+	return b
 }
 
 // ExtractTrigrams returns unique lowercase trigrams for s (edge-padded when short).
@@ -127,12 +91,61 @@ func ExtractTrigrams(s string) []string {
 	return out
 }
 
+// stripOverlappingExtensionForTrigrams removes "."+ext from the basename of s
+// only when that basename ends with the extension (case-insensitive). Used only
+// by trigram index/query paths; Name/DisplayName/segment indexes stay full.
+func stripOverlappingExtensionForTrigrams(s, ext string) string {
+	ext = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(ext), "."))
+	if ext == "" {
+		return s
+	}
+	s = strings.TrimSpace(s)
+	base := s
+	prefix := ""
+	if i := strings.LastIndexByte(base, '/'); i >= 0 {
+		prefix = base[:i+1]
+		base = base[i+1:]
+	}
+	suffix := "." + ext
+	if len(base) <= len(suffix) || !strings.EqualFold(base[len(base)-len(suffix):], suffix) {
+		return s
+	}
+	return prefix + base[:len(base)-len(suffix)]
+}
+
+// TrigramSourceText prepares a query needle for trigram intersect by stripping a
+// trailing extension only when the needle ends with that extension. Indexing
+// uses NodeTrigrams with the stored file Extension instead.
+func TrigramSourceText(needle string) string {
+	needle = strings.TrimSpace(needle)
+	if needle == "" {
+		return needle
+	}
+	base := needle
+	if i := strings.LastIndexByte(base, '/'); i >= 0 {
+		base = base[i+1:]
+	}
+	i := strings.LastIndexByte(base, '.')
+	if i <= 0 || i == len(base)-1 {
+		return needle
+	}
+	return stripOverlappingExtensionForTrigrams(needle, base[i+1:])
+}
+
 // NodeTrigrams returns unique trigrams for name plus each path segment (not across '/').
-// Uses displayPath when non-empty, else path.
-func NodeTrigrams(path, displayPath, name string) []string {
+// Uses displayPath when non-empty, else path. For files, strips Extension from
+// each token only when that token ends with "."+Extension (folders never strip).
+func NodeTrigrams(path, displayPath, name, nodeType, extension string) []string {
 	seen := map[string]struct{}{}
 	var out []string
+	stripExt := ""
+	if nodeType == NodeTypeFile {
+		stripExt = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(extension), "."))
+	}
 	add := func(s string) {
+		if stripExt != "" {
+			s = stripOverlappingExtensionForTrigrams(s, stripExt)
+		}
 		for _, g := range ExtractTrigrams(s) {
 			if _, ok := seen[g]; ok {
 				continue
@@ -157,10 +170,10 @@ func NodeTrigrams(path, displayPath, name string) []string {
 	return out
 }
 
-func encodeU64BE(n uint64) []byte {
+func u64BE(n int64) string {
 	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, n)
-	return b
+	binary.BigEndian.PutUint64(b, uint64(n))
+	return string(b)
 }
 
 // ParseMTimeUnixNano parses NodeRecord.MTime into unix nanos for indexing.

@@ -17,7 +17,7 @@ func (s *Store) ListSchedAtDepth(side, phase string, depth int, nodeType, afterI
 	nodeType = pendingNodeType(nodeType)
 	prefix := pendingPrefix(side, phase, depth, nodeType)
 	var ids []string
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer it.Close()
 		if afterID != "" {

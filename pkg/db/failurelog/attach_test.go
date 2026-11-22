@@ -35,13 +35,13 @@ func TestAttachTaskFailureLogAndFlush(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	logs, err := database.Ops().GetLogsByIDs([]string{ev.ErrorLogID})
+	logs, err := database.Logs().GetLogsByIDs([]string{ev.ErrorLogID})
 	if err != nil {
 		t.Fatal(err)
 	}
 	rec, ok := logs[ev.ErrorLogID]
 	if !ok {
-		t.Fatal("expected log in ops store")
+		t.Fatal("expected log in logs sidecar")
 	}
 	if rec.Message != ev.ErrorLogMessage {
 		t.Fatalf("message=%q want %q", rec.Message, ev.ErrorLogMessage)

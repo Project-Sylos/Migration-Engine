@@ -20,7 +20,7 @@ func (s *Store) HasTriIndexV1() (bool, error) {
 		return false, nil
 	}
 	var ok bool
-	err := s.view(func(txn *badger.Txn) error {
+	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get([]byte(metaTriIndexV1Key))
 		if err == badger.ErrKeyNotFound {
 			return nil
@@ -52,7 +52,7 @@ func (s *Store) EnsureTriIndexV1() error {
 	if err := s.RebuildSecondaryIndexes(); err != nil {
 		return err
 	}
-	return s.update(func(txn *badger.Txn) error {
+	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set([]byte(metaTriIndexV1Key), []byte(metaTriIndexV1Val))
 	})
 }

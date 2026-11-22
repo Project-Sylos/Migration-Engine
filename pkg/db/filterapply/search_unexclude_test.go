@@ -1,6 +1,7 @@
 package filterapply_test
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -35,7 +36,7 @@ func TestApplySearchUnexclusionRestoresInheritedSubtree(t *testing.T) {
 			Deltas: []opsdb.PendingDelta{{Phase: opsdb.PhaseCopy, NodeType: opsdb.NodeTypeFile, Add: true}},
 		},
 	}
-	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil, nil); err != nil {
+	if _, err := database.Ops().WriteSealBatch(writes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.ApplySubtreeCopyExclusion("/p", true, nil); err != nil {
@@ -49,7 +50,7 @@ func TestApplySearchUnexclusionRestoresInheritedSubtree(t *testing.T) {
 	}
 
 	f := review.ReviewFilter{CopyStatus: db.CopyStatusExcluded, StatusSearchType: "copy"}
-	mut, err := filterapply.ApplySearchUnexclusionOps(database, f, nil, 0)
+	mut, err := filterapply.ApplySearchUnexclusionOpsCtx(context.Background(), database, f, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

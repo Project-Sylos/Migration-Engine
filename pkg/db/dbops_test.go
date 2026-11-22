@@ -91,13 +91,6 @@ func TestHardAbortedSkipsOpsFlush(t *testing.T) {
 	}
 }
 
-func TestCompactionSQLPrefixParseable(t *testing.T) {
-	got := db.CompactionSQLPrefix("SRC", 7)
-	if !strings.HasPrefix(got, "side=SRC depth=7\n") {
-		t.Fatalf("prefix=%q", got)
-	}
-}
-
 func TestRecordOpDoesNotRequireDuck(t *testing.T) {
 	database, err := db.Open(db.Options{Path: t.TempDir() + "/no-duck.db"})
 	if err != nil {
@@ -125,7 +118,7 @@ func TestSealFlushRecordsOp(t *testing.T) {
 		ID: id, Path: "/a.txt", ParentPath: "/", Name: "a.txt",
 		Type: db.NodeTypeFile, Depth: 1, TraversalStatus: db.StatusSuccessful,
 	}
-	if err := database.SealLevel("SRC", 1, []*db.NodeState{node}, 0, 1, 0, 1, -1, -1, -1); err != nil {
+	if err := database.AppendDiscoveredNodes([]db.InsertOperation{{QueueType: "SRC", Level: 1, Status: db.StatusSuccessful, State: node}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.Flush(t.Context()); err != nil {

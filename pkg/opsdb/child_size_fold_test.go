@@ -4,6 +4,8 @@
 package opsdb
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	badger "github.com/dgraph-io/badger/v4"
@@ -17,13 +19,13 @@ func TestFoldChildSizesNestedAndRoot(t *testing.T) {
 	if _, err := s.WriteSealBatchTrusted(nil, nil, []SealKidsReplace{{
 		Side: SideSRC, ParentID: "a",
 		Kids: []KidRecord{{ID: "f", Type: NodeTypeFile, Size: 10, Depth: 1}},
-	}}, nil, nil, nil); err != nil {
+	}}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.WriteSealBatchTrusted(nil, nil, []SealKidsReplace{{
 		Side: SideSRC, ParentID: "root",
 		Kids: []KidRecord{{ID: "a", Type: NodeTypeFolder, Depth: 1}},
-	}}, nil, nil, nil); err != nil {
+	}}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.AddPending(SideSRC, PhaseTrav, 1, NodeTypeFolder, "a"); err != nil {
@@ -40,6 +42,12 @@ func TestFoldChildSizesNestedAndRoot(t *testing.T) {
 	}
 	if got := mustChildSize(t, s, "root"); got != 10 {
 		t.Fatalf("root child_size=%d want 10", got)
+	}
+	if got := mustChildCount(t, s, "a"); got != 1 {
+		t.Fatalf("a child_count=%d want 1", got)
+	}
+	if got := mustChildCount(t, s, "root"); got != 2 {
+		t.Fatalf("root child_count=%d want 2 (folder a + file f)", got)
 	}
 	ids, err := s.ListSchedAtDepth(SideSRC, PhaseTrav, 1, NodeTypeFolder, "", 10)
 	if err != nil {
@@ -63,7 +71,7 @@ func TestFoldRetryTouchesAncestorsNotSiblings(t *testing.T) {
 	if _, err := s.WriteSealBatchTrusted(nil, nil, []SealKidsReplace{{
 		Side: SideSRC, ParentID: "b",
 		Kids: []KidRecord{{ID: "cfile", Type: NodeTypeFile, Size: 7}},
-	}}, nil, nil, nil); err != nil {
+	}}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.WriteSealBatchTrusted(nil, nil, []SealKidsReplace{{
@@ -72,13 +80,13 @@ func TestFoldRetryTouchesAncestorsNotSiblings(t *testing.T) {
 			{ID: "b", Type: NodeTypeFolder, Depth: 2},
 			{ID: "sib", Type: NodeTypeFolder, Depth: 2},
 		},
-	}}, nil, nil, nil); err != nil {
+	}}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.WriteSealBatchTrusted(nil, nil, []SealKidsReplace{{
 		Side: SideSRC, ParentID: "root",
 		Kids: []KidRecord{{ID: "a", Type: NodeTypeFolder, Depth: 1}},
-	}}, nil, nil, nil); err != nil {
+	}}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	// Only the retried folder is still on the frontier.
@@ -106,13 +114,13 @@ func TestFoldAssignNotAddOnReplay(t *testing.T) {
 	if _, err := s.WriteSealBatchTrusted(nil, nil, []SealKidsReplace{{
 		Side: SideSRC, ParentID: "a",
 		Kids: []KidRecord{{ID: "f", Type: NodeTypeFile, Size: 4}},
-	}}, nil, nil, nil); err != nil {
+	}}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.WriteSealBatchTrusted(nil, nil, []SealKidsReplace{{
 		Side: SideSRC, ParentID: "root",
 		Kids: []KidRecord{{ID: "a", Type: NodeTypeFolder, Depth: 1}},
-	}}, nil, nil, nil); err != nil {
+	}}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.AssignChildSize(SideSRC, "a", 4); err != nil {
@@ -121,7 +129,7 @@ func TestFoldAssignNotAddOnReplay(t *testing.T) {
 	if err := s.AddPending(SideSRC, PhaseTrav, 1, NodeTypeFolder, "a"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.update(func(txn *badger.Txn) error {
+	if err := s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set(foldSealedDepthKey(SideSRC), []byte("2"))
 	}); err != nil {
 		t.Fatal(err)
@@ -144,18 +152,18 @@ func TestFoldResumeUsesPersistedNext(t *testing.T) {
 	if _, err := s.WriteSealBatchTrusted(nil, nil, []SealKidsReplace{{
 		Side: SideSRC, ParentID: "root",
 		Kids: []KidRecord{{ID: "a", Type: NodeTypeFolder, Depth: 1}},
-	}}, nil, nil, nil); err != nil {
+	}}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.AssignChildSize(SideSRC, "a", 8); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.update(func(txn *badger.Txn) error {
+	if err := s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set(foldNextKey(SideSRC, "root"), []byte{1})
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.update(func(txn *badger.Txn) error {
+	if err := s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set(foldSealedDepthKey(SideSRC), []byte("1"))
 	}); err != nil {
 		t.Fatal(err)
@@ -241,28 +249,138 @@ func TestCopyFoldFromTickets(t *testing.T) {
 func TestStatusWriteDoesNotClearChildSize(t *testing.T) {
 	s := openFoldStore(t)
 	putFolder(t, s, "a", "", "/a", 1)
-	if _, err := s.AssignChildSize(SideSRC, "a", 20); err != nil {
+	if err := s.PutStatus(SideSRC, "a", StatusRecord{
+		TraversalStatus: traversalStatusSuccessful,
+		ChildSize:       20,
+		ChildCount:      7,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.WriteSealBatch(nil, []SealStatusWrite{{
 		Side: SideSRC, ID: "a", Depth: 1,
 		Status:     StatusRecord{CopyStatus: copyStatusExcludedExplicit, TraversalStatus: traversalStatusSuccessful},
 		PrevStatus: StatusRecord{CopyStatus: copyStatusPending, TraversalStatus: traversalStatusSuccessful},
-	}}, nil, nil, nil); err != nil {
+	}}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := mustChildSize(t, s, "a"); got != 20 {
 		t.Fatalf("exclude cleared child_size: %d", got)
 	}
+	if got := mustChildCount(t, s, "a"); got != 7 {
+		t.Fatalf("exclude cleared child_count: %d", got)
+	}
+	if _, err := s.AssignChildSize(SideSRC, "a", 21); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustChildCount(t, s, "a"); got != 7 {
+		t.Fatalf("AssignChildSize cleared child_count: %d", got)
+	}
 	if _, err := s.WriteSealBatch(nil, []SealStatusWrite{{
 		Side: SideSRC, ID: "a", Depth: 1,
 		Status:     StatusRecord{DeleteStatus: deleteStatusDeleted, TraversalStatus: traversalStatusSuccessful, CopyStatus: copyStatusSuccessful},
 		PrevStatus: StatusRecord{DeleteStatus: deleteStatusPendingExplicit, TraversalStatus: traversalStatusSuccessful, CopyStatus: copyStatusSuccessful},
-	}}, nil, nil, nil); err != nil {
+	}}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if got := mustChildSize(t, s, "a"); got != 20 {
+	if got := mustChildSize(t, s, "a"); got != 21 {
 		t.Fatalf("delete status cleared child_size: %d", got)
+	}
+	if got := mustChildCount(t, s, "a"); got != 7 {
+		t.Fatalf("delete status cleared child_count: %d", got)
+	}
+}
+
+func TestFoldChildSizesRefoldWithoutPend(t *testing.T) {
+	s := openFoldStore(t)
+	putFolder(t, s, "root", "", "/", 0)
+	putFolder(t, s, "a", "root", "/a", 1)
+	putFile(t, s, "f", "a", "/a/f", 2, 11)
+	if _, err := s.WriteSealBatchTrusted(nil, nil, []SealKidsReplace{{
+		Side: SideSRC, ParentID: "a",
+		Kids: []KidRecord{{ID: "f", Type: NodeTypeFile, Size: 11, Depth: 2}},
+	}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteSealBatchTrusted(nil, nil, []SealKidsReplace{{
+		Side: SideSRC, ParentID: "root",
+		Kids: []KidRecord{{ID: "a", Type: NodeTypeFolder, Depth: 1}},
+	}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AssignChildSize(SideSRC, "a", 99); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AssignChildSize(SideSRC, "root", 99); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FoldChildSizes(SideSRC, FoldKindRefold, FoldHooks{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustChildSize(t, s, "a"); got != 11 {
+		t.Fatalf("a=%d want 11", got)
+	}
+	if got := mustChildSize(t, s, "root"); got != 11 {
+		t.Fatalf("root=%d want 11", got)
+	}
+}
+
+func TestFoldAndSealAbortMidDepth(t *testing.T) {
+	old := foldTxnBatchSize
+	foldTxnBatchSize = 2
+	t.Cleanup(func() { foldTxnBatchSize = old })
+
+	s := openFoldStore(t)
+	putFolder(t, s, "root", "", "/", 0)
+	for i := 0; i < 6; i++ {
+		id := fmt.Sprintf("c%d", i)
+		putFolder(t, s, id, "root", "/"+id, 1)
+		putFile(t, s, id+"f", id, "/"+id+"/f", 2, int64(i+1))
+		if _, err := s.WriteSealBatchTrusted(nil, nil, []SealKidsReplace{{
+			Side: SideSRC, ParentID: id,
+			Kids: []KidRecord{{ID: id + "f", Type: NodeTypeFile, Size: int64(i + 1), Depth: 2}},
+		}}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.AddPending(SideSRC, PhaseTrav, 1, NodeTypeFolder, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.WriteSealBatchTrusted(nil, nil, []SealKidsReplace{{
+		Side: SideSRC, ParentID: "root",
+		Kids: []KidRecord{
+			{ID: "c0", Type: NodeTypeFolder, Depth: 1},
+			{ID: "c1", Type: NodeTypeFolder, Depth: 1},
+			{ID: "c2", Type: NodeTypeFolder, Depth: 1},
+			{ID: "c3", Type: NodeTypeFolder, Depth: 1},
+			{ID: "c4", Type: NodeTypeFolder, Depth: 1},
+			{ID: "c5", Type: NodeTypeFolder, Depth: 1},
+		},
+	}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddPending(SideSRC, PhaseTrav, 0, NodeTypeFolder, "root"); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int
+	err := s.FoldChildSizes(SideSRC, FoldKindTrav, FoldHooks{
+		Aborted: func() bool {
+			calls++
+			return calls > 3
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "aborted") {
+		t.Fatalf("want abort err, got %v", err)
+	}
+	if err := s.FoldChildSizes(SideSRC, FoldKindTrav, FoldHooks{}); err != nil {
+		t.Fatal(err)
+	}
+	var sum int64
+	for i := 0; i < 6; i++ {
+		sum += int64(i + 1)
+	}
+	if got := mustChildSize(t, s, "root"); got != sum {
+		t.Fatalf("root=%d want %d", got, sum)
 	}
 }
 
@@ -288,6 +406,16 @@ func putFolder(t *testing.T, s *Store, id, parent, path string, depth int) {
 
 func mustChildSize(t *testing.T, s *Store, id string) int64 {
 	t.Helper()
+	return mustFoldStatus(t, s, id).ChildSize
+}
+
+func mustChildCount(t *testing.T, s *Store, id string) int64 {
+	t.Helper()
+	return mustFoldStatus(t, s, id).ChildCount
+}
+
+func mustFoldStatus(t *testing.T, s *Store, id string) StatusRecord {
+	t.Helper()
 	st, ok, err := s.GetStatus(SideSRC, id)
 	if err != nil || !ok {
 		st, ok, err = s.GetStatus(SideDST, id)
@@ -295,7 +423,7 @@ func mustChildSize(t *testing.T, s *Store, id string) int64 {
 	if err != nil || !ok {
 		t.Fatalf("status %s: ok=%v err=%v", id, ok, err)
 	}
-	return st.ChildSize
+	return st
 }
 
 func putFile(t *testing.T, s *Store, id, parent, path string, depth int, size int64) {

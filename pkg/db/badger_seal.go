@@ -9,12 +9,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"codeberg.org/Sylos/Migration-Engine/pkg/memweight"
 	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
 const (
 	defaultBadgerSealRowThreshold  = 50_000
-	defaultBadgerSealHardCap       = 100_000
+	defaultBadgerSealHardCap       = 250_000
 	defaultBadgerSealFlushInterval = 10 * time.Second
 )
 
@@ -41,36 +42,45 @@ type badgerSeal struct {
 	db  *DB
 	ops *opsdb.Store
 
-	mu               sync.Mutex
-	cond             *sync.Cond
-	flushMu          sync.Mutex
-	lastFlushedDepth int
-	hardAbort        int32
-	rowsSinceFlush   int64
-	rowThreshold     int
-	hardCap          int
-	interval         time.Duration
-	lastFlushRows    int64
-	lastFlushDurNs   int64
+	mu                    sync.Mutex
+	cond                  *sync.Cond
+	flushMu               sync.Mutex
+	lastFlushedDepth      int
+	hardAbort             int32
+	rowsSinceFlush        int64
+	rowThreshold          int
+	hardCap               int
+	interval              time.Duration
+	lastFlushRows         int64
+	lastFlushDurNs        int64
+	lastOrganicFlushRows  int64
+	lastOrganicFlushDurNs int64
 
-	telemetryHardCapHits int64
-	telemetryHWM         int64
-	telemetryFlushCount  int64
-	hardCapWaiters       int32
-	flushActive          int32
+	telemetryHardCapHits            int64
+	telemetryHardCapWaitNs          int64
+	telemetryHWM                    int64
+	telemetryFlushCount             int64
+	telemetryFlushDurationNs        int64
+	telemetryOrganicFlushCount      int64
+	telemetryOrganicFlushDurationNs int64
+	telemetryForcedFlushCount       int64
+	telemetryForcedFlushDurationNs  int64
+	hardCapWaiters                  int32
+	flushActive                     int32
 
-	nodes  []sealNodeJob
-	events []sealEventJob
-	maps   []sealMapJob
-	errors []TaskErrorRecord
-	gpl    []GPLIssue
+	nodes       []sealNodeJob
+	events      []sealEventJob
+	maps        []sealMapJob
+	errors      []TaskErrorRecord
+	gpl         []GPLIssue
 	kidsReplace []opsdb.SealKidsReplace
 	kidTickets  []opsdb.KidTicket
-	failedSubtreePaths []string
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
+
+	memWeight *memweight.Ledger
 }
 
 func newBadgerSeal(db *DB, ops *opsdb.Store, opts SealBufferOptions) *badgerSeal {
@@ -109,7 +119,7 @@ func (b *badgerSeal) flushLoop() {
 		case <-b.stopCh:
 			return
 		case <-ticker.C:
-			_ = b.Flush()
+			_ = b.flush(true)
 		}
 	}
 }
@@ -156,7 +166,7 @@ func (b *badgerSeal) AddDiscoveryNodes(ops []InsertOperation) error {
 		b.enqueueNodes(k.table, k.depth, nodes, true)
 	}
 	if b.bufferedRows() >= int64(b.rowThreshold) {
-		return b.Flush()
+		return b.flush(true)
 	}
 	return nil
 }
@@ -170,8 +180,9 @@ func (b *badgerSeal) AddDiscoveryStatusEvent(table string, e StatusEvent, fromRe
 	exceeds := b.rowsSinceFlush >= int64(b.rowThreshold)
 	b.cond.Broadcast()
 	b.mu.Unlock()
+	b.noteSealWeight(1)
 	if exceeds {
-		_ = b.Flush()
+		_ = b.flush(true)
 	}
 }
 
@@ -184,22 +195,10 @@ func (b *badgerSeal) AddTaskError(rec TaskErrorRecord) {
 	exceeds := b.rowsSinceFlush >= int64(b.rowThreshold)
 	b.cond.Broadcast()
 	b.mu.Unlock()
+	b.noteSealWeight(1)
 	if exceeds {
-		_ = b.Flush()
+		_ = b.flush(true)
 	}
-}
-
-func (b *badgerSeal) AddFailedSubtreePath(parentPath string) {
-	if parentPath == "" {
-		return
-	}
-	b.mu.Lock()
-	b.waitBelowHardCapLocked()
-	b.failedSubtreePaths = append(b.failedSubtreePaths, parentPath)
-	b.rowsSinceFlush++
-	b.noteRowsLocked(b.rowsSinceFlush)
-	b.cond.Broadcast()
-	b.mu.Unlock()
 }
 
 func (b *badgerSeal) AddGPLIssue(e GPLIssue) {
@@ -214,8 +213,9 @@ func (b *badgerSeal) AddGPLIssue(e GPLIssue) {
 	exceeds := b.rowsSinceFlush >= int64(b.rowThreshold)
 	b.cond.Broadcast()
 	b.mu.Unlock()
+	b.noteSealWeight(1)
 	if exceeds {
-		_ = b.Flush()
+		_ = b.flush(true)
 	}
 }
 
@@ -228,8 +228,9 @@ func (b *badgerSeal) AddIDMapEvent(e IDMapEvent) {
 	exceeds := b.rowsSinceFlush >= int64(b.rowThreshold)
 	b.cond.Broadcast()
 	b.mu.Unlock()
+	b.noteSealWeight(1)
 	if exceeds {
-		_ = b.Flush()
+		_ = b.flush(true)
 	}
 }
 
@@ -237,6 +238,7 @@ func (b *badgerSeal) enqueueNodes(table string, depth int, nodes []*NodeState, d
 	if len(nodes) == 0 {
 		return
 	}
+	added := int64(0)
 	b.mu.Lock()
 	b.waitBelowHardCapLocked()
 	for _, n := range nodes {
@@ -245,10 +247,12 @@ func (b *badgerSeal) enqueueNodes(table string, depth int, nodes []*NodeState, d
 		}
 		b.nodes = append(b.nodes, sealNodeJob{table: table, depth: depth, node: n, discoveryStats: discoveryStats})
 		b.rowsSinceFlush++
+		added++
 	}
 	b.noteRowsLocked(b.rowsSinceFlush)
 	b.cond.Broadcast()
 	b.mu.Unlock()
+	b.noteSealWeight(added)
 }
 
 func (b *badgerSeal) bufferedRows() int64 {
@@ -313,13 +317,13 @@ func statusEventFrontierDeltas(side string, e StatusEvent, nodeType string) []op
 	if e.CopyStatus != "" {
 		deltas = append(deltas, opsdb.PendingDelta{
 			Phase: opsdb.PhaseCopy, NodeType: nt, Add: CopyStatusIsPending(e.CopyStatus),
-			PendWasSet: copyPendingWasSet(e.PrevCopyStatus),
+			PendWasSet: CopyStatusIsPending(e.PrevCopyStatus),
 		})
 	}
 	if e.DeleteStatus != "" {
 		deltas = append(deltas, opsdb.PendingDelta{
 			Phase: opsdb.PhaseDel, NodeType: nt, Add: DeleteStatusOnFrontier(e.DeleteStatus),
-			PendWasSet: deletePendingWasSet(e.PrevDeleteStatus),
+			PendWasSet: DeleteStatusOnFrontier(e.PrevDeleteStatus),
 		})
 	}
 	return deltas
@@ -329,7 +333,14 @@ func (b *badgerSeal) waitBelowHardCapLocked() {
 	for b.rowsSinceFlush >= int64(b.hardCap) {
 		atomic.AddInt64(&b.telemetryHardCapHits, 1)
 		atomic.AddInt32(&b.hardCapWaiters, 1)
+		backpressure, hardCap := b.db.Busy(BusyBackpressure), b.db.Busy(BusyHardCap)
+		backpressure.Enter()
+		hardCap.Enter()
+		start := time.Now()
 		b.cond.Wait()
+		atomic.AddInt64(&b.telemetryHardCapWaitNs, time.Since(start).Nanoseconds())
+		hardCap.Leave()
+		backpressure.Leave()
 		atomic.AddInt32(&b.hardCapWaiters, -1)
 	}
 }
@@ -343,7 +354,20 @@ func (b *badgerSeal) noteRowsLocked(cur int64) {
 	}
 }
 
+func (b *badgerSeal) noteSealWeight(n int64) {
+	if b == nil || b.memWeight == nil || n <= 0 {
+		return
+	}
+	b.memWeight.Add(memweight.SealBuffer, n)
+}
+
+// Flush forces a drain (round advance, phase stop, queue complete, explicit save).
+// Does not count toward organic seal-size efficiency probe stats.
 func (b *badgerSeal) Flush() error {
+	return b.flush(false)
+}
+
+func (b *badgerSeal) flush(organic bool) error {
 	b.flushMu.Lock()
 	defer b.flushMu.Unlock()
 
@@ -353,7 +377,6 @@ func (b *badgerSeal) Flush() error {
 	maps := b.maps
 	errs := b.errors
 	gpl := b.gpl
-	subtreePaths := b.failedSubtreePaths
 	kidsReplace := b.kidsReplace
 	kidTickets := b.kidTickets
 	rows := b.rowsSinceFlush
@@ -362,45 +385,55 @@ func (b *badgerSeal) Flush() error {
 	b.maps = nil
 	b.errors = nil
 	b.gpl = nil
-	b.failedSubtreePaths = nil
 	b.kidsReplace = nil
 	b.kidTickets = nil
 	b.rowsSinceFlush = 0
 	b.cond.Broadcast()
 	b.mu.Unlock()
 
-	if rows == 0 && len(nodes) == 0 && len(events) == 0 && len(maps) == 0 && len(errs) == 0 && len(gpl) == 0 && len(subtreePaths) == 0 && len(kidsReplace) == 0 && len(kidTickets) == 0 {
+	if rows == 0 && len(nodes) == 0 && len(events) == 0 && len(maps) == 0 && len(errs) == 0 && len(gpl) == 0 && len(kidsReplace) == 0 && len(kidTickets) == 0 {
 		return nil
 	}
 
 	atomic.AddInt32(&b.flushActive, 1)
 	defer atomic.AddInt32(&b.flushActive, 0)
+	flushClock := b.db.Busy(BusyBackpressure)
+	if organic {
+		flushClock = b.db.Busy(BusyDBWork)
+	}
+	flushClock.Enter()
+	defer flushClock.Leave()
+
+	if b.memWeight != nil && rows > 0 {
+		b.memWeight.Move(memweight.SealBuffer, memweight.SealFlush, rows)
+	}
 
 	start := time.Now()
 	if err := b.flushBatch(nodes, events, maps, errs, gpl, kidsReplace, kidTickets); err != nil {
-		b.requeue(nodes, events, maps, errs, gpl, subtreePaths, kidsReplace, kidTickets, rows)
+		if b.memWeight != nil && rows > 0 {
+			b.memWeight.Move(memweight.SealFlush, memweight.SealBuffer, rows)
+		}
+		b.requeue(nodes, events, maps, errs, gpl, kidsReplace, kidTickets, rows)
 		return err
 	}
-	for _, path := range subtreePaths {
-		mut, err := b.db.Ops().PropagateCopyFailureUnderPath(path)
-		if err != nil {
-			return fmt.Errorf("propagate subtree failure for %s: %w", path, err)
-		}
-		if mut.Affected > 0 {
-			deltas := []ReviewStatsDelta{
-				{Key: ReviewKeyCopyPending, Delta: -mut.Affected},
-				{Key: ReviewKeyCopyFailed, Delta: mut.Affected},
-			}
-			if mut.SelectedBytes != 0 {
-				deltas = append(deltas, ReviewStatsDelta{Key: ReviewKeySizeSelected, Delta: -mut.SelectedBytes})
-			}
-			_ = b.db.ApplyReviewStatsDeltas(deltas)
-		}
+	if b.memWeight != nil && rows > 0 {
+		b.memWeight.Release(memweight.SealFlush, rows)
 	}
 	d := time.Since(start)
+	ns := d.Nanoseconds()
 	b.lastFlushRows = rows
-	b.lastFlushDurNs = d.Nanoseconds()
+	b.lastFlushDurNs = ns
 	atomic.AddInt64(&b.telemetryFlushCount, 1)
+	atomic.AddInt64(&b.telemetryFlushDurationNs, ns)
+	if organic {
+		b.lastOrganicFlushRows = rows
+		b.lastOrganicFlushDurNs = ns
+		atomic.AddInt64(&b.telemetryOrganicFlushCount, 1)
+		atomic.AddInt64(&b.telemetryOrganicFlushDurationNs, ns)
+	} else {
+		atomic.AddInt64(&b.telemetryForcedFlushCount, 1)
+		atomic.AddInt64(&b.telemetryForcedFlushDurationNs, ns)
+	}
 	b.db.RecordOp(OpBadgerSync, "", rows, d, nil)
 	return nil
 }
@@ -419,8 +452,9 @@ func (b *badgerSeal) AddKidTicket(side, parentID string, parentDepth int, kid op
 	exceeds := b.rowsSinceFlush >= int64(b.rowThreshold)
 	b.cond.Broadcast()
 	b.mu.Unlock()
+	b.noteSealWeight(1)
 	if exceeds {
-		_ = b.Flush()
+		_ = b.flush(true)
 	}
 }
 
@@ -436,8 +470,9 @@ func (b *badgerSeal) AddKidsPackReplace(side, parentID string, kids []opsdb.KidR
 	exceeds := b.rowsSinceFlush >= int64(b.rowThreshold)
 	b.cond.Broadcast()
 	b.mu.Unlock()
+	b.noteSealWeight(1)
 	if exceeds {
-		_ = b.Flush()
+		_ = b.flush(true)
 	}
 }
 
@@ -554,9 +589,18 @@ func (b *badgerSeal) flushBatch(nodes []sealNodeJob, events []sealEventJob, maps
 	if err != nil {
 		return fmt.Errorf("merge kid tickets: %w", err)
 	}
-	sched, err := b.ops.WriteSealBatchTrusted(nodeWrites, statusWrites, merged, mapWrites, logs, taskErrs)
+	// Status/frontier seal stays in ops; log rows belong only in the logs sidecar.
+	sched, err := b.ops.WriteSealBatchTrusted(nodeWrites, statusWrites, merged, mapWrites, taskErrs)
 	if err != nil {
 		return fmt.Errorf("flush seal batch: %w", err)
+	}
+	if len(logs) > 0 {
+		if b.db == nil || b.db.Logs() == nil {
+			return fmt.Errorf("flush seal logs: logs sidecar not open")
+		}
+		if err := b.db.Logs().AppendLogs(logs); err != nil {
+			return fmt.Errorf("flush seal logs: %w", err)
+		}
 	}
 	if len(gpl) > 0 {
 		recs := make([]opsdb.GPLRecord, 0, len(gpl))
@@ -579,7 +623,7 @@ func (b *badgerSeal) flushBatch(nodes []sealNodeJob, events []sealEventJob, maps
 	return nil
 }
 
-func (b *badgerSeal) requeue(nodes []sealNodeJob, events []sealEventJob, maps []sealMapJob, errs []TaskErrorRecord, gpl []GPLIssue, subtreePaths []string, kidsReplace []opsdb.SealKidsReplace, kidTickets []opsdb.KidTicket, rows int64) {
+func (b *badgerSeal) requeue(nodes []sealNodeJob, events []sealEventJob, maps []sealMapJob, errs []TaskErrorRecord, gpl []GPLIssue, kidsReplace []opsdb.SealKidsReplace, kidTickets []opsdb.KidTicket, rows int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.nodes = append(nodes, b.nodes...)
@@ -587,7 +631,6 @@ func (b *badgerSeal) requeue(nodes []sealNodeJob, events []sealEventJob, maps []
 	b.maps = append(maps, b.maps...)
 	b.errors = append(errs, b.errors...)
 	b.gpl = append(gpl, b.gpl...)
-	b.failedSubtreePaths = append(subtreePaths, b.failedSubtreePaths...)
 	b.kidsReplace = append(kidsReplace, b.kidsReplace...)
 	b.kidTickets = append(kidTickets, b.kidTickets...)
 	b.rowsSinceFlush += rows
@@ -619,12 +662,20 @@ func (b *badgerSeal) TelemetrySnapshot() SealBufferTelemetry {
 		hwm = current
 	}
 	return SealBufferTelemetry{
-		CurrentRows:              current,
-		HWMSinceLastPoll:         hwm,
-		HardCapHitsSinceLastPoll: atomic.SwapInt64(&b.telemetryHardCapHits, 0),
-		FlushCountSinceLastPoll:  atomic.SwapInt64(&b.telemetryFlushCount, 0),
-		LastFlushRows:            b.lastFlushRows,
-		LastFlushDurationNs:      b.lastFlushDurNs,
+		CurrentRows:                         current,
+		HWMSinceLastPoll:                    hwm,
+		HardCapHitsSinceLastPoll:            atomic.SwapInt64(&b.telemetryHardCapHits, 0),
+		HardCapWaitNsSinceLastPoll:          atomic.SwapInt64(&b.telemetryHardCapWaitNs, 0),
+		FlushCountSinceLastPoll:             atomic.SwapInt64(&b.telemetryFlushCount, 0),
+		FlushDurationNsSinceLastPoll:        atomic.SwapInt64(&b.telemetryFlushDurationNs, 0),
+		LastFlushRows:                       b.lastFlushRows,
+		LastFlushDurationNs:                 b.lastFlushDurNs,
+		OrganicFlushCountSinceLastPoll:      atomic.SwapInt64(&b.telemetryOrganicFlushCount, 0),
+		OrganicFlushDurationNsSinceLastPoll: atomic.SwapInt64(&b.telemetryOrganicFlushDurationNs, 0),
+		LastOrganicFlushRows:                b.lastOrganicFlushRows,
+		LastOrganicFlushDurationNs:          b.lastOrganicFlushDurNs,
+		ForcedFlushCountSinceLastPoll:       atomic.SwapInt64(&b.telemetryForcedFlushCount, 0),
+		ForcedFlushDurationNsSinceLastPoll:  atomic.SwapInt64(&b.telemetryForcedFlushDurationNs, 0),
 	}
 }
 
@@ -651,11 +702,11 @@ func (b *badgerSeal) StartPhase() error {
 	return nil
 }
 
-func (b *badgerSeal) StopPhase() error { return b.Flush() }
-
 func (b *badgerSeal) AbortPhase() { atomic.StoreInt32(&b.hardAbort, 1) }
 
 func (b *badgerSeal) HardAborted() bool { return atomic.LoadInt32(&b.hardAbort) != 0 }
+
+func (b *badgerSeal) ClearHardAbort() { atomic.StoreInt32(&b.hardAbort, 0) }
 
 func (b *badgerSeal) OnCheckpointOK() {}
 
@@ -664,4 +715,17 @@ func (b *badgerSeal) Stop() {
 	b.wg.Wait()
 	_ = b.Flush()
 	_ = b.ops.Sync()
+}
+
+func prevStatusFromEvent(e StatusEvent) opsdb.StatusRecord {
+	return opsdb.StatusRecord{
+		TraversalStatus: e.PrevTraversalStatus,
+		CopyStatus:      e.PrevCopyStatus,
+		DeleteStatus:    e.PrevDeleteStatus,
+		GPLStatus:       e.PrevGPLStatus,
+	}
+}
+
+func travPendingWasSet(s string) bool {
+	return s == "" || s == StatusPending
 }

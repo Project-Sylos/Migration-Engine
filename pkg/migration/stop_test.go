@@ -123,11 +123,17 @@ func TestAbortTransitionsToAborted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Abort: %v", err)
 	}
-	if res.Phase != PhaseAborted {
-		t.Fatalf("phase = %q, want %s", res.Phase, PhaseAborted)
+	if res.Phase != PhaseTraversalSuspended {
+		t.Fatalf("phase = %q, want %s", res.Phase, PhaseTraversalSuspended)
 	}
-	if mig.Phase() != PhaseAborted {
-		t.Fatalf("mig.Phase() = %q, want %s", mig.Phase(), PhaseAborted)
+	if mig.Phase() != PhaseTraversalSuspended {
+		t.Fatalf("mig.Phase() = %q, want %s", mig.Phase(), PhaseTraversalSuspended)
+	}
+	if !mig.HasUncleanInterrupt() {
+		t.Fatal("expected unclean_interrupt after hard stop")
+	}
+	if mig.UncleanInterruptKind() != "traversal" {
+		t.Fatalf("unclean kind = %q, want traversal", mig.UncleanInterruptKind())
 	}
 	if q.State() != queue.QueueStatePaused {
 		t.Fatalf("queue state = %s, want paused", q.State())
@@ -142,7 +148,7 @@ func TestAbortTransitionsToAborted(t *testing.T) {
 	if sp.Step != StopStepAborted {
 		t.Fatalf("stop step = %q, want %s", sp.Step, StopStepAborted)
 	}
-	if canTransition(PhaseAborted, PhaseTraversing) {
-		t.Fatal("aborted must be terminal")
+	if !canTransition(PhaseAborted, PhaseTraversalSuspended) {
+		t.Fatal("legacy aborted must heal to suspended")
 	}
 }

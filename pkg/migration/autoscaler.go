@@ -11,6 +11,7 @@ import (
 	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/memweight"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
 	"codeberg.org/Sylos/Migration-Engine/pkg/scaling"
@@ -27,7 +28,7 @@ type AutoscalerConfig struct {
 	DisableAutoscaler bool
 	Interval          time.Duration
 	OnEvent           func(scaling.ScalingEvent)
-	DebugAIMD         bool // probe cooldown + scale-up diagnostics on stdout
+	DebugAutoscaler         bool // probe cooldown + scale-up diagnostics on stdout
 	// WorkerCapOverrides overlay MaxWorkers after profile resolve (from API/DB or live UI).
 	WorkerCapOverrides profile.WorkerCapOverrides
 }
@@ -73,66 +74,39 @@ func (a *autoscalerRunContext) Autoscaler() *loop.Autoscaler {
 	return a.scaler
 }
 
-func startAutoscaler(
-	ctx context.Context,
-	cfg AutoscalerConfig,
-	observer *observe.QueueObserver,
-	database *db.DB,
-	srcQueue, dstQueue *queue.Queue,
-	srcService, dstService Service,
-	pathCheckProfile string,
-	windowsCompat bool,
-) *autoscalerRunContext {
-	same := sameBackend(srcService.Adapter, dstService.Adapter)
-	wireQueueScalingContext(srcQueue, dstQueue, nil, srcService, dstService, same, pathCheckProfile, windowsCompat)
-	return startAutoscalerActuators(ctx, cfg, observer, database, map[string]scaling.QueueActuator{
-		"src": srcQueue,
-		"dst": dstQueue,
-	}, []autoscalerQueueSpec{
-		{Name: "src", Service: srcService, InitialWorkers: srcQueue.GetWorkerCount()},
-		{Name: "dst", Service: dstService, InitialWorkers: dstQueue.GetWorkerCount()},
-	}, srcService.Adapter, dstService.Adapter)
-}
-
-func startCopyAutoscaler(
-	ctx context.Context,
-	cfg AutoscalerConfig,
-	observer *observe.QueueObserver,
-	database *db.DB,
-	copyQueue *queue.Queue,
-	srcService, dstService Service,
-	pathCheckProfile string,
-	windowsCompat bool,
-) *autoscalerRunContext {
-	wireQueueScalingContext(nil, nil, copyQueue, srcService, dstService, false, pathCheckProfile, windowsCompat)
-	return startAutoscalerActuators(ctx, cfg, observer, database, map[string]scaling.QueueActuator{
-		"copy": copyQueue,
-	}, []autoscalerQueueSpec{
-		{Name: "copy", Service: srcService, InitialWorkers: copyQueue.GetWorkerCount()},
-	}, srcService.Adapter, dstService.Adapter)
-}
-
-func startDeleteAutoscaler(
-	ctx context.Context,
-	cfg AutoscalerConfig,
-	observer *observe.QueueObserver,
-	database *db.DB,
-	deleteQueue *queue.Queue,
-	srcService, dstService Service,
-	pathCheckProfile string,
-	windowsCompat bool,
-) *autoscalerRunContext {
-	wireDeleteQueueScalingContext(deleteQueue, srcService, dstService, pathCheckProfile, windowsCompat)
-	return startAutoscalerActuators(ctx, cfg, observer, database, map[string]scaling.QueueActuator{
-		"delete": deleteQueue,
-	}, []autoscalerQueueSpec{
-		{Name: "delete", Service: srcService, InitialWorkers: deleteQueue.GetWorkerCount()},
-	}, srcService.Adapter, dstService.Adapter)
+// startAutoscaler wires each queue's scaling context (keyed by queue name: src, dst, copy, delete)
+// and starts the autoscaler loop over them.
+func (rt *PhaseRuntime) startAutoscaler(observer *observe.QueueObserver, database *db.DB, queues ...*queue.Queue) *autoscalerRunContext {
+	srcGroup := backend.ResolveGroupID(rt.SrcService.BackendGroupID, "", "src")
+	dstGroup := backend.ResolveGroupID(rt.DstService.BackendGroupID, "", "dst")
+	if sameBackend(rt.SrcService.Adapter, rt.DstService.Adapter) {
+		dstGroup = srcGroup
+	}
+	actuators := make(map[string]scaling.QueueActuator, len(queues))
+	specs := make([]autoscalerQueueSpec, 0, len(queues))
+	for _, q := range queues {
+		name := q.Name()
+		spec := autoscalerQueueSpec{Name: name, Service: rt.SrcService, GroupID: srcGroup, InitialWorkers: q.GetWorkerCount()}
+		queueSrcGroup, queueDstGroup := srcGroup, dstGroup
+		switch name {
+		case "dst":
+			spec.Service, spec.GroupID = rt.DstService, dstGroup
+		case "copy", "delete":
+			spec.GroupID = "queue:" + name
+			queueSrcGroup, queueDstGroup = spec.GroupID, spec.GroupID
+		}
+		q.ConfigureScalingContext(rt.SrcService.ProviderID, rt.DstService.ProviderID, queueSrcGroup, queueDstGroup, rt.PathCheckTarget, rt.WindowsCompat)
+		q.ConfigureTraversalCompare(rt.OverwritePolicy, rt.HashVerify)
+		actuators[name] = q
+		specs = append(specs, spec)
+	}
+	return startAutoscalerActuators(rt.ShutdownOrBackground(), rt.Autoscaler, observer, database, actuators, specs, rt.SrcService.Adapter, rt.DstService.Adapter)
 }
 
 type autoscalerQueueSpec struct {
 	Name           string
 	Service        Service
+	GroupID        string
 	InitialWorkers int
 }
 
@@ -167,45 +141,16 @@ func startAutoscalerActuators(
 
 	registry := backend.NewBackendRegistry()
 	profiles := make(map[string]profile.FSPerformanceProfile, len(specs))
-
-	var srcGroup, dstGroup string
 	for _, spec := range specs {
-		if spec.Name == "src" {
-			srcGroup = backend.ResolveGroupID(spec.Service.BackendGroupID, "", spec.Name)
-		}
-		if spec.Name == "dst" {
-			dstGroup = backend.ResolveGroupID(spec.Service.BackendGroupID, "", spec.Name)
-		}
-	}
-	if len(adapters) >= 2 && sameBackend(adapters[0], adapters[1]) {
-		dstGroup = srcGroup
-	}
-
-	for _, spec := range specs {
-		q := actuators[spec.Name]
 		var prof profile.FSPerformanceProfile
-		if q != nil {
-			sctx := q.ScalingContext()
-			prof = profile.ResolveEffectiveProfile(sctx, srcAdapter, dstAdapter)
+		if q := actuators[spec.Name]; q != nil {
+			prof = profile.ResolveEffectiveProfile(q.ScalingContext(), srcAdapter, dstAdapter)
 		} else {
 			prof = profile.ToActuatorProfile(
 				profile.LookupOperationProfile(spec.Service.ProviderID, spec.Service.Name, profile.OpListChildren),
 			)
 		}
-		groupID := backend.ResolveGroupID(spec.Service.BackendGroupID, "", spec.Name)
-		if spec.Name == "dst" && dstGroup != "" {
-			groupID = dstGroup
-		}
-		if spec.Name == "src" && srcGroup != "" {
-			groupID = srcGroup
-		}
-		if spec.Name == "copy" {
-			groupID = "queue:copy"
-		}
-		if spec.Name == "delete" {
-			groupID = "queue:delete"
-		}
-		registry.RegisterQueue(spec.Name, groupID, prof, spec.InitialWorkers)
+		registry.RegisterQueue(spec.Name, spec.GroupID, prof, spec.InitialWorkers)
 		profiles[spec.Name] = prof
 	}
 
@@ -213,7 +158,7 @@ func startAutoscalerActuators(
 		Enabled:   true,
 		Interval:  cfg.Interval,
 		OnEvent:   cfg.OnEvent,
-		DebugAIMD: cfg.DebugAIMD,
+		DebugAutoscaler: cfg.DebugAutoscaler,
 		Adapters: profile.AdaptersForScaling{
 			Src: srcAdapter,
 			Dst: dstAdapter,
@@ -222,6 +167,17 @@ func startAutoscalerActuators(
 	})
 	// Apply overlays to the initial registry profiles (NewAutoscaler stores them; refresh on first tick too).
 	scaler.SetWorkerCapOverrides(cfg.WorkerCapOverrides)
+
+	ledger := memweight.New()
+	scaler.SetWeightLedger(ledger)
+	if database != nil {
+		database.SetMemWeightLedger(ledger)
+	}
+	for _, act := range actuators {
+		if q, ok := act.(*queue.Queue); ok && q != nil {
+			q.SetMemWeightLedger(ledger)
+		}
+	}
 
 	runCtx, cancel := context.WithCancel(ctx)
 	go scaler.Run(runCtx)

@@ -25,7 +25,7 @@ func TestKeysetCursorNeverRewinds(t *testing.T) {
 		t.Fatalf("cursor=%q want ccc", got)
 	}
 
-	q.resetThisQueueKeysetCursor()
+	q.ResetKeysetCursorForShed()
 	if got := q.GetKeysetCursor(); got != "" {
 		t.Fatalf("reset cursor=%q want empty", got)
 	}

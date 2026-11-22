@@ -4,6 +4,7 @@
 package stats
 
 import (
+	"context"
 	"fmt"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
@@ -200,7 +201,7 @@ func GetCopyWorkProgressCounts(database *db.DB) (db.PhaseProgressCounts, error) 
 // GetDeleteProgressCounts aggregates delete statuses only for copy-successful SRC nodes
 // (same eligibility as GetDeleteCountAtDepth), excluding delete_status=skipped.
 func GetDeleteProgressCounts(database *db.DB) (db.PhaseProgressCounts, error) {
-	counts, err := GetEligibleDeleteStatusCounts(database)
+	counts, err := GetDeleteStatusCountsFromEvents(database)
 	if err != nil {
 		return db.PhaseProgressCounts{}, err
 	}
@@ -209,14 +210,6 @@ func GetDeleteProgressCounts(database *db.DB) (db.PhaseProgressCounts, error) {
 		Successful: counts.Deleted,
 		Failed:     counts.Failed,
 	}, nil
-}
-
-// GetEligibleDeleteStatusCounts returns current delete-status counts only for
-// copy-successful SRC nodes. This is the population shown in source-cleanup
-// planning/results; skipped nodes are excluded from deletion but still counted
-// for the review footer.
-func GetEligibleDeleteStatusCounts(database *db.DB) (db.DeleteStatusCounts, error) {
-	return GetDeleteStatusCountsFromEvents(database)
 }
 
 // GetReviewStatsSnapshot reads the full canonical review stats from the universal stats table.
@@ -274,33 +267,8 @@ func GetReviewStatsSnapshot(database *db.DB) (db.ReviewStatsSnapshot, error) {
 	return out, nil
 }
 
-// GetPathReviewStatsFromDB computes path review stats from nodes and status events only (no stats table).
-// Prefer GetReviewStatsSnapshot for live API paths; this is for verification / offline checks.
-func GetPathReviewStatsFromDB(database *db.DB) (db.ReviewStatsSnapshot, error) {
-	return GetPathReviewStatsFromOps(database)
-}
-
-// GetTraversalStatusCountsFromEvents returns counts of nodes by current traversal_status from Badger depth stats.
-func GetTraversalStatusCountsFromEvents(database *db.DB, table string) (db.TraversalStatusCounts, error) {
-	return getTraversalStatusCounts(database, table)
-}
-
-// GetTraversalStatusCountsFromCurrent returns counts from Badger depth stats (same as FromEvents on Badger-only stores).
-func GetTraversalStatusCountsFromCurrent(database *db.DB, table string) (db.TraversalStatusCounts, error) {
-	return getTraversalStatusCounts(database, table)
-}
-
-// GetTraversalStatusCounts returns traversal status counts; fromCurrent is ignored on Badger-only stores.
-func GetTraversalStatusCounts(database *db.DB, table string, fromCurrent bool) (db.TraversalStatusCounts, error) {
-	_ = fromCurrent
-	return getTraversalStatusCounts(database, table)
-}
-
-func getTraversalStatusCounts(database *db.DB, table string) (db.TraversalStatusCounts, error) {
-	return traversalCountsFromDepthStats(database, table)
-}
-
-func traversalCountsFromDepthStats(database *db.DB, table string) (db.TraversalStatusCounts, error) {
+// GetTraversalStatusCounts returns traversal status counts from per-depth stats.
+func GetTraversalStatusCounts(database *db.DB, table string) (db.TraversalStatusCounts, error) {
 	var out db.TraversalStatusCounts
 	if database == nil || database.Ops() == nil {
 		return out, nil
@@ -417,33 +385,6 @@ func GetDeleteStatusCountsFromEvents(database *db.DB) (db.DeleteStatusCounts, er
 		p.apply(n)
 	}
 	return out, nil
-}
-
-// GetRemainingSourceSizeAfterDelete returns the persisted size_src review counter.
-func GetRemainingSourceSizeAfterDelete(database *db.DB) (int64, error) {
-	return readStatsKeyCount(database, db.ReviewKeySizeSrc)
-}
-
-// GetStatsCount returns the total count for the given key from Badger depth stats (table = "SRC" or "DST"). Supports traversal status keys only.
-func GetStatsCount(database *db.DB, table, key string) (int64, error) {
-	if key == "" {
-		return 0, nil
-	}
-	status := statsKeyToTraversalStatus(key)
-	if status == "" {
-		return 0, nil
-	}
-	return getTraversalStatusCountFromLive(database, table, status)
-}
-
-func getTraversalStatusCountFromLive(database *db.DB, table, status string) (int64, error) {
-	if database == nil || database.Ops() == nil {
-		return 0, nil
-	}
-	if status == "" {
-		status = db.StatusPending
-	}
-	return database.Ops().GetDepthStatTotal(opsSide(table), db.StatsKey(db.StatsKindTraversal, status))
 }
 
 // statsKeyToTraversalStatus returns the status part if key is "traversal/<status>", else "".
@@ -583,55 +524,6 @@ func GetMaxDepth(database *db.DB, table string) (int, error) {
 	return database.Ops().GetDepthMax(opsSide(table))
 }
 
-// GetStatsBreakdown returns (depth, key, count) from Badger depth stats grouped by depth and traversal_status. Order: depth, key.
-func GetStatsBreakdown(database *db.DB, table string) ([]db.StatsRow, error) {
-	if database == nil || database.Ops() == nil {
-		return nil, nil
-	}
-	side := opsSide(table)
-	rows, err := database.Ops().ListDepthStats()
-	if err != nil {
-		return nil, err
-	}
-	var out []db.StatsRow
-	for _, row := range rows {
-		if row.Side != side {
-			continue
-		}
-		if statsKeyToTraversalStatus(row.Key) == "" {
-			continue
-		}
-		if row.Count == 0 {
-			continue
-		}
-		out = append(out, db.StatsRow{Depth: row.Depth, Key: row.Key, Count: row.Count})
-	}
-	if len(out) > 0 {
-		return out, nil
-	}
-	maxDepth, err := GetMaxDepth(database, table)
-	if err != nil {
-		return nil, err
-	}
-	for d := 0; d <= maxDepth; d++ {
-		for _, status := range []string{db.StatusPending, db.StatusSuccessful, db.StatusFailed, db.StatusNotOnSrc, db.StatusExcluded, db.StatusExclusionInherited} {
-			if table != "DST" && status == db.StatusNotOnSrc {
-				continue
-			}
-			key := db.StatsKey(db.StatsKindTraversal, status)
-			n, err := database.Ops().GetDepthStat(side, d, key)
-			if err != nil {
-				return nil, err
-			}
-			if n == 0 {
-				continue
-			}
-			out = append(out, db.StatsRow{Depth: d, Key: key, Count: n})
-		}
-	}
-	return out, nil
-}
-
 // GetLatestQueueStats returns the most recent metrics JSON for queue_key and phase.
 func GetLatestQueueStats(database *db.DB, queueKey, phase string) ([]byte, error) {
 	if database == nil || database.Ops() == nil {
@@ -688,11 +580,11 @@ func GetAllQueueStats(database *db.DB) (map[string][]byte, error) {
 
 // GetPathReviewStatsFromOps rebuilds review counters from Badger depth/review stats.
 func GetPathReviewStatsFromOps(database *db.DB) (db.ReviewStatsSnapshot, error) {
-	srcT, err := traversalCountsFromDepthStats(database, "SRC")
+	srcT, err := GetTraversalStatusCounts(database, "SRC")
 	if err != nil {
 		return db.ReviewStatsSnapshot{}, err
 	}
-	dstT, err := traversalCountsFromDepthStats(database, "DST")
+	dstT, err := GetTraversalStatusCounts(database, "DST")
 	if err != nil {
 		return db.ReviewStatsSnapshot{}, err
 	}
@@ -700,11 +592,11 @@ func GetPathReviewStatsFromOps(database *db.DB) (db.ReviewStatsSnapshot, error) 
 	if err != nil {
 		return db.ReviewStatsSnapshot{}, err
 	}
-	deleteCounts, err := GetEligibleDeleteStatusCounts(database)
+	deleteCounts, err := GetDeleteStatusCountsFromEvents(database)
 	if err != nil {
 		return db.ReviewStatsSnapshot{}, err
 	}
-	merged, err := review.GetMergedReviewStats(database, review.ReviewFilter{})
+	merged, err := review.GetMergedReviewStatsCtx(context.Background(), database, review.ReviewFilter{})
 	if err != nil {
 		return db.ReviewStatsSnapshot{}, err
 	}

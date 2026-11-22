@@ -37,7 +37,7 @@ func mergeWaitContexts(primary context.Context, shutdown context.Context) (conte
 }
 
 // performTraversalForceStop abandons in-flight work only. No Flush / rebuild / checkpoint:
-// hard kill must not block on DuckDB writeMu after Abort (soft-then-hard UX).
+// hard kill must not block on DB writeMu after Abort (soft-then-hard UX).
 func performTraversalForceStop(
 	srcQueue, dstQueue *queue.Queue,
 	observer *observe.QueueObserver,

@@ -203,10 +203,34 @@ func sizeBounds(op string, v int64) (lo, hi *int64) {
 	}
 }
 
+func dstChildOfMappedSRCParent(ops *opsdb.Store, dstParentID, srcParentPath string) bool {
+	if ops == nil || dstParentID == "" || srcParentPath == "" {
+		return false
+	}
+	srcParentID, err := ops.GetNodeIDByPath(opsdb.SideSRC, srcParentPath)
+	if err != nil || srcParentID == "" {
+		return false
+	}
+	m, ok, err := ops.GetMapBySrc(srcParentID)
+	if err != nil || !ok || m.DstID == "" {
+		return false
+	}
+	if m.Status != "" && m.Status != db.IDMapStatusActive {
+		return false
+	}
+	return m.DstID == dstParentID
+}
+
 func nodeMatchesMetaFilter(ops *opsdb.Store, side string, n opsdb.NodeRecord, f ReviewFilter) bool {
 	path := opsdb.NormalizeIndexPath(n.Path)
-	if f.ParentPath != "" && opsdb.NormalizeIndexPath(n.ParentPath) != db.NormalizeRootRelativePath(f.ParentPath) {
-		return false
+	if f.ParentPath != "" {
+		want := db.NormalizeRootRelativePath(f.ParentPath)
+		if opsdb.NormalizeIndexPath(n.ParentPath) != want {
+			// DST children under a merge/remap peer of the SRC parent path.
+			if side != opsdb.SideDST || !dstChildOfMappedSRCParent(ops, n.ParentID, want) {
+				return false
+			}
+		}
 	}
 	under := strings.TrimSpace(f.UnderPath)
 	if under != "" && under != "/" {
@@ -237,16 +261,16 @@ func nodeMatchesMetaFilter(ops *opsdb.Store, side string, n opsdb.NodeRecord, f 
 			return false
 		}
 	}
-	name := strings.ToLower(n.Name)
-	q := strings.ToLower(strings.TrimSpace(f.Query))
+	name := n.Name
+	q := strings.TrimSpace(f.Query)
 	qf := strings.TrimSpace(f.QueryField)
 	segments := pathSegmentsForFilter(f)
 	if q != "" && strings.EqualFold(qf, "name") {
-		if !strings.Contains(name, q) {
+		if !fuzzyNeedleMatch(name, q) {
 			return false
 		}
 	} else if q != "" && len(segments) == 0 && !strings.EqualFold(qf, "path") {
-		if !strings.Contains(name, q) && !strings.Contains(strings.ToLower(path), q) {
+		if !fuzzyNeedleMatch(name, q) && !fuzzyNeedleMatch(path, q) {
 			return false
 		}
 	}
@@ -265,7 +289,7 @@ func nodeMatchesMetaFilter(ops *opsdb.Store, side string, n opsdb.NodeRecord, f 
 	return true
 }
 
-// pathSegmentsMatchAncestry mirrors Duck EXISTS ancestry: ordered name-contains
+// pathSegmentsMatchAncestry mirrors Duck EXISTS ancestry: ordered fuzzy name
 // matches along the root→node chain (gaps allowed).
 func pathSegmentsMatchAncestry(ops *opsdb.Store, side string, n opsdb.NodeRecord, segments []string) bool {
 	segments = NormalizePathSegments(segments)
@@ -297,7 +321,7 @@ func pathSegmentsMatchAncestry(ops *opsdb.Store, side string, n opsdb.NodeRecord
 		if si >= len(segments) {
 			break
 		}
-		if strings.Contains(strings.ToLower(node.Name), strings.ToLower(segments[si])) {
+		if fuzzyNeedleMatch(node.Name, segments[si]) {
 			si++
 		}
 	}
@@ -325,6 +349,61 @@ func sortCandidateIDsByPath(nodes map[string]opsdb.NodeRecord, ids []string, sor
 				less = a.Path < b.Path
 			}
 		default: // path
+			less = a.Path < b.Path
+			if a.Path == b.Path {
+				less = a.ID < b.ID
+			}
+		}
+		if sortDesc {
+			return !less
+		}
+		return less
+	})
+}
+
+// sortCandidateIDsByRelevance ranks trigram needles by fuzzy score first, then
+// the requested column (path/name/…).
+func sortCandidateIDsByRelevance(nodes map[string]opsdb.NodeRecord, ids []string, f ReviewFilter, sortCol string, sortDesc bool) {
+	needles := containsNeedlesFromFilter(f)
+	if len(needles) == 0 {
+		sortCandidateIDsByPath(nodes, ids, sortCol, sortDesc)
+		return
+	}
+	score := func(n opsdb.NodeRecord) int {
+		s := needleRelevanceScore(n.Name, needles)
+		path := n.DisplayPath
+		if path == "" {
+			path = n.Path
+		}
+		if p := needleRelevanceScore(path, needles); p > s {
+			s = p
+		}
+		return s
+	}
+	sort.SliceStable(ids, func(i, j int) bool {
+		a, b := nodes[ids[i]], nodes[ids[j]]
+		sa, sb := score(a), score(b)
+		if sa != sb {
+			return sa > sb
+		}
+		var less bool
+		switch strings.ToLower(strings.TrimSpace(sortCol)) {
+		case "name":
+			less = strings.ToLower(a.Name) < strings.ToLower(b.Name)
+			if a.Name == b.Name {
+				less = a.Path < b.Path
+			}
+		case "size":
+			less = a.Size < b.Size
+			if a.Size == b.Size {
+				less = a.Path < b.Path
+			}
+		case "depth":
+			less = a.Depth < b.Depth
+			if a.Depth == b.Depth {
+				less = a.Path < b.Path
+			}
+		default:
 			less = a.Path < b.Path
 			if a.Path == b.Path {
 				less = a.ID < b.ID
