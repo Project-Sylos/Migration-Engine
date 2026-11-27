@@ -260,6 +260,34 @@ type TraversalAckResult struct {
 	WasFolder bool
 }
 
+// ApplyTraversalAck acknowledges (ack=true) SRC failed nodes under the path as intentionally
+// ignored, or restores (ack=false) acknowledged-from-failed nodes to failed. A failed (or
+// ack-excluded) DST-at-path is updated alongside when present. Does not enroll pend:trav.
+func (s *Store) ApplyTraversalAck(srcID, dstAtPathID string, ack bool) (TraversalAckResult, error) {
+	var out TraversalAckResult
+	if s == nil || srcID == "" {
+		return out, fmt.Errorf("opsdb: src id required")
+	}
+	n, ok, err := s.GetNode(SideSRC, srcID)
+	if err != nil {
+		return out, err
+	}
+	if !ok {
+		return out, fmt.Errorf("opsdb: SRC node %s not found", srcID)
+	}
+	out, err = applyRetryAt(s, SideSRC, n, ack, s.ApplyTraversalAckChunk)
+	if err != nil {
+		return out, err
+	}
+	if dstAtPathID == "" {
+		return out, err
+	}
+	// Same-class DST peer only; successful DST is left alone. Do not fold DST into Affected:
+	// review Failed / excluded counters are SRC-only.
+	_, err = ApplyNodeRetry(s, SideDST, dstAtPathID, ack, s.ApplyTraversalAckChunk)
+	return out, err
+}
+
 // ApplyTraversalAckChunk acknowledges (Mark) failed nodes in a chunk as intentionally ignored,
 // or restores (!Mark) acknowledged-from-failed nodes to failed. It does not enroll pend:trav.
 func (s *Store) ApplyTraversalAckChunk(sc RetryScope, chunk SubtreeChunk, out *TraversalAckResult) error {

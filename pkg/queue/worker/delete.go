@@ -42,8 +42,17 @@ func NewDeleteWorker(
 }
 
 func (w *DeleteWorker) execute(task *queue.TaskBase) error {
-	parent := fsOpContext(w.workerCtx, w.shutdownCtx)
-	wd, ctx := observe.NewProgressWatchdog(parent, deleteStallTimeout, progressStallSuppress(w.queue))
+	base := fsOpContext(w.workerCtx, w.shutdownCtx)
+	parent, leaseCancel := context.WithCancel(base)
+	w.queue.BindLeaseCancel(task.ID, leaseCancel)
+	defer w.queue.ClearLeaseCancel(task.ID)
+	if task.UserCancelRequested {
+		leaseCancel()
+		return errUserCancelled
+	}
+	delTimeout := deleteStallBudget(w.queue)
+	wd, ctx := observe.NewProgressWatchdog(parent, delTimeout, progressStallSuppress(w.queue),
+		stallOnFail(w.queue, task.ID, delTimeout, "delete"))
 	defer wd.Stop()
 
 	w.queue.SetActiveLeaseSize(w.id, 0)
@@ -63,15 +72,15 @@ func (w *DeleteWorker) execute(task *queue.TaskBase) error {
 			logservice.LogFields{Action: "delete", NodeID: task.ID, Queue: "delete"})
 	}
 
-	// DeleteNode often ignores cancel; run async so the progress watchdog can still abort.
-	err := awaitErr(w.queue, ctx, parent, deleteStallTimeout, "delete", task.DisplayPath, func() error {
+	// DeleteNode often ignores cancel; Open/Close + onStall still abort the lease.
+	err := awaitErr(w.queue, ctx, parent, delTimeout, "delete", task.DisplayPath, wd, func() error {
 		return w.srcAdapter.DeleteNode(ctx, serviceID, nodeType)
 	})
+	if task.UserCancelRequested {
+		return errUserCancelled
+	}
 	if isForceCheckoutAbort(err, w.shouldRetire(), w.queue.ForceCheckoutWorker(w.id)) {
 		return errTransferAbandoned
-	}
-	if err == nil {
-		wd.Beat()
 	}
 	return err
 }

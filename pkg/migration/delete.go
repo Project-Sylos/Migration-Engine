@@ -71,6 +71,7 @@ func RunDeletePhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 	mr := effectiveInt(0, cfg.MaxRetries)
 
 	deleteQueue := queue.NewQueue("delete", mr, wc, nil, sizing)
+	applyFSStallTimeouts(deleteQueue, cfg.PhaseRuntime)
 	deleteQueue.SetMode(queue.QueueModeDelete)
 	deleteQueue.SetCopyPass(1) // pass 1 = folders for delete (recursive)
 
@@ -203,7 +204,7 @@ func RunDeletePhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 		}
 		if cfg.SoftSuspendRequested != nil && cfg.SoftSuspendRequested() {
 			waitCtx, cancel := softSuspendWaitContext(cfg.ShutdownContext)
-			stats, suspend, err := performQueueSoftSuspend(waitCtx, database, deleteQueue, observer, &cfg.PhaseRuntime, "removals", "delete", wc, mr, drainQueuesInOrder(cfg.ShutdownContext, deleteQueue))
+			stats, suspend, err := performQueueSoftSuspend(waitCtx, database, deleteQueue, observer, &cfg.PhaseRuntime, "removals", "delete", wc, mr, drainSoftStopWithGrace(cfg.ShutdownContext, deleteQueue))
 			cancel()
 			if forceStopOverridesSoftSuspend(cfg.ShutdownContext, database) {
 				skipDurableTeardown = true
@@ -255,6 +256,7 @@ func RunDeleteRetryPhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 	mr := effectiveInt(0, cfg.MaxRetries)
 
 	deleteQueue := queue.NewQueue("delete", mr, wc, nil, sizing)
+	applyFSStallTimeouts(deleteQueue, cfg.PhaseRuntime)
 	deleteQueue.SetMode(queue.QueueModeDeleteRetry)
 	deleteQueue.SetCopyPass(1)
 	startRound := findDeleteStartRound(database, true)
@@ -329,7 +331,7 @@ func RunDeleteRetryPhase(cfg DeletePhaseConfig) (queue.QueueStats, error) {
 		}
 		if cfg.SoftSuspendRequested != nil && cfg.SoftSuspendRequested() {
 			waitCtx, cancel := softSuspendWaitContext(cfg.ShutdownContext)
-			stats, suspend, err := performQueueSoftSuspend(waitCtx, database, deleteQueue, observer, &cfg.PhaseRuntime, "removals", "delete", wc, mr, drainQueuesInOrder(cfg.ShutdownContext, deleteQueue))
+			stats, suspend, err := performQueueSoftSuspend(waitCtx, database, deleteQueue, observer, &cfg.PhaseRuntime, "removals", "delete", wc, mr, drainSoftStopWithGrace(cfg.ShutdownContext, deleteQueue))
 			cancel()
 			if forceStopOverridesSoftSuspend(cfg.ShutdownContext, database) {
 				skipDurableTeardown = true

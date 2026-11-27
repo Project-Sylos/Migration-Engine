@@ -326,6 +326,14 @@ func FailCopyTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.Dura
 	logQueue(q, "debug", fmt.Sprintf("Failing copy task: id=%s path=%s round=%d pass=%d attempts=%d maxRetries=%d",
 		nodeID, task.DisplayPath, currentRound, task.CopyPass, task.Attempts, maxRetries))
 
+	if task.UserCancelRequested {
+		if task.LastError == "" {
+			task.LastError = "cancelled by user"
+		}
+		_ = q.ClearTransferCheckpoint(context.Background(), task)
+		task.Attempts = maxRetries
+	}
+
 	task.Attempts++
 
 	// Permanent FS errors should not retry; they block round completion and waste API quota.

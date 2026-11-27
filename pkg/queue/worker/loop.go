@@ -138,6 +138,19 @@ func (b *workerBase) Run() {
 			}
 			continue
 		}
+		if errors.Is(err, errUserCancelled) {
+			_ = b.queue.ClearTransferCheckpoint(context.Background(), task)
+			task.UserCancelRequested = true
+			if task.LastError == "" {
+				task.LastError = errUserCancelled.Error()
+			}
+			reportTaskOutcome(b.queue, task, err)
+			if b.shouldRetire() {
+				logf("exiting - scale down retire after user cancel")
+				return
+			}
+			continue
+		}
 		// Worker result is set before ReportTaskResult (for stall diagnostics).
 		reportTaskOutcome(b.queue, task, err)
 		if err != nil && spec.logFailure != nil && !queue.IsThrottleError(err) {

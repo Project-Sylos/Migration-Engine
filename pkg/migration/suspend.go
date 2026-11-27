@@ -217,23 +217,58 @@ func (rt *PhaseRuntime) newSuspendState(kind string, workerCount, maxRetries int
 	}
 }
 
-// drainQueuesInOrder returns a drain step that waits for each queue's in-flight work in turn.
-func drainQueuesInOrder(shutdown context.Context, queues ...*queue.Queue) func(context.Context, func(int)) error {
+// drainSoftStopWithGrace waits up to DefaultSpinDownGrace for cooperative finish, then
+// cancels leases and clears Working-on immediately (checkpoints publish off the drain
+// path). Soft-stop UI then waits on seal Flush / suspend write, not hung syscalls.
+func drainSoftStopWithGrace(shutdown context.Context, queues ...*queue.Queue) func(context.Context, func(int)) error {
 	return func(mergedCtx context.Context, onDrainTick func(int)) error {
+		live := make([]*queue.Queue, 0, len(queues))
 		for _, q := range queues {
-			if err := q.WaitInProgressZeroFunc(mergedCtx, 50*time.Millisecond, onDrainTick); err != nil {
-				if softSuspendHardKilled(shutdown) {
-					abandonQueuesDBOnly(queues...)
-				}
-				return fmt.Errorf("%s queue drain in-flight: %w", q.Name(), err)
+			if q == nil {
+				continue
 			}
+			live = append(live, q)
+			q.EnterStopAbandonWindow(queue.DefaultSpinDownGrace)
 		}
-		// Hard kill may clear in-progress so Wait succeeds; do not continue soft-save.
+		graceCtx, graceCancel := context.WithTimeout(mergedCtx, queue.DefaultSpinDownGrace)
+		defer graceCancel()
+		_ = waitQueuesInProgressZero(graceCtx, live, onDrainTick)
+
+		for _, q := range live {
+			q.RequestForceCheckoutAllWorkersForStop()
+			q.CancelBusyWorkerContexts()
+			q.AbandonInProgressTasks()
+		}
 		if err := errIfSoftSuspendHardKilled(shutdown); err != nil {
-			abandonQueuesDBOnly(queues...)
+			abandonQueuesDBOnly(live...)
 			return err
 		}
+		for _, q := range live {
+			q.Spin.AbandonDBOnly.Store(false)
+		}
 		return nil
+	}
+}
+
+func waitQueuesInProgressZero(ctx context.Context, queues []*queue.Queue, onDrainTick func(int)) error {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		n := 0
+		for _, q := range queues {
+			n += q.InProgressCount()
+		}
+		if onDrainTick != nil {
+			onDrainTick(n)
+		}
+		if n == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -290,7 +325,7 @@ func performTraversalSoftSuspend(
 	workerCount, maxRetries int,
 ) (RuntimeStats, RuntimeSuspendV1, error) {
 	queues := []*queue.Queue{srcQueue, dstQueue}
-	if err := softSuspendQueues(waitCtx, database, observer, rt, "items", queues, drainQueuesInOrder(rt.ShutdownContext, queues...)); err != nil {
+	if err := softSuspendQueues(waitCtx, database, observer, rt, "items", queues, drainSoftStopWithGrace(rt.ShutdownContext, queues...)); err != nil {
 		return RuntimeStats{}, RuntimeSuspendV1{}, err
 	}
 	mergedCtx, cancelMerged := mergeWaitContexts(waitCtx, rt.ShutdownContext)
@@ -336,29 +371,9 @@ func performTraversalSoftSuspend(
 	}, suspend, nil
 }
 
-// drainCopyQueue returns the copy drain step: a grace window, then force-checkout of workers, then abandon.
+// drainCopyQueue is soft-stop drain for the copy queue (grace, then immediate abandon).
 func drainCopyQueue(copyQueue *queue.Queue, shutdown context.Context) func(context.Context, func(int)) error {
-	return func(mergedCtx context.Context, onDrainTick func(int)) error {
-		copyQueue.EnterStopAbandonWindow(queue.DefaultSpinDownGrace)
-		graceCtx, graceCancel := context.WithTimeout(mergedCtx, queue.DefaultSpinDownGrace)
-		defer graceCancel()
-		if err := copyQueue.WaitInProgressZeroFunc(graceCtx, 50*time.Millisecond, onDrainTick); err != nil {
-			// After grace: force-checkout smallest file workers (freeze callback also does this).
-			copyQueue.RequestForceCheckoutAllWorkersForStop()
-			drainCtx, drainCancel := context.WithTimeout(mergedCtx, 5*time.Second)
-			defer drainCancel()
-			if err2 := copyQueue.WaitInProgressZeroFunc(drainCtx, 50*time.Millisecond, onDrainTick); err2 != nil {
-				copyQueue.Spin.AbandonDBOnly.Store(true)
-				copyQueue.AbandonInProgressTasks()
-			}
-		}
-		if err := errIfSoftSuspendHardKilled(shutdown); err != nil {
-			abandonQueuesDBOnly(copyQueue)
-			return err
-		}
-		copyQueue.Spin.AbandonDBOnly.Store(false)
-		return nil
-	}
+	return drainSoftStopWithGrace(shutdown, copyQueue)
 }
 
 // performQueueSoftSuspend is the copy/delete soft suspend; kind is "copy" or "delete" and selects the position fields saved.

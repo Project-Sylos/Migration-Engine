@@ -107,7 +107,7 @@ LocalFS refuses to list or open paths under `/proc`, `/sys`, `/dev`, `/run` (and
 
 ### Traversal stall (Migration-Engine)
 
-`ListChildren` gets one ProgressWatchdog Beat at start and no mid-list fake beats. Seal flush does **not** freeze the timer (that used to hide automount/NFS/FUSE blackholes). Active FS rate-limit windows still freeze it so provider backoff is not treated as a hang. After `traversalStallTimeout` (60s) of unsuppressed idle, the watchdog cancels the context and the task fails as non-retryable (`traversal stalled`) so the round can advance. Cancel frees the worker even if the adapter goroutine remains blocked in the syscall. Copy/delete still use seal-or-rate-limit suppress with their own kill timeouts (`DeleteNode` / `DeleteBatch` at 60s).
+`ListChildren` is bracketed by ProgressWatchdog `Open`/`Close` (no mid-list fake beats). The stall clock runs only while that FS await is open; CPU/seal publish outside the await does not count. Active FS rate-limit windows still freeze the budget so provider backoff is not treated as a hang. After `traversalStallTimeout` (60s) of unsuppressed FS wait, the watchdog cancels the context and force-fails the lease (`traversal stalled`, non-retryable) so the round can advance even if the adapter goroutine remains blocked in the syscall. Copy/delete use the same Open/Close + rate-limit-only suppress model with their own timeouts (`DeleteNode` / `DeleteBatch` at 60s; file copy Beats on byte progress during an open wait).
 
 ---
 

@@ -754,23 +754,56 @@ func (s *migrationStore) unmarkNodeForRetryDiscovery(nodeID string) (int64, map[
 }
 
 // setTraversalFailedAcknowledged sets failed → traversal excluded (intentional ignore), or restores
-// acknowledged-from-failed excluded → failed.
+// acknowledged-from-failed excluded → failed. Same-class DST peers are updated with SRC; DST-only
+// failures are acknowledged without touching a successful SRC.
 func (s *migrationStore) setTraversalFailedAcknowledged(nodeID string, acknowledged bool) (int64, map[string]int64, error) {
-	srcNode, _, err := s.reviewPairFromID(nodeID)
+	srcNode, dstNode, err := s.reviewPairFromID(nodeID)
 	if err != nil {
 		return 0, nil, err
 	}
-	if srcNode == nil {
-		return 0, nil, fmt.Errorf("node %s not found in SRC", nodeID)
+	srcEligible := false
+	if srcNode != nil {
+		if acknowledged {
+			srcEligible = srcNode.TraversalStatus == db.StatusFailed
+		} else {
+			srcEligible = srcNode.TraversalStatus == db.StatusExcluded &&
+				opsdb.IsTraversalAckFromFailed(srcNode.ExclusionSource)
+		}
 	}
-	if acknowledged && srcNode.TraversalStatus != db.StatusFailed {
+	dstEligible := false
+	if dstNode != nil {
+		if acknowledged {
+			dstEligible = dstNode.TraversalStatus == db.StatusFailed
+		} else {
+			dstEligible = dstNode.TraversalStatus == db.StatusExcluded &&
+				opsdb.IsTraversalAckFromFailed(dstNode.ExclusionSource)
+		}
+	}
+	if !srcEligible && !dstEligible {
 		return 0, nil, nil
 	}
-	res, err := opsdb.ApplyRetryAtID(s.db.Ops(), opsdb.SideSRC, srcNode.ID, acknowledged, s.db.Ops().ApplyTraversalAckChunk)
-	if err != nil {
-		return 0, nil, err
+
+	var affected int64
+	if srcEligible {
+		dstID := ""
+		if dstEligible {
+			dstID = dstNode.ID
+		}
+		res, err := s.db.Ops().ApplyTraversalAck(srcNode.ID, dstID, acknowledged)
+		if err != nil {
+			return 0, nil, err
+		}
+		affected = res.Affected
+	} else {
+		// DST-only: SRC succeeded (or is absent); ack/unack the DST peer alone.
+		res, err := opsdb.ApplyRetryAtID(s.db.Ops(), opsdb.SideDST, dstNode.ID, acknowledged, s.db.Ops().ApplyTraversalAckChunk)
+		if err != nil {
+			return 0, nil, err
+		}
+		// DST mutations do not move SRC review Failed / excluded counters.
+		return res.Affected, nil, nil
 	}
-	if res.Affected == 0 {
+	if affected == 0 {
 		return 0, nil, nil
 	}
 	sign := int64(1)
@@ -778,12 +811,12 @@ func (s *migrationStore) setTraversalFailedAcknowledged(nodeID string, acknowled
 		sign = -1
 	}
 	deltas := make(map[string]int64)
-	addReviewDelta(deltas, DeltaTraversalFailed, -sign*res.Affected)
-	addReviewDelta(deltas, DeltaExcluded, sign*res.Affected)
+	addReviewDelta(deltas, DeltaTraversalFailed, -sign*affected)
+	addReviewDelta(deltas, DeltaExcluded, sign*affected)
 	if err := s.persistReviewDeltas(deltas); err != nil {
 		return 0, nil, fmt.Errorf("persist review deltas: %w", err)
 	}
-	return res.Affected, deltas, nil
+	return affected, deltas, nil
 }
 
 func (s *migrationStore) setNodeExcluded(nodeID string, excluded bool) (int64, map[string]int64, error) {

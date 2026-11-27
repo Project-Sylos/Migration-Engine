@@ -40,7 +40,7 @@ If a usable soft checkpoint exists, Resume must not also force recovery HashVeri
 Leave a checkpoint Resume can trust.
 
 1. Soft stop is requested while a phase is live.
-2. Queues pause; workers drain under soft-stop rules (finish or release leases; do not abandon).
+2. Queues pause; workers get a short grace window to finish. After grace, leases cancel and Working-on clears immediately (copy checkpoints publish without blocking drain). Soft stop does not wait on hung FS syscalls.
 3. Seal buffer flushes; durable teardown / checkpoint for that phase runs as needed.
 4. Runtime writes `suspend_v1` (rounds, cursors, knobs) and related queue position state.
 5. Phase becomes the matching `*-suspended`.

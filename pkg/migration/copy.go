@@ -74,6 +74,7 @@ func RunCopyRetryPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 	mr := effectiveInt(suspendRetries, cfg.MaxRetries)
 
 	copyQueue := queue.NewQueue("copy", mr, wc, nil, sizing)
+	applyFSStallTimeouts(copyQueue, cfg.PhaseRuntime)
 	copyQueue.SetMode(queue.QueueModeCopyRetry)
 	copyQueue.SetCopyPass(1)
 	seedQueueCountersFromDB(database, copyQueue, "copy", db.QueueStatsPhaseCopy)
@@ -282,6 +283,7 @@ func RunCopyPhase(cfg CopyPhaseConfig) (queue.QueueStats, error) {
 
 	// Create copy queue (single queue, not dual like traversal)
 	copyQueue := queue.NewQueue("copy", mr, wc, nil, sizing) // No coordinator needed for copy
+	applyFSStallTimeouts(copyQueue, cfg.PhaseRuntime)
 	copyQueue.SetMode(queue.QueueModeCopy)
 	copyQueue.SetCopyPass(1) // Start with pass 1 (folders)
 	if cfg.ResumeCopy != nil {

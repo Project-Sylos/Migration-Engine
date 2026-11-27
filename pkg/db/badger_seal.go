@@ -65,7 +65,6 @@ type badgerSeal struct {
 	telemetryOrganicFlushDurationNs int64
 	telemetryForcedFlushCount       int64
 	telemetryForcedFlushDurationNs  int64
-	hardCapWaiters                  int32
 	flushActive                     int32
 
 	nodes       []sealNodeJob
@@ -75,6 +74,18 @@ type badgerSeal struct {
 	gpl         []GPLIssue
 	kidsReplace []opsdb.SealKidsReplace
 	kidTickets  []opsdb.KidTicket
+
+	// overflow accepts in-flight publishes while the main buffer is at the hard cap.
+	// Producers return immediately and must not lease more work until flush drains it.
+	overflowNodes       []sealNodeJob
+	overflowEvents      []sealEventJob
+	overflowMaps        []sealMapJob
+	overflowErrors      []TaskErrorRecord
+	overflowGPL         []GPLIssue
+	overflowKidsReplace []opsdb.SealKidsReplace
+	overflowKidTickets  []opsdb.KidTicket
+	overflowRows        int64
+	overflowFlushArmed  int32
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -162,18 +173,29 @@ func (b *badgerSeal) AddDiscoveryNodes(ops []InsertOperation) error {
 		k := key{op.QueueType, op.Level}
 		groups[k] = append(groups[k], s)
 	}
+	overflowed := false
 	for k, nodes := range groups {
-		b.enqueueNodes(k.table, k.depth, nodes, true)
+		if b.enqueueNodes(k.table, k.depth, nodes, true) {
+			overflowed = true
+		}
 	}
-	if b.bufferedRows() >= int64(b.rowThreshold) {
-		return b.flush(true)
+	if overflowed || b.bufferedRows() < int64(b.rowThreshold) {
+		return nil
 	}
-	return nil
+	return b.flush(true)
 }
 
 func (b *badgerSeal) AddDiscoveryStatusEvent(table string, e StatusEvent, fromRetry bool) {
 	b.mu.Lock()
-	b.waitBelowHardCapLocked()
+	if b.useOverflowLocked() {
+		b.overflowEvents = append(b.overflowEvents, sealEventJob{table: table, event: e, fromRetry: fromRetry})
+		b.overflowRows++
+		b.cond.Broadcast()
+		b.mu.Unlock()
+		b.noteSealWeight(1)
+		b.kickOverflowFlush()
+		return
+	}
 	b.events = append(b.events, sealEventJob{table: table, event: e, fromRetry: fromRetry})
 	b.rowsSinceFlush++
 	b.noteRowsLocked(b.rowsSinceFlush)
@@ -188,7 +210,15 @@ func (b *badgerSeal) AddDiscoveryStatusEvent(table string, e StatusEvent, fromRe
 
 func (b *badgerSeal) AddTaskError(rec TaskErrorRecord) {
 	b.mu.Lock()
-	b.waitBelowHardCapLocked()
+	if b.useOverflowLocked() {
+		b.overflowErrors = append(b.overflowErrors, rec)
+		b.overflowRows++
+		b.cond.Broadcast()
+		b.mu.Unlock()
+		b.noteSealWeight(1)
+		b.kickOverflowFlush()
+		return
+	}
 	b.errors = append(b.errors, rec)
 	b.rowsSinceFlush++
 	b.noteRowsLocked(b.rowsSinceFlush)
@@ -206,7 +236,15 @@ func (b *badgerSeal) AddGPLIssue(e GPLIssue) {
 		return
 	}
 	b.mu.Lock()
-	b.waitBelowHardCapLocked()
+	if b.useOverflowLocked() {
+		b.overflowGPL = append(b.overflowGPL, e)
+		b.overflowRows++
+		b.cond.Broadcast()
+		b.mu.Unlock()
+		b.noteSealWeight(1)
+		b.kickOverflowFlush()
+		return
+	}
 	b.gpl = append(b.gpl, e)
 	b.rowsSinceFlush++
 	b.noteRowsLocked(b.rowsSinceFlush)
@@ -221,7 +259,15 @@ func (b *badgerSeal) AddGPLIssue(e GPLIssue) {
 
 func (b *badgerSeal) AddIDMapEvent(e IDMapEvent) {
 	b.mu.Lock()
-	b.waitBelowHardCapLocked()
+	if b.useOverflowLocked() {
+		b.overflowMaps = append(b.overflowMaps, sealMapJob{event: e})
+		b.overflowRows++
+		b.cond.Broadcast()
+		b.mu.Unlock()
+		b.noteSealWeight(1)
+		b.kickOverflowFlush()
+		return
+	}
 	b.maps = append(b.maps, sealMapJob{event: e})
 	b.rowsSinceFlush++
 	b.noteRowsLocked(b.rowsSinceFlush)
@@ -234,13 +280,27 @@ func (b *badgerSeal) AddIDMapEvent(e IDMapEvent) {
 	}
 }
 
-func (b *badgerSeal) enqueueNodes(table string, depth int, nodes []*NodeState, discoveryStats bool) {
+func (b *badgerSeal) enqueueNodes(table string, depth int, nodes []*NodeState, discoveryStats bool) (overflowed bool) {
 	if len(nodes) == 0 {
 		return
 	}
 	added := int64(0)
 	b.mu.Lock()
-	b.waitBelowHardCapLocked()
+	if b.useOverflowLocked() {
+		for _, n := range nodes {
+			if n == nil {
+				continue
+			}
+			b.overflowNodes = append(b.overflowNodes, sealNodeJob{table: table, depth: depth, node: n, discoveryStats: discoveryStats})
+			b.overflowRows++
+			added++
+		}
+		b.cond.Broadcast()
+		b.mu.Unlock()
+		b.noteSealWeight(added)
+		b.kickOverflowFlush()
+		return true
+	}
 	for _, n := range nodes {
 		if n == nil {
 			continue
@@ -253,6 +313,7 @@ func (b *badgerSeal) enqueueNodes(table string, depth int, nodes []*NodeState, d
 	b.cond.Broadcast()
 	b.mu.Unlock()
 	b.noteSealWeight(added)
+	return false
 }
 
 func (b *badgerSeal) bufferedRows() int64 {
@@ -329,20 +390,33 @@ func statusEventFrontierDeltas(side string, e StatusEvent, nodeType string) []op
 	return deltas
 }
 
-func (b *badgerSeal) waitBelowHardCapLocked() {
-	for b.rowsSinceFlush >= int64(b.hardCap) {
+// useOverflowLocked reports that the main buffer is already at the hard cap (or an
+// overflow publish is waiting). Caller must hold b.mu. The publish goes to overflow
+// and must not flush on this goroutine.
+func (b *badgerSeal) useOverflowLocked() bool {
+	if b.rowsSinceFlush >= int64(b.hardCap) || b.overflowRows > 0 {
 		atomic.AddInt64(&b.telemetryHardCapHits, 1)
-		atomic.AddInt32(&b.hardCapWaiters, 1)
-		backpressure, hardCap := b.db.Busy(BusyBackpressure), b.db.Busy(BusyHardCap)
-		backpressure.Enter()
-		hardCap.Enter()
-		start := time.Now()
-		b.cond.Wait()
-		atomic.AddInt64(&b.telemetryHardCapWaitNs, time.Since(start).Nanoseconds())
-		hardCap.Leave()
-		backpressure.Leave()
-		atomic.AddInt32(&b.hardCapWaiters, -1)
+		return true
 	}
+	return false
+}
+
+// kickOverflowFlush drains overflow off the producer goroutine.
+func (b *badgerSeal) kickOverflowFlush() {
+	if !atomic.CompareAndSwapInt32(&b.overflowFlushArmed, 0, 1) {
+		return
+	}
+	go func() {
+		_ = b.flush(true)
+		atomic.StoreInt32(&b.overflowFlushArmed, 0)
+	}()
+}
+
+// AtHardCap reports whether buffered rows are at or above the hard cap, or an overflow publish is waiting.
+func (b *badgerSeal) AtHardCap() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.rowsSinceFlush >= int64(b.hardCap) || b.overflowRows > 0
 }
 
 func (b *badgerSeal) noteRowsLocked(cur int64) {
@@ -372,14 +446,14 @@ func (b *badgerSeal) flush(organic bool) error {
 	defer b.flushMu.Unlock()
 
 	b.mu.Lock()
-	nodes := b.nodes
-	events := b.events
-	maps := b.maps
-	errs := b.errors
-	gpl := b.gpl
-	kidsReplace := b.kidsReplace
-	kidTickets := b.kidTickets
-	rows := b.rowsSinceFlush
+	nodes := append(b.nodes, b.overflowNodes...)
+	events := append(b.events, b.overflowEvents...)
+	maps := append(b.maps, b.overflowMaps...)
+	errs := append(b.errors, b.overflowErrors...)
+	gpl := append(b.gpl, b.overflowGPL...)
+	kidsReplace := append(b.kidsReplace, b.overflowKidsReplace...)
+	kidTickets := append(b.kidTickets, b.overflowKidTickets...)
+	rows := b.rowsSinceFlush + b.overflowRows
 	b.nodes = nil
 	b.events = nil
 	b.maps = nil
@@ -387,7 +461,15 @@ func (b *badgerSeal) flush(organic bool) error {
 	b.gpl = nil
 	b.kidsReplace = nil
 	b.kidTickets = nil
+	b.overflowNodes = nil
+	b.overflowEvents = nil
+	b.overflowMaps = nil
+	b.overflowErrors = nil
+	b.overflowGPL = nil
+	b.overflowKidsReplace = nil
+	b.overflowKidTickets = nil
 	b.rowsSinceFlush = 0
+	b.overflowRows = 0
 	b.cond.Broadcast()
 	b.mu.Unlock()
 
@@ -443,7 +525,17 @@ func (b *badgerSeal) AddKidTicket(side, parentID string, parentDepth int, kid op
 		return
 	}
 	b.mu.Lock()
-	b.waitBelowHardCapLocked()
+	if b.useOverflowLocked() {
+		b.overflowKidTickets = append(b.overflowKidTickets, opsdb.KidTicket{
+			Side: side, ParentID: parentID, ParentDepth: parentDepth, Kid: kid,
+		})
+		b.overflowRows++
+		b.cond.Broadcast()
+		b.mu.Unlock()
+		b.noteSealWeight(1)
+		b.kickOverflowFlush()
+		return
+	}
 	b.kidTickets = append(b.kidTickets, opsdb.KidTicket{
 		Side: side, ParentID: parentID, ParentDepth: parentDepth, Kid: kid,
 	})
@@ -463,7 +555,15 @@ func (b *badgerSeal) AddKidsPackReplace(side, parentID string, kids []opsdb.KidR
 		return
 	}
 	b.mu.Lock()
-	b.waitBelowHardCapLocked()
+	if b.useOverflowLocked() {
+		b.overflowKidsReplace = append(b.overflowKidsReplace, opsdb.SealKidsReplace{Side: side, ParentID: parentID, Kids: kids})
+		b.overflowRows++
+		b.cond.Broadcast()
+		b.mu.Unlock()
+		b.noteSealWeight(1)
+		b.kickOverflowFlush()
+		return
+	}
 	b.kidsReplace = append(b.kidsReplace, opsdb.SealKidsReplace{Side: side, ParentID: parentID, Kids: kids})
 	b.rowsSinceFlush++
 	b.noteRowsLocked(b.rowsSinceFlush)
@@ -648,8 +748,7 @@ func (b *badgerSeal) WaitUntilFlushedThrough(depth int) {
 }
 
 func (b *badgerSeal) IOWaitActive() bool {
-	return atomic.LoadInt32(&b.flushActive) != 0 ||
-		atomic.LoadInt32(&b.hardCapWaiters) != 0
+	return atomic.LoadInt32(&b.flushActive) != 0
 }
 
 func (b *badgerSeal) TelemetrySnapshot() SealBufferTelemetry {

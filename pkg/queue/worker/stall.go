@@ -15,52 +15,82 @@ import (
 )
 
 const (
-	// copyStallTimeout / deleteStallTimeout: cancel a copy or delete FS op after this
-	// long with no progress Beat while not rate-limited and not blocked on seal I/O.
-	// Queue STALL DETECTED dumps are separate (30s diagnostic).
-	copyStallTimeout = 60 * time.Second
 	// copyIOReadTimeout / copyIOWriteTimeout: per-Read / per-Write await budgets (match
 	// Sylos-FS ctxstream + chunk deadlines). Fresh deadline each call.
 	copyIOReadTimeout  = optimeout.IORead
 	copyIOWriteTimeout = optimeout.IOWrite
 	// copyCommitStallTimeout bounds dstWriter.Close (session finish / commit).
 	copyCommitStallTimeout = 10 * time.Minute
-	deleteStallTimeout     = 60 * time.Second
 	// gplStallTimeout bounds path-rule revalidation (CPU/DB; no FS) so a wedged GPL
 	// task cannot hold a traversal worker forever.
 	gplStallTimeout = 60 * time.Second
-	// traversalStallTimeout is a hard wall clock for ListChildren with no mid-op
-	// ProgressWatchdog beats and no seal suppress. Rate-limit windows still freeze
-	// the timer (provider backoff is not a metadata blackhole). Automount / NFS /
-	// FUSE hangs must not hold a BFS round open forever.
-	traversalStallTimeout = 60 * time.Second
 )
 
-// progressStallSuppress freezes the ProgressWatchdog while seal flush blocks or an
-// FS rate-limit window is open. Use for copy/delete commit paths where seal I/O
-// is expected idle time.
+// Package defaults mirror queue.Default*StallTimeout; workers prefer queue overrides.
+const (
+	copyStallTimeout      = queue.DefaultCopyStallTimeout
+	deleteStallTimeout    = queue.DefaultDeleteStallTimeout
+	traversalStallTimeout = queue.DefaultTraversalStallTimeout
+)
+
+func copyStallBudget(q *queue.Queue) time.Duration {
+	if q != nil {
+		return q.CopyStallTimeout()
+	}
+	return copyStallTimeout
+}
+
+func deleteStallBudget(q *queue.Queue) time.Duration {
+	if q != nil {
+		return q.DeleteStallTimeout()
+	}
+	return deleteStallTimeout
+}
+
+func traversalStallBudget(q *queue.Queue) time.Duration {
+	if q != nil {
+		return q.TraversalStallTimeout()
+	}
+	return traversalStallTimeout
+}
+
+// stallOnFail returns onStall only when timeout is positive (0 = unlimited).
+func stallOnFail(q *queue.Queue, nodeID string, timeout time.Duration, op string) func() {
+	if timeout <= 0 {
+		return nil
+	}
+	return stallForceFail(q, nodeID, timeout, op)
+}
+
+// progressStallSuppress freezes the ProgressWatchdog while an FS rate-limit window is
+// open. Seal publish no longer blocks the FS await path, so it is not part of suppress.
 func progressStallSuppress(q *queue.Queue) func() bool {
 	return func() bool {
-		if q == nil {
-			return false
-		}
-		return q.SealIOWaitActive() || q.IsRateLimitActive()
+		return q != nil && q.IsRateLimitActive()
 	}
 }
 
-// progressRateLimitSuppress freezes the ProgressWatchdog only during an active FS
-// rate-limit window. Traversal ListChildren uses this so provider backoff does not
-// look like a hung Lstat, while seal flush does not reset the blackhole timer.
-func progressRateLimitSuppress(q *queue.Queue) func() bool {
-	return func() bool {
-		return q != nil && q.IsRateLimitActive()
+// stallForceFail returns an onStall hook that hard-drops the lease when an FS wait
+// exceeds the ProgressWatchdog budget (syscall may still be blocked).
+func stallForceFail(q *queue.Queue, nodeID string, timeout time.Duration, op string) func() {
+	return func() {
+		if q == nil || nodeID == "" {
+			return
+		}
+		msg := fmt.Sprintf("%s stalled after %s", op, timeout)
+		q.ForceAbortInFlightLease(nodeID, msg)
 	}
 }
 
 // awaitCancellable runs fn on a goroutine. ok is false when ctx finishes first; fn may
 // still be running (adapters that ignore cancel). Callers must free the worker either way.
 // When q is non-nil, the await is bracketed on the migration FS overlap wall clock.
-func awaitCancellable[T any](q *queue.Queue, ctx context.Context, fn func() T) (v T, ok bool) {
+// When wd is non-nil, Open/Close arm the per-task FS stall clock for this await only.
+func awaitCancellable[T any](q *queue.Queue, ctx context.Context, wd *observe.ProgressWatchdog, fn func() T) (v T, ok bool) {
+	if wd != nil {
+		wd.Open()
+		defer wd.Close()
+	}
 	if q != nil {
 		fsBusy := q.Database().Busy(db.BusyFS)
 		fsBusy.Enter()
@@ -80,9 +110,13 @@ func awaitCancellable[T any](q *queue.Queue, ctx context.Context, fn func() T) (
 // Callers should pass a queue-only beater here so ProgressWatchdog still cancels hung
 // RPCs; real progress (bytes written) should Beat the ProgressWatchdog separately.
 // Adapter/HTTP per-chunk and per-RPC deadlines are the primary hang protection.
-func awaitCancellableBeating[T any](q *queue.Queue, ctx context.Context, beat func(), interval time.Duration, fn func() T) (v T, ok bool) {
+func awaitCancellableBeating[T any](q *queue.Queue, ctx context.Context, wd *observe.ProgressWatchdog, beat func(), interval time.Duration, fn func() T) (v T, ok bool) {
 	if beat == nil || interval <= 0 {
-		return awaitCancellable(q, ctx, fn)
+		return awaitCancellable(q, ctx, wd, fn)
+	}
+	if wd != nil {
+		wd.Open()
+		defer wd.Close()
 	}
 	if q != nil {
 		fsBusy := q.Database().Busy(db.BusyFS)
@@ -147,8 +181,8 @@ func stallOrAbandoned(ctx, parent context.Context, op, path string, timeout time
 
 // awaitErr runs an error-returning FS (or worker) call under ctx cancel.
 // Pass q=nil for non-FS work (e.g. GPL revalidate) so it is not counted as provider wait.
-func awaitErr(q *queue.Queue, ctx, parent context.Context, timeout time.Duration, op, path string, fn func() error) error {
-	err, ok := awaitCancellable(q, ctx, fn)
+func awaitErr(q *queue.Queue, ctx, parent context.Context, timeout time.Duration, op, path string, wd *observe.ProgressWatchdog, fn func() error) error {
+	err, ok := awaitCancellable(q, ctx, wd, fn)
 	if !ok {
 		return stallOrAbandoned(ctx, parent, op, path, timeout)
 	}
@@ -156,8 +190,8 @@ func awaitErr(q *queue.Queue, ctx, parent context.Context, timeout time.Duration
 }
 
 // awaitErrBeating is awaitErr with periodic Beats for long adapter RPCs (all FS backends).
-func awaitErrBeating(q *queue.Queue, ctx, parent context.Context, timeout time.Duration, beat func(), op, path string, fn func() error) error {
-	err, ok := awaitCancellableBeating(q, ctx, beat, copyStallBeatInterval(timeout), fn)
+func awaitErrBeating(q *queue.Queue, ctx, parent context.Context, timeout time.Duration, beat func(), op, path string, wd *observe.ProgressWatchdog, fn func() error) error {
+	err, ok := awaitCancellableBeating(q, ctx, wd, beat, copyStallBeatInterval(timeout), fn)
 	if !ok {
 		return stallOrAbandoned(ctx, parent, op, path, timeout)
 	}
@@ -170,8 +204,8 @@ type fsOut[T any] struct {
 }
 
 // awaitResult runs a (T, error) FS call under ctx cancel.
-func awaitResult[T any](q *queue.Queue, ctx, parent context.Context, timeout time.Duration, op, path string, fn func() (T, error)) (T, error) {
-	out, ok := awaitCancellable(q, ctx, func() fsOut[T] {
+func awaitResult[T any](q *queue.Queue, ctx, parent context.Context, timeout time.Duration, op, path string, wd *observe.ProgressWatchdog, fn func() (T, error)) (T, error) {
+	out, ok := awaitCancellable(q, ctx, wd, func() fsOut[T] {
 		v, err := fn()
 		return fsOut[T]{Val: v, Err: err}
 	})
@@ -183,8 +217,8 @@ func awaitResult[T any](q *queue.Queue, ctx, parent context.Context, timeout tim
 }
 
 // awaitResultBeating is awaitResult with periodic Beats for long adapter RPCs (all FS backends).
-func awaitResultBeating[T any](q *queue.Queue, ctx, parent context.Context, timeout time.Duration, beat func(), op, path string, fn func() (T, error)) (T, error) {
-	out, ok := awaitCancellableBeating(q, ctx, beat, copyStallBeatInterval(timeout), func() fsOut[T] {
+func awaitResultBeating[T any](q *queue.Queue, ctx, parent context.Context, timeout time.Duration, beat func(), op, path string, wd *observe.ProgressWatchdog, fn func() (T, error)) (T, error) {
+	out, ok := awaitCancellableBeating(q, ctx, wd, beat, copyStallBeatInterval(timeout), func() fsOut[T] {
 		v, err := fn()
 		return fsOut[T]{Val: v, Err: err}
 	})

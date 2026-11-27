@@ -4,6 +4,7 @@
 package queue
 
 import (
+	"sort"
 	"sync/atomic"
 	"time"
 )
@@ -32,12 +33,9 @@ func (q *Queue) InFlightSnapshot(limit int) []InFlightTask {
 	}
 	q.mu.RLock()
 	defer q.mu.RUnlock()
-	out := make([]InFlightTask, 0, min(limit, len(q.inProgress)))
+	out := make([]InFlightTask, 0, len(q.inProgress))
 	now := time.Now()
 	for _, flight := range q.inProgress {
-		if len(out) >= limit {
-			break
-		}
 		tb := flight.task
 		if tb == nil {
 			continue
@@ -74,6 +72,12 @@ func (q *Queue) InFlightSnapshot(limit int) []InFlightTask {
 			BytesDone:  atomic.LoadInt64(&tb.BytesTransferred),
 			BytesTotal: bytesTotal,
 		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].LeaseAgeMs > out[j].LeaseAgeMs
+	})
+	if len(out) > limit {
+		out = out[:limit]
 	}
 	return out
 }

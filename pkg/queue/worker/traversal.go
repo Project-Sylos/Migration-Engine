@@ -66,11 +66,20 @@ func (w *TraversalWorker) execute(task *queue.TaskBase) error {
 	}
 
 	// Prefer workerCtx so scale-down / stop force-checkout aborts mid-ListChildren; fall back to shutdown.
-	parent := fsOpContext(w.workerCtx, w.shutdownCtx)
-	// One Beat at watchdog creation, then a hard wall-clock cancel. No mid-list fake
-	// beats and no seal suppress (seal must not hide kernel blackholes). Rate-limit
-	// windows still freeze the timer so provider backoff is not treated as a hang.
-	wd, ctx := observe.NewProgressWatchdog(parent, traversalStallTimeout, progressRateLimitSuppress(w.queue))
+	base := fsOpContext(w.workerCtx, w.shutdownCtx)
+	parent, leaseCancel := context.WithCancel(base)
+	w.queue.BindLeaseCancel(task.ID, leaseCancel)
+	defer w.queue.ClearLeaseCancel(task.ID)
+	if task.UserCancelRequested {
+		leaseCancel()
+		return errUserCancelled
+	}
+	// FS-wait Open/Close around ListChildren; rate-limit pauses the budget. onStall
+	// force-fails the lease if the syscall ignores cancel.
+	travTimeout := traversalStallBudget(w.queue)
+	wd, ctx := observe.NewProgressWatchdog(parent, travTimeout, func() bool {
+		return w.queue.IsRateLimitActive()
+	}, stallOnFail(w.queue, task.ID, travTimeout, "traversal"))
 	defer wd.Stop()
 
 	w.queue.SetActiveLeaseSize(w.id, 0)
@@ -86,24 +95,36 @@ func (w *TraversalWorker) execute(task *queue.TaskBase) error {
 			logservice.LogFields{Action: "traversal", NodeID: task.ID, Queue: w.queueName})
 	}
 	depth := folder.DepthLevel
-	out, ok := awaitCancellable(w.queue, ctx, func() fsOut[types.ListResult] {
+	out, ok := awaitCancellable(w.queue, ctx, wd, func() fsOut[types.ListResult] {
 		d := depth
 		r, err := w.fsAdapter.ListChildren(ctx, folder.ServiceID, &d, folder.LocationPath)
 		return fsOut[types.ListResult]{Val: r, Err: err}
 	})
 	if !ok {
+		if task.UserCancelRequested || task.UserCancelHard {
+			return errUserCancelled
+		}
+		if strings.Contains(task.LastError, "traversal stalled") {
+			return fmt.Errorf("%w: list children of %s stalled after %s", errTraversalStalled, task.DisplayPath, travTimeout)
+		}
 		if parent.Err() != nil || (w.shutdownCtx != nil && w.shutdownCtx.Err() != nil) {
 			return errTransferAbandoned
 		}
-		return fmt.Errorf("%w: list children of %s stalled after %s", errTraversalStalled, task.DisplayPath, traversalStallTimeout)
+		return fmt.Errorf("%w: list children of %s stalled after %s", errTraversalStalled, task.DisplayPath, travTimeout)
 	}
 	if out.Err != nil {
 		err := out.Err
+		if task.UserCancelRequested || task.UserCancelHard {
+			return errUserCancelled
+		}
+		if strings.Contains(task.LastError, "traversal stalled") {
+			return fmt.Errorf("%w: list children of %s stalled after %s", errTraversalStalled, task.DisplayPath, travTimeout)
+		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			if parent.Err() != nil || (w.shutdownCtx != nil && w.shutdownCtx.Err() != nil) {
 				return errTransferAbandoned
 			}
-			return fmt.Errorf("%w: list children of %s stalled after %s", errTraversalStalled, task.DisplayPath, traversalStallTimeout)
+			return fmt.Errorf("%w: list children of %s stalled after %s", errTraversalStalled, task.DisplayPath, travTimeout)
 		}
 		if logservice.LS != nil {
 			_ = logservice.LS.Log("error",
@@ -440,18 +461,16 @@ func (w *TraversalWorker) executeGPL(task *queue.TaskBase) error {
 		return nil
 	}
 	parent := fsOpContext(w.workerCtx, w.shutdownCtx)
-	wd, ctx := observe.NewProgressWatchdog(parent, gplStallTimeout, progressStallSuppress(w.queue))
+	wd, ctx := observe.NewProgressWatchdog(parent, gplStallTimeout, progressStallSuppress(w.queue),
+		stallOnFail(w.queue, task.ID, gplStallTimeout, "gpl revalidate"))
 	defer wd.Stop()
 
 	database := w.queue.Database()
 	checkTarget := gpl.ResolvePathCheckTarget(w.queue.ScalingSrcProvider(), w.queue.ScalingDstProvider(), w.queue.PathCheckProfile())
 	target := gpl.GPLTargetFromProvider(checkTarget)
-	err := awaitErr(nil, ctx, parent, gplStallTimeout, "gpl revalidate", task.DisplayPath, func() error {
+	err := awaitErr(nil, ctx, parent, gplStallTimeout, "gpl revalidate", task.DisplayPath, wd, func() error {
 		_, err := gpl.ProcessGPLTaskSRC(database, target, task, w.queue.WindowsCompat())
 		return err
 	})
-	if err == nil {
-		wd.Beat()
-	}
 	return err
 }

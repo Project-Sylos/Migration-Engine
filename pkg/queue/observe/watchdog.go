@@ -16,44 +16,86 @@ const (
 	queueWatchdogCheckInterval = 5 * time.Second
 )
 
-// ProgressWatchdog detects stalled tasks by requiring progress (Beat) within a timeout.
-// If no progress occurs, it cancels the context so adapter operations abort.
+// ProgressWatchdog cancels a task when an FS wait stays open longer than timeout of
+// active (non-suppressed) time. Open starts the clock; Close stops it. Beat resets the
+// budget during an open wait (byte progress). Rate-limit suppress pauses the budget
+// without resetting it: 10s FS wait + 60s rate-limit leaves ~50s of a 60s clock.
+// Time outside Open/Close (CPU, seal publish, worker bookkeeping) does not count.
 type ProgressWatchdog struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
 	timeout       time.Duration
-	stallSuppress func() bool  // when non-nil and true, stall timer is frozen (e.g. seal flush / backpressure)
-	lastBeat      atomic.Int64 // UnixNano (time.Now().UnixNano())
+	stallSuppress func() bool // when non-nil and true, active elapsed does not advance
+	onStall       func()      // optional control-plane abort (force-fail lease / replace worker)
+	armed         atomic.Bool // true only between Open and Close
+	activeNs      atomic.Int64 // accumulated non-suppressed ns since last Beat while armed
+	lastTickNs    atomic.Int64 // UnixNano of last monitor sample
 }
 
-// NewProgressWatchdog creates a watchdog and a child context. When no Beat() occurs
-// within timeout, the context is cancelled. Call Stop() when the task ends to release resources.
-// If stallSuppress is non-nil and returns true, the elapsed stall window does not advance (workers blocked on seal I/O are not adapter stalls).
-func NewProgressWatchdog(parent context.Context, timeout time.Duration, stallSuppress func() bool) (*ProgressWatchdog, context.Context) {
+// NewProgressWatchdog creates a watchdog and a child context. The stall clock runs only
+// while Open has been called and Close has not (FS await bracket). When no Beat() occurs
+// within timeout of active FS time, the context is cancelled.
+// If stallSuppress is non-nil and returns true, that wall interval is excluded from the budget.
+// If onStall is non-nil, it runs after the context cancel (e.g. control-plane force-fail).
+func NewProgressWatchdog(parent context.Context, timeout time.Duration, stallSuppress func() bool, onStall func()) (*ProgressWatchdog, context.Context) {
 	ctx, cancel := context.WithCancel(parent)
 	wd := &ProgressWatchdog{
 		ctx:           ctx,
 		cancel:        cancel,
 		timeout:       timeout,
 		stallSuppress: stallSuppress,
+		onStall:       onStall,
 	}
-	wd.lastBeat.Store(time.Now().UnixNano())
+	wd.lastTickNs.Store(time.Now().UnixNano())
 	go wd.monitor()
 	return wd, ctx
 }
 
-// Beat records progress. Call whenever meaningful work completes.
+// Open arms the FS-wait stall clock and resets the active budget. Call at the start of
+// an adapter await; Close when the await returns (do not wait for a hung syscall).
+func (w *ProgressWatchdog) Open() {
+	if w == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	w.activeNs.Store(0)
+	w.lastTickNs.Store(now)
+	w.armed.Store(true)
+}
+
+// Close disarms the FS-wait stall clock. Safe after Stop or when never Opened.
+func (w *ProgressWatchdog) Close() {
+	if w == nil {
+		return
+	}
+	w.armed.Store(false)
+	w.activeNs.Store(0)
+	w.lastTickNs.Store(time.Now().UnixNano())
+}
+
+// Beat records progress during an open FS wait and resets the active-time stall budget.
 func (w *ProgressWatchdog) Beat() {
-	w.lastBeat.Store(time.Now().UnixNano())
+	if w == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	w.activeNs.Store(0)
+	w.lastTickNs.Store(now)
 }
 
 // Stop cancels the context and stops the monitor goroutine.
 func (w *ProgressWatchdog) Stop() {
+	w.armed.Store(false)
 	w.cancel()
 }
 
 func (w *ProgressWatchdog) monitor() {
-	ticker := time.NewTicker(1 * time.Second)
+	// Sub-second ticks so short timeouts (tests) and remaining budgets stay accurate.
+	tick := time.Second
+	if w.timeout > 0 && w.timeout < 2*time.Second {
+		tick = 20 * time.Millisecond
+	}
+	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 
 	for {
@@ -61,15 +103,28 @@ func (w *ProgressWatchdog) monitor() {
 		case <-w.ctx.Done():
 			return
 		case <-ticker.C:
-			if w.stallSuppress != nil && w.stallSuppress() {
-				w.lastBeat.Store(time.Now().UnixNano())
+			now := time.Now().UnixNano()
+			prev := w.lastTickNs.Swap(now)
+			if prev <= 0 || !w.armed.Load() {
 				continue
 			}
-			lastNano := w.lastBeat.Load()
-			last := time.Unix(lastNano/1e9, lastNano%1e9)
-			if time.Since(last) > w.timeout {
-				w.cancel()
-				return
+			delta := now - prev
+			if delta < 0 {
+				continue
+			}
+			if w.timeout <= 0 {
+				continue // 0 = unlimited: Open/Close still bracket BusyFS, never force-fail
+			}
+			if w.stallSuppress == nil || !w.stallSuppress() {
+				active := w.activeNs.Add(delta)
+				if time.Duration(active) > w.timeout {
+					w.armed.Store(false)
+					w.cancel()
+					if w.onStall != nil {
+						w.onStall()
+					}
+					return
+				}
 			}
 		}
 	}
@@ -153,7 +208,7 @@ func (wd *QueueWatchdog) checkForStall() {
 		wd.lastProgress.Store(time.Now().UnixNano())
 		return
 	}
-	// Rate-limit windows are expected idle time — not a deadlock.
+	// Rate-limit windows are expected idle time, not a deadlock.
 	if wd.queue.IsRateLimitActive() {
 		wd.lastProgress.Store(time.Now().UnixNano())
 		wd.possibleStall.Store(false)

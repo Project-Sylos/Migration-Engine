@@ -103,6 +103,129 @@ func TestApplyTraversalAcknowledgeFailed(t *testing.T) {
 	}
 }
 
+func TestApplyTraversalAckPairsFailedDST(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(Options{Dir: filepath.Join(dir, "ops")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	srcID := "src1"
+	dstID := "dst1"
+	writes := []SealNodeWrite{
+		{
+			Side: SideSRC,
+			Node: NodeRecord{ID: srcID, Path: "/pair", Name: "pair", Type: NodeTypeFile, Depth: 1, Size: 1},
+			Status: StatusRecord{
+				TraversalStatus: traversalStatusFailed,
+				CopyStatus:      copyStatusPending,
+			},
+			Depth:      1,
+			InsertOnly: true,
+		},
+		{
+			Side: SideDST,
+			Node: NodeRecord{ID: dstID, Path: "/pair", Name: "pair", Type: NodeTypeFile, Depth: 1, Size: 1},
+			Status: StatusRecord{
+				TraversalStatus: traversalStatusFailed,
+				CopyStatus:      copyStatusPending,
+			},
+			Depth:      1,
+			InsertOnly: true,
+		},
+	}
+	if _, err := s.WriteSealBatch(writes, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := s.ApplyTraversalAck(srcID, dstID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Affected != 1 {
+		t.Fatalf("ack affected=%d want 1 (SRC count)", res.Affected)
+	}
+	for _, pair := range []struct {
+		side string
+		id   string
+	}{{SideSRC, srcID}, {SideDST, dstID}} {
+		st, ok, err := s.GetStatus(pair.side, pair.id)
+		if err != nil || !ok {
+			t.Fatalf("%s %s: %v", pair.side, pair.id, err)
+		}
+		if st.TraversalStatus != traversalStatusExcluded || !IsTraversalAckFromFailed(st.ExclusionSource) {
+			t.Fatalf("%s %s status=%+v", pair.side, pair.id, st)
+		}
+	}
+
+	ures, err := s.ApplyTraversalAck(srcID, dstID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ures.Affected != 1 {
+		t.Fatalf("unack affected=%d want 1", ures.Affected)
+	}
+	for _, pair := range []struct {
+		side string
+		id   string
+	}{{SideSRC, srcID}, {SideDST, dstID}} {
+		st, _, _ := s.GetStatus(pair.side, pair.id)
+		if st.TraversalStatus != traversalStatusFailed || st.ExclusionSource != "" {
+			t.Fatalf("%s %s after unack=%+v", pair.side, pair.id, st)
+		}
+	}
+}
+
+func TestApplyTraversalAckLeavesSuccessfulDST(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(Options{Dir: filepath.Join(dir, "ops")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	srcID := "src1"
+	dstID := "dst1"
+	writes := []SealNodeWrite{
+		{
+			Side: SideSRC,
+			Node: NodeRecord{ID: srcID, Path: "/pair", Name: "pair", Type: NodeTypeFile, Depth: 1, Size: 1},
+			Status: StatusRecord{
+				TraversalStatus: traversalStatusFailed,
+				CopyStatus:      copyStatusPending,
+			},
+			Depth:      1,
+			InsertOnly: true,
+		},
+		{
+			Side: SideDST,
+			Node: NodeRecord{ID: dstID, Path: "/pair", Name: "pair", Type: NodeTypeFile, Depth: 1, Size: 1},
+			Status: StatusRecord{
+				TraversalStatus: traversalStatusSuccessful,
+				CopyStatus:      copyStatusPending,
+			},
+			Depth:      1,
+			InsertOnly: true,
+		},
+	}
+	if _, err := s.WriteSealBatch(writes, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.ApplyTraversalAck(srcID, dstID, true); err != nil {
+		t.Fatal(err)
+	}
+	stDST, _, _ := s.GetStatus(SideDST, dstID)
+	if stDST.TraversalStatus != traversalStatusSuccessful {
+		t.Fatalf("successful DST mutated: %+v", stDST)
+	}
+	stSRC, _, _ := s.GetStatus(SideSRC, srcID)
+	if stSRC.TraversalStatus != traversalStatusExcluded {
+		t.Fatalf("SRC not acked: %+v", stSRC)
+	}
+}
+
 func TestAcknowledgeThenMarkRetry(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(Options{Dir: filepath.Join(dir, "ops")})

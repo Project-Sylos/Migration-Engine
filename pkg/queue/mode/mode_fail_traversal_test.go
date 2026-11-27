@@ -34,3 +34,28 @@ func TestFailTraversalTask_nonRetryableSkipsRetries(t *testing.T) {
 		t.Fatalf("inProgress=%d want 0", q.InProgressCount())
 	}
 }
+
+func TestFailTraversalTask_userCancelSkipsRetries(t *testing.T) {
+	q := queue.NewQueue("src", 3, 1, nil, nil)
+	task := &queue.TaskBase{
+		ID:                  "n2",
+		Round:               0,
+		Attempts:            0,
+		UserCancelRequested: true,
+		LastError:           "cancelled by user",
+		Folder:              types.Folder{ServiceID: "/x", LocationPath: "/x", Type: types.NodeTypeFolder},
+	}
+	q.AddInProgress(task.ID, task)
+
+	q.FinishModeTask(queue.ModeTraversal, task, time.Millisecond, false)
+
+	if task.Status != "failed" {
+		t.Fatalf("status=%q want failed", task.Status)
+	}
+	if q.GetPendingCount() != 0 {
+		t.Fatalf("pending=%d want 0 (user cancel must not retry)", q.GetPendingCount())
+	}
+	if q.InProgressCount() != 0 {
+		t.Fatalf("inProgress=%d want 0", q.InProgressCount())
+	}
+}

@@ -4,11 +4,12 @@
 package observe
 
 import (
-	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"context"
 	"errors"
 	"testing"
 	"time"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 )
 
 func TestIsNonRetryableTraversalError(t *testing.T) {
@@ -31,8 +32,10 @@ func TestIsNonRetryableTraversalError(t *testing.T) {
 
 func TestProgressWatchdog_cancelsOnStall(t *testing.T) {
 	parent := context.Background()
-	wd, ctx := NewProgressWatchdog(parent, 50*time.Millisecond, nil)
+	stalled := false
+	wd, ctx := NewProgressWatchdog(parent, 50*time.Millisecond, nil, func() { stalled = true })
 	defer wd.Stop()
+	wd.Open()
 
 	select {
 	case <-ctx.Done():
@@ -43,23 +46,76 @@ func TestProgressWatchdog_cancelsOnStall(t *testing.T) {
 	if parent.Err() != nil {
 		t.Fatal("parent should still be live on stall cancel")
 	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && !stalled {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !stalled {
+		t.Fatal("expected onStall callback")
+	}
 }
 
-func TestProgressWatchdog_rateLimitSuppressesStall(t *testing.T) {
+func TestProgressWatchdog_zeroTimeoutNeverStalls(t *testing.T) {
 	parent := context.Background()
-	active := true
-	wd, ctx := NewProgressWatchdog(parent, 40*time.Millisecond, func() bool { return active })
+	stalled := false
+	wd, ctx := NewProgressWatchdog(parent, 0, nil, func() { stalled = true })
+	defer wd.Stop()
+	wd.Open()
+	time.Sleep(80 * time.Millisecond)
+	if ctx.Err() != nil || stalled {
+		t.Fatal("timeout 0 must not stall-abort")
+	}
+	wd.Close()
+}
+
+func TestProgressWatchdog_disarmedOutsideOpenClose(t *testing.T) {
+	parent := context.Background()
+	wd, ctx := NewProgressWatchdog(parent, 40*time.Millisecond, nil, nil)
 	defer wd.Stop()
 
 	time.Sleep(120 * time.Millisecond)
 	if ctx.Err() != nil {
-		t.Fatal("stall should be suppressed while rate-limit active")
+		t.Fatal("must not stall before Open")
+	}
+	wd.Open()
+	time.Sleep(20 * time.Millisecond)
+	wd.Close()
+	time.Sleep(120 * time.Millisecond)
+	if ctx.Err() != nil {
+		t.Fatal("must not stall after Close")
+	}
+}
+
+func TestProgressWatchdog_rateLimitPreservesRemainingBudget(t *testing.T) {
+	parent := context.Background()
+	active := true
+	// 80ms active budget. Spend ~40ms, suppress well past the wall clock, then
+	// clear suppress: must keep ~40ms remaining (not cancel immediately, not reset to 80ms).
+	wd, ctx := NewProgressWatchdog(parent, 80*time.Millisecond, func() bool { return active }, nil)
+	defer wd.Stop()
+	wd.Open()
+
+	time.Sleep(40 * time.Millisecond)
+	if ctx.Err() != nil {
+		t.Fatal("should not stall during first active slice")
+	}
+	time.Sleep(200 * time.Millisecond) // wall >> timeout while suppressed
+	if ctx.Err() != nil {
+		t.Fatal("wall clock during rate-limit must not consume stall budget")
 	}
 	active = false
+	cleared := time.Now()
 	select {
 	case <-ctx.Done():
+		elapsed := time.Since(cleared)
+		if elapsed < 20*time.Millisecond {
+			t.Fatalf("cancelled too soon after rate-limit cleared (%s); remaining budget should apply", elapsed)
+		}
+		if elapsed > 200*time.Millisecond {
+			t.Fatalf("cancelled too late after rate-limit cleared (%s); budget should not fully reset", elapsed)
+		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("watchdog did not cancel after suppress cleared")
+		t.Fatal("watchdog did not cancel after remaining active budget")
 	}
 }
 

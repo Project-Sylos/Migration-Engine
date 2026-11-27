@@ -164,9 +164,10 @@ func (t *TaskBase) AttachNodeState(state *db.NodeState) {
 // All operational state lives in DB, flushed via per-queue buffers.
 // inFlight is a leased task with ownership used to drop stale completions.
 type inFlight struct {
-	task  *TaskBase
-	owner string
-	epoch uint64
+	task   *TaskBase
+	owner  string
+	epoch  uint64
+	cancel context.CancelFunc // optional lease-scoped cancel (copy-file soft cancel)
 }
 
 type Queue struct {
@@ -176,7 +177,10 @@ type Queue struct {
 	state              QueueState          // Lifecycle state (running/paused/stopped/completed/waiting)
 	inProgress         map[string]inFlight // Tasks currently being executed (keyed by node ID)
 	leaseEpochSeq      uint64              // monotonic epoch counter for leases
-	pendingBuff        []*TaskBase         // Local task buffer fetched from DB
+	// One-poll Working-on window: prior active ids + terminal outcomes for leavers.
+	lastSentActive map[string]settledHint
+	recentOutcomes map[string]settledOutcome
+	pendingBuff    []*TaskBase // Local task buffer fetched from DB
 	pulling            bool                // Indicates a pull operation is active
 	waitingOnDB        atomic.Bool         // Waiting for shared pull ticket or in DB pull query
 	lastPullWasPartial bool                // True if last pull returned fewer tasks than requested (partial batch)
@@ -198,10 +202,13 @@ type Queue struct {
 	avgExecutionTime      time.Duration   // Average execution time (calculated periodically)
 	lastAvgTime           time.Time       // Last time average was calculated
 	avgInterval           time.Duration   // Interval for calculating averages
-	dequeueDebugLastLogAt time.Time       // Throttle timestamp for dequeue skip debug prints
-	dequeueSkipOldRound   int64           // Aggregated dequeue skips: task.Round < currentRound
-	dequeueSkipEmptyID    int64           // Aggregated dequeue skips: empty task.ID
-	dequeueSkipInProgress int64           // Aggregated dequeue skips: already in progress
+	dequeueDebugLastLogAt time.Time // Throttle timestamp for dequeue skip debug prints
+	dequeueSkipOldRound   int64     // Aggregated dequeue skips: task.Round < currentRound
+	dequeueSkipEmptyID    int64     // Aggregated dequeue skips: empty task.ID
+	dequeueSkipInProgress int64     // Aggregated dequeue skips: already in progress
+	// Per-kind ProgressWatchdog budgets (0 = unlimited). When unset, workers use defaults.
+	fsStallTimeoutsSet bool
+	fsStallTimeouts    FSStallTimeouts
 	// Retry sweep specific fields
 	maxKnownDepth int // Maximum known depth from previous traversal (for retry sweep)
 	// Copy phase specific fields
@@ -554,6 +561,9 @@ func (q *Queue) LeaseGroup(maxN int) []*TaskBase {
 	if q.State() == QueueStateCompleted {
 		return nil
 	}
+	if q.SealAtHardCap() {
+		return nil
+	}
 
 	q.PullTasksIfNeeded(false)
 
@@ -635,6 +645,9 @@ func (q *Queue) LeaseGroupBudget(opts LeaseBudgetOpts) []*TaskBase {
 		maxCount = 1
 	}
 	if q.State() == QueueStateCompleted {
+		return nil
+	}
+	if q.SealAtHardCap() {
 		return nil
 	}
 
@@ -1114,6 +1127,9 @@ func (q *Queue) PullTasksIfNeeded(force bool) PullResult {
 	if state == QueueStatePaused || state == QueueStateCompleted {
 		return PullResult{Status: PullAborted}
 	}
+	if database.SealAtHardCap() {
+		return PullResult{Round: q.GetRound(), Status: PullSkipped}
+	}
 
 	if force {
 		return q.PullTasksOnce(true)
@@ -1139,16 +1155,12 @@ func (q *Queue) TotalTracked() int {
 // Clear removes all tasks from DB and resets in-progress tracking.
 // Note: This is a destructive operation - use with caution.
 func (q *Queue) Clear() {
+	pendingCap := q.EffectiveLeaseBatchSize() // before Lock; do not call Get* while holding mu
 	q.mu.Lock()
 	defer q.mu.Unlock()
-
-	// Clear in-progress tracking
 	q.inProgress = make(map[string]inFlight)
-	q.pendingBuff = make([]*TaskBase, 0, q.EffectiveLeaseBatchSize())
+	q.pendingBuff = make([]*TaskBase, 0, pendingCap)
 	q.pulling = false
-
-	// DB clearing would require deleting all buckets - typically not needed
-	// (DB-only: no ETL.)
 }
 
 // Shutdown gracefully shuts down the queue.

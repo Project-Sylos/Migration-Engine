@@ -5,12 +5,11 @@ package db
 
 import (
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 )
 
-func TestHardCapWaitNsAccumulatesAndResets(t *testing.T) {
+func TestSealAtHardCapAllowsAppendWithoutWait(t *testing.T) {
 	dir := t.TempDir()
 	database, err := Open(Options{
 		Path:   filepath.Join(dir, "wait.db"),
@@ -18,7 +17,7 @@ func TestHardCapWaitNsAccumulatesAndResets(t *testing.T) {
 		SealBuffer: &SealBufferOptions{
 			RowThreshold:  100,
 			HardCap:       2,
-			FlushInterval: time.Hour, // avoid timer flush during wait
+			FlushInterval: time.Hour, // avoid timer flush during test
 		},
 	})
 	if err != nil {
@@ -30,7 +29,6 @@ func TestHardCapWaitNsAccumulatesAndResets(t *testing.T) {
 	seal.rowThreshold = 100
 	seal.hardCap = 2
 
-	// Fill to hard cap without flushing.
 	for i := 0; i < 2; i++ {
 		if err := seal.AddDiscoveryNodes([]InsertOperation{{
 			QueueType: "SRC", Level: 0, Status: StatusSuccessful,
@@ -39,38 +37,41 @@ func TestHardCapWaitNsAccumulatesAndResets(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if !seal.AtHardCap() {
+		t.Fatal("expected AtHardCap after filling to hardCap")
+	}
+	if !database.SealAtHardCap() {
+		t.Fatal("expected DB.SealAtHardCap")
+	}
 
-	var wg sync.WaitGroup
-	wg.Add(1)
+	// Append must not block when at hard cap (lease/pull gate owns backpressure).
+	done := make(chan struct{})
 	go func() {
-		defer wg.Done()
 		_ = seal.AddDiscoveryNodes([]InsertOperation{{
 			QueueType: "SRC", Level: 0, Status: StatusSuccessful,
-			State: &NodeState{ID: "blocked", Depth: 0, Type: NodeTypeFile, TraversalStatus: StatusSuccessful},
+			State: &NodeState{ID: "over", Depth: 0, Type: NodeTypeFile, TraversalStatus: StatusSuccessful},
 		}})
+		close(done)
 	}()
-
-	// Wait until a waiter is blocked, then flush to release.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if seal.IOWaitActive() {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("append blocked on hard cap; expected non-blocking handoff")
 	}
-	time.Sleep(20 * time.Millisecond) // ensure measurable wait
-	if err := seal.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	wg.Wait()
 
 	tel := seal.TelemetrySnapshot()
-	if tel.HardCapWaitNsSinceLastPoll <= 0 {
-		t.Fatalf("expected HardCapWaitNsSinceLastPoll > 0, got %d (hits=%d)",
-			tel.HardCapWaitNsSinceLastPoll, tel.HardCapHitsSinceLastPoll)
+	if tel.HardCapHitsSinceLastPoll <= 0 {
+		t.Fatalf("expected HardCapHitsSinceLastPoll > 0, got %d", tel.HardCapHitsSinceLastPoll)
 	}
-	tel2 := seal.TelemetrySnapshot()
-	if tel2.HardCapWaitNsSinceLastPoll != 0 {
-		t.Fatalf("expected swap-on-read reset, got %d", tel2.HardCapWaitNsSinceLastPoll)
+	if tel.HardCapWaitNsSinceLastPoll != 0 {
+		t.Fatalf("expected HardCapWaitNsSinceLastPoll == 0 (no producer wait), got %d", tel.HardCapWaitNsSinceLastPoll)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && seal.AtHardCap() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if seal.AtHardCap() {
+		t.Fatal("expected overflow flush to drain below the hard cap without the producer waiting")
 	}
 }

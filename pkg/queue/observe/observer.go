@@ -119,6 +119,8 @@ type ExternalQueueMetrics struct {
 
 	// ActiveTasks is a live-only leased-task snapshot (not written to durable queue_stats).
 	ActiveTasks []queue.InFlightTask `json:"activeTasks,omitempty"`
+	// RecentlySettled is a one-poll flash of tasks that left the prior active snapshot.
+	RecentlySettled []queue.SettledInFlightTask `json:"recentlySettled,omitempty"`
 
 	// Last DB frontier pull (this queue). Surfaced via observer → queue_stats.
 	DBPullDurationMs float64 `json:"db_pull_duration_ms,omitempty"`
@@ -290,6 +292,37 @@ func (o *QueueObserver) RegisterQueue(queueName string, q *queue.Queue) {
 
 	o.queues[queueName] = q
 	o.startLoopsLocked()
+}
+
+// Queue returns a registered queue by name (e.g. "copy"), or nil.
+func (o *QueueObserver) Queue(queueName string) *queue.Queue {
+	if o == nil {
+		return nil
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.queues[queueName]
+}
+
+// RequestUserCancel arms soft-cancel on whichever registered queue currently leases nodeID.
+func (o *QueueObserver) RequestUserCancel(nodeID string) bool {
+	if o == nil || nodeID == "" {
+		return false
+	}
+	o.mu.RLock()
+	queues := make([]*queue.Queue, 0, len(o.queues))
+	for _, q := range o.queues {
+		if q != nil {
+			queues = append(queues, q)
+		}
+	}
+	o.mu.RUnlock()
+	for _, q := range queues {
+		if q.RequestUserCancel(nodeID) {
+			return true
+		}
+	}
+	return false
 }
 
 // PauseRegisteredQueues pauses every registered queue, clears pending buffers, and stops
@@ -616,6 +649,7 @@ func buildAuditSnapshot(metrics map[string]ExternalQueueMetrics, queues map[stri
 			phase = PhaseFamilyForMode(q.GetMode())
 		}
 		met.ActiveTasks = nil // durable audit must not store live task lists
+		met.RecentlySettled = nil
 		b, err := json.Marshal(met)
 		if err != nil {
 			continue
@@ -794,7 +828,7 @@ func (o *QueueObserver) pollQueue(queueName string, q *queue.Queue) *ExternalQue
 	if queueName == "copy" || queueName == "delete" {
 		metric.CopyPass = q.GetCopyPass()
 	}
-	metric.ActiveTasks = q.InFlightSnapshot(24)
+	metric.ActiveTasks, metric.RecentlySettled = q.SnapshotSettledWindow(24)
 
 	srcUntil, dstUntil := q.RateLimitedUntilSides()
 	metric.RateLimitedUntilSrc, metric.RateLimitedRemainingMsSrc = formatActiveRateLimit(srcUntil, now)

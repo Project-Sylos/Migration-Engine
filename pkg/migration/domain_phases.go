@@ -86,8 +86,12 @@ func (m *Migration) phaseRuntime(cfg Config, o RunOverrides, runCtx context.Cont
 		DstService:           cfg.Destination,
 		PathCheckTarget:      cfg.PathCheckTarget,
 		WindowsCompat:        cfg.WindowsCompat,
-		OverwritePolicy:      NormalizeOverwritePolicy(cfg.OverwritePolicy),
-		HashVerify:           cfg.HashVerify,
+		OverwritePolicy:       NormalizeOverwritePolicy(cfg.OverwritePolicy),
+		HashVerify:            cfg.HashVerify,
+		StallTimeoutsSet:      cfg.StallTimeoutsSet,
+		StallTimeoutTraversal: cfg.StallTimeoutTraversal,
+		StallTimeoutDelete:    cfg.StallTimeoutDelete,
+		StallTimeoutCopy:      cfg.StallTimeoutCopy,
 	}
 }
 

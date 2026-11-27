@@ -23,9 +23,11 @@ type SealBufferOptions struct {
 type SealBufferTelemetry struct {
 	CurrentRows              int64
 	HWMSinceLastPoll         int64
+	// HardCapHitsSinceLastPoll counts producer appends observed while the buffer
+	// was already at/over the hard cap (lease/pull gate should be refusing work).
 	HardCapHitsSinceLastPoll int64
-	// HardCapWaitNsSinceLastPoll is wall time producers spent blocked in
-	// waitBelowHardCapLocked since the last TelemetrySnapshot (swap-on-read).
+	// HardCapWaitNsSinceLastPoll is retained for telemetry compatibility; appends
+	// no longer block on the hard cap, so this stays zero.
 	HardCapWaitNsSinceLastPoll int64
 	FlushCountSinceLastPoll    int64
 	// FlushDurationNsSinceLastPoll sums wall time of every successful flush
@@ -65,6 +67,7 @@ type SealController interface {
 	Flush() error
 	WaitUntilFlushedThrough(depth int)
 	IOWaitActive() bool
+	AtHardCap() bool
 	TelemetrySnapshot() SealBufferTelemetry
 	LastFlushStats() SealFlushStats
 	UpdateOptions(opts SealBufferOptions)

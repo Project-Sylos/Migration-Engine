@@ -229,6 +229,7 @@ func finishPull(q *queue.Queue, round, yield int, partial bool) queue.PullResult
 // It returns nil (after dropping the lease) when the queue has no database.
 func beginTerminalSuccess(q *queue.Queue, task *queue.TaskBase, executionDelta time.Duration) *db.DB {
 	q.RecordExecutionTime(executionDelta)
+	q.RememberSettledOutcome(task, true)
 	database := q.Database()
 	if database == nil {
 		q.ReleaseTaskInFlightWeight(task)
@@ -254,6 +255,7 @@ func requeueForRetry(q *queue.Queue, task *queue.TaskBase) bool {
 // beginTerminalFailure records permanent-failure bookkeeping once retries are exhausted.
 // It returns nil (after dropping the lease) when the queue has no database.
 func beginTerminalFailure(q *queue.Queue, task *queue.TaskBase) *db.DB {
+	q.RememberSettledOutcome(task, false)
 	task.Locked = false
 	task.Status = "failed"
 	q.IncrementRoundStatsCompleted(task.Round)
@@ -263,7 +265,10 @@ func beginTerminalFailure(q *queue.Queue, task *queue.TaskBase) *db.DB {
 	database := q.Database()
 	if database == nil {
 		q.RemoveInProgress(task.ID)
+		return nil
 	}
+	// Drop the lease before seal I/O. A stuck flush must not keep the row in Working-on.
+	q.RemoveInProgress(task.ID)
 	return database
 }
 

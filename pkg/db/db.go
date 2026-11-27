@@ -270,9 +270,16 @@ func (db *DB) WaitUntilFlushedThrough(depth int) {
 	db.sealBuffer.WaitUntilFlushedThrough(depth)
 }
 
-// SealIOWaitActive reports whether the seal buffer is flushing, waiting on flush depth, or producers are blocked on hard-cap backpressure. Queue stall and progress watchdogs use this to avoid false stalls during long seal I/O.
+// SealIOWaitActive reports whether the seal buffer is flushing. Queue stall and
+// progress watchdogs use this to avoid false stalls during long seal I/O.
 func (db *DB) SealIOWaitActive() bool {
 	return db != nil && db.sealBuffer != nil && db.sealBuffer.IOWaitActive()
+}
+
+// SealAtHardCap reports whether the seal buffer is at or above its hard cap.
+// Lease and pull refuse new work while true; in-flight workers still append.
+func (db *DB) SealAtHardCap() bool {
+	return db != nil && db.sealBuffer != nil && db.sealBuffer.AtHardCap()
 }
 
 // SealBufferTelemetry returns seal buffer gauges and read-and-reset event counters.

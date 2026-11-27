@@ -10,25 +10,40 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
 )
 
-// AbandonInProgressTasks unleases all in-flight tasks. File copy tasks with progress
-// persist a transfer checkpoint. When abandonModeForStop is set (stop/soft-suspend),
-// tasks are not requeued (DB-only). Otherwise they return to pendingBuff (scale-down).
+type abandonLease struct {
+	task   *TaskBase
+	cancel context.CancelFunc
+}
+
+// AbandonInProgressTasks unleases all in-flight tasks. Lease contexts are cancelled
+// first so FS awaits can return; Working-on clears before checkpoint I/O.
+// File copy tasks with progress persist a transfer checkpoint asynchronously so a
+// busy seal/DB path cannot hold soft-stop progress on "draining".
+// When AbandonDBOnly is set (stop/soft-suspend), tasks are not requeued.
+// Otherwise they return to pendingBuff (scale-down).
 func (q *Queue) AbandonInProgressTasks() {
 	if q == nil {
 		return
 	}
 	dbOnly := q.Spin.AbandonDBOnly.Load()
 	q.mu.Lock()
-	tasks := make([]*TaskBase, 0, len(q.inProgress))
+	leases := make([]abandonLease, 0, len(q.inProgress))
 	for _, f := range q.inProgress {
 		if f.task != nil {
-			tasks = append(tasks, f.task)
+			leases = append(leases, abandonLease{task: f.task, cancel: f.cancel})
 		}
 	}
 	q.mu.Unlock()
 
+	for _, lease := range leases {
+		if lease.cancel != nil {
+			lease.cancel()
+		}
+	}
+
 	ctx := context.Background()
-	for _, task := range tasks {
+	for _, lease := range leases {
+		task := lease.task
 		if task == nil {
 			continue
 		}
@@ -38,10 +53,16 @@ func (q *Queue) AbandonInProgressTasks() {
 			offset = task.XferOffset
 		}
 		dstRef := task.XferDstRef
+		token := task.XferResumeToken
 		task.Locked = false
 		q.RemoveInProgress(nodeID)
-		if task.IsFile() && offset > 0 {
-			_ = q.PersistTransferCheckpointToken(ctx, task, offset, dstRef, "")
+
+		if task.IsFile() && (offset > 0 || dstRef != "" || token != "") {
+			t := task
+			off, ref, tok := offset, dstRef, token
+			go func() {
+				_ = q.PersistTransferCheckpointToken(ctx, t, off, ref, tok)
+			}()
 		}
 		if dbOnly {
 			continue

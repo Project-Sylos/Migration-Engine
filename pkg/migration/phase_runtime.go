@@ -10,6 +10,7 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Migration-Engine/pkg/queue/observe"
 	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/loop"
 	"codeberg.org/Sylos/Sylos-FS/pkg/types"
@@ -47,6 +48,23 @@ type PhaseRuntime struct {
 	OverwritePolicy string
 	// HashVerify enables dual-stream SHA-256 compare for name-matched files during DST traversal.
 	HashVerify bool
+	// FS stall ProgressWatchdog budgets (0 = unlimited). StallTimeoutsSet false → package defaults.
+	StallTimeoutsSet      bool
+	StallTimeoutTraversal time.Duration
+	StallTimeoutDelete    time.Duration
+	StallTimeoutCopy      time.Duration
+}
+
+// applyFSStallTimeouts pushes Config/PhaseRuntime stall overrides onto a queue.
+func applyFSStallTimeouts(q *queue.Queue, rt PhaseRuntime) {
+	if q == nil || !rt.StallTimeoutsSet {
+		return
+	}
+	q.SetFSStallTimeouts(queue.FSStallTimeouts{
+		Traversal: rt.StallTimeoutTraversal,
+		Delete:    rt.StallTimeoutDelete,
+		Copy:      rt.StallTimeoutCopy,
+	})
 }
 
 // Begin validates the phase inputs and starts the log service. Every phase entry point calls it first.

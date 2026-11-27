@@ -101,6 +101,11 @@ type TaskBase struct {
 	// Lease ownership (set at lease time; used to drop stale completions).
 	LeaseOwner string
 	LeaseEpoch uint64
+	// UserCancelRequested is set when Progress Monitor cancels a live lease.
+	// Soft grace asks the worker to stop; UserCancelHard is set when the grace
+	// expires and the lease context is force-cancelled.
+	UserCancelRequested bool
+	UserCancelHard      bool
 	// DisplayPath is the write-once root-relative name path for filter rules (SRC).
 	DisplayPath string
 	// IncludeOnlyJSON is JSON []child service IDs; empty = unrestricted ListChildren keep-all.

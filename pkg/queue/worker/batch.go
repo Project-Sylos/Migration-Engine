@@ -48,6 +48,13 @@ func abandonLeasedGroup(q *queue.Queue, tasks []*queue.TaskBase) {
 		if task == nil || !q.HasInProgress(task.ID) {
 			continue
 		}
+		// Stall / user hard-cancel already force-failed (or is about to). Do not
+		// requeue: workerCtx cancel otherwise looks like scale-down abandon.
+		if task.UserCancelHard || task.UserCancelRequested {
+			task.Locked = false
+			q.RemoveInProgress(task.ID)
+			continue
+		}
 		task.Locked = false
 		q.RemoveInProgress(task.ID)
 		if dbOnly {
@@ -177,8 +184,8 @@ func fileLeaseBytes(group []*queue.TaskBase) int64 {
 }
 
 // leaseAndRunBatch leases one budgeted group and runs fn with the batch watchdog context.
-// The ProgressWatchdog only sees real progress: beatBatchWatchdogs beats the queue watchdog
-// alone, so a hung batch call still cancels after spec.stallTimeout.
+// ProgressWatchdog Open/Close brackets each FS await; beatBatchWatchdogs beats the queue
+// watchdog alone so a hung batch call still cancels after spec.stallTimeout.
 func (b *workerBase) leaseAndRunBatch(spec batchSpec, fn func(group []*queue.TaskBase, parent, ctx context.Context, wd *observe.ProgressWatchdog)) {
 	b.queue.EnsureLeaseBatchSizeAtLeast(spec.pullSize)
 
@@ -201,7 +208,18 @@ func (b *workerBase) leaseAndRunBatch(spec batchSpec, fn func(group []*queue.Tas
 	defer b.queue.ClearActiveLeaseSize(b.id)
 
 	parent := fsOpContext(b.workerCtx, b.shutdownCtx)
-	wd, ctx := observe.NewProgressWatchdog(parent, spec.stallTimeout, progressStallSuppress(b.queue))
+	var onStall func()
+	if spec.stallTimeout > 0 {
+		onStall = func() {
+			msg := fmt.Sprintf("batch stalled after %s", spec.stallTimeout)
+			for _, t := range group {
+				if t != nil {
+					b.queue.ForceAbortInFlightLease(t.ID, msg)
+				}
+			}
+		}
+	}
+	wd, ctx := observe.NewProgressWatchdog(parent, spec.stallTimeout, progressStallSuppress(b.queue), onStall)
 	defer wd.Stop()
 	stopBeat := beatBatchWatchdogs(ctx, b.queue, wd)
 	defer stopBeat()
@@ -298,7 +316,7 @@ func (w *CopyWorker) folderBatchTurn() bool {
 			return
 		}
 
-		results, err := awaitResult(w.queue, ctx, parent, folderBatchStallTimeout, "create folder batch", "", func() ([]types.CreateFolderBatchEntryResult, error) {
+		results, err := awaitResult(w.queue, ctx, parent, folderBatchStallTimeout, "create folder batch", "", wd, func() ([]types.CreateFolderBatchEntryResult, error) {
 			return batch.CreateFolderBatch(ctx, items)
 		})
 		if err != nil {
@@ -388,7 +406,7 @@ func (w *CopyWorker) fileBatchTurn() bool {
 					continue
 				}
 			}
-			plan, err := awaitResult(w.queue, ctx, parent, fileBatchStallTimeout, "prepare resume", task.DisplayPath, func() (queue.FileTransferPlan, error) {
+			plan, err := awaitResult(w.queue, ctx, parent, fileBatchStallTimeout, "prepare resume", task.DisplayPath, wd, func() (queue.FileTransferPlan, error) {
 				return queue.PrepareFileTransferResume(ctx, w.queue, w.dstAdapter, task)
 			})
 			if err != nil {
@@ -401,7 +419,7 @@ func (w *CopyWorker) fileBatchTurn() bool {
 				reportTaskOutcome(w.queue, task, fmt.Errorf("empty create basename for file %s", task.DisplayPath))
 				continue
 			}
-			rc, err := awaitResult(w.queue, ctx, parent, fileBatchStallTimeout, "open source", task.DisplayPath, func() (io.ReadCloser, error) {
+			rc, err := awaitResult(w.queue, ctx, parent, fileBatchStallTimeout, "open source", task.DisplayPath, wd, func() (io.ReadCloser, error) {
 				return w.srcAdapter.OpenRead(parent, srcID)
 			})
 			if err != nil {
@@ -413,7 +431,7 @@ func (w *CopyWorker) fileBatchTurn() bool {
 				continue
 			}
 			if resumeOffset > 0 {
-				if seekErr := awaitErr(w.queue, ctx, parent, fileBatchStallTimeout, "seek source", task.DisplayPath, func() error {
+				if seekErr := awaitErr(w.queue, ctx, parent, fileBatchStallTimeout, "seek source", task.DisplayPath, wd, func() error {
 					return queue.SeekReaderTo(rc, resumeOffset)
 				}); seekErr != nil {
 					_ = rc.Close()
@@ -438,7 +456,7 @@ func (w *CopyWorker) fileBatchTurn() bool {
 			return
 		}
 
-		results, err := awaitResult(w.queue, ctx, parent, fileBatchStallTimeout, "upload files batch", "", func() ([]types.UploadFilesBatchEntryResult, error) {
+		results, err := awaitResult(w.queue, ctx, parent, fileBatchStallTimeout, "upload files batch", "", wd, func() ([]types.UploadFilesBatchEntryResult, error) {
 			return batch.UploadFilesBatch(ctx, items)
 		})
 		if err != nil {
@@ -518,7 +536,7 @@ func (w *DeleteWorker) deleteBatchTurn() bool {
 	if !ok {
 		return false
 	}
-	spec := batchSpec{max: maxN, pullSize: types.DefaultDeleteBatchPullSize, stallTimeout: deleteStallTimeout}
+	spec := batchSpec{max: maxN, pullSize: types.DefaultDeleteBatchPullSize, stallTimeout: deleteStallBudget(w.queue)}
 	w.leaseAndRunBatch(spec, func(group []*queue.TaskBase, parent, ctx context.Context, wd *observe.ProgressWatchdog) {
 		items := make([]types.DeleteBatchItem, 0, len(group))
 		aligned := make([]*queue.TaskBase, 0, len(group))
@@ -539,7 +557,7 @@ func (w *DeleteWorker) deleteBatchTurn() bool {
 			return
 		}
 
-		out, ok := awaitCancellable(w.queue, ctx, func() fsOut[[]types.DeleteBatchEntryResult] {
+		out, ok := awaitCancellable(w.queue, ctx, wd, func() fsOut[[]types.DeleteBatchEntryResult] {
 			r, e := batch.DeleteBatch(ctx, items)
 			return fsOut[[]types.DeleteBatchEntryResult]{Val: r, Err: e}
 		})
@@ -548,7 +566,7 @@ func (w *DeleteWorker) deleteBatchTurn() bool {
 				abandonLeasedGroup(w.queue, aligned)
 				return
 			}
-			reportGroupOutcome(w.queue, aligned, fmt.Errorf("delete batch stalled after %s: %w", deleteStallTimeout, ctx.Err()))
+			reportGroupOutcome(w.queue, aligned, fmt.Errorf("delete batch stalled after %s: %w", deleteStallBudget(w.queue), ctx.Err()))
 			return
 		}
 		results, err := out.Val, out.Err

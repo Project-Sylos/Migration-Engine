@@ -67,6 +67,8 @@ func RunMigration(cfg MigrationConfig) (RuntimeStats, error) {
 	// DB-backed frontier: no LevelCache for traversal. Queues pull from DB in batches.
 	srcQueue := queue.NewQueue("src", mr, srcWC, coordinator, srcSizing)
 	dstQueue := queue.NewQueue("dst", mr, dstWC, coordinator, dstSizing)
+	applyFSStallTimeouts(srcQueue, cfg.PhaseRuntime)
+	applyFSStallTimeouts(dstQueue, cfg.PhaseRuntime)
 
 	if cfg.ResumeTraversal != nil {
 		maxKD := cfg.ResumeTraversal.MaxKnownDepth

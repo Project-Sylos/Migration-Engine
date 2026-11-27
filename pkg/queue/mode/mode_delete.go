@@ -126,9 +126,16 @@ func CompleteDeleteTask(q *queue.Queue, task *queue.TaskBase, executionDelta tim
 // FailDeleteTask handles delete task failure with retries.
 func FailDeleteTask(q *queue.Queue, task *queue.TaskBase, executionDelta time.Duration) {
 	q.RecordExecutionTime(executionDelta)
+	maxRetries := q.MaxRetries()
+	if task.UserCancelRequested {
+		if task.LastError == "" {
+			task.LastError = "cancelled by user"
+		}
+		task.Attempts = maxRetries
+	}
 	task.Attempts++
 
-	if task.Attempts < q.MaxRetries() {
+	if task.Attempts < maxRetries {
 		requeueForRetry(q, task)
 		return
 	}

@@ -11,7 +11,7 @@ import (
 
 func TestAwaitCancellable_completes(t *testing.T) {
 	ctx := context.Background()
-	v, ok := awaitCancellable(nil, ctx, func() int { return 7 })
+	v, ok := awaitCancellable(nil, ctx, nil, func() int { return 7 })
 	if !ok || v != 7 {
 		t.Fatalf("got %v ok=%v", v, ok)
 	}
@@ -25,7 +25,7 @@ func TestAwaitCancellable_ctxWinsOverHang(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 		cancel()
 	}()
-	v, ok := awaitCancellable(nil, ctx, func() int {
+	v, ok := awaitCancellable(nil, ctx, nil, func() int {
 		close(started)
 		time.Sleep(time.Hour)
 		return 1
@@ -38,7 +38,7 @@ func TestAwaitCancellable_ctxWinsOverHang(t *testing.T) {
 func TestAwaitCancellableBeating_beatsUntilDone(t *testing.T) {
 	ctx := context.Background()
 	var beats int
-	v, ok := awaitCancellableBeating(nil, ctx, func() { beats++ }, 20*time.Millisecond, func() int {
+	v, ok := awaitCancellableBeating(nil, ctx, nil, func() { beats++ }, 20*time.Millisecond, func() int {
 		time.Sleep(55 * time.Millisecond)
 		return 9
 	})
@@ -56,7 +56,7 @@ func TestAwaitCancellableBeating_ctxWins(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 		cancel()
 	}()
-	v, ok := awaitCancellableBeating(nil, ctx, func() {}, 5*time.Millisecond, func() int {
+	v, ok := awaitCancellableBeating(nil, ctx, nil, func() {}, 5*time.Millisecond, func() int {
 		time.Sleep(time.Hour)
 		return 1
 	})

@@ -191,6 +191,7 @@ func IsNonRetryableCopyError(errMsg string) bool {
 		"missing scope",
 		"invalid_part_size",
 		"bytes but declared size",
+		"cancelled by user",
 	} {
 		if strings.Contains(msg, frag) {
 			return true
@@ -207,6 +208,7 @@ func IsNonRetryableTraversalError(errMsg string) bool {
 		return false
 	}
 	for _, frag := range []string{
+		"cancelled by user",
 		"path blocked from migration",
 		"permission denied",
 		"operation not permitted",

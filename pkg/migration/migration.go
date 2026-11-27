@@ -130,6 +130,13 @@ type Config struct {
 	// RootPreparation is set when the UI reviewed root children before Start discovery.
 	RootPreparation RootPreparation
 
+	// FS stall ProgressWatchdog budgets (0 = unlimited). When StallTimeoutsSet is
+	// false, queues keep package defaults (60s traversal/delete/copy).
+	StallTimeoutsSet      bool
+	StallTimeoutTraversal time.Duration
+	StallTimeoutDelete    time.Duration
+	StallTimeoutCopy      time.Duration
+
 	// FilterRuleset is retained configuration; discovery does not evaluate it.
 	// Nil / empty means no filter rules (current behavior).
 	FilterRuleset *filter.CompiledRuleset

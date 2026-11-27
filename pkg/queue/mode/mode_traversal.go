@@ -191,6 +191,7 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 	database := q.Database()
 	if database == nil {
 		markTraversalComplete()
+		q.RememberSettledOutcome(task, true)
 		q.ReleaseTaskInFlightWeight(task)
 		q.RemoveInProgress(nodeID)
 		return
@@ -465,6 +466,7 @@ func CompleteTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta 
 		}
 	}
 
+	q.RememberSettledOutcome(task, true)
 	q.ReleaseTaskInFlightWeight(task)
 	q.RemoveInProgress(nodeID)
 }
@@ -486,6 +488,13 @@ func FailTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta time
 		if err != nil {
 			fmt.Println("error logging", err)
 		}
+	}
+
+	if task.UserCancelRequested || task.UserCancelHard {
+		if task.LastError == "" {
+			task.LastError = "cancelled by user"
+		}
+		task.Attempts = maxRetries
 	}
 
 	task.Attempts++
@@ -536,9 +545,10 @@ func FailTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta time
 		}
 	}
 
+	q.RememberSettledOutcome(task, false)
+	q.RemoveInProgress(nodeID)
 	database := q.Database()
 	if database == nil {
-		q.RemoveInProgress(nodeID)
 		return
 	}
 
@@ -570,8 +580,6 @@ func FailTraversalTask(q *queue.Queue, task *queue.TaskBase, executionDelta time
 		ev.ExclusionSource = task.ExclusionSource
 		database.AppendStatusEvent(queueType, ev, opsdb.IsDiscoveryRetryMark(task.ExclusionSource))
 	}
-
-	q.RemoveInProgress(nodeID)
 }
 
 // CheckTraversalCompletion checks if traversal/retry phase should complete.

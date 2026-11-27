@@ -208,6 +208,12 @@ func (q *Queue) SealIOWaitActive() bool {
 	return d != nil && d.SealIOWaitActive()
 }
 
+// SealAtHardCap reports whether the seal buffer refuses new leases/pulls until flush drains.
+func (q *Queue) SealAtHardCap() bool {
+	d := q.Database()
+	return d != nil && d.SealAtHardCap()
+}
+
 func (q *Queue) ShutdownCtx() context.Context {
 	q.mu.RLock()
 	defer q.mu.RUnlock()

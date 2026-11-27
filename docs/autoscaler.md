@@ -181,17 +181,19 @@ Other FS adapters need degradation telemetry wired via `GetDegradationState()` /
 | `FS_THROTTLE` / `RateLimitedUntil` | Adapter reported rate-limit (or suspected) with retry-after | Yes — step down workers / delay |
 | `QUEUE WATCHDOG: STALL DETECTED` | No task completions **and** no queue `Beat()` for ~30s while pending/in-progress remain | **No** — diagnostic dump only |
 
-Queue watchdog **suppresses** stalls while `IsRateLimitActive()` or `sealIOWaitActive()`. Copy workers beat the queue watchdog on each successful streamed write chunk. Separately, per-task **ProgressWatchdog** cancels an FS op when no Beat arrives within the phase timeout. Copy/delete freeze that timer during seal I/O or rate-limit waits; **traversal ListChildren** freezes only for rate-limit windows (one Beat at start, no seal suppress, no mid-list fake beats):
+Queue watchdog **suppresses** stalls while `IsRateLimitActive()` or `sealIOWaitActive()`. Copy workers beat the queue watchdog on each successful streamed write chunk. Separately, per-task **ProgressWatchdog** measures FS wait only: `Open` at the start of an adapter await, `Close` when the await returns (does not wait for a hung syscall). Rate-limit windows freeze the budget; time outside Open/Close does not count. No Beat within the phase timeout while Open force-cancels the lease (`onStall`). Byte progress `Beat`s reset the budget during an open wait:
 
 | Phase | Timeout | Notes |
 |-------|---------|-------|
-| Copy (single) | `copyStallTimeout` = 60s | All FS steps (`OpenRead`/`CreateFile`/`OpenWrite`/`Read`/`Write`/`Close`/resume prep/list) awaited asynchronously; **periodic Beats while each op is outstanding** (covers Dropbox/GDrive pipe finish, Graph/Box fragment PUT, slow SFTP) |
-| Copy (batch) | folder 15m / file 30m | `CreateFolderBatch` / `OpenRead` / `UploadFilesBatch` awaited; Beats from `transferProgressReader` **and** a ticker on both watchdogs during the batch turn |
-| Delete (single + batch) | `deleteStallTimeout` = 60s | Async `DeleteNode` / `DeleteBatch` |
-| Traversal | `traversalStallTimeout` = 60s (rate-limit suppress only; no seal suppress / mid-list beats) | Async `ListChildren` |
-| GPL | `gplStallTimeout` = 60s | Path revalidation (CPU/DB) awaited so a wedged task cannot pin a worker |
+| Copy (single) | default 60s (prefs override; 0 = unlimited) | Each FS step (`OpenRead`/`CreateFile`/`OpenWrite`/`Read`/`Write`/resume prep/list) Open/Close bracketed; commit `Close` uses `copyCommitStallTimeout` (10m). Queue-only tickers keep STALL DETECTED quiet without resetting ProgressWatchdog |
+| Copy (batch) | folder 15m / file 30m | Same Open/Close brackets; Beats from `transferProgressReader`; queue watchdog ticker only during the batch turn |
+| Delete (single + batch) | default 60s (prefs override; 0 = unlimited) | Async `DeleteNode` / `DeleteBatch` |
+| Traversal | default 60s (prefs override; 0 = unlimited) | Async `ListChildren` (rate-limit suppress only; no mid-list beats) |
+| GPL | `gplStallTimeout` = 60s | Path revalidation awaited so a wedged task cannot pin a worker |
 
-If an adapter buffers the whole file and only uploads inside `Close()`, ME still Beats while that `Close` is outstanding (same for Dropbox/GDrive pipe finish). Prefer streaming on `Write` for real transfer progress; Close-only bulk upload is still an FS design smell.
+Per-kind budgets are set from Sylos developer prefs (`stallTimeoutTraversalSec` / `Delete` / `Copy`) at phase start via `Queue.SetFSStallTimeouts`.
+
+If an adapter buffers the whole file and only uploads inside `Close()`, the commit watchdog still times that FS wait. Prefer streaming on `Write` for real transfer progress; Close-only bulk upload is still an FS design smell.
 
 ### Soft-cap worker scaling (`pkg/scaling/softcap`)
 

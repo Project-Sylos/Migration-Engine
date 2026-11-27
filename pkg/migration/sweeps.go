@@ -77,11 +77,13 @@ func RunRetrySweep(cfg SweepConfig) (RuntimeStats, error) {
 
 	// Create queues in retry mode
 	srcQueue := queue.NewQueue("src", cfg.MaxRetries, srcWC, coordinator, qsz)
+	applyFSStallTimeouts(srcQueue, cfg.PhaseRuntime)
 	srcQueue.SetMode(queue.QueueModeRetry)
 	srcQueue.SetMaxKnownDepth(maxKnownDepth)
 	seedQueueCountersFromDB(database, srcQueue, "src-traversal", db.QueueStatsPhaseTraversal)
 
 	dstQueue := queue.NewQueue("dst", cfg.MaxRetries, dstWC, coordinator, qsz)
+	applyFSStallTimeouts(dstQueue, cfg.PhaseRuntime)
 	dstQueue.SetMode(queue.QueueModeRetry)
 	if cfg.MaxKnownDepth >= 0 {
 		dstQueue.SetMaxKnownDepth(cfg.MaxKnownDepth)
