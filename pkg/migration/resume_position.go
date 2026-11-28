@@ -86,6 +86,19 @@ func keysetCursorBeforeFirstPendingFolder(database *db.DB, side string, depth in
 	return ""
 }
 
+// softStopTraversalKeysetCursor rewinds the live queue cursor when soft-stop abandon left
+// pending folders behind it. If the round has no pending work, the live cursor is kept.
+func softStopTraversalKeysetCursor(database *db.DB, side string, depth int, live string) string {
+	first := firstPendingTraversalFolderID(database, side, depth)
+	if first == "" {
+		return live
+	}
+	if live == "" || live >= first {
+		return keysetCursorBeforeFirstPendingFolder(database, side, depth)
+	}
+	return live
+}
+
 // listFolderIDsAtDepthOps returns folder node ids at depth from Badger (path index + hydrate).
 func listFolderIDsAtDepthOps(database *db.DB, side string, depth int) ([]string, error) {
 	opsSide := opsdb.SideSRC
@@ -118,6 +131,13 @@ func restoreOrReconstructKeysetCursor(database *db.DB, side string, depth int, s
 		// Recovery: always start before the first pending item at this depth.
 		return keysetCursorBeforeFirstPendingFolder(database, side, depth)
 	}
+	// Soft stop force-abandon leaves pend:* behind the live keyset cursor. Resume must
+	// re-sweep that round from before the first pending row, then advance normally once
+	// the round drains. A saved cursor that would skip pending is treated as stale.
+	first := firstPendingTraversalFolderID(database, side, depth)
+	if first != "" && (saved == "" || saved >= first) {
+		return keysetCursorBeforeFirstPendingFolder(database, side, depth)
+	}
 	if saved != "" {
 		return saved
 	}
@@ -125,10 +145,14 @@ func restoreOrReconstructKeysetCursor(database *db.DB, side string, depth int, s
 		srcR, srcC, dstR, dstC, ok := database.LoadTraversalQueuePositions()
 		if ok {
 			if side == "DST" && dstR == depth && dstC != "" {
-				return dstC
+				if first == "" || dstC < first {
+					return dstC
+				}
 			}
 			if side != "DST" && srcR == depth && srcC != "" {
-				return srcC
+				if first == "" || srcC < first {
+					return srcC
+				}
 			}
 		}
 	}
@@ -164,10 +188,19 @@ func applyTraversalResume(database *db.DB, resume *RuntimeSuspendV1, srcQueue, d
 	}
 	srcQueue.SetRound(srcRound)
 	dstQueue.SetRound(dstRound)
-	if cur := restoreOrReconstructKeysetCursor(database, "SRC", srcRound, resume.SrcKeysetCursor, unclean); cur != "" {
+	srcCursor := resume.SrcKeysetCursor
+	dstCursor := resume.DstKeysetCursor
+	// Cursor belongs to the saved round; a depth jump must reconstruct at the new depth.
+	if srcRound != resume.LastRoundSrc {
+		srcCursor = ""
+	}
+	if dstRound != resume.LastRoundDst {
+		dstCursor = ""
+	}
+	if cur := restoreOrReconstructKeysetCursor(database, "SRC", srcRound, srcCursor, unclean); cur != "" {
 		srcQueue.SetKeysetCursor(cur)
 	}
-	if cur := restoreOrReconstructKeysetCursor(database, "DST", dstRound, resume.DstKeysetCursor, unclean); cur != "" {
+	if cur := restoreOrReconstructKeysetCursor(database, "DST", dstRound, dstCursor, unclean); cur != "" {
 		dstQueue.SetKeysetCursor(cur)
 	}
 	if coordinator != nil {

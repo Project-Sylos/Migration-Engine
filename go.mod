@@ -40,5 +40,5 @@ require (
 replace (
 	codeberg.org/Sylos/Spectra => ../Spectra
 	codeberg.org/Sylos/Sylos-FS => ../Sylos-FS
-	codeberg.org/Sylos/go-path-linter => ../go-path-linter
+	codeberg.org/Sylos/go-path-linter => ../Go-Path-Linter
 )

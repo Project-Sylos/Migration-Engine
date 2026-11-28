@@ -40,6 +40,94 @@ func TestApplyTraversalResumeRestoresRoundAndCursor(t *testing.T) {
 	}
 }
 
+func TestApplyTraversalResumeRewindsCursorPastAbandonedPending(t *testing.T) {
+	database, err := db.Open(db.Options{Path: t.TempDir() + "/resume-rewind-cursor.db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	seedTraversalFolder(t, database, "SRC", "folder-a", "/a", 7, db.StatusSuccessful)
+	seedTraversalFolder(t, database, "SRC", "folder-b", "/b", 7, db.StatusPending)
+
+	src := queue.NewQueue("src", 3, 1, nil, nil)
+	dst := queue.NewQueue("dst", 3, 1, nil, nil)
+	// Soft-stop force-abandon leaves the live cursor on the abandoned pending id.
+	applyTraversalResume(database, &RuntimeSuspendV1{
+		Version:         1,
+		Kind:            "traversal",
+		LastRoundSrc:    7,
+		LastRoundDst:    7,
+		SrcKeysetCursor: "folder-b",
+		DstKeysetCursor: "folder-b",
+	}, src, dst, nil, false)
+	if src.GetRound() != 7 {
+		t.Fatalf("round=%d want 7", src.GetRound())
+	}
+	if src.GetKeysetCursor() != "folder-a" {
+		t.Fatalf("cursor=%q want predecessor folder-a so folder-b is re-pulled", src.GetKeysetCursor())
+	}
+	batch, err := pull.ListNodesPendingAtDepthKeyset(database, "SRC", 7, src.GetKeysetCursor(), 1, db.NodeTypeFolder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch) != 1 || batch[0].Key != "folder-b" {
+		t.Fatalf("next pending=%v want folder-b", keysOf(batch))
+	}
+}
+
+func TestApplyTraversalResumeIgnoresCursorWhenRoundJumps(t *testing.T) {
+	database, err := db.Open(db.Options{Path: t.TempDir() + "/resume-jump-cursor.db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	seedTraversalFolder(t, database, "SRC", "d3-a", "/d3a", 3, db.StatusSuccessful)
+	seedTraversalFolder(t, database, "SRC", "d3-b", "/d3b", 3, db.StatusPending)
+
+	src := queue.NewQueue("src", 3, 1, nil, nil)
+	dst := queue.NewQueue("dst", 3, 1, nil, nil)
+	applyTraversalResume(database, &RuntimeSuspendV1{
+		Version:         1,
+		Kind:            "traversal",
+		LastRoundSrc:    2,
+		LastRoundDst:    2,
+		SrcKeysetCursor: "zzz-from-round-2",
+		DstKeysetCursor: "zzz-from-round-2",
+	}, src, dst, nil, false)
+	if src.GetRound() != 3 {
+		t.Fatalf("round=%d want 3", src.GetRound())
+	}
+	if src.GetKeysetCursor() != "d3-a" {
+		t.Fatalf("cursor=%q want d3-a (reconstruct at jumped depth, not round-2 cursor)", src.GetKeysetCursor())
+	}
+}
+
+func TestSoftStopTraversalKeysetCursorRewindsBehindPending(t *testing.T) {
+	database, err := db.Open(db.Options{Path: t.TempDir() + "/soft-stop-cursor.db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	seedTraversalFolder(t, database, "SRC", "folder-a", "/a", 4, db.StatusSuccessful)
+	seedTraversalFolder(t, database, "SRC", "folder-b", "/b", 4, db.StatusPending)
+
+	got := softStopTraversalKeysetCursor(database, "SRC", 4, "folder-b")
+	if got != "folder-a" {
+		t.Fatalf("cursor=%q want folder-a", got)
+	}
+	got = softStopTraversalKeysetCursor(database, "SRC", 4, "folder-a")
+	if got != "folder-a" {
+		t.Fatalf("cursor=%q want keep live pred folder-a", got)
+	}
+	got = softStopTraversalKeysetCursor(database, "SRC", 5, "live-keep")
+	if got != "live-keep" {
+		t.Fatalf("cursor=%q want live when no pending at depth", got)
+	}
+}
+
 func TestApplyTraversalResumeEmptyCursorStartsAtFirstPending(t *testing.T) {
 	database, err := db.Open(db.Options{Path: t.TempDir() + "/resume-empty-cursor.db"})
 	if err != nil {

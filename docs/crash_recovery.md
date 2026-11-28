@@ -52,7 +52,7 @@ Leave a checkpoint Resume can trust.
 1. Phase is already suspended (or a review / finalize-failed path as applicable).
 2. Load `suspend_v1` and restore rounds / cursors / knobs.
 3. Re-enter the phase (`*-in-progress`).
-4. Traversal: continue from saved keyset cursors (normal pending-depth fallbacks if needed).
+4. Traversal: re-sweep the stopped round from before any remaining `pend:*` folders at that depth (soft-stop force-abandon can leave pending behind the live keyset cursor). When that round drains, advance and continue BFS as normal. Saved cursors that would skip pending are rewritten on soft-stop save and again on resume.
 5. Copy: optional one-round DST existence window only when there was real prior copy success **and** pending work remains. No forced HashVerify.
 6. Delete: continue from `pending_explicit` frontier; no hash window.
 7. Run continues as a normal live phase.

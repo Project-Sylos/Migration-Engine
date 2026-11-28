@@ -351,8 +351,10 @@ func performTraversalSoftSuspend(
 	suspend.LastRoundSrc = srcStats.Round
 	suspend.LastRoundDst = dstStats.Round
 	suspend.MaxKnownDepth = maxD
-	suspend.SrcKeysetCursor = srcQueue.GetKeysetCursor()
-	suspend.DstKeysetCursor = dstQueue.GetKeysetCursor()
+	// After grace force-abandon, live cursors sit past unleashed pend:* rows. Checkpoint
+	// before the first pending folder at each round so Resume re-sweeps that round.
+	suspend.SrcKeysetCursor = softStopTraversalKeysetCursor(database, "SRC", srcStats.Round, srcQueue.GetKeysetCursor())
+	suspend.DstKeysetCursor = softStopTraversalKeysetCursor(database, "DST", dstStats.Round, dstQueue.GetKeysetCursor())
 	if database.Ops() != nil {
 		if err := database.SaveTraversalQueuePositions(
 			srcStats.Round, suspend.SrcKeysetCursor,
